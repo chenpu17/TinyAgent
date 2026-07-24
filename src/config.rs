@@ -229,20 +229,27 @@ impl Config {
             self.restrict_to_workdir = v;
         }
         if let Some(l) = p.limits {
+            // Batch task files are untrusted: a task may only TIGHTEN resource
+            // limits (shorter timeout / fewer turns / smaller output), never
+            // loosen them — otherwise it could set timeout_secs=0 (no limit)
+            // and max_turns=u32::MAX and pin a worker forever. 0 means "no
+            // limit" so it is treated as a loosening and ignored.
             if let Some(v) = l.max_turns {
-                self.limits.max_turns = v;
+                self.limits.max_turns = v.min(self.limits.max_turns);
             }
             if let Some(v) = l.timeout_secs {
-                self.limits.timeout_secs = v;
+                if v != 0 {
+                    self.limits.timeout_secs = v.min(self.limits.timeout_secs);
+                }
             }
             if let Some(v) = l.max_output_chars {
-                self.limits.max_output_chars = v;
+                self.limits.max_output_chars = v.min(self.limits.max_output_chars);
             }
             if let Some(v) = l.compress_threshold_chars {
-                self.limits.compress_threshold_chars = v;
+                self.limits.compress_threshold_chars = v.min(self.limits.compress_threshold_chars);
             }
             if let Some(v) = l.keep_recent_messages {
-                self.limits.keep_recent_messages = v;
+                self.limits.keep_recent_messages = v.min(self.limits.keep_recent_messages);
             }
         }
         if let Some(v) = p.mcp_servers {
@@ -429,5 +436,36 @@ mod tests {
             "limits": {"timeout_sec": 60}
         }"#;
         assert!(serde_json::from_str::<Config>(json).is_err());
+    }
+
+    #[test]
+    fn batch_overlay_clamps_limits_to_base() {
+        // A task can only tighten limits, never loosen them.
+        let mut cfg: Config = serde_json::from_str(
+            r#"{"provider":"anthropic","api_key_env":"K","model":"m",
+               "limits":{"max_turns":10,"timeout_secs":60,"max_output_chars":5000}}"#,
+        )
+        .unwrap();
+        let partial: PartialConfig = serde_json::from_str(
+            r#"{"task":"x","limits":{"max_turns":100,"timeout_secs":0,"max_output_chars":99999}}"#,
+        )
+        .unwrap();
+        cfg.apply(partial).unwrap();
+        assert_eq!(cfg.limits.max_turns, 10); // clamped down to base
+        assert_eq!(cfg.limits.timeout_secs, 60); // 0 (no-limit) ignored
+        assert_eq!(cfg.limits.max_output_chars, 5000); // clamped
+
+        // Tightening is allowed.
+        let mut cfg: Config = serde_json::from_str(
+            r#"{"provider":"anthropic","api_key_env":"K","model":"m",
+               "limits":{"max_turns":10,"timeout_secs":60}}"#,
+        )
+        .unwrap();
+        let partial: PartialConfig =
+            serde_json::from_str(r#"{"task":"x","limits":{"max_turns":3,"timeout_secs":30}}"#)
+                .unwrap();
+        cfg.apply(partial).unwrap();
+        assert_eq!(cfg.limits.max_turns, 3);
+        assert_eq!(cfg.limits.timeout_secs, 30);
     }
 }

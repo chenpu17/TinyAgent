@@ -138,6 +138,10 @@ fn http_client(total: Duration) -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(total)
+        // Never follow redirects: a malicious/compromised MCP server could
+        // 302 our authenticated POST (custom headers aren't auto-stripped
+        // across hosts) to an internal or attacker address.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap_or_else(|_| reqwest::blocking::Client::new())
 }
@@ -219,13 +223,22 @@ impl Transport for StdioTransport {
     fn request(&mut self, id: u64, method: &str, params: Value) -> Result<Value> {
         let (tx, rx) = mpsc::channel();
         self.pending.lock().unwrap().insert(id, tx);
-        self.stdin.write_all(frame(id, method, params).to_string().as_bytes())?;
-        self.stdin.write_all(b"\n")?;
-        self.stdin.flush()?;
-        let msg = rx
-            .recv_timeout(CALL_TIMEOUT)
-            .map_err(|_| anyhow!("MCP call '{method}' timed out or server died"))?;
-        extract_result(msg, method)
+        // Reclaim the pending slot on any failure (write error or timeout):
+        // otherwise a flaky server that times out on every call leaks one
+        // map entry per call and grows without bound over a long session.
+        let res = (|| -> Result<Value> {
+            self.stdin.write_all(frame(id, method, params).to_string().as_bytes())?;
+            self.stdin.write_all(b"\n")?;
+            self.stdin.flush()?;
+            let msg = rx
+                .recv_timeout(CALL_TIMEOUT)
+                .map_err(|_| anyhow!("MCP call '{method}' timed out or server died"))?;
+            extract_result(msg, method)
+        })();
+        if res.is_err() {
+            self.pending.lock().unwrap().remove(&id);
+        }
+        res
     }
 
     fn notify(&mut self, method: &str, params: Value) -> Result<()> {
@@ -369,6 +382,7 @@ impl SseTransport {
         // The GET is a long-lived stream: connect timeout only, no total timeout.
         let client = reqwest::blocking::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_else(|_| reqwest::blocking::Client::new());
         let mut req = client
@@ -426,7 +440,15 @@ impl SseTransport {
         }
         let post_url = endpoint_rx
             .recv_timeout(CONNECT_TIMEOUT)
-            .map_err(|_| anyhow!("MCP SSE: no 'endpoint' event from {url}"))?
+            .map_err(|e| {
+                // Timed out or the channel died before the endpoint arrived:
+                // tell the reader thread to stop. Its read() may still be
+                // blocked (reqwest::blocking can't be interrupted mid-read),
+                // but at least it won't keep dispatching into a dead table,
+                // and it will exit on the next event or stream close.
+                shutdown.store(true, Ordering::Relaxed);
+                anyhow!("MCP SSE: no 'endpoint' event from {url}: {e}")
+            })?
             .ok_or_else(|| anyhow!("MCP SSE endpoint rejected (origin mismatch)"))?;
         Ok(Self {
             client: http_client(CALL_TIMEOUT),
@@ -459,11 +481,17 @@ impl Transport for SseTransport {
     fn request(&mut self, id: u64, method: &str, params: Value) -> Result<Value> {
         let (tx, rx) = mpsc::channel();
         self.pending.lock().unwrap().insert(id, tx);
-        self.post(&frame(id, method, params))?;
-        let msg = rx
-            .recv_timeout(CALL_TIMEOUT)
-            .map_err(|_| anyhow!("MCP call '{method}' timed out or SSE stream died"))?;
-        extract_result(msg, method)
+        let res = (|| -> Result<Value> {
+            self.post(&frame(id, method, params))?;
+            let msg = rx
+                .recv_timeout(CALL_TIMEOUT)
+                .map_err(|_| anyhow!("MCP call '{method}' timed out or SSE stream died"))?;
+            extract_result(msg, method)
+        })();
+        if res.is_err() {
+            self.pending.lock().unwrap().remove(&id);
+        }
+        res
     }
 
     fn notify(&mut self, method: &str, params: Value) -> Result<()> {
@@ -523,11 +551,37 @@ fn read_sse_event<R: BufRead>(reader: &mut R) -> Option<(String, String)> {
 }
 
 /// scheme://authority of a URL (no path/query), or None if it has none.
+/// The scheme and host are lowercased and the scheme's default port stripped,
+/// so `http://H` and `http://h:80` compare equal as the same origin.
 fn origin_of(url: &str) -> Option<String> {
     let i = url.find("://")?;
+    let scheme = url[..i].to_ascii_lowercase();
     let after = &url[i + 3..];
     let end = after.find('/').unwrap_or(after.len());
-    Some(url[..i + 3 + end].to_string())
+    let authority = &after[..end];
+    // Drop userinfo (anything before the last '@') before comparing hosts.
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    Some(format!(
+        "{scheme}://{}",
+        normalize_host_port(host_port, &scheme)
+    ))
+}
+
+/// Lowercase the host and drop the scheme's default port so equivalent
+/// origins compare equal.
+fn normalize_host_port(hp: &str, scheme: &str) -> String {
+    let hp = hp.to_ascii_lowercase();
+    if let Some((host, port)) = hp.rsplit_once(':') {
+        if let Ok(p) = port.parse::<u16>() {
+            let default = if scheme == "https" { 443 } else { 80 };
+            return if p == default {
+                host.to_string()
+            } else {
+                format!("{host}:{p}")
+            };
+        }
+    }
+    hp
 }
 
 /// Resolve the endpoint event payload against the SSE URL. A relative path is
@@ -584,6 +638,10 @@ mod tests {
             resolve_endpoint("http://h:3000/sse", "http://h:3000/x").unwrap(),
             "http://h:3000/x"
         );
+        // Host case and the scheme's default port are normalized, so these
+        // legitimately-same-origin endpoints are NOT false-refused.
+        assert!(resolve_endpoint("http://Host:3000/sse", "http://host:3000/x").is_ok());
+        assert!(resolve_endpoint("http://h/sse", "http://h:80/x").is_ok());
         // Cross-origin absolute URL is refused (SSRF guard).
         assert!(resolve_endpoint("http://h:3000/sse", "http://other/x").is_err());
     }

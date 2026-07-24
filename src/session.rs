@@ -58,17 +58,10 @@ pub fn save(path: &Path, model: &str, messages: &[Message]) -> Result<()> {
         model,
         messages,
     };
-    let tmp = path.with_extension("tmp");
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-    std::fs::write(&tmp, serde_json::to_string_pretty(&s)?)
-        .with_context(|| format!("cannot write session: {}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("cannot rename session to: {}", path.display()))?;
-    Ok(())
+    let bytes = serde_json::to_string_pretty(&s)?;
+    // Reuse the hardened atomic write (fsync + temp cleanup) used for
+    // result/report files, so the session has the same crash safety.
+    crate::harness::atomic_write(path, bytes.as_bytes())
 }
 
 #[cfg(test)]

@@ -116,6 +116,9 @@ pub fn new_client(run_timeout_secs: u64) -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(15))
         .timeout(std::time::Duration::from_secs(run_timeout_secs.max(60)))
+        // Don't follow redirects: a custom base_url that redirects could leak
+        // the API key header (x-api-key / Authorization) to a third party.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap_or_else(|_| reqwest::blocking::Client::new())
 }
