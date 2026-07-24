@@ -210,7 +210,15 @@ fn ui_loop(
                         push_wrapped(&mut lines, "You", t, Color::Cyan);
                     }
                     Row::Assistant(t) => {
-                        push_wrapped(&mut lines, "Agent", t, Color::White);
+                        // Bold "Agent" label, then a markdown-rendered body.
+                        // from_str borrows `t`; to_owned() clones every Cow into
+                        // an owned String so the lines outlive the row borrow.
+                        lines.push(Line::from(Span::styled(
+                            "Agent".to_string(),
+                            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                        )));
+                        let md = tui_markdown::from_str(t).to_owned();
+                        lines.extend(md.lines);
                     }
                     Row::Tool(t) => {
                         push_wrapped(&mut lines, "Tool", t, Color::Yellow);
