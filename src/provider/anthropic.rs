@@ -81,6 +81,24 @@ enum Pending {
     ToolUse { id: String, name: String, json: String },
 }
 
+/// Finalize a fully-assembled pending block into a concrete Block. Shared by
+/// the content_block_stop handler and the truncation-recovery flushes
+/// (content_block_start overwrite + end-of-stream).
+fn finalize_pending(p: Pending) -> Result<Block> {
+    Ok(match p {
+        Pending::Text(t) => Block::Text(t),
+        Pending::ToolUse { id, name, json } => {
+            let input = if json.trim().is_empty() {
+                json!({})
+            } else {
+                serde_json::from_str(&json)
+                    .map_err(|e| anyhow!("bad tool input JSON from model: {e}"))?
+            };
+            Block::ToolUse { id, name, input }
+        }
+    })
+}
+
 impl Provider for Anthropic {
     fn chat(&self, req: &ChatRequest, on_event: &mut dyn FnMut(ChatEvent)) -> Result<ChatResponse> {
         let mut body = json!({
@@ -96,12 +114,16 @@ impl Provider for Anthropic {
             body["tools"] = Self::tools_json(req.tools);
         }
 
-        let resp = self
+        let mut rb = self
             .client
             .post(format!("{}/v1/messages", self.base_url))
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+        if let Some(t) = req.per_request_timeout {
+            rb = rb.timeout(t);
+        }
+        let resp = rb
             .json(&body)
             .send()
             .context("request to Anthropic API failed")?;
@@ -134,6 +156,11 @@ impl Anthropic {
             };
             match ev["type"].as_str().unwrap_or("") {
                 "content_block_start" => {
+                    // A previous block that never received content_block_stop
+                    // (truncated stream) would be overwritten here — flush it.
+                    if let Some(p) = pending.take() {
+                        blocks.push(finalize_pending(p)?);
+                    }
                     let cb = &ev["content_block"];
                     pending = Some(match cb["type"].as_str().unwrap_or("") {
                         "tool_use" => Pending::ToolUse {
@@ -164,18 +191,7 @@ impl Anthropic {
                 }
                 "content_block_stop" => {
                     if let Some(p) = pending.take() {
-                        blocks.push(match p {
-                            Pending::Text(t) => Block::Text(t),
-                            Pending::ToolUse { id, name, json } => {
-                                let input = if json.trim().is_empty() {
-                                    json!({})
-                                } else {
-                                    serde_json::from_str(&json)
-                                        .map_err(|e| anyhow!("bad tool input JSON from model: {e}"))?
-                                };
-                                Block::ToolUse { id, name, input }
-                            }
-                        });
+                        blocks.push(finalize_pending(p)?);
                     }
                 }
                 "message_delta" => {
@@ -184,10 +200,20 @@ impl Anthropic {
                     }
                 }
                 "error" => {
-                    bail!("Anthropic stream error: {}", ev["error"]["message"]);
+                    bail!(
+                        "Anthropic stream error: {}",
+                        ev["error"]["message"].as_str().unwrap_or("(no message)")
+                    );
                 }
                 _ => {}
             }
+        }
+
+        // A stream cut off mid-block (network drop, or per_request_timeout
+        // firing during generation) leaves a pending block unflushed. Flush
+        // it rather than silently dropping a tool call or trailing text.
+        if let Some(p) = pending.take() {
+            blocks.push(finalize_pending(p)?);
         }
 
         Ok(ChatResponse { blocks, stop_reason })
@@ -245,5 +271,25 @@ mod tests {
     fn stream_error_event_bails() {
         let raw = "data: {\"type\":\"error\",\"error\":{\"message\":\"overloaded\"}}\n\n";
         assert!(Anthropic::parse_stream(raw.as_bytes(), &mut |_| {}).is_err());
+    }
+
+    #[test]
+    fn stream_truncated_flushes_pending() {
+        // Stream cut off mid-tool-use (no content_block_stop, no message_stop)
+        // — the pending tool_use must still be recovered rather than dropped.
+        let raw = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_9\",\"name\":\"shell\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"ls\\\"}\"}}\n\n",
+        );
+        let resp = parse(raw.as_bytes());
+        assert_eq!(resp.blocks.len(), 1);
+        match &resp.blocks[0] {
+            Block::ToolUse { id, name, input } => {
+                assert_eq!(id, "toolu_9");
+                assert_eq!(name, "shell");
+                assert_eq!(input["command"], "ls");
+            }
+            other => panic!("expected tool_use, got {other:?}"),
+        }
     }
 }

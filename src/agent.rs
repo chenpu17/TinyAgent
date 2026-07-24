@@ -88,6 +88,15 @@ impl Agent {
             .is_some_and(|c| c.load(Ordering::Relaxed))
     }
 
+    /// Whether the last message is a user message. The TUI uses this to
+    /// decide whether to kick off an initial run — an initial task baked
+    /// in by main, or a resumed session that stopped mid-turn at a
+    /// tool_result — instead of waiting for the user to type something.
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
+    pub fn ends_with_user(&self) -> bool {
+        self.messages.last().is_some_and(|m| m.role == Role::User)
+    }
+
     /// Enable per-turn session persistence to the given file.
     pub fn enable_session(&mut self, path: std::path::PathBuf) {
         self.session_path = Some(path);
@@ -111,6 +120,16 @@ impl Agent {
     /// Run the loop until the model stops calling tools, or a limit is hit.
     pub fn run(&mut self, events: &mut dyn FnMut(AgentEvent)) -> Result<RunOutcome> {
         let start = Instant::now();
+        // Each top-level run gets a fresh compression budget. In the TUI the
+        // same Agent is reused across follow-ups; without this reset, one
+        // transient compression failure would disable it for the rest of the
+        // session and the history would grow until it hit the model's limit.
+        self.compress_failed = false;
+        // Overall run deadline. Each chat is capped to the time left so a
+        // single stuck request can't outlive the run budget — which is
+        // otherwise only enforced at turn boundaries.
+        let deadline = (self.limits.timeout_secs > 0)
+            .then(|| start + Duration::from_secs(self.limits.timeout_secs));
         let mut turns = 0u32;
         let mut final_text = String::new();
         let mut records: Vec<ToolCallRecord> = Vec::new();
@@ -125,13 +144,18 @@ impl Agent {
                 stop_reason = "max_turns_reached".into();
                 break;
             }
-            if start.elapsed().as_secs() >= self.limits.timeout_secs {
+            // timeout_secs == 0 means "no timeout" (mirroring the deadline
+            // guard below). Without this check, elapsed() >= 0 is always true
+            // and the agent would time out before its very first turn.
+            if self.limits.timeout_secs > 0
+                && start.elapsed().as_secs() >= self.limits.timeout_secs
+            {
                 stop_reason = "timeout".into();
                 break;
             }
             turns += 1;
             events(AgentEvent::TurnStart(turns));
-            self.compress_if_needed(events);
+            self.compress_if_needed(events, deadline);
 
             let req = ChatRequest {
                 system: self.system.as_deref(),
@@ -139,6 +163,8 @@ impl Agent {
                 tools: &self.tool_defs,
                 model: &self.model,
                 max_tokens: self.max_tokens,
+                per_request_timeout: deadline
+                    .map(|d| d.saturating_duration_since(Instant::now())),
             };
             let resp = self.provider.chat(&req, &mut |e| match e {
                 ChatEvent::TextDelta(t) => events(AgentEvent::TextDelta(t)),
@@ -253,7 +279,19 @@ fn total_chars(messages: &[Message]) -> usize {
             Block::Text(t) => t.len(),
             Block::Image { data, .. } => data.len() / 100, // base64 is ~33% overhead
             Block::ToolUse { input, .. } => input.to_string().len(),
-            Block::ToolResult { content, .. } => content.len(),
+            // A tool result may carry an image payload (e.g. load_image).
+            // Count it like a top-level image, or a load_image-heavy
+            // conversation never trips the compress threshold.
+            Block::ToolResult { content, image, .. } => {
+                let img = image
+                    .as_deref()
+                    .map(|b| match b {
+                        Block::Image { data, .. } => data.len() / 100,
+                        _ => 0,
+                    })
+                    .unwrap_or(0);
+                content.len() + img
+            }
         })
         .sum()
 }
@@ -300,16 +338,29 @@ impl Agent {
     /// If history exceeds the configured threshold, summarize the middle
     /// via the LLM and keep only the original task + recent tail.
     /// Failures degrade gracefully (warn and continue uncompressed).
-    fn compress_if_needed(&mut self, events: &mut dyn FnMut(AgentEvent)) {
+    fn compress_if_needed(
+        &mut self,
+        events: &mut dyn FnMut(AgentEvent),
+        deadline: Option<Instant>,
+    ) {
         let threshold = self.limits.compress_threshold_chars;
         if self.compress_failed || threshold == 0 || total_chars(&self.messages) <= threshold {
             return;
+        }
+        // Compression is best-effort: never let the summary request eat the
+        // run's remaining budget — that would leave the main request with a
+        // zero/near-zero timeout and fail the whole run with no result file.
+        // Skip this turn if too little time is left.
+        if let Some(d) = deadline {
+            if d.saturating_duration_since(Instant::now()).as_secs() < 5 {
+                return;
+            }
         }
         let Some(cut) = find_safe_cut(&self.messages, self.limits.keep_recent_messages) else {
             return;
         };
 
-        let summary = match self.summarize_prefix(cut) {
+        let summary = match self.summarize_prefix(cut, deadline) {
             Ok(s) if !s.trim().is_empty() => s,
             Ok(_) => {
                 self.compress_failed = true;
@@ -332,7 +383,7 @@ impl Agent {
     }
 
     /// Ask the LLM to summarize messages[..cut] into a compact brief.
-    fn summarize_prefix(&self, cut: usize) -> Result<String> {
+    fn summarize_prefix(&self, cut: usize, deadline: Option<Instant>) -> Result<String> {
         let mut transcript = String::new();
         for m in &self.messages[..cut] {
             let role = match m.role {
@@ -366,6 +417,9 @@ impl Agent {
             tools: &[],
             model: &self.model,
             max_tokens: 2048,
+            // Cap the summary to the remaining run budget too, so it can't
+            // outlive the run on its own (the client default is generous).
+            per_request_timeout: deadline.map(|d| d.saturating_duration_since(Instant::now())),
         };
         let resp = self.provider.chat(&req, &mut |_| {})?;
         Ok(resp
@@ -494,5 +548,26 @@ mod tests {
         ];
         // "12345" (5) + "{\"a\":1}" (7)
         assert_eq!(total_chars(&msgs), 12);
+    }
+
+    #[test]
+    fn total_chars_counts_tool_result_image() {
+        // A load_image result carries its image inside ToolResult.image;
+        // that payload must count toward the compress threshold just like
+        // a top-level Block::Image, or image-heavy chats never compress.
+        let msgs = vec![Message::user(vec![
+            Block::Text("note".into()), // 4
+            Block::ToolResult {
+                tool_use_id: "x".into(),
+                content: "see image".into(), // 9
+                image: Some(Box::new(Block::Image {
+                    media_type: "image/png".into(),
+                    data: "A".repeat(1000), // 1000 / 100 = 10
+                })),
+                is_error: false,
+            },
+        ])];
+        // 4 + 9 + 10 = 23
+        assert_eq!(total_chars(&msgs), 23);
     }
 }

@@ -57,6 +57,13 @@ impl OpenAi {
             Role::User => {
                 let mut out = Vec::new();
                 let mut parts: Vec<Value> = Vec::new();
+                // OpenAI `tool` messages can't carry images. Collect any
+                // tool-result images and emit them as ONE trailing `user`
+                // message after every `tool` message, so the wire order stays
+                // `assistant(tool_calls) → tool* → user`. Inserting a user
+                // message between two tool messages makes strict servers reject
+                // the request when a non-last parallel call returned an image.
+                let mut trailing_images: Vec<Value> = Vec::new();
                 let flush_user = |parts: &mut Vec<Value>, out: &mut Vec<Value>| {
                     if !parts.is_empty() {
                         out.push(json!({"role": "user", "content": parts}));
@@ -88,15 +95,10 @@ impl OpenAi {
                                 "tool_call_id": tool_use_id,
                                 "content": note
                             }));
-                            // OpenAI tool messages can't carry images; follow with a user message.
                             if let Some(Block::Image { media_type, data }) = image.as_deref() {
-                                out.push(json!({
-                                    "role": "user",
-                                    "content": [
-                                        {"type": "text", "text": "[image returned by tool]"},
-                                        {"type": "image_url",
-                                         "image_url": {"url": format!("data:{media_type};base64,{data}")}}
-                                    ]
+                                trailing_images.push(json!({
+                                    "type": "image_url",
+                                    "image_url": {"url": format!("data:{media_type};base64,{data}")}
                                 }));
                             }
                         }
@@ -104,6 +106,12 @@ impl OpenAi {
                     }
                 }
                 flush_user(&mut parts, &mut out);
+                if !trailing_images.is_empty() {
+                    let mut content =
+                        vec![json!({"type": "text", "text": "[image(s) returned by tool]"})];
+                    content.append(&mut trailing_images);
+                    out.push(json!({"role": "user", "content": content}));
+                }
                 out
             }
         }
@@ -154,15 +162,22 @@ impl Provider for OpenAi {
             body["tools"] = Self::tools_json(req.tools);
         }
 
-        let resp = self.post(&body)?;
+        let resp = self.post(&body, req.per_request_timeout)?;
 
         // Newer OpenAI reasoning models (o1/o3/gpt-4.1…) reject max_tokens;
         // retry once with max_completion_tokens when the error names it.
         let resp = if resp.status() == reqwest::StatusCode::BAD_REQUEST {
             let text = resp.text().unwrap_or_default();
             if text.contains("max_tokens") {
-                body["max_completion_tokens"] = body["max_tokens"].take();
-                self.post(&body)
+                // remove() the old key: take() would leave a
+                // "max_tokens": null entry that some strict servers reject
+                // again on the retry.
+                if let Some(obj) = body.as_object_mut() {
+                    if let Some(mt) = obj.remove("max_tokens") {
+                        obj.insert("max_completion_tokens".into(), mt);
+                    }
+                }
+                self.post(&body, req.per_request_timeout)
                     .context("retry with max_completion_tokens failed")?
             } else {
                 bail!("OpenAI-compatible API error 400: {text}");
@@ -182,12 +197,20 @@ impl Provider for OpenAi {
 }
 
 impl OpenAi {
-    fn post(&self, body: &Value) -> Result<reqwest::blocking::Response> {
-        self.client
+    fn post(
+        &self,
+        body: &Value,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<reqwest::blocking::Response> {
+        let mut rb = self
+            .client
             .post(format!("{}/chat/completions", self.base_url))
             .bearer_auth(&self.api_key)
-            .header("content-type", "application/json")
-            .json(body)
+            .header("content-type", "application/json");
+        if let Some(t) = timeout {
+            rb = rb.timeout(t);
+        }
+        rb.json(body)
             .send()
             .context("request to OpenAI-compatible API failed")
     }
@@ -211,6 +234,16 @@ impl OpenAi {
                 Ok(v) => v,
                 Err(_) => continue,
             };
+            // Streaming errors arrive as {"error": {...}} with no `choices`.
+            // Without this they'd be skipped (choice is null → continue) and a
+            // content_filter / overloaded error would masquerade as an empty
+            // success — possibly with half-received tool args fed to _raw.
+            if let Some(err) = ev.get("error") {
+                bail!(
+                    "OpenAI stream error: {}",
+                    err["message"].as_str().unwrap_or("(no message)")
+                );
+            }
             let choice = &ev["choices"][0];
             if choice.is_null() {
                 continue;
@@ -415,5 +448,59 @@ mod tests {
         let resp = OpenAi::parse_stream(raw.as_bytes(), &mut |_| {}).unwrap();
         assert_eq!(resp.stop_reason, "max_tokens");
         assert!(matches!(&resp.blocks[0], Block::Text(t) if t == "partial"));
+    }
+
+    #[test]
+    fn stream_error_event_bails() {
+        // A streaming error arrives with no `choices`; without the explicit
+        // check it would be skipped and surface as an empty success.
+        let raw = "data: {\"error\":{\"message\":\"content filter\",\"type\":\"content_filter\"}}\n\ndata: [DONE]\n\n";
+        match OpenAi::parse_stream(raw.as_bytes(), &mut |_| {}) {
+            Err(e) => assert!(format!("{e:#}").contains("content filter")),
+            Ok(_) => panic!("expected stream error, got success"),
+        }
+    }
+
+    #[test]
+    fn parallel_image_tool_results_keep_tool_order() {
+        // Two parallel tool results, BOTH carrying images, must serialize as
+        // tool, tool, user(images) — inserting a user message between two tool
+        // messages makes strict servers reject the request.
+        let m = Message::user(vec![
+            Block::ToolResult {
+                tool_use_id: "c1".into(),
+                content: "r1".into(),
+                image: Some(Box::new(Block::Image {
+                    media_type: "image/png".into(),
+                    data: "A1".into(),
+                })),
+                is_error: false,
+            },
+            Block::ToolResult {
+                tool_use_id: "c2".into(),
+                content: "r2".into(),
+                image: Some(Box::new(Block::Image {
+                    media_type: "image/png".into(),
+                    data: "A2".into(),
+                })),
+                is_error: false,
+            },
+        ]);
+        let msgs = OpenAi::message_jsons(&m);
+        let roles: Vec<&str> = msgs
+            .iter()
+            .map(|v| v["role"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(roles, vec!["tool", "tool", "user"]);
+        // The trailing user message carries both images.
+        let img_count = msgs[2]["content"]
+            .as_array()
+            .map(|c| {
+                c.iter()
+                    .filter(|p| p["type"] == "image_url")
+                    .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(img_count, 2);
     }
 }

@@ -87,6 +87,11 @@ pub struct ChatRequest<'a> {
     pub tools: &'a [ToolDef],
     pub model: &'a str,
     pub max_tokens: u32,
+    /// Per-request timeout that overrides the client default, used to keep
+    /// a single chat inside the run's remaining budget (None = use the
+    /// client's configured timeout). The run budget is otherwise only
+    /// checked at turn boundaries, so a stuck request could outlive it.
+    pub per_request_timeout: Option<std::time::Duration>,
 }
 
 pub trait Provider: Send + Sync {
