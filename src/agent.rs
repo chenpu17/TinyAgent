@@ -3,6 +3,8 @@ use crate::provider::{Block, ChatEvent, ChatRequest, Message, Provider, Role, To
 use crate::tools::{Tool, ToolCtx};
 use anyhow::Result;
 use serde_json::Value;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Events emitted during a run; frontends (headless printer / TUI) consume them.
@@ -43,6 +45,11 @@ pub struct Agent {
     limits: Limits,
     ctx: ToolCtx,
     session_path: Option<std::path::PathBuf>,
+    /// Set by the frontend (e.g. TUI Esc) to stop at the next turn boundary.
+    cancel: Option<Arc<AtomicBool>>,
+    /// One compression failure disables further attempts for this run,
+    /// so a persistent error doesn't retry (and warn) every single turn.
+    compress_failed: bool,
 }
 
 impl Agent {
@@ -65,7 +72,20 @@ impl Agent {
             limits: cfg.limits.clone(),
             ctx,
             session_path: None,
+            cancel: None,
+            compress_failed: false,
         }
+    }
+
+    /// Attach a cancellation flag; checked at every turn boundary.
+    pub fn set_cancel(&mut self, flag: Arc<AtomicBool>) {
+        self.cancel = Some(flag);
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|c| c.load(Ordering::Relaxed))
     }
 
     /// Enable per-turn session persistence to the given file.
@@ -97,6 +117,10 @@ impl Agent {
         let mut stop_reason: String;
 
         loop {
+            if self.cancelled() {
+                stop_reason = "cancelled".into();
+                break;
+            }
             if turns >= self.limits.max_turns {
                 stop_reason = "max_turns_reached".into();
                 break;
@@ -125,13 +149,19 @@ impl Agent {
                 .blocks
                 .iter()
                 .any(|b| matches!(b, Block::ToolUse { .. }));
+            // The result summary keeps only the last turn's text — tool-loop
+            // chatter from earlier turns is transcript, not conclusion.
+            let mut turn_text = String::new();
             for b in &resp.blocks {
                 if let Block::Text(t) = b {
-                    if !final_text.is_empty() {
-                        final_text.push('\n');
+                    if !turn_text.is_empty() {
+                        turn_text.push('\n');
                     }
-                    final_text.push_str(t);
+                    turn_text.push_str(t);
                 }
+            }
+            if !turn_text.is_empty() {
+                final_text = turn_text;
             }
             self.messages.push(Message::assistant(resp.blocks.clone()));
             self.save_session();
@@ -193,8 +223,8 @@ impl Agent {
     }
 }
 
-fn preview(s: &str) -> String {
-    const MAX: usize = 300;
+pub(crate) fn preview(s: &str) -> String {
+    const MAX: usize = 200;
     let one_line: String = s.chars().take(MAX).collect();
     if s.chars().count() > MAX {
         format!("{one_line}…")
@@ -228,6 +258,23 @@ fn total_chars(messages: &[Message]) -> usize {
         .sum()
 }
 
+/// Build the compressed history: original task (with the summary folded in
+/// as one extra text block) + the untouched tail. Folding into message[0]
+/// keeps proper user → assistant alternation when the tail starts with an
+/// assistant message. Previous summary blocks are replaced, not stacked —
+/// the new summary already absorbed them via the transcript.
+fn fold_summary(messages: &[Message], cut: usize, summary: &str) -> Vec<Message> {
+    let mut compressed = Vec::with_capacity(messages.len() - (cut - 1) + 1);
+    let mut head = messages[0].clone();
+    head.content
+        .retain(|b| !matches!(b, Block::Text(t) if t.starts_with(SUMMARY_MARKER)));
+    head.content
+        .push(Block::Text(format!("{SUMMARY_MARKER}\n{summary}")));
+    compressed.push(head);
+    compressed.extend_from_slice(&messages[cut..]);
+    compressed
+}
+
 /// Find a safe tail-start index. An assistant message is always a safe
 /// boundary: its tool_use blocks (if any) are answered by the tool_result
 /// that immediately follows it inside the kept tail. Cutting before a
@@ -255,7 +302,7 @@ impl Agent {
     /// Failures degrade gracefully (warn and continue uncompressed).
     fn compress_if_needed(&mut self, events: &mut dyn FnMut(AgentEvent)) {
         let threshold = self.limits.compress_threshold_chars;
-        if threshold == 0 || total_chars(&self.messages) <= threshold {
+        if self.compress_failed || threshold == 0 || total_chars(&self.messages) <= threshold {
             return;
         }
         let Some(cut) = find_safe_cut(&self.messages, self.limits.keep_recent_messages) else {
@@ -264,28 +311,19 @@ impl Agent {
 
         let summary = match self.summarize_prefix(cut) {
             Ok(s) if !s.trim().is_empty() => s,
-            Ok(_) => return,
+            Ok(_) => {
+                self.compress_failed = true;
+                return;
+            }
             Err(e) => {
-                eprintln!("[warn] context compression failed: {e:#}");
+                self.compress_failed = true;
+                eprintln!("[warn] context compression failed (disabled for this run): {e:#}");
                 return;
             }
         };
 
         let dropped = cut - 1;
-        let mut compressed = Vec::with_capacity(self.messages.len() - dropped + 1);
-        // Fold the summary into the original task message, so the tail
-        // (which may start with an assistant message) keeps proper
-        // user → assistant alternation.
-        let mut head = self.messages[0].clone();
-        // Drop previous summary blocks: the new summary already absorbed
-        // them via the transcript, so the head stays task + one summary.
-        head.content
-            .retain(|b| !matches!(b, Block::Text(t) if t.starts_with(SUMMARY_MARKER)));
-        head.content
-            .push(Block::Text(format!("{SUMMARY_MARKER}\n{summary}")));
-        compressed.push(head);
-        compressed.extend_from_slice(&self.messages[cut..]);
-        self.messages = compressed;
+        self.messages = fold_summary(&self.messages, cut, &summary);
         self.save_session();
         events(AgentEvent::Compressed {
             dropped,
@@ -414,6 +452,34 @@ mod tests {
             Message::assistant(vec![Block::Text("r4".into())]),
         ];
         assert_eq!(find_safe_cut(&msgs, 3), None);
+    }
+
+    #[test]
+    fn fold_summary_replaces_old_summary_keeps_tail() {
+        // Simulate a second compression: head already carries a summary
+        // block; folding a new one must replace it, not stack.
+        let mut msgs = vec![user_text("task"), user_text("old turn")];
+        msgs = fold_summary(&msgs, 2, "summary-one");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content.len(), 2); // task + summary
+
+        msgs.extend(tool_turn("t9"));
+        let cut = 1; // drop everything between head and the tail
+        let out = fold_summary(&msgs, cut, "summary-two");
+        // head + 2 tail messages
+        assert_eq!(out.len(), 3);
+        // head: task + exactly one summary block, and it's the new one
+        let summaries: Vec<_> = out[0]
+            .content
+            .iter()
+            .filter(|b| matches!(b, Block::Text(t) if t.starts_with(SUMMARY_MARKER)))
+            .collect();
+        assert_eq!(summaries.len(), 1);
+        assert!(matches!(summaries[0], Block::Text(t) if t.contains("summary-two")));
+        assert!(matches!(&out[0].content[0], Block::Text(t) if t == "task"));
+        // tail untouched
+        assert_eq!(out[1].role, Role::Assistant);
+        assert_eq!(out[2].role, Role::User);
     }
 
     #[test]

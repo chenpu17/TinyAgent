@@ -118,6 +118,16 @@ fn notify_frame(method: &str, params: Value) -> Value {
 /// Pending-response table shared by the async transports (stdio / legacy SSE).
 type Pending = std::sync::Arc<std::sync::Mutex<HashMap<u64, mpsc::Sender<Value>>>>;
 
+/// HTTP client with explicit timeouts for request/response calls.
+/// (Not used for the long-lived SSE GET — that one only gets a connect timeout.)
+fn http_client(total: Duration) -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(total)
+        .build()
+        .unwrap_or_else(|_| reqwest::blocking::Client::new())
+}
+
 fn pending_new() -> Pending {
     Default::default()
 }
@@ -232,7 +242,7 @@ struct HttpTransport {
 impl HttpTransport {
     fn new(url: &str, cfg: &McpServerConfig) -> Result<Self> {
         Ok(Self {
-            client: reqwest::blocking::Client::new(),
+            client: http_client(CALL_TIMEOUT),
             url: url.to_string(),
             headers: cfg.headers.clone(),
             session_id: None,
@@ -306,12 +316,11 @@ impl Transport for HttpTransport {
 /// Auto-detect: a Streamable HTTP server answers POST /initialize with 2xx;
 /// legacy SSE servers typically 404/405 on POST to the SSE endpoint.
 fn probe_http(url: &str, cfg: &McpServerConfig) -> Result<bool> {
-    let client = reqwest::blocking::Client::new();
+    let client = http_client(CONNECT_TIMEOUT);
     let mut req = client
         .post(url)
         .header("content-type", "application/json")
-        .header("accept", "application/json, text/event-stream")
-        .timeout(CONNECT_TIMEOUT);
+        .header("accept", "application/json, text/event-stream");
     for (k, v) in &cfg.headers {
         req = req.header(k, v);
     }
@@ -337,7 +346,11 @@ struct SseTransport {
 
 impl SseTransport {
     fn connect(url: &str, cfg: &McpServerConfig) -> Result<Self> {
-        let client = reqwest::blocking::Client::new();
+        // The GET is a long-lived stream: connect timeout only, no total timeout.
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .build()
+            .unwrap_or_else(|_| reqwest::blocking::Client::new());
         let mut req = client
             .get(url)
             .header("accept", "text/event-stream");
@@ -380,7 +393,7 @@ impl SseTransport {
             .recv_timeout(CONNECT_TIMEOUT)
             .map_err(|_| anyhow!("MCP SSE: no 'endpoint' event from {url}"))?;
         Ok(Self {
-            client,
+            client: http_client(CALL_TIMEOUT),
             post_url,
             headers: cfg.headers.clone(),
             pending,

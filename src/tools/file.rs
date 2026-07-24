@@ -26,27 +26,38 @@ impl Tool for ReadFile {
 
     fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         let path = input["path"].as_str().context("read_file: missing \"path\"")?;
-        let full = resolve(ctx, path);
-        let raw = std::fs::read_to_string(&full)
+        let full = resolve(ctx, path)?;
+        // Stream line by line and stop once the output cap is hit, so a
+        // huge file never gets pulled into memory whole.
+        let f = std::fs::File::open(&full)
             .with_context(|| format!("cannot read {}", full.display()))?;
+        let reader = std::io::BufReader::new(f);
 
         let offset = input["offset"].as_u64().unwrap_or(1).max(1) as usize;
         let limit = input["limit"].as_u64().map(|n| n as usize);
 
+        use std::io::BufRead;
         let mut out = String::new();
-        for (i, line) in raw.lines().enumerate().skip(offset - 1) {
+        for (i, line) in reader.lines().enumerate() {
+            if i < offset - 1 {
+                continue;
+            }
             if let Some(l) = limit {
                 if i - (offset - 1) >= l {
                     out.push_str("... [line limit reached]\n");
                     break;
                 }
             }
+            let line = line.with_context(|| format!("cannot read {}", full.display()))?;
             out.push_str(&format!("{:>6}\t{}\n", i + 1, line));
+            if out.len() >= ctx.max_output_chars {
+                truncate(&mut out, ctx.max_output_chars);
+                break;
+            }
         }
         if out.is_empty() {
             out.push_str("[empty file]");
         }
-        truncate(&mut out, ctx.max_output_chars);
         Ok(ToolOutput::text(out))
     }
 }
@@ -76,16 +87,17 @@ impl Tool for WriteFile {
         let content = input["content"]
             .as_str()
             .context("write_file: missing \"content\"")?;
-        let full = resolve(ctx, path);
+        let full = resolve(ctx, path)?;
         if let Some(parent) = full.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("cannot create {}", parent.display()))?;
         }
         std::fs::write(&full, content)
             .with_context(|| format!("cannot write {}", full.display()))?;
+        // Echo the path as given (usually relative) — less confusing than
+        // the canonicalized absolute form.
         Ok(ToolOutput::text(format!(
-            "wrote {} ({} bytes)",
-            full.display(),
+            "wrote {path} ({} bytes)",
             content.len()
         )))
     }
@@ -109,7 +121,7 @@ impl Tool for ListDir {
 
     fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         let path = input["path"].as_str().unwrap_or(".");
-        let full = resolve(ctx, path);
+        let full = resolve(ctx, path)?;
         let mut entries: Vec<String> = Vec::new();
         for e in std::fs::read_dir(&full)
             .with_context(|| format!("cannot list {}", full.display()))?

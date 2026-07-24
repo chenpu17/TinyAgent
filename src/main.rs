@@ -132,7 +132,8 @@ fn main() -> Result<()> {
         }
     }
 
-    let mut agent = build_agent(&cfg, initial)?;
+    let client = provider::new_client(cfg.limits.timeout_secs);
+    let mut agent = build_agent(&cfg, initial, &client)?;
     agent.enable_session(cli.session.clone());
 
     if cli.tui {
@@ -153,13 +154,17 @@ fn main() -> Result<()> {
 }
 
 /// Wire together provider + tools (built-in whitelist + MCP servers) + agent.
-pub(crate) fn build_agent(cfg: &Config, initial: Vec<Message>) -> Result<Agent> {
+pub(crate) fn build_agent(
+    cfg: &Config,
+    initial: Vec<Message>,
+    client: &reqwest::blocking::Client,
+) -> Result<Agent> {
     let workdir = cfg
         .workdir
         .clone()
         .unwrap_or(std::env::current_dir().context("cannot determine current directory")?);
     let api_key = cfg.api_key()?;
-    let provider = provider::build(cfg, &api_key);
+    let provider = provider::build(cfg, &api_key, client.clone());
 
     let mut tool_list = tools::build(&cfg.tools)?;
     if !cfg.mcp_servers.is_empty() {
@@ -169,6 +174,7 @@ pub(crate) fn build_agent(cfg: &Config, initial: Vec<Message>) -> Result<Agent> 
     let ctx = ToolCtx {
         workdir,
         max_output_chars: cfg.limits.max_output_chars,
+        restrict_to_workdir: cfg.restrict_to_workdir,
     };
     Ok(Agent::new(cfg, provider, tool_list, initial, ctx))
 }

@@ -112,7 +112,17 @@ impl Provider for Anthropic {
             bail!("Anthropic API error {status}: {text}");
         }
 
-        let mut sse = SseReader::new(resp);
+        Self::parse_stream(resp, on_event)
+    }
+}
+
+impl Anthropic {
+    /// Assemble a full response from an SSE byte stream (split out for testing).
+    fn parse_stream<R: std::io::Read>(
+        reader: R,
+        on_event: &mut dyn FnMut(ChatEvent),
+    ) -> Result<ChatResponse> {
+        let mut sse = SseReader::new(reader);
         let mut blocks: Vec<Block> = Vec::new();
         let mut pending: Option<Pending> = None;
         let mut stop_reason = String::from("end_turn");
@@ -181,5 +191,59 @@ impl Provider for Anthropic {
         }
 
         Ok(ChatResponse { blocks, stop_reason })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(raw: &[u8]) -> ChatResponse {
+        Anthropic::parse_stream(raw, &mut |_| {}).unwrap()
+    }
+
+    #[test]
+    fn stream_text_and_stop_reason() {
+        let raw = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" world\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+        );
+        let resp = parse(raw.as_bytes());
+        assert_eq!(resp.stop_reason, "end_turn");
+        assert_eq!(resp.blocks.len(), 1);
+        assert!(matches!(&resp.blocks[0], Block::Text(t) if t == "Hello world"));
+    }
+
+    #[test]
+    fn stream_tool_use_split_json_deltas() {
+        // input_json_delta arrives in arbitrary chunks — must reassemble.
+        let raw = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"shell\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"comma\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"nd\\\":\\\"ls -la\\\"}\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n",
+        );
+        let resp = parse(raw.as_bytes());
+        assert_eq!(resp.stop_reason, "tool_use");
+        assert_eq!(resp.blocks.len(), 1);
+        match &resp.blocks[0] {
+            Block::ToolUse { id, name, input } => {
+                assert_eq!(id, "toolu_1");
+                assert_eq!(name, "shell");
+                assert_eq!(input["command"], "ls -la");
+            }
+            other => panic!("expected tool_use, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_error_event_bails() {
+        let raw = "data: {\"type\":\"error\",\"error\":{\"message\":\"overloaded\"}}\n\n";
+        assert!(Anthropic::parse_stream(raw.as_bytes(), &mut |_| {}).is_err());
     }
 }

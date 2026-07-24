@@ -2,8 +2,9 @@ use super::{truncate, Tool, ToolCtx, ToolOutput};
 use crate::provider::ToolDef;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
+use std::io::Read;
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Max wall-clock time for a single shell command.
 const CMD_TIMEOUT: Duration = Duration::from_secs(120);
@@ -32,7 +33,7 @@ impl Tool for Shell {
             .as_str()
             .context("shell: missing \"command\" string")?;
 
-        let child = if cfg!(windows) {
+        let mut child = if cfg!(windows) {
             Command::new("cmd")
                 .args(["/C", cmd])
                 .current_dir(&ctx.workdir)
@@ -49,23 +50,53 @@ impl Tool for Shell {
         }
         .with_context(|| format!("failed to spawn shell for: {cmd}"))?;
 
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || tx.send(child.wait_with_output()));
+        // Drain stdout/stderr on reader threads, capped in memory: beyond the
+        // cap the output is discarded but still drained, so the child never
+        // blocks on a full pipe.
+        let cap = ctx.max_output_chars + 1024;
+        let mut out_pipe = child.stdout.take().expect("stdout piped");
+        let mut err_pipe = child.stderr.take().expect("stderr piped");
+        let out_thread = std::thread::spawn(move || read_capped(&mut out_pipe, cap));
+        let err_thread = std::thread::spawn(move || read_capped(&mut err_pipe, cap));
 
-        let output = match rx.recv_timeout(CMD_TIMEOUT) {
-            Ok(res) => res.context("shell: failed to read command output")?,
-            Err(_) => {
-                return Ok(ToolOutput::error(format!(
-                    "command timed out after {}s: {cmd}",
-                    CMD_TIMEOUT.as_secs()
-                )))
+        // Poll the child so a timeout can kill it (wait_with_output would
+        // consume the handle and leak the process on timeout).
+        let deadline = Instant::now() + CMD_TIMEOUT;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(s)) => break Some(s),
+                Ok(None) if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(e).context("shell: failed to wait on command");
+                }
             }
+        };
+
+        let stdout = out_thread.join().unwrap_or_default();
+        let stderr = err_thread.join().unwrap_or_default();
+
+        let Some(status) = status else {
+            let mut out = format!("$ {cmd}\n");
+            out.push_str(&String::from_utf8_lossy(&stdout));
+            truncate(&mut out, ctx.max_output_chars);
+            out.push_str(&format!(
+                "\n[command timed out after {}s and was killed]",
+                CMD_TIMEOUT.as_secs()
+            ));
+            return Ok(ToolOutput::error(out));
         };
 
         let mut out = String::new();
         out.push_str(&format!("$ {cmd}\n"));
-        out.push_str(&String::from_utf8_lossy(&output.stdout));
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        out.push_str(&String::from_utf8_lossy(&stdout));
+        let stderr = String::from_utf8_lossy(&stderr);
         if !stderr.trim().is_empty() {
             if !out.ends_with('\n') {
                 out.push('\n');
@@ -73,7 +104,7 @@ impl Tool for Shell {
             out.push_str("[stderr]\n");
             out.push_str(&stderr);
         }
-        let code = output.status.code().unwrap_or(-1);
+        let code = status.code().unwrap_or(-1);
         out.push_str(&format!("\n[exit code: {code}]"));
         truncate(&mut out, ctx.max_output_chars);
 
@@ -83,4 +114,23 @@ impl Tool for Shell {
             Ok(ToolOutput::error(out))
         }
     }
+}
+
+/// Read until EOF, keeping at most `cap` bytes; the rest is drained and
+/// discarded so the writer never blocks and memory stays bounded.
+fn read_capped<R: Read>(r: &mut R, cap: usize) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match r.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if buf.len() < cap {
+                    let room = cap - buf.len();
+                    buf.extend_from_slice(&chunk[..n.min(room)]);
+                }
+            }
+        }
+    }
+    buf
 }

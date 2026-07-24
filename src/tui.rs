@@ -35,10 +35,14 @@ pub fn run(agent: Agent, cfg: &Config) -> Result<()> {
     let (in_tx, in_rx) = mpsc::channel::<Option<String>>();
     // Worker → UI: agent events.
     let (out_tx, out_rx) = mpsc::channel::<UiMsg>();
+    // Cancellation: Esc sets this; the agent checks it at each turn boundary.
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // The worker thread owns the agent and drives run() per user input.
+    let worker_cancel = cancel.clone();
     let worker = std::thread::spawn(move || {
         let mut agent = agent;
+        agent.set_cancel(worker_cancel);
         while let Ok(Some(text)) = in_rx.recv() {
             agent.push_user(vec![Block::Text(text)]);
             let res = agent.run(&mut |ev| {
@@ -57,12 +61,13 @@ pub fn run(agent: Agent, cfg: &Config) -> Result<()> {
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
     let mut term = Terminal::new(ratatui::backend::CrosstermBackend::new(stdout()))?;
-    let result = ui_loop(&mut term, cfg, &in_tx, &out_rx);
+    let result = ui_loop(&mut term, cfg, &in_tx, &out_rx, &cancel);
 
     disable_raw_mode()?;
     stdout().execute(LeaveAlternateScreen)?;
+    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
     drop(in_tx); // signal worker to exit
-    let _ = worker.join();
+    drop(worker); // detach: never block exit on a stuck run
     result
 }
 
@@ -71,6 +76,7 @@ fn ui_loop(
     cfg: &Config,
     in_tx: &mpsc::Sender<Option<String>>,
     out_rx: &mpsc::Receiver<UiMsg>,
+    cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<()> {
     let mut rows: Vec<Row> = Vec::new();
     let mut input = String::new();
@@ -213,6 +219,7 @@ fn ui_loop(
                 }
                 match (key.code, key.modifiers) {
                     (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                         let _ = in_tx.send(None);
                         return Ok(());
                     }
@@ -253,10 +260,5 @@ fn push_wrapped(lines: &mut Vec<Line>, label: &str, text: &str, color: Color) {
 }
 
 fn compact(v: &serde_json::Value) -> String {
-    let s = v.to_string();
-    if s.chars().count() > 160 {
-        format!("{}…", s.chars().take(160).collect::<String>())
-    } else {
-        s
-    }
+    crate::agent::preview(&v.to_string())
 }

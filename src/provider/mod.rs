@@ -95,13 +95,24 @@ pub trait Provider: Send + Sync {
     fn chat(&self, req: &ChatRequest, on_event: &mut dyn FnMut(ChatEvent)) -> Result<ChatResponse>;
 }
 
-pub fn build(cfg: &Config, api_key: &str) -> Box<dyn Provider> {
+pub fn build(cfg: &Config, api_key: &str, client: reqwest::blocking::Client) -> Box<dyn Provider> {
     let base = cfg.base_url();
-    let client = reqwest::blocking::Client::new();
     match cfg.provider {
         ProviderKind::Anthropic => Box::new(Anthropic::new(client, base, api_key)),
         ProviderKind::Openai => Box::new(OpenAi::new(client, base, api_key)),
     }
+}
+
+/// HTTP client with explicit timeouts. A stuck or trickling connection
+/// must never outlive the whole run budget — an agent that hangs forever
+/// would stall any CI/eval pipeline it runs in. Clones share one
+/// connection pool (cheap, Arc inside).
+pub fn new_client(run_timeout_secs: u64) -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(run_timeout_secs.max(60)))
+        .build()
+        .unwrap_or_else(|_| reqwest::blocking::Client::new())
 }
 
 /// Iterate over the `data:` payloads of an SSE stream.

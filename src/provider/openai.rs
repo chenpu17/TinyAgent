@@ -154,14 +154,22 @@ impl Provider for OpenAi {
             body["tools"] = Self::tools_json(req.tools);
         }
 
-        let resp = self
-            .client
-            .post(format!("{}/chat/completions", self.base_url))
-            .bearer_auth(&self.api_key)
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .context("request to OpenAI-compatible API failed")?;
+        let resp = self.post(&body)?;
+
+        // Newer OpenAI reasoning models (o1/o3/gpt-4.1…) reject max_tokens;
+        // retry once with max_completion_tokens when the error names it.
+        let resp = if resp.status() == reqwest::StatusCode::BAD_REQUEST {
+            let text = resp.text().unwrap_or_default();
+            if text.contains("max_tokens") {
+                body["max_completion_tokens"] = body["max_tokens"].take();
+                self.post(&body)
+                    .context("retry with max_completion_tokens failed")?
+            } else {
+                bail!("OpenAI-compatible API error 400: {text}");
+            }
+        } else {
+            resp
+        };
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -169,9 +177,30 @@ impl Provider for OpenAi {
             bail!("OpenAI-compatible API error {status}: {text}");
         }
 
-        let mut sse = SseReader::new(resp);
+        Self::parse_stream(resp, on_event)
+    }
+}
+
+impl OpenAi {
+    fn post(&self, body: &Value) -> Result<reqwest::blocking::Response> {
+        self.client
+            .post(format!("{}/chat/completions", self.base_url))
+            .bearer_auth(&self.api_key)
+            .header("content-type", "application/json")
+            .json(body)
+            .send()
+            .context("request to OpenAI-compatible API failed")
+    }
+
+    /// Assemble a full response from an SSE byte stream (split out for testing).
+    fn parse_stream<R: std::io::Read>(
+        reader: R,
+        on_event: &mut dyn FnMut(ChatEvent),
+    ) -> Result<ChatResponse> {
+        let mut sse = SseReader::new(reader);
         let mut text = String::new();
         let mut calls: std::collections::BTreeMap<u64, PendingCall> = Default::default();
+        let mut cur_idx: u64 = 0;
         let mut finish_reason = String::from("stop");
 
         while let Some(data) = sse.next_data() {
@@ -196,7 +225,25 @@ impl Provider for OpenAi {
             }
             if let Some(tc) = delta["tool_calls"].as_array() {
                 for call in tc {
-                    let idx = call["index"].as_u64().unwrap_or(0);
+                    // Servers that omit `index`: a chunk carrying an unseen
+                    // id starts a new call, id-less chunks continue the last.
+                    let idx = match call["index"].as_u64() {
+                        Some(i) => {
+                            cur_idx = i;
+                            i
+                        }
+                        None => {
+                            if let Some(id) = call["id"].as_str() {
+                                let seen = calls
+                                    .get(&cur_idx)
+                                    .is_some_and(|e| !e.id.is_empty() && e.id != id);
+                                if seen {
+                                    cur_idx += 1;
+                                }
+                            }
+                            cur_idx
+                        }
+                    };
                     let entry = calls.entry(idx).or_default();
                     if let Some(id) = call["id"].as_str() {
                         entry.id = id.to_string();
@@ -295,5 +342,78 @@ mod tests {
             msgs[0]["tool_calls"][0]["function"]["arguments"],
             "{\"command\":\"ls\"}"
         );
+    }
+
+    #[test]
+    fn stream_parallel_tool_calls_split_args() {
+        // Two tool calls, arguments delivered in chunks, indexed properly.
+        let raw = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"shell\",\"arguments\":\"\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"comma\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"c2\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"nd\\\":\\\"ls\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let resp = OpenAi::parse_stream(raw.as_bytes(), &mut |_| {}).unwrap();
+        assert_eq!(resp.stop_reason, "tool_use");
+        assert_eq!(resp.blocks.len(), 2);
+        match &resp.blocks[0] {
+            Block::ToolUse { id, name, input } => {
+                assert_eq!(id, "c1");
+                assert_eq!(name, "shell");
+                assert_eq!(input["command"], "ls");
+            }
+            other => panic!("expected tool_use, got {other:?}"),
+        }
+        match &resp.blocks[1] {
+            Block::ToolUse { id, name, input } => {
+                assert_eq!(id, "c2");
+                assert_eq!(name, "read_file");
+                assert_eq!(input["path"], "a.txt");
+            }
+            other => panic!("expected tool_use, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_tool_calls_without_index() {
+        // Server omits `index`: new id starts a new call, id-less chunks
+        // continue the previous one. Arguments must not cross-contaminate.
+        let raw = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"id\":\"c1\",\"function\":{\"name\":\"shell\",\"arguments\":\"{\\\"a\\\":1}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"id\":\"c2\",\"function\":{\"name\":\"shell\",\"arguments\":\"{\\\"b\\\"\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\":2}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let resp = OpenAi::parse_stream(raw.as_bytes(), &mut |_| {}).unwrap();
+        assert_eq!(resp.blocks.len(), 2);
+        match &resp.blocks[0] {
+            Block::ToolUse { id, input, .. } => {
+                assert_eq!(id, "c1");
+                assert_eq!(input["a"], 1);
+            }
+            other => panic!("expected tool_use, got {other:?}"),
+        }
+        match &resp.blocks[1] {
+            Block::ToolUse { id, input, .. } => {
+                assert_eq!(id, "c2");
+                assert_eq!(input["b"], 2);
+            }
+            other => panic!("expected tool_use, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_text_and_length_reason() {
+        let raw = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"partial\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"length\",\"delta\":{}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let resp = OpenAi::parse_stream(raw.as_bytes(), &mut |_| {}).unwrap();
+        assert_eq!(resp.stop_reason, "max_tokens");
+        assert!(matches!(&resp.blocks[0], Block::Text(t) if t == "partial"));
     }
 }

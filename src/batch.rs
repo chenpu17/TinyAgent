@@ -52,6 +52,14 @@ pub fn run(base: &Config, dir: &Path, jobs: usize, report_path: &Path) -> Result
         .join("results");
     std::fs::create_dir_all(&results_dir)?;
 
+    // One HTTP client (connection pool) shared by all tasks. The total
+    // timeout must cover the largest per-task override.
+    let max_timeout = tasks
+        .iter()
+        .filter_map(|(_, p)| p.limits.as_ref()?.timeout_secs)
+        .fold(base.limits.timeout_secs, |a, b| a.max(b));
+    let client = crate::provider::new_client(max_timeout);
+
     eprintln!(
         "batch: {} tasks, {} workers, results → {}",
         tasks.len(),
@@ -71,7 +79,7 @@ pub fn run(base: &Config, dir: &Path, jobs: usize, report_path: &Path) -> Result
                     Ok(t) => t,
                     Err(_) => return, // channel drained
                 };
-                let report = run_one(base, &name, partial, &results_dir);
+                let report = run_one(base, &name, partial, &results_dir, &client);
                 eprintln!(
                     "[{}] {} ({} turns, {:.1}s{})",
                     report.name,
@@ -111,6 +119,7 @@ fn run_one(
     name: &str,
     partial: PartialConfig,
     results_dir: &Path,
+    client: &reqwest::blocking::Client,
 ) -> TaskReport {
     let start = std::time::Instant::now();
     let fail = |msg: String| TaskReport {
@@ -135,7 +144,7 @@ fn run_one(
         let initial = vec![crate::provider::Message::user(vec![
             crate::provider::Block::Text(task),
         ])];
-        let mut agent = crate::build_agent(&cfg, initial)?;
+        let mut agent = crate::build_agent(&cfg, initial, client)?;
         let o = agent.run(&mut |_| {})?; // quiet: no per-event printing
         Ok((o,))
     })();

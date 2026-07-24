@@ -79,10 +79,5 @@ pub fn write_result(path: &Path, o: &RunOutcome) -> Result<()> {
 }
 
 fn compact(v: &serde_json::Value) -> String {
-    let s = v.to_string();
-    if s.chars().count() > 200 {
-        format!("{}…", s.chars().take(200).collect::<String>())
-    } else {
-        s
-    }
+    crate::agent::preview(&v.to_string())
 }

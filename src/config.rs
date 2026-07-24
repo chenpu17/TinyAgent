@@ -144,6 +144,10 @@ pub struct Config {
     /// Whitelist of enabled built-in tool names.
     #[serde(default = "default_tools")]
     pub tools: Vec<String>,
+    /// When true, file tools reject paths outside `workdir`. Recommended
+    /// for batch/CI runs with untrusted task files.
+    #[serde(default)]
+    pub restrict_to_workdir: bool,
     #[serde(default)]
     pub limits: Limits,
     /// External MCP tool servers (stdio transport).
@@ -218,6 +222,9 @@ impl Config {
         if let Some(v) = p.tools {
             self.tools = v;
         }
+        if let Some(v) = p.restrict_to_workdir {
+            self.restrict_to_workdir = v;
+        }
         if let Some(l) = p.limits {
             if let Some(v) = l.max_turns {
                 self.limits.max_turns = v;
@@ -254,6 +261,7 @@ pub struct PartialConfig {
     pub task: Option<String>,
     pub workdir: Option<PathBuf>,
     pub tools: Option<Vec<String>>,
+    pub restrict_to_workdir: Option<bool>,
     pub limits: Option<PartialLimits>,
     pub mcp_servers: Option<Vec<McpServerConfig>>,
 }
