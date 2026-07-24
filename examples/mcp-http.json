@@ -1,0 +1,17 @@
+{
+  "provider": "anthropic",
+  "api_key_env": "ANTHROPIC_API_KEY",
+  "model": "claude-haiku-4-5-20251001",
+  "system_prompt": "You are a concise assistant. Use the mcp_demo_echo tool when asked to echo something.",
+  "task": "Use the echo tool to echo the text 'hello http mcp', then report what came back.",
+  "tools": [],
+  "mcp_servers": [
+    {
+      "name": "demo",
+      "url": "http://127.0.0.1:8792/mcp",
+      "transport": "auto",
+      "headers": {}
+    }
+  ],
+  "limits": { "max_turns": 10, "timeout_secs": 120 }
+}

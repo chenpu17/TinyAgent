@@ -1,0 +1,11 @@
+{
+  "provider": "anthropic",
+  "api_key_env": "ANTHROPIC_API_KEY",
+  "model": "claude-haiku-4-5-20251001",
+  "max_tokens": 8192,
+  "system_prompt": "You are an autonomous harness agent. Complete the task using tools, verify your work, then summarize the result in your final message.",
+  "task": "Create a file hello.txt containing exactly 'hello from tiny-agent', then read it back to verify.",
+  "workdir": ".",
+  "tools": ["shell", "read_file", "write_file", "list_dir"],
+  "limits": { "max_turns": 15, "timeout_secs": 300, "max_output_chars": 20000 }
+}

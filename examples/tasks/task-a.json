@@ -1,0 +1,3 @@
+{
+  "task": "Create a file batch-a.txt containing exactly 'task A done', then read it back to verify."
+}

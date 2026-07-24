@@ -1,0 +1,26 @@
+[package]
+name = "tiny-agent"
+version = "0.1.0"
+edition = "2021"
+description = "A minimal single-binary AI agent: one JSON config, two modes (headless / TUI)"
+
+[features]
+default = []
+tui = ["dep:ratatui", "dep:crossterm"]
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+ratatui = { version = "0.29", optional = true }
+crossterm = { version = "0.28", optional = true }
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"
+codegen-units = 1

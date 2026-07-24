@@ -1,0 +1,3 @@
+{
+  "task": "Create a file batch-b.txt containing exactly 'task B done', then list the directory to verify."
+}
