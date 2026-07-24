@@ -107,6 +107,7 @@ tiny-agent --config examples/chat.json --tui
   "system_prompt": "可选系统提示词",
   "task": "headless 模式要执行的任务（可被 --task 覆盖）",
   "workdir": "工具操作的工作目录，默认当前目录",
+  "restrict_to_workdir": false,
   "tools": ["shell", "read_file", "write_file", "list_dir", "load_image"],
   "mcp_servers": [],
   "limits": {
@@ -127,8 +128,23 @@ API key 从 `api_key_env` 指定的环境变量读取，不写进配置文件。
 `compress_threshold_chars`（默认 100k，`0` = 关闭）时，agent 会在下一轮调用前
 自动压缩：让模型把中段历史写成结构化摘要，折叠进首条任务消息，只保留任务 +
 最近 `keep_recent_messages` 条原文。切割点选在 assistant 消息边界，保证
-tool_use/tool_result 配对不被切断；压缩失败时告警并继续（不中断任务）。
-运行日志中可见 `[context compressed: dropped N messages, M kept]`。
+tool_use/tool_result 配对不被切断；压缩失败时告警一次并禁用本次运行的后续压缩
+（不中断任务，也不每轮重试刷屏）。运行日志中可见
+`[context compressed: dropped N messages, M kept]`。
+
+## ⚠️ 安全说明
+
+**这是一个给模型直接执行能力的 agent，不是沙箱。** 请按此定位使用：
+
+- `shell` 工具原样执行模型生成的命令（`sh -c` / `cmd /C`），无任何命令过滤。
+  模型可以 `rm -rf`、`curl ... | sh`、访问网络——与其赋予进程的权限一致。
+- 文件工具默认不限制路径：`read_file ../../etc/passwd`、
+  `write_file /etc/cron.d/x` 都会被执行。
+- **在 CI / 评测 pipeline 中批量运行不可信的第三方 task 时**，务必：
+  1. 在容器或受限用户下运行 tiny-agent；
+  2. 配置 `"restrict_to_workdir": true`，文件工具将拒绝一切逃逸
+     `workdir` 的路径（`../` 与绝对路径，对新建文件同样生效）；
+  3. 必要时用 `"tools"` 白名单去掉 `shell`。
 
 ## 结果文件（`--output result.json`）
 
@@ -149,8 +165,8 @@ tool_use/tool_result 配对不被切断；压缩失败时告警并继续（不�
 
 | 工具 | 说明 |
 |---|---|
-| `shell` | 在工作目录执行命令（sh -c / cmd /C），120s 超时，输出按 `max_output_chars` 截断 |
-| `read_file` | 读文本文件，带行号，支持 offset/limit |
+| `shell` | 在工作目录执行命令（sh -c / cmd /C），120s 超时后 kill，输出有界读取并按 `max_output_chars` 截断 |
+| `read_file` | 读文本文件，带行号，支持 offset/limit；流式读取，超大文件不会整段进内存 |
 | `write_file` | 全量重写文件，自动创建父目录 |
 | `list_dir` | 列目录，最多 500 条 |
 | `load_image` | 加载本地图片让模型"看到"（需视觉模型） |
