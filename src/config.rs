@@ -30,6 +30,7 @@ fn default_tools() -> Vec<String> {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Limits {
     #[serde(default = "default_max_turns")]
     pub max_turns: u32,
@@ -85,6 +86,7 @@ pub enum McpTransport {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct McpServerConfig {
     pub name: String,
     /// stdio transport: command to spawn.
@@ -123,6 +125,7 @@ impl McpServerConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub provider: ProviderKind,
     /// Optional; falls back to the provider's default endpoint.
@@ -251,6 +254,7 @@ impl Config {
 
 /// All-optional config fragment used by batch task files.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PartialConfig {
     pub provider: Option<ProviderKind>,
     pub base_url: Option<String>,
@@ -266,7 +270,40 @@ pub struct PartialConfig {
     pub mcp_servers: Option<Vec<McpServerConfig>>,
 }
 
+impl PartialConfig {
+    /// First security-relevant field this fragment tries to set, if any.
+    /// Batch task files are untrusted: they may only override soft fields
+    /// (task / system_prompt / model / max_tokens / limits). Everything else
+    /// (endpoints, credentials, tool whitelist, sandbox, MCP servers) must
+    /// come from the trusted base config and must not be weakened per task.
+    pub fn forbidden_batch_override(&self) -> Option<&'static str> {
+        if self.provider.is_some() {
+            return Some("provider");
+        }
+        if self.base_url.is_some() {
+            return Some("base_url");
+        }
+        if self.api_key_env.is_some() {
+            return Some("api_key_env");
+        }
+        if self.workdir.is_some() {
+            return Some("workdir");
+        }
+        if self.tools.is_some() {
+            return Some("tools");
+        }
+        if self.restrict_to_workdir.is_some() {
+            return Some("restrict_to_workdir");
+        }
+        if self.mcp_servers.is_some() {
+            return Some("mcp_servers");
+        }
+        None
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PartialLimits {
     pub max_turns: Option<u32>,
     pub timeout_secs: Option<u64>,
@@ -358,5 +395,39 @@ mod tests {
         .unwrap();
         assert!(http.validate().is_ok());
         assert_eq!(http.transport, Some(McpTransport::Http));
+    }
+
+    #[test]
+    fn batch_overlay_rejects_unsafe_fields() {
+        // Soft fields are fine.
+        let ok: PartialConfig =
+            serde_json::from_str(r#"{"task":"x","model":"m","limits":{"max_turns":3}}"#).unwrap();
+        assert!(ok.forbidden_batch_override().is_none());
+
+        // Security-relevant fields are refused.
+        for (json, field) in [
+            (r#"{"base_url":"http://x"}"#, "base_url"),
+            (r#"{"api_key_env":"X"}"#, "api_key_env"),
+            (r#"{"tools":["shell"]}"#, "tools"),
+            (r#"{"restrict_to_workdir":false}"#, "restrict_to_workdir"),
+            (r#"{"provider":"openai"}"#, "provider"),
+            (r#"{"workdir":"/"}"#, "workdir"),
+        ] {
+            let p: PartialConfig = serde_json::from_str(json).unwrap();
+            assert_eq!(p.forbidden_batch_override(), Some(field), "{json}");
+        }
+    }
+
+    #[test]
+    fn config_rejects_unknown_field() {
+        // deny_unknown_fields: a typo like "timeout_sec" must fail loudly
+        // instead of silently falling back to the default.
+        let json = r#"{
+            "provider": "anthropic",
+            "api_key_env": "K",
+            "model": "m",
+            "limits": {"timeout_sec": 60}
+        }"#;
+        assert!(serde_json::from_str::<Config>(json).is_err());
     }
 }

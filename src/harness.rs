@@ -69,15 +69,58 @@ pub fn write_result(path: &Path, o: &RunOutcome) -> Result<()> {
         "summary": o.final_text,
         "tool_calls": tool_calls,
     });
+    let bytes = serde_json::to_string_pretty(&result)?;
+    atomic_write(path, bytes.as_bytes())
+}
+
+/// Atomically write bytes to `path`: write a temp file in the same
+/// directory, then rename. A crash mid-write never leaves a half-file —
+/// result.json and report.json are read by CI, so they must not corrupt.
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = path.with_extension("tmp");
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
         }
     }
-    std::fs::write(path, serde_json::to_string_pretty(&result)?)
-        .with_context(|| format!("cannot write result file: {}", path.display()))
+    // Write + fsync the temp file before renaming, so a crash after rename
+    // never exposes a zero-length file. (result.json / report.json are read
+    // by CI and must not corrupt on power loss.)
+    {
+        let mut f = std::fs::File::create(&tmp)
+            .with_context(|| format!("cannot create {}", tmp.display()))?;
+        f.write_all(bytes)
+            .with_context(|| format!("cannot write {}", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("cannot sync {}", tmp.display()))?;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp); // don't litter on failure
+        return Err(e).with_context(|| format!("cannot save {}", path.display()));
+    }
+    Ok(())
 }
 
 fn compact(v: &serde_json::Value) -> String {
     crate::agent::preview(&v.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atomic_write_roundtrips_and_leaves_no_tmp() {
+        let dir = std::env::temp_dir().join(format!("ta-atomic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.json");
+        atomic_write(&path, b"{\"ok\":true}").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"ok\":true}");
+        // The temp file must be gone after the rename.
+        assert!(!dir.join("out.tmp").exists());
+        // Overwriting an existing file is also atomic.
+        atomic_write(&path, b"v2").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "v2");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

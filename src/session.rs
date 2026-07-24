@@ -19,17 +19,44 @@ pub fn load(path: &Path) -> Result<Option<(String, Vec<Message>)>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("cannot read session: {}", path.display())),
     };
-    let s: Session = serde_json::from_str(&raw)
-        .with_context(|| format!("invalid session file: {}", path.display()))?;
+    let s: Session = match serde_json::from_str(&raw) {
+        Ok(s) => s,
+        Err(e) => {
+            // A corrupt session (truncated write, hand edit, future format)
+            // must not kill --resume: warn and start fresh instead of hard-failing.
+            eprintln!(
+                "[warn] session file corrupt, starting fresh: {} ({e})",
+                path.display()
+            );
+            return Ok(None);
+        }
+    };
+    if s.version > SESSION_VERSION {
+        eprintln!(
+            "[warn] session file is newer (v{}) than supported (v{}), starting fresh: {}",
+            s.version,
+            SESSION_VERSION,
+            path.display()
+        );
+        return Ok(None);
+    }
     Ok(Some((s.model, s.messages)))
 }
 
 /// Atomically persist the conversation (write temp file, then rename).
 pub fn save(path: &Path, model: &str, messages: &[Message]) -> Result<()> {
-    let s = Session {
+    // Serialize by reference: no need to deep-clone the whole history (with
+    // its base64 images and tool inputs) on every turn just to write it out.
+    #[derive(Serialize)]
+    struct SessionRef<'a> {
+        version: u32,
+        model: &'a str,
+        messages: &'a [Message],
+    }
+    let s = SessionRef {
         version: SESSION_VERSION,
-        model: model.to_string(),
-        messages: messages.to_vec(),
+        model,
+        messages,
     };
     let tmp = path.with_extension("tmp");
     if let Some(parent) = path.parent() {
@@ -88,6 +115,18 @@ mod tests {
         let (model, loaded) = load(&path).unwrap().unwrap();
         assert_eq!(model, "m1");
         assert_eq!(loaded.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn corrupt_session_returns_none() {
+        // A truncated/garbled session must degrade to "start fresh" instead
+        // of killing --resume.
+        let dir = std::env::temp_dir().join(format!("ta-corrupt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad.json");
+        std::fs::write(&path, "not valid json {{{{").unwrap();
+        assert!(load(&path).unwrap().is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

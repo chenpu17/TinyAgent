@@ -132,6 +132,12 @@ fn run_one(
     };
 
     let mut cfg = base.clone();
+    if let Some(field) = partial.forbidden_batch_override() {
+        return fail(format!(
+            "task file must not override '{field}' (only task/system_prompt/model/max_tokens/limits \
+             are overridable in batch mode)"
+        ));
+    }
     if let Err(e) = cfg.apply(partial) {
         return fail(format!("{e:#}"));
     }
@@ -151,15 +157,24 @@ fn run_one(
 
     match outcome {
         Ok((o,)) => {
-            let _ = harness::write_result(&results_dir.join(format!("{name}.json")), &o);
-            let success = o.stop_reason == "end_turn";
+            // A failed result write must not be swallowed: CI reads this file
+            // for the full tool_calls/summary. Surface it so report.json does
+            // not claim success while the result file is missing.
+            let mut error = None;
+            if let Err(e) =
+                harness::write_result(&results_dir.join(format!("{name}.json")), &o)
+            {
+                eprintln!("[warn] {name}: failed to write result file: {e:#}");
+                error = Some(format!("result file not written: {e:#}"));
+            }
+            let success = error.is_none() && o.stop_reason == "end_turn";
             TaskReport {
                 name: name.into(),
                 success,
                 stop_reason: o.stop_reason,
                 turns: o.turns,
                 elapsed_secs: o.elapsed.as_secs_f64(),
-                error: None,
+                error,
             }
         }
         Err(e) => fail(format!("{e:#}")),
@@ -187,6 +202,6 @@ fn write_report(path: &Path, reports: &[TaskReport]) -> Result<()> {
         "failed": reports.len() - succeeded,
         "tasks": tasks,
     });
-    std::fs::write(path, serde_json::to_string_pretty(&report)?)
-        .with_context(|| format!("cannot write report: {}", path.display()))
+    let bytes = serde_json::to_string_pretty(&report)?;
+    harness::atomic_write(path, bytes.as_bytes())
 }
