@@ -146,6 +146,7 @@ fn main() -> Result<()> {
     // the session ends with a user message (an initial task, or a resumed
     // session stopped mid-turn at a tool_result). The TUI needs to know so it
     // can show "running" instead of letting the user submit into a queue.
+    #[cfg_attr(not(feature = "tui"), allow(unused_variables))]
     let auto_start = initial.last().is_some_and(|m| m.role == Role::User);
     let client = provider::new_client(cfg.limits.timeout_secs);
     let mut agent = build_agent(&cfg, initial, &client)?;
@@ -170,6 +171,10 @@ fn main() -> Result<()> {
     } else {
         let mut agent = agent;
         let code = harness::run(&mut agent, cli.output.as_deref())?;
+        // Drop the agent before exit so MCP stdio children are killed via
+        // StdioTransport::drop — std::process::exit skips destructors, which
+        // would otherwise orphan spawned MCP server processes.
+        drop(agent);
         std::process::exit(code);
     }
 }

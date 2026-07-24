@@ -33,27 +33,39 @@ impl Tool for Shell {
             .as_str()
             .context("shell: missing \"command\" string")?;
 
-        let mut child = if cfg!(windows) {
-            Command::new("cmd")
-                .args(["/C", cmd])
-                .current_dir(&ctx.workdir)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-        } else {
-            Command::new("sh")
-                .args(["-c", cmd])
-                .current_dir(&ctx.workdir)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
+        // Spawn the child in its own process group (unix) so that a timeout
+        // can kill the whole tree, not just the direct `sh`/`cmd` process —
+        // a single `sh -c make` execs make, but make spawns compilers; those
+        // grandchildren share the child's group and would otherwise survive a
+        // plain `child.kill()` and keep the build running in the background.
+        let mut child = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                Command::new("sh")
+                    .args(["-c", cmd])
+                    .current_dir(&ctx.workdir)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .process_group(0)
+                    .spawn()
+            }
+            #[cfg(not(unix))]
+            {
+                Command::new("cmd")
+                    .args(["/C", cmd])
+                    .current_dir(&ctx.workdir)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+            }
         }
         .with_context(|| format!("failed to spawn shell for: {cmd}"))?;
 
         // Drain stdout/stderr on reader threads, capped in memory: beyond the
         // cap the output is discarded but still drained, so the child never
         // blocks on a full pipe.
-        let cap = ctx.max_output_chars + 1024;
+        let cap = ctx.max_output_chars.saturating_add(1024);
         let mut out_pipe = child.stdout.take().expect("stdout piped");
         let mut err_pipe = child.stderr.take().expect("stderr piped");
         let out_thread = std::thread::spawn(move || read_capped(&mut out_pipe, cap));
@@ -66,13 +78,13 @@ impl Tool for Shell {
             match child.try_wait() {
                 Ok(Some(s)) => break Some(s),
                 Ok(None) if Instant::now() >= deadline => {
-                    let _ = child.kill();
+                    kill_process_group(&child);
                     let _ = child.wait();
                     break None;
                 }
                 Ok(None) => std::thread::sleep(Duration::from_millis(50)),
                 Err(e) => {
-                    let _ = child.kill();
+                    kill_process_group(&child);
                     let _ = child.wait();
                     return Err(e).context("shell: failed to wait on command");
                 }
@@ -134,3 +146,19 @@ fn read_capped<R: Read>(r: &mut R, cap: usize) -> Vec<u8> {
     }
     buf
 }
+
+/// Kill the child's entire process group. `process_group(0)` at spawn made
+/// the child a group leader, so its pid IS the group id and `-pid` targets
+/// every descendant — plain `child.kill()` only signals the direct child and
+/// orphans grandchildren (a build tool's compilers, a test runner's workers).
+/// ESRCH (already reaped) is harmless, so the return is ignored. No-op off unix.
+#[cfg(unix)]
+fn kill_process_group(child: &std::process::Child) {
+    let pgid = child.id() as i32;
+    unsafe {
+        libc::kill(-pgid, libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_child: &std::process::Child) {}

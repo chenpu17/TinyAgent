@@ -1321,6 +1321,7 @@ dependencies = [
  "base64",
  "clap",
  "crossterm",
+ "libc",
  "ratatui",
  "reqwest",
  "serde",
