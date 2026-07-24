@@ -99,6 +99,25 @@ fn finalize_pending(p: Pending) -> Result<Block> {
     })
 }
 
+/// Like finalize_pending but tolerant of incomplete JSON — used when flushing
+/// a block from a truncated stream, where tool arguments may be half-delivered.
+/// Half-JSON becomes {"_raw": ...} instead of failing, so a network/timeout
+/// truncation surfaces as a stream_truncated stop_reason, not a parse error
+/// that (falsely) blames the model.
+fn finalize_pending_lenient(p: Pending) -> Block {
+    match p {
+        Pending::Text(t) => Block::Text(t),
+        Pending::ToolUse { id, name, json } => {
+            let input = if json.trim().is_empty() {
+                json!({})
+            } else {
+                serde_json::from_str(&json).unwrap_or_else(|_| json!({"_raw": json}))
+            };
+            Block::ToolUse { id, name, input }
+        }
+    }
+}
+
 impl Provider for Anthropic {
     fn chat(&self, req: &ChatRequest, on_event: &mut dyn FnMut(ChatEvent)) -> Result<ChatResponse> {
         let mut body = json!({
@@ -148,6 +167,7 @@ impl Anthropic {
         let mut blocks: Vec<Block> = Vec::new();
         let mut pending: Option<Pending> = None;
         let mut stop_reason = String::from("end_turn");
+        let mut got_stop = false;
 
         while let Some(data) = sse.next_data() {
             let ev: Value = match serde_json::from_str(&data) {
@@ -157,9 +177,10 @@ impl Anthropic {
             match ev["type"].as_str().unwrap_or("") {
                 "content_block_start" => {
                     // A previous block that never received content_block_stop
-                    // (truncated stream) would be overwritten here — flush it.
+                    // (truncated stream) would be overwritten here — flush it
+                    // leniently (its tool JSON may be half-delivered).
                     if let Some(p) = pending.take() {
-                        blocks.push(finalize_pending(p)?);
+                        blocks.push(finalize_pending_lenient(p));
                     }
                     let cb = &ev["content_block"];
                     pending = Some(match cb["type"].as_str().unwrap_or("") {
@@ -197,6 +218,7 @@ impl Anthropic {
                 "message_delta" => {
                     if let Some(r) = ev["delta"]["stop_reason"].as_str() {
                         stop_reason = r.to_string();
+                        got_stop = true;
                     }
                 }
                 "error" => {
@@ -211,11 +233,19 @@ impl Anthropic {
 
         // A stream cut off mid-block (network drop, or per_request_timeout
         // firing during generation) leaves a pending block unflushed. Flush
-        // it rather than silently dropping a tool call or trailing text.
+        // it leniently (half-delivered tool JSON becomes _raw) rather than
+        // dropping the block or hard-failing on a parse error.
         if let Some(p) = pending.take() {
-            blocks.push(finalize_pending(p)?);
+            blocks.push(finalize_pending_lenient(p));
         }
-
+        // No terminal message_delta arrived → the stream was truncated. Don't
+        // masquerade as a clean end_turn: batch/CI success checks rely on
+        // stop_reason being honest about an incomplete response.
+        let stop_reason = if got_stop {
+            stop_reason
+        } else {
+            "stream_truncated".into()
+        };
         Ok(ChatResponse { blocks, stop_reason })
     }
 }
@@ -282,6 +312,7 @@ mod tests {
             "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"ls\\\"}\"}}\n\n",
         );
         let resp = parse(raw.as_bytes());
+        assert_eq!(resp.stop_reason, "stream_truncated");
         assert_eq!(resp.blocks.len(), 1);
         match &resp.blocks[0] {
             Block::ToolUse { id, name, input } => {
@@ -289,6 +320,22 @@ mod tests {
                 assert_eq!(name, "shell");
                 assert_eq!(input["command"], "ls");
             }
+            other => panic!("expected tool_use, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_truncated_incomplete_json() {
+        // Tool args cut off mid-JSON: must not hard-fail or blame the model —
+        // the half-JSON becomes _raw and stop_reason reports the truncation.
+        let raw = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t\",\"name\":\"shell\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"ls\"}}\n\n",
+        );
+        let resp = parse(raw.as_bytes());
+        assert_eq!(resp.stop_reason, "stream_truncated");
+        match &resp.blocks[0] {
+            Block::ToolUse { input, .. } => assert!(input.get("_raw").is_some()),
             other => panic!("expected tool_use, got {other:?}"),
         }
     }

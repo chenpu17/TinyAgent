@@ -225,6 +225,7 @@ impl OpenAi {
         let mut calls: std::collections::BTreeMap<u64, PendingCall> = Default::default();
         let mut cur_idx: u64 = 0;
         let mut finish_reason = String::from("stop");
+        let mut got_finish = false;
 
         while let Some(data) = sse.next_data() {
             if data == "[DONE]" {
@@ -250,6 +251,7 @@ impl OpenAi {
             }
             if let Some(r) = choice["finish_reason"].as_str() {
                 finish_reason = r.to_string();
+                got_finish = true;
             }
             let delta = &choice["delta"];
             if let Some(t) = delta["content"].as_str() {
@@ -308,12 +310,19 @@ impl OpenAi {
             });
         }
 
-        // Normalize to Anthropic-style stop reasons.
-        let stop_reason = match finish_reason.as_str() {
-            "stop" => "end_turn".into(),
-            "tool_calls" => "tool_use".into(),
-            "length" => "max_tokens".into(),
-            other => other.into(),
+        // Normalize to Anthropic-style stop reasons. If no finish_reason
+        // arrived the stream was truncated — say so instead of defaulting to
+        // "stop", which would make batch/CI treat an incomplete response as
+        // success.
+        let stop_reason = if !got_finish {
+            "stream_truncated".into()
+        } else {
+            match finish_reason.as_str() {
+                "stop" => "end_turn".into(),
+                "tool_calls" => "tool_use".into(),
+                "length" => "max_tokens".into(),
+                other => other.into(),
+            }
         };
         Ok(ChatResponse { blocks, stop_reason })
     }

@@ -78,6 +78,7 @@ impl Agent {
     }
 
     /// Attach a cancellation flag; checked at every turn boundary.
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
     pub fn set_cancel(&mut self, flag: Arc<AtomicBool>) {
         self.cancel = Some(flag);
     }
@@ -270,6 +271,11 @@ the current state / next step. Be concise but keep all facts the agent still nee
 const SUMMARY_MARKER: &str =
     "[前情摘要，由系统自动生成 / Auto-generated summary of the earlier conversation]";
 
+/// Time reserved for the main chat request after a compression summary, so the
+/// summary can't eat the whole remaining run budget and leave the main request
+/// with a near-zero timeout (which would fail the whole run with no result).
+const COMPRESS_RESERVE: Duration = Duration::from_secs(20);
+
 /// Rough size estimate of a conversation (chars; images count cheaply).
 fn total_chars(messages: &[Message]) -> usize {
     messages
@@ -350,9 +356,11 @@ impl Agent {
         // Compression is best-effort: never let the summary request eat the
         // run's remaining budget — that would leave the main request with a
         // zero/near-zero timeout and fail the whole run with no result file.
-        // Skip this turn if too little time is left.
+        // Skip unless there's room for both the summary and the main request.
         if let Some(d) = deadline {
-            if d.saturating_duration_since(Instant::now()).as_secs() < 5 {
+            if d.saturating_duration_since(Instant::now())
+                < COMPRESS_RESERVE + Duration::from_secs(5)
+            {
                 return;
             }
         }
@@ -417,9 +425,13 @@ impl Agent {
             tools: &[],
             model: &self.model,
             max_tokens: 2048,
-            // Cap the summary to the remaining run budget too, so it can't
-            // outlive the run on its own (the client default is generous).
-            per_request_timeout: deadline.map(|d| d.saturating_duration_since(Instant::now())),
+            // Cap the summary to the remaining budget MINUS a reserve for the
+            // main request that follows in the same turn, so summarizing can't
+            // starve the main chat into a zero-timeout failure.
+            per_request_timeout: deadline.map(|d| {
+                d.saturating_duration_since(Instant::now())
+                    .saturating_sub(COMPRESS_RESERVE)
+            }),
         };
         let resp = self.provider.chat(&req, &mut |_| {})?;
         Ok(resp
