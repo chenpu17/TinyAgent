@@ -7,7 +7,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::Duration;
 
 const PROTOCOL_VERSION: &str = "2025-03-26";
@@ -45,7 +47,19 @@ impl McpClient {
                 McpTransport::Sse => Self::handshake(SseTransport::connect(url, cfg)?),
                 McpTransport::Auto => {
                     if probe_http(url, cfg)? {
-                        Self::handshake(HttpTransport::new(url, cfg)?)
+                        // Probe says Streamable HTTP, but a 200 from a legacy
+                        // SSE server can still fool it; fall back to SSE if
+                        // the HTTP handshake then fails.
+                        match Self::handshake(HttpTransport::new(url, cfg)?) {
+                            ok @ Ok(_) => ok,
+                            Err(e) => {
+                                eprintln!(
+                                    "[warn] MCP '{}': Streamable HTTP handshake failed ({e:#}); falling back to legacy SSE",
+                                    cfg.name
+                                );
+                                Self::handshake(SseTransport::connect(url, cfg)?)
+                            }
+                        }
                     } else {
                         Self::handshake(SseTransport::connect(url, cfg)?)
                     }
@@ -290,9 +304,12 @@ impl Transport for HttpTransport {
             .to_string();
 
         if ct.contains("text/event-stream") {
-            // Read SSE events until the response with our id arrives.
-            let mut sse = crate::provider::SseReader::new(resp);
-            while let Some(data) = sse.next_data() {
+            // Read SSE events until the response with our id arrives. Use the
+            // multi-line-aware event reader: provider::SseReader takes only
+            // the first `data:` line of a multi-line event and would drop the
+            // rest, losing large JSON-RPC results.
+            let mut reader = std::io::BufReader::new(resp);
+            while let Some((_event, data)) = read_sse_event(&mut reader) {
                 if let Ok(msg) = serde_json::from_str::<Value>(&data) {
                     if msg.get("id").and_then(|v| v.as_u64()) == Some(id) {
                         return extract_result(msg, method);
@@ -320,7 +337,8 @@ fn probe_http(url: &str, cfg: &McpServerConfig) -> Result<bool> {
     let mut req = client
         .post(url)
         .header("content-type", "application/json")
-        .header("accept", "application/json, text/event-stream");
+        .header("accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", PROTOCOL_VERSION);
     for (k, v) in &cfg.headers {
         req = req.header(k, v);
     }
@@ -342,6 +360,8 @@ struct SseTransport {
     post_url: String,
     headers: HashMap<String, String>,
     pending: Pending,
+    /// Signals the reader thread to stop at its next loop iteration.
+    shutdown: Arc<AtomicBool>,
 }
 
 impl SseTransport {
@@ -358,10 +378,12 @@ impl SseTransport {
             req = req.header(k, v);
         }
         // The GET is a long-lived stream; drive it on a reader thread.
-        let (endpoint_tx, endpoint_rx) = mpsc::channel::<String>();
+        let (endpoint_tx, endpoint_rx) = mpsc::channel::<Option<String>>();
         let pending = pending_new();
+        let shutdown = Arc::new(AtomicBool::new(false));
         {
             let pending = pending.clone();
+            let shutdown = shutdown.clone();
             let url = url.to_string();
             std::thread::spawn(move || {
                 let Ok(resp) = req.send() else {
@@ -370,13 +392,26 @@ impl SseTransport {
                 };
                 let mut reader = BufReader::new(resp);
                 let mut endpoint_sent = false;
-                while let Some((event, data)) = read_sse_event(&mut reader) {
+                while !shutdown.load(Ordering::Relaxed) {
+                    let Some((event, data)) = read_sse_event(&mut reader) else {
+                        break;
+                    };
                     match event.as_str() {
                         "endpoint" if !endpoint_sent => {
                             endpoint_sent = true;
-                            // Resolve against the SSE URL (usually a relative path).
-                            let resolved = resolve_endpoint(&url, data.trim());
-                            let _ = endpoint_tx.send(resolved);
+                            // Resolve against the SSE URL; refuse cross-origin
+                            // endpoints (SSRF guard on the authenticated POST).
+                            match resolve_endpoint(&url, data.trim()) {
+                                Ok(u) => {
+                                    let _ = endpoint_tx.send(Some(u));
+                                }
+                                Err(e) => {
+                                    eprintln!("[warn] MCP SSE endpoint rejected: {e:#}");
+                                    let _ = endpoint_tx.send(None);
+                                    pending_fail_all(&pending);
+                                    return;
+                                }
+                            }
                         }
                         "message" => {
                             if let Ok(msg) = serde_json::from_str::<Value>(&data) {
@@ -391,12 +426,14 @@ impl SseTransport {
         }
         let post_url = endpoint_rx
             .recv_timeout(CONNECT_TIMEOUT)
-            .map_err(|_| anyhow!("MCP SSE: no 'endpoint' event from {url}"))?;
+            .map_err(|_| anyhow!("MCP SSE: no 'endpoint' event from {url}"))?
+            .ok_or_else(|| anyhow!("MCP SSE endpoint rejected (origin mismatch)"))?;
         Ok(Self {
             client: http_client(CALL_TIMEOUT),
             post_url,
             headers: cfg.headers.clone(),
             pending,
+            shutdown,
         })
     }
 
@@ -434,6 +471,19 @@ impl Transport for SseTransport {
     }
 }
 
+impl Drop for SseTransport {
+    fn drop(&mut self) {
+        // Ask the reader thread to stop. NOTE: reqwest::blocking responses
+        // block inside read() with no per-read timeout, so this only takes
+        // effect once the server sends another event or closes the stream —
+        // a fully stuck GET still relies on process exit to reclaim the
+        // thread and its TCP connection. Truly interruptible reads need an
+        // async runtime or direct hyper use, which this binary avoids; in
+        // batch mode prefer stdio MCP servers (which kill cleanly on drop).
+        self.shutdown.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Read one SSE event as (event, data); returns None at end of stream.
 /// Handles `event:`, possibly multi-line `data:`, and skips comments.
 fn read_sse_event<R: BufRead>(reader: &mut R) -> Option<(String, String)> {
@@ -443,7 +493,15 @@ fn read_sse_event<R: BufRead>(reader: &mut R) -> Option<(String, String)> {
     loop {
         line.clear();
         match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => return None,
+            Ok(0) | Err(_) => {
+                // Flush a buffered event even if the stream ended without a
+                // trailing blank line, or the last message is silently lost.
+                return if data.is_empty() {
+                    None
+                } else {
+                    Some((event, data))
+                };
+            }
             Ok(_) => {
                 let t = line.trim_end_matches(['\r', '\n']);
                 if t.is_empty() {
@@ -464,21 +522,38 @@ fn read_sse_event<R: BufRead>(reader: &mut R) -> Option<(String, String)> {
     }
 }
 
-/// Resolve the endpoint event payload against the SSE URL.
-fn resolve_endpoint(sse_url: &str, endpoint: &str) -> String {
-    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-        return endpoint.to_string();
-    }
-    // Strip path from the SSE URL, keep scheme+authority, append endpoint.
-    match sse_url.find("://") {
-        Some(i) => {
-            let after = &sse_url[i + 3..];
-            match after.find('/') {
-                Some(j) => format!("{}{}", &sse_url[..i + 3 + j], endpoint),
-                None => format!("{sse_url}{endpoint}"),
-            }
-        }
-        None => endpoint.to_string(),
+/// scheme://authority of a URL (no path/query), or None if it has none.
+fn origin_of(url: &str) -> Option<String> {
+    let i = url.find("://")?;
+    let after = &url[i + 3..];
+    let end = after.find('/').unwrap_or(after.len());
+    Some(url[..i + 3 + end].to_string())
+}
+
+/// Resolve the endpoint event payload against the SSE URL. A relative path is
+/// joined to the SSE origin; an absolute (or network-path `//`) endpoint is
+/// accepted only if it shares the SSE URL's origin — otherwise a compromised
+/// server could redirect the authenticated POST (config headers, e.g.
+/// Authorization) to an attacker or internal address (SSRF).
+fn resolve_endpoint(sse_url: &str, endpoint: &str) -> Result<String> {
+    let sse_origin =
+        origin_of(sse_url).ok_or_else(|| anyhow!("invalid SSE URL (no origin): {sse_url}"))?;
+    let abs = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        endpoint.to_string()
+    } else if let Some(rest) = endpoint.strip_prefix("//") {
+        // network-path reference: borrow the SSE URL's scheme.
+        let scheme = sse_url.split("://").next().unwrap_or("https");
+        format!("{scheme}://{rest}")
+    } else {
+        format!("{sse_origin}{endpoint}")
+    };
+    if origin_of(&abs).as_deref() == Some(sse_origin.as_str()) {
+        Ok(abs)
+    } else {
+        bail!(
+            "MCP SSE endpoint '{endpoint}' is not on the same origin as '{sse_url}' \
+             (possible SSRF); refusing"
+        )
     }
 }
 
@@ -499,13 +574,17 @@ mod tests {
 
     #[test]
     fn endpoint_resolution() {
+        // Relative path resolves against the SSE origin.
         assert_eq!(
-            resolve_endpoint("http://h:3000/sse", "/messages?s=1"),
+            resolve_endpoint("http://h:3000/sse", "/messages?s=1").unwrap(),
             "http://h:3000/messages?s=1"
         );
+        // Same-origin absolute URL is accepted.
         assert_eq!(
-            resolve_endpoint("http://h:3000/sse", "http://other/x"),
-            "http://other/x"
+            resolve_endpoint("http://h:3000/sse", "http://h:3000/x").unwrap(),
+            "http://h:3000/x"
         );
+        // Cross-origin absolute URL is refused (SSRF guard).
+        assert!(resolve_endpoint("http://h:3000/sse", "http://other/x").is_err());
     }
 }

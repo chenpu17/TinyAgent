@@ -108,7 +108,7 @@ fn main() -> Result<()> {
     // assumed already consumed — only an explicit --task sends a new one.
     // (cli.task was already merged into cfg.task above, so we check cli.task
     // directly to distinguish command-line from config.)
-    let task_to_send = if resumed { cli_task } else { cfg.task.clone() };
+    let task_to_send = if resumed { cli_task.clone() } else { cfg.task.clone() };
     if let Some(task) = task_to_send {
         let mut blocks = vec![Block::Text(task)];
         for img in &cli.image {
@@ -117,7 +117,17 @@ fn main() -> Result<()> {
                     .with_context(|| format!("cannot load --image {}", img.display()))?,
             );
         }
-        initial.push(Message::user(blocks));
+        // If the resumed session already ends with a user message (e.g. it
+        // crashed mid-turn at a tool_result), fold the new task into that
+        // message instead of pushing another — two adjacent user messages
+        // make Anthropic reject the request with a 400.
+        if initial.last().map(|m| m.role) == Some(Role::User) {
+            if let Some(last) = initial.last_mut() {
+                last.content.extend(blocks);
+            }
+        } else {
+            initial.push(Message::user(blocks));
+        }
     } else if !cli.image.is_empty() {
         bail!("--image requires a task (--task or config \"task\")");
     }
@@ -132,6 +142,11 @@ fn main() -> Result<()> {
         }
     }
 
+    // Whether the worker will auto-start a run on launch: it kicks off when
+    // the session ends with a user message (an initial task, or a resumed
+    // session stopped mid-turn at a tool_result). The TUI needs to know so it
+    // can show "running" instead of letting the user submit into a queue.
+    let auto_start = initial.last().is_some_and(|m| m.role == Role::User);
     let client = provider::new_client(cfg.limits.timeout_secs);
     let mut agent = build_agent(&cfg, initial, &client)?;
     agent.enable_session(cli.session.clone());
@@ -139,7 +154,13 @@ fn main() -> Result<()> {
     if cli.tui {
         #[cfg(feature = "tui")]
         {
-            tui::run(agent, &cfg)
+            // Resume-aware: only an explicit --task is layered on top of
+            // a resumed session; otherwise the config task (if any) is the
+            // initial task. This is for display only — the worker kicks
+            // off the run based on the agent's last message role, so we
+            // never double-send the task.
+            let initial_task = if resumed { cli_task.clone() } else { cfg.task.clone() };
+            tui::run(agent, &cfg, initial_task, auto_start)
         }
         #[cfg(not(feature = "tui"))]
         {

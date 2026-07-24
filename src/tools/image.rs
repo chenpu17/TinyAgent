@@ -3,6 +3,7 @@ use crate::provider::{Block, ToolDef};
 use anyhow::{bail, Context, Result};
 use base64::Engine;
 use serde_json::{json, Value};
+use std::io::Read;
 use std::path::Path;
 
 /// Refuse images larger than this (base64 inflates by ~4/3).
@@ -25,16 +26,22 @@ pub(crate) fn media_type_for(path: &Path) -> Option<&'static str> {
 pub(crate) fn load_block(full: &Path) -> Result<Block> {
     let media_type = media_type_for(full)
         .with_context(|| format!("unsupported image format: {}", full.display()))?;
-    let meta = std::fs::metadata(full)?;
-    if meta.len() > MAX_IMAGE_BYTES {
+    // Bound the read directly rather than trusting stat then reading: a file
+    // that grows between metadata() and read() (a concurrent writer, or a
+    // special file that reports a small length) could otherwise blow past the
+    // limit and exhaust memory.
+    let f = std::fs::File::open(full)
+        .with_context(|| format!("cannot read image: {}", full.display()))?;
+    let mut raw = Vec::new();
+    f.take(MAX_IMAGE_BYTES + 1).read_to_end(&mut raw)?;
+    if raw.len() > MAX_IMAGE_BYTES as usize {
         bail!(
             "image too large ({} bytes, limit {}): {}",
-            meta.len(),
+            raw.len(),
             MAX_IMAGE_BYTES,
             full.display()
         );
     }
-    let raw = std::fs::read(full)?;
     Ok(Block::Image {
         media_type: media_type.to_string(),
         data: base64::engine::general_purpose::STANDARD.encode(raw),

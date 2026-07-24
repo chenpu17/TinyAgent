@@ -38,7 +38,9 @@ impl Tool for ReadFile {
 
         use std::io::BufRead;
         let mut out = String::new();
+        let mut lines_seen = 0usize;
         for (i, line) in reader.lines().enumerate() {
+            lines_seen += 1;
             if i < offset - 1 {
                 continue;
             }
@@ -56,7 +58,16 @@ impl Tool for ReadFile {
             }
         }
         if out.is_empty() {
-            out.push_str("[empty file]");
+            // Distinguish a truly empty file from an offset past EOF. The
+            // latter used to read as "[empty file]", which misleads the
+            // model into thinking the file has no content.
+            if lines_seen == 0 {
+                out.push_str("[empty file]");
+            } else {
+                out.push_str(&format!(
+                    "... [offset {offset} beyond EOF; file has {lines_seen} lines]\n"
+                ));
+            }
         }
         Ok(ToolOutput::text(out))
     }
@@ -145,5 +156,45 @@ impl Tool for ListDir {
         let mut out = entries.join("\n");
         truncate(&mut out, ctx.max_output_chars);
         Ok(ToolOutput::text(out))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::fs;
+
+    fn ctx_in(dir: &std::path::Path) -> ToolCtx {
+        ToolCtx {
+            workdir: dir.to_path_buf(),
+            max_output_chars: 1000,
+            restrict_to_workdir: false,
+        }
+    }
+
+    #[test]
+    fn read_file_offset_beyond_eof_reports_range() {
+        let dir = std::env::temp_dir().join(format!("ta-read-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("f.txt"), "line1\nline2\n").unwrap();
+        let out = ReadFile
+            .run(&json!({"path": "f.txt", "offset": 99}), &ctx_in(&dir))
+            .unwrap();
+        assert!(out.content.contains("beyond EOF"), "got: {}", out.content);
+        assert!(out.content.contains("2 lines"), "got: {}", out.content);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_file_truly_empty() {
+        let dir = std::env::temp_dir().join(format!("ta-empty-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("empty.txt"), "").unwrap();
+        let out = ReadFile
+            .run(&json!({"path": "empty.txt"}), &ctx_in(&dir))
+            .unwrap();
+        assert_eq!(out.content, "[empty file]");
+        fs::remove_dir_all(&dir).ok();
     }
 }

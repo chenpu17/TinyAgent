@@ -30,7 +30,12 @@ enum UiMsg {
     RunFinished,
 }
 
-pub fn run(agent: Agent, cfg: &Config) -> Result<()> {
+pub fn run(
+    agent: Agent,
+    cfg: &Config,
+    initial_task: Option<String>,
+    auto_start: bool,
+) -> Result<()> {
     // UI → worker: user inputs (None = quit).
     let (in_tx, in_rx) = mpsc::channel::<Option<String>>();
     // Worker → UI: agent events.
@@ -43,8 +48,11 @@ pub fn run(agent: Agent, cfg: &Config) -> Result<()> {
     let worker = std::thread::spawn(move || {
         let mut agent = agent;
         agent.set_cancel(worker_cancel);
-        while let Ok(Some(text)) = in_rx.recv() {
-            agent.push_user(vec![Block::Text(text)]);
+
+        // Run one agent turn. Returns false once the UI has gone away
+        // (out_rx dropped) so the loop can stop instead of pushing into
+        // a dead channel.
+        let run_once = |agent: &mut Agent| -> bool {
             let res = agent.run(&mut |ev| {
                 let _ = out_tx.send(UiMsg::Event(ev));
             });
@@ -52,7 +60,21 @@ pub fn run(agent: Agent, cfg: &Config) -> Result<()> {
                 Ok(_) => UiMsg::RunFinished,
                 Err(e) => UiMsg::Error(format!("{e:#}")),
             };
-            if out_tx.send(msg).is_err() {
+            out_tx.send(msg).is_ok()
+        };
+
+        // If the session already ends with a user message — an initial
+        // task baked in by main, or a resumed session stopped mid-turn at
+        // a tool_result — kick off a run now. We must NOT re-send the
+        // task over in_tx: main already put it in the agent's history,
+        // and sending again would create two adjacent user messages
+        // (Anthropic rejects that with a 400).
+        if agent.ends_with_user() && !run_once(&mut agent) {
+            return;
+        }
+        while let Ok(Some(text)) = in_rx.recv() {
+            agent.push_user(vec![Block::Text(text)]);
+            if !run_once(&mut agent) {
                 return;
             }
         }
@@ -61,12 +83,23 @@ pub fn run(agent: Agent, cfg: &Config) -> Result<()> {
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
     let mut term = Terminal::new(ratatui::backend::CrosstermBackend::new(stdout()))?;
-    let result = ui_loop(&mut term, cfg, &in_tx, &out_rx, &cancel);
+    let result = ui_loop(
+        &mut term,
+        cfg,
+        &in_tx,
+        &out_rx,
+        &cancel,
+        initial_task.as_deref(),
+        auto_start,
+    );
 
-    disable_raw_mode()?;
-    stdout().execute(LeaveAlternateScreen)?;
+    // Stop the worker before restoring the terminal. If terminal restoration
+    // errors out below, the worker has already been told to stop (and is
+    // detached on scope exit) instead of running unchecked to its next limit.
     cancel.store(true, std::sync::atomic::Ordering::Relaxed);
     drop(in_tx); // signal worker to exit
+    disable_raw_mode()?;
+    stdout().execute(LeaveAlternateScreen)?;
     drop(worker); // detach: never block exit on a stuck run
     result
 }
@@ -77,6 +110,8 @@ fn ui_loop(
     in_tx: &mpsc::Sender<Option<String>>,
     out_rx: &mpsc::Receiver<UiMsg>,
     cancel: &std::sync::atomic::AtomicBool,
+    initial_task: Option<&str>,
+    auto_start: bool,
 ) -> Result<()> {
     let mut rows: Vec<Row> = Vec::new();
     let mut input = String::new();
@@ -90,11 +125,20 @@ fn ui_loop(
         "tiny-agent · model {} · type a message, Enter to send, Esc to quit",
         cfg.model
     )));
-    // Kick off an initial task from the config, if any.
-    if let Some(task) = &cfg.task {
-        rows.push(Row::User(task.clone()));
+    // Mirror the initial task (already in the agent's history) so the
+    // user sees what's running. Do NOT re-send it over in_tx: main has
+    // already placed it in the agent's messages, and a second send would
+    // duplicate the task and create two adjacent user messages (Anthropic
+    // rejects that with a 400). The worker starts the run itself.
+    if let Some(task) = initial_task {
+        rows.push(Row::User(task.to_string()));
+    }
+    // The worker auto-runs when the session ends with a user message (an
+    // initial task, or a resumed session stopped mid-turn). Show "running" so
+    // the status bar is honest and the input box blocks instead of queueing a
+    // submission behind the in-flight turn.
+    if auto_start {
         busy = true;
-        let _ = in_tx.send(Some(task.clone()));
     }
 
     loop {

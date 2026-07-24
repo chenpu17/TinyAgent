@@ -26,6 +26,7 @@ impl Tool for McpTool {
 
         let mut text = String::new();
         let mut image = None;
+        let mut extra_images = 0u32;
         for c in result["content"].as_array().cloned().unwrap_or_default() {
             match c["type"].as_str().unwrap_or("") {
                 "text" => {
@@ -35,15 +36,25 @@ impl Tool for McpTool {
                     text.push_str(c["text"].as_str().unwrap_or_default());
                 }
                 "image" => {
+                    // ToolOutput carries a single image; keep the first and
+                    // note the rest rather than silently dropping them.
                     if image.is_none() {
                         image = Some(Block::Image {
                             media_type: c["mimeType"].as_str().unwrap_or("image/png").to_string(),
                             data: c["data"].as_str().unwrap_or_default().to_string(),
                         });
+                    } else {
+                        extra_images += 1;
                     }
                 }
                 _ => {}
             }
+        }
+        if extra_images > 0 {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&format!("[{extra_images} additional image(s) omitted]"));
         }
         if text.is_empty() && image.is_none() {
             text = "[empty tool result]".into();
