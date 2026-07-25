@@ -121,7 +121,7 @@ impl Agent {
     /// Append a user message (multi-turn / TUI follow-ups).
     #[cfg_attr(not(feature = "tui"), allow(dead_code))]
     pub fn push_user(&mut self, blocks: Vec<Block>) {
-        self.messages.push(Message::user(blocks));
+        append_user_turn(&mut self.messages, blocks);
         self.save_session();
     }
 
@@ -268,11 +268,28 @@ impl Agent {
             }
 
             // Execute each tool call, collect results into one user message.
+            // Once cancelled (e.g. Ctrl-C during tool #1), stop running further
+            // tools — but STILL emit a result for every remaining tool_use: an
+            // assistant message carrying N tool_use blocks must be followed by
+            // N tool_results, or the next request is rejected. (A non-cancel-
+            // aware tool that was already in flight returns on its own; later
+            // tools in the batch are short-circuited here.)
             let mut results: Vec<Block> = Vec::new();
+            let mut batch_cancelled = false;
             for b in &resp.blocks {
                 let Block::ToolUse { id, name, input } = b else {
                     continue;
                 };
+                if batch_cancelled || self.cancelled() {
+                    batch_cancelled = true;
+                    results.push(Block::ToolResult {
+                        tool_use_id: id.clone(),
+                        content: "[cancelled by user]".into(),
+                        image: None,
+                        is_error: true,
+                    });
+                    continue;
+                }
                 events(AgentEvent::ToolCall {
                     name: name.clone(),
                     input: input.clone(),
@@ -415,6 +432,20 @@ fn find_safe_cut(messages: &[Message], keep_recent: usize) -> Option<usize> {
     None
 }
 
+/// Fold `blocks` into a trailing user message, or push a new one. Two adjacent
+/// user messages make Anthropic reject the request with a 400, so a follow-up
+/// must merge into the prior user turn — notably after a turn cancelled before
+/// any assistant text (the assistant message is dropped, leaving history ending
+/// in the prior user message this follow-up must merge into).
+fn append_user_turn(messages: &mut Vec<Message>, blocks: Vec<Block>) {
+    if messages.last().is_some_and(|m| m.role == Role::User) {
+        if let Some(last) = messages.last_mut() {
+            last.content.extend(blocks);
+        }
+    } else {
+        messages.push(Message::user(blocks));
+    }
+}
 impl Agent {
     /// If history exceeds the configured threshold, summarize the middle
     /// via the LLM and keep only the original task + recent tail.
@@ -578,6 +609,32 @@ mod tests {
         assert_eq!(find_safe_cut(&msgs, 2), Some(7));
         // keep_recent=6 → candidate cut at 3 = assistant.
         assert_eq!(find_safe_cut(&msgs, 6), Some(3));
+    }
+
+    #[test]
+    fn append_user_turn_merges_into_trailing_user() {
+        // History ends in a user message (e.g. the prior turn was cancelled
+        // before any assistant text, so its assistant message was dropped).
+        // The follow-up must merge, not append a second user message — two
+        // adjacent user messages are a 400.
+        let mut msgs = vec![user_text("task")];
+        append_user_turn(&mut msgs, vec![Block::Text("again".into())]);
+        assert_eq!(msgs.len(), 1, "no second user message");
+        assert_eq!(msgs[0].role, Role::User);
+        assert_eq!(msgs[0].content.len(), 2, "blocks merged into the one turn");
+    }
+
+    #[test]
+    fn append_user_turn_pushes_new_after_assistant() {
+        // Normal turn boundary: assistant spoke, now a user follow-up starts a
+        // new message (no trailing user to merge into).
+        let mut msgs = vec![
+            user_text("task"),
+            Message::assistant(vec![Block::Text("hi".into())]),
+        ];
+        append_user_turn(&mut msgs, vec![Block::Text("more".into())]);
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[2].role, Role::User);
     }
 
     #[test]

@@ -157,6 +157,17 @@ enum Input {
     Clear,
 }
 
+/// On drop, signals worker completion so the quit path can wait a bounded
+/// time for the worker to exit (and let a cancel-aware tool kill its child)
+/// instead of detaching it mid-tool and orphaning a spawned shell process.
+struct DoneSignal(mpsc::Sender<()>);
+
+impl Drop for DoneSignal {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+
 pub fn run(
     agent: Agent,
     cfg: &Config,
@@ -165,6 +176,9 @@ pub fn run(
 ) -> Result<()> {
     // UI → worker: user inputs (None = quit).
     let (in_tx, in_rx) = mpsc::channel::<Option<Input>>();
+    // Worker → quit-path: the worker signals it has exited, so quitting can
+    // join within a bounded wait instead of detaching mid-tool.
+    let (done_tx, done_rx) = mpsc::channel::<()>();
     // Worker → UI: agent events.
     let (out_tx, out_rx) = mpsc::channel::<UiMsg>();
     // Cancellation: Esc sets this; the agent checks it at each turn boundary.
@@ -173,6 +187,9 @@ pub fn run(
     // The worker thread owns the agent and drives run() per user input.
     let worker_cancel = cancel.clone();
     let worker = std::thread::spawn(move || {
+        // Signal completion on ANY exit (normal loop end or early return) via
+        // Drop, so the quit path can join within a bounded wait.
+        let _done = DoneSignal(done_tx);
         let mut agent = agent;
         agent.set_cancel(worker_cancel);
 
@@ -232,9 +249,16 @@ pub fn run(
     // detached on scope exit) instead of running unchecked to its next limit.
     cancel.store(true, std::sync::atomic::Ordering::Relaxed);
     drop(in_tx); // signal worker to exit
+    // Wait a bounded time for the worker to actually exit. A cancel-aware
+    // shell kills its process group within ~50ms, so joining here prevents the
+    // orphan-on-quit case where the process exits mid-tool and reparents a
+    // running shell to init. A wedged, non-cancel-aware tool (e.g. a stuck MCP
+    // call up to its timeout) just lets this time out — we then detach as
+    // before, never hanging exit.
+    let _ = done_rx.recv_timeout(Duration::from_secs(3));
     disable_raw_mode()?;
     stdout().execute(LeaveAlternateScreen)?;
-    drop(worker); // detach: never block exit on a stuck run
+    drop(worker); // detach if the worker is still stuck past the deadline
     result
 }
 
