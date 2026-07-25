@@ -1,5 +1,7 @@
 /target
 /run-tui.sh
+/run-harness.sh
 /.tinyagent-session.json
+/.tinyagent-harness-session.json
 /glm-tui.json
 /测试模型.md
