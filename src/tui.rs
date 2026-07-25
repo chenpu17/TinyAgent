@@ -14,6 +14,7 @@ use ratatui::widgets::{Block as WBlock, Borders, Paragraph, Wrap};
 use ratatui::Terminal;
 use std::io::stdout;
 use std::sync::mpsc;
+use unicode_width::UnicodeWidthStr;
 use std::time::{Duration, Instant};
 
 /// One rendered row in the message history.
@@ -437,15 +438,11 @@ fn ui_loop(
                         push_wrapped(&mut lines, "You", t, Color::Cyan);
                     }
                     Row::Assistant(t) => {
-                        // Bold "Agent" label, then a markdown-rendered body.
-                        // from_str borrows `t`; to_owned() clones every Cow into
-                        // an owned String so the lines outlive the row borrow.
                         lines.push(Line::from(Span::styled(
                             "Agent".to_string(),
                             Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
                         )));
-                        let md = tui_markdown::from_str(t).to_owned();
-                        lines.extend(md.lines);
+                        lines.extend(render_markdown(t));
                     }
                     Row::ToolCall {
                         name,
@@ -527,7 +524,7 @@ fn ui_loop(
             } else {
                 input.text()
             };
-            let (crow, ccol) = input.cursor();
+            let (crow, ccol) = input.cursor_pos();
             // The input box height is capped (~40% of screen), so a long paste
             // can exceed it. Scroll the box to follow the caret and place the
             // caret within the visible window — otherwise it lands on the
@@ -540,12 +537,12 @@ fn ui_loop(
                 .block(WBlock::default().borders(Borders::ALL).title("input"))
                 .scroll((input_scroll, 0));
             f.render_widget(input_widget, chunks[1]);
-            // Show the caret when editable. Column offset accounts for the
-            // prompt only on the first line; wide chars may drift slightly.
+            // Place the caret. Column = border(1) + display width of the text
+            // before the caret (+ the prompt, on the first line only). Display
+            // width keeps it correct for wide chars.
             if !busy && mode == Mode::Input {
-                let prompt_chars = prompt.chars().count();
-                let lead = if crow == 0 { prompt_chars } else { 0 };
-                let x = chunks[1].x + 1 + (ccol + lead) as u16;
+                let lead = if crow == 0 { prompt.width() } else { 0 };
+                let x = chunks[1].x + 1 + (ccol + lead).min(u16::MAX as usize) as u16;
                 let y = chunks[1].y + 1 + (crow as u16).saturating_sub(input_scroll);
                 f.set_cursor_position((x, y));
             }
@@ -800,6 +797,57 @@ fn compact(v: &serde_json::Value) -> String {
     crate::agent::preview(&v.to_string())
 }
 
+/// Render a markdown string into styled lines. `tui-markdown` 0.3 styles inline
+/// elements (bold / code) correctly but leaves block elements literal: an ATX
+/// header renders as plain "## Title" (markers visible, no emphasis) and a list
+/// item as "- text". We keep its inline work and fix only the block lines —
+/// headers become a bold, level-colored title with the `#` markers stripped, and
+/// `-`/`*`/`+` bullets become `•`.
+fn render_markdown(md: &str) -> Vec<Line<'_>> {
+    let mut lines = tui_markdown::from_str(md).lines;
+    for line in lines.iter_mut() {
+        let first: &str = line.spans.first().map(|s| s.content.as_ref()).unwrap_or("");
+        if let Some(hashes) = header_level(first) {
+            // Collapse to one bold span; inline styling inside a header title
+            // is rare, so dropping it is fine.
+            let title: String = line
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()[hashes..]
+                .trim_start()
+                .to_string();
+            let color = match hashes {
+                1 => Color::Yellow,
+                2 | 3 => Color::Cyan,
+                _ => Color::DarkGray,
+            };
+            line.spans = vec![Span::styled(
+                title,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )];
+        } else if first.starts_with("- ") || first.starts_with("* ") || first.starts_with("+ ") {
+            // tui-markdown isolates the marker in its own span, so swap just it
+            // and keep the rest (inline code/bold on the item text).
+            if let Some(s0) = line.spans.first_mut() {
+                s0.content = "• ".into();
+            }
+        }
+    }
+    lines
+}
+
+/// ATX header level if `s` starts with 1..=6 '#' immediately followed by a
+/// space (CommonMark). None otherwise.
+fn header_level(s: &str) -> Option<usize> {
+    let n = s.chars().take_while(|c| *c == '#').count();
+    if (1..=6).contains(&n) && s[n..].starts_with(' ') {
+        Some(n)
+    } else {
+        None
+    }
+}
+
 /// Multi-line input editor: a vec of lines with a (row, col) cursor. `col` is
 /// a byte offset kept on UTF-8 char boundaries, so insert/remove never split a
 /// multi-byte character. Owned entirely by the UI thread.
@@ -922,12 +970,12 @@ impl InputBuffer {
         self.lines.join("\n")
     }
 
-    /// Cursor (row, char-column) for display. Char column so the caret lands on
-    /// a grapheme, not mid-codepoint. (Display width of wide chars is ignored —
-    /// the caret may drift on CJK, accepted for now.)
-    fn cursor(&self) -> (usize, usize) {
-        let col_chars = self.lines[self.row][..self.col].chars().count();
-        (self.row, col_chars)
+    /// (row, DISPLAY width of the text before the caret on that line). Display
+    /// width — not a char count — so the caret column is correct for wide (CJK)
+    /// chars, which occupy two columns each (a char count drifts one column per
+    /// wide char and lands the caret mid-text).
+    fn cursor_pos(&self) -> (usize, usize) {
+        (self.row, self.lines[self.row][..self.col].width())
     }
 }
 
@@ -950,6 +998,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn markdown_headers_and_lists_restyled() {
+        // tui-markdown 0.3 leaves ATX headers literal ("## T", unstyled) and
+        // bullets literal ("- x"). render_markdown must fix them while keeping
+        // inline styling (code → fg White) on list items.
+        let lines = render_markdown("## 标题\n\n- 项目 `code` more\n");
+        // Header: a single bold span, markers stripped, just the title.
+        let hdr = lines
+            .iter()
+            .find(|l| l.spans.first().is_some_and(|s| s.style.add_modifier.contains(Modifier::BOLD)))
+            .expect("a bold header line");
+        assert_eq!(hdr.spans.len(), 1);
+        let ht = hdr.spans[0].content.as_ref();
+        assert!(!ht.contains('#'), "header still has '#': {ht}");
+        assert_eq!(ht, "标题");
+
+        // List: first span is "• ", and a later span still carries inline code
+        // styling from `code` (kept, not dropped by the marker swap).
+        let list = lines
+            .iter()
+            .find(|l| l.spans.first().is_some_and(|s| s.content.as_ref() == "• "))
+            .expect("a bulleted list line");
+        assert_eq!(list.spans[0].content.as_ref(), "• ");
+        assert!(
+            list.spans.iter().any(|s| s.style.fg == Some(Color::White)),
+            "inline code styling lost: {:?}",
+            list.spans
+        );
+    }
+
+    #[test]
+    fn caret_column_uses_display_width() {
+        // 3 CJK chars = 6 display columns; the caret prefix width must be 6,
+        // not the char count 3, or the caret lands mid-text on wide input.
+        let mut b = InputBuffer::new();
+        for c in "看来离".chars() {
+            b.put_char(c);
+        }
+        assert_eq!(b.cursor_pos(), (0, 6));
+    }
+
+    #[test]
     fn type_and_drain() {
         let mut b = InputBuffer::new();
         for c in "hi".chars() {
@@ -969,7 +1058,7 @@ mod tests {
         b.newline();
         assert_eq!(b.text(), "ab\ncd");
         assert_eq!(b.line_count(), 2);
-        assert_eq!(b.cursor(), (1, 0));
+        assert_eq!(b.cursor_pos(), (1, 0));
     }
 
     #[test]
@@ -980,7 +1069,7 @@ mod tests {
         b.backspace(); // join → "abcd", cursor after "ab"
         assert_eq!(b.text(), "abcd");
         assert_eq!(b.line_count(), 1);
-        assert_eq!(b.cursor(), (0, 2));
+        assert_eq!(b.cursor_pos(), (0, 2));
     }
 
     #[test]
@@ -1025,7 +1114,7 @@ mod tests {
         b.move_up(); // -> row0; col 1 would be inside '中' (bytes 0..3)
         assert_eq!(b.row, 0);
         assert!(b.col == 0 || b.col == 3, "col {} not a boundary of '中'", b.col);
-        let _ = b.cursor(); // must not panic
+        let _ = b.cursor_pos(); // slices lines[row][..col]; must not panic
 
         // Reverse direction: cursor after 'a' (col1) on a 1-byte line, moving
         // down onto '中' lands col1 inside it.
@@ -1037,7 +1126,7 @@ mod tests {
         b.move_down(); // -> row1; col 1 inside '中'
         assert_eq!(b.row, 1);
         assert!(b.col == 0 || b.col == 3, "col {} not a boundary of '中'", b.col);
-        let _ = b.cursor(); // must not panic
+        let _ = b.cursor_pos(); // must not panic
     }
 
     #[test]
