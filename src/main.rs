@@ -35,6 +35,23 @@ struct Cli {
     #[arg(long)]
     task: Option<String>,
 
+    /// Override the model from the config
+    #[arg(long)]
+    model: Option<String>,
+
+    /// Override limits.max_turns
+    #[arg(long)]
+    max_turns: Option<u32>,
+
+    /// Override limits.timeout_secs (0 = no timeout)
+    #[arg(long)]
+    timeout: Option<u64>,
+
+    /// Headless: emit one JSON object per agent event on stdout (NDJSON) instead
+    /// of the human-readable format. Good for piping into another program.
+    #[arg(long)]
+    json: bool,
+
     /// Write a structured result JSON here when done (headless mode)
     #[arg(long)]
     output: Option<PathBuf>,
@@ -70,6 +87,16 @@ fn main() -> Result<()> {
     let mut cfg = Config::load(&cli.config)?;
     if let Some(t) = cli.task {
         cfg.task = Some(t);
+    }
+    // CLI overrides for quick A/B runs without editing the config.
+    if let Some(m) = cli.model {
+        cfg.model = m;
+    }
+    if let Some(n) = cli.max_turns {
+        cfg.limits.max_turns = n;
+    }
+    if let Some(s) = cli.timeout {
+        cfg.limits.timeout_secs = s;
     }
 
     // ── Batch mode ────────────────────────────────────────────────────
@@ -170,7 +197,7 @@ fn main() -> Result<()> {
         }
     } else {
         let mut agent = agent;
-        let code = harness::run(&mut agent, cli.output.as_deref())?;
+        let code = harness::run(&mut agent, cli.output.as_deref(), cli.json)?;
         // Drop the agent before exit so MCP stdio children are killed via
         // StdioTransport::drop — std::process::exit skips destructors, which
         // would otherwise orphan spawned MCP server processes.

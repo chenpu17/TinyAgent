@@ -162,7 +162,7 @@ fn run_one(
             // not claim success while the result file is missing.
             let mut error = None;
             if let Err(e) =
-                harness::write_result(&results_dir.join(format!("{name}.json")), &o)
+                harness::write_result(&results_dir.join(format!("{name}.json")), Some(&o), None)
             {
                 eprintln!("[warn] {name}: failed to write result file: {e:#}");
                 error = Some(format!("result file not written: {e:#}"));

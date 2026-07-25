@@ -5,73 +5,174 @@ use std::io::Write;
 use std::path::Path;
 
 /// Run the agent to completion in headless mode:
-/// stream events to stdout, then write a structured result file.
-/// Returns the process exit code (0 = success, 1 = failure).
-pub fn run(agent: &mut Agent, output_path: Option<&Path>) -> Result<i32> {
+/// - `json = false`: stream human-readable events to stdout/stderr.
+/// - `json = true`:  stream one JSON object per event (NDJSON) to stdout.
+///
+/// Then write a structured result file (always — even on failure). Returns the
+/// process exit code.
+pub fn run(agent: &mut Agent, output_path: Option<&Path>, json: bool) -> Result<i32> {
     let mut at_line_start = true;
-    let outcome = agent.run(&mut |ev| match ev {
-        AgentEvent::TurnStart(n) => {
-            if !at_line_start {
-                println!();
+    let result: std::result::Result<RunOutcome, anyhow::Error> =
+        agent.run(&mut |ev| {
+            if json {
+                emit_json(&ev);
+                return;
             }
-            eprintln!("── turn {n} ──");
+            match ev {
+                AgentEvent::TurnStart(n) => {
+                    if !at_line_start {
+                        println!();
+                    }
+                    eprintln!("── turn {n} ──");
+                }
+                AgentEvent::TextDelta(t) => {
+                    print!("{t}");
+                    let _ = std::io::stdout().flush();
+                    at_line_start = t.ends_with('\n');
+                }
+                AgentEvent::ToolCall { name, input } => {
+                    println!("\n[tool →] {name} {}", compact(&input));
+                }
+                AgentEvent::ToolResult {
+                    name,
+                    is_error,
+                    content,
+                } => {
+                    let tag = if is_error { "[tool ✗]" } else { "[tool ✓]" };
+                    println!("{tag} {name}: {}", crate::agent::preview(&content));
+                }
+                AgentEvent::Done { stop_reason } => {
+                    println!("\n[done: {stop_reason}]");
+                }
+                AgentEvent::Compressed { dropped, kept } => {
+                    println!("\n[context compressed: dropped {dropped} messages, {kept} kept]");
+                }
+                AgentEvent::Usage { input_tokens, output_tokens } => {
+                    eprintln!("[tokens: {input_tokens}↑ {output_tokens}↓]");
+                }
+            }
+        });
+
+    // Always produce a result artifact, even on failure: the previous `?` here
+    // skipped write_result on any error, leaving CI with nothing but an opaque
+    // non-zero exit. Batch (run_one) already did this; single-run now matches.
+    let (code, outcome, error) = match result {
+        Ok(o) => (exit_code_for(&o.stop_reason), Some(o), None),
+        Err(e) => (EXIT_ERROR, None, Some(format!("{e:#}"))),
+    };
+    if let Some(path) = output_path {
+        write_result(path, outcome.as_ref(), error.as_deref())?;
+        if !json {
+            eprintln!("result written to {}", path.display());
         }
-        AgentEvent::TextDelta(t) => {
-            print!("{t}");
-            let _ = std::io::stdout().flush();
-            at_line_start = t.ends_with('\n');
-        }
+    }
+    Ok(code)
+}
+
+/// Exit codes. 0 = success; 124 = timed out (GNU `timeout` convention); 130 =
+/// cancelled (128 + SIGINT, the conventional "interrupted" code); 1 = anything
+/// else (max_turns, provider error, …). Scripts can branch on `$?`; the result
+/// JSON carries the precise stop_reason / error for detail.
+const EXIT_ERROR: i32 = 1;
+const EXIT_TIMEOUT: i32 = 124;
+const EXIT_CANCELLED: i32 = 130;
+
+fn exit_code_for(stop_reason: &str) -> i32 {
+    match stop_reason {
+        "end_turn" => 0,
+        "timeout" => EXIT_TIMEOUT,
+        "cancelled" => EXIT_CANCELLED,
+        _ => EXIT_ERROR,
+    }
+}
+
+/// Print one JSON object per event (NDJSON) for `--json` mode, so a pipeline
+/// can consume progress live instead of waiting for the final result file.
+fn emit_json(ev: &AgentEvent) {
+    // ev is borrowed, so the match bindings are references — clone the owned
+    // fields (String/Value) and deref the Copy ones for serde_json::Value.
+    let v = match ev {
+        AgentEvent::TurnStart(n) => json!({"type": "turn", "n": *n}),
+        AgentEvent::TextDelta(t) => json!({"type": "text", "delta": t.clone()}),
         AgentEvent::ToolCall { name, input } => {
-            println!("\n[tool →] {name} {}", compact(&input));
+            json!({"type": "tool_call", "name": name.clone(), "input": input.clone()})
         }
         AgentEvent::ToolResult {
             name,
             is_error,
             content,
         } => {
-            let tag = if is_error { "[tool ✗]" } else { "[tool ✓]" };
-            println!("{tag} {name}: {}", crate::agent::preview(&content));
+            json!({
+                "type": "tool_result",
+                "name": name.clone(),
+                "is_error": *is_error,
+                "content": content.clone(),
+            })
         }
-        AgentEvent::Done { stop_reason } => {
-            println!("\n[done: {stop_reason}]");
+        AgentEvent::Usage {
+            input_tokens,
+            output_tokens,
+        } => {
+            json!({
+                "type": "usage",
+                "input_tokens": *input_tokens,
+                "output_tokens": *output_tokens,
+            })
         }
         AgentEvent::Compressed { dropped, kept } => {
-            println!("\n[context compressed: dropped {dropped} messages, {kept} kept]");
+            json!({"type": "compressed", "dropped": *dropped, "kept": *kept})
         }
-        AgentEvent::Usage { input_tokens, output_tokens } => {
-            eprintln!("[tokens: {input_tokens}↑ {output_tokens}↓]");
+        AgentEvent::Done { stop_reason } => {
+            json!({"type": "done", "stop_reason": stop_reason.clone()})
         }
-    })?;
-
-    if let Some(path) = output_path {
-        write_result(path, &outcome)?;
-        eprintln!("result written to {}", path.display());
-    }
-
-    let success = outcome.stop_reason == "end_turn";
-    Ok(if success { 0 } else { 1 })
+    };
+    println!(
+        "{}",
+        serde_json::to_string(&v).unwrap_or_else(|_| "{}".into())
+    );
+    let _ = std::io::stdout().flush();
 }
 
-pub fn write_result(path: &Path, o: &RunOutcome) -> Result<()> {
-    let tool_calls: Vec<_> = o
-        .tool_calls
-        .iter()
-        .map(|c| {
+pub fn write_result(path: &Path, outcome: Option<&RunOutcome>, error: Option<&str>) -> Result<()> {
+    // json! takes values by ownership, so the &RunOutcome fields are cloned
+    // here; Option<&str> is turned into a JSON null/string explicitly (Value
+    // has no From<Option<_>>).
+    let error_val: serde_json::Value = match error {
+        Some(s) => json!(s),
+        None => serde_json::Value::Null,
+    };
+    let result = match outcome {
+        Some(o) => {
+            let tool_calls: Vec<_> = o
+                .tool_calls
+                .iter()
+                .map(|c| {
+                    json!({
+                        "name": c.name.clone(),
+                        "input": c.input.clone(),
+                        "output": c.output.clone(),
+                        "is_error": c.is_error,
+                    })
+                })
+                .collect();
             json!({
-                "name": c.name,
-                "input": c.input,
-                "is_error": c.is_error,
+                "success": o.stop_reason == "end_turn",
+                "stop_reason": o.stop_reason.clone(),
+                "turns": o.turns,
+                "elapsed_secs": o.elapsed.as_secs_f64(),
+                "input_tokens": o.input_tokens,
+                "output_tokens": o.output_tokens,
+                "summary": o.final_text.clone(),
+                "tool_calls": tool_calls,
+                "error": error_val,
             })
-        })
-        .collect();
-    let result = json!({
-        "success": o.stop_reason == "end_turn",
-        "stop_reason": o.stop_reason,
-        "turns": o.turns,
-        "elapsed_secs": o.elapsed.as_secs_f64(),
-        "summary": o.final_text,
-        "tool_calls": tool_calls,
-    });
+        }
+        None => json!({
+            "success": false,
+            "stop_reason": "error",
+            "error": error_val,
+        }),
+    };
     let bytes = serde_json::to_string_pretty(&result)?;
     atomic_write(path, bytes.as_bytes())
 }
@@ -111,6 +212,8 @@ fn compact(v: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::{RunOutcome, ToolCallRecord};
+    use serde_json::json;
 
     #[test]
     fn atomic_write_roundtrips_and_leaves_no_tmp() {
@@ -125,5 +228,54 @@ mod tests {
         atomic_write(&path, b"v2").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "v2");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_result_carries_output_tokens_and_error() {
+        let dir = std::env::temp_dir().join(format!("ta-res-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let o = RunOutcome {
+            final_text: "done".into(),
+            turns: 2,
+            stop_reason: "end_turn".into(),
+            tool_calls: vec![ToolCallRecord {
+                name: "read_file".into(),
+                input: json!({"path": "a.txt"}),
+                output: "hello world".into(),
+                is_error: false,
+            }],
+            input_tokens: 100,
+            output_tokens: 5,
+            elapsed: std::time::Duration::from_secs_f64(1.5),
+        };
+        // Success path: tool output + token totals + summary all present.
+        let path = dir.join("out.json");
+        write_result(&path, Some(&o), None).unwrap();
+        let s = std::fs::read_to_string(&path).unwrap();
+        assert!(s.contains("\"output\"") && s.contains("hello world"), "tool output missing");
+        assert!(
+            s.contains("\"input_tokens\"") && s.contains("\"output_tokens\""),
+            "token totals missing"
+        );
+        assert!(s.contains("\"summary\""));
+
+        // Failure path: agent.run returned Err — still write a result artifact
+        // (this is the gap the old `?`-skips-write_result had).
+        let epath = dir.join("err.json");
+        write_result(&epath, None, Some("provider 503")).unwrap();
+        let es = std::fs::read_to_string(&epath).unwrap();
+        assert!(es.contains("\"success\": false"));
+        assert!(es.contains("provider 503"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn exit_code_distinguishes_outcomes() {
+        assert_eq!(exit_code_for("end_turn"), 0);
+        assert_eq!(exit_code_for("timeout"), 124);
+        assert_eq!(exit_code_for("cancelled"), 130);
+        assert_eq!(exit_code_for("max_turns_reached"), 1);
+        assert_eq!(exit_code_for("max_tokens"), 1);
     }
 }

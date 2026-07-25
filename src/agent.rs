@@ -27,6 +27,10 @@ pub enum AgentEvent {
 pub struct ToolCallRecord {
     pub name: String,
     pub input: Value,
+    /// The tool's result text (what read_file returned, shell stdout, …) — kept
+    /// so the structured result file is self-contained for verification, not
+    /// just the model's summary of it.
+    pub output: String,
     pub is_error: bool,
 }
 
@@ -35,6 +39,10 @@ pub struct RunOutcome {
     pub turns: u32,
     pub stop_reason: String,
     pub tool_calls: Vec<ToolCallRecord>,
+    /// Token usage summed across every chat request in this run (best-effort:
+    /// only the requests whose stream reached the usage frame).
+    pub input_tokens: u64,
+    pub output_tokens: u64,
     pub elapsed: Duration,
 }
 
@@ -157,6 +165,10 @@ impl Agent {
         let mut final_text = String::new();
         let mut records: Vec<ToolCallRecord> = Vec::new();
         let mut stop_reason: String;
+        // Running token totals for RunOutcome (the per-turn Usage event is also
+        // emitted to the frontend; these accumulate for the result file).
+        let mut in_tokens: u64 = 0;
+        let mut out_tokens: u64 = 0;
 
         loop {
             if self.cancelled() {
@@ -201,6 +213,8 @@ impl Agent {
                 ChatEvent::TextDelta(t) => events(AgentEvent::TextDelta(t)),
             })?;
             if let Some(u) = resp.usage {
+                in_tokens += u.input_tokens;
+                out_tokens += u.output_tokens;
                 events(AgentEvent::Usage {
                     input_tokens: u.input_tokens,
                     output_tokens: u.output_tokens,
@@ -312,6 +326,7 @@ impl Agent {
                 records.push(ToolCallRecord {
                     name: name.clone(),
                     input: input.clone(),
+                    output: output.content.clone(),
                     is_error: output.is_error,
                 });
                 events(AgentEvent::ToolResult {
@@ -338,6 +353,8 @@ impl Agent {
             turns,
             stop_reason,
             tool_calls: records,
+            input_tokens: in_tokens,
+            output_tokens: out_tokens,
             elapsed: start.elapsed(),
         })
     }
