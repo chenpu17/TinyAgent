@@ -16,6 +16,11 @@ pub struct ToolCtx {
     pub max_output_chars: usize,
     /// When true, file tools refuse paths that escape `workdir`.
     pub restrict_to_workdir: bool,
+    /// Cancellation flag shared with the agent run. Pollable tools (shell)
+    /// check this between waits so Ctrl-C can interrupt a long-running
+    /// command within ~50ms instead of waiting out its full timeout. None in
+    /// headless mode (no interactive cancellation).
+    pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 pub struct ToolOutput {

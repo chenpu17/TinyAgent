@@ -71,10 +71,21 @@ impl Tool for Shell {
         let out_thread = std::thread::spawn(move || read_capped(&mut out_pipe, cap));
         let err_thread = std::thread::spawn(move || read_capped(&mut err_pipe, cap));
 
-        // Poll the child so a timeout can kill it (wait_with_output would
-        // consume the handle and leak the process on timeout).
+        // Poll the child so a timeout or cancel can kill it (wait_with_output
+        // would consume the handle and leak the process on timeout).
         let deadline = Instant::now() + CMD_TIMEOUT;
+        let mut cancelled = false;
         let status = loop {
+            // Honor an interactive cancel (Ctrl-C in the TUI) between polls,
+            // killing the whole process group the same way a timeout does.
+            if let Some(c) = &ctx.cancel {
+                if c.load(std::sync::atomic::Ordering::Relaxed) {
+                    cancelled = true;
+                    kill_process_group(&child);
+                    let _ = child.wait();
+                    break None;
+                }
+            }
             match child.try_wait() {
                 Ok(Some(s)) => break Some(s),
                 Ok(None) if Instant::now() >= deadline => {
@@ -98,10 +109,14 @@ impl Tool for Shell {
             let mut out = format!("$ {cmd}\n");
             out.push_str(&String::from_utf8_lossy(&stdout));
             truncate(&mut out, ctx.max_output_chars);
-            out.push_str(&format!(
-                "\n[command timed out after {}s and was killed]",
-                CMD_TIMEOUT.as_secs()
-            ));
+            if cancelled {
+                out.push_str("\n[command cancelled by user]");
+            } else {
+                out.push_str(&format!(
+                    "\n[command timed out after {}s and was killed]",
+                    CMD_TIMEOUT.as_secs()
+                ));
+            }
             return Ok(ToolOutput::error(out));
         };
 
@@ -162,3 +177,35 @@ fn kill_process_group(child: &std::process::Child) {
 
 #[cfg(not(unix))]
 fn kill_process_group(_child: &std::process::Child) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn cancel_flag_kills_a_running_command_promptly() {
+        // Cancel pre-set: the poll loop must notice it on the first iteration
+        // and kill the whole process group, returning within ~1s instead of
+        // waiting out the full CMD_TIMEOUT (120s). The output reports the
+        // cancellation distinctly from a timeout.
+        let cancel = Arc::new(AtomicBool::new(true));
+        let ctx = ToolCtx {
+            workdir: std::env::temp_dir(),
+            max_output_chars: 1000,
+            restrict_to_workdir: false,
+            cancel: Some(cancel),
+        };
+        let start = Instant::now();
+        let out = Shell.run(&json!({"command": "sleep 30"}), &ctx).unwrap();
+        let elapsed = start.elapsed();
+        assert!(out.is_error);
+        assert!(out.content.contains("cancelled by user"));
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "cancel should kill within a poll interval, took {elapsed:?}"
+        );
+    }
+}

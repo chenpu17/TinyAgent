@@ -81,9 +81,12 @@ impl Agent {
         }
     }
 
-    /// Attach a cancellation flag; checked at every turn boundary.
+    /// Attach a cancellation flag; checked at every turn boundary and shared
+    /// with tools (via ToolCtx) so a running shell can be interrupted too,
+    /// not only the streaming read.
     #[cfg_attr(not(feature = "tui"), allow(dead_code))]
     pub fn set_cancel(&mut self, flag: Arc<AtomicBool>) {
+        self.ctx.cancel = Some(flag.clone());
         self.cancel = Some(flag);
     }
 
@@ -226,6 +229,40 @@ impl Agent {
             self.messages.push(Message::assistant(resp.blocks.clone()));
             self.save_session();
 
+            // A cancelled / idle-timeout / truncated stream may leave a
+            // half-delivered tool_use whose input is partial or _raw. Never
+            // execute it. Also drop it from the saved assistant message: a
+            // tool_use with no matching tool_result would be rejected by strict
+            // APIs on the next request. Keep whatever partial text arrived so
+            // the transcript reflects what the user saw.
+            let aborted = self.cancelled()
+                || matches!(
+                    resp.stop_reason.as_str(),
+                    "cancelled" | "stream_idle" | "stream_truncated"
+                );
+            if aborted {
+                let kept: Vec<Block> = resp
+                    .blocks
+                    .iter()
+                    .filter(|b| !matches!(b, Block::ToolUse { .. }))
+                    .cloned()
+                    .collect();
+                // Replace the just-pushed message with the filtered one (or
+                // drop it entirely if only a partial tool_use arrived).
+                match self.messages.last_mut() {
+                    Some(m) if m.role == Role::Assistant => {
+                        if kept.is_empty() {
+                            self.messages.pop();
+                        } else {
+                            m.content = kept;
+                        }
+                    }
+                    _ => {}
+                }
+                self.save_session();
+                break;
+            }
+
             if !has_tool_use {
                 break; // end_turn / max_tokens without pending calls
             }
@@ -285,11 +322,16 @@ impl Agent {
 
 pub(crate) fn preview(s: &str) -> String {
     const MAX: usize = 200;
-    let one_line: String = s.chars().take(MAX).collect();
-    if s.chars().count() > MAX {
-        format!("{one_line}…")
+    // Single pass: take MAX chars, then test whether anything remained. The
+    // old `.chars().count() > MAX` walked the WHOLE string just to decide
+    // truncation — O(n) per call, and the renderer calls this every frame for
+    // every collapsed tool row.
+    let mut it = s.chars();
+    let head: String = it.by_ref().take(MAX).collect();
+    if it.next().is_some() {
+        format!("{head}…")
     } else {
-        one_line
+        head
     }
 }
 
@@ -618,5 +660,19 @@ mod tests {
         ])];
         // 4 + 9 + 10 = 23
         assert_eq!(total_chars(&msgs), 23);
+    }
+
+    #[test]
+    fn preview_truncates_in_one_pass() {
+        // Single-pass truncation: up to 200 chars kept verbatim, 201+ gets an
+        // ellipsis; the exact boundary (MAX) must NOT add one.
+        assert_eq!(preview("hi"), "hi");
+        let exact: String = "b".repeat(200);
+        let p = preview(&exact);
+        assert_eq!(p.chars().count(), 200);
+        assert!(!p.ends_with('…'));
+        let over = preview(&"a".repeat(500));
+        assert!(over.ends_with('…'));
+        assert_eq!(over.chars().count(), 201); // 200 + ellipsis
     }
 }

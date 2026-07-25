@@ -22,9 +22,12 @@ enum Row {
     Assistant(String),
     /// Tool call: collapsed shows a compact one-line arg summary; expanded
     /// pretty-prints the full input JSON. `expanded` is toggled in Nav mode.
+    /// `collapsed` caches the compact arg summary at creation so the renderer
+    /// doesn't re-serialize the input JSON every frame.
     ToolCall {
         name: String,
         input: serde_json::Value,
+        collapsed: String,
         expanded: bool,
     },
     /// Tool result: collapsed shows a truncated preview; expanded shows the
@@ -304,9 +307,11 @@ fn ui_loop(
                     }
                     AgentEvent::ToolCall { name, input } => {
                         streaming = false;
+                        let collapsed = compact(&input);
                         rows.push(Row::ToolCall {
                             name,
                             input,
+                            collapsed,
                             expanded: false,
                         });
                     }
@@ -383,7 +388,12 @@ fn ui_loop(
                         let md = tui_markdown::from_str(t).to_owned();
                         lines.extend(md.lines);
                     }
-                    Row::ToolCall { name, input, expanded } => {
+                    Row::ToolCall {
+                        name,
+                        input,
+                        collapsed,
+                        expanded,
+                    } => {
                         lines.push(Line::from(Span::styled(
                             format!("{marker}→ {name}"),
                             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
@@ -392,7 +402,7 @@ fn ui_loop(
                             serde_json::to_string_pretty(input)
                                 .unwrap_or_else(|_| input.to_string())
                         } else {
-                            compact(input)
+                            collapsed.clone()
                         };
                         for l in body.lines() {
                             lines.push(Line::from(Span::styled(
@@ -458,17 +468,24 @@ fn ui_loop(
             } else {
                 input.text()
             };
+            let (crow, ccol) = input.cursor();
+            // The input box height is capped (~40% of screen), so a long paste
+            // can exceed it. Scroll the box to follow the caret and place the
+            // caret within the visible window — otherwise it lands on the
+            // status bar or off-screen.
+            let inner_rows = (input_h as usize).saturating_sub(2);
+            let input_scroll = crow.saturating_sub(inner_rows.saturating_sub(1)) as u16;
             let input_widget = Paragraph::new(format!("{prompt}{body}"))
-                .block(WBlock::default().borders(Borders::ALL).title("input"));
+                .block(WBlock::default().borders(Borders::ALL).title("input"))
+                .scroll((input_scroll, 0));
             f.render_widget(input_widget, chunks[1]);
             // Show the caret when editable. Column offset accounts for the
             // prompt only on the first line; wide chars may drift slightly.
             if !busy && mode == Mode::Input {
-                let (crow, ccol) = input.cursor();
                 let prompt_chars = prompt.chars().count();
                 let lead = if crow == 0 { prompt_chars } else { 0 };
                 let x = chunks[1].x + 1 + (ccol + lead) as u16;
-                let y = chunks[1].y + 1 + crow as u16;
+                let y = chunks[1].y + 1 + (crow as u16).saturating_sub(input_scroll);
                 f.set_cursor_position((x, y));
             }
 
@@ -510,6 +527,11 @@ fn ui_loop(
                     (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                         if busy {
                             cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                            // End the current assistant bubble: a System row is
+                            // now last, so any trailing TextDelta events still
+                            // queued before the stream stops must start a fresh
+                            // Assistant row instead of being silently dropped.
+                            streaming = false;
                             rows.push(Row::System("[cancelling…]".into()));
                         } else {
                             let _ = in_tx.send(None);
@@ -521,7 +543,15 @@ fn ui_loop(
                         mode = match mode {
                             Mode::Input => {
                                 // Snap to the first tool row if nothing is
-                                // selected, so j/k have a starting point.
+                                // selected, or if the old selection is stale
+                                // (points past the end / at a non-tool row,
+                                // e.g. after /clear shrank the list), so j/k
+                                // always start from a valid tool row.
+                                if select_idx
+                                    .is_some_and(|i| i >= rows.len() || !is_selectable(&rows[i]))
+                                {
+                                    select_idx = None;
+                                }
                                 if select_idx.is_none() {
                                     select_idx = rows.iter().position(is_selectable);
                                 }
@@ -587,6 +617,11 @@ fn ui_loop(
                                         rows.clear();
                                         in_tokens = 0;
                                         out_tokens = 0;
+                                        // Reset Nav state: select_idx pointed at
+                                        // a now-vanished row, and clearing is an
+                                        // input-mode action.
+                                        select_idx = None;
+                                        mode = Mode::Input;
                                         rows.push(Row::System("[history cleared]".into()));
                                         let _ = in_tx.send(Some(Input::Clear));
                                     }
@@ -948,6 +983,7 @@ mod tests {
             Row::ToolCall {
                 name: "a".into(),
                 input: serde_json::Value::Null,
+                collapsed: String::new(),
                 expanded: false,
             },
             Row::Assistant("x".into()),

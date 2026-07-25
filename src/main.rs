@@ -201,6 +201,7 @@ pub(crate) fn build_agent(
         workdir,
         max_output_chars: cfg.limits.max_output_chars,
         restrict_to_workdir: cfg.restrict_to_workdir,
+        cancel: None,
     };
     Ok(Agent::new(cfg, provider, tool_list, initial, ctx))
 }
