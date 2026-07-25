@@ -229,16 +229,22 @@ impl Agent {
             self.messages.push(Message::assistant(resp.blocks.clone()));
             self.save_session();
 
-            // A cancelled / idle-timeout / truncated stream may leave a
-            // half-delivered tool_use whose input is partial or _raw. Never
-            // execute it. Also drop it from the saved assistant message: a
-            // tool_use with no matching tool_result would be rejected by strict
-            // APIs on the next request. Keep whatever partial text arrived so
-            // the transcript reflects what the user saw.
+            // A cancelled / idle-timeout / truncated / max_tokens stream may
+            // leave a half-delivered tool_use whose input is partial or _raw.
+            // OpenAI maps finish_reason "length" → "max_tokens"; when the
+            // budget runs out mid tool-call arguments the truncated JSON fails
+            // to parse and falls back to a _raw sentinel — executing that is
+            // garbage. Anthropic is unaffected (it still emits content_block_stop,
+            // so malformed JSON fails the request rather than yielding _raw).
+            // Drop such tool_use blocks; also remove them from the saved
+            // assistant message so a tool_use with no matching tool_result
+            // isn't rejected by strict APIs on the next request. Keep whatever
+            // partial text arrived so the transcript reflects what the user
+            // saw. (stop_reason is still reported as-is below.)
             let aborted = self.cancelled()
                 || matches!(
                     resp.stop_reason.as_str(),
-                    "cancelled" | "stream_idle" | "stream_truncated"
+                    "cancelled" | "stream_idle" | "stream_truncated" | "max_tokens"
                 );
             if aborted {
                 let kept: Vec<Block> = resp

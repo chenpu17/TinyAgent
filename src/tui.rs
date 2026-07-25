@@ -168,6 +168,19 @@ impl Drop for DoneSignal {
     }
 }
 
+/// Restores the terminal on drop. Installed right after raw mode + alternate
+/// screen are entered, so a panic (or a propagated `?` error) inside the UI
+/// loop unwinds through this and still leaves the user's terminal usable —
+/// without it, a panic mid-draw strands them in raw mode with no echo.
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = stdout().execute(LeaveAlternateScreen);
+    }
+}
+
 pub fn run(
     agent: Agent,
     cfg: &Config,
@@ -233,6 +246,10 @@ pub fn run(
 
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
+    // From here the terminal is modified; the guard restores it on drop so a
+    // panic (or a propagated `?` error) in the UI loop below can't strand the
+    // user in raw mode + alternate screen.
+    let _guard = TerminalGuard;
     let mut term = Terminal::new(ratatui::backend::CrosstermBackend::new(stdout()))?;
     let result = ui_loop(
         &mut term,
@@ -256,10 +273,10 @@ pub fn run(
     // call up to its timeout) just lets this time out — we then detach as
     // before, never hanging exit.
     let _ = done_rx.recv_timeout(Duration::from_secs(3));
-    disable_raw_mode()?;
-    stdout().execute(LeaveAlternateScreen)?;
     drop(worker); // detach if the worker is still stuck past the deadline
     result
+    // _guard drops here: restores the terminal (raw mode off, leave alt screen)
+    // on the normal path and on any unwind above.
 }
 
 fn ui_loop(
@@ -313,7 +330,25 @@ fn ui_loop(
 
     loop {
         // Drain worker events.
-        while let Ok(msg) = out_rx.try_recv() {
+        loop {
+            let msg = match out_rx.try_recv() {
+                Ok(m) => m,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // Worker thread is gone (e.g. panicked mid-run, or the
+                    // process is tearing down). Don't leave the UI stuck in
+                    // "running" waiting for a RunFinished that will never come
+                    // — surface it so the user can Esc out cleanly.
+                    if busy {
+                        busy = false;
+                        streaming = false;
+                        rows.push(Row::System(
+                            "[worker stopped unexpectedly — press Esc to quit]".into(),
+                        ));
+                    }
+                    break;
+                }
+            };
             match msg {
                 UiMsg::Event(ev) => match ev {
                     AgentEvent::TurnStart(n) => {
@@ -472,7 +507,7 @@ fn ui_loop(
             if scroll_up > max_scroll {
                 scroll_up = max_scroll;
             }
-            let scroll = (max_scroll - scroll_up) as u16;
+            let scroll = (max_scroll - scroll_up).min(u16::MAX as usize) as u16;
 
             let history = Paragraph::new(lines)
                 .block(WBlock::default().borders(Borders::ALL).title("conversation"))
@@ -498,7 +533,9 @@ fn ui_loop(
             // caret within the visible window — otherwise it lands on the
             // status bar or off-screen.
             let inner_rows = (input_h as usize).saturating_sub(2);
-            let input_scroll = crow.saturating_sub(inner_rows.saturating_sub(1)) as u16;
+            let input_scroll = crow
+                .saturating_sub(inner_rows.saturating_sub(1))
+                .min(u16::MAX as usize) as u16;
             let input_widget = Paragraph::new(format!("{prompt}{body}"))
                 .block(WBlock::default().borders(Borders::ALL).title("input"))
                 .scroll((input_scroll, 0));
@@ -834,14 +871,14 @@ impl InputBuffer {
     fn move_up(&mut self) {
         if self.row > 0 {
             self.row -= 1;
-            self.col = self.col.min(self.lines[self.row].len());
+            self.col = floor_char_boundary(&self.lines[self.row], self.col);
         }
     }
 
     fn move_down(&mut self) {
         if self.row + 1 < self.lines.len() {
             self.row += 1;
-            self.col = self.col.min(self.lines[self.row].len());
+            self.col = floor_char_boundary(&self.lines[self.row], self.col);
         }
     }
 
@@ -892,6 +929,20 @@ impl InputBuffer {
         let col_chars = self.lines[self.row][..self.col].chars().count();
         (self.row, col_chars)
     }
+}
+
+/// Nearest UTF-8 char boundary at or below `idx`. `col` is a byte offset kept
+/// on char boundaries of the *current* line; vertical motion targets a line
+/// whose multibyte layout may differ, so an offset that's valid here can land
+/// mid-codepoint there — and slicing/inserting at a non-boundary
+/// (`cursor`/`put_char`/`backspace`/`move_*`) panics. Flooring to a boundary
+/// avoids that.
+fn floor_char_boundary(s: &str, idx: usize) -> usize {
+    let mut i = idx.min(s.len());
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
 }
 
 #[cfg(test)]
@@ -962,6 +1013,31 @@ mod tests {
         b.move_up(); // col clamps to min(3, line0.len())
         assert_eq!(b.row, 0);
         assert!(b.col <= "long line one".len());
+    }
+
+    #[test]
+    fn move_up_down_floors_to_char_boundary() {
+        // col is a byte offset valid on the current line. Moving to a line whose
+        // multibyte layout differs can place it mid-codepoint — cursor() then
+        // slices lines[row][..col] and panics. The mover must floor to a boundary.
+        let mut b = InputBuffer::new();
+        b.set_text("中\na"); // ["中"(3B), "a"(1B)]; cursor at end of "a": row1 col1
+        b.move_up(); // -> row0; col 1 would be inside '中' (bytes 0..3)
+        assert_eq!(b.row, 0);
+        assert!(b.col == 0 || b.col == 3, "col {} not a boundary of '中'", b.col);
+        let _ = b.cursor(); // must not panic
+
+        // Reverse direction: cursor after 'a' (col1) on a 1-byte line, moving
+        // down onto '中' lands col1 inside it.
+        let mut b = InputBuffer::new();
+        b.set_text("a\n中"); // ["a", "中"]; cursor ends at row1 col3 (end of 中)
+        b.home(); // row1 col0
+        b.move_up(); // row0 col0
+        b.end(); // row0 col1 (after 'a')
+        b.move_down(); // -> row1; col 1 inside '中'
+        assert_eq!(b.row, 1);
+        assert!(b.col == 0 || b.col == 3, "col {} not a boundary of '中'", b.col);
+        let _ = b.cursor(); // must not panic
     }
 
     #[test]
