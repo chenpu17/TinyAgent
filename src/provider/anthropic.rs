@@ -1,4 +1,4 @@
-use super::{Block, CancellableSse, ChatEvent, ChatRequest, ChatResponse, Message, Provider, Role, SseSource, StreamAbort, ToolDef};
+use super::{Block, CancellableSse, ChatEvent, ChatRequest, ChatResponse, Message, Provider, Role, SseSource, StreamAbort, ToolDef, Usage};
 #[cfg(test)]
 use super::SseReader;
 use anyhow::{anyhow, bail, Context, Result};
@@ -185,6 +185,7 @@ impl Anthropic {
         let mut stop_reason = String::from("end_turn");
         let mut got_stop = false;
         let mut abort: Option<&'static str> = None;
+        let mut usage = Usage::default();
 
         loop {
             let data = match src.next_payload() {
@@ -204,6 +205,11 @@ impl Anthropic {
                 Err(_) => continue, // ignore unparseable keep-alives
             };
             match ev["type"].as_str().unwrap_or("") {
+                "message_start" => {
+                    if let Some(i) = ev["message"]["usage"]["input_tokens"].as_u64() {
+                        usage.input_tokens = i;
+                    }
+                }
                 "content_block_start" => {
                     // A previous block that never received content_block_stop
                     // (truncated stream) would be overwritten here — flush it
@@ -249,6 +255,9 @@ impl Anthropic {
                         stop_reason = r.to_string();
                         got_stop = true;
                     }
+                    if let Some(o) = ev["usage"]["output_tokens"].as_u64() {
+                        usage.output_tokens = o;
+                    }
                 }
                 "error" => {
                     bail!(
@@ -277,7 +286,7 @@ impl Anthropic {
         } else {
             "stream_truncated".into()
         };
-        Ok(ChatResponse { blocks, stop_reason })
+        Ok(ChatResponse { blocks, stop_reason, usage: Some(usage) })
     }
 }
 
@@ -292,17 +301,35 @@ mod tests {
     #[test]
     fn stream_text_and_stop_reason() {
         let raw = concat!(
-            "event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":12}}}\n\n",
             "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
             "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n",
             "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" world\"}}\n\n",
             "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
-            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7}}\n\n",
         );
         let resp = parse(raw.as_bytes());
         assert_eq!(resp.stop_reason, "end_turn");
         assert_eq!(resp.blocks.len(), 1);
         assert!(matches!(&resp.blocks[0], Block::Text(t) if t == "Hello world"));
+        assert_eq!(
+            resp.usage.map(|u| (u.input_tokens, u.output_tokens)),
+            Some((12, 7))
+        );
+    }
+
+    #[test]
+    fn stream_usage_defaults_when_missing() {
+        // No usage frames in the stream → Some(0,0), not None, because the
+        // Anthropic reader initializes usage to zero and always returns it.
+        // (Either side may legitimately be absent if the stream is cut short.)
+        let raw = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"hi\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        );
+        let resp = parse(raw.as_bytes());
+        let u = resp.usage.expect("anthropic always reports usage");
+        assert_eq!((u.input_tokens, u.output_tokens), (0, 0));
     }
 
     #[test]

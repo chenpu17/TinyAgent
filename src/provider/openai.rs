@@ -1,4 +1,4 @@
-use super::{Block, CancellableSse, ChatEvent, ChatRequest, ChatResponse, Message, Provider, Role, SseSource, StreamAbort, ToolDef};
+use super::{Block, CancellableSse, ChatEvent, ChatRequest, ChatResponse, Message, Provider, Role, SseSource, StreamAbort, ToolDef, Usage};
 #[cfg(test)]
 use super::SseReader;
 use anyhow::{bail, Context, Result};
@@ -158,6 +158,7 @@ impl Provider for OpenAi {
             "model": req.model,
             "max_tokens": req.max_tokens,
             "stream": true,
+            "stream_options": {"include_usage": true},
             "messages": messages,
         });
         if !req.tools.is_empty() {
@@ -243,6 +244,7 @@ impl OpenAi {
         let mut finish_reason = String::from("stop");
         let mut got_finish = false;
         let mut abort: Option<&'static str> = None;
+        let mut usage: Option<Usage> = None;
 
         loop {
             let data = match src.next_payload() {
@@ -276,6 +278,14 @@ impl OpenAi {
             }
             let choice = &ev["choices"][0];
             if choice.is_null() {
+                // With stream_options.include_usage the final chunk has an empty
+                // choices array and carries the usage totals.
+                if let Some(u) = ev.get("usage") {
+                    usage = Some(Usage {
+                        input_tokens: u["prompt_tokens"].as_u64().unwrap_or(0),
+                        output_tokens: u["completion_tokens"].as_u64().unwrap_or(0),
+                    });
+                }
                 continue;
             }
             if let Some(r) = choice["finish_reason"].as_str() {
@@ -355,7 +365,7 @@ impl OpenAi {
                 other => other.into(),
             }
         };
-        Ok(ChatResponse { blocks, stop_reason })
+        Ok(ChatResponse { blocks, stop_reason, usage })
     }
 }
 
@@ -483,11 +493,29 @@ mod tests {
         let raw = concat!(
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"partial\"}}]}\n\n",
             "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"length\",\"delta\":{}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":42,\"completion_tokens\":9,\"total_tokens\":51}}\n\n",
             "data: [DONE]\n\n",
         );
         let resp = OpenAi::parse_stream(raw.as_bytes(), &mut |_| {}).unwrap();
         assert_eq!(resp.stop_reason, "max_tokens");
         assert!(matches!(&resp.blocks[0], Block::Text(t) if t == "partial"));
+        assert_eq!(
+            resp.usage.map(|u| (u.input_tokens, u.output_tokens)),
+            Some((42, 9))
+        );
+    }
+
+    #[test]
+    fn stream_usage_none_when_not_requested() {
+        // A server that didn't get include_usage (or never sends the final
+        // totals chunk) leaves usage as None — the TUI just won't show tokens.
+        let raw = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let resp = OpenAi::parse_stream(raw.as_bytes(), &mut |_| {}).unwrap();
+        assert!(resp.usage.is_none());
     }
 
     #[test]

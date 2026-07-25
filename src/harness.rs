@@ -27,16 +27,19 @@ pub fn run(agent: &mut Agent, output_path: Option<&Path>) -> Result<i32> {
         AgentEvent::ToolResult {
             name,
             is_error,
-            preview,
+            content,
         } => {
             let tag = if is_error { "[tool ✗]" } else { "[tool ✓]" };
-            println!("{tag} {name}: {preview}");
+            println!("{tag} {name}: {}", crate::agent::preview(&content));
         }
         AgentEvent::Done { stop_reason } => {
             println!("\n[done: {stop_reason}]");
         }
         AgentEvent::Compressed { dropped, kept } => {
             println!("\n[context compressed: dropped {dropped} messages, {kept} kept]");
+        }
+        AgentEvent::Usage { input_tokens, output_tokens } => {
+            eprintln!("[tokens: {input_tokens}↑ {output_tokens}↓]");
         }
     })?;
 

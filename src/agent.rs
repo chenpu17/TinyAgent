@@ -12,7 +12,11 @@ pub enum AgentEvent {
     TurnStart(u32),
     TextDelta(String),
     ToolCall { name: String, input: Value },
-    ToolResult { name: String, is_error: bool, preview: String },
+    ToolResult { name: String, is_error: bool, content: String },
+    /// Token usage reported by the provider for the latest chat request.
+    /// Best-effort: emitted only when the provider actually reported usage
+    /// (e.g. the stream wasn't cut off before the usage frame).
+    Usage { input_tokens: u64, output_tokens: u64 },
     /// History was compressed: how many middle messages were dropped,
     /// and how many remain.
     Compressed { dropped: usize, kept: usize },
@@ -118,6 +122,15 @@ impl Agent {
         self.save_session();
     }
 
+    /// Drop the conversation transcript (`/clear`). Keeps config, tools, and
+    /// system prompt — only messages are reset, and the session file is
+    /// rewritten so a restart doesn't restore the cleared chat.
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
+    pub fn clear_messages(&mut self) {
+        self.messages.clear();
+        self.save_session();
+    }
+
     /// Run the loop until the model stops calling tools, or a limit is hit.
     pub fn run(&mut self, events: &mut dyn FnMut(AgentEvent)) -> Result<RunOutcome> {
         let start = Instant::now();
@@ -184,6 +197,12 @@ impl Agent {
             let resp = self.provider.chat(&req, &mut |e| match e {
                 ChatEvent::TextDelta(t) => events(AgentEvent::TextDelta(t)),
             })?;
+            if let Some(u) = resp.usage {
+                events(AgentEvent::Usage {
+                    input_tokens: u.input_tokens,
+                    output_tokens: u.output_tokens,
+                });
+            }
 
             stop_reason = resp.stop_reason.clone();
             let has_tool_use = resp
@@ -238,7 +257,7 @@ impl Agent {
                 events(AgentEvent::ToolResult {
                     name: name.clone(),
                     is_error: output.is_error,
-                    preview: preview(&output.content),
+                    content: output.content.clone(),
                 });
                 results.push(Block::ToolResult {
                     tool_use_id: id.clone(),

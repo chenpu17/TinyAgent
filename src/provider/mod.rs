@@ -78,11 +78,20 @@ pub enum ChatEvent {
     TextDelta(String),
 }
 
+/// Token usage for one chat. Best-effort: None when the server didn't report
+/// (request errored, or the stream was cut off before the usage frame).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
 /// A completed assistant turn.
 pub struct ChatResponse {
     pub blocks: Vec<Block>,
     /// "end_turn" | "tool_use" | "max_tokens" | provider-specific value.
     pub stop_reason: String,
+    pub usage: Option<Usage>,
 }
 
 pub struct ChatRequest<'a> {
