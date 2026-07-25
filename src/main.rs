@@ -79,6 +79,16 @@ struct Cli {
     /// Batch mode: summary report output path
     #[arg(long, default_value = "report.json")]
     report: PathBuf,
+
+    /// Batch mode: retry each task this many extra times on transient failures
+    /// (provider/network errors) with exponential backoff. Deterministic
+    /// failures (bad task file, max_turns) are not retried.
+    #[arg(long, default_value = "0")]
+    retries: usize,
+
+    /// Batch mode: re-run only tasks that failed in the prior report (at --report)
+    #[arg(long)]
+    failed: bool,
 }
 
 fn main() -> Result<()> {
@@ -104,7 +114,7 @@ fn main() -> Result<()> {
         if cli.tui {
             bail!("--batch and --tui are mutually exclusive");
         }
-        let code = batch::run(&cfg, dir, cli.jobs, &cli.report)?;
+        let code = batch::run(&cfg, dir, cli.jobs, &cli.report, cli.retries, cli.failed)?;
         std::process::exit(code);
     }
 

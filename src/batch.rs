@@ -16,8 +16,19 @@ struct TaskReport {
 }
 
 /// Run every `*.json` task fragment in `dir` against the base config,
-/// with a fixed pool of worker threads. Returns process exit code.
-pub fn run(base: &Config, dir: &Path, jobs: usize, report_path: &Path) -> Result<i32> {
+/// with a fixed pool of worker threads.
+/// - `retries`: extra attempts per task on transient failures only.
+/// - `failed`: re-run only tasks that failed in the prior report at `report_path`.
+///
+/// Returns process exit code.
+pub fn run(
+    base: &Config,
+    dir: &Path,
+    jobs: usize,
+    report_path: &Path,
+    retries: usize,
+    failed: bool,
+) -> Result<i32> {
     let mut files: Vec<PathBuf> = Vec::new();
     for e in std::fs::read_dir(dir)
         .with_context(|| format!("cannot read batch dir: {}", dir.display()))?
@@ -45,6 +56,22 @@ pub fn run(base: &Config, dir: &Path, jobs: usize, report_path: &Path) -> Result
         tasks.push((name, partial));
     }
 
+    // --failed: re-run only tasks that failed in the prior report (at the same
+    // --report path). Reads it before we overwrite it with the new subset.
+    if failed {
+        let names = failed_names_from_report(report_path)?;
+        let set: std::collections::HashSet<&str> = names.iter().map(|s| s.as_str()).collect();
+        tasks.retain(|(name, _)| set.contains(name.as_str()));
+        eprintln!(
+            "batch --failed: re-running {} of {} previously-failed tasks",
+            tasks.len(),
+            names.len()
+        );
+        if tasks.is_empty() {
+            bail!("no previously-failed tasks matched files in {}", dir.display());
+        }
+    }
+
     let results_dir = report_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -61,9 +88,10 @@ pub fn run(base: &Config, dir: &Path, jobs: usize, report_path: &Path) -> Result
     let client = crate::provider::new_client(max_timeout);
 
     eprintln!(
-        "batch: {} tasks, {} workers, results → {}",
+        "batch: {} tasks, {} workers, {} retries, results → {}",
         tasks.len(),
         jobs,
+        retries,
         results_dir.display()
     );
 
@@ -79,7 +107,7 @@ pub fn run(base: &Config, dir: &Path, jobs: usize, report_path: &Path) -> Result
                     Ok(t) => t,
                     Err(_) => return, // channel drained
                 };
-                let report = run_one(base, &name, partial, &results_dir, &client);
+                let report = run_one(base, &name, partial, &results_dir, &client, retries);
                 eprintln!(
                     "[{}] {} ({} turns, {:.1}s{})",
                     report.name,
@@ -114,18 +142,24 @@ pub fn run(base: &Config, dir: &Path, jobs: usize, report_path: &Path) -> Result
     Ok(if succeeded == reports.len() { 0 } else { 1 })
 }
 
-fn run_one(
+/// One attempt at a task. Returns a `stop_reason` that signals retryability:
+/// `"error"` is transient (agent.run returned Err — provider/network) and is
+/// retried by `run_one`; `"bad_task"` is a deterministic config problem
+/// (forbidden override, bad JSON, no task) and is NOT retried; any other value
+/// is the model's real stop reason (end_turn / max_turns / …) and is not
+/// retried either.
+fn run_one_attempt(
     base: &Config,
     name: &str,
-    partial: PartialConfig,
+    partial: &PartialConfig,
     results_dir: &Path,
     client: &reqwest::blocking::Client,
 ) -> TaskReport {
     let start = std::time::Instant::now();
-    let fail = |msg: String| TaskReport {
+    let bad = |stop: &str, msg: String| TaskReport {
         name: name.into(),
         success: false,
-        stop_reason: "error".into(),
+        stop_reason: stop.into(),
         turns: 0,
         elapsed_secs: start.elapsed().as_secs_f64(),
         error: Some(msg),
@@ -133,16 +167,22 @@ fn run_one(
 
     let mut cfg = base.clone();
     if let Some(field) = partial.forbidden_batch_override() {
-        return fail(format!(
-            "task file must not override '{field}' (only task/system_prompt/model/max_tokens/limits \
-             are overridable in batch mode)"
-        ));
+        return bad(
+            "bad_task",
+            format!(
+                "task file must not override '{field}' (only task/system_prompt/model/max_tokens/limits \
+                 are overridable in batch mode)"
+            ),
+        );
     }
-    if let Err(e) = cfg.apply(partial) {
-        return fail(format!("{e:#}"));
+    if let Err(e) = cfg.apply(partial.clone()) {
+        return bad("bad_task", format!("{e:#}"));
     }
     if cfg.task.is_none() {
-        return fail("task file did not set \"task\" and base config has none".into());
+        return bad(
+            "bad_task",
+            "task file did not set \"task\" and base config has none".into(),
+        );
     }
 
     let outcome: Result<(RunOutcome,)> = (|| {
@@ -177,8 +217,75 @@ fn run_one(
                 error,
             }
         }
-        Err(e) => fail(format!("{e:#}")),
+        Err(e) => bad("error", format!("{e:#}")),
     }
+}
+
+/// Run a task, retrying up to `retries` extra times on transient (`"error"`)
+/// failures with exponential backoff. Successes and deterministic failures
+/// (bad_task, max_turns, …) are not retried — they won't change on a re-run.
+fn run_one(
+    base: &Config,
+    name: &str,
+    partial: PartialConfig,
+    results_dir: &Path,
+    client: &reqwest::blocking::Client,
+    retries: usize,
+) -> TaskReport {
+    let start = std::time::Instant::now();
+    let mut report = run_one_attempt(base, name, &partial, results_dir, client);
+    let mut attempt = 0;
+    while report.stop_reason == "error" && attempt < retries {
+        let backoff = std::time::Duration::from_secs(backoff_secs(attempt));
+        eprintln!(
+            "[{}] transient error ({}); retry {}/{} in {:?}",
+            name,
+            report.error.as_deref().unwrap_or(""),
+            attempt + 1,
+            retries,
+            backoff,
+        );
+        std::thread::sleep(backoff);
+        attempt += 1;
+        report = run_one_attempt(base, name, &partial, results_dir, client);
+    }
+    // run_one_attempt stamps per-attempt elapsed; overwrite with the total
+    // across attempts + backoffs so report.json reflects real wall cost.
+    report.elapsed_secs = start.elapsed().as_secs_f64();
+    report
+}
+
+/// Exponential backoff (seconds) for retry `attempt` (0-indexed): 1, 2, 4, 8,
+/// 16, 32 — the shift is clamped so a large `--retries` can't sleep for minutes
+/// (or overflow).
+fn backoff_secs(attempt: usize) -> u64 {
+    1u64 << attempt.min(5)
+}
+
+/// Names of tasks that failed in a prior batch report (for `--failed`). A
+/// failure with no name (or empty) is ignored — it can't be matched to a file.
+fn failed_names_from_report(path: &Path) -> Result<Vec<String>> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read prior report {}", path.display()))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&raw).context("prior report is not valid JSON")?;
+    let tasks = v
+        .get("tasks")
+        .and_then(|t| t.as_array())
+        .context("prior report has no \"tasks\" array")?;
+    Ok(tasks
+        .iter()
+        .filter_map(|t| {
+            let success = t.get("success").and_then(|s| s.as_bool()).unwrap_or(true);
+            (!success).then(|| {
+                t.get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            })
+        })
+        .filter(|s| !s.is_empty())
+        .collect())
 }
 
 fn write_report(path: &Path, reports: &[TaskReport]) -> Result<()> {
@@ -204,4 +311,69 @@ fn write_report(path: &Path, reports: &[TaskReport]) -> Result<()> {
     });
     let bytes = serde_json::to_string_pretty(&report)?;
     harness::atomic_write(path, bytes.as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_grows_then_caps() {
+        // 1, 2, 4, 8, 16, 32 — doubling each step…
+        assert_eq!(backoff_secs(0), 1);
+        assert_eq!(backoff_secs(1), 2);
+        assert_eq!(backoff_secs(2), 4);
+        assert_eq!(backoff_secs(3), 8);
+        assert_eq!(backoff_secs(4), 16);
+        assert_eq!(backoff_secs(5), 32);
+        // …then clamped at 32s so a large --retries never sleeps for minutes
+        // (and so the shift can't overflow on absurd inputs).
+        assert_eq!(backoff_secs(6), 32);
+        assert_eq!(backoff_secs(100), 32);
+    }
+
+    #[test]
+    fn failed_names_from_report_selects_failures() {
+        let dir = std::env::temp_dir().join(format!("ta-batch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("report.json");
+        std::fs::write(
+            &path,
+            r#"{"total":3,"succeeded":1,"failed":2,"tasks":[
+                {"name":"a","success":true},
+                {"name":"b","success":false},
+                {"name":"c","success":false},
+                {"name":"","success":false}
+            ]}"#,
+        )
+        .unwrap();
+
+        let names = failed_names_from_report(&path).unwrap();
+        // Only the failed tasks with names; the empty-name one is dropped.
+        assert_eq!(names, vec!["b".to_string(), "c".to_string()]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn failed_names_from_report_rejects_bad_report() {
+        let dir = std::env::temp_dir().join(format!("ta-batch-err-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Missing file.
+        let missing = dir.join("nope.json");
+        assert!(failed_names_from_report(&missing).is_err());
+
+        // Not JSON.
+        let bad = dir.join("bad.json");
+        std::fs::write(&bad, "not json").unwrap();
+        assert!(failed_names_from_report(&bad).is_err());
+
+        // Valid JSON but no tasks array.
+        let notasks = dir.join("notasks.json");
+        std::fs::write(&notasks, r#"{"total":0}"#).unwrap();
+        assert!(failed_names_from_report(&notasks).is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
