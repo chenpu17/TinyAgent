@@ -114,12 +114,17 @@ fn ui_loop(
     auto_start: bool,
 ) -> Result<()> {
     let mut rows: Vec<Row> = Vec::new();
-    let mut input = String::new();
+    let mut input = InputBuffer::new();
     let mut busy = false;
     let mut turn = 0u32;
     let mut scroll_up: usize = 0;
     let mut streaming = false;
     let start = Instant::now();
+    // Input history (Alt+Up/Down to recall). `draft` holds the in-progress
+    // text when the user starts browsing, so Down past the newest restores it.
+    let mut history: Vec<String> = Vec::new();
+    let mut hist_idx: Option<usize> = None;
+    let mut draft: String = String::new();
 
     rows.push(Row::System(format!(
         "tiny-agent · model {} · type a message, Enter to send, Esc to quit",
@@ -194,14 +199,19 @@ fn ui_loop(
 
         // Render.
         term.draw(|f| {
+            let area = f.area();
+            // Input box grows with the number of lines typed, up to ~40% of
+            // the screen so the conversation always stays visible.
+            let max_input = ((area.height as usize) * 2 / 5).max(3);
+            let input_h = (input.line_count() + 2).min(max_input) as u16;
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Min(3),
-                    Constraint::Length(3),
+                    Constraint::Length(input_h),
                     Constraint::Length(1),
                 ])
-                .split(f.area());
+                .split(area);
 
             let mut lines: Vec<Line> = Vec::new();
             for row in &rows {
@@ -245,9 +255,20 @@ fn ui_loop(
             f.render_widget(history, chunks[0]);
 
             let prompt = if busy { "… running (please wait)" } else { "> " };
-            let input_widget = Paragraph::new(format!("{prompt}{input}"))
+            let body = if busy { String::new() } else { input.text() };
+            let input_widget = Paragraph::new(format!("{prompt}{body}"))
                 .block(WBlock::default().borders(Borders::ALL).title("input"));
             f.render_widget(input_widget, chunks[1]);
+            // Show the caret when editable. Column offset accounts for the
+            // prompt only on the first line; wide chars may drift slightly.
+            if !busy {
+                let (crow, ccol) = input.cursor();
+                let prompt_chars = prompt.chars().count();
+                let lead = if crow == 0 { prompt_chars } else { 0 };
+                let x = chunks[1].x + 1 + (ccol + lead) as u16;
+                let y = chunks[1].y + 1 + crow as u16;
+                f.set_cursor_position((x, y));
+            }
 
             let state = if busy { "running" } else { "idle" };
             let status = Line::from(vec![
@@ -256,7 +277,7 @@ fn ui_loop(
                     Style::default().fg(Color::Black).bg(Color::Cyan),
                 ),
                 Span::raw(format!(
-                    "  turn {turn} · {state} · {:.0}s · Esc quit · ↑/↓ scroll",
+                    "  turn {turn} · {state} · {:.0}s · Ctrl-C cancel · Esc quit · PgUp/PgDn scroll",
                     start.elapsed().as_secs_f64()
                 )),
             ]);
@@ -270,29 +291,118 @@ fn ui_loop(
                     continue;
                 }
                 match (key.code, key.modifiers) {
-                    (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                    (KeyCode::Esc, _) => {
                         cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                         let _ = in_tx.send(None);
                         return Ok(());
                     }
+                    // Ctrl-C: cancel the in-flight turn (and stay in the TUI);
+                    // when idle, fall back to quitting.
+                    (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                        if busy {
+                            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                            rows.push(Row::System("[cancelling…]".into()));
+                        } else {
+                            let _ = in_tx.send(None);
+                            return Ok(());
+                        }
+                    }
+                    // Enter sends; Alt/Shift+Enter inserts a newline.
+                    (KeyCode::Enter, KeyModifiers::ALT)
+                    | (KeyCode::Enter, KeyModifiers::SHIFT) => {
+                        if !busy {
+                            input.newline();
+                        }
+                    }
                     (KeyCode::Enter, _) => {
-                        let text = input.trim().to_string();
-                        if !text.is_empty() && !busy {
-                            input.clear();
-                            rows.push(Row::User(text.clone()));
-                            busy = true;
-                            scroll_up = 0;
-                            let _ = in_tx.send(Some(text));
+                        if !busy && !input.is_empty() {
+                            let trimmed = input.text().trim().to_string();
+                            if !trimmed.is_empty() {
+                                if history.last().map(String::as_str) != Some(&trimmed) {
+                                    history.push(trimmed.clone());
+                                }
+                                hist_idx = None;
+                                draft.clear();
+                                input.drain_to_string();
+                                rows.push(Row::User(trimmed.clone()));
+                                busy = true;
+                                scroll_up = 0;
+                                let _ = in_tx.send(Some(trimmed));
+                            }
                         }
                     }
                     (KeyCode::Backspace, _) => {
-                        input.pop();
+                        if !busy {
+                            input.backspace();
+                        }
                     }
-                    (KeyCode::Up, _) => scroll_up = scroll_up.saturating_add(1),
-                    (KeyCode::Down, _) => scroll_up = scroll_up.saturating_sub(1),
+                    (KeyCode::Left, _) => {
+                        if !busy {
+                            input.move_left();
+                        }
+                    }
+                    (KeyCode::Right, _) => {
+                        if !busy {
+                            input.move_right();
+                        }
+                    }
+                    // Alt+Up/Down recall input history; Up/Down move the caret
+                    // across lines inside the buffer.
+                    (KeyCode::Up, KeyModifiers::ALT) => {
+                        if !busy && !history.is_empty() {
+                            match hist_idx {
+                                None => {
+                                    draft = input.text();
+                                    hist_idx = Some(history.len() - 1);
+                                }
+                                Some(0) => {}
+                                Some(i) => hist_idx = Some(i - 1),
+                            }
+                            if let Some(i) = hist_idx {
+                                input.set_text(&history[i]);
+                            }
+                        }
+                    }
+                    (KeyCode::Down, KeyModifiers::ALT) => {
+                        if !busy {
+                            if let Some(i) = hist_idx {
+                                if i + 1 < history.len() {
+                                    hist_idx = Some(i + 1);
+                                    input.set_text(&history[i + 1]);
+                                } else {
+                                    hist_idx = None;
+                                    input.set_text(&draft);
+                                }
+                            }
+                        }
+                    }
+                    (KeyCode::Up, _) => {
+                        if !busy {
+                            input.move_up();
+                        }
+                    }
+                    (KeyCode::Down, _) => {
+                        if !busy {
+                            input.move_down();
+                        }
+                    }
+                    (KeyCode::Home, _) => {
+                        if !busy {
+                            input.home();
+                        }
+                    }
+                    (KeyCode::End, _) => {
+                        if !busy {
+                            input.end();
+                        }
+                    }
                     (KeyCode::PageUp, _) => scroll_up = scroll_up.saturating_add(10),
                     (KeyCode::PageDown, _) => scroll_up = scroll_up.saturating_sub(10),
-                    (KeyCode::Char(c), _) => input.push(c),
+                    (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => {
+                        if !busy {
+                            input.put_char(c);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -313,4 +423,226 @@ fn push_wrapped(lines: &mut Vec<Line>, label: &str, text: &str, color: Color) {
 
 fn compact(v: &serde_json::Value) -> String {
     crate::agent::preview(&v.to_string())
+}
+
+/// Multi-line input editor: a vec of lines with a (row, col) cursor. `col` is
+/// a byte offset kept on UTF-8 char boundaries, so insert/remove never split a
+/// multi-byte character. Owned entirely by the UI thread.
+struct InputBuffer {
+    lines: Vec<String>,
+    row: usize,
+    col: usize,
+}
+
+impl InputBuffer {
+    fn new() -> Self {
+        Self {
+            lines: vec![String::new()],
+            row: 0,
+            col: 0,
+        }
+    }
+
+    fn put_char(&mut self, c: char) {
+        self.lines[self.row].insert(self.col, c);
+        self.col += c.len_utf8();
+    }
+
+    /// Delete the char before the cursor; at the start of a line, join it onto
+    /// the previous one.
+    fn backspace(&mut self) {
+        if self.col > 0 {
+            let prev_ch = self.lines[self.row][..self.col].chars().last().unwrap();
+            let prev = self.col - prev_ch.len_utf8();
+            self.lines[self.row].replace_range(prev..self.col, "");
+            self.col = prev;
+        } else if self.row > 0 {
+            let cur = self.lines.remove(self.row);
+            self.row -= 1;
+            self.col = self.lines[self.row].len();
+            self.lines[self.row].push_str(&cur);
+        }
+    }
+
+    /// Split the current line at the cursor; cursor lands at the start of the
+    /// new line.
+    fn newline(&mut self) {
+        let rest = self.lines[self.row].split_off(self.col);
+        self.lines.insert(self.row + 1, rest);
+        self.row += 1;
+        self.col = 0;
+    }
+
+    fn move_left(&mut self) {
+        if self.col > 0 {
+            let prev_ch = self.lines[self.row][..self.col].chars().last().unwrap();
+            self.col -= prev_ch.len_utf8();
+        } else if self.row > 0 {
+            self.row -= 1;
+            self.col = self.lines[self.row].len();
+        }
+    }
+
+    fn move_right(&mut self) {
+        if self.col < self.lines[self.row].len() {
+            let ch = self.lines[self.row][self.col..].chars().next().unwrap();
+            self.col += ch.len_utf8();
+        } else if self.row + 1 < self.lines.len() {
+            self.row += 1;
+            self.col = 0;
+        }
+    }
+
+    fn move_up(&mut self) {
+        if self.row > 0 {
+            self.row -= 1;
+            self.col = self.col.min(self.lines[self.row].len());
+        }
+    }
+
+    fn move_down(&mut self) {
+        if self.row + 1 < self.lines.len() {
+            self.row += 1;
+            self.col = self.col.min(self.lines[self.row].len());
+        }
+    }
+
+    fn home(&mut self) {
+        self.col = 0;
+    }
+
+    fn end(&mut self) {
+        self.col = self.lines[self.row].len();
+    }
+
+    /// Replace the whole buffer and put the cursor at the end (history recall).
+    fn set_text(&mut self, s: &str) {
+        self.lines = s.split('\n').map(String::from).collect();
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        self.row = self.lines.len() - 1;
+        self.col = self.lines[self.row].len();
+    }
+
+    /// Take the full text, leaving an empty buffer.
+    fn drain_to_string(&mut self) -> String {
+        let text = self.lines.join("\n");
+        self.lines = vec![String::new()];
+        self.row = 0;
+        self.col = 0;
+        text
+    }
+
+    fn is_empty(&self) -> bool {
+        self.lines.len() == 1 && self.lines[0].is_empty()
+    }
+
+    fn line_count(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// Snapshot for rendering.
+    fn text(&self) -> String {
+        self.lines.join("\n")
+    }
+
+    /// Cursor (row, char-column) for display. Char column so the caret lands on
+    /// a grapheme, not mid-codepoint. (Display width of wide chars is ignored —
+    /// the caret may drift on CJK, accepted for now.)
+    fn cursor(&self) -> (usize, usize) {
+        let col_chars = self.lines[self.row][..self.col].chars().count();
+        (self.row, col_chars)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn type_and_drain() {
+        let mut b = InputBuffer::new();
+        for c in "hi".chars() {
+            b.put_char(c);
+        }
+        assert_eq!(b.text(), "hi");
+        assert_eq!(b.drain_to_string(), "hi");
+        assert!(b.is_empty());
+    }
+
+    #[test]
+    fn newline_splits_line() {
+        let mut b = InputBuffer::new();
+        b.set_text("abcd");
+        b.move_left();
+        b.move_left(); // cursor at col 2
+        b.newline();
+        assert_eq!(b.text(), "ab\ncd");
+        assert_eq!(b.line_count(), 2);
+        assert_eq!(b.cursor(), (1, 0));
+    }
+
+    #[test]
+    fn backspace_joins_lines() {
+        let mut b = InputBuffer::new();
+        b.set_text("ab\ncd"); // cursor at end of "cd"
+        b.home(); // start of line 1
+        b.backspace(); // join → "abcd", cursor after "ab"
+        assert_eq!(b.text(), "abcd");
+        assert_eq!(b.line_count(), 1);
+        assert_eq!(b.cursor(), (0, 2));
+    }
+
+    #[test]
+    fn backspace_preserves_unicode() {
+        let mut b = InputBuffer::new();
+        b.set_text("中文");
+        b.move_left(); // before 文
+        b.backspace(); // delete 中
+        assert_eq!(b.text(), "文");
+        assert_eq!(b.col, 0);
+    }
+
+    #[test]
+    fn move_left_right_over_unicode() {
+        let mut b = InputBuffer::new();
+        b.set_text("a中b"); // bytes: a(1) 中(3) b(1) = 5
+        b.move_left(); // before b → col 4
+        b.move_left(); // before 中 → col 1
+        assert_eq!(b.col, 1);
+        b.move_left(); // before a → col 0
+        assert_eq!(b.col, 0);
+        b.move_right(); // before 中 → col 1
+        assert_eq!(b.col, 1);
+    }
+
+    #[test]
+    fn move_up_down_clamps_col() {
+        let mut b = InputBuffer::new();
+        b.set_text("long line one\n短"); // cursor at end of 短 (col 3)
+        b.move_up(); // col clamps to min(3, line0.len())
+        assert_eq!(b.row, 0);
+        assert!(b.col <= "long line one".len());
+    }
+
+    #[test]
+    fn home_end() {
+        let mut b = InputBuffer::new();
+        b.set_text("abc");
+        b.home();
+        assert_eq!(b.col, 0);
+        b.end();
+        assert_eq!(b.col, 3);
+    }
+
+    #[test]
+    fn drain_resets_to_empty() {
+        let mut b = InputBuffer::new();
+        b.set_text("x\ny\nz");
+        let s = b.drain_to_string();
+        assert_eq!(s, "x\ny\nz");
+        assert!(b.is_empty());
+        assert_eq!(b.line_count(), 1);
+    }
 }
