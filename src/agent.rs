@@ -126,6 +126,12 @@ impl Agent {
         // transient compression failure would disable it for the rest of the
         // session and the history would grow until it hit the model's limit.
         self.compress_failed = false;
+        // Reset any stale cancel from a previous run: cancel is level-triggered
+        // and never auto-clears elsewhere, so without this a Ctrl-C that ended
+        // the last turn would cancel this one before it starts.
+        if let Some(c) = &self.cancel {
+            c.store(false, Ordering::Relaxed);
+        }
         // Overall run deadline. Each chat is capped to the time left so a
         // single stuck request can't outlive the run budget — which is
         // otherwise only enforced at turn boundaries.
@@ -166,6 +172,14 @@ impl Agent {
                 max_tokens: self.max_tokens,
                 per_request_timeout: deadline
                     .map(|d| d.saturating_duration_since(Instant::now())),
+                // Shared cancel flag: the streaming reader checks it between
+                // chunks, so Esc/Ctrl-C can interrupt a stuck request mid-read
+                // (not only at the next turn boundary). Headless has no flag →
+                // a dummy never-set one, so idle-timeout still applies.
+                cancel: self
+                    .cancel
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
             };
             let resp = self.provider.chat(&req, &mut |e| match e {
                 ChatEvent::TextDelta(t) => events(AgentEvent::TextDelta(t)),
@@ -432,6 +446,10 @@ impl Agent {
                 d.saturating_duration_since(Instant::now())
                     .saturating_sub(COMPRESS_RESERVE)
             }),
+            cancel: self
+                .cancel
+                .clone()
+                .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
         };
         let resp = self.provider.chat(&req, &mut |_| {})?;
         Ok(resp

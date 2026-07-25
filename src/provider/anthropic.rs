@@ -1,4 +1,6 @@
-use super::{Block, ChatEvent, ChatRequest, ChatResponse, Message, Provider, Role, SseReader, ToolDef};
+use super::{Block, CancellableSse, ChatEvent, ChatRequest, ChatResponse, Message, Provider, Role, SseSource, StreamAbort, ToolDef};
+#[cfg(test)]
+use super::SseReader;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 
@@ -153,23 +155,50 @@ impl Provider for Anthropic {
             bail!("Anthropic API error {status}: {text}");
         }
 
-        Self::parse_stream(resp, on_event)
+        let mut sse = CancellableSse::new(resp, req.cancel.clone());
+        Self::parse_loop(&mut sse, on_event)
     }
 }
 
 impl Anthropic {
-    /// Assemble a full response from an SSE byte stream (split out for testing).
+    /// Assemble a full response from an SSE byte stream (sync, for tests).
+    #[cfg(test)]
     fn parse_stream<R: std::io::Read>(
         reader: R,
         on_event: &mut dyn FnMut(ChatEvent),
     ) -> Result<ChatResponse> {
         let mut sse = SseReader::new(reader);
+        Self::parse_loop(&mut sse, on_event)
+    }
+
+    /// Streaming core shared by the sync test path and the live path
+    /// (`CancellableSse`). A cancel/idle abort surfaces as a stop_reason
+    /// carrying whatever partial blocks arrived — mirroring stream_truncated,
+    /// so the agent ends the run cleanly instead of hanging on a half-open
+    /// connection.
+    fn parse_loop<S: SseSource>(
+        src: &mut S,
+        on_event: &mut dyn FnMut(ChatEvent),
+    ) -> Result<ChatResponse> {
         let mut blocks: Vec<Block> = Vec::new();
         let mut pending: Option<Pending> = None;
         let mut stop_reason = String::from("end_turn");
         let mut got_stop = false;
+        let mut abort: Option<&'static str> = None;
 
-        while let Some(data) = sse.next_data() {
+        loop {
+            let data = match src.next_payload() {
+                Ok(Some(d)) => d,
+                Ok(None) => break, // end of stream
+                Err(StreamAbort::Cancelled) => {
+                    abort = Some("cancelled");
+                    break;
+                }
+                Err(StreamAbort::IdleTimeout) => {
+                    abort = Some("stream_idle");
+                    break;
+                }
+            };
             let ev: Value = match serde_json::from_str(&data) {
                 Ok(v) => v,
                 Err(_) => continue, // ignore unparseable keep-alives
@@ -231,17 +260,19 @@ impl Anthropic {
             }
         }
 
-        // A stream cut off mid-block (network drop, or per_request_timeout
-        // firing during generation) leaves a pending block unflushed. Flush
-        // it leniently (half-delivered tool JSON becomes _raw) rather than
-        // dropping the block or hard-failing on a parse error.
+        // A stream cut off mid-block (network drop, cancel, or idle timeout)
+        // leaves a pending block unflushed. Flush it leniently (half-delivered
+        // tool JSON becomes _raw) rather than dropping the block or
+        // hard-failing on a parse error.
         if let Some(p) = pending.take() {
             blocks.push(finalize_pending_lenient(p));
         }
-        // No terminal message_delta arrived → the stream was truncated. Don't
-        // masquerade as a clean end_turn: batch/CI success checks rely on
-        // stop_reason being honest about an incomplete response.
-        let stop_reason = if got_stop {
+        // stop_reason priority: explicit abort (cancel/idle) > real
+        // message_delta > stream_truncated. Without this an incomplete stream
+        // would masquerade as a clean end_turn and break batch/CI checks.
+        let stop_reason = if let Some(r) = abort {
+            r.into()
+        } else if got_stop {
             stop_reason
         } else {
             "stream_truncated".into()

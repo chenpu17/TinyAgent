@@ -1,4 +1,6 @@
-use super::{Block, ChatEvent, ChatRequest, ChatResponse, Message, Provider, Role, SseReader, ToolDef};
+use super::{Block, CancellableSse, ChatEvent, ChatRequest, ChatResponse, Message, Provider, Role, SseSource, StreamAbort, ToolDef};
+#[cfg(test)]
+use super::SseReader;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
@@ -192,7 +194,8 @@ impl Provider for OpenAi {
             bail!("OpenAI-compatible API error {status}: {text}");
         }
 
-        Self::parse_stream(resp, on_event)
+        let mut sse = CancellableSse::new(resp, req.cancel.clone());
+        Self::parse_loop(&mut sse, on_event)
     }
 }
 
@@ -215,19 +218,45 @@ impl OpenAi {
             .context("request to OpenAI-compatible API failed")
     }
 
-    /// Assemble a full response from an SSE byte stream (split out for testing).
+    /// Assemble a full response from an SSE byte stream (sync, for tests).
+    #[cfg(test)]
     fn parse_stream<R: std::io::Read>(
         reader: R,
         on_event: &mut dyn FnMut(ChatEvent),
     ) -> Result<ChatResponse> {
         let mut sse = SseReader::new(reader);
+        Self::parse_loop(&mut sse, on_event)
+    }
+
+    /// Streaming core shared by the sync test path (`SseReader`) and the live
+    /// path (`CancellableSse`). A cancel/idle abort surfaces as a stop_reason
+    /// carrying whatever partial text/calls arrived — mirroring stream_truncated,
+    /// so the agent ends the run cleanly instead of hanging on a half-open
+    /// connection.
+    fn parse_loop<S: SseSource>(
+        src: &mut S,
+        on_event: &mut dyn FnMut(ChatEvent),
+    ) -> Result<ChatResponse> {
         let mut text = String::new();
         let mut calls: std::collections::BTreeMap<u64, PendingCall> = Default::default();
         let mut cur_idx: u64 = 0;
         let mut finish_reason = String::from("stop");
         let mut got_finish = false;
+        let mut abort: Option<&'static str> = None;
 
-        while let Some(data) = sse.next_data() {
+        loop {
+            let data = match src.next_payload() {
+                Ok(Some(d)) => d,
+                Ok(None) => break, // end of stream
+                Err(StreamAbort::Cancelled) => {
+                    abort = Some("cancelled");
+                    break;
+                }
+                Err(StreamAbort::IdleTimeout) => {
+                    abort = Some("stream_idle");
+                    break;
+                }
+            };
             if data == "[DONE]" {
                 break;
             }
@@ -310,11 +339,13 @@ impl OpenAi {
             });
         }
 
-        // Normalize to Anthropic-style stop reasons. If no finish_reason
-        // arrived the stream was truncated — say so instead of defaulting to
-        // "stop", which would make batch/CI treat an incomplete response as
-        // success.
-        let stop_reason = if !got_finish {
+        // Normalize to Anthropic-style stop reasons. An explicit abort
+        // (cancel/idle) wins; otherwise a missing finish_reason means the
+        // stream was truncated, not a clean "stop" — reporting it honestly
+        // keeps batch/CI from treating an incomplete response as success.
+        let stop_reason = if let Some(r) = abort {
+            r.into()
+        } else if !got_finish {
             "stream_truncated".into()
         } else {
             match finish_reason.as_str() {
