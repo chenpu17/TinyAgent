@@ -51,6 +51,8 @@ cargo clippy --all-targets                # lint headless 版（两个 feature �
   `&String`/`&Value` 要 `.clone()`；`Option<&str>` 要显式转成 `Value::Null` 或 `json!(s)`。
 - **Anthropic 不允许相邻两条 user 消息**（400）；且 N 个 `tool_use` 必须配 N 个 `tool_result`。
   `agent::append_user_turn` 会把新 user 内容折进已有的末尾 user 消息——新增 user 入口走它，别直接 push。
+  另有兜底：`agent::run()` 每轮发请求前 `normalize_adjacent` 把相邻同 role 合并（保块顺序，不动配对），
+  防 resumed/手改的损坏历史触发 400。别依赖它当正常路径，正常仍走 append_user_turn。
 - **cancel 标志一旦 `store(true)` 全库不会自动复位**（无 `store(false)`）。`agent::run()` 入口
   显式复位，所以"取消本轮"后下一条消息能正常再跑。新增触发 cancel 的地方不用管复位。
 - **批量任务片段只能覆盖** `task`/`system_prompt`/`model`/`max_tokens`/`limits`；安全字段
@@ -65,6 +67,9 @@ cargo clippy --all-targets                # lint headless 版（两个 feature �
   改请求体字段的人要知道这条重试路径，别在 fix 后又引入新 400。
 - **`--session none` 是关闭持久化的字面量哨兵**（不是文件名）——真要叫 `none` 的文件没法用，
   但它语义清晰、够用。改 `session_target` 判定前先想清楚。
+- **MCP 工具名只消毒展示名，wire 名不动**（`tools::mcp::sanitize_name`）：对外名 `mcp_<server>_<tool>`
+  非 `[A-Za-z0-9_]` → `_` 并折叠，但 `wire_name` 保留服务器原始工具名，`tools/call` 用它分发。
+  改消毒逻辑别误动 `wire_name`，否则分发会找不到工具。`dedup_check` 在消毒后撞名时启动报错。
 - **改 `agent.rs` 核心路径必须配套 loop 测试**。`agent.rs` 的 `#[cfg(test)]` 模块用
   `provider/mock.rs` 的脚本化 Provider 覆盖不变量：cancel 复位、tool_use/tool_result N:N 配对
   （含中途取消时合成的 `[cancelled by user]` 进 history 但不进 `tool_calls`）、压缩、usage 累计。

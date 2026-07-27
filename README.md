@@ -162,6 +162,11 @@ tiny-agent --config examples/harness.json --batch examples/tasks --failed --retr
 
 支持三种传输（`command` 与 `url` 二选一）：
 
+工具名以 `mcp_<server>_<tool>` 注册给模型，非 `[A-Za-z0-9_]` 的字符（空格/点/符号）消毒成 `_`
+并折叠，使名字始终是模型可稳定输出的标识符；**实际分发用的 wire 名保持原样**（`tools/call`
+仍按服务器原始工具名调用），所以消毒只影响模型看到的名字。若消毒后两个工具撞名
+（如 server `a`+tool `b.c` 与 `a.b`+`c` 同得 `mcp_a_b_c`），启动时报错而非静默覆盖。
+
 | 传输 | 说明 |
 |---|---|
 | **stdio** | `command` + `args`，spawn 本地子进程（NDJSON / JSON-RPC 2.0） |
@@ -304,8 +309,8 @@ src/
 │   ├── mod.rs   (316)  #   共享 Message/Block、SSE reader、CancellableSse
 │   ├── openai.rs (624) #   OpenAI 兼容（include_usage；400 回退：max_tokens→max_completion_tokens / 丢 stream_options）
 │   ├── anthropic.rs(400) # Anthropic 原生（message_start/message_delta usage）
-│   └── mock.rs   (153) #   测试用脚本化 Provider（cfg(test)）
-├── agent.rs    (1146) # 核心 loop + usage 累计 + cancel + 上下文压缩 + 回归测试
+│   └── mock.rs   (158) #   测试用脚本化 Provider（cfg(test)）
+├── agent.rs    (1242) # 核心 loop + usage 累计 + cancel + 上下文压缩 + 相邻消息归一 + 回归测试
 ├── signal.rs     (58) # headless SIGINT → cancel（首次优雅 / 二次硬退出 130）
 ├── tools/              # 5 个内置工具 + MCP 工具包装
 ├── mcp.rs      (648)   # MCP 客户端（stdio / Streamable HTTP / 旧版 SSE）
