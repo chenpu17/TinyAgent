@@ -5,7 +5,8 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::json;
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Mutex};
+use std::sync::atomic::Ordering;
+use std::sync::{mpsc, Arc, Mutex};
 
 #[derive(Debug, Clone, Deserialize)]
 struct TaskReport {
@@ -21,8 +22,11 @@ struct TaskReport {
 /// with a fixed pool of worker threads.
 /// - `retries`: extra attempts per task on transient failures only.
 /// - `failed`: re-run only tasks that failed in the prior report at `report_path`.
+/// - `cancel`: shared flag flipped by SIGINT (headless). Once set, workers stop
+///   dispatching new tasks — in-flight tasks finish on their own, not-yet-started
+///   ones are marked `cancelled` so the report still accounts for every task.
 ///
-/// Returns process exit code.
+/// Returns process exit code (130 if cancelled, else 0/1 by success).
 pub fn run(
     base: &Config,
     dir: &Path,
@@ -30,6 +34,7 @@ pub fn run(
     report_path: &Path,
     retries: usize,
     failed: bool,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<i32> {
     let mut files: Vec<PathBuf> = Vec::new();
     for e in std::fs::read_dir(dir)
@@ -120,7 +125,24 @@ pub fn run(
                     Ok(t) => t,
                     Err(_) => return, // channel drained
                 };
-                let report = run_one(base, &name, partial, &results_dir, &client, retries);
+                let report = if cancel.load(Ordering::Relaxed) {
+                    // Ctrl-C was hit: stop dispatching new tasks. Mark this one
+                    // cancelled (not run) so the report still accounts for every
+                    // task. In-flight tasks in other workers finish on their own
+                    // — we don't hard-interrupt a running agent here (sharing one
+                    // cancel flag across workers would race with agent::run()'s
+                    // entry reset); a second Ctrl-C force-exits via _exit(130).
+                    TaskReport {
+                        name,
+                        success: false,
+                        stop_reason: "cancelled".into(),
+                        turns: 0,
+                        elapsed_secs: 0.0,
+                        error: Some("cancelled by user (not started)".into()),
+                    }
+                } else {
+                    run_one(base, &name, partial, &results_dir, &client, retries)
+                };
                 eprintln!(
                     "[{}] {} ({} turns, {:.1}s{})",
                     report.name,
@@ -159,7 +181,13 @@ pub fn run(
         final_reports.len(),
         report_path.display()
     );
-    Ok(if succeeded == final_reports.len() { 0 } else { 1 })
+    Ok(if cancel.load(Ordering::Relaxed) {
+        130 // cancelled by Ctrl-C — report still written above
+    } else if succeeded == final_reports.len() {
+        0
+    } else {
+        1
+    })
 }
 
 /// One attempt at a task. Returns a `stop_reason` that signals retryability:
@@ -469,6 +497,44 @@ mod tests {
         assert!(!read[0].success);
         assert_eq!(read[1].name, "beta");
         assert!(read[1].success);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cancelled_run_marks_all_tasks_cancelled_exit_130() {
+        // With the cancel flag already set, the worker pool must gate every
+        // task (none run — no provider/agent is built), mark each `cancelled`,
+        // still write a report accounting for all tasks, and return 130.
+        let dir = std::env::temp_dir().join(format!("ta-batch-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.json"), r#"{"task":"do a"}"#).unwrap();
+        std::fs::write(dir.join("b.json"), r#"{"task":"do b"}"#).unwrap();
+
+        let base: Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"MOCK_API_KEY","model":"m"}"#,
+        )
+        .unwrap();
+        let report = dir.join("report.json");
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(true)); // pre-cancelled
+
+        let code = run(&base, &dir, 2, &report, 0, false, cancel).unwrap();
+        assert_eq!(code, 130);
+
+        // Report accounts for both tasks; both cancelled, none actually run.
+        let tasks = read_prior_tasks(&report).unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert!(tasks.iter().all(|t| !t.success));
+        assert!(tasks.iter().all(|t| t.stop_reason == "cancelled"));
+        assert!(tasks.iter().all(|t| t.turns == 0));
+        // No per-task result files were written (tasks never ran).
+        let results_dir = dir.join("results");
+        assert_eq!(
+            std::fs::read_dir(&results_dir).unwrap().count(),
+            0,
+            "cancelled tasks must not write result files"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

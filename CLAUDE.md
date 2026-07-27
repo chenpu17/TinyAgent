@@ -36,7 +36,8 @@ cargo clippy --all-targets                # lint headless 版（两个 feature �
   harness（headless 打印/NDJSON）或 TUI。上下文压缩的摘要请求自身 usage 也计入累计（诚实成本）。
 - **headless Ctrl-C** 走 `signal.rs`：首次 SIGINT 翻 cancel 标志（流式 ≤200ms 内断，照常写
   `result.json`，exit 130），二次 SIGINT `libc::_exit(130)` 立即退。handler 只碰 lock-free 原子 + `_exit`
-  （async-signal-safe）。TUI 不用它——raw 模式下 crossterm 把 Ctrl-C 当普通按键。
+  （async-signal-safe）。**批量模式**（`batch::run`）也装它：cancel 标志由 worker 在起任务前 gate
+  （在跑的跑完、未起的标记 `cancelled`、照常合并 report、exit 130）。TUI 不用它——raw 模式下 crossterm 把 Ctrl-C 当普通按键。
 - **会话持久化**由 `session.rs` 负责；`--session none`（`main::session_target` 判定字面量 `none`）
   关闭读写，与 `--resume` 互斥（直接 bail）。
 - **TUI 是可选 feature**（`ratatui` + `crossterm` + `tui-markdown` + `unicode-width`），
@@ -61,6 +62,10 @@ cargo clippy --all-targets                # lint headless 版（两个 feature �
 - **批量 `--retries` 只重试 transient**（`stop_reason == "error"`），指数退避 1..32s 封顶；
   `bad_task`/`max_turns` 等确定性失败不重试。`--failed` 重跑失败子集后**合并**进完整报告
   （未重跑的历史成功项原样保留）。
+- **批量 Ctrl-C 是 worker gate，不中断在跑任务**：`batch::run` 的 worker 在**起任务前**检查共享
+  cancel 标志，命中则标 `cancelled` 跳过；在跑的任务照常跑完（"收敛"）。**没有**把 cancel 标志传给
+  agent 中断流式——因为多 worker 共享一个 flag 会和 `agent::run()` 入口的 `store(false)` 复位竞争
+  （一个 worker 起新 run 会清掉另一个在跑的取消信号）。要立刻退出按第二次 Ctrl-C（`_exit(130)`）。
 - **OpenAI 400 回退**（`openai::body_fix_for_400`）：错误文本提到 `max_tokens` 时改名为
   `max_completion_tokens` 重试一次（reasoning 模型）；提到 `stream_options` 时丢弃该字段重试一次
   （vLLM 等旧网关，之后 usage 走 `None` 降级，`parse_loop` 已容忍）。未知 400 直接 bail。

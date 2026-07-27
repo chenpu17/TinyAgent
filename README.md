@@ -263,7 +263,8 @@ tool_use/tool_result 配对不被切断；压缩失败时告警一次并禁用�
 
 headless 模式下 `Ctrl-C` 走**优雅取消**：首次 SIGINT 在流式 chunk 间（≤200ms）中断，照常写好
 `result.json`（`stop_reason = cancelled`）后 exit 130；再次 `Ctrl-C` 立即 exit 130（不等本轮结束）。
-TUI 模式下 `Ctrl-C` 是普通按键，按上面的按键表处理。
+**批量模式**（`--batch`）同样生效：首次 SIGINT 后在跑的任务跑完、不再起新任务（未起的标记 `cancelled`），
+照常合并写出 `--report` 后 exit 130；再次 `Ctrl-C` 立即 exit 130。TUI 模式下 `Ctrl-C` 是普通按键，按上面的按键表处理。
 
 `--json` 模式额外在每个事件吐一行 NDJSON（`type`: `turn` / `text` / `tool_call` / `tool_result` /
 `usage` / `compressed` / `done`），可在结果文件落盘前实时跟进进度。

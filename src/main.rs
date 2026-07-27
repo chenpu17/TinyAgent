@@ -124,7 +124,14 @@ fn main() -> Result<()> {
         if cli.tui {
             bail!("--batch and --tui are mutually exclusive");
         }
-        let code = batch::run(&cfg, dir, cli.jobs, &cli.report, cli.retries, cli.failed)?;
+        // Wire Ctrl-C into batch the same way single-run headless does: first
+        // SIGINT flips a shared flag the worker pool gates on (in-flight tasks
+        // finish, no new ones start, the report still merges) → exit 130; a
+        // second SIGINT force-exits 130. Without this, Ctrl-C killed the batch
+        // hard and the merged report was never written.
+        let cancel = Arc::new(AtomicBool::new(false));
+        signal::install_sigint_cancel(cancel.clone());
+        let code = batch::run(&cfg, dir, cli.jobs, &cli.report, cli.retries, cli.failed, cancel)?;
         std::process::exit(code);
     }
 
