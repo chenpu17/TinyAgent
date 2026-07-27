@@ -52,6 +52,9 @@ tiny-agent --config examples/harness.json --task "描述这张截图" --image sh
 tiny-agent --config examples/chat.json --task "记住暗号 PINEAPPLE" --session sess.json
 tiny-agent --config examples/chat.json --resume --task "暗号是什么？" --session sess.json
 
+# 一次性运行不落盘会话（CI / 临时跑不想污染 cwd）
+tiny-agent --config examples/harness.json --task "跑测试" --session none --output result.json
+
 # 批量任务模式：跑目录下所有任务片段，2 个并发，输出汇总报告
 tiny-agent --config examples/harness.json --batch examples/tasks --jobs 2 --report report.json
 # 只重跑上一轮 report.json 里失败的任务（结果合并回完整报告），并对 transient 失败重试 2 次
@@ -110,6 +113,7 @@ tiny-agent --config examples/harness.json --batch examples/tasks --failed --retr
 ## 会话持久化
 
 - `--session <path>` 指定会话文件（默认 `./.tinyagent-session.json`），每轮结束原子落盘
+- `--session none` 关闭持久化——不读不写，一次性 headless 运行不在 cwd 留文件（与 `--resume` 互斥）
 - `--resume` 加载历史继续；此时 config 里的 `task` 视为已消费，用 `--task` 追加新指令
 - 崩溃也不丢已完成的轮次；TUI 模式同样生效
 
@@ -141,6 +145,8 @@ tiny-agent --config examples/harness.json --batch examples/tasks --failed --retr
 | `/help` | 命令列表 |
 
 取消机制：每轮开始会复位 cancel 标志，`Ctrl-C` 在流式 chunk 间（≤200ms）生效，取消后可继续发下一条。
+
+多行粘贴：终端开启 bracketed paste，一次粘贴含换行的多行会被当作**单条**消息，不会因换行被提前发送——直接粘贴即可，无需手动改 Alt+Enter。
 
 ## MCP 客户端
 
@@ -202,6 +208,9 @@ tool_use/tool_result 配对不被切断；压缩失败时告警一次并禁用�
 （不中断任务，也不每轮重试刷屏）。运行日志中可见
 `[context compressed: dropped N messages, M kept]`。
 
+压缩摘要请求自身的 token 用量也计入运行累计（`input_tokens` / `output_tokens`），
+成本数字与实际调用一致，不因压缩而漏报。
+
 ## ⚠️ 安全说明
 
 **这是一个给模型直接执行能力的 agent，不是沙箱。** 请按此定位使用：
@@ -247,6 +256,10 @@ tool_use/tool_result 配对不被切断；压缩失败时告警一次并禁用�
 | `130` | 用户取消（`cancelled`，128 + SIGINT）|
 | `1` | 其它（`max_turns_reached` / `max_tokens` / provider 错误等）|
 
+headless 模式下 `Ctrl-C` 走**优雅取消**：首次 SIGINT 在流式 chunk 间（≤200ms）中断，照常写好
+`result.json`（`stop_reason = cancelled`）后 exit 130；再次 `Ctrl-C` 立即 exit 130（不等本轮结束）。
+TUI 模式下 `Ctrl-C` 是普通按键，按上面的按键表处理。
+
 `--json` 模式额外在每个事件吐一行 NDJSON（`type`: `turn` / `text` / `tool_call` / `tool_result` /
 `usage` / `compressed` / `done`），可在结果文件落盘前实时跟进进度。
 
@@ -277,21 +290,27 @@ cd $(mktemp -d) && MOCK_API_KEY=dummy tiny-agent --config <指向 mock 的配置
 agent loop（含 tool_use 配对、token 用量解析、流式取消）。注意 `[profile.release] panic = "abort"`，
 release 下 panic 不触发 `Drop`——调试 destructors（如 TUI 终端还原）用 debug 构建。
 
+核心 agent loop 有进程内回归测试：`src/provider/mock.rs` 是 cfg(test) 的脚本化 Provider，
+`src/agent.rs` 的 `#[cfg(test)]` 模块覆盖 cancel 复位、tool_use/tool_result N:N 配对（含中途取消的
+合成 `[cancelled by user]`）、上下文压缩、usage 累计等不变量。**改 `agent.rs` 核心路径请配套补 loop 测试。**
+
 ## 代码结构
 
 ```
 src/
-├── main.rs      (244)  # CLI 入口 + 组装（build_agent）
+├── main.rs      (311)  # CLI 入口 + 组装（build_agent）+ --session none
 ├── config.rs    (471)  # 配置解析 + 任务片段合并 + 批量覆盖白名单
 ├── provider/           # LLM 后端
-│   ├── mod.rs   (314)  #   共享 Message/Block、SSE reader、CancellableSse
-│   ├── openai.rs (574) #   OpenAI 兼容（含 stream_options.include_usage 解析）
-│   └── anthropic.rs(400) # Anthropic 原生（message_start/message_delta usage）
-├── agent.rs     (758)  # 核心 loop + usage 累计 + cancel + 上下文压缩
+│   ├── mod.rs   (316)  #   共享 Message/Block、SSE reader、CancellableSse
+│   ├── openai.rs (624) #   OpenAI 兼容（include_usage；400 回退：max_tokens→max_completion_tokens / 丢 stream_options）
+│   ├── anthropic.rs(400) # Anthropic 原生（message_start/message_delta usage）
+│   └── mock.rs   (153) #   测试用脚本化 Provider（cfg(test)）
+├── agent.rs    (1146) # 核心 loop + usage 累计 + cancel + 上下文压缩 + 回归测试
+├── signal.rs     (58) # headless SIGINT → cancel（首次优雅 / 二次硬退出 130）
 ├── tools/              # 5 个内置工具 + MCP 工具包装
 ├── mcp.rs      (648)   # MCP 客户端（stdio / Streamable HTTP / 旧版 SSE）
 ├── session.rs   (125)  # 会话持久化
 ├── batch.rs     (475)  # 批量任务 + --retries/--failed + 报告合并
 ├── harness.rs   (281)  # headless 模式 + result.json + NDJSON + exit code
-└── tui.rs      (1218)  # TUI（feature-gated）：InputBuffer / 模式 / 斜杠命令
+└── tui.rs      (1274)  # TUI（feature-gated）：InputBuffer / 模式 / 斜杠命令 / bracketed paste
 ```

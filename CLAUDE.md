@@ -30,9 +30,15 @@ cargo clippy --all-targets                # lint headless 版（两个 feature �
 - **两个 provider** 共享 `parse_loop` 与 `Message`/`Block` 类型：`provider/openai.rs`（兼容协议，
   覆盖 DeepSeek/vLLM/Ollama）与 `provider/anthropic.rs`（原生）。两者都解析 token 用量
   （OpenAI 走 `stream_options.include_usage` + `choices:[]` 末块；Anthropic 走
-  `message_start`/`message_delta`）。
+  `message_start`/`message_delta`）。`provider/mock.rs` 是 `cfg(test)` 的脚本化 Provider，
+  供 `agent.rs` 的进程内 loop 回归测试用（不连网）。
 - **核心 loop 在 `agent.rs`**：累计 usage、cancel 复位、上下文压缩都在这里。`AgentEvent` 透传给
-  harness（headless 打印/NDJSON）或 TUI。
+  harness（headless 打印/NDJSON）或 TUI。上下文压缩的摘要请求自身 usage 也计入累计（诚实成本）。
+- **headless Ctrl-C** 走 `signal.rs`：首次 SIGINT 翻 cancel 标志（流式 ≤200ms 内断，照常写
+  `result.json`，exit 130），二次 SIGINT `libc::_exit(130)` 立即退。handler 只碰 lock-free 原子 + `_exit`
+  （async-signal-safe）。TUI 不用它——raw 模式下 crossterm 把 Ctrl-C 当普通按键。
+- **会话持久化**由 `session.rs` 负责；`--session none`（`main::session_target` 判定字面量 `none`）
+  关闭读写，与 `--resume` 互斥（直接 bail）。
 - **TUI 是可选 feature**（`ratatui` + `crossterm` + `tui-markdown` + `unicode-width`），
   `src/tui.rs` 在 `#[cfg(feature = "tui")]` 后。默认 headless 版不含它，保持体积。
 
@@ -53,11 +59,23 @@ cargo clippy --all-targets                # lint headless 版（两个 feature �
 - **批量 `--retries` 只重试 transient**（`stop_reason == "error"`），指数退避 1..32s 封顶；
   `bad_task`/`max_turns` 等确定性失败不重试。`--failed` 重跑失败子集后**合并**进完整报告
   （未重跑的历史成功项原样保留）。
+- **OpenAI 400 回退**（`openai::body_fix_for_400`）：错误文本提到 `max_tokens` 时改名为
+  `max_completion_tokens` 重试一次（reasoning 模型）；提到 `stream_options` 时丢弃该字段重试一次
+  （vLLM 等旧网关，之后 usage 走 `None` 降级，`parse_loop` 已容忍）。未知 400 直接 bail。
+  改请求体字段的人要知道这条重试路径，别在 fix 后又引入新 400。
+- **`--session none` 是关闭持久化的字面量哨兵**（不是文件名）——真要叫 `none` 的文件没法用，
+  但它语义清晰、够用。改 `session_target` 判定前先想清楚。
+- **改 `agent.rs` 核心路径必须配套 loop 测试**。`agent.rs` 的 `#[cfg(test)]` 模块用
+  `provider/mock.rs` 的脚本化 Provider 覆盖不变量：cancel 复位、tool_use/tool_result N:N 配对
+  （含中途取消时合成的 `[cancelled by user]` 进 history 但不进 `tool_calls`）、压缩、usage 累计。
+  动了 loop 逻辑先补/查这些测试，别只靠 mock server 跑一遍就提交。
 
 ## 离线 / 视觉验证
 
 - **mock server**：`examples/mock_openai.py`、`examples/mock_anthropic.py` 是零依赖 SSE mock，
   用于无 API key 跑通整个 loop（tool_use 配对、usage 解析、取消）。改动 provider/agent 后用它回归。
+- **进程内回归**：`agent.rs` 的 loop 不变量用 `provider/mock.rs`（脚本化 Provider，不连网）单测覆盖，
+  比 mock server 更快、断言更准。新增/改动 loop 行为优先在这里加用例。
 - **TUI 视觉验证**：用 ratatui `TestBackend` 抓 cell grid 做断言（见 `tui::tests`）；端到端交互用
   pty 脚本驱动（项目里惯用 `/tmp/ta-verify/` 放临时 mock + pty 脚本，跑完即删）。**不要只靠
   "看起来对"**——改了渲染/光标/markdown 要真抓屏或单测断言验证。
