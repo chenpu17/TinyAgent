@@ -176,14 +176,17 @@ impl Tool for EditFile {
             );
         }
 
-        // Like write_file this is an in-place (non-atomic) write; a crash
-        // mid-write could leave a partial file. Matches the existing file tools.
         let updated = if replace_all {
             original.replace(old_string, new_string)
         } else {
             original.replacen(old_string, new_string, 1)
         };
-        std::fs::write(&full, &updated)
+        // Atomic (temp + fsync + rename): unlike write_file — which the model
+        // can redo from its in-context copy — edit_file mutates an existing file
+        // the model may NOT have in full, so a crash mid-write (panic=abort,
+        // SIGKILL, power loss) must not leave it truncated. Same helper
+        // result.json/report.json use.
+        crate::harness::atomic_write(&full, updated.as_bytes())
             .with_context(|| format!("cannot write {}", full.display()))?;
         let n = if replace_all { count } else { 1 };
         Ok(ToolOutput::text(format!(

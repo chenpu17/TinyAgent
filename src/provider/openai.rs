@@ -305,17 +305,23 @@ impl OpenAi {
                 // With stream_options.include_usage the final chunk has an empty
                 // choices array and carries the usage totals.
                 if let Some(u) = ev.get("usage") {
+                    // OpenAI's `prompt_tokens` is the TOTAL prompt (cached +
+                    // uncached); `cached_tokens` is the subset served from
+                    // cache. Subtract so `input_tokens` stays non-cached-only
+                    // — matching Anthropic's invariant on the Usage struct and
+                    // keeping the billed-input formula honest across providers
+                    // (otherwise cached tokens count full-price here AND again
+                    // as a cache read). cache_creation stays 0: OpenAI's
+                    // implicit caching has no separate "creation" event.
+                    let cached = u["prompt_tokens_details"]["cached_tokens"]
+                        .as_u64()
+                        .unwrap_or(0);
+                    let prompt = u["prompt_tokens"].as_u64().unwrap_or(0);
                     usage = Some(Usage {
-                        input_tokens: u["prompt_tokens"].as_u64().unwrap_or(0),
+                        input_tokens: prompt.saturating_sub(cached),
                         output_tokens: u["completion_tokens"].as_u64().unwrap_or(0),
-                        // OpenAI prompt caching is implicit (automatic for prompts
-                        // >1024 tokens); the only observable is how many of the
-                        // prompt tokens were served from cache. There's no
-                        // separate "creation" event, so cache_creation stays 0.
                         cache_creation_input_tokens: 0,
-                        cache_read_input_tokens: u["prompt_tokens_details"]["cached_tokens"]
-                            .as_u64()
-                            .unwrap_or(0),
+                        cache_read_input_tokens: cached,
                     });
                 }
                 continue;
@@ -574,8 +580,9 @@ mod tests {
     #[test]
     fn stream_usage_reads_cached_tokens() {
         // OpenAI reports cache hits as prompt_tokens_details.cached_tokens on
-        // the final usage chunk. parse_loop maps it to cache_read_input_tokens;
-        // cache_creation stays 0 (OpenAI implicit caching has no "creation").
+        // the final usage chunk. cached_tokens is a subset of prompt_tokens, so
+        // input_tokens must be prompt - cached (non-cached only, matching
+        // Anthropic); cache_creation stays 0 (OpenAI implicit caching).
         let raw = concat!(
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"x\"}}]}\n\n",
             "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":42,\"completion_tokens\":3,\"total_tokens\":45,\"prompt_tokens_details\":{\"cached_tokens\":30}}}\n\n",
@@ -583,7 +590,7 @@ mod tests {
         );
         let resp = OpenAi::parse_stream(raw.as_bytes(), &mut |_| {}).unwrap();
         let u = resp.usage.expect("usage frame present");
-        assert_eq!(u.input_tokens, 42);
+        assert_eq!(u.input_tokens, 12); // 42 total − 30 cached = 12 non-cached
         assert_eq!(u.output_tokens, 3);
         assert_eq!(u.cache_creation_input_tokens, 0);
         assert_eq!(u.cache_read_input_tokens, 30);

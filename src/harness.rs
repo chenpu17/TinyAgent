@@ -26,8 +26,12 @@ pub fn run(
 /// backoff (the live path passes `std::thread::sleep`). The same `&mut Agent` is
 /// reused across attempts — a provider Err happens before any message is
 /// appended (the `?` is on `provider.chat`), and `agent.run` resets the cancel
-/// flag at entry, so a retry starts clean. Token totals reflect only the final
-/// attempt (matching batch); `attempts` in result.json records how many ran.
+/// flag at entry, so a retry starts clean. Caveat: if compression fired on a
+/// failed attempt it already folded the history (and saved the session), so the
+/// retry runs on the shorter history — safe and idempotent (it won't re-compress
+/// or double-bill), just not a perfect in-place restart. Token totals reflect
+/// only the final attempt (matching batch); `attempts` in result.json records
+/// how many ran.
 pub(crate) fn run_with_retries(
     agent: &mut Agent,
     output_path: Option<&Path>,
@@ -119,6 +123,17 @@ pub(crate) fn run_with_retries(
                         eprintln!("[transient] {msg}; retry {attempt}/{retries} in {backoff:?}");
                     }
                     sleep(backoff);
+                    // A Ctrl-C during the backoff flips the cancel flag, but
+                    // the next agent.run clears it at entry and would proceed
+                    // — making the first Ctrl-C look like a no-op (only the
+                    // second SIGINT force-exits). Honor it here instead.
+                    if agent.cancelled() {
+                        break (
+                            EXIT_CANCELLED,
+                            None,
+                            Some("cancelled during retry backoff".into()),
+                        );
+                    }
                     attempt += 1;
                     continue;
                 }

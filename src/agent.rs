@@ -107,7 +107,7 @@ impl Agent {
         self.cancel = Some(flag);
     }
 
-    fn cancelled(&self) -> bool {
+    pub(crate) fn cancelled(&self) -> bool {
         self.cancel
             .as_ref()
             .is_some_and(|c| c.load(Ordering::Relaxed))
@@ -265,6 +265,9 @@ impl Agent {
                     .cancel
                     .clone()
                     .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
+                // The main turn benefits from prompt caching (re-reads the
+                // stable prefix across turns); one-off requests opt out.
+                cache: true,
             };
             let resp = self.provider.chat(&req, &mut |e| match e {
                 ChatEvent::TextDelta(t) => events(AgentEvent::TextDelta(t)),
@@ -665,6 +668,10 @@ impl Agent {
                 .cancel
                 .clone()
                 .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
+            // The summary is one-off: the next compression summarizes a
+            // different transcript, so a cache breakpoint would only ever pay
+            // the 1.25× write premium with no subsequent read. Skip caching.
+            cache: false,
         };
         let resp = self.provider.chat(&req, &mut |_| {})?;
         let text = resp
@@ -1178,6 +1185,35 @@ mod tests {
     }
 
     #[test]
+    fn compress_summary_request_omits_caching() {
+        // The compression summary is a one-off call on a prefix that will never
+        // be re-sent as a growing prefix, so it must pass cache:false (no 1.25×
+        // write premium). The subsequent main turn is a normal agent turn and
+        // passes cache:true. Pinned because the summary builds its own
+        // ChatRequest, separate from the turn request — easy to forget.
+        let mut cfg = cfg_with(5, 0, 30);
+        cfg.limits.keep_recent_messages = 2;
+        let long = "x".repeat(40);
+        let initial = vec![
+            user_text(&long),
+            Message::assistant(vec![Block::Text("a1".into())]),
+            user_text("u1"),
+            Message::assistant(vec![Block::Text("a2".into())]),
+            user_text("u2"),
+        ];
+        let (prov, state) = MockProvider::new(vec![
+            mock::resp_text("SUMMARY", None),     // summarize_prefix call
+            mock::resp_text("final answer", None), // main call
+        ]);
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+        agent.run(&mut |_| {}).unwrap();
+        let cap = state.captured();
+        assert_eq!(cap.len(), 2);
+        assert!(!cap[0].cache, "summary request must be cache:false");
+        assert!(cap[1].cache, "main turn request must be cache:true");
+    }
+
+    #[test]
     fn compress_summary_usage_is_counted_in_totals() {
         // The summarize_prefix request is a real billed call — its usage must
         // fold into the run totals (and emit a Usage event), not be dropped.
@@ -1414,6 +1450,34 @@ mod tests {
         assert_eq!(state.calls(), 1, "retries=0 → exactly one attempt");
         let s = std::fs::read_to_string(&out).unwrap();
         assert!(s.contains("\"attempts\": 1"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn single_run_cancel_during_backoff_exits_130() {
+        // A Ctrl-C during the retry backoff must cancel (exit 130) instead of
+        // being swallowed: the next agent.run would clear the flag at entry and
+        // proceed, making the first Ctrl-C look like a no-op. The sleeper
+        // simulates the signal by flipping the shared cancel flag.
+        let cfg = cfg_with(5, 0, 0);
+        let (prov, state) = MockProvider::new(vec![
+            MockTurn::Err("503".into()),
+            MockTurn::Err("not reached".into()),
+        ]);
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], vec![user_text("go")], test_ctx());
+        let cancel = Arc::new(AtomicBool::new(false));
+        agent.set_cancel(cancel.clone());
+        let dir = std::env::temp_dir().join(format!("ta-retry-cancel-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let out = dir.join("r.json");
+        let code = crate::harness::run_with_retries(&mut agent, Some(&out), false, 2, |_| {
+            cancel.store(true, Ordering::Relaxed);
+        })
+        .unwrap();
+        assert_eq!(code, 130, "cancel during backoff → exit 130");
+        assert_eq!(state.calls(), 1, "only attempt 1 ran; cancel broke before attempt 2");
+        let s = std::fs::read_to_string(&out).unwrap();
+        assert!(s.contains("cancelled during retry backoff"), "{s}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

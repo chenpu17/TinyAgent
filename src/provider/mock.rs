@@ -33,6 +33,11 @@ pub(crate) struct Captured {
     pub(crate) trailing_tool_uses: usize,
     /// tool_result blocks on the trailing user message.
     pub(crate) trailing_tool_results: usize,
+    /// The `cache` flag on the request — lets tests assert that one-off calls
+    /// (the compression summary) request `cache:false` while agent turns send
+    /// `cache:true`. The mock doesn't build an HTTP body, so this records the
+    /// agent's intent rather than the wire-level cache_control markup.
+    pub(crate) cache: bool,
 }
 
 /// Shared, interior-mutable state — cloned by the test so it survives the
@@ -95,6 +100,7 @@ impl Provider for MockProvider {
             roles: req.messages.iter().map(|m| m.role).collect(),
             trailing_tool_uses,
             trailing_tool_results,
+            cache: req.cache,
         });
 
         // Pop the next scripted turn; running off the end is a test bug.

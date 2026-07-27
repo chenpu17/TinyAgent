@@ -120,6 +120,12 @@ pub struct ChatRequest<'a> {
     /// checks it between chunks so Esc/Ctrl-C can interrupt a stuck request
     /// mid-stream, not only at the next turn boundary.
     pub cancel: Arc<AtomicBool>,
+    /// When true (the normal agent turn), the Anthropic provider marks prompt-
+    /// caching breakpoints. One-off requests that won't be re-sent with a
+    /// growing prefix (e.g. the compression summary) pass false to skip the
+    /// 1.25× cache-write premium on content that will never be a cache read.
+    /// OpenAI caching is implicit and ignores this.
+    pub cache: bool,
 }
 
 pub trait Provider: Send + Sync {

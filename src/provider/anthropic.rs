@@ -122,47 +122,7 @@ fn finalize_pending_lenient(p: Pending) -> Block {
 
 impl Provider for Anthropic {
     fn chat(&self, req: &ChatRequest, on_event: &mut dyn FnMut(ChatEvent)) -> Result<ChatResponse> {
-        let mut body = json!({
-            "model": req.model,
-            "max_tokens": req.max_tokens,
-            "stream": true,
-            "messages": req.messages.iter().map(Self::message_json).collect::<Vec<_>>(),
-        });
-        // Prompt caching: mark up to three ephemeral breakpoints so a multi-turn
-        // run re-reads the stable prefix cheaply instead of re-billing it every
-        // turn. Anthropic ignores breakpoints below its ~1024-token floor (no
-        // error, no charge), so this is always safe to apply, and ≤3 breakpoints
-        // stays under the 4-breakpoint cap the API enforces across the whole
-        // request. OpenAI caching is implicit (no body field), so this markup is
-        // Anthropic-only by virtue of living in this provider's chat().
-        if let Some(sys) = req.system {
-            // System must be a content-block array (not a bare string) to carry
-            // cache_control; tag it so the system prompt is cached across turns.
-            body["system"] = json!([{
-                "type": "text",
-                "text": sys,
-                "cache_control": {"type": "ephemeral"},
-            }]);
-        }
-        if !req.tools.is_empty() {
-            body["tools"] = Self::tools_json(req.tools);
-            // The tool definitions are stable for the whole run — cache them by
-            // tagging the last one.
-            if let Some(last) = body["tools"].as_array_mut().and_then(|a| a.last_mut()) {
-                last["cache_control"] = json!({"type": "ephemeral"});
-            }
-        }
-        // Cache the conversation prefix: tag the last content block of the last
-        // message, so on the next turn everything before it is a cache read.
-        if let Some(last_block) = body["messages"]
-            .as_array_mut()
-            .and_then(|msgs| msgs.last_mut())
-            .and_then(|m| m["content"].as_array_mut())
-            .and_then(|blocks| blocks.last_mut())
-        {
-            last_block["cache_control"] = json!({"type": "ephemeral"});
-        }
-
+        let body = Self::build_body(req);
         let mut rb = self
             .client
             .post(format!("{}/v1/messages", self.base_url))
@@ -189,6 +149,62 @@ impl Provider for Anthropic {
 }
 
 impl Anthropic {
+    /// Assemble the `/v1/messages` request body. Pure (no `&self`, no I/O) so
+    /// the prompt-cache gating is directly unit-testable (see
+    /// `tests::build_body_*`). Prompt caching marks up to three ephemeral
+    /// breakpoints when `req.cache` is set, so a multi-turn run re-reads the
+    /// stable prefix cheaply instead of re-billing it every turn. One-off
+    /// requests (the compression summary) pass `cache=false` to skip the 1.25×
+    /// write premium on content that's never re-read. Anthropic ignores
+    /// breakpoints below its ~1024-token floor (no error, no charge), so this
+    /// is always safe to apply, and ≤3 breakpoints stays under the 4-breakpoint
+    /// cap. OpenAI caching is implicit (no body field), so this markup is
+    /// Anthropic-only by virtue of living here.
+    fn build_body(req: &ChatRequest) -> Value {
+        let mut body = json!({
+            "model": req.model,
+            "max_tokens": req.max_tokens,
+            "stream": true,
+            "messages": req.messages.iter().map(Self::message_json).collect::<Vec<_>>(),
+        });
+        if let Some(sys) = req.system {
+            if req.cache {
+                // System must be a content-block array (not a bare string) to
+                // carry cache_control; tag it so the prompt is cached across turns.
+                body["system"] = json!([{
+                    "type": "text",
+                    "text": sys,
+                    "cache_control": {"type": "ephemeral"},
+                }]);
+            } else {
+                body["system"] = json!(sys);
+            }
+        }
+        if !req.tools.is_empty() {
+            body["tools"] = Self::tools_json(req.tools);
+            if req.cache {
+                // The tool definitions are stable for the whole run — cache
+                // them by tagging the last one.
+                if let Some(last) = body["tools"].as_array_mut().and_then(|a| a.last_mut()) {
+                    last["cache_control"] = json!({"type": "ephemeral"});
+                }
+            }
+        }
+        if req.cache {
+            // Cache the conversation prefix: tag the last content block of the
+            // last message, so on the next turn everything before it is a read.
+            if let Some(last_block) = body["messages"]
+                .as_array_mut()
+                .and_then(|msgs| msgs.last_mut())
+                .and_then(|m| m["content"].as_array_mut())
+                .and_then(|blocks| blocks.last_mut())
+            {
+                last_block["cache_control"] = json!({"type": "ephemeral"});
+            }
+        }
+        body
+    }
+
     /// Assemble a full response from an SSE byte stream (sync, for tests).
     #[cfg(test)]
     fn parse_stream<R: std::io::Read>(
@@ -450,4 +466,67 @@ mod tests {
             other => panic!("expected tool_use, got {other:?}"),
         }
     }
+
+    /// A representative agent-turn request: system prompt + two tools + two
+    /// messages (so the last-message and last-tool paths are both exercised).
+    fn sample_req(cache: bool) -> ChatRequest<'static> {
+        let tools = vec![
+            ToolDef {
+                name: "shell".into(),
+                description: "run a shell command".into(),
+                schema: json!({"type": "object"}),
+            },
+            ToolDef {
+                name: "read_file".into(),
+                description: "read a file".into(),
+                schema: json!({"type": "object"}),
+            },
+        ];
+        // Leak so the slice is 'static (test-only; the process exits with it).
+        let tools: &'static [ToolDef] = Box::leak(tools.into_boxed_slice());
+        let msgs = vec![
+            Message::user(vec![Block::Text("hello".into())]),
+            Message::assistant(vec![Block::Text("hi there".into())]),
+        ];
+        let msgs: &'static [Message] = Box::leak(msgs.into_boxed_slice());
+        ChatRequest {
+            system: Some("you are a helpful agent"),
+            messages: msgs,
+            tools,
+            model: "claude-haiku-4-5-20251001",
+            max_tokens: 1024,
+            per_request_timeout: None,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cache,
+        }
+    }
+
+    #[test]
+    fn build_body_marks_three_cache_breakpoints_when_cache_on() {
+        // cache=true (an agent turn) → up to three ephemeral breakpoints:
+        // system array, the last tool def, and the last block of the last
+        // message. The whole run stays under Anthropic's 4-breakpoint cap.
+        let body = Anthropic::build_body(&sample_req(true));
+        let s = serde_json::to_string(&body).unwrap();
+        let n = s.matches("cache_control").count();
+        assert_eq!(n, 3, "expected 3 breakpoints, body was:\n{s}");
+        // System becomes a content-block array carrying cache_control, not a
+        // bare string.
+        assert_eq!(body["system"][0]["type"], "text");
+    }
+
+    #[test]
+    fn build_body_has_no_cache_control_when_cache_off() {
+        // cache=false (a one-off compression-summary request) → no breakpoint
+        // markup at all: paying the 1.25× write premium on content that's never
+        // re-read would be pure waste. System falls back to a bare string.
+        let body = Anthropic::build_body(&sample_req(false));
+        let s = serde_json::to_string(&body).unwrap();
+        assert!(
+            !s.contains("cache_control"),
+            "one-off request must not carry cache_control, body was:\n{s}"
+        );
+        assert_eq!(body["system"], "you are a helpful agent", "bare string form");
+    }
 }
+
