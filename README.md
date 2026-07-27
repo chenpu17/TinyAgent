@@ -110,6 +110,19 @@ tiny-agent --config examples/harness.json --batch examples/tasks --report report
 tiny-agent --config examples/harness.json --batch examples/tasks --failed --retries 2 --report report.json
 ```
 
+### 单跑瞬态重试
+
+`--retries N` 在**单跑 headless** 模式同样生效：`agent.run` 返回 `Err`（provider/网络/超时，即 transient
+失败）时按指数退避（1/2/4/8/16/32s 封顶）原地重试，最多 N 次额外尝试；确定性结局（`end_turn` /
+`max_turns` / `cancelled` / `timeout`）是 `Ok`，**不重试**。退出码与无重试时一致（成功 0、失败 1），
+`result.json` 的 `attempts` 字段记录实际运行次数（`>1` 即发生过重试）。`--json` 模式每次重试前另吐一行
+`{"type":"retry","attempt":N,"max":M,"backoff_secs":B,"error":"..."}` 方便管道跟进。
+
+```sh
+# 单跑：撞到 provider 5xx 自动退避重试 3 次
+tiny-agent --config examples/harness.json --task "跑测试" --retries 3 --output result.json
+```
+
 ## 会话持久化
 
 - `--session <path>` 指定会话文件（默认 `./.tinyagent-session.json`），每轮结束原子落盘
@@ -249,6 +262,7 @@ Anthropic 原生 provider 默认开启 prompt caching：每个请求自动在 **
   "success": true,
   "stop_reason": "end_turn",
   "turns": 2,
+  "attempts": 3,
   "elapsed_secs": 3.1,
   "input_tokens": 1234,
   "output_tokens": 567,
@@ -263,6 +277,7 @@ Anthropic 原生 provider 默认开启 prompt caching：每个请求自动在 **
 ```
 
 - `tool_calls[].output` 是工具返回的完整内容（`is_error` 标记是否为错误结果）
+- `attempts` 是实际执行的 agent 运行次数（`>1` 表示发生了瞬态重试，见下文「单跑瞬态重试」）
 - `input_tokens` / `output_tokens` 是本次运行累计的 token 用量；`cache_creation_input_tokens` /
   `cache_read_input_tokens` 是 prompt 缓存写/读累计（Anthropic 两者都报，OpenAI 只报读）。`input_tokens`
   只含未缓存部分，真实计费输入需加上缓存写 1.25× / 读 0.1×（见上文 Prompt caching）

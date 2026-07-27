@@ -9,72 +9,128 @@ use std::path::Path;
 /// - `json = true`:  stream one JSON object per event (NDJSON) to stdout.
 ///
 /// Then write a structured result file (always — even on failure). Returns the
-/// process exit code.
-pub fn run(agent: &mut Agent, output_path: Option<&Path>, json: bool) -> Result<i32> {
-    let mut at_line_start = true;
-    let result: std::result::Result<RunOutcome, anyhow::Error> =
-        agent.run(&mut |ev| {
-            if json {
-                emit_json(&ev);
-                return;
-            }
-            match ev {
-                AgentEvent::TurnStart(n) => {
-                    if !at_line_start {
-                        println!();
-                    }
-                    eprintln!("── turn {n} ──");
-                }
-                AgentEvent::TextDelta(t) => {
-                    print!("{t}");
-                    let _ = std::io::stdout().flush();
-                    at_line_start = t.ends_with('\n');
-                }
-                AgentEvent::ToolCall { name, input } => {
-                    println!("\n[tool →] {name} {}", compact(&input));
-                }
-                AgentEvent::ToolResult {
-                    name,
-                    is_error,
-                    content,
-                } => {
-                    let tag = if is_error { "[tool ✗]" } else { "[tool ✓]" };
-                    println!("{tag} {name}: {}", crate::agent::preview(&content));
-                }
-                AgentEvent::Done { stop_reason } => {
-                    println!("\n[done: {stop_reason}]");
-                }
-                AgentEvent::Compressed { dropped, kept } => {
-                    println!("\n[context compressed: dropped {dropped} messages, {kept} kept]");
-                }
-                AgentEvent::Usage {
-                    input_tokens,
-                    output_tokens,
-                    cache_creation_input_tokens,
-                    cache_read_input_tokens,
-                } => {
-                    let cache = if cache_creation_input_tokens > 0 || cache_read_input_tokens > 0 {
-                        format!(
-                            " · cache {}write {}read",
-                            cache_creation_input_tokens, cache_read_input_tokens
-                        )
-                    } else {
-                        String::new()
-                    };
-                    eprintln!("[tokens: {input_tokens}↑ {output_tokens}↓{cache}]");
-                }
-            }
-        });
+/// process exit code. On a transient error (`agent.run` returns Err — provider /
+/// network / timeout), retry up to `retries` more times with exponential
+/// backoff (shared with batch); deterministic outcomes (end_turn, max_turns,
+/// cancelled, timeout) come back as Ok and are never retried.
+pub fn run(
+    agent: &mut Agent,
+    output_path: Option<&Path>,
+    json: bool,
+    retries: usize,
+) -> Result<i32> {
+    run_with_retries(agent, output_path, json, retries, std::thread::sleep)
+}
 
+/// `sleep` is injected so unit tests run the retry loop without waiting on real
+/// backoff (the live path passes `std::thread::sleep`). The same `&mut Agent` is
+/// reused across attempts — a provider Err happens before any message is
+/// appended (the `?` is on `provider.chat`), and `agent.run` resets the cancel
+/// flag at entry, so a retry starts clean. Token totals reflect only the final
+/// attempt (matching batch); `attempts` in result.json records how many ran.
+pub(crate) fn run_with_retries(
+    agent: &mut Agent,
+    output_path: Option<&Path>,
+    json: bool,
+    retries: usize,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> Result<i32> {
+    let mut at_line_start = true;
+    // 1-based count of completed tries → result.json's `attempts`. We retry
+    // while `attempt <= retries`, i.e. at most retries+1 total attempts.
+    let mut attempt = 1usize;
+    let (code, outcome, error) = loop {
+        let result: std::result::Result<RunOutcome, anyhow::Error> =
+            agent.run(&mut |ev| {
+                if json {
+                    emit_json(&ev);
+                    return;
+                }
+                match ev {
+                    AgentEvent::TurnStart(n) => {
+                        if !at_line_start {
+                            println!();
+                        }
+                        eprintln!("── turn {n} ──");
+                    }
+                    AgentEvent::TextDelta(t) => {
+                        print!("{t}");
+                        let _ = std::io::stdout().flush();
+                        at_line_start = t.ends_with('\n');
+                    }
+                    AgentEvent::ToolCall { name, input } => {
+                        println!("\n[tool →] {name} {}", compact(&input));
+                    }
+                    AgentEvent::ToolResult {
+                        name,
+                        is_error,
+                        content,
+                    } => {
+                        let tag = if is_error { "[tool ✗]" } else { "[tool ✓]" };
+                        println!("{tag} {name}: {}", crate::agent::preview(&content));
+                    }
+                    AgentEvent::Done { stop_reason } => {
+                        println!("\n[done: {stop_reason}]");
+                    }
+                    AgentEvent::Compressed { dropped, kept } => {
+                        println!("\n[context compressed: dropped {dropped} messages, {kept} kept]");
+                    }
+                    AgentEvent::Usage {
+                        input_tokens,
+                        output_tokens,
+                        cache_creation_input_tokens,
+                        cache_read_input_tokens,
+                    } => {
+                        let cache = if cache_creation_input_tokens > 0 || cache_read_input_tokens > 0 {
+                            format!(
+                                " · cache {}write {}read",
+                                cache_creation_input_tokens, cache_read_input_tokens
+                            )
+                        } else {
+                            String::new()
+                        };
+                        eprintln!("[tokens: {input_tokens}↑ {output_tokens}↓{cache}]");
+                    }
+                }
+            });
+        match result {
+            Ok(o) => break (exit_code_for(&o.stop_reason), Some(o), None),
+            Err(e) => {
+                if attempt <= retries {
+                    let backoff =
+                        std::time::Duration::from_secs(crate::retry::backoff_secs(attempt - 1));
+                    let msg = format!("{e:#}");
+                    if json {
+                        // Surface the retry to NDJSON consumers between attempts
+                        // so they can follow progress, not just see a gap.
+                        let v = json!({
+                            "type": "retry",
+                            "attempt": attempt,
+                            "max": retries,
+                            "backoff_secs": backoff.as_secs(),
+                            "error": msg,
+                        });
+                        println!(
+                            "{}",
+                            serde_json::to_string(&v).unwrap_or_else(|_| "{}".into())
+                        );
+                        let _ = std::io::stdout().flush();
+                    } else {
+                        eprintln!("[transient] {msg}; retry {attempt}/{retries} in {backoff:?}");
+                    }
+                    sleep(backoff);
+                    attempt += 1;
+                    continue;
+                }
+                break (EXIT_ERROR, None, Some(format!("{e:#}")));
+            }
+        }
+    };
     // Always produce a result artifact, even on failure: the previous `?` here
     // skipped write_result on any error, leaving CI with nothing but an opaque
     // non-zero exit. Batch (run_one) already did this; single-run now matches.
-    let (code, outcome, error) = match result {
-        Ok(o) => (exit_code_for(&o.stop_reason), Some(o), None),
-        Err(e) => (EXIT_ERROR, None, Some(format!("{e:#}"))),
-    };
     if let Some(path) = output_path {
-        write_result(path, outcome.as_ref(), error.as_deref())?;
+        write_result(path, outcome.as_ref(), error.as_deref(), attempt)?;
         if !json {
             eprintln!("result written to {}", path.display());
         }
@@ -150,7 +206,12 @@ fn emit_json(ev: &AgentEvent) {
     let _ = std::io::stdout().flush();
 }
 
-pub fn write_result(path: &Path, outcome: Option<&RunOutcome>, error: Option<&str>) -> Result<()> {
+pub fn write_result(
+    path: &Path,
+    outcome: Option<&RunOutcome>,
+    error: Option<&str>,
+    attempts: usize,
+) -> Result<()> {
     // json! takes values by ownership, so the &RunOutcome fields are cloned
     // here; Option<&str> is turned into a JSON null/string explicitly (Value
     // has no From<Option<_>>).
@@ -176,6 +237,7 @@ pub fn write_result(path: &Path, outcome: Option<&RunOutcome>, error: Option<&st
                 "success": o.stop_reason == "end_turn",
                 "stop_reason": o.stop_reason.clone(),
                 "turns": o.turns,
+                "attempts": attempts,
                 "elapsed_secs": o.elapsed.as_secs_f64(),
                 "input_tokens": o.input_tokens,
                 "output_tokens": o.output_tokens,
@@ -189,6 +251,7 @@ pub fn write_result(path: &Path, outcome: Option<&RunOutcome>, error: Option<&st
         None => json!({
             "success": false,
             "stop_reason": "error",
+            "attempts": attempts,
             "error": error_val,
         }),
     };
@@ -271,7 +334,7 @@ mod tests {
         };
         // Success path: tool output + token totals + summary all present.
         let path = dir.join("out.json");
-        write_result(&path, Some(&o), None).unwrap();
+        write_result(&path, Some(&o), None, 1).unwrap();
         let s = std::fs::read_to_string(&path).unwrap();
         assert!(s.contains("\"output\"") && s.contains("hello world"), "tool output missing");
         assert!(
@@ -283,7 +346,7 @@ mod tests {
         // Failure path: agent.run returned Err — still write a result artifact
         // (this is the gap the old `?`-skips-write_result had).
         let epath = dir.join("err.json");
-        write_result(&epath, None, Some("provider 503")).unwrap();
+        write_result(&epath, None, Some("provider 503"), 1).unwrap();
         let es = std::fs::read_to_string(&epath).unwrap();
         assert!(es.contains("\"success\": false"));
         assert!(es.contains("provider 503"));

@@ -1,6 +1,7 @@
 use crate::agent::RunOutcome;
 use crate::config::{Config, PartialConfig};
 use crate::harness;
+use crate::retry::backoff_secs;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::json;
@@ -250,7 +251,7 @@ fn run_one_attempt(
             // not claim success while the result file is missing.
             let mut error = None;
             if let Err(e) =
-                harness::write_result(&results_dir.join(format!("{name}.json")), Some(&o), None)
+                harness::write_result(&results_dir.join(format!("{name}.json")), Some(&o), None, 1)
             {
                 eprintln!("[warn] {name}: failed to write result file: {e:#}");
                 error = Some(format!("result file not written: {e:#}"));
@@ -301,13 +302,6 @@ fn run_one(
     // across attempts + backoffs so report.json reflects real wall cost.
     report.elapsed_secs = start.elapsed().as_secs_f64();
     report
-}
-
-/// Exponential backoff (seconds) for retry `attempt` (0-indexed): 1, 2, 4, 8,
-/// 16, 32 — the shift is clamped so a large `--retries` can't sleep for minutes
-/// (or overflow).
-fn backoff_secs(attempt: usize) -> u64 {
-    1u64 << attempt.min(5)
 }
 
 /// Read the `tasks` array out of a prior batch report. Used by `--failed` both
@@ -384,21 +378,6 @@ fn write_report(path: &Path, reports: &[TaskReport]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn backoff_grows_then_caps() {
-        // 1, 2, 4, 8, 16, 32 — doubling each step…
-        assert_eq!(backoff_secs(0), 1);
-        assert_eq!(backoff_secs(1), 2);
-        assert_eq!(backoff_secs(2), 4);
-        assert_eq!(backoff_secs(3), 8);
-        assert_eq!(backoff_secs(4), 16);
-        assert_eq!(backoff_secs(5), 32);
-        // …then clamped at 32s so a large --retries never sleeps for minutes
-        // (and so the shift can't overflow on absurd inputs).
-        assert_eq!(backoff_secs(6), 32);
-        assert_eq!(backoff_secs(100), 32);
-    }
 
     #[test]
     fn failed_names_from_report_selects_failures() {

@@ -4,6 +4,7 @@ mod config;
 mod harness;
 mod mcp;
 mod provider;
+mod retry;
 mod session;
 mod signal;
 mod tools;
@@ -85,9 +86,10 @@ struct Cli {
     #[arg(long, default_value = "report.json")]
     report: PathBuf,
 
-    /// Batch mode: retry each task this many extra times on transient failures
-    /// (provider/network errors) with exponential backoff. Deterministic
-    /// failures (bad task file, max_turns) are not retried.
+    /// Retry on transient failures (provider/network errors) with exponential
+    /// backoff. In single-run headless mode the agent run is retried in place;
+    /// in `--batch` mode each task is retried. Deterministic failures (bad task
+    /// file, max_turns, end_turn) are not retried.
     #[arg(long, default_value = "0")]
     retries: usize,
 
@@ -241,7 +243,7 @@ fn main() -> Result<()> {
         let cancel = Arc::new(AtomicBool::new(false));
         agent.set_cancel(cancel.clone());
         signal::install_sigint_cancel(cancel);
-        let code = harness::run(&mut agent, cli.output.as_deref(), cli.json)?;
+        let code = harness::run(&mut agent, cli.output.as_deref(), cli.json, cli.retries)?;
         // Drop the agent before exit so MCP stdio children are killed via
         // StdioTransport::drop — std::process::exit skips destructors, which
         // would otherwise orphan spawned MCP server processes.

@@ -1348,6 +1348,76 @@ mod tests {
     }
 
     #[test]
+    fn single_run_retries_transient_then_succeeds() {
+        // harness::run_with_retries retries on agent.run() Err: two transient
+        // 503s then a clean turn → success, exit 0, attempts==3 in result.json.
+        // The injected sleeper is a no-op so the test doesn't wait on backoff.
+        let cfg = cfg_with(5, 0, 0);
+        let (prov, state) = MockProvider::new(vec![
+            MockTurn::Err("503 transient".into()),
+            MockTurn::Err("503 transient".into()),
+            mock::resp_text("recovered", None),
+        ]);
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], vec![user_text("go")], test_ctx());
+        let dir = std::env::temp_dir().join(format!("ta-retry-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let out = dir.join("r.json");
+        let code =
+            crate::harness::run_with_retries(&mut agent, Some(&out), false, 2, |_| {}).unwrap();
+        assert_eq!(code, 0, "recovered → exit 0");
+        assert_eq!(state.calls(), 3, "two retries → three attempts");
+        let s = std::fs::read_to_string(&out).unwrap();
+        assert!(s.contains("\"attempts\": 3"), "attempts not recorded: {s}");
+        assert!(s.contains("\"success\": true"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn single_run_retries_exhausted_exit_1() {
+        // All attempts fail: exit 1, attempts==retries+1, result.json carries
+        // the last error (stop_reason "error"). Deterministic Ok outcomes are
+        // never retried — only Err is, which is exactly what the mock feeds.
+        let cfg = cfg_with(5, 0, 0);
+        let (prov, state) = MockProvider::new(vec![
+            MockTurn::Err("503 one".into()),
+            MockTurn::Err("503 two".into()),
+            MockTurn::Err("503 three".into()),
+        ]);
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], vec![user_text("go")], test_ctx());
+        let dir = std::env::temp_dir().join(format!("ta-retry2-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let out = dir.join("r.json");
+        let code =
+            crate::harness::run_with_retries(&mut agent, Some(&out), false, 2, |_| {}).unwrap();
+        assert_eq!(code, 1, "exhausted → exit 1");
+        assert_eq!(state.calls(), 3, "retries=2 → 3 total attempts, no more");
+        let s = std::fs::read_to_string(&out).unwrap();
+        assert!(s.contains("\"attempts\": 3"), "{s}");
+        assert!(s.contains("\"success\": false"));
+        assert!(s.contains("\"stop_reason\": \"error\""));
+        assert!(s.contains("503"), "last error surfaced: {s}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn single_run_no_retry_when_retries_zero() {
+        // retries=0: a single Err → exit 1, attempts==1, no retry attempted.
+        let cfg = cfg_with(5, 0, 0);
+        let (prov, state) = MockProvider::new(vec![MockTurn::Err("503".into())]);
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], vec![user_text("go")], test_ctx());
+        let dir = std::env::temp_dir().join(format!("ta-retry0-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let out = dir.join("r.json");
+        let code =
+            crate::harness::run_with_retries(&mut agent, Some(&out), false, 0, |_| {}).unwrap();
+        assert_eq!(code, 1);
+        assert_eq!(state.calls(), 1, "retries=0 → exactly one attempt");
+        let s = std::fs::read_to_string(&out).unwrap();
+        assert!(s.contains("\"attempts\": 1"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn normalize_adjacent_merges_same_role_neighbors() {
         // [user a][user b] → one user with both blocks; alternation preserved.
         let mut msgs = vec![user_text("a"), user_text("b")];
