@@ -167,23 +167,17 @@ impl Provider for OpenAi {
 
         let resp = self.post(&body, req.per_request_timeout)?;
 
-        // Newer OpenAI reasoning models (o1/o3/gpt-4.1…) reject max_tokens;
-        // retry once with max_completion_tokens when the error names it.
+        // A 400 may name a field this gateway doesn't accept (newer reasoning
+        // models reject `max_tokens`; older gateways/vLLM reject the unknown
+        // `stream_options`). Apply the one known fix and retry once; an unknown
+        // 400 bails with the error text below.
         let resp = if resp.status() == reqwest::StatusCode::BAD_REQUEST {
             let text = resp.text().unwrap_or_default();
-            if text.contains("max_tokens") {
-                // remove() the old key: take() would leave a
-                // "max_tokens": null entry that some strict servers reject
-                // again on the retry.
-                if let Some(obj) = body.as_object_mut() {
-                    if let Some(mt) = obj.remove("max_tokens") {
-                        obj.insert("max_completion_tokens".into(), mt);
-                    }
-                }
-                self.post(&body, req.per_request_timeout)
-                    .context("retry with max_completion_tokens failed")?
-            } else {
-                bail!("OpenAI-compatible API error 400: {text}");
+            match Self::body_fix_for_400(&text, &body) {
+                Some(fixed) => self
+                    .post(&fixed, req.per_request_timeout)
+                    .context("retry after adjusting request for 400 failed")?,
+                None => bail!("OpenAI-compatible API error 400: {text}"),
             }
         } else {
             resp
@@ -217,6 +211,28 @@ impl OpenAi {
         rb.json(body)
             .send()
             .context("request to OpenAI-compatible API failed")
+    }
+
+    /// On a 400, return an adjusted request body to retry once with, when the
+    /// error names a field this gateway doesn't accept:
+    /// - `max_tokens`     → rename to `max_completion_tokens` (reasoning models).
+    /// - `stream_options` → drop it (older gateways / vLLM). Usage then goes
+    ///   unreported, which `parse_loop` already tolerates as `None`.
+    ///
+    /// Returns `None` for an unknown 400 (the caller bails with the error text).
+    fn body_fix_for_400(text: &str, body: &Value) -> Option<Value> {
+        let mut next = body.clone();
+        let obj = next.as_object_mut()?;
+        if text.contains("max_tokens") {
+            if let Some(mt) = obj.remove("max_tokens") {
+                obj.insert("max_completion_tokens".into(), mt);
+                return Some(next);
+            }
+        }
+        if text.contains("stream_options") && obj.remove("stream_options").is_some() {
+            return Some(next);
+        }
+        None
     }
 
     /// Assemble a full response from an SSE byte stream (sync, for tests).
@@ -373,6 +389,40 @@ impl OpenAi {
 mod tests {
     use super::*;
     use crate::provider::Message;
+
+    #[test]
+    fn body_fix_renames_max_tokens() {
+        let body = json!({
+            "model": "m", "max_tokens": 100,
+            "stream_options": {"include_usage": true},
+        });
+        let fixed =
+            OpenAi::body_fix_for_400("Unrecognized request argument: max_tokens", &body).unwrap();
+        // Renamed, old key gone; stream_options untouched on a max_tokens error.
+        assert!(fixed.get("max_tokens").is_none());
+        assert_eq!(fixed.get("max_completion_tokens"), Some(&json!(100)));
+        assert!(fixed.get("stream_options").is_some());
+    }
+
+    #[test]
+    fn body_fix_drops_stream_options() {
+        // Older OpenAI-compatible gateways reject the unknown stream_options
+        // field — drop it and retry (usage then goes unreported as None).
+        let body = json!({
+            "model": "m", "max_tokens": 100,
+            "stream_options": {"include_usage": true},
+        });
+        let fixed = OpenAi::body_fix_for_400("Unknown argument: stream_options", &body).unwrap();
+        assert!(fixed.get("stream_options").is_none());
+        assert_eq!(fixed.get("max_tokens"), Some(&json!(100))); // untouched
+    }
+
+    #[test]
+    fn body_fix_unknown_400_returns_none() {
+        // A 400 that names neither field has no known fix → caller bails.
+        let body = json!({"model": "m", "max_tokens": 100});
+        assert!(OpenAi::body_fix_for_400("your account is out of credits", &body).is_none());
+    }
 
     #[test]
     fn tool_result_becomes_tool_message() {
