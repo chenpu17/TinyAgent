@@ -104,6 +104,27 @@ impl Agent {
             .is_some_and(|c| c.load(Ordering::Relaxed))
     }
 
+    /// Test-only view of the trailing user message's tool_result contents —
+    /// used to assert N tool_use ↔ N tool_result pairing survives a mid-batch
+    /// cancel (cancelled tools get a synthesized "[cancelled by user]" result
+    /// in the message history, even though they aren't recorded as executed).
+    #[cfg(test)]
+    pub(crate) fn trailing_tool_result_contents(&self) -> Vec<String> {
+        self.messages
+            .last()
+            .filter(|m| m.role == Role::User)
+            .map(|m| {
+                m.content
+                    .iter()
+                    .filter_map(|b| match b {
+                        Block::ToolResult { content, .. } => Some(content.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Whether the last message is a user message. The TUI uses this to
     /// decide whether to kick off an initial run — an initial task baked
     /// in by main, or a resumed session that stopped mid-turn at a
@@ -582,6 +603,9 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::mock::{self, MockProvider, MockTurn};
+    use crate::provider::ChatResponse;
+    use crate::tools::ToolOutput;
     use serde_json::json;
 
     fn user_text(s: &str) -> Message {
@@ -754,5 +778,327 @@ mod tests {
         let over = preview(&"a".repeat(500));
         assert!(over.ends_with('…'));
         assert_eq!(over.chars().count(), 201); // 200 + ellipsis
+    }
+
+    // ── agent-loop invariants (driven by the in-process MockProvider) ─────
+    //
+    // These pin down the structural rules the loop relies on — the ones that
+    // used to be covered only by hand-run Python mocks. Each names the
+    // invariant it guards so a future change that breaks it fails loudly.
+
+    /// A minimal Config built from JSON (no file, no API-key lookup — the
+    /// agent never calls `api_key()`; the test wires a MockProvider directly).
+    fn cfg_with(max_turns: u32, timeout_secs: u64, compress: usize) -> Config {
+        let mut c = serde_json::from_str::<Config>(
+            r#"{"provider":"openai","api_key_env":"MOCK_API_KEY","model":"m"}"#,
+        )
+        .expect("valid test config");
+        c.limits.max_turns = max_turns;
+        c.limits.timeout_secs = timeout_secs;
+        c.limits.compress_threshold_chars = compress;
+        c
+    }
+
+    fn test_ctx() -> ToolCtx {
+        ToolCtx {
+            workdir: std::env::current_dir().expect("cwd"),
+            max_output_chars: 1000,
+            restrict_to_workdir: false,
+            cancel: None,
+        }
+    }
+
+    /// A no-op tool that can also (a) record that it ran, and (b) flip a
+    /// shared cancel flag mid-run — to exercise the batch-cancel path.
+    struct EchoTool {
+        name: String,
+        ran: Option<Arc<AtomicBool>>,
+        cancel_on_run: Option<Arc<AtomicBool>>,
+    }
+    impl EchoTool {
+        fn new(name: &str) -> Self {
+            Self { name: name.into(), ran: None, cancel_on_run: None }
+        }
+        fn tracking(name: &str, ran: Arc<AtomicBool>) -> Self {
+            Self { name: name.into(), ran: Some(ran), cancel_on_run: None }
+        }
+        fn cancel_on_run(name: &str, flag: Arc<AtomicBool>) -> Self {
+            Self { name: name.into(), ran: None, cancel_on_run: Some(flag) }
+        }
+    }
+    impl Tool for EchoTool {
+        fn def(&self) -> ToolDef {
+            ToolDef {
+                name: self.name.clone(),
+                description: "test echo tool".into(),
+                schema: json!({"type": "object", "properties": {}}),
+            }
+        }
+        fn run(&self, _input: &Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+            if let Some(r) = &self.ran {
+                r.store(true, Ordering::Relaxed);
+            }
+            if let Some(c) = &self.cancel_on_run {
+                c.store(true, Ordering::Relaxed);
+            }
+            Ok(ToolOutput::text("ok"))
+        }
+    }
+
+    #[test]
+    fn run_resets_stale_cancel_so_first_turn_is_not_cancelled() {
+        // A cancel left set from a previous run must be cleared at entry —
+        // cancel is level-triggered and never auto-clears elsewhere, so
+        // without the reset the first turn breaks "cancelled" before chat.
+        let cfg = cfg_with(5, 0, 0);
+        let (prov, _) = MockProvider::new(vec![mock::resp_text("done", None)]);
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], vec![user_text("hi")], test_ctx());
+        agent.set_cancel(Arc::new(AtomicBool::new(true))); // stale cancel
+        let o = agent.run(&mut |_| {}).unwrap();
+        assert_eq!(o.stop_reason, "end_turn");
+        assert_eq!(o.turns, 1);
+    }
+
+    #[test]
+    fn parallel_tool_uses_pair_with_n_tool_results() {
+        // One assistant turn with 2 tool_use → the NEXT request's trailing
+        // message must be a user turn carrying 2 tool_results (N:N), or a
+        // strict provider rejects the orphaned tool_use with a 400.
+        let cfg = cfg_with(5, 0, 0);
+        let (prov, state) = MockProvider::new(vec![
+            MockTurn::Ok(ChatResponse {
+                blocks: vec![
+                    Block::ToolUse { id: "a".into(), name: "echo".into(), input: json!({}) },
+                    Block::ToolUse { id: "b".into(), name: "echo".into(), input: json!({}) },
+                ],
+                stop_reason: "tool_use".into(),
+                usage: None,
+            }),
+            mock::resp_text("all done", None),
+        ]);
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![Box::new(EchoTool::new("echo"))],
+            vec![user_text("do it")],
+            test_ctx(),
+        );
+        let o = agent.run(&mut |_| {}).unwrap();
+        assert_eq!(o.stop_reason, "end_turn");
+        assert_eq!(o.tool_calls.len(), 2);
+        // The 2nd chat saw a trailing USER message with exactly 2 tool_results.
+        let cap = state.captured();
+        assert_eq!(cap.len(), 2);
+        assert_eq!(cap[1].last_role, Some(Role::User));
+        assert_eq!(cap[1].trailing_tool_results, 2);
+    }
+
+    #[test]
+    fn cancel_mid_batch_synthesizes_results_for_remaining_tools() {
+        // 2 parallel tool calls; the first tool flips cancel. The second must
+        // STILL get a tool_result ("[cancelled by user]") so the assistant's
+        // 2 tool_use are answered 1:1, and the run ends "cancelled".
+        let cfg = cfg_with(5, 0, 0);
+        let (prov, _) = MockProvider::new(vec![MockTurn::Ok(ChatResponse {
+            blocks: vec![
+                Block::ToolUse { id: "a".into(), name: "echo".into(), input: json!({}) },
+                Block::ToolUse { id: "b".into(), name: "echo".into(), input: json!({}) },
+            ],
+            stop_reason: "tool_use".into(),
+            usage: None,
+        })]);
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![Box::new(EchoTool::cancel_on_run("echo", flag.clone()))],
+            vec![user_text("go")],
+            test_ctx(),
+        );
+        agent.set_cancel(flag); // so cancelled() is observable; the tool flips it
+        let o = agent.run(&mut |_| {}).unwrap();
+        assert_eq!(o.stop_reason, "cancelled");
+        // Only the first tool actually executed; the cancelled one is NOT in
+        // tool_calls (those record real executions).
+        assert_eq!(o.tool_calls.len(), 1);
+        assert!(!o.tool_calls[0].is_error);
+        // But the message history still answers both tool_use 1:1 — the
+        // cancelled tool gets a synthesized result so pairing holds.
+        assert_eq!(
+            agent.trailing_tool_result_contents(),
+            vec!["ok".to_string(), "[cancelled by user]".to_string()]
+        );
+    }
+
+    #[test]
+    fn aborted_stream_does_not_execute_truncated_tool_use() {
+        // stop_reason "max_tokens" with a half-delivered tool_use: the tool
+        // must NOT run (executing truncated args is garbage), and no
+        // tool_result is synthesized — the orphaned tool_use is dropped.
+        let cfg = cfg_with(5, 0, 0);
+        let (prov, _) = MockProvider::new(vec![MockTurn::Ok(ChatResponse {
+            blocks: vec![
+                Block::Text("partial...".into()),
+                Block::ToolUse { id: "x".into(), name: "echo".into(), input: json!({"_raw": "trun"}) },
+            ],
+            stop_reason: "max_tokens".into(),
+            usage: None,
+        })]);
+        let ran = Arc::new(AtomicBool::new(false));
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![Box::new(EchoTool::tracking("echo", ran.clone()))],
+            vec![user_text("go")],
+            test_ctx(),
+        );
+        let o = agent.run(&mut |_| {}).unwrap();
+        assert_eq!(o.stop_reason, "max_tokens");
+        assert!(o.tool_calls.is_empty(), "truncated tool_use must not execute");
+        assert!(!ran.load(Ordering::Relaxed), "tool.run was not called");
+        assert_eq!(o.final_text, "partial..."); // partial text still surfaced
+    }
+
+    #[test]
+    fn max_turns_caps_the_loop() {
+        // max_turns=1: exactly one chat call, then stop — even though the
+        // model keeps requesting tools.
+        let cfg = cfg_with(1, 0, 0);
+        let (prov, state) = MockProvider::new(vec![
+            mock::resp_tool("a", "echo", json!({}), None),
+            mock::resp_tool("b", "echo", json!({}), None), // turn 2, never reached
+        ]);
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![Box::new(EchoTool::new("echo"))],
+            vec![user_text("loop")],
+            test_ctx(),
+        );
+        let o = agent.run(&mut |_| {}).unwrap();
+        assert_eq!(o.stop_reason, "max_turns_reached");
+        assert_eq!(o.turns, 1);
+        assert_eq!(state.calls(), 1, "only one chat call within the budget");
+    }
+
+    #[test]
+    fn timeout_zero_means_no_timeout() {
+        // Guards the elapsed()>=0 trap: with timeout_secs=0 the run must
+        // proceed normally instead of timing out before its first turn.
+        let cfg = cfg_with(5, 0, 0);
+        let (prov, _) = MockProvider::new(vec![mock::resp_text("ok", None)]);
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], vec![user_text("hi")], test_ctx());
+        let o = agent.run(&mut |_| {}).unwrap();
+        assert_eq!(o.stop_reason, "end_turn");
+        assert_eq!(o.turns, 1);
+    }
+
+    #[test]
+    fn usage_accumulates_across_turns_and_emits_events() {
+        // Token usage from every chat sums into RunOutcome and is also emitted
+        // per-turn (so the TUI bar / result file report honest totals).
+        let cfg = cfg_with(5, 0, 0);
+        let (prov, _) = MockProvider::new(vec![
+            mock::resp_tool("a", "echo", json!({}), mock::mk_usage(100, 10)),
+            mock::resp_text("done", mock::mk_usage(50, 5)),
+        ]);
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![Box::new(EchoTool::new("echo"))],
+            vec![user_text("go")],
+            test_ctx(),
+        );
+        let mut events = Vec::new();
+        let o = agent.run(&mut |e| events.push(e)).unwrap();
+        assert_eq!(o.input_tokens, 150);
+        assert_eq!(o.output_tokens, 15);
+        let usage_n = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::Usage { .. }))
+            .count();
+        assert_eq!(usage_n, 2);
+    }
+
+    #[test]
+    fn compress_folds_history_and_emits_event() {
+        // History over threshold + a safe cut → summarize runs (an extra chat
+        // call), the middle folds into message[0], a Compressed event fires,
+        // and the main request sees the shorter folded history.
+        let mut cfg = cfg_with(5, 0, 30);
+        cfg.limits.keep_recent_messages = 2;
+        let long = "x".repeat(40);
+        // 5 messages → n > keep_recent+2; cut candidate 3 = assistant → Some(3)
+        let initial = vec![
+            user_text(&long),
+            Message::assistant(vec![Block::Text("a1".into())]),
+            user_text("u1"),
+            Message::assistant(vec![Block::Text("a2".into())]),
+            user_text("u2"),
+        ];
+        let (prov, state) = MockProvider::new(vec![
+            mock::resp_text("SUMMARY", None),     // summarize_prefix call
+            mock::resp_text("final answer", None), // main call
+        ]);
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+        let mut events = Vec::new();
+        let o = agent.run(&mut |e| events.push(e)).unwrap();
+        assert_eq!(o.stop_reason, "end_turn");
+        assert_eq!(state.calls(), 2);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Compressed { dropped: 2, kept: 3 })),
+            "compress should drop 2 middle messages, keep 3"
+        );
+        // The main (2nd) request saw the folded history: 3 messages.
+        let cap = state.captured();
+        assert_eq!(cap[1].message_count, 3);
+    }
+
+    #[test]
+    fn compress_failure_degrades_gracefully() {
+        // summarize_prefix errors → compress_failed set, NO Compressed event,
+        // the run continues uncompressed and still completes.
+        let mut cfg = cfg_with(5, 0, 30);
+        cfg.limits.keep_recent_messages = 2;
+        let long = "x".repeat(40);
+        let initial = vec![
+            user_text(&long),
+            Message::assistant(vec![Block::Text("a1".into())]),
+            user_text("u1"),
+            Message::assistant(vec![Block::Text("a2".into())]),
+            user_text("u2"),
+        ];
+        let (prov, _) = MockProvider::new(vec![
+            MockTurn::Err("summary blew up".into()), // summarize_prefix fails
+            mock::resp_text("answer anyway", None),   // main call proceeds uncompressed
+        ]);
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+        let mut events = Vec::new();
+        let o = agent.run(&mut |e| events.push(e)).unwrap();
+        assert_eq!(o.stop_reason, "end_turn");
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Compressed { .. })),
+            "no compress event on summary failure"
+        );
+    }
+
+    #[test]
+    fn provider_error_propagates_as_run_error() {
+        // A provider Err from the main chat surfaces as run()'s Result::Err —
+        // the headless harness then writes a result file + exit 1.
+        let cfg = cfg_with(5, 0, 0);
+        let (prov, _) =
+            MockProvider::new(vec![MockTurn::Err("503 service unavailable".into())]);
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], vec![user_text("hi")], test_ctx());
+        // Match by hand: RunOutcome isn't Debug, so unwrap_err() won't compile.
+        let err = match agent.run(&mut |_| {}) {
+            Err(e) => e,
+            Ok(_) => panic!("expected a provider error to propagate"),
+        };
+        assert!(format!("{err:#}").contains("503"));
     }
 }

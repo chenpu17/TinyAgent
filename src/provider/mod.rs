@@ -1,5 +1,7 @@
 mod anthropic;
 mod openai;
+#[cfg(test)]
+pub(crate) mod mock;
 
 pub use anthropic::Anthropic;
 pub use openai::OpenAi;
