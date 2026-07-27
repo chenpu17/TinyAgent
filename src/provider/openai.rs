@@ -165,23 +165,31 @@ impl Provider for OpenAi {
             body["tools"] = Self::tools_json(req.tools);
         }
 
-        let resp = self.post(&body, req.per_request_timeout)?;
+        let mut resp = self.post(&body, req.per_request_timeout)?;
 
         // A 400 may name a field this gateway doesn't accept (newer reasoning
         // models reject `max_tokens`; older gateways/vLLM reject the unknown
-        // `stream_options`). Apply the one known fix and retry once; an unknown
-        // 400 bails with the error text below.
-        let resp = if resp.status() == reqwest::StatusCode::BAD_REQUEST {
+        // `stream_options`). Apply known fixes and retry — at most a couple of
+        // times. Each fix mutates a distinct field, so a gateway rejecting BOTH
+        // (reasoning model on an old vLLM gateway) is satisfied by two sequential
+        // fixes; when no known fix applies the 400 bails with the text. The cap
+        // is a backstop — there are only two known fixes, and a fix that can't
+        // change anything returns None and bails, so the loop always converges.
+        for _ in 0..3 {
+            if resp.status() != reqwest::StatusCode::BAD_REQUEST {
+                break;
+            }
             let text = resp.text().unwrap_or_default();
             match Self::body_fix_for_400(&text, &body) {
-                Some(fixed) => self
-                    .post(&fixed, req.per_request_timeout)
-                    .context("retry after adjusting request for 400 failed")?,
+                Some(fixed) => {
+                    body = fixed;
+                    resp = self
+                        .post(&body, req.per_request_timeout)
+                        .context("retry after adjusting request for 400 failed")?;
+                }
                 None => bail!("OpenAI-compatible API error 400: {text}"),
             }
-        } else {
-            resp
-        };
+        }
 
         if !resp.status().is_success() {
             let status = resp.status();
