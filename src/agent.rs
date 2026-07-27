@@ -92,7 +92,6 @@ impl Agent {
     /// Attach a cancellation flag; checked at every turn boundary and shared
     /// with tools (via ToolCtx) so a running shell can be interrupted too,
     /// not only the streaming read.
-    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
     pub fn set_cancel(&mut self, flag: Arc<AtomicBool>) {
         self.ctx.cancel = Some(flag.clone());
         self.cancel = Some(flag);

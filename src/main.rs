@@ -5,6 +5,7 @@ mod harness;
 mod mcp;
 mod provider;
 mod session;
+mod signal;
 mod tools;
 #[cfg(feature = "tui")]
 mod tui;
@@ -15,6 +16,8 @@ use clap::Parser;
 use config::Config;
 use provider::{Block, Message, Role};
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use tools::ToolCtx;
 
 #[derive(Parser)]
@@ -207,6 +210,14 @@ fn main() -> Result<()> {
         }
     } else {
         let mut agent = agent;
+        // Wire Ctrl-C into the graceful-cancel path (headless only): first
+        // SIGINT flips a shared flag → the stream breaks within ~200ms →
+        // result.json is still written (stop_reason=cancelled) → exit 130.
+        // Second SIGINT exits at once. The TUI doesn't need this — crossterm
+        // reads Ctrl-C as a key event in raw mode.
+        let cancel = Arc::new(AtomicBool::new(false));
+        agent.set_cancel(cancel.clone());
+        signal::install_sigint_cancel(cancel);
         let code = harness::run(&mut agent, cli.output.as_deref(), cli.json)?;
         // Drop the agent before exit so MCP stdio children are killed via
         // StdioTransport::drop — std::process::exit skips destructors, which
