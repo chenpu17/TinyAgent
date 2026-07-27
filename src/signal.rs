@@ -8,7 +8,9 @@
 //! exit 130. Second SIGINT: `_exit(130)` immediately (the user insists).
 //!
 //! Safety: the handler only touches lock-free atomics and `_exit` — both
-//! async-signal-safe. No allocation, no locks, no I/O.
+//! async-signal-safe. No allocation, no locks, no I/O. (Rust's
+//! `std::sync::atomic` types are guaranteed lock-free wherever they compile,
+//! so the handler can never accidentally call a locking `__atomic_*`.)
 #[cfg(unix)]
 pub(crate) fn install_sigint_cancel(flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
     use std::sync::atomic::{AtomicUsize, Ordering};
