@@ -3,7 +3,8 @@ use crate::config::Config;
 use crate::provider::Block;
 use anyhow::Result;
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -12,7 +13,7 @@ use crossterm::ExecutableCommand;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block as WBlock, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block as WBlock, Borders, Paragraph};
 use ratatui::Terminal;
 use std::io::stdout;
 use std::sync::mpsc;
@@ -179,6 +180,7 @@ struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        let _ = stdout().execute(DisableMouseCapture);
         let _ = stdout().execute(DisableBracketedPaste);
         let _ = disable_raw_mode();
         let _ = stdout().execute(LeaveAlternateScreen);
@@ -254,6 +256,12 @@ pub fn run(
     // Event::Paste (newlines included) instead of replaying it as keystrokes —
     // which would hit the Enter handler and send each line as a message.
     stdout().execute(EnableBracketedPaste)?;
+    // Mouse capture so the scroll wheel / trackpad two-finger scroll reaches
+    // the app (crossterm maps vertical trackpad scroll to ScrollUp/Down). The
+    // terminal guard disables it on drop. Note: while captured, click-drag text
+    // selection is intercepted by the app — hold Shift to select/copy as usual
+    // (most terminals bypass app mouse capture under Shift).
+    stdout().execute(EnableMouseCapture)?;
     // From here the terminal is modified; the guard restores it on drop so a
     // panic (or a propagated `?` error) in the UI loop below can't strand the
     // user in raw mode + alternate screen.
@@ -517,16 +525,27 @@ fn ui_loop(
             }
 
             let view_height = chunks[0].height.saturating_sub(2) as usize;
-            let total = lines.len();
+            // Pre-wrap to the conversation inner width so the line count is the
+            // true rendered row count. Without this, ratatui's `.wrap()` folded
+            // long lines at draw time but `lines.len()` counted only logical
+            // lines — so the scroll range was too small and the top of a long
+            // history (wide code, long tool output) was unreachable. We now
+            // wrap ourselves and drop `.wrap()`: our wrapped rows are exactly
+            // what's drawn, so the count and the render can't drift apart.
+            let inner_w = (chunks[0].width as usize).saturating_sub(2).max(1);
+            let wrapped: Vec<Line> = lines
+                .iter()
+                .flat_map(|l| wrap_line(l, inner_w))
+                .collect();
+            let total = wrapped.len();
             let max_scroll = total.saturating_sub(view_height);
             if scroll_up > max_scroll {
                 scroll_up = max_scroll;
             }
             let scroll = (max_scroll - scroll_up).min(u16::MAX as usize) as u16;
 
-            let history = Paragraph::new(lines)
+            let history = Paragraph::new(wrapped)
                 .block(WBlock::default().borders(Borders::ALL).title("conversation"))
-                .wrap(Wrap { trim: false })
                 .scroll((scroll, 0));
             f.render_widget(history, chunks[0]);
 
@@ -592,7 +611,7 @@ fn ui_loop(
                     fmt_tokens(out_tokens),
                     start.elapsed().as_secs_f64()
                 )),
-                Span::raw("  Ctrl-C cancel · Tab browse · Esc quit · PgUp/PgDn scroll"),
+                Span::raw("  Ctrl-C cancel · Tab browse · Esc quit · PgUp/PgDn·wheel scroll"),
             ]);
             f.render_widget(Paragraph::new(status), chunks[2]);
         })?;
@@ -805,6 +824,17 @@ fn ui_loop(
                 if !busy && mode == Mode::Input {
                     input.insert_str(&s);
                 }
+            } else if let Event::Mouse(m) = ev {
+                // Mouse wheel / trackpad two-finger scroll. Each notch moves a
+                // few rows; saturating math keeps scroll_up ≥ 0, and the
+                // renderer clamps the top end to max_scroll every frame, so
+                // overflow here is harmless. Works while busy too — scrolling
+                // back to read earlier output shouldn't wait for the run.
+                match m.kind {
+                    MouseEventKind::ScrollUp => scroll_up = scroll_up.saturating_add(3),
+                    MouseEventKind::ScrollDown => scroll_up = scroll_up.saturating_sub(3),
+                    _ => {}
+                }
             }
         }
     }
@@ -819,6 +849,111 @@ fn push_wrapped(lines: &mut Vec<Line>, label: &str, text: &str, color: Color) {
     for l in text.lines() {
         lines.push(Line::from(Span::styled(l.to_string(), Style::default().fg(color))));
     }
+}
+
+/// Wrap one styled line to `width` display columns, returning one `Line` per
+/// visual row. Greedy word wrap: fill a row until the next word won't fit, then
+/// break at the last space; a word longer than `width` is hard-broken. A space
+/// landing right after a break is dropped (cleaner left edge). Span styles are
+/// preserved across breaks — a span split by a wrap becomes two spans with the
+/// same style. With this, `lines.len()` equals the rendered height, so the
+/// scroll range is exact.
+fn wrap_line(src: &Line, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    // Flatten to (char, style) so a wrap can split a span at any char.
+    let cells: Vec<(char, Style)> = src
+        .spans
+        .iter()
+        .flat_map(|s| s.content.chars().map(|c| (c, s.style)))
+        .collect();
+    let char_w = |c: char| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut row_start = 0usize; // cells index where the current row began
+    let mut col = 0usize; // display width of [row_start, i)
+    // Index just past the most recent space — a valid break point as long as
+    // there's non-space content before it on this row.
+    let mut last_space_after: Option<usize> = None;
+
+    let mut i = 0usize;
+    while i < cells.len() {
+        let (c, _style) = cells[i];
+        let w = char_w(c);
+        if c == ' ' {
+            if col + w > width && col > 0 {
+                // The space itself would overflow: break before it and drop it.
+                rows.push(line_from_cells(&cells[row_start..i]));
+                row_start = i + 1;
+                col = 0;
+                last_space_after = None;
+                i += 1;
+                continue;
+            }
+            col += w;
+            // Only treat it as a break point if real content precedes it.
+            if row_start < i {
+                last_space_after = Some(i + 1);
+            }
+            i += 1;
+            continue;
+        }
+        if col + w > width {
+            // Overflow on a non-space char. Prefer breaking at the last space.
+            if let Some(after) = last_space_after {
+                if after - 1 > row_start {
+                    // Row = everything before the space (space dropped).
+                    rows.push(line_from_cells(&cells[row_start..after - 1]));
+                    row_start = after;
+                    col = cells[row_start..i].iter().map(|(ch, _)| char_w(*ch)).sum();
+                    last_space_after = None;
+                    continue; // re-process cell i on the new row
+                }
+            }
+            // No usable break point: hard-break before this char.
+            if col > 0 {
+                rows.push(line_from_cells(&cells[row_start..i]));
+                row_start = i;
+                col = 0;
+                last_space_after = None;
+                continue; // re-process cell i
+            }
+            // Row empty and char wider than width (or width 1): emit it anyway
+            // so we make progress instead of looping forever.
+        }
+        col += w;
+        i += 1;
+    }
+    if row_start < cells.len() {
+        rows.push(line_from_cells(&cells[row_start..]));
+    }
+    if rows.is_empty() {
+        rows.push(Line::default());
+    }
+    rows
+}
+
+/// Build a `Line` from (char, style) cells, coalescing adjacent same-style chars
+/// into one span so a wrapped row doesn't explode into one span per char.
+fn line_from_cells(cells: &[(char, Style)]) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut text = String::new();
+    let mut style = Style::default();
+    for (c, st) in cells {
+        if text.is_empty() {
+            text.push(*c);
+            style = *st;
+        } else if *st == style {
+            text.push(*c);
+        } else {
+            spans.push(Span::styled(std::mem::take(&mut text), style));
+            text.push(*c);
+            style = *st;
+        }
+    }
+    if !text.is_empty() {
+        spans.push(Span::styled(text, style));
+    }
+    Line::from(spans)
 }
 
 /// Compact token count for the status line: 850, 1.2k, 12k, 1.0M.
@@ -1294,5 +1429,162 @@ mod tests {
         assert_eq!(fmt_tokens(999_999), "1000.0k");
         assert_eq!(fmt_tokens(1_000_000), "1.0M");
         assert_eq!(fmt_tokens(1_500_000), "1.5M");
+    }
+
+    /// Helper: a single-span line with one style.
+    fn span_line(text: &str, fg: Color) -> Line<'static> {
+        Line::from(vec![Span::styled(
+            text.to_string(),
+            Style::default().fg(fg),
+        )])
+    }
+
+    /// Display width of a wrapped row (sum of its spans), via unicode-width.
+    fn row_width(l: &Line) -> usize {
+        l.spans
+            .iter()
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .sum()
+    }
+
+    /// Joined text of a wrapped row (to assert content / dropped spaces).
+    fn row_text(l: &Line) -> String {
+        l.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn wrap_line_short_fits_one_row() {
+        let rows = wrap_line(&span_line("hello world", Color::Cyan), 40);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_text(&rows[0]), "hello world");
+    }
+
+    #[test]
+    fn wrap_line_breaks_at_word_boundary_and_drops_space() {
+        // width 5: "hello" fits exactly; " world" would overflow → break at the
+        // space, drop it, start "world" fresh on row 2. No mid-word split.
+        let rows = wrap_line(&span_line("hello world", Color::Cyan), 5);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(row_text(&rows[0]), "hello");
+        assert_eq!(row_text(&rows[1]), "world");
+        // The dropped space must not leak as a leading space on the wrap.
+        assert!(!row_text(&rows[1]).starts_with(' '));
+        // Every row stays within width.
+        for r in &rows {
+            assert!(row_width(r) <= 5);
+        }
+    }
+
+    #[test]
+    fn wrap_line_hard_breaks_an_overlong_word() {
+        // A single word wider than width must still wrap (char-break), not loop
+        // forever or overflow the column.
+        let rows = wrap_line(&span_line("abcdefgh", Color::Cyan), 3);
+        assert!(rows.len() >= 3, "got {} rows", rows.len());
+        for r in &rows {
+            assert!(row_width(r) <= 3);
+        }
+        // No characters lost across the hard breaks.
+        let joined: String = rows.iter().map(|r| row_text(r)).collect();
+        assert_eq!(joined, "abcdefgh");
+    }
+
+    #[test]
+    fn wrap_line_preserves_span_styles_across_break() {
+        // Two styled spans in one line; the wrap splits the second span but its
+        // color must survive onto the wrapped row.
+        let line = Line::from(vec![
+            Span::styled("short ".to_string(), Style::default().fg(Color::Cyan)),
+            Span::styled("longtail".to_string(), Style::default().fg(Color::Yellow)),
+        ]);
+        let rows = wrap_line(&line, 8);
+        assert_eq!(rows.len(), 2);
+        // Row 0 holds "short " (cyan); row 1 holds "longtail" (yellow) — the
+        // split span kept its style.
+        assert_eq!(row_text(&rows[0]), "short");
+        assert_eq!(row_text(&rows[1]), "longtail");
+        assert_eq!(rows[1].spans[0].style.fg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn wrap_line_counts_wide_chars_by_display_width() {
+        // 6 CJK chars = 12 display columns, no spaces (so one word, hard-broken).
+        // At width 4 each row holds 2 chars (4 cols) → 3 rows. Proves width is
+        // display columns, not char count — the original bug counted logical
+        // lines and under-scrolled CJK text.
+        let rows = wrap_line(&span_line("看来离谱的测", Color::Cyan), 4);
+        assert_eq!(rows.len(), 3);
+        for r in &rows {
+            assert!(row_width(r) <= 4);
+        }
+        // And only at width ≥ 12 do all 6 wide chars fit one row — char-count
+        // semantics would have fit them at width 6.
+        assert_eq!(
+            wrap_line(&span_line("看来离谱的测", Color::Cyan), 11).len(),
+            2,
+            "11 cols still can't hold 12 cols of wide chars"
+        );
+        assert_eq!(
+            wrap_line(&span_line("看来离谱的测", Color::Cyan), 12).len(),
+            1,
+            "12 cols exactly fits 6 wide chars on one row"
+        );
+    }
+
+    #[test]
+    fn wrap_line_empty_yields_one_empty_row() {
+        let rows = wrap_line(&Line::default(), 10);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_width(&rows[0]), 0);
+    }
+
+    #[test]
+    fn scroll_reaches_both_ends_of_wrapped_content() {
+        // End-to-end at the widget layer: one long line wraps to several rows,
+        // and scrolling through [0, max_scroll] must reveal BOTH the first and
+        // the last wrapped row. The old code computed max_scroll from the
+        // logical line count (1 here), so max_scroll was 0 and everything past
+        // the first screenful was unreachable — this pins that the wrap-based
+        // count fixes it (and that dropping `.wrap()` still renders the rows).
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Rect;
+
+        let text = "abcdefghijklmnopqrst"; // 20 chars, no spaces → hard-break wrap
+        let inner_w = 6usize;
+        let wrapped: Vec<Line> = wrap_line(&span_line(text, Color::Cyan), inner_w);
+        assert_eq!(wrapped.len(), 4, "20 cols at width 6 → 4 rows");
+
+        let view_h = 2usize;
+        let max_scroll = wrapped.len().saturating_sub(view_h);
+        assert_eq!(max_scroll, 2);
+
+        let area = Rect::new(0, 0, inner_w as u16 + 2, view_h as u16 + 2);
+        let visible = |skip: u16| -> String {
+            let mut term = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+            term.draw(|f| {
+                let p = Paragraph::new(wrapped.clone())
+                    .block(WBlock::default().borders(Borders::ALL))
+                    .scroll((skip, 0));
+                f.render_widget(p, area);
+            })
+            .unwrap();
+            let buf = term.backend().buffer();
+            (1..=view_h as u16)
+                .map(|y| {
+                    (1..area.width.saturating_sub(1))
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("│")
+        };
+
+        let top = visible(0);
+        let bottom = visible(max_scroll as u16);
+        // scroll=0 → first two wrapped rows.
+        assert!(top.contains("abcdef") && top.contains("ghijkl"), "top: {top:?}");
+        // scroll=max_scroll → last two wrapped rows (previously unreachable).
+        assert!(bottom.contains("mnopqr"), "bottom: {bottom:?}");
+        assert!(bottom.contains("st"), "bottom tail: {bottom:?}");
     }
 }
