@@ -222,6 +222,13 @@ impl Agent {
                 });
             }
 
+            // Safety net: fold any adjacent same-role messages (e.g. a resumed
+            // session that ends on two user messages, or a hand-edited history)
+            // into one before sending — Anthropic rejects consecutive user
+            // messages with a 400. The normal append paths already alternate,
+            // so this is usually a no-op.
+            normalize_adjacent(&mut self.messages);
+
             let req = ChatRequest {
                 system: self.system.as_deref(),
                 messages: &self.messages,
@@ -420,6 +427,23 @@ const SUMMARY_MARKER: &str =
 /// summary can't eat the whole remaining run budget and leave the main request
 /// with a near-zero timeout (which would fail the whole run with no result).
 const COMPRESS_RESERVE: Duration = Duration::from_secs(20);
+
+/// Merge adjacent messages that share a role into one. Anthropic rejects two
+/// consecutive user messages with a 400, and tool_use ↔ tool_result pairing is
+/// simplest with strict role alternation. This is a safety net: the known
+/// append paths already alternate, but a resumed/corrupt session or a future
+/// code path could violate it. Block order is preserved (so N tool_use ↔
+/// N tool_result pairing is unaffected) — only same-role neighbors fold.
+fn normalize_adjacent(messages: &mut Vec<Message>) {
+    let mut out: Vec<Message> = Vec::with_capacity(messages.len());
+    for m in messages.drain(..) {
+        match out.last_mut() {
+            Some(prev) if prev.role == m.role => prev.content.extend(m.content),
+            _ => out.push(m),
+        }
+    }
+    *messages = out;
+}
 
 /// Rough size estimate of a conversation (chars; images count cheaply).
 fn total_chars(messages: &[Message]) -> usize {
@@ -1142,5 +1166,77 @@ mod tests {
             Ok(_) => panic!("expected a provider error to propagate"),
         };
         assert!(format!("{err:#}").contains("503"));
+    }
+
+    #[test]
+    fn normalize_adjacent_merges_same_role_neighbors() {
+        // [user a][user b] → one user with both blocks; alternation preserved.
+        let mut msgs = vec![user_text("a"), user_text("b")];
+        normalize_adjacent(&mut msgs);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, Role::User);
+        assert_eq!(msgs[0].content.len(), 2);
+
+        // A run of three same-role messages folds into one.
+        let mut msgs = vec![user_text("a"), user_text("b"), user_text("c")];
+        normalize_adjacent(&mut msgs);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content.len(), 3);
+
+        // Already-alternating history is untouched.
+        let mut msgs = vec![user_text("a"), Message::assistant(vec![Block::Text("x".into())])];
+        normalize_adjacent(&mut msgs);
+        assert_eq!(msgs.len(), 2);
+
+        // Mixed: [u][u][a][a][u] → [u][a][u], block order preserved.
+        let mut msgs = vec![
+            user_text("1"),
+            user_text("2"),
+            Message::assistant(vec![Block::Text("a1".into())]),
+            Message::assistant(vec![Block::Text("a2".into())]),
+            user_text("3"),
+        ];
+        normalize_adjacent(&mut msgs);
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(
+            msgs.iter().map(|m| m.role).collect::<Vec<_>>(),
+            vec![Role::User, Role::Assistant, Role::User]
+        );
+        assert_eq!(msgs[0].content.len(), 2); // "1"+"2"
+        assert_eq!(msgs[1].content.len(), 2); // "a1"+"a2"
+        assert_eq!(msgs[2].content.len(), 1); // "3"
+    }
+
+    #[test]
+    fn run_normalizes_adjacent_user_messages_before_request() {
+        // A resumed/hand-edited history with two trailing user messages would
+        // make Anthropic 400. The loop must fold them into one before the
+        // first chat — assert the provider sees strictly alternating roles.
+        let cfg = cfg_with(5, 0, 0);
+        let (prov, state) = MockProvider::new(vec![mock::resp_text("done", None)]);
+        // Two adjacent user messages at the head.
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![],
+            vec![user_text("first"), user_text("second")],
+            test_ctx(),
+        );
+        let o = agent.run(&mut |_| {}).unwrap();
+        assert_eq!(o.stop_reason, "end_turn");
+
+        let cap = state.captured();
+        assert_eq!(cap.len(), 1, "exactly one chat call");
+        let roles = &cap[0].roles;
+        assert_eq!(
+            roles,
+            &vec![Role::User],
+            "two adjacent user messages were folded into one before the request"
+        );
+        assert_eq!(cap[0].message_count, 1);
+        // No two adjacent roles equal (trivially true here, but pins the rule).
+        for w in roles.windows(2) {
+            assert_ne!(w[0], w[1], "adjacent same-role leaked: {roles:?}");
+        }
     }
 }

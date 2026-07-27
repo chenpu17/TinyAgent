@@ -22,6 +22,9 @@ pub(crate) enum MockTurn {
 pub(crate) struct Captured {
     pub(crate) message_count: usize,
     pub(crate) last_role: Option<Role>,
+    /// Role of every message in the request, in order — lets tests assert no
+    /// two adjacent messages share a role (Anthropic rejects that with a 400).
+    pub(crate) roles: Vec<Role>,
     /// tool_use blocks on the trailing assistant message.
     pub(crate) trailing_tool_uses: usize,
     /// tool_result blocks on the trailing user message.
@@ -47,6 +50,7 @@ impl MockState {
             .map(|c| Captured {
                 message_count: c.message_count,
                 last_role: c.last_role,
+                roles: c.roles.clone(),
                 trailing_tool_uses: c.trailing_tool_uses,
                 trailing_tool_results: c.trailing_tool_results,
             })
@@ -92,6 +96,7 @@ impl Provider for MockProvider {
         self.state.captured.lock().unwrap().push(Captured {
             message_count: req.messages.len(),
             last_role,
+            roles: req.messages.iter().map(|m| m.role).collect(),
             trailing_tool_uses,
             trailing_tool_results,
         });
