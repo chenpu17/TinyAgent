@@ -2,10 +2,12 @@ use crate::agent::RunOutcome;
 use crate::config::{Config, PartialConfig};
 use crate::harness;
 use anyhow::{bail, Context, Result};
+use serde::Deserialize;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Mutex};
 
+#[derive(Debug, Clone, Deserialize)]
 struct TaskReport {
     name: String,
     success: bool,
@@ -57,20 +59,31 @@ pub fn run(
     }
 
     // --failed: re-run only tasks that failed in the prior report (at the same
-    // --report path). Reads it before we overwrite it with the new subset.
-    if failed {
-        let names = failed_names_from_report(report_path)?;
-        let set: std::collections::HashSet<&str> = names.iter().map(|s| s.as_str()).collect();
-        tasks.retain(|(name, _)| set.contains(name.as_str()));
+    // --report path). We load the whole prior report once (before overwriting
+    // it) so we can both filter to failed tasks AND, at write time, merge the
+    // fresh results back — a re-run that now passes folds into a report that
+    // still reflects the full task set, not just the re-run subset.
+    let prior: Option<Vec<TaskReport>> = if failed {
+        let prior_tasks = read_prior_tasks(report_path)?;
+        let failed_names: std::collections::HashSet<String> = prior_tasks
+            .iter()
+            .filter(|t| !t.success)
+            .map(|t| t.name.clone())
+            .collect();
+        let kept_successes = prior_tasks.len() - failed_names.len();
+        tasks.retain(|(name, _)| failed_names.contains(name));
         eprintln!(
-            "batch --failed: re-running {} of {} previously-failed tasks",
+            "batch --failed: re-running {} failed task(s); {} prior success(es) kept in report",
             tasks.len(),
-            names.len()
+            kept_successes
         );
         if tasks.is_empty() {
             bail!("no previously-failed tasks matched files in {}", dir.display());
         }
-    }
+        Some(prior_tasks)
+    } else {
+        None
+    };
 
     let results_dir = report_path
         .parent()
@@ -131,15 +144,22 @@ pub fn run(
 
     let mut reports = reports.into_inner().unwrap();
     reports.sort_by(|a, b| a.name.cmp(&b.name));
-    let succeeded = reports.iter().filter(|r| r.success).count();
-    write_report(report_path, &reports)?;
+    // For --failed: overlay the re-run results onto the prior report so the
+    // written file reflects the full task set (prior successes preserved,
+    // re-run tasks updated). A plain run just writes its own results.
+    let final_reports = match prior {
+        Some(p) => merge_reports(p, &reports),
+        None => reports,
+    };
+    let succeeded = final_reports.iter().filter(|r| r.success).count();
+    write_report(report_path, &final_reports)?;
     eprintln!(
         "batch done: {}/{} succeeded, report → {}",
         succeeded,
-        reports.len(),
+        final_reports.len(),
         report_path.display()
     );
-    Ok(if succeeded == reports.len() { 0 } else { 1 })
+    Ok(if succeeded == final_reports.len() { 0 } else { 1 })
 }
 
 /// One attempt at a task. Returns a `stop_reason` that signals retryability:
@@ -262,30 +282,50 @@ fn backoff_secs(attempt: usize) -> u64 {
     1u64 << attempt.min(5)
 }
 
-/// Names of tasks that failed in a prior batch report (for `--failed`). A
-/// failure with no name (or empty) is ignored — it can't be matched to a file.
-fn failed_names_from_report(path: &Path) -> Result<Vec<String>> {
+/// Read the `tasks` array out of a prior batch report. Used by `--failed` both
+/// to pick the failed subset and as the merge base for the updated report.
+fn read_prior_tasks(path: &Path) -> Result<Vec<TaskReport>> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read prior report {}", path.display()))?;
-    let v: serde_json::Value =
-        serde_json::from_str(&raw).context("prior report is not valid JSON")?;
-    let tasks = v
-        .get("tasks")
-        .and_then(|t| t.as_array())
-        .context("prior report has no \"tasks\" array")?;
-    Ok(tasks
-        .iter()
-        .filter_map(|t| {
-            let success = t.get("success").and_then(|s| s.as_bool()).unwrap_or(true);
-            (!success).then(|| {
-                t.get("name")
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("")
-                    .to_string()
-            })
-        })
+    // serde will reject valid JSON that lacks a "tasks" array (the field is
+    // non-optional), which is exactly the "not a real report" case.
+    let file: ReportFile =
+        serde_json::from_str(&raw).context("prior report is not a valid batch report")?;
+    Ok(file.tasks)
+}
+
+/// Names of tasks that failed in a prior batch report (for `--failed`). A
+/// failure with no name (or empty) is ignored — it can't be matched to a file.
+#[cfg(test)]
+fn failed_names_from_report(path: &Path) -> Result<Vec<String>> {
+    Ok(read_prior_tasks(path)?
+        .into_iter()
+        .filter(|t| !t.success)
+        .map(|t| t.name)
         .filter(|s| !s.is_empty())
         .collect())
+}
+
+/// Overlay `fresh` re-run results onto `prior`, keyed by task name. A task
+/// present in `fresh` replaces its prior entry (the re-run is now the truth of
+/// record); everything else from `prior` — the successes we didn't re-run — is
+/// kept verbatim. Result is sorted by name.
+fn merge_reports(prior: Vec<TaskReport>, fresh: &[TaskReport]) -> Vec<TaskReport> {
+    let mut by_name: std::collections::HashMap<String, TaskReport> =
+        prior.into_iter().map(|t| (t.name.clone(), t)).collect();
+    for t in fresh {
+        by_name.insert(t.name.clone(), t.clone());
+    }
+    let mut out: Vec<_> = by_name.into_values().collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// Shape of a report.json file on disk — only `tasks` is read back; the
+/// total/succeeded/failed summary is recomputed when we write.
+#[derive(Deserialize)]
+struct ReportFile {
+    tasks: Vec<TaskReport>,
 }
 
 fn write_report(path: &Path, reports: &[TaskReport]) -> Result<()> {
@@ -337,16 +377,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ta-batch-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("report.json");
-        std::fs::write(
-            &path,
-            r#"{"total":3,"succeeded":1,"failed":2,"tasks":[
-                {"name":"a","success":true},
-                {"name":"b","success":false},
-                {"name":"c","success":false},
-                {"name":"","success":false}
-            ]}"#,
-        )
-        .unwrap();
+        // A realistic prior report (write_report's exact shape): a ok, b/c
+        // failed, plus a failed task with an empty name — the latter can't be
+        // matched to a file, so it must be dropped from the re-run list.
+        let reports = vec![tr("a", true), tr("b", false), tr("c", false), tr("", false)];
+        write_report(&path, &reports).unwrap();
 
         let names = failed_names_from_report(&path).unwrap();
         // Only the failed tasks with names; the empty-name one is dropped.
@@ -373,6 +408,67 @@ mod tests {
         let notasks = dir.join("notasks.json");
         std::fs::write(&notasks, r#"{"total":0}"#).unwrap();
         assert!(failed_names_from_report(&notasks).is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Minimal TaskReport builder for the merge/read tests below.
+    fn tr(name: &str, success: bool) -> TaskReport {
+        TaskReport {
+            name: name.into(),
+            success,
+            stop_reason: if success { "end_turn" } else { "error" }.into(),
+            turns: 1,
+            elapsed_secs: 1.0,
+            error: if success { None } else { Some("e".into()) },
+        }
+    }
+
+    #[test]
+    fn merge_keeps_prior_successes_and_overlays_fresh() {
+        // Prior: alpha failed, beta succeeded. Re-run alpha, now it passes.
+        let prior = vec![tr("alpha", false), tr("beta", true)];
+        let fresh = vec![tr("alpha", true)];
+
+        let merged = merge_reports(prior, &fresh);
+
+        // Full set present (not just the re-run subset), alpha now green.
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].name, "alpha");
+        assert!(merged[0].success);
+        assert_eq!(merged[1].name, "beta");
+        assert!(merged[1].success); // prior success preserved verbatim
+    }
+
+    #[test]
+    fn merge_fresh_failure_overrides_prior_success() {
+        // A re-run that regresses (was ok, now fails) must record the failure —
+        // the fresh result is the truth of record, never stale-optimistic.
+        let prior = vec![tr("alpha", true)];
+        let fresh = vec![tr("alpha", false)];
+
+        let merged = merge_reports(prior, &fresh);
+
+        assert_eq!(merged.len(), 1);
+        assert!(!merged[0].success);
+    }
+
+    #[test]
+    fn read_prior_tasks_roundtrips_write_report() {
+        let dir = std::env::temp_dir().join(format!("ta-batch-rt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("report.json");
+
+        // Write a report, then read it back: field names must line up so the
+        // merge base is faithful (a mismatch would silently drop entries).
+        let wrote = vec![tr("alpha", false), tr("beta", true)];
+        write_report(&path, &wrote).unwrap();
+        let read = read_prior_tasks(&path).unwrap();
+        assert_eq!(read.len(), 2);
+        assert_eq!(read[0].name, "alpha");
+        assert!(!read[0].success);
+        assert_eq!(read[1].name, "beta");
+        assert!(read[1].success);
 
         std::fs::remove_dir_all(&dir).ok();
     }
