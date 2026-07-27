@@ -2,8 +2,9 @@ use super::{Tool, ToolCtx, ToolOutput};
 use crate::config::McpServerConfig;
 use crate::mcp::McpClient;
 use crate::provider::{Block, ToolDef};
-use anyhow::Result;
+use anyhow::{bail, Result};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 /// An MCP tool exposed to the agent as `mcp_<server>_<tool>`.
@@ -71,15 +72,18 @@ impl Tool for McpTool {
 /// A server that fails the handshake aborts startup with a clear error.
 pub fn build(servers: &[McpServerConfig]) -> Result<Vec<Box<dyn Tool>>> {
     let mut out: Vec<Box<dyn Tool>> = Vec::new();
+    let mut display_names: Vec<String> = Vec::new();
     for cfg in servers {
         let (client, infos) = McpClient::start(cfg)?;
         let n = infos.len();
         let client = Arc::new(Mutex::new(client));
         for info in infos {
+            let display = sanitize_name(&cfg.name, &info.name);
+            display_names.push(display.clone());
             out.push(Box::new(McpTool {
                 client: client.clone(),
                 def: ToolDef {
-                    name: format!("mcp_{}_{}", cfg.name, info.name),
+                    name: display,
                     description: info.description,
                     schema: if info.input_schema.is_null() {
                         json!({"type": "object", "properties": {}})
@@ -87,10 +91,107 @@ pub fn build(servers: &[McpServerConfig]) -> Result<Vec<Box<dyn Tool>>> {
                         info.input_schema
                     },
                 },
+                // The MCP *wire* name is the original, unsanitized tool name —
+                // tools/call must dispatch with the name the server knows.
+                // Only the name shown to the model is sanitized.
                 wire_name: info.name,
             }));
         }
         eprintln!("mcp: server '{}' ready ({} tools)", cfg.name, n);
     }
+    // Cross-server collisions after sanitization are the real risk — e.g.
+    // server "a" + tool "b.c" and server "a.b" + tool "c" both yield
+    // `mcp_a_b_c`. Surface it at startup rather than silently shadowing a tool.
+    dedup_check(&display_names)?;
     Ok(out)
+}
+
+/// Build the agent-facing tool name `mcp_<server>_<tool>`, sanitized so the
+/// model can emit it reliably: characters outside `[A-Za-z0-9_]` become `_`,
+/// runs of separators collapse, and leading/trailing separators are trimmed
+/// (matching the ASCII-identifier convention from the MCP spec). The wire name
+/// is untouched — only this display name is sanitized, so dispatch is safe.
+fn sanitize_name(server: &str, tool: &str) -> String {
+    fn clean(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut just_sep = true; // suppress a leading separator + collapse runs
+        for c in s.chars() {
+            if c.is_ascii_alphanumeric() {
+                out.push(c);
+                just_sep = false;
+            } else if !just_sep {
+                out.push('_');
+                just_sep = true;
+            }
+        }
+        if out.ends_with('_') {
+            out.pop();
+        }
+        out
+    }
+    let server = clean(server);
+    let tool = clean(tool);
+    // A half made entirely of symbols/non-ascii (e.g. a CJK server name) would
+    // clean to empty; substitute a stable placeholder so the name stays
+    // well-formed. Two such tools then collide (caught by dedup_check) instead
+    // of silently shadowing.
+    let server = if server.is_empty() { "server".to_string() } else { server };
+    let tool = if tool.is_empty() { "tool".to_string() } else { tool };
+    format!("mcp_{server}_{tool}")
+}
+
+/// Reject duplicate agent-facing tool names. Sanitization can map distinct
+/// (server, tool) pairs onto the same identifier; report that as a startup
+/// error instead of letting one tool silently shadow another.
+fn dedup_check(names: &[String]) -> Result<()> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    for n in names {
+        if !seen.insert(n.as_str()) {
+            bail!(
+                "MCP tool name collision after sanitization: '{n}' — two tools \
+                 map to the same identifier; use more distinct server/tool names"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{dedup_check, sanitize_name};
+
+    #[test]
+    fn sanitize_keeps_clean_identifiers_unchanged() {
+        assert_eq!(sanitize_name("fs", "read_file"), "mcp_fs_read_file");
+        assert_eq!(sanitize_name("server_1", "tool_2"), "mcp_server_1_tool_2");
+    }
+
+    #[test]
+    fn sanitize_replaces_non_alnum_runs_with_single_underscore() {
+        // spaces, dots, slashes, symbols all collapse to one '_' between runs.
+        assert_eq!(sanitize_name("my server", "do.thing"), "mcp_my_server_do_thing");
+        assert_eq!(sanitize_name("a...b", "c/d"), "mcp_a_b_c_d");
+        assert_eq!(sanitize_name("---lead", "trail---"), "mcp_lead_trail");
+    }
+
+    #[test]
+    fn sanitize_falls_back_when_a_half_is_all_symbols() {
+        // Non-ascii-alnum halves (CJK, pure symbols) → placeholder so the name
+        // stays well-formed; dedup_check then catches the resulting collision.
+        assert_eq!(sanitize_name("中文", "工具"), "mcp_server_tool");
+        assert_eq!(sanitize_name("***", "ok"), "mcp_server_ok");
+        assert_eq!(sanitize_name("ok", "***"), "mcp_ok_tool");
+    }
+
+    #[test]
+    fn dedup_check_passes_on_unique_names() {
+        assert!(dedup_check(&["mcp_a_b".into(), "mcp_c_d".into()]).is_ok());
+    }
+
+    #[test]
+    fn dedup_check_rejects_collision() {
+        let r = dedup_check(&["mcp_a_b".into(), "mcp_a_b".into()]);
+        assert!(r.is_err());
+        assert!(format!("{}", r.unwrap_err()).contains("collision"));
+    }
 }
