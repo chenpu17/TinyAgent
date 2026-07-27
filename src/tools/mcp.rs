@@ -109,8 +109,11 @@ pub fn build(servers: &[McpServerConfig]) -> Result<Vec<Box<dyn Tool>>> {
 /// Build the agent-facing tool name `mcp_<server>_<tool>`, sanitized so the
 /// model can emit it reliably: characters outside `[A-Za-z0-9_]` become `_`,
 /// runs of separators collapse, and leading/trailing separators are trimmed
-/// (matching the ASCII-identifier convention from the MCP spec). The wire name
-/// is untouched — only this display name is sanitized, so dispatch is safe.
+/// (matching the ASCII-identifier convention from the MCP spec). The result is
+/// capped at 64 chars (the Anthropic tool-name / OpenAI function-name limit);
+/// the wire name is untouched — only this display name is sanitized, so
+/// dispatch is safe. Two names that collide after sanitize+truncate are caught
+/// by `dedup_check`.
 fn sanitize_name(server: &str, tool: &str) -> String {
     fn clean(s: &str) -> String {
         let mut out = String::with_capacity(s.len());
@@ -137,7 +140,12 @@ fn sanitize_name(server: &str, tool: &str) -> String {
     // of silently shadowing.
     let server = if server.is_empty() { "server".to_string() } else { server };
     let tool = if tool.is_empty() { "tool".to_string() } else { tool };
-    format!("mcp_{server}_{tool}")
+    let mut name = format!("mcp_{server}_{tool}");
+    // Cap at 64 chars (Anthropic/OpenAI tool-name limit). The name is pure ASCII
+    // (alnum/_), so byte truncation stays on a char boundary; truncate() is a
+    // no-op when the name is already short enough.
+    name.truncate(64);
+    name
 }
 
 /// Reject duplicate agent-facing tool names. Sanitization can map distinct
@@ -181,6 +189,20 @@ mod tests {
         assert_eq!(sanitize_name("中文", "工具"), "mcp_server_tool");
         assert_eq!(sanitize_name("***", "ok"), "mcp_server_ok");
         assert_eq!(sanitize_name("ok", "***"), "mcp_ok_tool");
+    }
+
+    #[test]
+    fn sanitize_caps_long_names_at_64_chars() {
+        // Anthropic tool names are {1,64}; OpenAI function names too. A long
+        // server+tool combo must be truncated so the provider doesn't 400.
+        // The name is ASCII, so truncation keeps the mcp_ prefix intact.
+        let s = "s".repeat(40);
+        let t = "t".repeat(60);
+        let name = sanitize_name(&s, &t);
+        assert_eq!(name.len(), 64);
+        assert!(name.starts_with("mcp_"));
+        // Short names are untouched.
+        assert_eq!(sanitize_name("a", "b"), "mcp_a_b");
     }
 
     #[test]
