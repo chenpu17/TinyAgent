@@ -212,8 +212,12 @@ impl Agent {
             events(AgentEvent::TurnStart(turns));
             // The summary request (if compression fires) is a real billed call;
             // fold its usage into the run totals so result.json / TUI report
-            // honest costs. Returns None when no compression happened.
-            if let Some(u) = self.compress_if_needed(events, deadline) {
+            // honest costs. compress_if_needed returns Option<Option<Usage>>:
+            // outer None = no compression ran; inner None = compression ran but
+            // the provider reported no usage. We only count/emit on Some(Some):
+            // a usage-less summary contributes nothing and must not emit a
+            // noise Usage{0,0} event into the NDJSON stream / TUI status.
+            if let Some(Some(u)) = self.compress_if_needed(events, deadline) {
                 in_tokens += u.input_tokens;
                 out_tokens += u.output_tokens;
                 events(AgentEvent::Usage {
@@ -526,14 +530,18 @@ fn append_user_turn(messages: &mut Vec<Message>, blocks: Vec<Block>) {
 impl Agent {
     /// If history exceeds the configured threshold, summarize the middle
     /// via the LLM and keep only the original task + recent tail.
-    /// Failures degrade gracefully (warn and continue uncompressed). Returns
-    /// the summary request's token usage (None if no compression ran) so the
-    /// run can count that billed call in its totals.
+    /// Failures degrade gracefully (warn and continue uncompressed).
+    ///
+    /// Returns the summary request's token usage wrapped twice:
+    /// - outer `None` — no compression ran (below threshold / out of budget);
+    /// - `Some(None)` — compression ran but the provider reported no usage
+    ///   (count nothing, emit no Usage event);
+    /// - `Some(Some(u))` — compression ran and billed `u` (count + emit).
     fn compress_if_needed(
         &mut self,
         events: &mut dyn FnMut(AgentEvent),
         deadline: Option<Instant>,
-    ) -> Option<Usage> {
+    ) -> Option<Option<Usage>> {
         let threshold = self.limits.compress_threshold_chars;
         if self.compress_failed || threshold == 0 || total_chars(&self.messages) <= threshold {
             return None;
@@ -554,12 +562,14 @@ impl Agent {
         let (summary, sum_usage) = match self.summarize_prefix(cut, deadline) {
             Ok((s, u)) if !s.trim().is_empty() => (s, u),
             Ok((_empty, u)) => {
-                // The summary request ran and billed tokens even though the
-                // model returned empty/unusable text. Surface that usage so the
-                // run's totals stay honest, then disable compression for the
-                // rest of this run (don't retry every turn).
+                // The summary request ran (so compression "happened") even
+                // though the model returned empty/unusable text. Pass `u`
+                // through unchanged: if the provider billed usage, the caller
+                // counts/emits it; if it reported none, count nothing and emit
+                // no noise Usage{0,0} event. Either way disable compression for
+                // the rest of this run (don't retry every turn).
                 self.compress_failed = true;
-                return Some(u.unwrap_or_default());
+                return Some(u);
             }
             Err(e) => {
                 self.compress_failed = true;
@@ -575,9 +585,11 @@ impl Agent {
             dropped,
             kept: self.messages.len(),
         });
-        // The summary is a real billed request; surface its usage (0 if the
-        // provider didn't report any) so the caller can add it to the totals.
-        Some(sum_usage.unwrap_or_default())
+        // The summary is a real billed request — pass its usage through so the
+        // caller can add it to the totals. If the provider didn't report usage,
+        // the inner is None and the caller counts/emits nothing (no Usage{0,0}
+        // noise event in the NDJSON stream / TUI status).
+        Some(sum_usage)
     }
 
     /// Ask the LLM to summarize messages[..cut] into a compact brief. Returns
@@ -1175,6 +1187,55 @@ mod tests {
         assert!(events
             .iter()
             .all(|e| !matches!(e, AgentEvent::Compressed { .. })));
+    }
+
+    #[test]
+    fn compress_without_provider_usage_emits_no_zero_event() {
+        // Compression ran (summary non-empty, history folded, Compressed fires)
+        // but the provider reported NO usage for the summary request. The old
+        // code synthesized a Usage{0,0} event for it (noise in NDJSON/TUI).
+        // G3: no Usage event and nothing added to the totals from the summary —
+        // only the main call's usage (which it did report) shows up.
+        let mut cfg = cfg_with(5, 0, 30);
+        cfg.limits.keep_recent_messages = 2;
+        let long = "x".repeat(40);
+        let initial = vec![
+            user_text(&long),
+            Message::assistant(vec![Block::Text("a1".into())]),
+            user_text("u1"),
+            Message::assistant(vec![Block::Text("a2".into())]),
+            user_text("u2"),
+        ];
+        let (prov, _) = MockProvider::new(vec![
+            mock::resp_text("SUMMARY", None),                  // summary ran, no usage reported
+            mock::resp_text("final", mock::mk_usage(100, 10)), // main call reports usage
+        ]);
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+        let mut events = Vec::new();
+        let o = agent.run(&mut |e| events.push(e)).unwrap();
+        // Totals reflect ONLY the main call — the summary reported no usage, so
+        // there is nothing honest to count from it.
+        assert_eq!(o.input_tokens, 100);
+        assert_eq!(o.output_tokens, 10);
+        // Compression did run...
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Compressed { dropped: 2, kept: 3 })));
+        // ...but emitted exactly ONE Usage event (the main call's), not a
+        // spurious second Usage{0,0} for the usage-less summary.
+        let usage_events = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::Usage { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            usage_events.len(),
+            1,
+            "summary with no provider usage must not emit a Usage{{0,0}} event"
+        );
+        assert!(matches!(
+            usage_events[0],
+            AgentEvent::Usage { input_tokens: 100, output_tokens: 10 }
+        ));
     }
 
     #[test]
