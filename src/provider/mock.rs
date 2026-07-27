@@ -19,13 +19,17 @@ pub(crate) enum MockTurn {
 
 /// What a `chat()` call saw — enough to assert the loop's structural
 /// invariants (message count, N tool_use ↔ N tool_result pairing).
+#[derive(Clone)]
 pub(crate) struct Captured {
     pub(crate) message_count: usize,
     pub(crate) last_role: Option<Role>,
     /// Role of every message in the request, in order — lets tests assert no
     /// two adjacent messages share a role (Anthropic rejects that with a 400).
     pub(crate) roles: Vec<Role>,
-    /// tool_use blocks on the trailing assistant message.
+    /// tool_use blocks on the trailing assistant message. Captured for
+    /// symmetry with `trailing_tool_results` and ad-hoc debugging; no test
+    /// currently asserts it (the mock records N:N but doesn't enforce it).
+    #[allow(dead_code)]
     pub(crate) trailing_tool_uses: usize,
     /// tool_result blocks on the trailing user message.
     pub(crate) trailing_tool_results: usize,
@@ -43,18 +47,10 @@ impl MockState {
         self.captured.lock().unwrap().len()
     }
     pub(crate) fn captured(&self) -> Vec<Captured> {
-        self.captured
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|c| Captured {
-                message_count: c.message_count,
-                last_role: c.last_role,
-                roles: c.roles.clone(),
-                trailing_tool_uses: c.trailing_tool_uses,
-                trailing_tool_results: c.trailing_tool_results,
-            })
-            .collect()
+        // Captured is Clone — snapshot the whole vec in one call rather than
+        // hand-copying each field (which silently drops new fields when someone
+        // forgets to update the mapping; adding `roles` already bit us once).
+        self.captured.lock().unwrap().clone()
     }
 }
 

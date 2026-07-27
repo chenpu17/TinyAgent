@@ -1263,6 +1263,47 @@ mod tests {
     }
 
     #[test]
+    fn normalize_adjacent_preserves_tool_use_tool_result_pairing() {
+        // Folding a user message carrying a tool_result into an adjacent user
+        // message must keep the tool_result AFTER its assistant tool_use — they
+        // live in different roles and never merge across, so N:N pairing and id
+        // survival hold. Locks the claim that the safety net can't corrupt a
+        // tool history.
+        let tu = Block::ToolUse {
+            id: "x".into(),
+            name: "sh".into(),
+            input: json!({}),
+        };
+        let tr = Block::ToolResult {
+            tool_use_id: "x".into(),
+            content: "ok".into(),
+            image: None,
+            is_error: false,
+        };
+        let mut msgs = vec![
+            Message::assistant(vec![tu]),
+            Message::user(vec![tr]),
+            Message::user(vec![Block::Text("more".into())]),
+        ];
+        normalize_adjacent(&mut msgs);
+        assert_eq!(msgs.len(), 2, "two adjacent user messages fold into one");
+        assert_eq!(msgs[0].role, Role::Assistant);
+        assert_eq!(msgs[1].role, Role::User);
+        // tool_use still leads, in the assistant message; tool_result + text
+        // merged into the trailing user message, order preserved.
+        assert!(matches!(
+            &msgs[0].content[0],
+            Block::ToolUse { id, .. } if id == "x"
+        ));
+        assert_eq!(msgs[1].content.len(), 2);
+        assert!(matches!(
+            &msgs[1].content[0],
+            Block::ToolResult { tool_use_id, .. } if tool_use_id == "x"
+        ));
+        assert!(matches!(&msgs[1].content[1], Block::Text(t) if t == "more"));
+    }
+
+    #[test]
     fn run_normalizes_adjacent_user_messages_before_request() {
         // A resumed/hand-edited history with two trailing user messages would
         // make Anthropic 400. The loop must fold them into one before the
