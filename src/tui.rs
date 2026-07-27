@@ -2,7 +2,9 @@ use crate::agent::{Agent, AgentEvent};
 use crate::config::Config;
 use crate::provider::Block;
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
+};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -177,6 +179,7 @@ struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        let _ = stdout().execute(DisableBracketedPaste);
         let _ = disable_raw_mode();
         let _ = stdout().execute(LeaveAlternateScreen);
     }
@@ -247,6 +250,10 @@ pub fn run(
 
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
+    // Bracketed paste: terminals that support it deliver a pasted blob as one
+    // Event::Paste (newlines included) instead of replaying it as keystrokes —
+    // which would hit the Enter handler and send each line as a message.
+    stdout().execute(EnableBracketedPaste)?;
     // From here the terminal is modified; the guard restores it on drop so a
     // panic (or a propagated `?` error) in the UI loop below can't strand the
     // user in raw mode + alternate screen.
@@ -570,7 +577,8 @@ fn ui_loop(
 
         // Keyboard.
         if event::poll(Duration::from_millis(60))? {
-            if let Event::Key(key) = event::read()? {
+            let ev = event::read()?;
+            if let Event::Key(key) = ev {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
@@ -766,6 +774,13 @@ fn ui_loop(
                     }
                     _ => {}
                 }
+            } else if let Event::Paste(s) = ev {
+                // Bracketed paste: the whole blob (newlines included) arrives
+                // as one event and is inserted as input — not split into many
+                // Enter-triggered sends the way a raw paste would be.
+                if !busy && mode == Mode::Input {
+                    input.insert_str(&s);
+                }
             }
         }
     }
@@ -894,6 +909,19 @@ impl InputBuffer {
         self.lines.insert(self.row + 1, rest);
         self.row += 1;
         self.col = 0;
+    }
+
+    /// Insert a (possibly multi-line) string at the cursor — used for bracketed
+    /// paste. `\n` splits into a fresh line; a leading `\r` (CRLF pastes) is
+    /// dropped so it doesn't leave a stray CR in the input.
+    fn insert_str(&mut self, s: &str) {
+        for c in s.chars() {
+            match c {
+                '\n' => self.newline(),
+                '\r' => {}
+                _ => self.put_char(c),
+            }
+        }
     }
 
     fn move_left(&mut self) {
@@ -1047,6 +1075,34 @@ mod tests {
         assert_eq!(b.text(), "hi");
         assert_eq!(b.drain_to_string(), "hi");
         assert!(b.is_empty());
+    }
+
+    #[test]
+    fn insert_str_handles_multiline_crlf_and_cjk() {
+        // Paste a multi-line blob at the start: each \n starts a new line.
+        let mut b = InputBuffer::new();
+        b.insert_str("line1\nline2\nline3");
+        assert_eq!(b.text(), "line1\nline2\nline3");
+        assert_eq!(b.line_count(), 3);
+
+        // CRLF pastes collapse to a single newline (no stray CR left behind).
+        let mut b = InputBuffer::new();
+        b.insert_str("a\r\nb");
+        assert_eq!(b.text(), "a\nb");
+
+        // Insert mid-line lands at the cursor, splitting the existing text.
+        let mut b = InputBuffer::new();
+        b.set_text("abcd"); // cursor at end (pos 4)
+        b.move_left(); // "abc|d"
+        b.move_left(); // "ab|cd"
+        b.insert_str("XY");
+        assert_eq!(b.text(), "abXYcd");
+
+        // A multi-line CJK paste round-trips byte-for-byte.
+        let mut b = InputBuffer::new();
+        b.insert_str("你好\n世界");
+        assert_eq!(b.text(), "你好\n世界");
+        assert_eq!(b.line_count(), 2);
     }
 
     #[test]
