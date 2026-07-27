@@ -23,6 +23,7 @@ pub struct ToolCtx {
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
+#[derive(Debug)]
 pub struct ToolOutput {
     pub content: String,
     pub image: Option<Block>,
@@ -60,6 +61,7 @@ pub fn build(names: &[String]) -> Result<Vec<Box<dyn Tool>>> {
             "shell" => Box::new(shell::Shell),
             "read_file" => Box::new(file::ReadFile),
             "write_file" => Box::new(file::WriteFile),
+            "edit_file" => Box::new(file::EditFile),
             "list_dir" => Box::new(file::ListDir),
             "load_image" => Box::new(image::LoadImage),
             other => bail!("unknown tool in config: {other}"),

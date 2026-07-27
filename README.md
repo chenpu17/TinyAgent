@@ -7,7 +7,7 @@
 - **单一可执行文件**，无运行时依赖；musl 静态编译后可丢到路由器 / 树莓派 / CI runner 直接跑
 - **两种 LLM 后端**：Anthropic 原生 API + OpenAI 兼容协议（覆盖 DeepSeek / vLLM / Ollama 等），均带 token 用量统计
 - **图片输入**：`--image` 参数或 `load_image` 工具（png / jpeg / gif / webp，base64）
-- **精炼工具集**：`shell`、`read_file`、`write_file`、`list_dir`、`load_image`，配置白名单启用
+- **精炼工具集**：`shell`、`read_file`、`write_file`、`edit_file`、`list_dir`、`load_image`，配置白名单启用
 - **Harness 契约**：`--output result.json` 写结构化结果（含 token 用量、每次工具调用的 input/output），`--json` 流式 NDJSON；exit code 语义化（`0` 成功 / `124` 超时 / `130` 取消 / `1` 其它），可直接进 CI / 评测 pipeline
 - **CLI 覆盖**：`--model` / `--max-turns` / `--timeout` 免改配置做 A/B 对照
 - **批量任务**：`--batch <dir>` 并发跑一组任务片段，`--retries` 对 transient 失败指数退避重试，`--failed` 只重跑上一轮失败的任务并合并进完整报告
@@ -189,7 +189,7 @@ tiny-agent --config examples/harness.json --batch examples/tasks --failed --retr
   "task": "headless 模式要执行的任务（可被 --task 覆盖）",
   "workdir": "工具操作的工作目录，默认当前目录",
   "restrict_to_workdir": false,
-  "tools": ["shell", "read_file", "write_file", "list_dir", "load_image"],
+  "tools": ["shell", "read_file", "write_file", "edit_file", "list_dir", "load_image"],
   "mcp_servers": [],
   "limits": {
     "max_turns": 30,
@@ -292,6 +292,7 @@ headless 模式下 `Ctrl-C` 走**优雅取消**：首次 SIGINT 在流式 chunk 
 | `shell` | 在工作目录执行命令（sh -c / cmd /C），120s 超时后 kill，输出有界读取并按 `max_output_chars` 截断 |
 | `read_file` | 读文本文件，带行号，支持 offset/limit；流式读取，超大文件不会整段进内存 |
 | `write_file` | 全量重写文件，自动创建父目录 |
+| `edit_file` | 精确替换：`old_string`→`new_string`，默认要求唯一匹配（`replace_all` 全替换）；匹配 0 或 >1 时报错引导补上下文，复用 `restrict_to_workdir` 沙箱 |
 | `list_dir` | 列目录，最多 500 条 |
 | `load_image` | 加载本地图片让模型"看到"（需视觉模型） |
 

@@ -25,6 +25,7 @@ fn default_tools() -> Vec<String> {
         "shell".into(),
         "read_file".into(),
         "write_file".into(),
+        "edit_file".into(),
         "list_dir".into(),
     ]
 }
@@ -334,7 +335,7 @@ mod tests {
         assert_eq!(cfg.provider, ProviderKind::Anthropic);
         assert_eq!(cfg.base_url(), "https://api.anthropic.com");
         assert_eq!(cfg.limits.max_turns, 30);
-        assert_eq!(cfg.tools, vec!["shell", "read_file", "write_file", "list_dir"]);
+        assert_eq!(cfg.tools, vec!["shell", "read_file", "write_file", "edit_file", "list_dir"]);
     }
 
     #[test]
