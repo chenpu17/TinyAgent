@@ -63,7 +63,9 @@ struct Cli {
     #[arg(long)]
     image: Vec<PathBuf>,
 
-    /// Session file for conversation persistence
+    /// Session file for conversation persistence. Pass `none` to disable
+    /// persistence entirely (no read on --resume, no per-turn write) — handy
+    /// for one-shot headless runs that shouldn't touch the cwd.
     #[arg(long, default_value = ".tinyagent-session.json")]
     session: PathBuf,
 
@@ -112,6 +114,11 @@ fn main() -> Result<()> {
         cfg.limits.timeout_secs = s;
     }
 
+    // Resolve the session target up front: `--session none` is the opt-out
+    // sentinel (no read on --resume, no per-turn write), anything else is a
+    // file path. Computed once here so every mode below treats it the same.
+    let session = session_target(&cli.session);
+
     // ── Batch mode ────────────────────────────────────────────────────
     if let Some(dir) = &cli.batch {
         if cli.tui {
@@ -125,7 +132,14 @@ fn main() -> Result<()> {
     let mut initial: Vec<Message> = Vec::new();
     let mut resumed = false;
     if cli.resume {
-        if let Some((model, history)) = session::load(&cli.session)? {
+        let path = match session {
+            Some(p) => p,
+            // --resume with no persistence target is contradictory: there is
+            // nothing to resume from. (Without --resume, --session none is
+            // fine and just skips writing.)
+            None => bail!("--resume needs a session file, but --session none disables persistence"),
+        };
+        if let Some((model, history)) = session::load(path)? {
             if model != cfg.model {
                 eprintln!(
                     "[warn] session model '{model}' differs from config model '{}'",
@@ -190,7 +204,9 @@ fn main() -> Result<()> {
     let auto_start = initial.last().is_some_and(|m| m.role == Role::User);
     let client = provider::new_client(cfg.limits.timeout_secs);
     let mut agent = build_agent(&cfg, initial, &client)?;
-    agent.enable_session(cli.session.clone());
+    if let Some(path) = session {
+        agent.enable_session(path.to_path_buf());
+    }
 
     if cli.tui {
         #[cfg(feature = "tui")]
@@ -252,4 +268,44 @@ pub(crate) fn build_agent(
         cancel: None,
     };
     Ok(Agent::new(cfg, provider, tool_list, initial, ctx))
+}
+
+/// Resolve the `--session` value into the persistence target, if any. The
+/// literal `none` is the opt-out sentinel — no session file is read or written,
+/// so a one-shot headless run doesn't litter the cwd. Anything else is treated
+/// as a file path (the default is `.tinyagent-session.json`).
+fn session_target(raw: &std::path::Path) -> Option<&std::path::Path> {
+    if raw.as_os_str() == "none" {
+        None
+    } else {
+        Some(raw)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::session_target;
+    use std::path::Path;
+
+    #[test]
+    fn session_target_none_disables_persistence() {
+        assert!(session_target(Path::new("none")).is_none());
+    }
+
+    #[test]
+    fn session_target_passes_real_paths_through() {
+        // Default and custom paths (single-segment or nested) are kept as-is.
+        assert_eq!(
+            session_target(Path::new(".tinyagent-session.json")),
+            Some(Path::new(".tinyagent-session.json"))
+        );
+        assert_eq!(
+            session_target(Path::new("chat.json")),
+            Some(Path::new("chat.json"))
+        );
+        assert_eq!(
+            session_target(Path::new("/tmp/ta/chat.json")),
+            Some(Path::new("/tmp/ta/chat.json"))
+        );
+    }
 }
