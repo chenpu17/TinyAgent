@@ -553,9 +553,13 @@ impl Agent {
 
         let (summary, sum_usage) = match self.summarize_prefix(cut, deadline) {
             Ok((s, u)) if !s.trim().is_empty() => (s, u),
-            Ok(_) => {
+            Ok((_empty, u)) => {
+                // The summary request ran and billed tokens even though the
+                // model returned empty/unusable text. Surface that usage so the
+                // run's totals stay honest, then disable compression for the
+                // rest of this run (don't retry every turn).
                 self.compress_failed = true;
-                return None;
+                return Some(u.unwrap_or_default());
             }
             Err(e) => {
                 self.compress_failed = true;
@@ -1117,9 +1121,60 @@ mod tests {
             mock::resp_text("final", mock::mk_usage(100, 10)),   // main call
         ]);
         let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
-        let o = agent.run(&mut |_| {}).unwrap();
+        let mut events = Vec::new();
+        let o = agent.run(&mut |e| events.push(e)).unwrap();
         assert_eq!(o.input_tokens, 300); // 200 (summary) + 100 (main)
         assert_eq!(o.output_tokens, 40); // 30 + 10
+        // The summary's usage must emit a Usage event too (not just fold into
+        // the totals) — otherwise a future refactor could drop the event emit
+        // while the totals still add up and this test would pass. Two calls →
+        // two Usage events.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, AgentEvent::Usage { .. }))
+                .count(),
+            2,
+            "summary and main chat each emit a Usage event"
+        );
+    }
+
+    #[test]
+    fn compress_empty_summary_still_counts_its_usage() {
+        // The model returned an empty/unusable summary, but the summarize
+        // request still billed tokens. Those must be counted (honest cost) even
+        // though compression is then disabled and no Compressed event fires.
+        let mut cfg = cfg_with(5, 0, 30);
+        cfg.limits.keep_recent_messages = 2;
+        let long = "x".repeat(40);
+        let initial = vec![
+            user_text(&long),
+            Message::assistant(vec![Block::Text("a1".into())]),
+            user_text("u1"),
+            Message::assistant(vec![Block::Text("a2".into())]),
+            user_text("u2"),
+        ];
+        let (prov, _) = MockProvider::new(vec![
+            mock::resp_text("   ", mock::mk_usage(200, 30)), // empty summary, but billed
+            mock::resp_text("final", mock::mk_usage(100, 10)),
+        ]);
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+        let mut events = Vec::new();
+        let o = agent.run(&mut |e| events.push(e)).unwrap();
+        // Summary usage counted despite the empty/unusable text.
+        assert_eq!(o.input_tokens, 300);
+        assert_eq!(o.output_tokens, 40);
+        // Both calls emitted a Usage event; compression was NOT applied.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, AgentEvent::Usage { .. }))
+                .count(),
+            2
+        );
+        assert!(events
+            .iter()
+            .all(|e| !matches!(e, AgentEvent::Compressed { .. })));
     }
 
     #[test]
