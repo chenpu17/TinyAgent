@@ -47,8 +47,21 @@ pub fn run(agent: &mut Agent, output_path: Option<&Path>, json: bool) -> Result<
                 AgentEvent::Compressed { dropped, kept } => {
                     println!("\n[context compressed: dropped {dropped} messages, {kept} kept]");
                 }
-                AgentEvent::Usage { input_tokens, output_tokens } => {
-                    eprintln!("[tokens: {input_tokens}↑ {output_tokens}↓]");
+                AgentEvent::Usage {
+                    input_tokens,
+                    output_tokens,
+                    cache_creation_input_tokens,
+                    cache_read_input_tokens,
+                } => {
+                    let cache = if cache_creation_input_tokens > 0 || cache_read_input_tokens > 0 {
+                        format!(
+                            " · cache {}write {}read",
+                            cache_creation_input_tokens, cache_read_input_tokens
+                        )
+                    } else {
+                        String::new()
+                    };
+                    eprintln!("[tokens: {input_tokens}↑ {output_tokens}↓{cache}]");
                 }
             }
         });
@@ -112,11 +125,15 @@ fn emit_json(ev: &AgentEvent) {
         AgentEvent::Usage {
             input_tokens,
             output_tokens,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
         } => {
             json!({
                 "type": "usage",
                 "input_tokens": *input_tokens,
                 "output_tokens": *output_tokens,
+                "cache_creation_input_tokens": *cache_creation_input_tokens,
+                "cache_read_input_tokens": *cache_read_input_tokens,
             })
         }
         AgentEvent::Compressed { dropped, kept } => {
@@ -162,6 +179,8 @@ pub fn write_result(path: &Path, outcome: Option<&RunOutcome>, error: Option<&st
                 "elapsed_secs": o.elapsed.as_secs_f64(),
                 "input_tokens": o.input_tokens,
                 "output_tokens": o.output_tokens,
+                "cache_creation_input_tokens": o.cache_creation_input_tokens,
+                "cache_read_input_tokens": o.cache_read_input_tokens,
                 "summary": o.final_text.clone(),
                 "tool_calls": tool_calls,
                 "error": error_val,
@@ -246,6 +265,8 @@ mod tests {
             }],
             input_tokens: 100,
             output_tokens: 5,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
             elapsed: std::time::Duration::from_secs_f64(1.5),
         };
         // Success path: tool output + token totals + summary all present.

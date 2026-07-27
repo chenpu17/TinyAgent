@@ -128,11 +128,39 @@ impl Provider for Anthropic {
             "stream": true,
             "messages": req.messages.iter().map(Self::message_json).collect::<Vec<_>>(),
         });
+        // Prompt caching: mark up to three ephemeral breakpoints so a multi-turn
+        // run re-reads the stable prefix cheaply instead of re-billing it every
+        // turn. Anthropic ignores breakpoints below its ~1024-token floor (no
+        // error, no charge), so this is always safe to apply, and ≤3 breakpoints
+        // stays under the 4-breakpoint cap the API enforces across the whole
+        // request. OpenAI caching is implicit (no body field), so this markup is
+        // Anthropic-only by virtue of living in this provider's chat().
         if let Some(sys) = req.system {
-            body["system"] = json!(sys);
+            // System must be a content-block array (not a bare string) to carry
+            // cache_control; tag it so the system prompt is cached across turns.
+            body["system"] = json!([{
+                "type": "text",
+                "text": sys,
+                "cache_control": {"type": "ephemeral"},
+            }]);
         }
         if !req.tools.is_empty() {
             body["tools"] = Self::tools_json(req.tools);
+            // The tool definitions are stable for the whole run — cache them by
+            // tagging the last one.
+            if let Some(last) = body["tools"].as_array_mut().and_then(|a| a.last_mut()) {
+                last["cache_control"] = json!({"type": "ephemeral"});
+            }
+        }
+        // Cache the conversation prefix: tag the last content block of the last
+        // message, so on the next turn everything before it is a cache read.
+        if let Some(last_block) = body["messages"]
+            .as_array_mut()
+            .and_then(|msgs| msgs.last_mut())
+            .and_then(|m| m["content"].as_array_mut())
+            .and_then(|blocks| blocks.last_mut())
+        {
+            last_block["cache_control"] = json!({"type": "ephemeral"});
         }
 
         let mut rb = self
@@ -206,8 +234,15 @@ impl Anthropic {
             };
             match ev["type"].as_str().unwrap_or("") {
                 "message_start" => {
-                    if let Some(i) = ev["message"]["usage"]["input_tokens"].as_u64() {
+                    let u = &ev["message"]["usage"];
+                    if let Some(i) = u["input_tokens"].as_u64() {
                         usage.input_tokens = i;
+                    }
+                    if let Some(c) = u["cache_creation_input_tokens"].as_u64() {
+                        usage.cache_creation_input_tokens = c;
+                    }
+                    if let Some(r) = u["cache_read_input_tokens"].as_u64() {
+                        usage.cache_read_input_tokens = r;
                     }
                 }
                 "content_block_start" => {
@@ -316,6 +351,24 @@ mod tests {
             resp.usage.map(|u| (u.input_tokens, u.output_tokens)),
             Some((12, 7))
         );
+    }
+
+    #[test]
+    fn stream_usage_reads_cache_fields() {
+        // When prompt caching engaged, message_start.usage carries
+        // cache_creation_input_tokens / cache_read_input_tokens. parse_loop must
+        // surface them on Usage (previously they were dropped).
+        let raw = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":12,\"cache_creation_input_tokens\":300,\"cache_read_input_tokens\":1500}}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"hi\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":4}}\n\n",
+        );
+        let resp = parse(raw.as_bytes());
+        let u = resp.usage.expect("anthropic always reports usage");
+        assert_eq!(u.input_tokens, 12);
+        assert_eq!(u.cache_creation_input_tokens, 300);
+        assert_eq!(u.cache_read_input_tokens, 1500);
     }
 
     #[test]

@@ -82,10 +82,19 @@ pub enum ChatEvent {
 
 /// Token usage for one chat. Best-effort: None when the server didn't report
 /// (request errored, or the stream was cut off before the usage frame).
+///
+/// `cache_creation_input_tokens` / `cache_read_input_tokens` cover prompt
+/// caching: Anthropic reports both (writes billed 1.25×, reads 0.1×); OpenAI
+/// reports only cached reads via `prompt_tokens_details.cached_tokens`. Both
+/// default to 0 when the provider doesn't report caching. `input_tokens` is the
+/// *non-cached* input (the two cache fields are separate), so the honest billed
+/// input is `input_tokens + cache_creation*1.25 + cache_read*0.1`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
 }
 
 /// A completed assistant turn.

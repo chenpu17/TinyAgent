@@ -150,5 +150,23 @@ pub(crate) fn mk_usage(input_tokens: u64, output_tokens: u64) -> Option<Usage> {
     Some(Usage {
         input_tokens,
         output_tokens,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+    })
+}
+
+/// Like `mk_usage` but also sets the prompt-cache fields — for tests asserting
+/// cache tokens flow through the agent loop honestly.
+pub(crate) fn mk_usage_cache(
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_creation_input_tokens: u64,
+    cache_read_input_tokens: u64,
+) -> Option<Usage> {
+    Some(Usage {
+        input_tokens,
+        output_tokens,
+        cache_creation_input_tokens,
+        cache_read_input_tokens,
     })
 }

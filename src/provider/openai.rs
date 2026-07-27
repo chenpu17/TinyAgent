@@ -308,6 +308,14 @@ impl OpenAi {
                     usage = Some(Usage {
                         input_tokens: u["prompt_tokens"].as_u64().unwrap_or(0),
                         output_tokens: u["completion_tokens"].as_u64().unwrap_or(0),
+                        // OpenAI prompt caching is implicit (automatic for prompts
+                        // >1024 tokens); the only observable is how many of the
+                        // prompt tokens were served from cache. There's no
+                        // separate "creation" event, so cache_creation stays 0.
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: u["prompt_tokens_details"]["cached_tokens"]
+                            .as_u64()
+                            .unwrap_or(0),
                     });
                 }
                 continue;
@@ -561,6 +569,24 @@ mod tests {
             resp.usage.map(|u| (u.input_tokens, u.output_tokens)),
             Some((42, 9))
         );
+    }
+
+    #[test]
+    fn stream_usage_reads_cached_tokens() {
+        // OpenAI reports cache hits as prompt_tokens_details.cached_tokens on
+        // the final usage chunk. parse_loop maps it to cache_read_input_tokens;
+        // cache_creation stays 0 (OpenAI implicit caching has no "creation").
+        let raw = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"x\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":42,\"completion_tokens\":3,\"total_tokens\":45,\"prompt_tokens_details\":{\"cached_tokens\":30}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let resp = OpenAi::parse_stream(raw.as_bytes(), &mut |_| {}).unwrap();
+        let u = resp.usage.expect("usage frame present");
+        assert_eq!(u.input_tokens, 42);
+        assert_eq!(u.output_tokens, 3);
+        assert_eq!(u.cache_creation_input_tokens, 0);
+        assert_eq!(u.cache_read_input_tokens, 30);
     }
 
     #[test]

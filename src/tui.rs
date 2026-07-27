@@ -311,6 +311,10 @@ fn ui_loop(
     // Running token totals for the session, summed from each turn's usage.
     let mut in_tokens: u64 = 0;
     let mut out_tokens: u64 = 0;
+    // Prompt-cache write/read totals — shown in the status bar so the user can
+    // see caching paying off (Anthropic reports both; OpenAI reports reads).
+    let mut cache_create: u64 = 0;
+    let mut cache_read: u64 = 0;
     // Input vs. browse mode (Tab toggles). In Nav mode select_idx picks a
     // tool row; j/k move it, Enter/Space toggles its expanded view.
     let mut mode = Mode::Input;
@@ -405,9 +409,16 @@ fn ui_loop(
                             "[context compressed: dropped {dropped} messages, {kept} kept]"
                         )));
                     }
-                    AgentEvent::Usage { input_tokens, output_tokens } => {
+                    AgentEvent::Usage {
+                        input_tokens,
+                        output_tokens,
+                        cache_creation_input_tokens,
+                        cache_read_input_tokens,
+                    } => {
                         in_tokens += input_tokens;
                         out_tokens += output_tokens;
+                        cache_create += cache_creation_input_tokens;
+                        cache_read += cache_read_input_tokens;
                     }
                 },
                 UiMsg::Error(e) => {
@@ -559,13 +570,24 @@ fn ui_loop(
                 Mode::Input => "input",
                 Mode::Nav => "nav",
             };
+            // Show cache stats only once caching has actually engaged, so the
+            // bar stays uncluttered for providers/requests with no caching.
+            let cache_seg = if cache_read > 0 || cache_create > 0 {
+                format!(
+                    " · cache {}w {}r",
+                    fmt_tokens(cache_create),
+                    fmt_tokens(cache_read)
+                )
+            } else {
+                String::new()
+            };
             let status = Line::from(vec![
                 Span::styled(
                     format!(" {} ", cfg.model),
                     Style::default().fg(Color::Black).bg(Color::Cyan),
                 ),
                 Span::raw(format!(
-                    "  {state} · {mode_str} · turn {turn} · tok {}↑ {}↓ · {:.0}s",
+                    "  {state} · {mode_str} · turn {turn} · tok {}↑ {}↓{cache_seg} · {:.0}s",
                     fmt_tokens(in_tokens),
                     fmt_tokens(out_tokens),
                     start.elapsed().as_secs_f64()
@@ -683,6 +705,8 @@ fn ui_loop(
                                         rows.clear();
                                         in_tokens = 0;
                                         out_tokens = 0;
+                                        cache_create = 0;
+                                        cache_read = 0;
                                         // Reset Nav state: select_idx pointed at
                                         // a now-vanished row, and clearing is an
                                         // input-mode action.

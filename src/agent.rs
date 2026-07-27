@@ -15,8 +15,14 @@ pub enum AgentEvent {
     ToolResult { name: String, is_error: bool, content: String },
     /// Token usage reported by the provider for the latest chat request.
     /// Best-effort: emitted only when the provider actually reported usage
-    /// (e.g. the stream wasn't cut off before the usage frame).
-    Usage { input_tokens: u64, output_tokens: u64 },
+    /// (e.g. the stream wasn't cut off before the usage frame). The cache_*
+    /// fields are 0 for providers/requests with no prompt caching.
+    Usage {
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_creation_input_tokens: u64,
+        cache_read_input_tokens: u64,
+    },
     /// History was compressed: how many middle messages were dropped,
     /// and how many remain.
     Compressed { dropped: usize, kept: usize },
@@ -40,9 +46,13 @@ pub struct RunOutcome {
     pub stop_reason: String,
     pub tool_calls: Vec<ToolCallRecord>,
     /// Token usage summed across every chat request in this run (best-effort:
-    /// only the requests whose stream reached the usage frame).
+    /// only the requests whose stream reached the usage frame). The cache_*
+    /// fields accumulate prompt-cache writes/reads so the reported cost stays
+    /// honest when caching is on (Anthropic reports both; OpenAI reports reads).
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
     pub elapsed: Duration,
 }
 
@@ -189,6 +199,8 @@ impl Agent {
         // emitted to the frontend; these accumulate for the result file).
         let mut in_tokens: u64 = 0;
         let mut out_tokens: u64 = 0;
+        let mut cache_create: u64 = 0;
+        let mut cache_read: u64 = 0;
 
         loop {
             if self.cancelled() {
@@ -220,9 +232,13 @@ impl Agent {
             if let Some(Some(u)) = self.compress_if_needed(events, deadline) {
                 in_tokens += u.input_tokens;
                 out_tokens += u.output_tokens;
+                cache_create += u.cache_creation_input_tokens;
+                cache_read += u.cache_read_input_tokens;
                 events(AgentEvent::Usage {
                     input_tokens: u.input_tokens,
                     output_tokens: u.output_tokens,
+                    cache_creation_input_tokens: u.cache_creation_input_tokens,
+                    cache_read_input_tokens: u.cache_read_input_tokens,
                 });
             }
 
@@ -256,9 +272,13 @@ impl Agent {
             if let Some(u) = resp.usage {
                 in_tokens += u.input_tokens;
                 out_tokens += u.output_tokens;
+                cache_create += u.cache_creation_input_tokens;
+                cache_read += u.cache_read_input_tokens;
                 events(AgentEvent::Usage {
                     input_tokens: u.input_tokens,
                     output_tokens: u.output_tokens,
+                    cache_creation_input_tokens: u.cache_creation_input_tokens,
+                    cache_read_input_tokens: u.cache_read_input_tokens,
                 });
             }
 
@@ -396,6 +416,8 @@ impl Agent {
             tool_calls: records,
             input_tokens: in_tokens,
             output_tokens: out_tokens,
+            cache_creation_input_tokens: cache_create,
+            cache_read_input_tokens: cache_read,
             elapsed: start.elapsed(),
         })
     }
@@ -1079,6 +1101,47 @@ mod tests {
     }
 
     #[test]
+    fn cache_usage_propagates_to_run_outcome_and_event() {
+        // Prompt-cache tokens billed by the provider (Anthropic cache writes/
+        // reads) must flow through to the RunOutcome totals AND the per-turn
+        // Usage event — otherwise caching-on would under-report real cost.
+        let cfg = cfg_with(5, 0, 0);
+        let (prov, _) = MockProvider::new(vec![
+            mock::resp_tool("a", "echo", json!({}), mock::mk_usage_cache(100, 10, 300, 1500)),
+            mock::resp_text("done", mock::mk_usage_cache(50, 5, 0, 1200)),
+        ]);
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![Box::new(EchoTool::new("echo"))],
+            vec![user_text("go")],
+            test_ctx(),
+        );
+        let mut events = Vec::new();
+        let o = agent.run(&mut |e| events.push(e)).unwrap();
+        // input/output accumulate as before...
+        assert_eq!(o.input_tokens, 150);
+        assert_eq!(o.output_tokens, 15);
+        // ...and so do the cache fields: 300+0 writes, 1500+1200 reads.
+        assert_eq!(o.cache_creation_input_tokens, 300);
+        assert_eq!(o.cache_read_input_tokens, 2700);
+        // The per-turn Usage event carries the cache fields too.
+        let cache_events = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    AgentEvent::Usage {
+                        cache_creation_input_tokens: _,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(cache_events, 2);
+    }
+
+    #[test]
     fn compress_folds_history_and_emits_event() {
         // History over threshold + a safe cut → summarize runs (an extra chat
         // call), the middle folds into message[0], a Compressed event fires,
@@ -1234,7 +1297,7 @@ mod tests {
         );
         assert!(matches!(
             usage_events[0],
-            AgentEvent::Usage { input_tokens: 100, output_tokens: 10 }
+            AgentEvent::Usage { input_tokens: 100, output_tokens: 10, .. }
         ));
     }
 

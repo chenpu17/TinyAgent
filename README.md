@@ -216,6 +216,18 @@ tool_use/tool_result 配对不被切断；压缩失败时告警一次并禁用�
 压缩摘要请求自身的 token 用量也计入运行累计（`input_tokens` / `output_tokens`），
 成本数字与实际调用一致，不因压缩而漏报。
 
+### Prompt caching
+
+Anthropic 原生 provider 默认开启 prompt caching：每个请求自动在 **system prompt / tools / 末条消息**
+三处打 ephemeral 断点（≤4 断点上限内），多轮任务重发整段历史时只对增量计费（缓存写 1.25×、读 0.1×）。
+断点低于 ~1024 token 时 API 自动忽略（不报错不收费），所以始终开启是安全的。OpenAI 兼容协议是隐式
+前缀缓存（请求体无字段），命中数体现在 `cache_read_input_tokens`。
+
+缓存命中的 token 单独计入：`input_tokens` 只含**未缓存**部分，缓存写/读分别走
+`cache_creation_input_tokens` / `cache_read_input_tokens`（result.json / NDJSON / TUI 状态条都可见）。
+真实计费输入 ≈ `input_tokens + cache_creation_input_tokens × 1.25 + cache_read_input_tokens × 0.1`。
+压缩摘要请求是一次性调用，不加缓存断点。
+
 ## ⚠️ 安全说明
 
 **这是一个给模型直接执行能力的 agent，不是沙箱。** 请按此定位使用：
@@ -240,6 +252,8 @@ tool_use/tool_result 配对不被切断；压缩失败时告警一次并禁用�
   "elapsed_secs": 3.1,
   "input_tokens": 1234,
   "output_tokens": 567,
+  "cache_creation_input_tokens": 300,
+  "cache_read_input_tokens": 1500,
   "summary": "agent 的最终文本回复",
   "tool_calls": [
     { "name": "write_file", "input": {...}, "output": "wrote 42 bytes", "is_error": false }
@@ -249,7 +263,9 @@ tool_use/tool_result 配对不被切断；压缩失败时告警一次并禁用�
 ```
 
 - `tool_calls[].output` 是工具返回的完整内容（`is_error` 标记是否为错误结果）
-- `input_tokens` / `output_tokens` 是本次运行累计的 token 用量
+- `input_tokens` / `output_tokens` 是本次运行累计的 token 用量；`cache_creation_input_tokens` /
+  `cache_read_input_tokens` 是 prompt 缓存写/读累计（Anthropic 两者都报，OpenAI 只报读）。`input_tokens`
+  只含未缓存部分，真实计费输入需加上缓存写 1.25× / 读 0.1×（见上文 Prompt caching）
 - agent.run 返回 `Err`（如 provider 503）时仍会写结果文件：`{"success": false, "stop_reason": "error", "error": "..."}`
 
 进程 exit code：
