@@ -73,6 +73,7 @@ impl Tool for LoadImage {
             content: format!("[image loaded: {}]", full.display()),
             image: Some(block),
             is_error: false,
+            usage: None,
         })
     }
 }

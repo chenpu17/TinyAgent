@@ -2,10 +2,12 @@ mod file;
 mod image;
 pub(crate) mod mcp;
 mod shell;
+mod subagent;
 
 pub(crate) use image::load_block;
 
-use crate::provider::{Block, ToolDef};
+use crate::config::Config;
+use crate::provider::{Block, ToolDef, Usage};
 use anyhow::{bail, Result};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -28,6 +30,11 @@ pub struct ToolOutput {
     pub content: String,
     pub image: Option<Block>,
     pub is_error: bool,
+    /// Token usage a tool wants billed to the parent run. Leaf tools (shell,
+    /// file, …) leave this None; the `task` sub-agent tool sets it to its
+    /// child run's usage so sub-agent cost is counted honestly in the parent's
+    /// totals (and surfaces via AgentEvent::Usage / result.json).
+    pub usage: Option<Usage>,
 }
 
 impl ToolOutput {
@@ -36,6 +43,7 @@ impl ToolOutput {
             content: s.into(),
             image: None,
             is_error: false,
+            usage: None,
         }
     }
 
@@ -44,6 +52,7 @@ impl ToolOutput {
             content: s.into(),
             image: None,
             is_error: true,
+            usage: None,
         }
     }
 }
@@ -54,7 +63,17 @@ pub trait Tool: Send + Sync {
 }
 
 /// Instantiate the built-in tools named in the config whitelist.
-pub fn build(names: &[String]) -> Result<Vec<Box<dyn Tool>>> {
+///
+/// `cfg` / `client` / `api_key` are only used by the `task` sub-agent tool
+/// (which builds a fresh child provider+agent); the leaf tools ignore them.
+/// Passing them here keeps the `Tool` trait's `run(ctx)` signature free of
+/// agent-construction plumbing.
+pub fn build(
+    names: &[String],
+    cfg: &Config,
+    client: &reqwest::blocking::Client,
+    api_key: &str,
+) -> Result<Vec<Box<dyn Tool>>> {
     let mut out: Vec<Box<dyn Tool>> = Vec::new();
     for name in names {
         out.push(match name.as_str() {
@@ -64,6 +83,11 @@ pub fn build(names: &[String]) -> Result<Vec<Box<dyn Tool>>> {
             "edit_file" => Box::new(file::EditFile),
             "list_dir" => Box::new(file::ListDir),
             "load_image" => Box::new(image::LoadImage),
+            "task" => Box::new(subagent::SubAgent::new(
+                cfg.clone(),
+                client.clone(),
+                api_key.to_string(),
+            )),
             other => bail!("unknown tool in config: {other}"),
         });
     }

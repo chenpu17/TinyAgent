@@ -64,6 +64,7 @@ impl Tool for McpTool {
             content: text,
             image,
             is_error: result["isError"].as_bool().unwrap_or(false),
+            usage: None,
         })
     }
 }

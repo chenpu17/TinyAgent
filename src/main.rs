@@ -265,7 +265,7 @@ pub(crate) fn build_agent(
     let api_key = cfg.api_key()?;
     let provider = provider::build(cfg, &api_key, client.clone());
 
-    let mut tool_list = tools::build(&cfg.tools)?;
+    let mut tool_list = tools::build(&cfg.tools, cfg, client, &api_key)?;
     if !cfg.mcp_servers.is_empty() {
         tool_list.extend(tools::mcp::build(&cfg.mcp_servers)?);
     }

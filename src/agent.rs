@@ -386,6 +386,22 @@ impl Agent {
                     },
                     None => crate::tools::ToolOutput::error(format!("unknown tool: {name}")),
                 };
+                // A tool that did real LLM work (the `task` sub-agent) bills
+                // its usage to this run: fold it into the totals and emit a
+                // Usage event so TUI/NDJSON/result.json see the honest cost.
+                // Leaf tools report None and add nothing.
+                if let Some(u) = output.usage {
+                    in_tokens += u.input_tokens;
+                    out_tokens += u.output_tokens;
+                    cache_create += u.cache_creation_input_tokens;
+                    cache_read += u.cache_read_input_tokens;
+                    events(AgentEvent::Usage {
+                        input_tokens: u.input_tokens,
+                        output_tokens: u.output_tokens,
+                        cache_creation_input_tokens: u.cache_creation_input_tokens,
+                        cache_read_input_tokens: u.cache_read_input_tokens,
+                    });
+                }
 
                 records.push(ToolCallRecord {
                     name: name.clone(),
@@ -930,6 +946,74 @@ mod tests {
             }
             Ok(ToolOutput::text("ok"))
         }
+    }
+
+    /// A tool that bills synthetic usage to the parent run — pins that
+    /// `ToolOutput::usage` folds into the agent's totals and emits a Usage
+    /// event. This is the path the `task` sub-agent relies on for honest cost.
+    struct BillTool;
+    impl Tool for BillTool {
+        fn def(&self) -> ToolDef {
+            ToolDef {
+                name: "bill".into(),
+                description: "test usage-billing tool".into(),
+                schema: json!({"type": "object", "properties": {}}),
+            }
+        }
+        fn run(&self, _input: &Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+            Ok(ToolOutput {
+                content: "sub-work done".into(),
+                image: None,
+                is_error: false,
+                usage: Some(crate::provider::Usage {
+                    input_tokens: 111,
+                    output_tokens: 22,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                }),
+            })
+        }
+    }
+
+    #[test]
+    fn tool_reported_usage_folds_into_run_totals_and_events() {
+        // A tool reporting usage (the `task` sub-agent path) must fold into the
+        // run's token totals AND emit its own AgentEvent::Usage, alongside each
+        // turn's streamed usage. Pins the honest-cost fold the sub-agent relies
+        // on — touched the core tool-result path, so this stays green.
+        let cfg = cfg_with(5, 0, 0);
+        let (prov, _) = MockProvider::new(vec![
+            mock::resp_tool("t", "bill", json!({}), mock::mk_usage(50, 7)),
+            // Turn 2 is the sole cache contributor, so cache totals are unambiguous.
+            mock::resp_text("final", mock::mk_usage_cache(0, 0, 5, 9)),
+        ]);
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![Box::new(BillTool)],
+            vec![user_text("go")],
+            test_ctx(),
+        );
+        let mut events = Vec::new();
+        let o = agent.run(&mut |e| events.push(e)).unwrap();
+        // Streamed turn usage (50↑/7↓, then 0/0) + the tool's billed (111↑/22↓).
+        assert_eq!(o.input_tokens, 50 + 111);
+        assert_eq!(o.output_tokens, 7 + 22);
+        // Cache only from turn 2 (5 write / 9 read); the tool billed none.
+        assert_eq!(o.cache_creation_input_tokens, 5);
+        assert_eq!(o.cache_read_input_tokens, 9);
+        // The tool's billed usage surfaced as its own Usage event (111/22).
+        let usage_events: Vec<(u64, u64)> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Usage { input_tokens, output_tokens, .. } => Some((*input_tokens, *output_tokens)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            usage_events.contains(&(111, 22)),
+            "tool-reported usage must emit a Usage event; got {usage_events:?}"
+        );
     }
 
     #[test]

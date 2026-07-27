@@ -7,7 +7,7 @@
 - **单一可执行文件**，无运行时依赖；musl 静态编译后可丢到路由器 / 树莓派 / CI runner 直接跑
 - **两种 LLM 后端**：Anthropic 原生 API + OpenAI 兼容协议（覆盖 DeepSeek / vLLM / Ollama 等），均带 token 用量统计
 - **图片输入**：`--image` 参数或 `load_image` 工具（png / jpeg / gif / webp，base64）
-- **精炼工具集**：`shell`、`read_file`、`write_file`、`edit_file`、`list_dir`、`load_image`，配置白名单启用
+- **精炼工具集**：`shell`、`read_file`、`write_file`、`edit_file`、`list_dir`、`load_image`，外加 `task`（顺序子 agent），配置白名单启用
 - **Harness 契约**：`--output result.json` 写结构化结果（含 token 用量、每次工具调用的 input/output），`--json` 流式 NDJSON；exit code 语义化（`0` 成功 / `124` 超时 / `130` 取消 / `1` 其它），可直接进 CI / 评测 pipeline
 - **CLI 覆盖**：`--model` / `--max-turns` / `--timeout` 免改配置做 A/B 对照
 - **批量任务**：`--batch <dir>` 并发跑一组任务片段，`--retries` 对 transient 失败指数退避重试，`--failed` 只重跑上一轮失败的任务并合并进完整报告
@@ -310,6 +310,28 @@ headless 模式下 `Ctrl-C` 走**优雅取消**：首次 SIGINT 在流式 chunk 
 | `edit_file` | 精确替换：`old_string`→`new_string`，默认要求唯一匹配（`replace_all` 全替换）；匹配 0 或 >1 时报错引导补上下文，复用 `restrict_to_workdir` 沙箱 |
 | `list_dir` | 列目录，最多 500 条 |
 | `load_image` | 加载本地图片让模型"看到"（需视觉模型） |
+| `task` | 把一块工作委派给一个**子 agent**（独立上下文 + 独立 turn 预算），只把子 agent 的最终摘要作为结果返回，保持主上下文清爽。详见下节 |
+
+## 子 agent（`task` 工具）
+
+`task` 是一个**顺序**子 agent 工具：主 agent 把一个聚焦的子任务交给一个全新的子 agent（自己的消息历史、自己的 turn 预算），子 agent 跑完后只把**最终摘要**作为 tool 结果返回——主 agent 的上下文不会被子 agent 的中间过程撑大。
+
+- **输入**：`{ "description": "简短说明", "prompt": "完整自包含的指令" }`（`prompt` 必填，`description` 可选、信息性）。
+- **成本诚实计入**：子 agent 的 token 用量折进主 run 的累计，并照常发 `usage` 事件 / 写进 `result.json`。
+- **继承**：子 agent 复用主 agent 的 provider / model / 工作目录 / `restrict_to_workdir` / 取消标志（Ctrl-C 会连带中断子 agent）。工具白名单继承父配置。
+
+**v1 边界（刻意收紧）**：
+
+- **顺序，不并行**：一次只跑一个子 agent，`task` 调用会阻塞当前 turn 直到子 agent 完成。并行子 agent + 工作目录隔离是后续工作。
+- **不可递归**：子 agent 的工具白名单会滤掉 `task` 本身，所以子 agent 不能再开子 agent（无需深度计数）。
+- **无事件转发**：子 agent 的流式过程不进主 UI（TUI / NDJSON），主 agent 只看到 `task` 调用与最终结果。
+- **不进默认白名单**：在配置的 `tools` 里显式加 `"task"` 才启用。
+
+启用：在配置 `tools` 数组加入 `"task"` 即可。
+
+```json
+"tools": ["shell", "read_file", "write_file", "edit_file", "list_dir", "task"]
+```
 
 ## 开发
 
