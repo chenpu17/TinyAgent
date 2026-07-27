@@ -1,5 +1,5 @@
 use crate::config::{Config, Limits};
-use crate::provider::{Block, ChatEvent, ChatRequest, Message, Provider, Role, ToolDef};
+use crate::provider::{Block, ChatEvent, ChatRequest, Message, Provider, Role, ToolDef, Usage};
 use crate::tools::{Tool, ToolCtx};
 use anyhow::Result;
 use serde_json::Value;
@@ -210,7 +210,17 @@ impl Agent {
             }
             turns += 1;
             events(AgentEvent::TurnStart(turns));
-            self.compress_if_needed(events, deadline);
+            // The summary request (if compression fires) is a real billed call;
+            // fold its usage into the run totals so result.json / TUI report
+            // honest costs. Returns None when no compression happened.
+            if let Some(u) = self.compress_if_needed(events, deadline) {
+                in_tokens += u.input_tokens;
+                out_tokens += u.output_tokens;
+                events(AgentEvent::Usage {
+                    input_tokens: u.input_tokens,
+                    output_tokens: u.output_tokens,
+                });
+            }
 
             let req = ChatRequest {
                 system: self.system.as_deref(),
@@ -492,15 +502,17 @@ fn append_user_turn(messages: &mut Vec<Message>, blocks: Vec<Block>) {
 impl Agent {
     /// If history exceeds the configured threshold, summarize the middle
     /// via the LLM and keep only the original task + recent tail.
-    /// Failures degrade gracefully (warn and continue uncompressed).
+    /// Failures degrade gracefully (warn and continue uncompressed). Returns
+    /// the summary request's token usage (None if no compression ran) so the
+    /// run can count that billed call in its totals.
     fn compress_if_needed(
         &mut self,
         events: &mut dyn FnMut(AgentEvent),
         deadline: Option<Instant>,
-    ) {
+    ) -> Option<Usage> {
         let threshold = self.limits.compress_threshold_chars;
         if self.compress_failed || threshold == 0 || total_chars(&self.messages) <= threshold {
-            return;
+            return None;
         }
         // Compression is best-effort: never let the summary request eat the
         // run's remaining budget — that would leave the main request with a
@@ -510,23 +522,21 @@ impl Agent {
             if d.saturating_duration_since(Instant::now())
                 < COMPRESS_RESERVE + Duration::from_secs(5)
             {
-                return;
+                return None;
             }
         }
-        let Some(cut) = find_safe_cut(&self.messages, self.limits.keep_recent_messages) else {
-            return;
-        };
+        let cut = find_safe_cut(&self.messages, self.limits.keep_recent_messages)?;
 
-        let summary = match self.summarize_prefix(cut, deadline) {
-            Ok(s) if !s.trim().is_empty() => s,
+        let (summary, sum_usage) = match self.summarize_prefix(cut, deadline) {
+            Ok((s, u)) if !s.trim().is_empty() => (s, u),
             Ok(_) => {
                 self.compress_failed = true;
-                return;
+                return None;
             }
             Err(e) => {
                 self.compress_failed = true;
                 eprintln!("[warn] context compression failed (disabled for this run): {e:#}");
-                return;
+                return None;
             }
         };
 
@@ -537,10 +547,18 @@ impl Agent {
             dropped,
             kept: self.messages.len(),
         });
+        // The summary is a real billed request; surface its usage (0 if the
+        // provider didn't report any) so the caller can add it to the totals.
+        Some(sum_usage.unwrap_or_default())
     }
 
-    /// Ask the LLM to summarize messages[..cut] into a compact brief.
-    fn summarize_prefix(&self, cut: usize, deadline: Option<Instant>) -> Result<String> {
+    /// Ask the LLM to summarize messages[..cut] into a compact brief. Returns
+    /// the summary text and the summary request's token usage.
+    fn summarize_prefix(
+        &self,
+        cut: usize,
+        deadline: Option<Instant>,
+    ) -> Result<(String, Option<Usage>)> {
         let mut transcript = String::new();
         for m in &self.messages[..cut] {
             let role = match m.role {
@@ -587,7 +605,7 @@ impl Agent {
                 .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
         };
         let resp = self.provider.chat(&req, &mut |_| {})?;
-        Ok(resp
+        let text = resp
             .blocks
             .iter()
             .filter_map(|b| match b {
@@ -595,7 +613,8 @@ impl Agent {
                 _ => None,
             })
             .collect::<Vec<_>>()
-            .join("\n"))
+            .join("\n");
+        Ok((text, resp.usage))
     }
 }
 
@@ -1053,6 +1072,30 @@ mod tests {
         // The main (2nd) request saw the folded history: 3 messages.
         let cap = state.captured();
         assert_eq!(cap[1].message_count, 3);
+    }
+
+    #[test]
+    fn compress_summary_usage_is_counted_in_totals() {
+        // The summarize_prefix request is a real billed call — its usage must
+        // fold into the run totals (and emit a Usage event), not be dropped.
+        let mut cfg = cfg_with(5, 0, 30);
+        cfg.limits.keep_recent_messages = 2;
+        let long = "x".repeat(40);
+        let initial = vec![
+            user_text(&long),
+            Message::assistant(vec![Block::Text("a1".into())]),
+            user_text("u1"),
+            Message::assistant(vec![Block::Text("a2".into())]),
+            user_text("u2"),
+        ];
+        let (prov, _) = MockProvider::new(vec![
+            mock::resp_text("SUMMARY", mock::mk_usage(200, 30)), // summary call
+            mock::resp_text("final", mock::mk_usage(100, 10)),   // main call
+        ]);
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+        let o = agent.run(&mut |_| {}).unwrap();
+        assert_eq!(o.input_tokens, 300); // 200 (summary) + 100 (main)
+        assert_eq!(o.output_tokens, 40); // 30 + 10
     }
 
     #[test]
