@@ -58,6 +58,10 @@ enum Mode {
 enum SlashCmd {
     Message,
     Clear,
+    /// `/export [path]` — dump the conversation to a file (or clipboard when no
+    /// path is given and a clipboard tool is available). The optional arg is the
+    /// destination path, whitespace-trimmed.
+    Export(Option<String>),
     Model,
     Limits,
     Tools,
@@ -69,12 +73,20 @@ enum SlashCmd {
 /// Classify a trimmed input line into a slash command (or Message). Pure — no
 /// side effects — so the command grammar is unit-tested independently of the
 /// terminal/key-handling. Case-sensitive: `/Model` is unknown, not `/model`.
+/// The command word is split from its argument on the first whitespace, so
+/// `/export out.md` carries `Some("out.md")`.
 fn classify(trimmed: &str) -> SlashCmd {
-    let Some(cmd) = trimmed.strip_prefix('/') else {
+    let Some(rest) = trimmed.strip_prefix('/') else {
         return SlashCmd::Message;
     };
-    match cmd.trim() {
+    let (word, raw_arg) = match rest.split_once(char::is_whitespace) {
+        Some((w, a)) => (w, a.trim()),
+        None => (rest.trim(), ""),
+    };
+    let arg = if raw_arg.is_empty() { None } else { Some(raw_arg.to_string()) };
+    match word {
         "clear" => SlashCmd::Clear,
+        "export" => SlashCmd::Export(arg),
         "model" => SlashCmd::Model,
         "limits" => SlashCmd::Limits,
         "tools" => SlashCmd::Tools,
@@ -111,11 +123,88 @@ fn slash_reply(cmd: &SlashCmd, cfg: &Config) -> String {
             "system: {}",
             cfg.system_prompt.as_deref().unwrap_or("(none)"),
         ),
-        SlashCmd::Help => "commands: /clear /model /limits /tools /system /help".into(),
+        SlashCmd::Help => "commands: /clear /export /model /limits /tools /system /help".into(),
         SlashCmd::Unknown(name) => format!("[unknown command: /{name} — try /help]"),
-        // Message/Clear never reach here; empty keeps the match exhaustive.
-        SlashCmd::Message | SlashCmd::Clear => String::new(),
+        // Message/Clear/Export never reach here; empty keeps the match
+        // exhaustive. Export and Clear have their own side-effecting arms in
+        // the key handler.
+        SlashCmd::Message | SlashCmd::Clear | SlashCmd::Export(_) => String::new(),
     }
+}
+
+/// Render the conversation rows as plain text for `/export` — a readable
+/// transcript mirroring the on-screen layout, minus styling/wrapping. Empty
+/// assistant rows (left while a turn is mid-stream) are skipped so the dump
+/// has no bare "Agent" headers with no body.
+fn render_transcript(rows: &[Row]) -> String {
+    let mut out = String::new();
+    for row in rows {
+        match row {
+            Row::User(t) => {
+                out.push_str("You\n");
+                out.push_str(t);
+                out.push_str("\n\n");
+            }
+            Row::Assistant(t) if t.is_empty() => {}
+            Row::Assistant(t) => {
+                out.push_str("Agent\n");
+                out.push_str(t);
+                out.push_str("\n\n");
+            }
+            Row::ToolCall { name, input, .. } => {
+                out.push_str(&format!("→ {name}: {input}\n\n"));
+            }
+            Row::ToolResult { name, content, is_error, .. } => {
+                let tag = if *is_error { "✗" } else { "✓" };
+                out.push_str(&format!("{tag} {name}: {content}\n\n"));
+            }
+            Row::System(t) => {
+                out.push_str(&format!("· {t}\n\n"));
+            }
+        }
+    }
+    out
+}
+
+/// Best-effort copy to the system clipboard via the platform's CLI tool. Tries
+/// each known tool in turn; returns true if one accepted the text. No clipboard
+/// crate dep (keeps the binary lean) — this shelling-out covers macOS (pbcopy),
+/// Wayland (wl-copy), X11 (xclip/xsel), and Windows (clip). A tool that isn't
+/// installed fails to spawn and we move on; if none is present, `/export` falls
+/// back to writing a file.
+fn copy_to_clipboard(text: &str) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let attempts: &[(&str, &[&str])] = &[
+        ("pbcopy", &[]),
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+        ("clip", &[]),
+    ];
+    for (prog, args) in attempts {
+        let mut child = match Command::new(prog)
+            .args(*args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => continue, // not installed / not on PATH → try the next
+        };
+        let fed = child
+            .stdin
+            .as_mut()
+            .map(|s| s.write_all(text.as_bytes()).is_ok())
+            .unwrap_or(false);
+        drop(child.stdin.take()); // EOF so the tool flushes and exits
+        let ok = fed && child.wait().map(|s| s.success()).unwrap_or(false);
+        if ok {
+            return true;
+        }
+    }
+    false
 }
 
 /// A row selectable in Nav mode (tool calls and tool results).
@@ -683,7 +772,7 @@ fn ui_loop(
                     fmt_tokens(out_tokens),
                     start.elapsed().as_secs_f64()
                 )),
-                Span::raw("  Ctrl-C cancel · Tab browse · Esc quit · PgUp/PgDn·wheel scroll"),
+                Span::raw("  Ctrl-C cancel · Tab browse · Esc quit · PgUp/PgDn·wheel · Shift+drag copy · /export"),
             ]);
             f.render_widget(Paragraph::new(status), chunks[2]);
         })?;
@@ -824,6 +913,49 @@ fn ui_loop(
                                         mode = Mode::Input;
                                         rows.push(Row::System("[history cleared]".into()));
                                         let _ = in_tx.send(Some(Input::Clear));
+                                    }
+                                    SlashCmd::Export(arg) => {
+                                        // The mouse-capture that enables wheel
+                                        // scroll also intercepts click-drag, so
+                                        // there's no terminal-agnostic way to
+                                        // select the on-screen output. /export
+                                        // is the app-level escape hatch: dump the
+                                        // conversation as text. With a path →
+                                        // that file; without → clipboard if a
+                                        // tool is available, else a default file.
+                                        input.drain_to_string();
+                                        scroll_up = 0;
+                                        let n = rows.len();
+                                        let text = render_transcript(&rows);
+                                        let msg = match arg {
+                                            Some(path) => {
+                                                match std::fs::write(&path, &text) {
+                                                    Ok(_) => {
+                                                        format!("[exported {n} rows to {path}]")
+                                                    }
+                                                    Err(e) => {
+                                                        format!("[export to {path} failed: {e}]")
+                                                    }
+                                                }
+                                            }
+                                            None => {
+                                                if copy_to_clipboard(&text) {
+                                                    format!("[copied {n} rows to clipboard]")
+                                                } else {
+                                                    let path = "tinyagent-export.md";
+                                                    match std::fs::write(path, &text) {
+                                                        Ok(_) => format!(
+                                                            "[no clipboard tool found; \
+                                                             exported {n} rows to {path}]"
+                                                        ),
+                                                        Err(e) => {
+                                                            format!("[export failed: {e}]")
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        };
+                                        rows.push(Row::System(msg));
                                     }
                                     cmd => {
                                         input.drain_to_string();
@@ -1534,6 +1666,51 @@ mod tests {
         assert_eq!(classify("/foo"), SlashCmd::Unknown("foo".into()));
         // Bare "/" → unknown with empty name (not a message, not a command).
         assert_eq!(classify("/"), SlashCmd::Unknown(String::new()));
+        // /export takes an optional path arg, split off + trimmed.
+        assert_eq!(classify("/export"), SlashCmd::Export(None));
+        assert_eq!(classify("/export out.md"), SlashCmd::Export(Some("out.md".into())));
+        assert_eq!(classify("/export   a/b.txt  "), SlashCmd::Export(Some("a/b.txt".into())));
+        // /export with only trailing spaces → no arg.
+        assert_eq!(classify("/export "), SlashCmd::Export(None));
+    }
+
+    #[test]
+    fn render_transcript_dumps_rows_as_plain_text() {
+        // /export's escape hatch: the conversation as readable text. Mirrors the
+        // on-screen layout (User/Agent/tool rows), skips mid-stream empty
+        // assistant rows, and tags error results distinctly.
+        let rows = vec![
+            Row::User("hello".into()),
+            Row::Assistant(String::new()), // empty → skipped (no bare "Agent")
+            Row::Assistant("I am fine".into()),
+            Row::ToolCall {
+                name: "shell".into(),
+                input: serde_json::Value::Null,
+                collapsed: "null".into(),
+                expanded: false,
+            },
+            Row::ToolResult {
+                name: "shell".into(),
+                content: "a.txt".into(),
+                is_error: false,
+                expanded: false,
+            },
+            Row::ToolResult {
+                name: "shell".into(),
+                content: "boom".into(),
+                is_error: true,
+                expanded: false,
+            },
+            Row::System("[note]".into()),
+        ];
+        let out = render_transcript(&rows);
+        assert!(out.contains("You\nhello"), "user row: {out:?}");
+        assert!(out.contains("Agent\nI am fine"), "assistant body: {out:?}");
+        assert!(!out.contains("Agent\n\n"), "empty assistant must be skipped");
+        assert!(out.contains("→ shell: null"), "tool call: {out:?}");
+        assert!(out.contains("✓ shell: a.txt"), "tool result: {out:?}");
+        assert!(out.contains("✗ shell: boom"), "error result tagged: {out:?}");
+        assert!(out.contains("· [note]"), "system row: {out:?}");
     }
 
     #[test]
