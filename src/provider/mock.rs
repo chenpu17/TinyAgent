@@ -26,9 +26,18 @@ pub(crate) struct Captured {
     /// Role of every message in the request, in order — lets tests assert no
     /// two adjacent messages share a role (Anthropic rejects that with a 400).
     pub(crate) roles: Vec<Role>,
+    /// Every `tool_use` id in the request, in message/block order, across ALL
+    /// messages. Paired with `tool_result_ids`, this lets a test enforce the
+    /// Anthropic N:N invariant — each `tool_use` must have exactly one matching
+    /// `tool_result` — over the WHOLE history (e.g. after context compression
+    /// folds the prefix), not just the trailing message.
+    pub(crate) tool_use_ids: Vec<String>,
+    /// Every `tool_result`'s `tool_use_id` in the request, in order. A
+    /// multiset-equal check against `tool_use_ids` is the N:N bijection.
+    pub(crate) tool_result_ids: Vec<String>,
     /// tool_use blocks on the trailing assistant message. Captured for
-    /// symmetry with `trailing_tool_results` and ad-hoc debugging; no test
-    /// currently asserts it (the mock records N:N but doesn't enforce it).
+    /// symmetry with `trailing_tool_results` and ad-hoc debugging; the
+    /// cross-history N:N check lives in `tool_use_ids`/`tool_result_ids`.
     #[allow(dead_code)]
     pub(crate) trailing_tool_uses: usize,
     /// tool_result blocks on the trailing user message.
@@ -94,12 +103,30 @@ impl Provider for MockProvider {
             }
             None => (None, 0, 0),
         };
+        // tool_use ↔ tool_result ids across the WHOLE request (not just the
+        // trailing message), so tests can assert the N:N bijection survives
+        // transformations like context compression.
+        let mut tool_use_ids = Vec::new();
+        let mut tool_result_ids = Vec::new();
+        for m in req.messages {
+            for b in &m.content {
+                match b {
+                    Block::ToolUse { id, .. } => tool_use_ids.push(id.clone()),
+                    Block::ToolResult { tool_use_id, .. } => {
+                        tool_result_ids.push(tool_use_id.clone())
+                    }
+                    _ => {}
+                }
+            }
+        }
         self.state.captured.lock().unwrap().push(Captured {
             message_count: req.messages.len(),
             last_role,
             roles: req.messages.iter().map(|m| m.role).collect(),
             trailing_tool_uses,
             trailing_tool_results,
+            tool_use_ids,
+            tool_result_ids,
             cache: req.cache,
         });
 

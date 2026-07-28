@@ -1791,6 +1791,91 @@ mod tests {
     }
 
     #[test]
+    fn compress_preserves_tool_use_tool_result_pairing_in_tail() {
+        // Integration-level companion to `safe_cut_skips_tool_pairs` (which
+        // only unit-tests find_safe_cut's cut SELECTION). This runs a REAL
+        // compression — summarize_prefix + fold_summary through
+        // compress_if_needed — with a tool_use ↔ tool_result pair sitting at
+        // the kept-tail boundary, and asserts the MAIN request still satisfies
+        // the Anthropic N:N invariant over the WHOLE folded history: every
+        // tool_use id has exactly one matching tool_result id (no orphans). A
+        // regression that cut mid-pair, or dropped/merged a tail message, would
+        // orphan one side and trip the sorted-id equality below.
+        let mut cfg = cfg_with(5, 0, 30);
+        cfg.limits.keep_recent_messages = 2;
+        let long = "x".repeat(40); // alone over the 30-char threshold
+        // Layout (n=7, strict user/assistant alternation from [0]=user):
+        //   [0] user(long)                                  ← head (summary folded in)
+        //   [1] asst a1  [2] user u1  [3] asst a2  [4] user u2  ← summarized prefix
+        //   [5] asst(tool_use t1, t2)  [6] user(tool_result t1, t2)  ← kept tail
+        // keep_recent=2 → find_safe_cut returns cut=5 (messages[5] is the
+        // assistant boundary), so the pair stays whole in the tail.
+        let initial = vec![
+            user_text(&long),
+            Message::assistant(vec![Block::Text("a1".into())]),
+            user_text("u1"),
+            Message::assistant(vec![Block::Text("a2".into())]),
+            user_text("u2"),
+            Message::assistant(vec![
+                Block::ToolUse {
+                    id: "t1".into(),
+                    name: "shell".into(),
+                    input: json!({"command": "ls"}),
+                },
+                Block::ToolUse {
+                    id: "t2".into(),
+                    name: "shell".into(),
+                    input: json!({"command": "pwd"}),
+                },
+            ]),
+            Message::user(vec![
+                Block::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: "ls-out".into(),
+                    image: None,
+                    is_error: false,
+                },
+                Block::ToolResult {
+                    tool_use_id: "t2".into(),
+                    content: "pwd-out".into(),
+                    image: None,
+                    is_error: false,
+                },
+            ]),
+        ];
+        let (prov, state) = MockProvider::new(vec![
+            mock::resp_text("SUMMARY", None),      // summarize_prefix call
+            mock::resp_text("final answer", None), // main call on folded history
+        ]);
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+        let mut events = Vec::new();
+        let o = agent.run(&mut |e| events.push(e)).unwrap();
+        assert_eq!(o.stop_reason, "end_turn");
+        assert_eq!(state.calls(), 2, "exactly summary call + main call");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Compressed { dropped: 4, kept: 3 })),
+            "should drop 4 prefix messages, keep 3 (head + the tail pair)"
+        );
+        // MAIN (2nd) request: head + asst(2 tool_use) + user(2 tool_result).
+        let cap = state.captured();
+        let main = &cap[1];
+        assert_eq!(main.message_count, 3);
+        // N:N bijection over the whole folded history. Anthropic doesn't mandate
+        // result order vs. use order, so compare as multisets (sorted).
+        let mut uses = main.tool_use_ids.clone();
+        let mut results = main.tool_result_ids.clone();
+        uses.sort();
+        results.sort();
+        assert_eq!(
+            uses, results,
+            "tool_use ↔ tool_result must stay N:N after compression (no orphans)"
+        );
+        assert_eq!(uses.len(), 2, "both tail tool_uses survived (none dropped)");
+    }
+
+    #[test]
     fn compress_summary_request_omits_caching() {
         // The compression summary is a one-off call on a prefix that will never
         // be re-sent as a growing prefix, so it must pass cache:false (no 1.25×
