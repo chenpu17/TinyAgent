@@ -7,7 +7,7 @@
 - **单一可执行文件**，无运行时依赖；musl 静态编译后可丢到路由器 / 树莓派 / CI runner 直接跑
 - **两种 LLM 后端**：Anthropic 原生 API + OpenAI 兼容协议（覆盖 DeepSeek / vLLM / Ollama 等），均带 token 用量统计
 - **图片输入**：`--image` 参数或 `load_image` 工具（png / jpeg / gif / webp，base64）
-- **精炼工具集**：`shell`、`read_file`、`write_file`、`edit_file`、`list_dir`、`load_image`，外加 `task`（顺序子 agent），配置白名单启用
+- **精炼工具集**：`shell`、`read_file`、`write_file`、`edit_file`、`list_dir`、`load_image`，外加 `task`（子 agent；同 turn 多调用并行），配置白名单启用
 - **Harness 契约**：`--output result.json` 写结构化结果（含 token 用量、每次工具调用的 input/output），`--json` 流式 NDJSON；exit code 语义化（`0` 成功 / `124` 超时 / `130` 取消 / `1` 其它），可直接进 CI / 评测 pipeline
 - **CLI 覆盖**：`--model` / `--max-turns` / `--timeout` 免改配置做 A/B 对照
 - **批量任务**：`--batch <dir>` 并发跑一组任务片段，`--retries` 对 transient 失败指数退避重试，`--failed` 只重跑上一轮失败的任务并合并进完整报告
@@ -314,16 +314,17 @@ headless 模式下 `Ctrl-C` 走**优雅取消**：首次 SIGINT 在流式 chunk 
 
 ## 子 agent（`task` 工具）
 
-`task` 是一个**顺序**子 agent 工具：主 agent 把一个聚焦的子任务交给一个全新的子 agent（自己的消息历史、自己的 turn 预算），子 agent 跑完后只把**最终摘要**作为 tool 结果返回——主 agent 的上下文不会被子 agent 的中间过程撑大。
+`task` 是一个子 agent 工具：主 agent 把一个聚焦的子任务交给一个全新的子 agent（自己的消息历史、自己的 turn 预算），子 agent 跑完后只把**最终摘要**作为 tool 结果返回——主 agent 的上下文不会被子 agent 的中间过程撑大。
 
 - **输入**：`{ "name": "身份标识", "description": "简短说明", "prompt": "完整自包含的指令" }`（`name` 与 `prompt` 必填，`description` 可选、信息性）。`name` 是这个子 agent 的身份，所有转发出来的事件都用它打标签。
+- **同 turn 多调用并行**：主 agent 在**一个** assistant turn 里发出多个 `task` 调用时，它们会**并行**跑（每个一个线程，借线程池 scope），各自的事件经 mpsc 漏斗实时转发进主 run 的事件流——所以多个子 agent 协同工作时，输出是交错流式出现的。结果仍按原始块序拼回（N:N 配对不变）。叶子工具（`shell`/`read_file`/…）保持顺序执行，只有 `task` 并行，避免在文件/进程上引入新的竞态。
 - **事件可见**：子 agent 的流式过程（文本增量 / tool 调用 / tool 结果）**实时转发**进主 run 的事件流，每条都裹上 `name` 身份——headless 的 `--json` 输出形如 `{"type":"subagent","name":..,"event":<子事件>}`，TUI 里子 agent 的输出也带 `[name]` 前缀。并行多个子 agent 时，靠 `name` 区分交错的事件。
-- **成本诚实计入**：子 agent 的 token 用量折进主 run 的累计，并照常发 `usage` 事件 / 写进 `result.json`。
-- **继承**：子 agent 复用主 agent 的 provider / model / 工作目录 / `restrict_to_workdir` / 取消标志（Ctrl-C 会连带中断子 agent）。工具白名单继承父配置。
+- **成本诚实计入**：每个子 agent 的 token 用量折进主 run 的累计，并照常发 `usage` 事件 / 写进 `result.json`（并行的几个各自计入）。
+- **继承**：子 agent 复用主 agent 的 provider / model / 工作目录 / `restrict_to_workdir` / 取消标志（Ctrl-C 会连带中断在跑的子 agent）。工具白名单继承父配置。
 
-**v1 边界（刻意收紧）**：
+**边界（刻意收紧）**：
 
-- **顺序，不并行**：一次只跑一个子 agent，`task` 调用会阻塞当前 turn 直到子 agent 完成。并行子 agent + 工作目录隔离是后续工作。
+- **并行仅限同 turn 的多个 `task` 调用**：一次 turn 内多个 `task` 并行；叶子工具顺序。工作目录隔离（worktree）不做——子 agent 共享主工作目录，约定并发子 agent 不写同一文件即可。
 - **不可递归**：子 agent 的工具白名单会滤掉 `task` 本身，所以子 agent 不能再开子 agent（无需深度计数）。
 - **不进默认白名单**：在配置的 `tools` 里显式加 `"task"` 才启用。
 

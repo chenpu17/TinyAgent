@@ -1,6 +1,6 @@
 use crate::config::{Config, Limits};
 use crate::provider::{Block, ChatEvent, ChatRequest, Message, Provider, Role, ToolDef, Usage};
-use crate::tools::{Tool, ToolCtx};
+use crate::tools::{Tool, ToolCtx, ToolOutput};
 use anyhow::Result;
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -363,74 +363,152 @@ impl Agent {
             // N tool_results, or the next request is rejected. (A non-cancel-
             // aware tool that was already in flight returns on its own; later
             // tools in the batch are short-circuited here.)
-            let mut results: Vec<Block> = Vec::new();
+
+            // Collect tool_use blocks (in order) with stable ordinals — only
+            // these produce results; the turn's text already streamed above.
+            // Owned (not borrows into `resp`) so `.clone()` in the passes below
+            // yields String/Value, and so `tool_uses` can be borrowed by the
+            // scoped worker threads without entangling `resp`'s lifetime.
+            let tool_uses: Vec<(String, String, Value)> = resp
+                .blocks
+                .iter()
+                .filter_map(|b| match b {
+                    Block::ToolUse { id, name, input } => {
+                        Some((id.clone(), name.clone(), input.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+
+            // Per-slot outcome. `Cancelled` keeps N:N pairing (a result block
+            // for every tool_use) without billing usage or recording a call —
+            // matching the pre-parallel behavior. `Ran` is a real ToolOutput
+            // (leaf run inline, or `task` run in the parallel batch).
+            enum Slot {
+                Cancelled,
+                Ran(ToolOutput),
+            }
+            let mut slots: Vec<Slot> = (0..tool_uses.len()).map(|_| Slot::Cancelled).collect();
+            // Ordinals of `task` calls deferred to the parallel batch.
+            let mut task_slots: Vec<usize> = Vec::new();
             let mut batch_cancelled = false;
-            for b in &resp.blocks {
-                let Block::ToolUse { id, name, input } = b else {
-                    continue;
-                };
+
+            // Inline leaf pass: run non-`task` tools one at a time (sequential —
+            // avoids new races on shell/file), announce every call in block
+            // order, and short-circuit on cancel (later slots stay Cancelled).
+            for (i, (_id, name, input)) in tool_uses.iter().enumerate() {
                 if batch_cancelled || self.cancelled() {
                     batch_cancelled = true;
-                    results.push(Block::ToolResult {
-                        tool_use_id: id.clone(),
-                        content: "[cancelled by user]".into(),
-                        image: None,
-                        is_error: true,
-                    });
-                    continue;
+                    continue; // leaves the default Slot::Cancelled
                 }
                 events(AgentEvent::ToolCall {
                     name: name.clone(),
                     input: input.clone(),
                 });
-
-                // run_with_emit lets a tool stream progress into the parent's
-                // event sink (the `task` sub-agent forwards its child's events,
-                // tagged with the sub-agent's name). Leaf tools ignore the sink.
-                let output = {
-                    let mut fwd = |ev: AgentEvent| events(ev);
-                    match self.tools.iter().find(|t| t.def().name == *name) {
-                        Some(tool) => match tool.run_with_emit(input, &self.ctx, &mut fwd) {
-                            Ok(o) => o,
-                            Err(e) => crate::tools::ToolOutput::error(format!("{e:#}")),
-                        },
-                        None => crate::tools::ToolOutput::error(format!("unknown tool: {name}")),
-                    }
-                };
-                // A tool that did real LLM work (the `task` sub-agent) bills
-                // its usage to this run: fold it into the totals and emit a
-                // Usage event so TUI/NDJSON/result.json see the honest cost.
-                // Leaf tools report None and add nothing.
-                if let Some(u) = output.usage {
-                    in_tokens += u.input_tokens;
-                    out_tokens += u.output_tokens;
-                    cache_create += u.cache_creation_input_tokens;
-                    cache_read += u.cache_read_input_tokens;
-                    events(AgentEvent::Usage {
-                        input_tokens: u.input_tokens,
-                        output_tokens: u.output_tokens,
-                        cache_creation_input_tokens: u.cache_creation_input_tokens,
-                        cache_read_input_tokens: u.cache_read_input_tokens,
-                    });
+                if name.as_str() == "task" {
+                    task_slots.push(i); // run concurrently after this pass
+                } else {
+                    let output = {
+                        let mut fwd = |ev: AgentEvent| events(ev);
+                        run_tool(&self.tools, name, input, &self.ctx, &mut fwd)
+                    };
+                    slots[i] = Slot::Ran(output);
                 }
+            }
 
-                records.push(ToolCallRecord {
-                    name: name.clone(),
-                    input: input.clone(),
-                    output: output.content.clone(),
-                    is_error: output.is_error,
+            // Parallel `task` batch: each `task` call runs on its own scoped
+            // thread (borrowing the read-only tool list + ctx, both Sync), and
+            // forwards its child events through an mpsc funnel the parent drains
+            // live — so concurrent sub-agents interleave on screen, tagged by
+            // name. Leaf tools stay sequential (above); only `task` is fanned
+            // out — it's the one worth parallelizing, and the only non-leaf
+            // `run_with_emit` impl. Cancel: gate before spawning (a cancel that
+            // hit during the inline pass, or one already set, marks the batch
+            // cancelled and skips it); in-flight children self-terminate via the
+            // shared cancel flag they inherit, returning partial/cancelled
+            // results rather than synthesised ones.
+            if !task_slots.is_empty() && !batch_cancelled && !self.cancelled() {
+                let (tx, rx) = std::sync::mpsc::channel::<AgentEvent>();
+                let tools = &self.tools;
+                let ctx = &self.ctx;
+                std::thread::scope(|s| {
+                    // Spawn every task worker BEFORE joining any, so they run
+                    // concurrently. Each owns its input/name + a sender clone,
+                    // and only ever touches `tx` (never `events`).
+                    let mut handles: Vec<std::thread::ScopedJoinHandle<ToolOutput>> =
+                        Vec::with_capacity(task_slots.len());
+                    for &i in &task_slots {
+                        let name = tool_uses[i].1.clone();
+                        let input = tool_uses[i].2.clone();
+                        let tx = tx.clone();
+                        handles.push(s.spawn(move || {
+                            let mut emit = |ev: AgentEvent| {
+                                let _ = tx.send(ev);
+                            };
+                            run_tool(tools, &name, &input, ctx, &mut emit)
+                        }));
+                    }
+                    drop(tx); // workers hold the last clones; rx ends when they drop
+                    // Forward child events to the parent sink as they arrive
+                    // (interleaved across parallel sub-agents, told apart by name).
+                    while let Ok(ev) = rx.recv() {
+                        events(ev);
+                    }
+                    // Join in spawn order and place each result at its ordinal.
+                    for (pos, h) in handles.into_iter().enumerate() {
+                        let output = h
+                            .join()
+                            .unwrap_or_else(|_| ToolOutput::error("task worker panicked"));
+                        slots[task_slots[pos]] = Slot::Ran(output);
+                    }
                 });
-                events(AgentEvent::ToolResult {
-                    name: name.clone(),
-                    is_error: output.is_error,
-                    content: output.content.clone(),
-                });
-                results.push(Block::ToolResult {
-                    tool_use_id: id.clone(),
-                    content: output.content,
-                    image: output.image.map(Box::new),
-                    is_error: output.is_error,
-                });
+            }
+
+            // Assemble results in block order: a result block for every tool_use
+            // (N:N), but records / ToolResult events / usage fold only for tools
+            // that actually ran. A `task` call's usage (the child's honest cost)
+            // is folded here exactly like a leaf tool's billed usage.
+            let mut results: Vec<Block> = Vec::with_capacity(tool_uses.len());
+            for (i, (id, name, input)) in tool_uses.iter().enumerate() {
+                match &slots[i] {
+                    Slot::Cancelled => results.push(Block::ToolResult {
+                        tool_use_id: id.clone(),
+                        content: "[cancelled by user]".into(),
+                        image: None,
+                        is_error: true,
+                    }),
+                    Slot::Ran(output) => {
+                        if let Some(u) = output.usage {
+                            in_tokens += u.input_tokens;
+                            out_tokens += u.output_tokens;
+                            cache_create += u.cache_creation_input_tokens;
+                            cache_read += u.cache_read_input_tokens;
+                            events(AgentEvent::Usage {
+                                input_tokens: u.input_tokens,
+                                output_tokens: u.output_tokens,
+                                cache_creation_input_tokens: u.cache_creation_input_tokens,
+                                cache_read_input_tokens: u.cache_read_input_tokens,
+                            });
+                        }
+                        records.push(ToolCallRecord {
+                            name: name.clone(),
+                            input: input.clone(),
+                            output: output.content.clone(),
+                            is_error: output.is_error,
+                        });
+                        events(AgentEvent::ToolResult {
+                            name: name.clone(),
+                            is_error: output.is_error,
+                            content: output.content.clone(),
+                        });
+                        results.push(Block::ToolResult {
+                            tool_use_id: id.clone(),
+                            content: output.content.clone(),
+                            image: output.image.clone().map(Box::new),
+                            is_error: output.is_error,
+                        });
+                    }
+                }
             }
             self.messages.push(Message::user(results));
             self.save_session();
@@ -450,6 +528,27 @@ impl Agent {
             cache_read_input_tokens: cache_read,
             elapsed: start.elapsed(),
         })
+    }
+}
+
+/// Look up a tool by name and run it through `run_with_emit` (so the `task`
+/// sub-agent can stream its child events into `emit`). A missing tool or a tool
+/// Err becomes a `ToolOutput::error` rather than aborting the run — the result
+/// is still paired N:N with the tool_use that triggered it. Shared by the
+/// sequential leaf pass and the parallel `task` batch.
+fn run_tool(
+    tools: &[Box<dyn Tool>],
+    name: &str,
+    input: &Value,
+    ctx: &ToolCtx,
+    emit: &mut dyn FnMut(AgentEvent),
+) -> ToolOutput {
+    match tools.iter().find(|t| t.def().name == name) {
+        Some(tool) => match tool.run_with_emit(input, ctx, emit) {
+            Ok(o) => o,
+            Err(e) => ToolOutput::error(format!("{e:#}")),
+        },
+        None => ToolOutput::error(format!("unknown tool: {name}")),
     }
 }
 
@@ -1021,6 +1120,49 @@ mod tests {
         }
     }
 
+    /// A stand-in for the real `task` sub-agent tool, named "task" so the loop's
+    /// partition routes it to the PARALLEL batch (the whole point of commit 2).
+    /// It reads `input["label"]` to make each call's output distinguishable, emits
+    /// a name-tagged SubAgent event (so we can assert it ran), and bills usage
+    /// (so we can assert parallel cost folds into the run totals). Concurrency is
+    /// structural — we assert functional correctness, NOT timing (which would flake).
+    struct TaskTool;
+    impl Tool for TaskTool {
+        fn def(&self) -> ToolDef {
+            ToolDef {
+                name: "task".into(),
+                description: "test stand-in for the task sub-agent tool".into(),
+                schema: json!({"type": "object", "properties": {"label": {"type": "string"}}}),
+            }
+        }
+        fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+            self.run_with_emit(input, ctx, &mut |_| {})
+        }
+        fn run_with_emit(
+            &self,
+            input: &Value,
+            _ctx: &ToolCtx,
+            emit: &mut dyn FnMut(AgentEvent),
+        ) -> Result<ToolOutput> {
+            let label = input["label"].as_str().unwrap_or("?").to_string();
+            emit(AgentEvent::SubAgent {
+                name: label.clone(),
+                event: Box::new(AgentEvent::TextDelta(format!("work-{label}"))),
+            });
+            Ok(ToolOutput {
+                content: format!("out-{label}"),
+                image: None,
+                is_error: false,
+                usage: Some(crate::provider::Usage {
+                    input_tokens: 100,
+                    output_tokens: 10,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                }),
+            })
+        }
+    }
+
     #[test]
     fn tool_reported_usage_folds_into_run_totals_and_events() {
         // A tool reporting usage (the `task` sub-agent path) must fold into the
@@ -1100,6 +1242,118 @@ mod tests {
         );
         let text: String = forwarded.into_iter().map(|(_, t)| t).collect();
         assert_eq!(text, "looking found", "both deltas forwarded in order");
+    }
+
+    #[test]
+    fn parallel_task_calls_both_run_and_keep_order_with_usage_folded() {
+        // One turn with TWO `task` calls (labels a/b). The parallel batch must
+        // run BOTH (assert via the forwarded SubAgent events), keep results in
+        // the ORIGINAL block order despite concurrent execution (N:N + ordered
+        // records), and fold each task's billed usage into the run totals.
+        // We assert functional correctness only — concurrency is structural
+        // (thread::scope), never timing.
+        let cfg = cfg_with(5, 0, 0);
+        let (prov, _) = MockProvider::new(vec![MockTurn::Ok(ChatResponse {
+            blocks: vec![
+                Block::ToolUse {
+                    id: "a".into(),
+                    name: "task".into(),
+                    input: json!({"label": "a"}),
+                },
+                Block::ToolUse {
+                    id: "b".into(),
+                    name: "task".into(),
+                    input: json!({"label": "b"}),
+                },
+            ],
+            stop_reason: "tool_use".into(),
+            usage: None,
+        }),
+        // Turn 2 reports no usage so the only input tokens are the two tasks'.
+        mock::resp_text("final", None)]);
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![Box::new(TaskTool)],
+            vec![user_text("go")],
+            test_ctx(),
+        );
+        let mut events = Vec::new();
+        let o = agent.run(&mut |e| events.push(e)).unwrap();
+
+        // Both tasks ran — each forwarded a SubAgent event tagged with its label.
+        let tags: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::SubAgent { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(tags.contains(&"a".into()) && tags.contains(&"b".into()), "both ran: {tags:?}");
+
+        // Results assembled in ORIGINAL block order (a before b), not completion
+        // order — records must stay coherent with the tool_use sequence.
+        assert_eq!(o.tool_calls.len(), 2);
+        assert_eq!(o.tool_calls[0].output, "out-a");
+        assert_eq!(o.tool_calls[1].output, "out-b");
+        // (N:N result pairing + synthesis is pinned by the cancel test below,
+        // where the run stops right after the batch so the trailing message is
+        // the tool_results; here turn 2 produces the assistant's final text.)
+
+        // Each task billed 100 input tokens → 200 total (turn usage was None/0).
+        assert_eq!(o.input_tokens, 200);
+        assert_eq!(o.output_tokens, 20);
+    }
+
+    #[test]
+    fn cancel_gates_the_parallel_task_batch_and_keeps_n_n_pairing() {
+        // A leaf tool ("trip") flips cancel mid-batch; the FOLLOWING `task` call
+        // must be gated off (never spawned) — the batch checks `batch_cancelled`
+        // before fanning out. Yet the orphaned task_use still gets a synthesized
+        // "[cancelled by user]" result so pairing holds (N:N), and it is NOT
+        // recorded as executed.
+        let cfg = cfg_with(5, 0, 0);
+        let (prov, _) = MockProvider::new(vec![MockTurn::Ok(ChatResponse {
+            blocks: vec![
+                Block::ToolUse { id: "a".into(), name: "trip".into(), input: json!({}) },
+                Block::ToolUse { id: "b".into(), name: "task".into(), input: json!({"label": "x"}) },
+            ],
+            stop_reason: "tool_use".into(),
+            usage: None,
+        })]);
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![
+                Box::new(EchoTool::cancel_on_run("trip", flag.clone())),
+                Box::new(TaskTool),
+            ],
+            vec![user_text("go")],
+            test_ctx(),
+        );
+        agent.set_cancel(flag);
+        let mut saw_task_subagent = false;
+        let o = agent.run(&mut |e| {
+            if let AgentEvent::SubAgent { name, .. } = &e {
+                if name == "x" {
+                    saw_task_subagent = true;
+                }
+            }
+        })
+        .unwrap();
+
+        assert_eq!(o.stop_reason, "cancelled");
+        // Only the leaf "trip" executed; the gated `task` is NOT recorded.
+        assert_eq!(o.tool_calls.len(), 1);
+        assert_eq!(o.tool_calls[0].name, "trip");
+        // The task never ran (no forwarded SubAgent event for label "x").
+        assert!(!saw_task_subagent, "gated task must not have spawned");
+        // N:N pairing intact: trip → "ok", task → synthesized cancelled result.
+        assert_eq!(
+            agent.trailing_tool_result_contents(),
+            vec!["ok".to_string(), "[cancelled by user]".to_string()]
+        );
     }
 
     #[test]
