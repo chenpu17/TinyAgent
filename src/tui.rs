@@ -781,9 +781,27 @@ fn ui_loop(
                                         draft.clear();
                                         input.drain_to_string();
                                         rows.push(Row::User(trimmed.clone()));
-                                        busy = true;
                                         scroll_up = 0;
-                                        let _ = in_tx.send(Some(Input::Text(trimmed)));
+                                        // Deliver before flipping busy. If the
+                                        // worker is gone (panicked mid-run in a
+                                        // debug build, or tearing down) the send
+                                        // fails — don't leave the UI stuck in
+                                        // "running" waiting for a RunFinished that
+                                        // will never arrive. The out_rx disconnect
+                                        // path is a backstop, but it only fires on
+                                        // a later frame's drain; handling the send
+                                        // result here is immediate and doesn't
+                                        // rely on the loop reaching that drain.
+                                        if in_tx.send(Some(Input::Text(trimmed))).is_err() {
+                                            busy = false;
+                                            rows.push(Row::System(
+                                                "[worker stopped — message not delivered; \
+                                                 press Esc to quit]"
+                                                    .into(),
+                                            ));
+                                        } else {
+                                            busy = true;
+                                        }
                                     }
                                     SlashCmd::Clear => {
                                         // Slash command — handled in the UI,
