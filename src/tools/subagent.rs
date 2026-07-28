@@ -48,18 +48,28 @@ const SUBAGENT_MAX_TURNS: u32 = 25;
 
 /// The `task` sub-agent tool. Holds what it needs to build a fresh child agent
 /// (provider config + HTTP client + key), constructed once at `tools::build`.
+/// `mcp_tools` are the parent's SHARED MCP tools (Arc-backed connections): the
+/// child clones them rather than re-running `mcp::build`, so a `task` call no
+/// longer re-spawns every MCP server.
 pub struct SubAgent {
     cfg: Config,
     client: reqwest::blocking::Client,
     api_key: String,
+    mcp_tools: Vec<crate::tools::mcp::McpTool>,
 }
 
 impl SubAgent {
-    pub fn new(cfg: Config, client: reqwest::blocking::Client, api_key: String) -> Self {
+    pub fn new(
+        cfg: Config,
+        client: reqwest::blocking::Client,
+        api_key: String,
+        mcp_tools: Vec<crate::tools::mcp::McpTool>,
+    ) -> Self {
         Self {
             cfg,
             client,
             api_key,
+            mcp_tools,
         }
     }
 }
@@ -124,17 +134,20 @@ impl Tool for SubAgent {
         child_cfg.limits.max_turns = child_cfg.limits.max_turns.min(SUBAGENT_MAX_TURNS);
 
         // Child tools: parent's whitelist minus `task` → no recursion. MCP
-        // servers are inherited (a sub-agent may need the same external tools).
+        // servers are inherited (a sub-agent may need the same external tools)
+        // by CLONING the parent's shared MCP tools — each clone Arc-shares the
+        // underlying connection, so this does NOT re-spawn the MCP servers
+        // (the old path called tools::mcp::build, running McpClient::start for
+        // every server on every task call — a parallel task batch would spawn
+        // N×(#servers) subprocesses).
         let child_tool_names: Vec<String> = child_cfg
             .tools
             .iter()
             .filter(|t| t.as_str() != "task")
             .cloned()
             .collect();
-        let mut child_tools = tools::build(&child_tool_names, &self.cfg, &self.client, &self.api_key)?;
-        if !child_cfg.mcp_servers.is_empty() {
-            child_tools.extend(tools::mcp::build(&child_cfg.mcp_servers)?);
-        }
+        let mut child_tools = tools::build(&child_tool_names, &self.cfg, &self.client, &self.api_key, &self.mcp_tools)?;
+        child_tools.extend(self.mcp_tools.iter().cloned().map(|t| Box::new(t) as Box<dyn Tool>));
 
         let provider = provider::build(&child_cfg, &self.api_key, self.client.clone());
         let child_ctx = ToolCtx {
@@ -325,7 +338,7 @@ mod tests {
     fn subagent_tool_rejects_missing_or_empty_name_and_prompt() {
         // Validate before building anything: a missing/empty name or prompt is a
         // caller bug, not a sub-agent run to attempt.
-        let sa = SubAgent::new(fake_cfg(), reqwest::blocking::Client::new(), "k".into());
+        let sa = SubAgent::new(fake_cfg(), reqwest::blocking::Client::new(), "k".into(), vec![]);
         let ctx = ToolCtx {
             workdir: std::env::temp_dir(),
             max_output_chars: 1000,

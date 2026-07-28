@@ -90,6 +90,7 @@ pub fn build(
     cfg: &Config,
     client: &reqwest::blocking::Client,
     api_key: &str,
+    shared_mcp: &[mcp::McpTool],
 ) -> Result<Vec<Box<dyn Tool>>> {
     let mut out: Vec<Box<dyn Tool>> = Vec::new();
     for name in names {
@@ -100,10 +101,14 @@ pub fn build(
             "edit_file" => Box::new(file::EditFile),
             "list_dir" => Box::new(file::ListDir),
             "load_image" => Box::new(image::LoadImage),
+            // The sub-agent clones the SHARED MCP tools into each child
+            // (Arc-sharing the connections) instead of re-spawning every MCP
+            // server per task call — see SubAgent::run_with_emit.
             "task" => Box::new(subagent::SubAgent::new(
                 cfg.clone(),
                 client.clone(),
                 api_key.to_string(),
+                shared_mcp.to_vec(),
             )),
             other => bail!("unknown tool in config: {other}"),
         });

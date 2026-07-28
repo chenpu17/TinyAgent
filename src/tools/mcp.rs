@@ -8,7 +8,14 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 /// An MCP tool exposed to the agent as `mcp_<server>_<tool>`.
-struct McpTool {
+///
+/// `Clone` is cheap and intentional: the `client` is an `Arc`, so cloning an
+/// `McpTool` shares the underlying MCP connection rather than duplicating it.
+/// The `task` sub-agent relies on this — it clones the parent's MCP tools into
+/// each child instead of re-running `McpClient::start` (re-spawning every MCP
+/// server per sub-agent call).
+#[derive(Clone)]
+pub(crate) struct McpTool {
     client: Arc<Mutex<McpClient>>,
     wire_name: String,
     def: ToolDef,
@@ -75,8 +82,13 @@ impl Tool for McpTool {
 
 /// Start every configured MCP server and collect their tools.
 /// A server that fails the handshake aborts startup with a clear error.
-pub fn build(servers: &[McpServerConfig]) -> Result<Vec<Box<dyn Tool>>> {
-    let mut out: Vec<Box<dyn Tool>> = Vec::new();
+///
+/// Returns concrete `McpTool`s (not boxed) so the parent agent's tool list and
+/// the `task` sub-agent can SHARE them: the parent boxes its copies, while each
+/// sub-agent `clone()`s the same set into its child (sharing the `Arc`'d MCP
+/// connection) instead of re-calling this — re-spawning every server per task.
+pub(crate) fn build(servers: &[McpServerConfig]) -> Result<Vec<McpTool>> {
+    let mut out: Vec<McpTool> = Vec::new();
     let mut display_names: Vec<String> = Vec::new();
     for cfg in servers {
         let (client, infos) = McpClient::start(cfg)?;
@@ -85,7 +97,7 @@ pub fn build(servers: &[McpServerConfig]) -> Result<Vec<Box<dyn Tool>>> {
         for info in infos {
             let display = sanitize_name(&cfg.name, &info.name);
             display_names.push(display.clone());
-            out.push(Box::new(McpTool {
+            out.push(McpTool {
                 client: client.clone(),
                 def: ToolDef {
                     name: display,
@@ -100,7 +112,7 @@ pub fn build(servers: &[McpServerConfig]) -> Result<Vec<Box<dyn Tool>>> {
                 // tools/call must dispatch with the name the server knows.
                 // Only the name shown to the model is sanitized.
                 wire_name: info.name,
-            }));
+            });
         }
         eprintln!("mcp: server '{}' ready ({} tools)", cfg.name, n);
     }

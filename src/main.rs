@@ -272,10 +272,17 @@ pub(crate) fn build_agent(
     let api_key = cfg.api_key()?;
     let provider = provider::build(cfg, &api_key, client.clone());
 
-    let mut tool_list = tools::build(&cfg.tools, cfg, client, &api_key)?;
-    if !cfg.mcp_servers.is_empty() {
-        tool_list.extend(tools::mcp::build(&cfg.mcp_servers)?);
-    }
+    // Build MCP tools ONCE. The parent boxes them into its own tool list, and
+    // tools::build hands SubAgent a clone of the same set — so a `task` call
+    // shares the parent's MCP connections instead of re-spawning every server
+    // (the old path called mcp::build inside SubAgent per task call).
+    let mcp_tools = if !cfg.mcp_servers.is_empty() {
+        tools::mcp::build(&cfg.mcp_servers)?
+    } else {
+        Vec::new()
+    };
+    let mut tool_list = tools::build(&cfg.tools, cfg, client, &api_key, &mcp_tools)?;
+    tool_list.extend(mcp_tools.into_iter().map(|t| Box::new(t) as Box<dyn tools::Tool>));
 
     let ctx = ToolCtx {
         workdir,
