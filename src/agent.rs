@@ -26,6 +26,11 @@ pub enum AgentEvent {
     /// History was compressed: how many middle messages were dropped,
     /// and how many remain.
     Compressed { dropped: usize, kept: usize },
+    /// An event forwarded from a named sub-agent (the `task` tool). Carries the
+    /// sub-agent's identity so a harness/UI can show concurrent sub-agent work
+    /// and tell interleaved streams apart. The inner `event` is the child's own
+    /// `AgentEvent` (TextDelta, ToolCall, …) — recurse to render it.
+    SubAgent { name: String, event: Box<AgentEvent> },
     Done { stop_reason: String },
 }
 
@@ -379,12 +384,18 @@ impl Agent {
                     input: input.clone(),
                 });
 
-                let output = match self.tools.iter().find(|t| t.def().name == *name) {
-                    Some(tool) => match tool.run(input, &self.ctx) {
-                        Ok(o) => o,
-                        Err(e) => crate::tools::ToolOutput::error(format!("{e:#}")),
-                    },
-                    None => crate::tools::ToolOutput::error(format!("unknown tool: {name}")),
+                // run_with_emit lets a tool stream progress into the parent's
+                // event sink (the `task` sub-agent forwards its child's events,
+                // tagged with the sub-agent's name). Leaf tools ignore the sink.
+                let output = {
+                    let mut fwd = |ev: AgentEvent| events(ev);
+                    match self.tools.iter().find(|t| t.def().name == *name) {
+                        Some(tool) => match tool.run_with_emit(input, &self.ctx, &mut fwd) {
+                            Ok(o) => o,
+                            Err(e) => crate::tools::ToolOutput::error(format!("{e:#}")),
+                        },
+                        None => crate::tools::ToolOutput::error(format!("unknown tool: {name}")),
+                    }
                 };
                 // A tool that did real LLM work (the `task` sub-agent) bills
                 // its usage to this run: fold it into the totals and emit a
@@ -975,6 +986,41 @@ mod tests {
         }
     }
 
+    /// A tool that streams synthetic sub-agent events into the parent run via
+    /// `run_with_emit` — pins that the tool loop routes the `emit` closure
+    /// through to the parent's event sink (the whole point of child-event
+    /// visibility for the `task` tool). Mirrors how `SubAgent` forwards its
+    /// child's events wrapped as `AgentEvent::SubAgent{..}`.
+    struct EmitTool;
+    impl Tool for EmitTool {
+        fn def(&self) -> ToolDef {
+            ToolDef {
+                name: "emit".into(),
+                description: "test tool that forwards sub-agent events".into(),
+                schema: json!({"type": "object", "properties": {}}),
+            }
+        }
+        fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+            self.run_with_emit(input, ctx, &mut |_| {})
+        }
+        fn run_with_emit(
+            &self,
+            _input: &Value,
+            _ctx: &ToolCtx,
+            emit: &mut dyn FnMut(AgentEvent),
+        ) -> Result<ToolOutput> {
+            emit(AgentEvent::SubAgent {
+                name: "scout".into(),
+                event: Box::new(AgentEvent::TextDelta("looking".into())),
+            });
+            emit(AgentEvent::SubAgent {
+                name: "scout".into(),
+                event: Box::new(AgentEvent::TextDelta(" found".into())),
+            });
+            Ok(ToolOutput::text("scout done"))
+        }
+    }
+
     #[test]
     fn tool_reported_usage_folds_into_run_totals_and_events() {
         // A tool reporting usage (the `task` sub-agent path) must fold into the
@@ -1014,6 +1060,46 @@ mod tests {
             usage_events.contains(&(111, 22)),
             "tool-reported usage must emit a Usage event; got {usage_events:?}"
         );
+    }
+
+    #[test]
+    fn tool_emitted_subagent_events_reach_parent_stream() {
+        // A tool overriding run_with_emit (the `task` path) forwards its
+        // AgentEvent::SubAgent{..} into the parent's run callback, tagged with
+        // the sub-agent's name — that identity is what disambiguates parallel
+        // sub-agents. Pins the loop's routing of the `emit` closure, which the
+        // sequential v1 changed from a plain `tool.run(...)` call.
+        let cfg = cfg_with(5, 0, 0);
+        let (prov, _) = MockProvider::new(vec![
+            mock::resp_tool("t", "emit", json!({}), mock::mk_usage(1, 1)),
+            mock::resp_text("final", None),
+        ]);
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![Box::new(EmitTool)],
+            vec![user_text("go")],
+            test_ctx(),
+        );
+        let mut events = Vec::new();
+        agent.run(&mut |e| events.push(e)).unwrap();
+        // Collect forwarded sub-agent text deltas, grouped by name.
+        let forwarded: Vec<(String, String)> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::SubAgent { name, event } => match &**event {
+                    AgentEvent::TextDelta(t) => Some((name.clone(), t.clone())),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert!(
+            forwarded.iter().all(|(n, _)| n == "scout"),
+            "every forwarded event must be tagged scout: {forwarded:?}"
+        );
+        let text: String = forwarded.into_iter().map(|(_, t)| t).collect();
+        assert_eq!(text, "looking found", "both deltas forwarded in order");
     }
 
     #[test]

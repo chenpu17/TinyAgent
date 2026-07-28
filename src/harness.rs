@@ -1,6 +1,6 @@
 use crate::agent::{Agent, AgentEvent, RunOutcome};
 use anyhow::{Context, Result};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::io::Write;
 use std::path::Path;
 
@@ -95,6 +95,33 @@ pub(crate) fn run_with_retries(
                         };
                         eprintln!("[tokens: {input_tokens}↑ {output_tokens}↓{cache}]");
                     }
+                    AgentEvent::SubAgent { name, event } => {
+                        // Render the child's event prefixed with its identity, so
+                        // a human can follow each sub-agent's progress —
+                        // especially when several run in parallel and interleave.
+                        // Usage is already folded into the run totals at the agent
+                        // level, so it's not re-shown here.
+                        match &*event {
+                            AgentEvent::TextDelta(t) => {
+                                print!("[{name}] {t}");
+                                let _ = std::io::stdout().flush();
+                                at_line_start = t.ends_with('\n');
+                            }
+                            AgentEvent::ToolCall { name: tn, input } => {
+                                println!("\n[{name}] [tool →] {tn} {}", compact(input));
+                            }
+                            AgentEvent::ToolResult {
+                                name: tn,
+                                is_error,
+                                content,
+                            } => {
+                                let tag = if *is_error { "[tool ✗]" } else { "[tool ✓]" };
+                                println!("[{name}] {tag} {tn}: {}", crate::agent::preview(content));
+                            }
+                            AgentEvent::Done { .. } => {} // implicit in the result
+                            _ => {} // TurnStart/Compressed/Usage/SubAgent: noisy or folded
+                        }
+                    }
                 }
             });
         match result {
@@ -172,10 +199,12 @@ fn exit_code_for(stop_reason: &str) -> i32 {
 
 /// Print one JSON object per event (NDJSON) for `--json` mode, so a pipeline
 /// can consume progress live instead of waiting for the final result file.
-fn emit_json(ev: &AgentEvent) {
+/// JSON shape for one event. Factored out so `SubAgent` can nest its child's
+/// event as `event_json(child)` without re-listing every variant's fields.
+fn event_json(ev: &AgentEvent) -> Value {
     // ev is borrowed, so the match bindings are references — clone the owned
     // fields (String/Value) and deref the Copy ones for serde_json::Value.
-    let v = match ev {
+    match ev {
         AgentEvent::TurnStart(n) => json!({"type": "turn", "n": *n}),
         AgentEvent::TextDelta(t) => json!({"type": "text", "delta": t.clone()}),
         AgentEvent::ToolCall { name, input } => {
@@ -210,10 +239,21 @@ fn emit_json(ev: &AgentEvent) {
         AgentEvent::Compressed { dropped, kept } => {
             json!({"type": "compressed", "dropped": *dropped, "kept": *kept})
         }
+        AgentEvent::SubAgent { name, event } => {
+            json!({
+                "type": "subagent",
+                "name": name.clone(),
+                "event": event_json(event),
+            })
+        }
         AgentEvent::Done { stop_reason } => {
             json!({"type": "done", "stop_reason": stop_reason.clone()})
         }
-    };
+    }
+}
+
+fn emit_json(ev: &AgentEvent) {
+    let v = event_json(ev);
     println!(
         "{}",
         serde_json::to_string(&v).unwrap_or_else(|_| "{}".into())
@@ -376,5 +416,22 @@ mod tests {
         assert_eq!(exit_code_for("cancelled"), 130);
         assert_eq!(exit_code_for("max_turns_reached"), 1);
         assert_eq!(exit_code_for("max_tokens"), 1);
+    }
+
+    #[test]
+    fn event_json_nests_subagent_event_with_name() {
+        // NDJSON consumers see each forwarded child event as
+        // {"type":"subagent","name":..,"event":<child>}, with the child's own
+        // shape recursed via event_json — so identity + the inner event both
+        // survive the serialization (parallel sub-agents interleave by `name`).
+        let ev = AgentEvent::SubAgent {
+            name: "scout".into(),
+            event: Box::new(AgentEvent::TextDelta("hi".into())),
+        };
+        let v = event_json(&ev);
+        assert_eq!(v["type"], "subagent");
+        assert_eq!(v["name"], "scout");
+        assert_eq!(v["event"]["type"], "text");
+        assert_eq!(v["event"]["delta"], "hi");
     }
 }

@@ -6,6 +6,7 @@ mod subagent;
 
 pub(crate) use image::load_block;
 
+use crate::agent::AgentEvent;
 use crate::config::Config;
 use crate::provider::{Block, ToolDef, Usage};
 use anyhow::{bail, Result};
@@ -60,6 +61,22 @@ impl ToolOutput {
 pub trait Tool: Send + Sync {
     fn def(&self) -> ToolDef;
     fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput>;
+    /// Run with an event sink, for tools that stream progress into the parent
+    /// run (the `task` sub-agent forwards its child's `AgentEvent`s, wrapped
+    /// with the sub-agent's identity). Leaf tools have nothing to emit and use
+    /// the default, which ignores `emit` and delegates to `run` — so adding
+    /// this didn't touch the 6 leaf impls. The agent loop always calls this;
+    /// the parallel path (commit 2) gives each worker its own `emit` closure
+    /// backed by an mpsc sender.
+    fn run_with_emit(
+        &self,
+        input: &Value,
+        ctx: &ToolCtx,
+        emit: &mut dyn FnMut(AgentEvent),
+    ) -> Result<ToolOutput> {
+        let _ = emit;
+        self.run(input, ctx)
+    }
 }
 
 /// Instantiate the built-in tools named in the config whitelist.

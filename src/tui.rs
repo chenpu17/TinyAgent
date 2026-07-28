@@ -310,6 +310,10 @@ fn ui_loop(
     let mut turn = 0u32;
     let mut scroll_up: usize = 0;
     let mut streaming = false;
+    // Name of the sub-agent whose text is currently accumulating into the
+    // trailing Assistant row, so consecutive deltas from the same sub-agent
+    // merge — and a different sub-agent (or the parent) starts a fresh row.
+    let mut sub_streaming_name: Option<String> = None;
     let start = Instant::now();
     // Input history (Alt+Up/Down to recall). `draft` holds the in-progress
     // text when the user starts browsing, so Down past the newest restores it.
@@ -376,6 +380,7 @@ fn ui_loop(
                         streaming = false;
                     }
                     AgentEvent::TextDelta(t) => {
+                        sub_streaming_name = None; // parent speaks: don't merge into a sub-agent row
                         if !streaming {
                             rows.push(Row::Assistant(String::new()));
                             streaming = true;
@@ -427,6 +432,49 @@ fn ui_loop(
                         out_tokens += output_tokens;
                         cache_create += cache_creation_input_tokens;
                         cache_read += cache_read_input_tokens;
+                    }
+                    AgentEvent::SubAgent { name, event } => {
+                        // Minimal v1: render the child's event tagged with its
+                        // name so the user can see each sub-agent's progress
+                        // (and tell parallel ones apart). A richer nested/
+                        // grouped view is future work. Usage is already folded
+                        // into the run totals at the agent level, so skip it.
+                        match &*event {
+                            AgentEvent::TextDelta(t) => {
+                                let same = sub_streaming_name.as_deref() == Some(name.as_str());
+                                if !same {
+                                    rows.push(Row::Assistant(format!("[{name}] ")));
+                                    sub_streaming_name = Some(name.clone());
+                                }
+                                if let Some(Row::Assistant(buf)) = rows.last_mut() {
+                                    buf.push_str(t);
+                                }
+                            }
+                            AgentEvent::ToolCall { name: tn, input } => {
+                                sub_streaming_name = None;
+                                rows.push(Row::ToolCall {
+                                    name: format!("[{name}] {tn}"),
+                                    input: input.clone(),
+                                    collapsed: compact(input),
+                                    expanded: false,
+                                });
+                            }
+                            AgentEvent::ToolResult {
+                                name: tn,
+                                is_error,
+                                content,
+                            } => {
+                                sub_streaming_name = None;
+                                rows.push(Row::ToolResult {
+                                    name: format!("[{name}] {tn}"),
+                                    content: content.clone(),
+                                    is_error: *is_error,
+                                    expanded: false,
+                                });
+                            }
+                            AgentEvent::Done { .. } => sub_streaming_name = None,
+                            _ => {} // TurnStart/Compressed/Usage/SubAgent: noisy or folded
+                        }
                     }
                 },
                 UiMsg::Error(e) => {

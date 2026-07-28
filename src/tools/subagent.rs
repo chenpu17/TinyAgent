@@ -23,7 +23,7 @@
 //!   with the flag already set — the child's run-entry reset can't clobber a
 //!   cancel the parent is acting on.
 
-use crate::agent::{Agent, RunOutcome};
+use crate::agent::{Agent, AgentEvent, RunOutcome};
 use crate::config::Config;
 use crate::provider::{self, Block, Message, Usage};
 use crate::tools::{self, Tool, ToolCtx, ToolOutput};
@@ -72,6 +72,10 @@ impl Tool for SubAgent {
             schema: json!({
                 "type": "object",
                 "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "A short identifier for this sub-agent (its events are tagged with it)."
+                    },
                     "description": {
                         "type": "string",
                         "description": "A short (3-5 word) label for what this task does."
@@ -81,19 +85,34 @@ impl Tool for SubAgent {
                         "description": "The full, self-contained instruction for the sub-agent."
                     }
                 },
-                "required": ["prompt"]
+                "required": ["name", "prompt"]
             }),
         }
     }
 
     fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        // The agent loop always calls `run_with_emit` (so child events stream
+        // into the parent). This `run` exists only to satisfy the trait; it
+        // runs the sub-agent the same way, just with a discarded event stream.
+        self.run_with_emit(input, ctx, &mut |_| {})
+    }
+
+    fn run_with_emit(
+        &self,
+        input: &Value,
+        ctx: &ToolCtx,
+        emit: &mut dyn FnMut(AgentEvent),
+    ) -> Result<ToolOutput> {
+        let name = input["name"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("task requires a non-empty `name`"))?;
         let prompt = input["prompt"]
             .as_str()
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| anyhow::anyhow!("task requires a non-empty `prompt`"))?;
-        // `description` is informational only in v1 (no event forwarding); we
-        // accept it but don't consume it, so callers following the common
-        // {description, prompt} shape work without extra plumbing.
+        // `description` is accepted but informational; `name` is the identity
+        // that tags this sub-agent's forwarded events.
 
         // Child config: sub-agent persona + a capped turn budget.
         let mut child_cfg = self.cfg.clone();
@@ -125,29 +144,38 @@ impl Tool for SubAgent {
         if let Some(flag) = ctx.cancel.clone() {
             child.set_cancel(flag);
         }
-        Ok(run_subagent(&mut child))
+        Ok(run_subagent(&mut child, name, emit))
     }
 }
 
 /// Drive a constructed child agent to completion and map its outcome to a tool
-/// result. Split out from `run` so it's unit-testable with an in-process
-/// `MockProvider` (no HTTP): build any `Agent`, hand it here, assert the
-/// `ToolOutput`. The child's events stream into a no-op sink (v1: no forwarding).
-fn run_subagent(agent: &mut Agent) -> ToolOutput {
-    match agent.run(&mut |_| {}) {
-        Ok(o) => outcome_to_output(&o),
-        Err(e) => ToolOutput::error(format!("subagent failed: {e:#}")),
+/// result. Split out from `run_with_emit` so it's unit-testable with an
+/// in-process `MockProvider` (no HTTP): build any `Agent`, hand it here, assert
+/// the `ToolOutput`. The child's events are forwarded to `emit`, each wrapped as
+/// `AgentEvent::SubAgent { name, .. }` so the parent stream shows the
+/// sub-agent's progress tagged with its identity.
+fn run_subagent(agent: &mut Agent, name: &str, emit: &mut dyn FnMut(AgentEvent)) -> ToolOutput {
+    let name_owned = name.to_string();
+    match agent.run(&mut |ev| {
+        emit(AgentEvent::SubAgent {
+            name: name_owned.clone(),
+            event: Box::new(ev),
+        });
+    }) {
+        Ok(o) => outcome_to_output(&o, name),
+        Err(e) => ToolOutput::error(format!("subagent {name} failed: {e:#}")),
     }
 }
 
 /// Turn a completed child run into the parent-facing tool result: the child's
 /// final summary as content, its usage billed to the parent, and a non-alarming
-/// note when it ended short of `end_turn` (max_turns / timeout / cancelled).
-fn outcome_to_output(o: &RunOutcome) -> ToolOutput {
+/// note when it ended short of `end_turn` (max_turns / timeout / cancelled),
+/// tagged with the sub-agent's name so the parent can tell which one stopped.
+fn outcome_to_output(o: &RunOutcome, name: &str) -> ToolOutput {
     let content = if o.stop_reason == "end_turn" {
         o.final_text.clone()
     } else {
-        format!("[subagent ended: {}]\n{}", o.stop_reason, o.final_text)
+        format!("[subagent {name} ended: {}]\n{}", o.stop_reason, o.final_text)
     };
     ToolOutput {
         content,
@@ -215,12 +243,32 @@ mod tests {
             mock::resp_tool("t1", "noop", json!({}), mock::mk_usage(100, 5)),
             mock::resp_text("done summary", mock::mk_usage(50, 3)),
         ]);
-        let out = run_subagent(&mut agent);
+        let out = run_subagent(&mut agent, "scout", &mut |_| {});
         assert_eq!(out.content, "done summary");
         assert!(!out.is_error);
         let u = out.usage.expect("usage billed to parent");
         assert_eq!(u.input_tokens, 150);
         assert_eq!(u.output_tokens, 8);
+    }
+
+    #[test]
+    fn run_subagent_forwards_events_tagged_with_name() {
+        // The child's events must reach the parent stream wrapped as
+        // SubAgent{name, ..} — that identity is the whole point (parallel
+        // sub-agents interleave; the name disambiguates them).
+        let mut agent = mock_agent(vec![mock::resp_text("hi", mock::mk_usage(1, 1))]);
+        let mut seen: Vec<(String, String)> = Vec::new();
+        run_subagent(&mut agent, "worker-7", &mut |ev| {
+            if let AgentEvent::SubAgent { name, event } = ev {
+                match *event {
+                    AgentEvent::TextDelta(t) => seen.push((name.clone(), t)),
+                    AgentEvent::TurnStart(n) => seen.push((name.clone(), format!("turn{n}"))),
+                    _ => {}
+                }
+            }
+        });
+        assert!(seen.iter().all(|(n, _)| n == "worker-7"), "every event tagged: {seen:?}");
+        assert!(seen.iter().any(|(_, t)| t == "hi"), "child text forwarded: {seen:?}");
     }
 
     #[test]
@@ -236,7 +284,7 @@ mod tests {
             cache_read_input_tokens: 0,
             elapsed: std::time::Duration::from_secs_f64(1.0),
         };
-        let out = outcome_to_output(&o);
+        let out = outcome_to_output(&o, "a");
         assert_eq!(out.content, "all done");
         assert!(!out.is_error);
         let u = out.usage.expect("usage billed");
@@ -245,8 +293,9 @@ mod tests {
 
     #[test]
     fn outcome_to_output_short_stop_notes_reason_not_error() {
-        // max_turns / timeout / cancelled: surface the reason as a prefix, but
-        // don't mark is_error — partial work may still be useful to the parent.
+        // max_turns / timeout / cancelled: surface the reason as a prefix (with
+        // the sub-agent's name), but don't mark is_error — partial work may
+        // still be useful to the parent.
         let o = RunOutcome {
             final_text: "partial".into(),
             turns: 25,
@@ -258,29 +307,34 @@ mod tests {
             cache_read_input_tokens: 0,
             elapsed: std::time::Duration::from_secs_f64(2.0),
         };
-        let out = outcome_to_output(&o);
+        let out = outcome_to_output(&o, "scout");
         assert!(!out.is_error, "short stop must not be is_error");
-        assert!(out.content.starts_with("[subagent ended: max_turns_reached]"));
+        assert!(out.content.starts_with("[subagent scout ended: max_turns_reached]"));
         assert!(out.content.contains("partial"));
     }
 
     #[test]
-    fn subagent_tool_rejects_empty_prompt() {
-        // The tool must validate before building anything: an empty prompt is a
+    fn subagent_tool_rejects_missing_or_empty_name_and_prompt() {
+        // Validate before building anything: a missing/empty name or prompt is a
         // caller bug, not a sub-agent run to attempt.
-        let sa = SubAgent::new(
-            fake_cfg(),
-            reqwest::blocking::Client::new(),
-            "k".into(),
-        );
+        let sa = SubAgent::new(fake_cfg(), reqwest::blocking::Client::new(), "k".into());
         let ctx = ToolCtx {
             workdir: std::env::temp_dir(),
             max_output_chars: 1000,
             restrict_to_workdir: false,
             cancel: None,
         };
-        let err = sa.run(&json!({"prompt": "   "}), &ctx).unwrap_err();
-        assert!(format!("{err:#}").contains("non-empty"));
+        let mut emit = |_: AgentEvent| {};
+        // No name at all → rejected on name.
+        let err = sa
+            .run_with_emit(&json!({"prompt": "do it"}), &ctx, &mut emit)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("name"), "missing name: {err:#}");
+        // Empty prompt → rejected on prompt.
+        let err = sa
+            .run_with_emit(&json!({"name": "x", "prompt": "   "}), &ctx, &mut emit)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("prompt"), "empty prompt: {err:#}");
     }
 
     fn fake_cfg() -> Config {

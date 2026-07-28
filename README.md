@@ -316,7 +316,8 @@ headless 模式下 `Ctrl-C` 走**优雅取消**：首次 SIGINT 在流式 chunk 
 
 `task` 是一个**顺序**子 agent 工具：主 agent 把一个聚焦的子任务交给一个全新的子 agent（自己的消息历史、自己的 turn 预算），子 agent 跑完后只把**最终摘要**作为 tool 结果返回——主 agent 的上下文不会被子 agent 的中间过程撑大。
 
-- **输入**：`{ "description": "简短说明", "prompt": "完整自包含的指令" }`（`prompt` 必填，`description` 可选、信息性）。
+- **输入**：`{ "name": "身份标识", "description": "简短说明", "prompt": "完整自包含的指令" }`（`name` 与 `prompt` 必填，`description` 可选、信息性）。`name` 是这个子 agent 的身份，所有转发出来的事件都用它打标签。
+- **事件可见**：子 agent 的流式过程（文本增量 / tool 调用 / tool 结果）**实时转发**进主 run 的事件流，每条都裹上 `name` 身份——headless 的 `--json` 输出形如 `{"type":"subagent","name":..,"event":<子事件>}`，TUI 里子 agent 的输出也带 `[name]` 前缀。并行多个子 agent 时，靠 `name` 区分交错的事件。
 - **成本诚实计入**：子 agent 的 token 用量折进主 run 的累计，并照常发 `usage` 事件 / 写进 `result.json`。
 - **继承**：子 agent 复用主 agent 的 provider / model / 工作目录 / `restrict_to_workdir` / 取消标志（Ctrl-C 会连带中断子 agent）。工具白名单继承父配置。
 
@@ -324,7 +325,6 @@ headless 模式下 `Ctrl-C` 走**优雅取消**：首次 SIGINT 在流式 chunk 
 
 - **顺序，不并行**：一次只跑一个子 agent，`task` 调用会阻塞当前 turn 直到子 agent 完成。并行子 agent + 工作目录隔离是后续工作。
 - **不可递归**：子 agent 的工具白名单会滤掉 `task` 本身，所以子 agent 不能再开子 agent（无需深度计数）。
-- **无事件转发**：子 agent 的流式过程不进主 UI（TUI / NDJSON），主 agent 只看到 `task` 调用与最终结果。
 - **不进默认白名单**：在配置的 `tools` 里显式加 `"task"` 才启用。
 
 启用：在配置 `tools` 数组加入 `"task"` 即可。
