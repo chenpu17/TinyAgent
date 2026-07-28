@@ -240,7 +240,17 @@ impl Config {
             }
             if let Some(v) = l.timeout_secs {
                 if v != 0 {
-                    self.limits.timeout_secs = v.min(self.limits.timeout_secs);
+                    // timeout_secs==0 uniquely means "no limit" (the LOOSEST
+                    // value), so v.min(0)==0 would silently drop a task's
+                    // tightening to e.g. 30s — the opposite of every other
+                    // field where 0 is the tightest. When the base is 0, take v
+                    // directly (any finite v tightens); otherwise min so a task
+                    // can only tighten, never loosen.
+                    self.limits.timeout_secs = if self.limits.timeout_secs == 0 {
+                        v
+                    } else {
+                        v.min(self.limits.timeout_secs)
+                    };
                 }
             }
             if let Some(v) = l.max_output_chars {
@@ -468,5 +478,33 @@ mod tests {
         cfg.apply(partial).unwrap();
         assert_eq!(cfg.limits.max_turns, 3);
         assert_eq!(cfg.limits.timeout_secs, 30);
+    }
+
+    #[test]
+    fn batch_overlay_timeout_tightens_from_no_limit_base() {
+        // timeout_secs==0 is the LOOSEST value ("no limit"), unlike every other
+        // field where 0 is tightest. A task setting timeout_secs=30 over a base
+        // of 0 must tighten to 30 — NOT collapse back to 0 via v.min(0), which
+        // would silently drop the tightening and leave the worker unbounded.
+        let mut cfg: Config = serde_json::from_str(
+            r#"{"provider":"anthropic","api_key_env":"K","model":"m",
+               "limits":{"timeout_secs":0}}"#,
+        )
+        .unwrap();
+        let partial: PartialConfig =
+            serde_json::from_str(r#"{"task":"x","limits":{"timeout_secs":30}}"#).unwrap();
+        cfg.apply(partial).unwrap();
+        assert_eq!(cfg.limits.timeout_secs, 30, "0-base must adopt the finite task value");
+
+        // From a finite base the task can still only tighten (min), never loosen.
+        let mut cfg: Config = serde_json::from_str(
+            r#"{"provider":"anthropic","api_key_env":"K","model":"m",
+               "limits":{"timeout_secs":60}}"#,
+        )
+        .unwrap();
+        let partial: PartialConfig =
+            serde_json::from_str(r#"{"task":"x","limits":{"timeout_secs":120}}"#).unwrap();
+        cfg.apply(partial).unwrap();
+        assert_eq!(cfg.limits.timeout_secs, 60, "a larger task timeout must not loosen the base");
     }
 }

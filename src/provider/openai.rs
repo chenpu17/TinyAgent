@@ -294,36 +294,45 @@ impl OpenAi {
             // Without this they'd be skipped (choice is null → continue) and a
             // content_filter / overloaded error would masquerade as an empty
             // success — possibly with half-received tool args fed to _raw.
-            if let Some(err) = ev.get("error") {
+            // Some gateways serialize `"error": null` on success chunks; treat
+            // that as no error (filter out null).
+            if let Some(err) = ev.get("error").filter(|v| !v.is_null()) {
                 bail!(
                     "OpenAI stream error: {}",
                     err["message"].as_str().unwrap_or("(no message)")
                 );
             }
+            // Usage may ride on the final chunk whether or not it carries a
+            // choice: standard OpenAI sends an empty-choices trailer, but some
+            // DeepSeek/vLLM/Ollama gateways attach usage to the LAST chunk that
+            // also has finish_reason (a non-null choice). Parse it on every
+            // event so neither shape silently drops the cost accounting.
+            // (Reassigning on later chunks is harmless — usage only appears
+            // once, at the end.)
+            if let Some(u) = ev.get("usage").filter(|v| !v.is_null()) {
+                // OpenAI's `prompt_tokens` is the TOTAL prompt (cached +
+                // uncached); `cached_tokens` is the subset served from
+                // cache. Subtract so `input_tokens` stays non-cached-only
+                // — matching Anthropic's invariant on the Usage struct and
+                // keeping the billed-input formula honest across providers
+                // (otherwise cached tokens count full-price here AND again
+                // as a cache read). cache_creation stays 0: OpenAI's
+                // implicit caching has no separate "creation" event.
+                let cached = u["prompt_tokens_details"]["cached_tokens"]
+                    .as_u64()
+                    .unwrap_or(0);
+                let prompt = u["prompt_tokens"].as_u64().unwrap_or(0);
+                usage = Some(Usage {
+                    input_tokens: prompt.saturating_sub(cached),
+                    output_tokens: u["completion_tokens"].as_u64().unwrap_or(0),
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: cached,
+                });
+            }
             let choice = &ev["choices"][0];
             if choice.is_null() {
-                // With stream_options.include_usage the final chunk has an empty
-                // choices array and carries the usage totals.
-                if let Some(u) = ev.get("usage") {
-                    // OpenAI's `prompt_tokens` is the TOTAL prompt (cached +
-                    // uncached); `cached_tokens` is the subset served from
-                    // cache. Subtract so `input_tokens` stays non-cached-only
-                    // — matching Anthropic's invariant on the Usage struct and
-                    // keeping the billed-input formula honest across providers
-                    // (otherwise cached tokens count full-price here AND again
-                    // as a cache read). cache_creation stays 0: OpenAI's
-                    // implicit caching has no separate "creation" event.
-                    let cached = u["prompt_tokens_details"]["cached_tokens"]
-                        .as_u64()
-                        .unwrap_or(0);
-                    let prompt = u["prompt_tokens"].as_u64().unwrap_or(0);
-                    usage = Some(Usage {
-                        input_tokens: prompt.saturating_sub(cached),
-                        output_tokens: u["completion_tokens"].as_u64().unwrap_or(0),
-                        cache_creation_input_tokens: 0,
-                        cache_read_input_tokens: cached,
-                    });
-                }
+                // Empty-choices trailer (the standard OpenAI usage chunk); the
+                // usage was already captured above, so nothing else to do.
                 continue;
             }
             if let Some(r) = choice["finish_reason"].as_str() {
@@ -661,5 +670,40 @@ mod tests {
             })
             .unwrap_or(0);
         assert_eq!(img_count, 2);
+    }
+
+    #[test]
+    fn stream_usage_attaches_to_chunk_with_finish_reason() {
+        // DeepSeek/vLLM/Ollama gateways attach `usage` to the LAST chunk that
+        // also carries a non-null choice + finish_reason — NOT the standard
+        // OpenAI empty-choices trailer (which stream_usage_reads_cached_tokens
+        // covers). Usage must be parsed on every event regardless of whether
+        // the chunk carries a choice, or this shape silently drops cost.
+        let raw = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let resp = OpenAi::parse_stream(raw.as_bytes(), &mut |_| {}).unwrap();
+        assert_eq!(
+            resp.usage.map(|u| (u.input_tokens, u.output_tokens)),
+            Some((10, 2)),
+            "usage on a choice-carrying chunk must be captured"
+        );
+    }
+
+    #[test]
+    fn stream_error_null_on_success_chunk_does_not_bail() {
+        // Some gateways serialize `"error": null` on success chunks. The null
+        // filter must skip it — without it, a healthy stream would bail as an
+        // error the moment the first delta carries an explicit null error.
+        let raw = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}],\"error\":null}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"delta\":{}}],\"error\":null}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let resp = OpenAi::parse_stream(raw.as_bytes(), &mut |_| {}).unwrap();
+        assert!(matches!(&resp.blocks[0], Block::Text(t) if t == "hi"));
+        assert_eq!(resp.stop_reason, "end_turn");
     }
 }

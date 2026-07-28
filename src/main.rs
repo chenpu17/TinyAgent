@@ -126,6 +126,13 @@ fn main() -> Result<()> {
         if cli.tui {
             bail!("--batch and --tui are mutually exclusive");
         }
+        if cli.resume {
+            // --resume is single-run only; in batch mode each task is an
+            // independent fresh run, so resuming is silently meaningless. Reject
+            // explicitly rather than ignore (the --tui check above is the
+            // precedent; this one was missing).
+            bail!("--batch and --resume are mutually exclusive");
+        }
         // Wire Ctrl-C into batch the same way single-run headless does: first
         // SIGINT flips a shared flag the worker pool gates on (in-flight tasks
         // finish, no new ones start, the report still merges) → exit 130; a

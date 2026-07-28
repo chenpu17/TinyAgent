@@ -4,6 +4,11 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
 const MAX_LIST_ENTRIES: usize = 500;
+/// edit_file reads the whole file into memory (replace semantics), unlike
+/// read_file which streams. Refuse a file beyond this cap rather than OOM on
+/// a multi-GB file (e.g. a log in the workdir). Module-level so a test can
+/// reference the real value instead of a drift-prone literal.
+const EDIT_FILE_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 pub struct ReadFile;
 
@@ -160,6 +165,20 @@ impl Tool for EditFile {
         // (same sandbox as read_file/write_file); a path escaping the workdir is
         // rejected before any I/O.
         let full = resolve(ctx, path)?;
+        // edit_file needs the whole file in memory (replace semantics), unlike
+        // read_file which streams and stops at max_output_chars. Refuse a file
+        // beyond the module-level cap (EDIT_FILE_MAX_BYTES) rather than OOM on
+        // a multi-GB file (e.g. a log in the workdir). metadata() failing (e.g.
+        // broken symlink) falls through to read_to_string's own error.
+        if let Ok(meta) = full.metadata() {
+            if meta.len() > EDIT_FILE_MAX_BYTES {
+                bail!(
+                    "edit_file: {} is {} bytes, over the {EDIT_FILE_MAX_BYTES}-byte limit (edit_file reads the whole file into memory) — use read_file to inspect it, or a streaming editor",
+                    full.display(),
+                    meta.len()
+                );
+            }
+        }
         let original = std::fs::read_to_string(&full)
             .with_context(|| format!("cannot read {}", full.display()))?;
 
@@ -399,5 +418,30 @@ mod tests {
         assert_eq!(fs::read_to_string(&outside).unwrap(), "hello");
         fs::remove_dir_all(&dir).ok();
         let _ = fs::remove_file(&outside);
+    }
+
+    #[test]
+    fn edit_file_rejects_oversized_file() {
+        // edit_file loads the whole file into memory (replace semantics); a
+        // file over EDIT_FILE_MAX_BYTES must be rejected before read_to_string
+        // (OOM guard). A sparse file via set_len reports a large len() without
+        // actually allocating the bytes, so this test stays cheap.
+        let dir = std::env::temp_dir().join(format!("ta-edit-big-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let big = dir.join("big.txt");
+        {
+            let f = std::fs::File::create(&big).unwrap();
+            f.set_len(EDIT_FILE_MAX_BYTES + 1).unwrap(); // sparse hole, not 8 MB of data
+        }
+        let err = EditFile
+            .run(
+                &json!({"path": "big.txt", "old_string": "x", "new_string": "y"}),
+                &ctx_in(&dir),
+            )
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("over the"), "{msg}");
+        assert!(msg.contains("limit"), "{msg}");
+        fs::remove_dir_all(&dir).ok();
     }
 }

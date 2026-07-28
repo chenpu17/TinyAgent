@@ -342,6 +342,16 @@ impl Agent {
             if !turn_text.is_empty() {
                 final_text = turn_text;
             }
+            // An empty assistant turn (e.g. a content-filtered response that
+            // yields zero blocks) must NOT be persisted: an empty assistant
+            // message makes every later request 400 on strict APIs (Anthropic
+            // requires each message to carry >=1 content block), and once saved
+            // it does so until the session is cleared. final_text is already
+            // empty for this turn and has_tool_use is necessarily false, so just
+            // stop here with the provider's stop_reason.
+            if resp.blocks.is_empty() {
+                break;
+            }
             self.messages.push(Message::assistant(resp.blocks.clone()));
             self.save_session();
 
@@ -363,6 +373,16 @@ impl Agent {
                     "cancelled" | "stream_idle" | "stream_truncated" | "max_tokens"
                 );
             if aborted {
+                // If the abort is because a cancel arrived in the window between
+                // chat() returning and this check (e.g. during save_session
+                // above), stop_reason is still the provider's value (e.g.
+                // "tool_use"/"end_turn") — which would map to the wrong exit
+                // code (1 or 0 instead of 130). The cancel is the real reason
+                // here, so override it. (The other abort source — stop_reason
+                // itself being max_tokens/stream_truncated — leaves it as-is.)
+                if self.cancelled() {
+                    stop_reason = "cancelled".into();
+                }
                 let kept: Vec<Block> = resp
                     .blocks
                     .iter()
@@ -694,17 +714,18 @@ fn fold_summary(messages: &[Message], cut: usize, summary: &str) -> Vec<Message>
 /// boundary: its tool_use blocks (if any) are answered by the tool_result
 /// that immediately follows it inside the kept tail. Cutting before a
 /// tool_result-bearing user message would orphan those results, so those
-/// are skipped. Must leave at least one middle message worth summarizing
-/// (cut >= 2).
+/// are skipped. Must leave at least one middle message worth summarizing,
+/// i.e. n must exceed keep_recent by at least 3 (the kept tail, the
+/// assistant boundary to cut at, and one message before it to summarize).
 fn find_safe_cut(messages: &[Message], keep_recent: usize) -> Option<usize> {
     let n = messages.len();
     if n <= keep_recent + 2 {
         return None;
     }
-    let mut cut = n - keep_recent;
+    let mut cut = n - keep_recent; // always >= 3 by the guard above
     while cut < n {
         if messages[cut].role == Role::Assistant {
-            return if cut >= 2 { Some(cut) } else { None };
+            return Some(cut);
         }
         cut += 1;
     }
@@ -1457,6 +1478,78 @@ mod tests {
             flag.load(Ordering::Relaxed),
             "entry must not have cleared the shared flag"
         );
+    }
+
+    /// A Provider that flips a shared cancel flag as `chat()` returns, with a
+    /// stop_reason NOT in the abort set ("end_turn"). Used to exercise the M8
+    /// window: a Ctrl-C lands between `chat()` returning and the abort check,
+    /// so the provider's own stop_reason is still "end_turn" — the loop must
+    /// override it to "cancelled", or the run exits 0 (end_turn) instead of 130.
+    struct CancelOnChatProvider {
+        flag: Arc<AtomicBool>,
+    }
+    impl Provider for CancelOnChatProvider {
+        fn chat(&self, _req: &ChatRequest, on_event: &mut dyn FnMut(ChatEvent)) -> Result<ChatResponse> {
+            on_event(ChatEvent::TextDelta("partial".into()));
+            // Simulate a Ctrl-C landing as the stream wraps up: the agent's own
+            // cancel Arc flips true here — AFTER run()'s entry reset, BEFORE the
+            // abort check runs. (A real cancel during the final streaming bytes
+            // hits the same window: CancellableSse breaks the stream, chat()
+            // returns with whatever stop_reason the provider last sent.)
+            self.flag.store(true, Ordering::Relaxed);
+            Ok(ChatResponse {
+                blocks: vec![Block::Text("partial".into())],
+                stop_reason: "end_turn".into(),
+                usage: None,
+            })
+        }
+    }
+
+    #[test]
+    fn cancel_arriving_after_chat_reports_cancelled_not_end_turn() {
+        // M8: a Ctrl-C that lands in the window between chat() returning and the
+        // abort check must surface stop_reason "cancelled" (→ exit 130), even
+        // though the provider's own stop_reason was "end_turn". Without the
+        // override the run reports "end_turn" (→ exit 0) and silently swallows
+        // the cancel — a real Ctrl-C during a response's final streaming bytes
+        // used to exit 0 instead of 130.
+        let cfg = cfg_with(5, 0, 0);
+        let flag = Arc::new(AtomicBool::new(false));
+        let prov = CancelOnChatProvider { flag: flag.clone() };
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], vec![user_text("hi")], test_ctx());
+        agent.set_cancel(flag);
+        let o = agent.run(&mut |_| {}).unwrap();
+        assert_eq!(o.stop_reason, "cancelled");
+        // The partial text the provider streamed still surfaces to the caller.
+        assert_eq!(o.final_text, "partial");
+    }
+
+    #[test]
+    fn empty_assistant_turn_is_not_persisted() {
+        // M10: a content-filtered / genuinely empty response (zero blocks,
+        // stop_reason "end_turn") must NOT be pushed as an empty assistant
+        // message — Anthropic requires each message to carry >=1 content block,
+        // so an empty assistant turn makes EVERY later request 400 until the
+        // session is cleared. The loop stops here without persisting the turn.
+        let cfg = cfg_with(5, 0, 0);
+        let (prov, _) = MockProvider::new(vec![MockTurn::Ok(ChatResponse {
+            blocks: vec![],
+            stop_reason: "end_turn".into(),
+            usage: None,
+        })]);
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], vec![user_text("hi")], test_ctx());
+        let o = agent.run(&mut |_| {}).unwrap();
+        assert_eq!(o.stop_reason, "end_turn");
+        assert_eq!(o.turns, 1);
+        assert_eq!(o.final_text, "");
+        // No empty assistant message was pushed: history is still just the one
+        // user turn (same-module access to the private `messages` field).
+        assert_eq!(
+            agent.messages.len(),
+            1,
+            "empty assistant turn must not be persisted"
+        );
+        assert_eq!(agent.messages[0].role, Role::User);
     }
 
     #[test]

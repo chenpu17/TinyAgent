@@ -251,6 +251,15 @@ pub fn run(
     });
 
     enable_raw_mode()?;
+    // Create the restore guard IMMEDIATELY after the first state-changing
+    // call, so a `?` failure in ANY of the steps below (EnterAlternateScreen /
+    // EnableBracketedPaste / EnableMouseCapture / Terminal::new — e.g. stdout
+    // not a tty, broken pipe) still drops the guard and restores the terminal.
+    // Drop is fully idempotent (every disable is `let _ =`), so creating the
+    // guard before some enables have run is harmless. (Previously the guard
+    // was created after all four enables, leaving a mid-setup failure stranded
+    // in raw mode + alt screen with no echo.)
+    let _guard = TerminalGuard;
     stdout().execute(EnterAlternateScreen)?;
     // Bracketed paste: terminals that support it deliver a pasted blob as one
     // Event::Paste (newlines included) instead of replaying it as keystrokes —
@@ -262,10 +271,6 @@ pub fn run(
     // selection is intercepted by the app — hold Shift to select/copy as usual
     // (most terminals bypass app mouse capture under Shift).
     stdout().execute(EnableMouseCapture)?;
-    // From here the terminal is modified; the guard restores it on drop so a
-    // panic (or a propagated `?` error) in the UI loop below can't strand the
-    // user in raw mode + alternate screen.
-    let _guard = TerminalGuard;
     let mut term = Terminal::new(ratatui::backend::CrosstermBackend::new(stdout()))?;
     let result = ui_loop(
         &mut term,

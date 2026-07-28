@@ -19,7 +19,7 @@ impl Tool for McpTool {
         self.def.clone()
     }
 
-    fn run(&self, input: &Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+    fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         let result = self.client.lock().unwrap().call(
             "tools/call",
             json!({"name": self.wire_name, "arguments": input}),
@@ -60,6 +60,10 @@ impl Tool for McpTool {
         if text.is_empty() && image.is_none() {
             text = "[empty tool result]".into();
         }
+        // Truncate like shell/read_file/list_dir: an MCP tool returning
+        // megabytes of text would otherwise bypass max_output_chars and bloat
+        // the context window (this was the one tool that ignored the cap).
+        crate::tools::truncate(&mut text, ctx.max_output_chars);
         Ok(ToolOutput {
             content: text,
             image,
