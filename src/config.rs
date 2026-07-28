@@ -40,11 +40,22 @@ pub struct Limits {
     #[serde(default = "default_max_output")]
     pub max_output_chars: usize,
     /// Compress conversation history beyond this many chars (0 = never).
+    /// Only the FALLBACK trigger: used when `max_context_tokens` is 0/unset.
+    /// Once `max_context_tokens > 0`, the token-based preflight estimate takes
+    /// over and this char threshold is ignored.
     #[serde(default = "default_compress_threshold")]
     pub compress_threshold_chars: usize,
     /// Messages kept verbatim at the tail when compressing.
     #[serde(default = "default_keep_recent")]
     pub keep_recent_messages: usize,
+    /// Model context-window ceiling in tokens. `> 0` switches preflight
+    /// compression to a token estimate (≈4 chars/token, reserving room for one
+    /// turn's output) that compacts before the provider would reject an
+    /// over-long request; `0` (default) keeps the legacy `compress_threshold_chars`
+    /// heuristic. Overflow compression is ALWAYS on regardless of this field —
+    /// it is the last-resort safety net and never depends on client config.
+    #[serde(default)]
+    pub max_context_tokens: u64,
 }
 
 impl Default for Limits {
@@ -55,6 +66,7 @@ impl Default for Limits {
             max_output_chars: default_max_output(),
             compress_threshold_chars: default_compress_threshold(),
             keep_recent_messages: default_keep_recent(),
+            max_context_tokens: 0,
         }
     }
 }
@@ -262,6 +274,20 @@ impl Config {
             if let Some(v) = l.keep_recent_messages {
                 self.limits.keep_recent_messages = v.min(self.limits.keep_recent_messages);
             }
+            // max_context_tokens is 0-sentineled like timeout_secs: 0 means
+            // "no preflight token compaction" (the LOOSEST), so a task setting 0
+            // is a loosening and is ignored; a finite v can only tighten (adopt
+            // from a 0/disabled base, or min against a finite base → compacts
+            // earlier). Batch tasks may trigger compression sooner, never later.
+            if let Some(v) = l.max_context_tokens {
+                if v != 0 {
+                    self.limits.max_context_tokens = if self.limits.max_context_tokens == 0 {
+                        v
+                    } else {
+                        v.min(self.limits.max_context_tokens)
+                    };
+                }
+            }
         }
         if let Some(v) = p.mcp_servers {
             self.mcp_servers = v;
@@ -328,6 +354,7 @@ pub struct PartialLimits {
     pub max_output_chars: Option<usize>,
     pub compress_threshold_chars: Option<usize>,
     pub keep_recent_messages: Option<usize>,
+    pub max_context_tokens: Option<u64>,
 }
 
 #[cfg(test)]
@@ -506,5 +533,56 @@ mod tests {
             serde_json::from_str(r#"{"task":"x","limits":{"timeout_secs":120}}"#).unwrap();
         cfg.apply(partial).unwrap();
         assert_eq!(cfg.limits.timeout_secs, 60, "a larger task timeout must not loosen the base");
+    }
+
+    #[test]
+    fn batch_overlay_max_context_tokens_only_tightens() {
+        // max_context_tokens is 0-sentineled: 0 means "no preflight token
+        // compaction" (loosest). A task may set it (tighten: compact sooner) or
+        // tighten a finite base, but may NOT loosen/disable it.
+        // 0 in the partial is ignored — it's the no-op sentinel.
+        let mut cfg: Config = serde_json::from_str(
+            r#"{"provider":"anthropic","api_key_env":"K","model":"m",
+               "limits":{"max_context_tokens":200000}}"#,
+        )
+        .unwrap();
+        let partial: PartialConfig =
+            serde_json::from_str(r#"{"task":"x","limits":{"max_context_tokens":0}}"#).unwrap();
+        cfg.apply(partial).unwrap();
+        assert_eq!(cfg.limits.max_context_tokens, 200000, "0 sentinel must not disable");
+
+        // From a disabled base (0), a finite task value is adopted.
+        let mut cfg: Config = serde_json::from_str(
+            r#"{"provider":"anthropic","api_key_env":"K","model":"m"}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.limits.max_context_tokens, 0);
+        let partial: PartialConfig =
+            serde_json::from_str(r#"{"task":"x","limits":{"max_context_tokens":8000}}"#).unwrap();
+        cfg.apply(partial).unwrap();
+        assert_eq!(cfg.limits.max_context_tokens, 8000, "finite value adopted from 0 base");
+
+        // From a finite base, a task can only tighten (min), never loosen.
+        let mut cfg: Config = serde_json::from_str(
+            r#"{"provider":"anthropic","api_key_env":"K","model":"m",
+               "limits":{"max_context_tokens":100000}}"#,
+        )
+        .unwrap();
+        let partial: PartialConfig =
+            serde_json::from_str(r#"{"task":"x","limits":{"max_context_tokens":50000}}"#).unwrap();
+        cfg.apply(partial).unwrap();
+        assert_eq!(cfg.limits.max_context_tokens, 50000);
+
+        let mut cfg: Config = serde_json::from_str(
+            r#"{"provider":"anthropic","api_key_env":"K","model":"m",
+               "limits":{"max_context_tokens":100000}}"#,
+        )
+        .unwrap();
+        let partial: PartialConfig = serde_json::from_str(
+            r#"{"task":"x","limits":{"max_context_tokens":200000}}"#,
+        )
+        .unwrap();
+        cfg.apply(partial).unwrap();
+        assert_eq!(cfg.limits.max_context_tokens, 100000, "larger task value must not loosen");
     }
 }

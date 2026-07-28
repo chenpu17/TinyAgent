@@ -42,6 +42,11 @@ pub(crate) struct Captured {
     pub(crate) trailing_tool_uses: usize,
     /// tool_result blocks on the trailing user message.
     pub(crate) trailing_tool_results: usize,
+    /// Every `Block::Text` body in a USER-role message, in order. The summary /
+    /// combine calls build a single user message carrying their prompt, so this
+    /// lets a test assert what the summarizer was fed (a running-summary update
+    /// vs. fresh transcript, chunk segments vs. the combined brief).
+    pub(crate) user_texts: Vec<String>,
     /// The `cache` flag on the request — lets tests assert that one-off calls
     /// (the compression summary) request `cache:false` while agent turns send
     /// `cache:true`. The mock doesn't build an HTTP body, so this records the
@@ -108,6 +113,7 @@ impl Provider for MockProvider {
         // transformations like context compression.
         let mut tool_use_ids = Vec::new();
         let mut tool_result_ids = Vec::new();
+        let mut user_texts = Vec::new();
         for m in req.messages {
             for b in &m.content {
                 match b {
@@ -115,6 +121,10 @@ impl Provider for MockProvider {
                     Block::ToolResult { tool_use_id, .. } => {
                         tool_result_ids.push(tool_use_id.clone())
                     }
+                    // Capture user-message text so tests can assert what the
+                    // summarizer (single/chunk/combine) was fed. Assistant text
+                    // and tool results aren't needed for those assertions.
+                    Block::Text(t) if m.role == Role::User => user_texts.push(t.clone()),
                     _ => {}
                 }
             }
@@ -127,6 +137,7 @@ impl Provider for MockProvider {
             trailing_tool_results,
             tool_use_ids,
             tool_result_ids,
+            user_texts,
             cache: req.cache,
         });
 

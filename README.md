@@ -209,7 +209,8 @@ tiny-agent --config examples/harness.json --task "跑测试" --retries 3 --outpu
     "timeout_secs": 600,
     "max_output_chars": 30000,
     "compress_threshold_chars": 100000,
-    "keep_recent_messages": 8
+    "keep_recent_messages": 8,
+    "max_context_tokens": 0
   }
 }
 ```
@@ -218,12 +219,22 @@ API key 从 `api_key_env` 指定的环境变量读取，不写进配置文件。
 
 ### 上下文压缩
 
-长任务中历史消息会持续增长直至撞模型上下文上限。当历史总字符数超过
-`compress_threshold_chars`（默认 100k，`0` = 关闭）时，agent 会在下一轮调用前
-自动压缩：让模型把中段历史写成结构化摘要，折叠进首条任务消息，只保留任务 +
-最近 `keep_recent_messages` 条原文。切割点选在 assistant 消息边界，保证
-tool_use/tool_result 配对不被切断；压缩失败时告警一次并禁用本次运行的后续压缩
-（不中断任务，也不每轮重试刷屏）。运行日志中可见
+长任务中历史消息会持续增长直至撞模型上下文上限。压缩有**两条触发路径**，共用同一套摘要逻辑：
+
+1. **前馈（preflight）**——每轮调用前预估请求大小，超阈值就先压缩再用更短的历史发请求。阈值二选一：
+   - 设了 `max_context_tokens`（>0）：改用 token 估算（≈4 字符/token，另预留本回合 `max_tokens` 输出），
+     到窗口的 ~85% 就压。这是「按模型真实窗口压」，推荐。
+   - 未设（`0`，默认）：回退 `compress_threshold_chars`（默认 100k 字符，`0` = 关闭）的字符启发式。
+2. **溢出（overflow）兜底**——**永远开启，与上面配置无关**。当 provider 返回「上下文过长」类错误
+   （`context_length_exceeded` / `prompt is too long` / `maximum context length` 等，子串匹配错误体）
+   时，强制压缩一次并**重试该回合一次**；第二次仍溢出才当真错误上抛。这样即便前馈估算偏了、
+   或工具 schema / system prompt 占了大头，agent 也能自愈而不是整轮失败。
+
+摘要质量上：模型把中段历史写成**结构化滚动摘要**（目标/进展/决策/改动文件/报错与解法/下一步），
+折叠进首条任务消息，只保留任务 + 最近 `keep_recent_messages` 条原文；后续压缩是**更新**这份摘要而非
+重摘要整个前缀。前缀过大时按消息边界**分块**摘要再合并，把单次压缩比控制在 ~6:1，保住路径/报错等细节。
+切割点选在 assistant 消息边界，保证 tool_use/tool_result 配对不被切断；压缩失败时告警一次并禁用本次
+运行的后续压缩（不中断任务，也不每轮重试刷屏）。运行日志中可见
 `[context compressed: dropped N messages, M kept]`。
 
 压缩摘要请求自身的 token 用量也计入运行累计（`input_tokens` / `output_tokens`），
@@ -362,16 +373,16 @@ src/
 ├── main.rs      (311)  # CLI 入口 + 组装（build_agent）+ --session none
 ├── config.rs    (471)  # 配置解析 + 任务片段合并 + 批量覆盖白名单
 ├── provider/           # LLM 后端
-│   ├── mod.rs   (316)  #   共享 Message/Block、SSE reader、CancellableSse
-│   ├── openai.rs (624) #   OpenAI 兼容（include_usage；400 回退：max_tokens→max_completion_tokens / 丢 stream_options）
-│   ├── anthropic.rs(400) # Anthropic 原生（message_start/message_delta usage）
-│   └── mock.rs   (158) #   测试用脚本化 Provider（cfg(test)）
-├── agent.rs    (1242) # 核心 loop + usage 累计 + cancel + 上下文压缩 + 相邻消息归一 + 回归测试
-├── signal.rs     (58) # headless SIGINT → cancel（首次优雅 / 二次硬退出 130）
+│   ├── mod.rs   (412)  #   共享 Message/Block、SSE reader、CancellableSse
+│   ├── openai.rs (716) #   OpenAI 兼容（include_usage；400 回退：max_tokens→max_completion_tokens / 丢 stream_options）
+│   ├── anthropic.rs(538) # Anthropic 原生（message_start/message_delta usage）
+│   └── mock.rs   (216) #   测试用脚本化 Provider（cfg(test)）
+├── agent.rs    (2878) # 核心 loop + usage 累计 + cancel + 上下文压缩（前馈/溢出双触发 + 滚动分块摘要）+ 相邻消息归一 + 回归测试
+├── signal.rs     (60) # headless SIGINT → cancel（首次优雅 / 二次硬退出 130）
 ├── tools/              # 5 个内置工具 + MCP 工具包装
-├── mcp.rs      (648)   # MCP 客户端（stdio / Streamable HTTP / 旧版 SSE）
+├── mcp.rs      (732)   # MCP 客户端（stdio / Streamable HTTP / 旧版 SSE）
 ├── session.rs   (125)  # 会话持久化
-├── batch.rs     (475)  # 批量任务 + --retries/--failed + 报告合并
-├── harness.rs   (281)  # headless 模式 + result.json + NDJSON + exit code
+├── batch.rs     (596)  # 批量任务 + --retries/--failed + 报告合并
+├── harness.rs   (472)  # headless 模式 + result.json + NDJSON + exit code
 └── tui.rs      (1274)  # TUI（feature-gated）：InputBuffer / 模式 / 斜杠命令 / bracketed paste
 ```

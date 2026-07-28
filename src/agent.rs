@@ -260,14 +260,16 @@ impl Agent {
             }
             turns += 1;
             events(AgentEvent::TurnStart(turns));
-            // The summary request (if compression fires) is a real billed call;
-            // fold its usage into the run totals so result.json / TUI report
-            // honest costs. compress_if_needed returns Option<Option<Usage>>:
-            // outer None = no compression ran; inner None = compression ran but
-            // the provider reported no usage. We only count/emit on Some(Some):
-            // a usage-less summary contributes nothing and must not emit a
-            // noise Usage{0,0} event into the NDJSON stream / TUI status.
-            if let Some(Some(u)) = self.compress_if_needed(events, deadline) {
+            // Preflight compression: if the history is large enough that this
+            // request would blow the window, summarize first. The summary
+            // request is a real billed call; fold its usage into the run totals
+            // so result.json / TUI report honest costs. compress returns
+            // Option<Option<Usage>>: outer None = no compression ran; inner
+            // None = compression ran but the provider reported no usage. We only
+            // count/emit on Some(Some): a usage-less summary contributes nothing
+            // and must not emit a noise Usage{0,0} event into the NDJSON stream
+            // / TUI status.
+            if let Some(Some(u)) = self.compress(events, deadline, /*force*/ false) {
                 in_tokens += u.input_tokens;
                 out_tokens += u.output_tokens;
                 cache_create += u.cache_creation_input_tokens;
@@ -280,36 +282,92 @@ impl Agent {
                 });
             }
 
-            // Safety net: fold any adjacent same-role messages (e.g. a resumed
-            // session that ends on two user messages, or a hand-edited history)
-            // into one before sending — Anthropic rejects consecutive user
-            // messages with a 400. The normal append paths already alternate,
-            // so this is usually a no-op.
-            normalize_adjacent(&mut self.messages);
+            // Overflow recovery (OpenCode semantics): if the provider rejects
+            // this request as too long for the context window, force ONE
+            // compression and retry the turn on the shorter history; a second
+            // overflow is a real error. The request borrows &self.messages, so
+            // it lives in an inner block whose end releases that borrow before
+            // the (mutable) compress call in the recovery arm.
+            let mut overflow_recovered = false;
+            let resp = loop {
+                let before = self.messages.len();
+                let r = {
+                    // Safety net: fold any adjacent same-role messages (e.g. a
+                    // resumed session that ends on two user messages, or a
+                    // hand-edited history) into one before sending — Anthropic
+                    // rejects consecutive user messages with a 400. Idempotent,
+                    // so re-running it after a compression-folded history (still
+                    // strictly alternating) is a no-op.
+                    normalize_adjacent(&mut self.messages);
 
-            let req = ChatRequest {
-                system: self.system.as_deref(),
-                messages: &self.messages,
-                tools: &self.tool_defs,
-                model: &self.model,
-                max_tokens: self.max_tokens,
-                per_request_timeout: deadline
-                    .map(|d| d.saturating_duration_since(Instant::now())),
-                // Shared cancel flag: the streaming reader checks it between
-                // chunks, so Esc/Ctrl-C can interrupt a stuck request mid-read
-                // (not only at the next turn boundary). Headless has no flag →
-                // a dummy never-set one, so idle-timeout still applies.
-                cancel: self
-                    .cancel
-                    .clone()
-                    .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
-                // The main turn benefits from prompt caching (re-reads the
-                // stable prefix across turns); one-off requests opt out.
-                cache: true,
+                    let req = ChatRequest {
+                        system: self.system.as_deref(),
+                        messages: &self.messages,
+                        tools: &self.tool_defs,
+                        model: &self.model,
+                        max_tokens: self.max_tokens,
+                        per_request_timeout: deadline
+                            .map(|d| d.saturating_duration_since(Instant::now())),
+                        // Shared cancel flag: the streaming reader checks it
+                        // between chunks, so Esc/Ctrl-C can interrupt a stuck
+                        // request mid-read (not only at the next turn boundary).
+                        // Headless has no flag → a dummy never-set one, so
+                        // idle-timeout still applies.
+                        cancel: self
+                            .cancel
+                            .clone()
+                            .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
+                        // The main turn benefits from prompt caching (re-reads
+                        // the stable prefix across turns); one-off requests opt
+                        // out.
+                        cache: true,
+                    };
+                    self.provider.chat(&req, &mut |e| match e {
+                        ChatEvent::TextDelta(t) => events(AgentEvent::TextDelta(t)),
+                    })
+                }; // req dropped here → &self.messages borrow released
+                match r {
+                    Ok(resp) => break resp,
+                    Err(e) if !overflow_recovered && is_context_overflow(&e) => {
+                        // Need a compressible head and a non-failed compressor;
+                        // checked in the body (not the guard) to keep `self`
+                        // borrows out of the match guard.
+                        let can_compress = !self.compress_failed
+                            && find_safe_cut(
+                                &self.messages,
+                                self.limits.keep_recent_messages,
+                            )
+                            .is_some();
+                        if can_compress {
+                            overflow_recovered = true;
+                            // The server proved it's too long: force one
+                            // compression regardless of the size threshold, and
+                            // fold its usage into the run totals (honest cost).
+                            if let Some(Some(u)) =
+                                self.compress(events, deadline, /*force*/ true)
+                            {
+                                in_tokens += u.input_tokens;
+                                out_tokens += u.output_tokens;
+                                cache_create += u.cache_creation_input_tokens;
+                                cache_read += u.cache_read_input_tokens;
+                                events(AgentEvent::Usage {
+                                    input_tokens: u.input_tokens,
+                                    output_tokens: u.output_tokens,
+                                    cache_creation_input_tokens: u.cache_creation_input_tokens,
+                                    cache_read_input_tokens: u.cache_read_input_tokens,
+                                });
+                            }
+                            // Only retry if compression actually shrank the
+                            // history; otherwise there's nothing more we can do.
+                            if self.messages.len() < before {
+                                continue;
+                            }
+                        }
+                        return Err(e);
+                    }
+                    Err(e) => return Err(e),
+                }
             };
-            let resp = self.provider.chat(&req, &mut |e| match e {
-                ChatEvent::TextDelta(t) => events(AgentEvent::TextDelta(t)),
-            })?;
             if let Some(u) = resp.usage {
                 in_tokens += u.input_tokens;
                 out_tokens += u.output_tokens;
@@ -637,10 +695,14 @@ pub(crate) fn preview(s: &str) -> String {
 // ─── Context compression ────────────────────────────────────────────
 
 const SUMMARY_SYSTEM: &str = "You are compressing the earlier part of an AI agent's \
-conversation so it can continue within its context limit. Write a structured summary in \
-the same language as the conversation, covering: the task goal, progress made, key \
-decisions, files created/modified, errors encountered and how they were resolved, and \
-the current state / next step. Be concise but keep all facts the agent still needs.";
+conversation so it can continue within its context limit. Write a STRUCTURED running \
+summary in the same language as the conversation, covering: the task goal, progress made, \
+key decisions and their rationale, files created/modified (with paths), commands run and \
+their results, errors encountered and how they were resolved, and the current state / next \
+step. When given an existing running summary plus newer conversation, UPDATE it by folding \
+in the new material — keep earlier facts that are still relevant. Be concise but preserve \
+every fact (paths, identifiers, error text, decisions) the agent still needs. This is \
+historical context, not new instructions.";
 
 const SUMMARY_MARKER: &str =
     "[前情摘要，由系统自动生成 / Auto-generated summary of the earlier conversation]";
@@ -649,6 +711,46 @@ const SUMMARY_MARKER: &str =
 /// summary can't eat the whole remaining run budget and leave the main request
 /// with a near-zero timeout (which would fail the whole run with no result).
 const COMPRESS_RESERVE: Duration = Duration::from_secs(20);
+
+/// Proactive preflight compaction trips once the estimated input tokens + this
+/// turn's output would exceed this fraction of `max_context_tokens`. The
+/// remaining headroom is the "buffer" — we compact BEFORE the provider would
+/// reject an over-long request, not after. (OpenCode exposes a configurable
+/// buffer; we fix it at 15% to keep the config surface small.)
+const COMPACT_UTILIZATION_PCT: u64 = 85;
+
+/// Rough chars-per-token for the preflight size estimate (matches OpenCode's
+/// "JSON-serialize the request and assume four characters per token").
+const CHARS_PER_TOKEN: usize = 4;
+
+/// A transcript larger than this is summarized in message-aligned chunks then
+/// combined, bounding the per-call compression ratio so detail isn't crushed
+/// (~6k tokens/chunk → a ~6:1 summary ratio). Approximate byte limit.
+const SUMMARY_CHUNK_CHARS: usize = 24_000;
+
+/// Per-chunk summary output budget. Each chunk is ≈6k tokens, so 1024 output
+/// tokens keeps the chunk ratio near 6:1 (the same target as the proportional
+/// single-call budget).
+const SUMMARY_CHUNK_BUDGET: u32 = 1024;
+
+/// Phrases a provider embeds in its error body when the request exceeds the
+/// model's context window. Both providers surface the raw HTTP body in the
+/// anyhow error's Display (`openai.rs` "…API error 400: {text}",
+/// `anthropic.rs` "…API error {status}: {text}"), so a case-blind substring
+/// match is enough. `body_fix_for_400` has already absorbed the max_tokens /
+/// stream_options 400s, so only genuine overflow (and the odd 413) reaches
+/// here. Conservative list covering OpenAI / Anthropic / DeepSeek / vLLM / Ollama.
+const OVERFLOW_PHRASES: &[&str] = &[
+    "context_length_exceeded",
+    "maximum context length",
+    "prompt is too long",
+    "too many input tokens",
+    "context length",
+    "reduce the length",
+    "reduce your prompt",
+    "input length and max_tokens",
+    "request_too_large",
+];
 
 /// Merge adjacent messages that share a role into one. Anthropic rejects two
 /// consecutive user messages with a 400, and tool_use ↔ tool_result pairing is
@@ -691,6 +793,28 @@ fn total_chars(messages: &[Message]) -> usize {
             }
         })
         .sum()
+}
+
+/// Rough token estimate of what the next request will cost the model: message
+/// content + system prompt + advertised tool schemas, divided by the
+/// chars-per-token heuristic. Used ONLY for the preflight "should I compact
+/// before this request?" decision — never billed or reported; the provider's
+/// real usage is the source of truth for accounting.
+fn estimate_tokens(messages: &[Message], system: Option<&str>, tools: &[ToolDef]) -> usize {
+    let tool_chars: usize = tools
+        .iter()
+        .map(|t| t.name.len() + t.description.len() + t.schema.to_string().len())
+        .sum();
+    let chars = total_chars(messages) + system.map(|s| s.len()).unwrap_or(0) + tool_chars;
+    chars / CHARS_PER_TOKEN
+}
+
+/// True if a provider error looks like "the request was too long for the
+/// model's context window" — i.e. compressing and retrying might let it fit.
+/// See `OVERFLOW_PHRASES` for the match surface.
+fn is_context_overflow(e: &anyhow::Error) -> bool {
+    let msg = format!("{e:#}").to_lowercase();
+    OVERFLOW_PHRASES.iter().any(|p| msg.contains(p))
 }
 
 /// Build the compressed history: original task (with the summary folded in
@@ -747,22 +871,49 @@ fn append_user_turn(messages: &mut Vec<Message>, blocks: Vec<Block>) {
     }
 }
 impl Agent {
-    /// If history exceeds the configured threshold, summarize the middle
-    /// via the LLM and keep only the original task + recent tail.
-    /// Failures degrade gracefully (warn and continue uncompressed).
+    /// Compress history if it's too large, summarizing the middle via the LLM
+    /// and keeping only the head (+ folded summary) and recent tail. Failures
+    /// degrade gracefully (warn and continue uncompressed).
+    ///
+    /// `force=true` skips the size threshold — used by overflow recovery, where
+    /// the provider has just PROVEN the request is too long. The preflight path
+    /// (`force=false`) gates on a token estimate against `max_context_tokens`
+    /// when set, else the legacy char heuristic.
     ///
     /// Returns the summary request's token usage wrapped twice:
-    /// - outer `None` — no compression ran (below threshold / out of budget);
+    /// - outer `None` — no compression ran (below threshold / out of budget /
+    ///   nothing compressible when forced);
     /// - `Some(None)` — compression ran but the provider reported no usage
     ///   (count nothing, emit no Usage event);
     /// - `Some(Some(u))` — compression ran and billed `u` (count + emit).
-    fn compress_if_needed(
+    fn compress(
         &mut self,
         events: &mut dyn FnMut(AgentEvent),
         deadline: Option<Instant>,
+        force: bool,
     ) -> Option<Option<Usage>> {
-        let threshold = self.limits.compress_threshold_chars;
-        if self.compress_failed || threshold == 0 || total_chars(&self.messages) <= threshold {
+        // Threshold gate. force=true (overflow recovery) skips it — the provider
+        // just proved the request is too long, so compress regardless of size.
+        // Otherwise the trigger depends on config: a token estimate against
+        // max_context_tokens when set, else the legacy char heuristic.
+        if !force {
+            let over = if self.limits.max_context_tokens > 0 {
+                let est = estimate_tokens(&self.messages, self.system.as_deref(), &self.tool_defs);
+                // Trip at COMPACT_UTILIZATION_PCT of the window, reserving room
+                // for this turn's max_tokens output — so we compact BEFORE the
+                // provider would reject an over-long request, not after.
+                let cap = self.limits.max_context_tokens as usize
+                    * COMPACT_UTILIZATION_PCT as usize
+                    / 100;
+                est + self.max_tokens as usize > cap
+            } else {
+                let threshold = self.limits.compress_threshold_chars;
+                threshold > 0 && total_chars(&self.messages) > threshold
+            };
+            if self.compress_failed || !over {
+                return None;
+            }
+        } else if self.compress_failed {
             return None;
         }
         // Compression is best-effort: never let the summary request eat the
@@ -811,52 +962,162 @@ impl Agent {
         Some(sum_usage)
     }
 
-    /// Ask the LLM to summarize messages[..cut] into a compact brief. Returns
-    /// the summary text and the summary request's token usage.
-    fn summarize_prefix(
-        &self,
-        cut: usize,
-        deadline: Option<Instant>,
-    ) -> Result<(String, Option<Usage>)> {
-        let mut transcript = String::new();
-        for m in &self.messages[..cut] {
+    /// Pull the previous rolling summary out of the head message (if any). The
+    /// summary is stored as a Text block beginning with SUMMARY_MARKER (see
+    /// fold_summary); on a later compression we UPDATE it rather than re-feed
+    /// it as raw transcript, so the model refines a running brief instead of
+    /// re-summarizing its own output every time.
+    fn extract_running_summary(messages: &[Message]) -> Option<String> {
+        let head = messages.first()?;
+        head.content.iter().find_map(|b| match b {
+            Block::Text(t) if t.starts_with(SUMMARY_MARKER) => {
+                // Strip the marker line; keep the summary body.
+                Some(t[SUMMARY_MARKER.len()..].trim_start_matches('\n').to_string())
+            }
+            _ => None,
+        })
+    }
+
+    /// Format each block of `messages[..cut]` (skipping the head's running-
+    /// summary block) as a transcript line. Shared by the single-call and
+    /// chunked summarize paths so the formatting lives in one place.
+    fn window_lines(messages: &[Message], cut: usize) -> Vec<String> {
+        let mut lines = Vec::new();
+        for (i, m) in messages[..cut].iter().enumerate() {
             let role = match m.role {
                 Role::User => "user",
                 Role::Assistant => "assistant",
             };
             for b in &m.content {
-                match b {
-                    Block::Text(t) => transcript.push_str(&format!("[{role}] {t}\n")),
-                    Block::Image { .. } => transcript.push_str(&format!("[{role}] <image>\n")),
+                // Skip the head's running-summary block — it's the thing we're
+                // updating, not raw conversation to summarize.
+                if i == 0 {
+                    if let Block::Text(t) = b {
+                        if t.starts_with(SUMMARY_MARKER) {
+                            continue;
+                        }
+                    }
+                }
+                let line = match b {
+                    Block::Text(t) => format!("[{role}] {t}\n"),
+                    Block::Image { .. } => format!("[{role}] <image>\n"),
                     Block::ToolUse { name, input, .. } => {
-                        let args = input.to_string();
-                        let args = preview(&args);
-                        transcript.push_str(&format!("[{role}] tool_call {name}: {args}\n"))
+                        format!("[{role}] tool_call {name}: {}\n", preview(&input.to_string()))
                     }
                     Block::ToolResult {
                         content, is_error, ..
                     } => {
                         let body = preview(content);
                         let tag = if *is_error { "tool_error" } else { "tool_result" };
-                        transcript.push_str(&format!("[{role}] {tag}: {body}\n"))
+                        format!("[{role}] {tag}: {body}\n")
                     }
-                }
+                };
+                lines.push(line);
             }
         }
+        lines
+    }
+
+    /// Build the transcript of the prefix being summarized and the prior running
+    /// summary (if any). Pure function — unit-tested directly.
+    #[cfg(test)]
+    fn build_window_transcript(messages: &[Message], cut: usize) -> (String, Option<String>) {
+        let old_summary = Agent::extract_running_summary(messages);
+        let transcript = Agent::window_lines(messages, cut).concat();
+        (transcript, old_summary)
+    }
+
+    /// Ask the LLM to summarize `messages[..cut]` into a compact running brief.
+    /// Returns the summary text and the summed token usage across every summary
+    /// call (single, or per-chunk + combine).
+    ///
+    /// Small/normal prefixes make ONE call with a proportional budget. A large
+    /// prefix is split into message-aligned chunks (each ≤ SUMMARY_CHUNK_CHARS),
+    /// each summarized at a fixed budget, then the chunk summaries (+ any prior
+    /// running summary) are combined into the final brief. This bounds the
+    /// per-call compression ratio (~6:1) so coding-relevant detail (paths,
+    /// errors, decisions) survives, and keeps each call small enough that a
+    /// summary request itself can't overflow — which matters for overflow
+    /// recovery, which force-compresses exactly when the context is huge.
+    fn summarize_prefix(
+        &self,
+        cut: usize,
+        deadline: Option<Instant>,
+    ) -> Result<(String, Option<Usage>)> {
+        let old_summary = Agent::extract_running_summary(&self.messages);
+        let lines = Agent::window_lines(&self.messages, cut);
+        let transcript_size: usize = lines.iter().map(|l| l.len()).sum();
+
+        if transcript_size <= SUMMARY_CHUNK_CHARS {
+            // Common case: one summary call with a proportional budget.
+            let transcript = lines.concat();
+            let budget = summary_budget(transcript_size);
+            self.summary_call(
+                &summary_prompt(&transcript, old_summary.as_deref()),
+                budget,
+                deadline,
+                1,
+            )
+        } else {
+            // Large prefix: summarize chunks, then combine.
+            let chunks = chunk_lines(lines, SUMMARY_CHUNK_CHARS);
+            let n_calls = chunks.len() + 1; // per-chunk + combine
+            let mut usage = None;
+            let mut chunk_summaries = Vec::with_capacity(chunks.len());
+            for chunk in &chunks {
+                let (s, u) = self.summary_call(
+                    &summary_prompt(chunk, None),
+                    SUMMARY_CHUNK_BUDGET,
+                    deadline,
+                    n_calls,
+                )?;
+                usage = merge_usage(usage, u);
+                chunk_summaries.push(s);
+            }
+            // Combine the chunk summaries (+ prior running summary via the
+            // prompt's old_summary slot) into the final updated brief.
+            let mut combined = String::from(
+                "Summaries of recent conversation segments, in chronological order:\n",
+            );
+            for (i, s) in chunk_summaries.iter().enumerate() {
+                combined.push_str(&format!("\n[segment {}]\n{s}\n", i + 1));
+            }
+            let budget = summary_budget(combined.len());
+            let (final_summary, u) = self.summary_call(
+                &summary_prompt(&combined, old_summary.as_deref()),
+                budget,
+                deadline,
+                n_calls,
+            )?;
+            usage = merge_usage(usage, u);
+            Ok((final_summary, usage))
+        }
+    }
+
+    /// One summary chat call (no tools, no cache). `n_calls` shares the
+    /// remaining run budget evenly across all summary calls of this compression
+    /// so a multi-chunk summarize can't eat the main turn's time budget.
+    fn summary_call(
+        &self,
+        prompt: &str,
+        max_tokens: u32,
+        deadline: Option<Instant>,
+        n_calls: usize,
+    ) -> Result<(String, Option<Usage>)> {
         let req = ChatRequest {
             system: Some(SUMMARY_SYSTEM),
-            messages: &[Message::user(vec![Block::Text(format!(
-                "Summarize this conversation transcript:\n\n{transcript}"
-            ))])],
+            messages: &[Message::user(vec![Block::Text(prompt.to_string())])],
             tools: &[],
             model: &self.model,
-            max_tokens: 2048,
-            // Cap the summary to the remaining budget MINUS a reserve for the
-            // main request that follows in the same turn, so summarizing can't
-            // starve the main chat into a zero-timeout failure.
+            max_tokens,
+            // Even share of (remaining − reserve) across all summary calls, so
+            // a multi-chunk compression can't starve the main chat that follows
+            // in the same turn.
             per_request_timeout: deadline.map(|d| {
-                d.saturating_duration_since(Instant::now())
-                    .saturating_sub(COMPRESS_RESERVE)
+                let remaining = d
+                    .saturating_duration_since(Instant::now())
+                    .saturating_sub(COMPRESS_RESERVE);
+                remaining / (n_calls as u32)
             }),
             cancel: self
                 .cancel
@@ -878,6 +1139,63 @@ impl Agent {
             .collect::<Vec<_>>()
             .join("\n");
         Ok((text, resp.usage))
+    }
+}
+
+/// Proportional summary output budget: ≈16 bytes of transcript per output
+/// token, clamped to [1024, 4096]. 100k bytes → 4096 tokens (~6:1), a small
+/// window → 1024. Replaces the old fixed 2048, which crushed a 100k-char
+/// prefix at ~12:1 and dropped coding-relevant detail.
+fn summary_budget(size: usize) -> u32 {
+    ((size / 16) as u32).clamp(1024, 4096)
+}
+
+/// Build the user message for a summary call. With an `old_summary` we ask the
+/// model to UPDATE a running brief from new material; otherwise to summarize
+/// fresh. The system prompt (SUMMARY_SYSTEM) is shared.
+fn summary_prompt(body: &str, old_summary: Option<&str>) -> String {
+    match old_summary {
+        Some(old) if !old.trim().is_empty() => format!(
+            "Below is the current running summary of the earlier conversation, followed by newer \
+             conversation. Produce an UPDATED running summary that folds in the new material while \
+             keeping earlier facts that are still relevant.\n\n\
+             ## Current running summary\n{old}\n\n## Newer conversation\n{body}"
+        ),
+        _ => format!("Summarize this conversation transcript:\n\n{body}"),
+    }
+}
+
+/// Split transcript lines into chunks each ≤ `max_bytes`, breaking only at line
+/// boundaries (so a tool_use/tool_result block stays in one chunk). A single
+/// oversized line becomes its own chunk rather than being split mid-block.
+fn chunk_lines(lines: Vec<String>, max_bytes: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut cur = String::new();
+    for line in lines {
+        if !cur.is_empty() && cur.len() + line.len() > max_bytes {
+            chunks.push(std::mem::take(&mut cur));
+        }
+        cur.push_str(&line);
+    }
+    if !cur.is_empty() {
+        chunks.push(cur);
+    }
+    chunks
+}
+
+/// Add two optional per-request usages into one. Either side may be `None`
+/// (provider reported no usage); the result carries whichever was billed.
+fn merge_usage(a: Option<Usage>, b: Option<Usage>) -> Option<Usage> {
+    match (a, b) {
+        (None, None) => None,
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (Some(mut x), Some(y)) => {
+            x.input_tokens += y.input_tokens;
+            x.output_tokens += y.output_tokens;
+            x.cache_creation_input_tokens += y.cache_creation_input_tokens;
+            x.cache_read_input_tokens += y.cache_read_input_tokens;
+            Some(x)
+        }
     }
 }
 
@@ -2056,6 +2374,279 @@ mod tests {
                 .any(|e| matches!(e, AgentEvent::Compressed { .. })),
             "no compress event on summary failure"
         );
+    }
+
+    #[test]
+    fn proactive_compress_on_token_estimate() {
+        // max_context_tokens switches preflight to a token estimate (≈4
+        // chars/token, reserving this turn's output). A history whose estimate
+        // + output exceeds 85% of the window triggers compression BEFORE the
+        // main request — same fold / event / short-history guarantees as the
+        // char-threshold path, but driven by the model's real window size.
+        let mut cfg = cfg_with(5, 0, 0); // char threshold off
+        cfg.limits.max_context_tokens = 1000;
+        cfg.limits.keep_recent_messages = 2;
+        cfg.max_tokens = 100;
+        let long = "x".repeat(4000); // est ≈ 1000 tokens >> 85% of 1000 (850)
+        let initial = vec![
+            user_text(&long),
+            Message::assistant(vec![Block::Text("a1".into())]),
+            user_text("u1"),
+            Message::assistant(vec![Block::Text("a2".into())]),
+            user_text("u2"),
+        ];
+        let (prov, state) = MockProvider::new(vec![
+            mock::resp_text("SUMMARY", None), // summarize_prefix call
+            mock::resp_text("final", None),   // main call on folded history
+        ]);
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+        let mut events = Vec::new();
+        let o = agent.run(&mut |e| events.push(e)).unwrap();
+        assert_eq!(o.stop_reason, "end_turn");
+        assert_eq!(state.calls(), 2);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Compressed { dropped: 2, kept: 3 })));
+        let cap = state.captured();
+        assert_eq!(cap[1].message_count, 3, "main call saw the folded history");
+    }
+
+    #[test]
+    fn overflow_error_triggers_force_compress_then_retry() {
+        // The core overflow path: the provider rejects the request as too long
+        // → the agent force-compresses ONCE and retries the SAME turn on the
+        // shorter history, which then succeeds. Pins OpenCode's "compact and
+        // retry that step once" recovery — without it, an over-long request
+        // fails the whole run instead of self-healing.
+        let mut cfg = cfg_with(5, 0, 0); // no preflight; only the overflow path fires
+        cfg.limits.keep_recent_messages = 2;
+        let long = "x".repeat(40);
+        let initial = vec![
+            user_text(&long),
+            Message::assistant(vec![Block::Text("a1".into())]),
+            user_text("u1"),
+            Message::assistant(vec![Block::Text("a2".into())]),
+            user_text("u2"),
+        ];
+        let (prov, state) = MockProvider::new(vec![
+            MockTurn::Err(
+                "OpenAI-compatible API error 400: this model's maximum context length is 8192 tokens"
+                    .into(),
+            ),
+            mock::resp_text("SUMMARY", None),       // force-compress summary call
+            mock::resp_text("recovered answer", None), // retried main call
+        ]);
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+        let mut events = Vec::new();
+        let o = agent.run(&mut |e| events.push(e)).unwrap();
+        assert_eq!(o.stop_reason, "end_turn");
+        assert_eq!(o.final_text, "recovered answer");
+        // overflow Err → forced summary → retried main. Exactly 3 calls.
+        assert_eq!(state.calls(), 3);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Compressed { dropped: 2, kept: 3 })));
+        let cap = state.captured();
+        assert_eq!(cap[0].message_count, 5, "first (overflowing) call saw full history");
+        assert_eq!(cap[2].message_count, 3, "retried call saw the folded history");
+    }
+
+    #[test]
+    fn overflow_second_time_propagates_as_error() {
+        // After one forced compression + retry, a SECOND overflow on the same
+        // turn is a real error (OpenCode: "a second overflow after recovery is
+        // returned as an error"). overflow_recovered caps recovery at one per
+        // turn — no infinite retry loop.
+        let mut cfg = cfg_with(5, 0, 0);
+        cfg.limits.keep_recent_messages = 2;
+        let long = "x".repeat(40);
+        let initial = vec![
+            user_text(&long),
+            Message::assistant(vec![Block::Text("a1".into())]),
+            user_text("u1"),
+            Message::assistant(vec![Block::Text("a2".into())]),
+            user_text("u2"),
+        ];
+        let (prov, _state) = MockProvider::new(vec![
+            MockTurn::Err("OpenAI-compatible API error 400: context_length_exceeded".into()),
+            mock::resp_text("SUMMARY", None), // forced compress succeeds
+            MockTurn::Err("Anthropic API error 400: prompt is too long: 9000 > 8192".into()),
+        ]);
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+        let err = match agent.run(&mut |_| {}) {
+            Err(e) => e,
+            Ok(_) => panic!("second overflow must propagate as a run error"),
+        };
+        assert!(
+            format!("{err:#}").contains("prompt is too long"),
+            "second overflow surfaced, not swallowed: {err:#}"
+        );
+    }
+
+    #[test]
+    fn non_overflow_error_is_not_compressed() {
+        // A provider error that isn't a context-overflow (rate limit, auth,
+        // generic 400) must propagate IMMEDIATELY — never trigger a
+        // compression. Pins that overflow detection is specific, not "any Err".
+        let mut cfg = cfg_with(5, 0, 0);
+        cfg.limits.keep_recent_messages = 2;
+        let long = "x".repeat(40);
+        let initial = vec![
+            user_text(&long),
+            Message::assistant(vec![Block::Text("a1".into())]),
+            user_text("u1"),
+            Message::assistant(vec![Block::Text("a2".into())]),
+            user_text("u2"),
+        ];
+        let (prov, state) = MockProvider::new(vec![
+            MockTurn::Err("OpenAI-compatible API error 429: rate limit exceeded".into()),
+        ]);
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+        let mut events = Vec::new();
+        let err = match agent.run(&mut |e| events.push(e)) {
+            Err(e) => e,
+            Ok(_) => panic!("non-overflow error must propagate"),
+        };
+        assert!(format!("{err:#}").contains("rate limit"));
+        assert_eq!(state.calls(), 1, "no summary call for a non-overflow error");
+        assert!(events
+            .iter()
+            .all(|e| !matches!(e, AgentEvent::Compressed { .. })));
+    }
+
+    #[test]
+    fn overflow_with_no_compressible_head_propagates() {
+        // If the history is too short to cut (find_safe_cut None) — e.g. the
+        // overflow is driven by tool schemas / system prompt, not conversation —
+        // there's nothing to compress: propagate the overflow as a real error
+        // rather than looping or synthesizing an empty summary.
+        let cfg = cfg_with(5, 0, 0); // keep_recent default 8
+        let initial = vec![
+            user_text("hi"),
+            Message::assistant(vec![Block::Text("hello".into())]),
+            user_text("more"),
+        ]; // 3 messages <= keep_recent(8)+2 → find_safe_cut None
+        let (prov, state) = MockProvider::new(vec![
+            MockTurn::Err("Anthropic API error 400: prompt is too long".into()),
+        ]);
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+        let err = match agent.run(&mut |_| {}) {
+            Err(e) => e,
+            Ok(_) => panic!("overflow with no compressible head must propagate"),
+        };
+        assert!(format!("{err:#}").contains("prompt is too long"));
+        assert_eq!(state.calls(), 1, "no summary call when nothing is compressible");
+    }
+
+    #[test]
+    fn build_window_transcript_strips_marker_returns_old_summary() {
+        // The rolling-summary mechanism: when the head already carries a summary
+        // block (a later compression), build_window_transcript must (a) return
+        // that prior summary as `old_summary` so the prompt asks for an UPDATE,
+        // and (b) strip the marker block from the transcript so it isn't re-fed
+        // as raw input. The kept tail (>= cut) must not appear in the transcript.
+        let mut head = user_text("the task");
+        head.content
+            .push(Block::Text(format!("{SUMMARY_MARKER}\nold running summary body")));
+        let initial = vec![
+            head,
+            Message::assistant(vec![Block::Text("a1".into())]),
+            user_text("u1"),
+            Message::assistant(vec![Block::Text("a2".into())]),
+            user_text("u2"),
+        ];
+        // cut=3 → summarize head + [a1, u1]; tail [a2, u2] excluded.
+        let (transcript, old) = Agent::build_window_transcript(&initial, 3);
+        assert_eq!(old.as_deref(), Some("old running summary body"));
+        assert!(!transcript.contains(SUMMARY_MARKER), "marker block stripped");
+        assert!(transcript.contains("the task"), "original head text kept");
+        assert!(transcript.contains("a1") && transcript.contains("u1"));
+        assert!(
+            !transcript.contains("a2") && !transcript.contains("u2"),
+            "kept tail must not appear in the transcript"
+        );
+    }
+
+    #[test]
+    fn compress_large_window_chunks_then_combines() {
+        // A prefix larger than SUMMARY_CHUNK_CHARS is summarized per
+        // message-aligned chunk, then the chunk summaries are combined into the
+        // final brief. This bounds the per-call ratio (~6:1) so detail survives,
+        // and keeps each summary call small enough that it can't itself overflow
+        // — which the overflow path relies on, since it force-compresses exactly
+        // when the context is huge.
+        let mut cfg = cfg_with(5, 0, 30);
+        cfg.limits.keep_recent_messages = 2;
+        let big = "x".repeat(30_000); // one block alone > SUMMARY_CHUNK_CHARS (24_000)
+        let initial = vec![
+            user_text(&big),
+            Message::assistant(vec![Block::Text("a1".into())]),
+            user_text("u1"),
+            Message::assistant(vec![Block::Text("a2".into())]),
+            user_text("u2"),
+        ];
+        let (prov, state) = MockProvider::new(vec![
+            mock::resp_text("SUMMARY", None), // chunk 1 summary
+            mock::resp_text("SUMMARY", None), // chunk 2 summary
+            mock::resp_text("SUMMARY", None), // combine summary
+            mock::resp_text("final", None),   // main call on folded history
+        ]);
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+        let mut events = Vec::new();
+        let o = agent.run(&mut |e| events.push(e)).unwrap();
+        assert_eq!(o.stop_reason, "end_turn");
+        assert!(!o.final_text.is_empty());
+        // 2 chunk summaries + 1 combine + 1 main = 4 calls.
+        assert_eq!(state.calls(), 4, "chunk path: per-chunk + combine + main");
+        let cap = state.captured();
+        // The combine call assembled the chunk summaries under "[segment N]".
+        let combine = &cap[2];
+        assert!(
+            combine.user_texts.iter().any(|t| t.contains("segment")),
+            "combine call must assemble chunk summaries: {:?}",
+            combine.user_texts
+        );
+        // Every summary call opts out of caching; the main turn uses it.
+        assert!(!cap[0].cache && !cap[1].cache && !cap[2].cache, "summaries cache:false");
+        assert!(cap[3].cache, "main call uses prompt caching");
+        // The main call saw the folded (short) history.
+        assert_eq!(cap[3].message_count, 3);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Compressed { dropped: 2, kept: 3 })));
+    }
+
+    #[test]
+    fn compress_chunk_failure_disables_for_run() {
+        // If one of the chunk/combine summary calls fails, compression is
+        // abandoned for this run (compress_failed), NO fold happens, and the run
+        // continues uncompressed on the original history. Graceful degradation
+        // — a transient summary failure must not break the whole run.
+        let mut cfg = cfg_with(5, 0, 30);
+        cfg.limits.keep_recent_messages = 2;
+        let big = "x".repeat(30_000);
+        let initial = vec![
+            user_text(&big),
+            Message::assistant(vec![Block::Text("a1".into())]),
+            user_text("u1"),
+            Message::assistant(vec![Block::Text("a2".into())]),
+            user_text("u2"),
+        ];
+        let (prov, state) = MockProvider::new(vec![
+            mock::resp_text("SUMMARY", None),               // chunk 1 ok
+            MockTurn::Err("chunk2 summary blew up".into()), // chunk 2 fails
+            mock::resp_text("answer anyway", None),         // main proceeds uncompressed
+        ]);
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+        let mut events = Vec::new();
+        let o = agent.run(&mut |e| events.push(e)).unwrap();
+        assert_eq!(o.stop_reason, "end_turn");
+        assert_eq!(o.final_text, "answer anyway");
+        assert!(events
+            .iter()
+            .all(|e| !matches!(e, AgentEvent::Compressed { .. })), "no fold on chunk failure");
+        let cap = state.captured();
+        assert_eq!(cap[2].message_count, 5, "no fold → main sees the full history");
     }
 
     #[test]
