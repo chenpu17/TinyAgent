@@ -6,22 +6,26 @@
 //! child's scratch work. The child's token usage is folded into the parent's
 //! totals (honest cost) via `ToolOutput::usage`.
 //!
-//! v1 scope (deliberately tight):
-//! - **Sequential.** A `task` call blocks the parent's turn until the child
-//!   finishes; only one sub-agent runs at a time. Parallel sub-agents + workdir
-//!   isolation are a later step.
+//! Scope:
+//! - **Parallel within a turn.** Multiple `task` calls in one assistant turn
+//!   run concurrently (the agent loop fans them out on scoped threads); a
+//!   single `task` call just blocks its turn until the child finishes. No
+//!   workdir isolation — children share the parent's workdir (concurrent
+//!   sub-agents are expected not to write the same file).
 //! - **No recursion.** The child's tool list is the parent's whitelist with
 //!   `task` itself removed, so a sub-agent cannot spawn its own sub-agent. This
 //!   sidesteps depth bookkeeping entirely.
-//! - **No event forwarding.** The child streams into a no-op sink; the parent
-//!   just sees the `task` tool call and its result. (TUI/NDJSON don't show
-//!   child-internal progress in v1.)
+//! - **Event forwarding.** The child's events stream into the parent's sink,
+//!   each wrapped as `AgentEvent::SubAgent { name, .. }` so a harness/UI can
+//!   show each sub-agent's progress and tell parallel ones apart.
 //! - **Shared workdir + cancel.** The child inherits the parent's `workdir`,
 //!   `restrict_to_workdir`, and cancel flag (so Ctrl-C interrupts the child
-//!   mid-stream, not only at the next parent turn). Safe because the parent
-//!   checks `cancelled()` before each tool call, so it never enters the child
-//!   with the flag already set — the child's run-entry reset can't clobber a
-//!   cancel the parent is acting on.
+//!   mid-stream, not only at the next parent turn). The child runs via
+//!   `Agent::run_as_subagent`, which — unlike the top-level `run` — does NOT
+//!   reset the shared flag at entry. That reset would race a sibling's Ctrl-C
+//!   in a parallel batch (a later-starting child clearing a flag another child
+//!   is mid-responding to); skipping it is safe because the batch gate ensures
+//!   the flag is false at spawn, so any `true` seen mid-run is a real cancel.
 
 use crate::agent::{Agent, AgentEvent, RunOutcome};
 use crate::config::Config;
@@ -156,7 +160,11 @@ impl Tool for SubAgent {
 /// sub-agent's progress tagged with its identity.
 fn run_subagent(agent: &mut Agent, name: &str, emit: &mut dyn FnMut(AgentEvent)) -> ToolOutput {
     let name_owned = name.to_string();
-    match agent.run(&mut |ev| {
+    // run_as_subagent (not run): the child shares the parent's cancel Arc, and
+    // must NOT reset it at entry — otherwise a sibling in a parallel `task`
+    // batch starting later would clear a Ctrl-C just signalled on the shared
+    // flag. See Agent::run_as_subagent.
+    match agent.run_as_subagent(&mut |ev| {
         emit(AgentEvent::SubAgent {
             name: name_owned.clone(),
             event: Box::new(ev),

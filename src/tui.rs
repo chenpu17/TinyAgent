@@ -434,11 +434,19 @@ fn ui_loop(
                         cache_read += cache_read_input_tokens;
                     }
                     AgentEvent::SubAgent { name, event } => {
-                        // Minimal v1: render the child's event tagged with its
-                        // name so the user can see each sub-agent's progress
-                        // (and tell parallel ones apart). A richer nested/
-                        // grouped view is future work. Usage is already folded
-                        // into the run totals at the agent level, so skip it.
+                        // Render the child's event tagged with its name so the
+                        // user can see each sub-agent's progress (and tell
+                        // parallel ones apart). Usage is already folded into the
+                        // run totals at the agent level, so skip it here.
+                        //
+                        // Known limitation: consecutive TextDelta chunks merge
+                        // into the last Assistant row whose tag matches `name`.
+                        // If a turn runs two parallel sub-agents with the SAME
+                        // name (the model gave identical `name`s), their text
+                        // interleaves into one row. Distinguishing them would
+                        // need a stable id on AgentEvent::SubAgent (not just the
+                        // model-supplied name); the contract is that `name`
+                        // uniquely identifies a sub-agent within a turn.
                         match &*event {
                             AgentEvent::TextDelta(t) => {
                                 let same = sub_streaming_name.as_deref() == Some(name.as_str());

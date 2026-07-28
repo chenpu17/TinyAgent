@@ -40,6 +40,11 @@ pub(crate) fn run_with_retries(
     mut sleep: impl FnMut(std::time::Duration),
 ) -> Result<i32> {
     let mut at_line_start = true;
+    // Which sub-agent's text currently owns the stdout line (None = the parent
+    // agent or no one). When a different sub-agent's TextDelta arrives mid-line,
+    // we break to a new line and re-tag it — parallel sub-agents interleave, and
+    // without this their streamed text would mash together unlabelled.
+    let mut current_sub_name: Option<String> = None;
     // 1-based count of completed tries → result.json's `attempts`. We retry
     // while `attempt <= retries`, i.e. at most retries+1 total attempts.
     let mut attempt = 1usize;
@@ -56,14 +61,19 @@ pub(crate) fn run_with_retries(
                             println!();
                         }
                         eprintln!("── turn {n} ──");
+                        at_line_start = true; // we're on a fresh stdout line now
+                        current_sub_name = None;
                     }
                     AgentEvent::TextDelta(t) => {
                         print!("{t}");
                         let _ = std::io::stdout().flush();
                         at_line_start = t.ends_with('\n');
+                        current_sub_name = None; // parent agent owns this line now
                     }
                     AgentEvent::ToolCall { name, input } => {
                         println!("\n[tool →] {name} {}", compact(&input));
+                        at_line_start = true; // println ended on a fresh line
+                        current_sub_name = None;
                     }
                     AgentEvent::ToolResult {
                         name,
@@ -72,12 +82,18 @@ pub(crate) fn run_with_retries(
                     } => {
                         let tag = if is_error { "[tool ✗]" } else { "[tool ✓]" };
                         println!("{tag} {name}: {}", crate::agent::preview(&content));
+                        at_line_start = true;
+                        current_sub_name = None;
                     }
                     AgentEvent::Done { stop_reason } => {
                         println!("\n[done: {stop_reason}]");
+                        at_line_start = true;
+                        current_sub_name = None;
                     }
                     AgentEvent::Compressed { dropped, kept } => {
                         println!("\n[context compressed: dropped {dropped} messages, {kept} kept]");
+                        at_line_start = true;
+                        current_sub_name = None;
                     }
                     AgentEvent::Usage {
                         input_tokens,
@@ -103,12 +119,29 @@ pub(crate) fn run_with_retries(
                         // level, so it's not re-shown here.
                         match &*event {
                             AgentEvent::TextDelta(t) => {
-                                print!("[{name}] {t}");
+                                // Tag a sub-agent's text with [name]. Print the tag
+                                // once at the start of ITS run of text — not on
+                                // every streamed chunk (else fragments render as
+                                // "[scout] Hel[scout] lo[scout] world"). And if a
+                                // DIFFERENT sub-agent's text arrives mid-line
+                                // (parallel interleaving), break to a new line and
+                                // re-tag, so their streams don't mash together.
+                                let same = current_sub_name.as_deref() == Some(name.as_str());
+                                if at_line_start || !same {
+                                    if !at_line_start {
+                                        println!();
+                                    }
+                                    print!("[{name}] ");
+                                    current_sub_name = Some(name.clone());
+                                }
+                                print!("{t}");
                                 let _ = std::io::stdout().flush();
                                 at_line_start = t.ends_with('\n');
                             }
                             AgentEvent::ToolCall { name: tn, input } => {
                                 println!("\n[{name}] [tool →] {tn} {}", compact(input));
+                                at_line_start = true;
+                                current_sub_name = None;
                             }
                             AgentEvent::ToolResult {
                                 name: tn,
@@ -117,6 +150,8 @@ pub(crate) fn run_with_retries(
                             } => {
                                 let tag = if *is_error { "[tool ✗]" } else { "[tool ✓]" };
                                 println!("[{name}] {tag} {tn}: {}", crate::agent::preview(content));
+                                at_line_start = true;
+                                current_sub_name = None;
                             }
                             AgentEvent::Done { .. } => {} // implicit in the result
                             _ => {} // TurnStart/Compressed/Usage/SubAgent: noisy or folded

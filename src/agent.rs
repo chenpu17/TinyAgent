@@ -178,7 +178,35 @@ impl Agent {
     }
 
     /// Run the loop until the model stops calling tools, or a limit is hit.
+    /// Resets a stale cancel flag from a previous run (this `Agent` may be
+    /// reused across runs — TUI follow-ups, harness retries — so a Ctrl-C that
+    /// ended the last run must not bleed into this one).
     pub fn run(&mut self, events: &mut dyn FnMut(AgentEvent)) -> Result<RunOutcome> {
+        self.run_impl(events, /* reset_cancel */ true)
+    }
+
+    /// Drive this agent as a `task` sub-agent's child. Like `run`, but does NOT
+    /// reset the shared cancel flag at entry. The child inherits the parent's
+    /// cancel `Arc`; resetting here would let a sibling sub-agent starting
+    /// slightly later in a parallel `task` batch clear a Ctrl-C just signalled
+    /// on the shared flag — dropping the cancel for the whole batch. That is the
+    /// exact race CLAUDE.md records `batch::run` dodging by not sharing the flag
+    /// with its workers. Skipping the reset is safe: the child is freshly built
+    /// per call (no stale cancel to clear), and the batch gate guarantees the
+    /// flag is false when workers spawn — so any `true` the child later observes
+    /// is a real cancel it must honour, never stale state.
+    pub(crate) fn run_as_subagent(
+        &mut self,
+        events: &mut dyn FnMut(AgentEvent),
+    ) -> Result<RunOutcome> {
+        self.run_impl(events, /* reset_cancel */ false)
+    }
+
+    fn run_impl(
+        &mut self,
+        events: &mut dyn FnMut(AgentEvent),
+        reset_cancel: bool,
+    ) -> Result<RunOutcome> {
         let start = Instant::now();
         // Each top-level run gets a fresh compression budget. In the TUI the
         // same Agent is reused across follow-ups; without this reset, one
@@ -187,9 +215,14 @@ impl Agent {
         self.compress_failed = false;
         // Reset any stale cancel from a previous run: cancel is level-triggered
         // and never auto-clears elsewhere, so without this a Ctrl-C that ended
-        // the last turn would cancel this one before it starts.
-        if let Some(c) = &self.cancel {
-            c.store(false, Ordering::Relaxed);
+        // the last turn would cancel this one before it starts. Only the
+        // top-level `run` resets — a `task` sub-agent (run_as_subagent) shares
+        // the parent's flag and must NOT reset, or a sibling starting later in a
+        // parallel batch would race a just-signalled Ctrl-C (see run_as_subagent).
+        if reset_cancel {
+            if let Some(c) = &self.cancel {
+                c.store(false, Ordering::Relaxed);
+            }
         }
         // Overall run deadline. Each chat is capped to the time left so a
         // single stuck request can't outlive the run budget — which is
@@ -394,20 +427,24 @@ impl Agent {
             let mut batch_cancelled = false;
 
             // Inline leaf pass: run non-`task` tools one at a time (sequential —
-            // avoids new races on shell/file), announce every call in block
+            // avoids new races on shell/file), announce each LEAF call in block
             // order, and short-circuit on cancel (later slots stay Cancelled).
+            // `task` calls are NOT announced here — their ToolCall is emitted in
+            // the batch block below, AFTER the cancel gate, so a task gated off
+            // by a later leaf tripping cancel never dangles a ToolCall without a
+            // matching ToolResult on the UI.
             for (i, (_id, name, input)) in tool_uses.iter().enumerate() {
                 if batch_cancelled || self.cancelled() {
                     batch_cancelled = true;
                     continue; // leaves the default Slot::Cancelled
                 }
-                events(AgentEvent::ToolCall {
-                    name: name.clone(),
-                    input: input.clone(),
-                });
                 if name.as_str() == "task" {
-                    task_slots.push(i); // run concurrently after this pass
+                    task_slots.push(i); // ToolCall announced + run in the batch below
                 } else {
+                    events(AgentEvent::ToolCall {
+                        name: name.clone(),
+                        input: input.clone(),
+                    });
                     let output = {
                         let mut fwd = |ev: AgentEvent| events(ev);
                         run_tool(&self.tools, name, input, &self.ctx, &mut fwd)
@@ -428,6 +465,16 @@ impl Agent {
             // shared cancel flag they inherit, returning partial/cancelled
             // results rather than synthesised ones.
             if !task_slots.is_empty() && !batch_cancelled && !self.cancelled() {
+                // Announce the task calls in block order NOW that the batch is
+                // committed to run — emitting them in the inline pass (before the
+                // gate) would leave a ToolCall with no matching ToolResult if a
+                // later leaf tripped cancel and gated this batch off.
+                for &i in &task_slots {
+                    events(AgentEvent::ToolCall {
+                        name: tool_uses[i].1.clone(),
+                        input: tool_uses[i].2.clone(),
+                    });
+                }
                 let (tx, rx) = std::sync::mpsc::channel::<AgentEvent>();
                 let tools = &self.tools;
                 let ctx = &self.ctx;
@@ -1291,6 +1338,19 @@ mod tests {
             .collect();
         assert!(tags.contains(&"a".into()) && tags.contains(&"b".into()), "both ran: {tags:?}");
 
+        // Both tasks' ToolCall events still fire (now emitted from the batch
+        // block after the gate, not the inline pass) — in block order a, b.
+        let toolcalls: Vec<&Value> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ToolCall { name, input } if name == "task" => Some(input),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(toolcalls.len(), 2, "both task ToolCalls must fire: {toolcalls:?}");
+        assert_eq!(toolcalls[0]["label"], "a");
+        assert_eq!(toolcalls[1]["label"], "b");
+
         // Results assembled in ORIGINAL block order (a before b), not completion
         // order — records must stay coherent with the tool_use sequence.
         assert_eq!(o.tool_calls.len(), 2);
@@ -1334,12 +1394,11 @@ mod tests {
         );
         agent.set_cancel(flag);
         let mut saw_task_subagent = false;
-        let o = agent.run(&mut |e| {
-            if let AgentEvent::SubAgent { name, .. } = &e {
-                if name == "x" {
-                    saw_task_subagent = true;
-                }
-            }
+        let mut saw_task_toolcall = false;
+        let o = agent.run(&mut |e| match &e {
+            AgentEvent::SubAgent { name, .. } if name == "x" => saw_task_subagent = true,
+            AgentEvent::ToolCall { name, .. } if name == "task" => saw_task_toolcall = true,
+            _ => {}
         })
         .unwrap();
 
@@ -1349,6 +1408,12 @@ mod tests {
         assert_eq!(o.tool_calls[0].name, "trip");
         // The task never ran (no forwarded SubAgent event for label "x").
         assert!(!saw_task_subagent, "gated task must not have spawned");
+        // And it never had its ToolCall announced either — emitting it before the
+        // gate would dangle a ToolCall with no matching ToolResult on the UI.
+        assert!(
+            !saw_task_toolcall,
+            "gated task must not emit a ToolCall (would dangle without a ToolResult)"
+        );
         // N:N pairing intact: trip → "ok", task → synthesized cancelled result.
         assert_eq!(
             agent.trailing_tool_result_contents(),
@@ -1368,6 +1433,30 @@ mod tests {
         let o = agent.run(&mut |_| {}).unwrap();
         assert_eq!(o.stop_reason, "end_turn");
         assert_eq!(o.turns, 1);
+    }
+
+    #[test]
+    fn run_as_subagent_does_not_reset_a_set_cancel_flag() {
+        // The `task` sub-agent's child shares the parent's cancel Arc and runs
+        // via run_as_subagent, which — unlike the top-level run — must NOT reset
+        // the flag at entry. If it did, a sibling starting later in a parallel
+        // `task` batch would clear a Ctrl-C another child (or the parent) is
+        // mid-responding to, dropping the cancel for the whole batch (the race
+        // CLAUDE.md records batch::run avoiding by not sharing the flag). Pin
+        // the invariant directly: with the flag already set, the sub-agent run
+        // honours it (stop_reason "cancelled") and leaves the flag set, rather
+        // than resetting it and proceeding.
+        let cfg = cfg_with(5, 0, 0);
+        let (prov, _) = MockProvider::new(vec![mock::resp_text("x", None)]);
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], vec![user_text("hi")], test_ctx());
+        let flag = Arc::new(AtomicBool::new(true)); // already cancelled
+        agent.set_cancel(flag.clone());
+        let o = agent.run_as_subagent(&mut |_| {}).unwrap();
+        assert_eq!(o.stop_reason, "cancelled", "sub-agent must honour a set flag, not reset it");
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "entry must not have cleared the shared flag"
+        );
     }
 
     #[test]
