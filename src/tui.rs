@@ -336,6 +336,10 @@ fn ui_loop(
     // tool row; j/k move it, Enter/Space toggles its expanded view.
     let mut mode = Mode::Input;
     let mut select_idx: Option<usize> = None;
+    // M6: memoize per-row markdown rendering so redraws (each streamed delta,
+    // each scroll tick) don't re-parse the whole conversation. Cleared with
+    // `rows` on `/clear`.
+    let mut md_cache = MdCache::new();
 
     rows.push(Row::System(format!(
         "tiny-agent · model {} · type a message, Enter to send, Esc to quit",
@@ -529,7 +533,14 @@ fn ui_loop(
                             "Agent".to_string(),
                             Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
                         )));
-                        lines.extend(render_markdown(t));
+                        // M6: reuse the cached render unless this row's text
+                        // grew since last frame (streaming). Prior rows and
+                        // scroll redraws hit the cache; only the in-flight row
+                        // (or a first render) re-parses markdown.
+                        let rendered = md_cache.get_or_render(idx, t, |txt| {
+                            render_markdown(txt).iter().map(line_to_owned).collect()
+                        });
+                        lines.extend(rendered.iter().cloned());
                     }
                     Row::ToolCall {
                         name,
@@ -783,6 +794,7 @@ fn ui_loop(
                                         input.drain_to_string();
                                         scroll_up = 0;
                                         rows.clear();
+                                        md_cache.clear();
                                         in_tokens = 0;
                                         out_tokens = 0;
                                         cache_create = 0;
@@ -1070,6 +1082,71 @@ fn render_markdown(md: &str) -> Vec<Line<'_>> {
         }
     }
     lines
+}
+
+/// Snapshot a `Line` with every span's borrowed content materialized into an
+/// owned `String` → `Line<'static>`. Style and alignment are preserved (both
+/// `Copy`). M6's render cache stores owned lines so it outlives the row text it
+/// was rendered from (which is borrowed during the draw closure).
+fn line_to_owned(line: &Line) -> Line<'static> {
+    Line {
+        spans: line
+            .spans
+            .iter()
+            .map(|s| Span {
+                content: std::borrow::Cow::Owned(s.content.to_string()),
+                style: s.style,
+            })
+            .collect(),
+        style: line.style,
+        alignment: line.alignment,
+    }
+}
+
+/// Per-row cache of rendered-markdown lines (M6). The draw closure re-renders
+/// every assistant message on EVERY frame — including each streamed TextDelta
+/// and each scroll tick — which re-parses the whole conversation's markdown via
+/// `tui_markdown::from_str` each time. That's O(history) per event and gets
+/// slow for long chats. This memoizes the parse keyed by row index, invalidated
+/// only when that row's text length changes (an assistant row grows while
+/// streaming; once final it's stable). So a streaming delta re-renders only the
+/// in-flight row, and scrolling/history redraws hit the cache for every prior
+/// row. Safe because `rows` is append-only except `rows.clear()` (which clears
+/// this cache too) — indices are stable for a row's lifetime.
+struct MdCache {
+    entries: std::collections::HashMap<usize, (usize, Vec<Line<'static>>)>,
+}
+
+impl MdCache {
+    fn new() -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+        }
+    }
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+    /// Cached rendered lines for row `idx`, recomputing via `render` on a miss
+    /// (absent, or the text length changed since the last render). The borrow
+    /// of the returned slice ends at the next `&mut self` call.
+    fn get_or_render(
+        &mut self,
+        idx: usize,
+        text: &str,
+        render: impl FnOnce(&str) -> Vec<Line<'static>>,
+    ) -> &[Line<'static>] {
+        // Stale when absent OR when the text length changed since the last
+        // render (an assistant row grows while streaming; once final it's a
+        // stable length, so every scroll/redraw hits the cache).
+        let stale = self
+            .entries
+            .get(&idx)
+            .is_none_or(|(len, _)| *len != text.len());
+        if stale {
+            self.entries.insert(idx, (text.len(), render(text)));
+        }
+        &self.entries[&idx].1
+    }
 }
 
 /// ATX header level if `s` starts with 1..=6 '#' immediately followed by a
@@ -1647,5 +1724,124 @@ mod tests {
         // scroll=max_scroll → last two wrapped rows (previously unreachable).
         assert!(bottom.contains("mnopqr"), "bottom: {bottom:?}");
         assert!(bottom.contains("st"), "bottom tail: {bottom:?}");
+    }
+
+    // ── M6: render cache + owned-line conversion ───────────────────────
+
+    #[test]
+    fn md_cache_recomputes_only_when_text_changes() {
+        // M6: the draw closure re-renders every assistant row each frame. The
+        // cache must reuse a row's render across frames (scrolling, other rows
+        // streaming) and only recompute when THAT row's text grew. We prove
+        // reuse by changing the renderer between calls: a cache hit ignores the
+        // new renderer (returns the old content), a miss uses it.
+        let mut c = MdCache::new();
+        let upper = |t: &str| vec![Line::from(t.to_string())];
+        let lower = |t: &str| vec![Line::from(t.to_string())];
+
+        // Miss → upper renderer used.
+        let r = c.get_or_render(0, "hi", upper);
+        assert_eq!(r[0].spans.first().unwrap().content.as_ref(), "hi");
+
+        // Hit (same idx+text): the lower renderer is IGNORED — still "hi", not
+        // "hi" via lower (here identical, so swap to a distinguishing renderer).
+        let distinguishing = |t: &str| vec![Line::from(t.to_string() + "!")];
+        let r = c.get_or_render(0, "hi", distinguishing);
+        assert_eq!(
+            r[0].spans.first().unwrap().content.as_ref(),
+            "hi",
+            "cache hit must NOT re-render (distinguishing renderer ignored)"
+        );
+
+        // Text grew (streaming): miss → distinguishing renderer now applied.
+        let r = c.get_or_render(0, "hi there", distinguishing);
+        assert_eq!(r[0].spans.first().unwrap().content.as_ref(), "hi there!");
+
+        // A different row is independent (its own miss).
+        let r = c.get_or_render(7, "hi", upper);
+        assert_eq!(r[0].spans.first().unwrap().content.as_ref(), "hi");
+        // Row 0 untouched by row 7's render.
+        let r = c.get_or_render(0, "hi there", distinguishing);
+        assert_eq!(r[0].spans.first().unwrap().content.as_ref(), "hi there!");
+
+        // clear() drops entries → next access is a miss.
+        c.clear();
+        let r = c.get_or_render(0, "hi there", lower);
+        assert_eq!(
+            r[0].spans.first().unwrap().content.as_ref(),
+            "hi there",
+            "clear must force a re-render with the new renderer"
+        );
+    }
+
+    #[test]
+    fn line_to_owned_preserves_spans_style_and_alignment() {
+        // M6: the cache stores owned lines; the conversion must keep every
+        // span's text + style and the line's alignment, materializing the
+        // (possibly borrowed) content into owned Strings.
+        use ratatui::layout::Alignment;
+        let src = Line::from(vec![
+            Span::styled("hello", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw(" world"),
+        ])
+        .alignment(Alignment::Center);
+        let owned = line_to_owned(&src);
+        assert_eq!(owned.spans.len(), 2);
+        assert_eq!(owned.spans[0].content.as_ref(), "hello");
+        assert_eq!(owned.spans[0].style.fg, Some(Color::Cyan));
+        assert!(owned.spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(owned.spans[1].content.as_ref(), " world");
+        assert_eq!(owned.alignment, Some(Alignment::Center));
+        // CJK / multi-byte content round-trips through the owned snapshot too
+        // (to_string materializes the whole codepoint sequence, not bytes).
+        let cjk = Line::from(vec![Span::raw("你好")]);
+        let owned = line_to_owned(&cjk);
+        assert_eq!(owned.spans[0].content.as_ref(), "你好");
+    }
+
+    #[test]
+    fn cached_owned_lines_render_identically_to_fresh_markdown() {
+        // M6 end-to-end at the widget layer (the project's TestBackend
+        // convention): the cache stores `render_markdown` output run through
+        // `line_to_owned`. That snapshot must render into a real buffer with
+        // the SAME cells as rendering the borrowed `render_markdown` lines
+        // directly — otherwise the cache silently drifts what the user sees.
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Rect;
+        // Header + list + inline code: exercises render_markdown's restyling
+        // (cyan bold header, bullet swap, inline-code span).
+        let md = "## 标题\n\n- 项目 `代码` more\n";
+        let borrowed: Vec<Line> = render_markdown(md);
+        let owned: Vec<Line<'static>> =
+            render_markdown(md).iter().map(line_to_owned).collect();
+
+        // Wide enough that the content isn't wrapped (we're comparing caches,
+        // not wrapping). Render both into equal buffers and flatten cells.
+        let area = Rect::new(0, 0, 40, 5);
+        let cells_of = |lines: Vec<Line>| -> String {
+            let mut term = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+            term.draw(|f| f.render_widget(Paragraph::new(lines), area)).unwrap();
+            let buf = term.backend().buffer();
+            (0..area.height)
+                .map(|y| {
+                    (0..area.width)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("│")
+        };
+        assert_eq!(
+            cells_of(borrowed.clone()),
+            cells_of(owned.clone()),
+            "owned (cached) snapshot must render identically to the borrowed source"
+        );
+        // Sanity: the buffers carry real content (not both-empty-and-thus-equal).
+        // ASCII renders monotonically; CJK wide chars spread across cells (each
+        // leaves a trailing empty cell), so check an ASCII fragment plus a CJK
+        // glyph rather than the contiguous "标题" substring.
+        let rendered = cells_of(borrowed);
+        assert!(rendered.contains("more"), "list text missing: {rendered:?}");
+        assert!(rendered.contains('标'), "CJK header glyph missing: {rendered:?}");
     }
 }
