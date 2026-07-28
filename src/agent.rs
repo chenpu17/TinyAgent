@@ -290,7 +290,6 @@ impl Agent {
             // the (mutable) compress call in the recovery arm.
             let mut overflow_recovered = false;
             let resp = loop {
-                let before = self.messages.len();
                 let r = {
                     // Safety net: fold any adjacent same-role messages (e.g. a
                     // resumed session that ends on two user messages, or a
@@ -326,6 +325,10 @@ impl Agent {
                         ChatEvent::TextDelta(t) => events(AgentEvent::TextDelta(t)),
                     })
                 }; // req dropped here → &self.messages borrow released
+                // Baseline AFTER normalize_adjacent, so a same-role merge that
+                // shrank the history isn't mistaken for a successful compression
+                // fold — this gate means "did compression actually shrink it?".
+                let before = self.messages.len();
                 match r {
                     Ok(resp) => break resp,
                     Err(e) if !overflow_recovered && is_context_overflow(&e) => {
@@ -738,18 +741,22 @@ const SUMMARY_CHUNK_BUDGET: u32 = 1024;
 /// anyhow error's Display (`openai.rs` "…API error 400: {text}",
 /// `anthropic.rs` "…API error {status}: {text}"), so a case-blind substring
 /// match is enough. `body_fix_for_400` has already absorbed the max_tokens /
-/// stream_options 400s, so only genuine overflow (and the odd 413) reaches
-/// here. Conservative list covering OpenAI / Anthropic / DeepSeek / vLLM / Ollama.
+/// stream_options 400s, so only genuine overflow reaches here.
+///
+/// Kept SPECIFIC: a non-overflow error misread as overflow wastes one
+/// force-compress + retry before the real error surfaces, so vague phrases
+/// like bare "context length" or "reduce the length" are excluded. A MISS is
+/// safe — the error just propagates and the caller sees it. Covers OpenAI /
+/// Anthropic / DeepSeek / vLLM / Ollama.
 const OVERFLOW_PHRASES: &[&str] = &[
-    "context_length_exceeded",
-    "maximum context length",
-    "prompt is too long",
-    "too many input tokens",
-    "context length",
-    "reduce the length",
-    "reduce your prompt",
-    "input length and max_tokens",
-    "request_too_large",
+    "context_length_exceeded",     // OpenAI error type
+    "maximum context length",      // OpenAI message body
+    "prompt is too long",          // Anthropic
+    "too many input tokens",       // Anthropic variant / generic
+    "input length and max_tokens", // Anthropic "input length + max_tokens exceed context"
+    "input too long",              // some OpenAI-compatible gateways
+    "exceeds the context window",  // vLLM / Ollama / gateways
+    "token limit exceeded",        // some gateways
 ];
 
 /// Merge adjacent messages that share a role into one. Anthropic rejects two
@@ -901,10 +908,14 @@ impl Agent {
                 let est = estimate_tokens(&self.messages, self.system.as_deref(), &self.tool_defs);
                 // Trip at COMPACT_UTILIZATION_PCT of the window, reserving room
                 // for this turn's max_tokens output — so we compact BEFORE the
-                // provider would reject an over-long request, not after.
-                let cap = self.limits.max_context_tokens as usize
-                    * COMPACT_UTILIZATION_PCT as usize
-                    / 100;
+                // provider would reject an over-long request, not after. Compute
+                // on u64 with saturating_mul so an absurd configured value can't
+                // wrap (real windows are millions, far from overflow).
+                let cap = (self
+                    .limits
+                    .max_context_tokens
+                    .saturating_mul(COMPACT_UTILIZATION_PCT)
+                    / 100) as usize;
                 est + self.max_tokens as usize > cap
             } else {
                 let threshold = self.limits.compress_threshold_chars;
@@ -1061,6 +1072,17 @@ impl Agent {
         } else {
             // Large prefix: summarize chunks, then combine.
             let chunks = chunk_lines(lines, SUMMARY_CHUNK_CHARS);
+            // A single chunk (e.g. the transcript just cleared the limit but
+            // packed into one piece) needs no separate combine round — summarize
+            // it directly with the running-summary update prompt.
+            if chunks.len() == 1 {
+                return self.summary_call(
+                    &summary_prompt(&chunks[0], old_summary.as_deref()),
+                    summary_budget(chunks[0].len()),
+                    deadline,
+                    1,
+                );
+            }
             let n_calls = chunks.len() + 1; // per-chunk + combine
             let mut usage = None;
             let mut chunk_summaries = Vec::with_capacity(chunks.len());
@@ -1165,22 +1187,52 @@ fn summary_prompt(body: &str, old_summary: Option<&str>) -> String {
     }
 }
 
-/// Split transcript lines into chunks each ≤ `max_bytes`, breaking only at line
-/// boundaries (so a tool_use/tool_result block stays in one chunk). A single
-/// oversized line becomes its own chunk rather than being split mid-block.
+/// Split transcript lines into chunks each ≤ `max_bytes`, breaking only at
+/// line boundaries (so a tool_use/tool_result block stays in one chunk) — EXCEPT
+/// a single line larger than `max_bytes` (e.g. a huge read_file/shell dump, or
+/// an untruncated user paste) is itself split at char boundaries. Without that,
+/// one oversized chunk's summary call could itself overflow the window,
+/// defeating the overflow-recovery path that force-compresses exactly when the
+/// context is huge.
 fn chunk_lines(lines: Vec<String>, max_bytes: usize) -> Vec<String> {
+    // First break any over-long line into ≤ max_bytes pieces.
+    let mut pieces: Vec<String> = Vec::with_capacity(lines.len());
+    for line in lines {
+        if line.len() <= max_bytes {
+            pieces.push(line);
+        } else {
+            split_long(&line, max_bytes, &mut pieces);
+        }
+    }
+    // Then pack pieces into chunks at piece boundaries.
     let mut chunks = Vec::new();
     let mut cur = String::new();
-    for line in lines {
-        if !cur.is_empty() && cur.len() + line.len() > max_bytes {
+    for piece in pieces {
+        if !cur.is_empty() && cur.len() + piece.len() > max_bytes {
             chunks.push(std::mem::take(&mut cur));
         }
-        cur.push_str(&line);
+        cur.push_str(&piece);
     }
     if !cur.is_empty() {
         chunks.push(cur);
     }
     chunks
+}
+
+/// Split an over-long line into ≤ `max_bytes` pieces at char boundaries. The
+/// split may fall inside a transcript line's prefix tag, but in the summary
+/// path that's acceptable — we trade block atomicity for a bounded chunk size.
+fn split_long(line: &str, max_bytes: usize, out: &mut Vec<String>) {
+    let mut buf = String::new();
+    for c in line.chars() {
+        if !buf.is_empty() && buf.len() + c.len_utf8() > max_bytes {
+            out.push(std::mem::take(&mut buf));
+        }
+        buf.push(c);
+    }
+    if !buf.is_empty() {
+        out.push(buf);
+    }
 }
 
 /// Add two optional per-request usages into one. Either side may be `None`
@@ -2647,6 +2699,137 @@ mod tests {
             .all(|e| !matches!(e, AgentEvent::Compressed { .. })), "no fold on chunk failure");
         let cap = state.captured();
         assert_eq!(cap[2].message_count, 5, "no fold → main sees the full history");
+    }
+
+    #[test]
+    fn compress_updates_running_summary_on_second_pass() {
+        // The rolling-summary UPDATE path is this commit's core fidelity claim
+        // ("later compressions update the prior summary, not re-summarize the
+        // whole prefix"). build_window_transcript only unit-tests the pure
+        // extraction; THIS test drives the full summarize_prefix → summary_prompt
+        // wiring: with the head already carrying a SUMMARY_MARKER + old summary,
+        // the summary call's prompt must carry the UPDATE marker and the prior
+        // summary, and must NOT re-feed the raw marker block as transcript.
+        let mut cfg = cfg_with(5, 0, 30);
+        cfg.limits.keep_recent_messages = 2;
+        // Head already folded by a PRIOR compression: original task + a marker
+        // block holding an old running summary.
+        let mut head = user_text("the original task");
+        head.content.push(Block::Text(format!(
+            "{SUMMARY_MARKER}\nold running summary: we built feature X"
+        )));
+        let long = "y".repeat(40); // trips the 30-char threshold again
+        let initial = vec![
+            head,
+            Message::assistant(vec![Block::Text("a1".into())]),
+            user_text(&long),
+            Message::assistant(vec![Block::Text("a2".into())]),
+            user_text("u2"),
+        ];
+        let (prov, state) = MockProvider::new(vec![
+            mock::resp_text("UPDATED SUMMARY", None), // summary call (update mode)
+            mock::resp_text("final", None),           // main call
+        ]);
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+        let mut events = Vec::new();
+        let o = agent.run(&mut |e| events.push(e)).unwrap();
+        assert_eq!(o.stop_reason, "end_turn");
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Compressed { .. })));
+        let cap = state.captured();
+        let prompt = &cap[0].user_texts[0];
+        assert!(
+            prompt.contains("Current running summary"),
+            "update-mode prompt expected: {prompt}"
+        );
+        assert!(
+            prompt.contains("old running summary: we built feature X"),
+            "prior summary must be fed for the update: {prompt}"
+        );
+        assert!(
+            !prompt.contains(&format!("[user] {SUMMARY_MARKER}")),
+            "raw marker block must not be re-fed as transcript"
+        );
+    }
+
+    #[test]
+    fn compress_with_deadline_splits_timeout_without_panic() {
+        // Every other compress test uses timeout_secs=0 (deadline=None), so the
+        // summary call's per_request_timeout = (remaining − reserve) / n_calls
+        // branch never runs. Drive it here: a real timeout must let compression
+        // proceed and leave room for the main turn, without panicking on the
+        // Duration division.
+        let mut cfg = cfg_with(5, 60, 30); // timeout_secs=60 → deadline=Some
+        cfg.limits.keep_recent_messages = 2;
+        let long = "x".repeat(40);
+        let initial = vec![
+            user_text(&long),
+            Message::assistant(vec![Block::Text("a1".into())]),
+            user_text("u1"),
+            Message::assistant(vec![Block::Text("a2".into())]),
+            user_text("u2"),
+        ];
+        let (prov, state) = MockProvider::new(vec![
+            mock::resp_text("SUMMARY", None),
+            mock::resp_text("final", None),
+        ]);
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+        let o = agent.run(&mut |_| {}).unwrap();
+        assert_eq!(o.stop_reason, "end_turn");
+        assert_eq!(state.calls(), 2, "summary + main both ran under a deadline");
+    }
+
+    #[test]
+    fn token_estimate_over_but_too_short_to_cut_does_not_compress() {
+        // max_context_tokens trips the token estimate, but the history is too
+        // short for find_safe_cut (n <= keep_recent+2): compression is a no-op
+        // (no event, no fold), and the run proceeds — the overflow path remains
+        // as backstop. Pins that a too-short-to-cut history never partial-folds.
+        let mut cfg = cfg_with(5, 0, 0);
+        cfg.limits.max_context_tokens = 1000;
+        cfg.max_tokens = 100;
+        // keep_recent default 8 → 3 messages <= 8+2 → find_safe_cut None
+        let big = "x".repeat(4000); // est ≈ 1000 tokens >> cap (850)
+        let initial = vec![
+            user_text(&big),
+            Message::assistant(vec![Block::Text("a".into())]),
+            user_text("b"),
+        ];
+        let (prov, state) = MockProvider::new(vec![mock::resp_text("ok", None)]);
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+        let mut events = Vec::new();
+        let o = agent.run(&mut |e| events.push(e)).unwrap();
+        assert_eq!(o.stop_reason, "end_turn");
+        assert_eq!(state.calls(), 1, "no summary call — nothing safe to cut");
+        assert!(events
+            .iter()
+            .all(|e| !matches!(e, AgentEvent::Compressed { .. })));
+    }
+
+    #[test]
+    fn chunk_lines_splits_an_overlong_line_to_bound_chunk_size() {
+        // A single transcript line larger than the chunk limit (e.g. a huge
+        // read_file/shell dump, or an untruncated user paste) must be split at
+        // char boundaries so NO chunk exceeds the limit — otherwise that one
+        // chunk's summary call could itself overflow the window, defeating the
+        // overflow-recovery path that force-compresses when context is huge.
+        let one = "z".repeat(50_000);
+        let chunks = chunk_lines(vec![one], 24_000);
+        assert!(
+            chunks.len() >= 2,
+            "over-long line must be split, got {} chunks",
+            chunks.len()
+        );
+        assert!(
+            chunks.iter().all(|c| c.len() <= 24_000),
+            "every chunk must be ≤ limit: sizes {:?}",
+            chunks.iter().map(|c| c.len()).collect::<Vec<_>>()
+        );
+        // Short lines still pack into one chunk, unchanged.
+        let packed = chunk_lines(vec!["a\n".into(), "b\n".into()], 24_000);
+        assert_eq!(packed.len(), 1);
+        assert_eq!(packed[0], "a\nb\n");
     }
 
     #[test]
