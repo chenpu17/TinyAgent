@@ -15,6 +15,49 @@ use std::time::Duration;
 const PROTOCOL_VERSION: &str = "2025-03-26";
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Hard cap on a single line read from an MCP server (stdio line or one SSE
+/// `data:`/`event:` line). Bounds memory against a runaway or malicious server
+/// that emits an unbounded line with no newline — `read_line` would otherwise
+/// grow the buffer without limit and OOM the process. 16 MiB is far above any
+/// legitimate JSON-RPC message (a tools/call result is truncated to
+/// `max_output_chars` AFTER receipt, so the wire never carries the full blob).
+const MCP_LINE_MAX: usize = 16 * 1024 * 1024;
+
+/// Read one line (including its trailing `\n`) into `buf` (bytes appended;
+/// caller clears `buf` between calls), bounded by `max_bytes`. Returns the
+/// number of bytes pushed, or 0 at clean EOF. Bails if a single line exceeds
+/// `max_bytes`. Reads in `fill_buf` chunks (not byte-by-byte) and accumulates
+/// raw bytes, validating UTF-8 only at the call site — so a multi-byte char
+/// split across reads isn't misdecoded mid-accumulation.
+fn read_capped_line<R: BufRead>(reader: &mut R, buf: &mut Vec<u8>, max_bytes: usize) -> Result<usize> {
+    loop {
+        // fill_buf borrows `reader`; consume (also mut) can't run while that
+        // borrow is live. Compute + copy under the borrow, then consume after.
+        let (consumed, done) = {
+            let available = reader.fill_buf().context("MCP read failed")?;
+            if available.is_empty() {
+                return Ok(0); // clean EOF
+            }
+            let (take, found_nl) = match available.iter().position(|&c| c == b'\n') {
+                Some(i) => (&available[..=i], true),
+                None => (available, false),
+            };
+            if buf.len() + take.len() > max_bytes {
+                bail!("MCP line exceeds {max_bytes}-byte limit (runaway server output?)");
+            }
+            // `buf` is a distinct &mut, so extending it from a slice that
+            // borrows `reader` (shared) is allowed.
+            buf.extend_from_slice(take);
+            (take.len(), found_nl)
+        };
+        reader.consume(consumed);
+        if done {
+            return Ok(consumed);
+        }
+        // No newline yet — loop and fill again; the running `buf` keeps the
+        // partial line so the cap stays a per-line bound, not per-chunk.
+    }
+}
 
 /// A tool as advertised by an MCP server.
 pub struct McpToolInfo {
@@ -196,15 +239,27 @@ impl StdioTransport {
             let pending = pending.clone();
             std::thread::spawn(move || {
                 let mut reader = BufReader::new(stdout);
-                let mut line = String::new();
+                let mut buf: Vec<u8> = Vec::new();
                 loop {
-                    line.clear();
-                    match reader.read_line(&mut line) {
-                        Ok(0) | Err(_) => break,
+                    buf.clear();
+                    match read_capped_line(&mut reader, &mut buf, MCP_LINE_MAX) {
+                        Ok(0) => break,            // EOF
                         Ok(_) => {
-                            if let Ok(msg) = serde_json::from_str::<Value>(line.trim()) {
-                                pending_dispatch(&pending, msg);
+                            // Validate UTF-8 + parse here (the capped reader
+                            // accumulates raw bytes); an unparseable line is
+                            // skipped, matching the old read_line behavior.
+                            if let Ok(s) = std::str::from_utf8(&buf) {
+                                if let Ok(msg) = serde_json::from_str::<Value>(s.trim()) {
+                                    pending_dispatch(&pending, msg);
+                                }
                             }
+                        }
+                        Err(e) => {
+                            // A line over the cap (or a read error) ends the
+                            // stream: fail every waiter so callers don't sit
+                            // out the full CALL_TIMEOUT on a dead/abusive server.
+                            eprintln!("[warn] MCP stdio read stopped: {e:#}");
+                            break;
                         }
                     }
                 }
@@ -322,7 +377,7 @@ impl Transport for HttpTransport {
             // the first `data:` line of a multi-line event and would drop the
             // rest, losing large JSON-RPC results.
             let mut reader = std::io::BufReader::new(resp);
-            while let Some((_event, data)) = read_sse_event(&mut reader) {
+            while let Some((_event, data)) = read_sse_event(&mut reader)? {
                 if let Ok(msg) = serde_json::from_str::<Value>(&data) {
                     if msg.get("id").and_then(|v| v.as_u64()) == Some(id) {
                         return extract_result(msg, method);
@@ -407,8 +462,17 @@ impl SseTransport {
                 let mut reader = BufReader::new(resp);
                 let mut endpoint_sent = false;
                 while !shutdown.load(Ordering::Relaxed) {
-                    let Some((event, data)) = read_sse_event(&mut reader) else {
-                        break;
+                    let (event, data) = match read_sse_event(&mut reader) {
+                        Ok(Some(ev)) => ev,
+                        Ok(None) => break, // stream ended
+                        Err(e) => {
+                            // A line over the cap or a read error: the stream is
+                            // unusable. Fail every waiter so callers don't block
+                            // until CALL_TIMEOUT on a dead/abusive server.
+                            eprintln!("[warn] MCP SSE read stopped: {e:#}");
+                            pending_fail_all(&pending);
+                            return;
+                        }
                     };
                     match event.as_str() {
                         "endpoint" if !endpoint_sent => {
@@ -512,40 +576,35 @@ impl Drop for SseTransport {
     }
 }
 
-/// Read one SSE event as (event, data); returns None at end of stream.
-/// Handles `event:`, possibly multi-line `data:`, and skips comments.
-fn read_sse_event<R: BufRead>(reader: &mut R) -> Option<(String, String)> {
+/// Read one SSE event as (event, data); returns `Ok(None)` at end of stream,
+/// `Err` if a line exceeds the cap or the read fails. Handles `event:`,
+/// possibly multi-line `data:`, and skips comments.
+fn read_sse_event<R: BufRead>(reader: &mut R) -> Result<Option<(String, String)>> {
     let mut event = String::from("message");
     let mut data = String::new();
-    let mut line = String::new();
+    let mut line: Vec<u8> = Vec::new();
     loop {
         line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => {
-                // Flush a buffered event even if the stream ended without a
-                // trailing blank line, or the last message is silently lost.
-                return if data.is_empty() {
-                    None
-                } else {
-                    Some((event, data))
-                };
+        let n = read_capped_line(reader, &mut line, MCP_LINE_MAX)?;
+        if n == 0 {
+            // Flush a buffered event even if the stream ended without a
+            // trailing blank line, or the last message is silently lost.
+            return Ok(if data.is_empty() { None } else { Some((event, data)) });
+        }
+        let Ok(s) = std::str::from_utf8(&line) else { continue };
+        let t = s.trim_end_matches(['\r', '\n']);
+        if t.is_empty() {
+            if !data.is_empty() {
+                return Ok(Some((event, data)));
             }
-            Ok(_) => {
-                let t = line.trim_end_matches(['\r', '\n']);
-                if t.is_empty() {
-                    if !data.is_empty() {
-                        return Some((event, data));
-                    }
-                    event = String::from("message"); // reset for next event
-                } else if let Some(v) = t.strip_prefix("event:") {
-                    event = v.trim().to_string();
-                } else if let Some(v) = t.strip_prefix("data:") {
-                    if !data.is_empty() {
-                        data.push('\n');
-                    }
-                    data.push_str(v.trim_start());
-                }
+            event = String::from("message"); // reset for next event
+        } else if let Some(v) = t.strip_prefix("event:") {
+            event = v.trim().to_string();
+        } else if let Some(v) = t.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
             }
+            data.push_str(v.trim_start());
         }
     }
 }
@@ -619,11 +678,36 @@ mod tests {
     fn sse_event_parsing() {
         let raw = b"event: endpoint\ndata: /messages?session=abc\n\nevent: message\ndata: {\"id\":1}\n\n";
         let mut r = BufReader::new(&raw[..]);
-        let (e1, d1) = read_sse_event(&mut r).unwrap();
+        let (e1, d1) = read_sse_event(&mut r).unwrap().unwrap();
         assert_eq!((e1.as_str(), d1.as_str()), ("endpoint", "/messages?session=abc"));
-        let (e2, d2) = read_sse_event(&mut r).unwrap();
+        let (e2, d2) = read_sse_event(&mut r).unwrap().unwrap();
         assert_eq!((e2.as_str(), d2.as_str()), ("message", "{\"id\":1}"));
-        assert!(read_sse_event(&mut r).is_none());
+        assert!(read_sse_event(&mut r).unwrap().is_none());
+    }
+
+    #[test]
+    fn capped_line_rejects_runaway_output() {
+        // A line with no newline that grows past MCP_LINE_MAX must error rather
+        // than allocating without bound (OOM guard). Use a tiny cap so the test
+        // doesn't allocate 16 MiB. read_sse_event just `?`-propagates this, so
+        // pinning the cap on the shared helper covers both read paths.
+        let cap = 8;
+        let runaway: Vec<u8> = vec![b'A'; cap + 5]; // no newline → one endless line
+        let mut r = BufReader::new(&runaway[..]);
+        let mut buf = Vec::new();
+        let err = read_capped_line(&mut r, &mut buf, cap).unwrap_err();
+        assert!(format!("{err:#}").contains("exceeds"), "{err:#}");
+
+        // A line within the cap (incl. its newline) reads cleanly.
+        let ok = b"ab\n";
+        let mut r = BufReader::new(&ok[..]);
+        let mut buf = Vec::new();
+        let n = read_capped_line(&mut r, &mut buf, cap).unwrap();
+        assert_eq!(n, ok.len());
+        assert_eq!(&buf, ok);
+        // And the next read is a clean EOF.
+        buf.clear();
+        assert_eq!(read_capped_line(&mut r, &mut buf, cap).unwrap(), 0);
     }
 
     #[test]

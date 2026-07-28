@@ -243,6 +243,12 @@ impl Anthropic {
                     abort = Some("stream_idle");
                     break;
                 }
+                // A mid-stream read failure must NOT be treated as a clean
+                // end-of-stream — that would assemble a partial response and
+                // report it as success. Bail so the request fails and retries.
+                Err(StreamAbort::StreamError(msg)) => {
+                    bail!("Anthropic stream read error: {msg}");
+                }
             };
             let ev: Value = match serde_json::from_str(&data) {
                 Ok(v) => v,

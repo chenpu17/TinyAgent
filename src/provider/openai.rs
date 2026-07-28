@@ -282,6 +282,13 @@ impl OpenAi {
                     abort = Some("stream_idle");
                     break;
                 }
+                // A mid-stream read failure (connection reset, truncated body)
+                // must NOT be treated as a clean end-of-stream — that would
+                // assemble a partial response and report it as success. Bail so
+                // the request fails and is retried as transient.
+                Err(StreamAbort::StreamError(msg)) => {
+                    bail!("OpenAI stream read error: {msg}");
+                }
             };
             if data == "[DONE]" {
                 break;

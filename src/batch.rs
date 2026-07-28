@@ -142,7 +142,7 @@ pub fn run(
                         error: Some("cancelled by user (not started)".into()),
                     }
                 } else {
-                    run_one(base, &name, partial, &results_dir, &client, retries)
+                    run_one(base, &name, partial, &results_dir, &client, retries, &cancel)
                 };
                 eprintln!(
                     "[{}] {} ({} turns, {:.1}s{})",
@@ -273,6 +273,10 @@ fn run_one_attempt(
 /// Run a task, retrying up to `retries` extra times on transient (`"error"`)
 /// failures with exponential backoff. Successes and deterministic failures
 /// (bad_task, max_turns, …) are not retried — they won't change on a re-run.
+/// A Ctrl-C during a backoff (mirroring single-run `run_with_retries`) marks
+/// the task cancelled instead of running another full attempt: the worker's
+/// per-task gate only stops the NEXT task, so without this the cancel is
+/// swallowed until the in-flight retry loop finishes.
 fn run_one(
     base: &Config,
     name: &str,
@@ -280,6 +284,7 @@ fn run_one(
     results_dir: &Path,
     client: &reqwest::blocking::Client,
     retries: usize,
+    cancel: &Arc<std::sync::atomic::AtomicBool>,
 ) -> TaskReport {
     let start = std::time::Instant::now();
     let mut report = run_one_attempt(base, name, &partial, results_dir, client);
@@ -295,6 +300,20 @@ fn run_one(
             backoff,
         );
         std::thread::sleep(backoff);
+        // Honor a Ctrl-C that landed during the backoff: otherwise the next
+        // run_one_attempt runs to completion (a full task the user wanted to
+        // abort) and only the gate on the NEXT task stops the batch.
+        if cancel.load(Ordering::Relaxed) {
+            report = TaskReport {
+                name: name.into(),
+                success: false,
+                stop_reason: "cancelled".into(),
+                turns: report.turns,
+                elapsed_secs: start.elapsed().as_secs_f64(),
+                error: Some("cancelled by user during retry backoff".into()),
+            };
+            break;
+        }
         attempt += 1;
         report = run_one_attempt(base, name, &partial, results_dir, client);
     }
@@ -513,6 +532,63 @@ mod tests {
             std::fs::read_dir(&results_dir).unwrap().count(),
             0,
             "cancelled tasks must not write result files"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cancel_during_retry_backoff_marks_task_cancelled() {
+        // L4: a Ctrl-C during a RUNNING task's retry backoff must mark that
+        // task cancelled (not run another full attempt) and exit 130. This is
+        // distinct from the pre-start gate (cancelled_run_marks_all_tasks_*):
+        // here the task already started, errored transiently, and is mid-
+        // backoff when cancel arrives. Without the post-sleep check the next
+        // attempt would run to completion before the worker's NEXT-task gate
+        // caught the cancel.
+        //
+        // The task's api_key env is unset → build_agent errors → run_one_attempt
+        // returns the transient "error" stop_reason, entering the retry loop.
+        // A spawned thread flips cancel ~50ms in, well inside the 1s first
+        // backoff, so the post-sleep check trips deterministically (no race:
+        // 50ms ≪ 1s). Mirrors single-run's cancel-during-backoff semantics.
+        let dir = std::env::temp_dir().join(format!("ta-batch-bo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("t.json"), r#"{"task":"x"}"#).unwrap();
+
+        let base: Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"DEFINITELY_UNSET_TA_KEY","model":"m"}"#,
+        )
+        .unwrap();
+        let report = dir.join("report.json");
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Flip cancel ~50ms in — inside the first 1s backoff (attempt 0 errors
+        // near-instantly: build_agent fails at the env-var lookup, no network).
+        let flag = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            flag.store(true, Ordering::Relaxed);
+        });
+
+        let code = run(&base, &dir, 1, &report, 2, false, cancel).unwrap();
+        assert_eq!(code, 130, "cancel during backoff → exit 130");
+
+        // The task is marked cancelled (not re-attempted to success/error), with
+        // a backoff-cancel message — not the gate's "not started" wording.
+        let tasks = read_prior_tasks(&report).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].stop_reason, "cancelled");
+        assert!(!tasks[0].success);
+        assert!(
+            tasks[0]
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("backoff"),
+            "expected a backoff-cancel message, got {:?}",
+            tasks[0].error
         );
 
         std::fs::remove_dir_all(&dir).ok();
