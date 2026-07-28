@@ -370,19 +370,19 @@ release 下 panic 不触发 `Drop`——调试 destructors（如 TUI 终端还�
 
 ```
 src/
-├── main.rs      (311)  # CLI 入口 + 组装（build_agent）+ --session none
-├── config.rs    (471)  # 配置解析 + 任务片段合并 + 批量覆盖白名单
+├── main.rs      (334)  # CLI 入口 + 组装（build_agent）+ --session none
+├── config.rs    (588)  # 配置解析 + 任务片段合并 + 批量覆盖白名单
 ├── provider/           # LLM 后端
 │   ├── mod.rs   (412)  #   共享 Message/Block、SSE reader、CancellableSse
 │   ├── openai.rs (716) #   OpenAI 兼容（include_usage；400 回退：max_tokens→max_completion_tokens / 丢 stream_options）
 │   ├── anthropic.rs(538) # Anthropic 原生（message_start/message_delta usage）
 │   └── mock.rs   (216) #   测试用脚本化 Provider（cfg(test)）
-├── agent.rs    (2878) # 核心 loop + usage 累计 + cancel + 上下文压缩（前馈/溢出双触发 + 滚动分块摘要）+ 相邻消息归一 + 回归测试
+├── agent.rs    (3061) # 核心 loop + usage 累计 + cancel + 上下文压缩（前馈/溢出双触发 + 滚动分块摘要）+ 相邻消息归一 + 回归测试
 ├── signal.rs     (60) # headless SIGINT → cancel（首次优雅 / 二次硬退出 130）
 ├── tools/              # 5 个内置工具 + MCP 工具包装
 ├── mcp.rs      (732)   # MCP 客户端（stdio / Streamable HTTP / 旧版 SSE）
 ├── session.rs   (125)  # 会话持久化
 ├── batch.rs     (596)  # 批量任务 + --retries/--failed + 报告合并
 ├── harness.rs   (472)  # headless 模式 + result.json + NDJSON + exit code
-└── tui.rs      (1274)  # TUI（feature-gated）：InputBuffer / 模式 / 斜杠命令 / bracketed paste
+└── tui.rs      (2042)  # TUI（feature-gated）：InputBuffer / 模式 / 斜杠命令 / bracketed paste
 ```

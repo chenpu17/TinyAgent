@@ -84,15 +84,20 @@ fn classify(trimmed: &str) -> SlashCmd {
         None => (rest.trim(), ""),
     };
     let arg = if raw_arg.is_empty() { None } else { Some(raw_arg.to_string()) };
+    // Only /export takes an argument. After the classify refactor the other
+    // commands silently dropped a trailing arg (`/model foo` ran /model with
+    // "foo" ignored); reject them as unknown so the typo is surfaced. Unknown
+    // carries the full `rest` so the message names what was actually typed.
+    let stray_arg = arg.is_some();
     match word {
-        "clear" => SlashCmd::Clear,
+        "clear" if !stray_arg => SlashCmd::Clear,
         "export" => SlashCmd::Export(arg),
-        "model" => SlashCmd::Model,
-        "limits" => SlashCmd::Limits,
-        "tools" => SlashCmd::Tools,
-        "system" => SlashCmd::System,
-        "help" => SlashCmd::Help,
-        other => SlashCmd::Unknown(other.to_string()),
+        "model" if !stray_arg => SlashCmd::Model,
+        "limits" if !stray_arg => SlashCmd::Limits,
+        "tools" if !stray_arg => SlashCmd::Tools,
+        "system" if !stray_arg => SlashCmd::System,
+        "help" if !stray_arg => SlashCmd::Help,
+        _ => SlashCmd::Unknown(rest.to_string()),
     }
 }
 
@@ -199,12 +204,43 @@ fn copy_to_clipboard(text: &str) -> bool {
             .map(|s| s.write_all(text.as_bytes()).is_ok())
             .unwrap_or(false);
         drop(child.stdin.take()); // EOF so the tool flushes and exits
-        let ok = fed && child.wait().map(|s| s.success()).unwrap_or(false);
+        // Always reap. An earlier `fed && wait()` short-circuited the wait
+        // when the write failed (broken pipe after the tool exited early),
+        // and Rust's `Child::drop` does NOT reap on Unix — leaking a zombie
+        // until process exit. wait() runs unconditionally; its result still
+        // combines with `fed` so a failed write reports failure.
+        let exited_ok = child.wait().map(|s| s.success()).unwrap_or(false);
+        let ok = fed && exited_ok;
         if ok {
             return true;
         }
     }
     false
+}
+
+/// Expand a leading `~/` (and a bare `~`) to `$HOME`, for `/export ~/notes.md`.
+/// Only the current user's home — `~other` is left as-is (rare; not needed
+/// here). `_with` takes home explicitly so the logic is unit-testable without
+/// mutating the process-wide `$HOME`; `expand_tilde` binds it to the env.
+fn expand_tilde_with(path: &str, home: Option<&std::ffi::OsStr>) -> String {
+    let home = match home {
+        Some(h) => h,
+        None => return path.to_string(),
+    };
+    if path == "~" {
+        return home.to_string_lossy().into_owned();
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        let mut s = home.to_string_lossy().into_owned();
+        s.push('/');
+        s.push_str(rest);
+        return s;
+    }
+    path.to_string()
+}
+
+fn expand_tilde(path: &str) -> String {
+    expand_tilde_with(path, std::env::var_os("HOME").as_deref())
 }
 
 /// A row selectable in Nav mode (tool calls and tool results).
@@ -883,6 +919,13 @@ fn ui_loop(
                                         // rely on the loop reaching that drain.
                                         if in_tx.send(Some(Input::Text(trimmed))).is_err() {
                                             busy = false;
+                                            // The message never reached the agent — drop it
+                                            // from the transcript so the on-screen history
+                                            // matches what the agent actually saw (otherwise it
+                                            // reads as if the agent ignored the user).
+                                            if matches!(rows.last(), Some(Row::User(_))) {
+                                                rows.pop();
+                                            }
                                             rows.push(Row::System(
                                                 "[worker stopped — message not delivered; \
                                                  press Esc to quit]"
@@ -911,8 +954,23 @@ fn ui_loop(
                                         // input-mode action.
                                         select_idx = None;
                                         mode = Mode::Input;
-                                        rows.push(Row::System("[history cleared]".into()));
-                                        let _ = in_tx.send(Some(Input::Clear));
+                                        // Send before claiming success. If the worker is gone
+                                        // (panicked mid-run in a debug build, or tearing down)
+                                        // the send fails and the agent-side history is NOT
+                                        // cleared — report that honestly, mirroring the text
+                                        // path, instead of asserting "[history cleared]". The
+                                        // local UI reset above still applies (the user asked to
+                                        // clear the screen regardless).
+                                        let cleared = in_tx.send(Some(Input::Clear)).is_ok();
+                                        rows.push(Row::System(
+                                            if cleared {
+                                                "[history cleared]".into()
+                                            } else {
+                                                "[worker stopped — UI cleared but session \
+                                                 history not cleared]"
+                                                    .into()
+                                            },
+                                        ));
                                     }
                                     SlashCmd::Export(arg) => {
                                         // The mouse-capture that enables wheel
@@ -929,13 +987,32 @@ fn ui_loop(
                                         let text = render_transcript(&rows);
                                         let msg = match arg {
                                             Some(path) => {
-                                                match std::fs::write(&path, &text) {
-                                                    Ok(_) => {
-                                                        format!("[exported {n} rows to {path}]")
+                                                use std::fs::OpenOptions;
+                                                use std::io::Write;
+                                                // Expand `~/` so /export ~/notes.md lands in the
+                                                // home dir, not a literal "~/" directory.
+                                                // create_new refuses to clobber an existing file:
+                                                // the TUI has no undo and the success line gave
+                                                // no warning, so a typo'd path (e.g. ~/.zshrc)
+                                                // would otherwise truncate real content silently.
+                                                // (The clipboard-less fallback below keeps
+                                                // overwriting its own scratch file on purpose.)
+                                                let dest = expand_tilde(&path);
+                                                let res = OpenOptions::new()
+                                                    .write(true)
+                                                    .create_new(true)
+                                                    .open(&dest)
+                                                    .and_then(|mut f| f.write_all(text.as_bytes()));
+                                                match res {
+                                                    Ok(_) => format!("[exported {n} rows to {dest}]"),
+                                                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                                                        format!(
+                                                            "[export to {dest} failed: file already \
+                                                             exists — /export won't overwrite; remove \
+                                                             it or choose another path]"
+                                                        )
                                                     }
-                                                    Err(e) => {
-                                                        format!("[export to {path} failed: {e}]")
-                                                    }
+                                                    Err(e) => format!("[export to {dest} failed: {e}]"),
                                                 }
                                             }
                                             None => {
@@ -1672,6 +1749,25 @@ mod tests {
         assert_eq!(classify("/export   a/b.txt  "), SlashCmd::Export(Some("a/b.txt".into())));
         // /export with only trailing spaces → no arg.
         assert_eq!(classify("/export "), SlashCmd::Export(None));
+        // No-arg commands reject a trailing arg (only /export takes one):
+        // `/model foo` is a typo, not a silently-ignored /model.
+        assert_eq!(classify("/model foo"), SlashCmd::Unknown("model foo".into()));
+        assert_eq!(classify("/clear x"), SlashCmd::Unknown("clear x".into()));
+    }
+
+    #[test]
+    fn expand_tilde_resolves_home() {
+        let home = std::ffi::OsStr::new("/Users/x");
+        assert_eq!(expand_tilde_with("~/notes.md", Some(home)), "/Users/x/notes.md");
+        assert_eq!(expand_tilde_with("~", Some(home)), "/Users/x");
+        // No leading tilde → passthrough unchanged.
+        assert_eq!(expand_tilde_with("foo/bar", Some(home)), "foo/bar");
+        assert_eq!(expand_tilde_with("/abs/path", Some(home)), "/abs/path");
+        // Only the current user's home; `~other` is left as-is.
+        assert_eq!(expand_tilde_with("~other/x", Some(home)), "~other/x");
+        // $HOME unset → literal path (no expansion, no error).
+        assert_eq!(expand_tilde_with("~/notes.md", None), "~/notes.md");
+        assert_eq!(expand_tilde_with("~", None), "~");
     }
 
     #[test]
