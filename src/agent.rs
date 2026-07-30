@@ -839,8 +839,14 @@ impl Agent {
                 // through unchanged: if the provider billed usage, the caller
                 // counts/emits it; if it reported none, count nothing and emit
                 // no noise Usage{0,0} event. Either way disable compression for
-                // the rest of this run (don't retry every turn).
+                // the rest of this run (don't retry every turn), and WARN — a
+                // silent disable here (unlike the Err arm below) would leave a
+                // growing context with no explanation for why it stops
+                // compacting. Fires once: compress_failed gates future attempts.
                 self.compress_failed = true;
+                events(AgentEvent::Warning(
+                    "context compression produced an empty summary (disabled for this run)".into(),
+                ));
                 return Some(u);
             }
             Err(e) => {

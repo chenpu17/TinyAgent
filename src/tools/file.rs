@@ -57,7 +57,18 @@ impl Tool for ReadFile {
                 }
             }
             let line = line.with_context(|| format!("cannot read {}", full.display()))?;
-            out.push_str(&format!("{:>6}\t{}\n", i + 1, line));
+            // Cap a pathological single line BEFORE formatting+pushing: a
+            // multi-MB line would otherwise be allocated into `out` in full
+            // (far past max_output_chars) only for the truncation below to
+            // throw it away. Cheap byte-length gate; char-boundary-safe cap.
+            let remaining = ctx.max_output_chars.saturating_sub(out.len());
+            if line.len() > remaining {
+                let mut capped = line;
+                truncate(&mut capped, remaining);
+                out.push_str(&format!("{:>6}\t{}\n", i + 1, capped));
+            } else {
+                out.push_str(&format!("{:>6}\t{}\n", i + 1, line));
+            }
             if out.len() >= ctx.max_output_chars {
                 truncate(&mut out, ctx.max_output_chars);
                 break;
@@ -312,6 +323,28 @@ mod tests {
             .run(&json!({"path": "empty.txt"}), &ctx_in(&dir))
             .unwrap();
         assert_eq!(out.content, "[empty file]");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_file_caps_a_pathological_single_line() {
+        // A single line longer than the whole output budget (minified blob,
+        // base64) must be capped before formatting — not allocated in full
+        // then truncated. The output stays within max_output_chars (1000
+        // here) and carries the truncation marker.
+        let dir = std::env::temp_dir().join(format!("ta-bigline-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let big = "x".repeat(50_000); // one line, no newline, 50× the budget
+        fs::write(dir.join("big.txt"), &big).unwrap();
+        let out = ReadFile
+            .run(&json!({"path": "big.txt"}), &ctx_in(&dir))
+            .unwrap();
+        assert!(
+            out.content.len() < 2000,
+            "a pathological line must be capped, got {} bytes",
+            out.content.len()
+        );
+        assert!(out.content.contains("truncated"), "got: {}", out.content);
         fs::remove_dir_all(&dir).ok();
     }
 

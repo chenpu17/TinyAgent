@@ -22,6 +22,13 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// legitimate JSON-RPC message (a tools/call result is truncated to
 /// `max_output_chars` AFTER receipt, so the wire never carries the full blob).
 const MCP_LINE_MAX: usize = 16 * 1024 * 1024;
+/// Upper bound on one aggregated SSE event. Each `data:` line is already
+/// capped at `MCP_LINE_MAX`, but a single event can splice many of them; an
+/// adversarial or buggy server could stream data: lines indefinitely (until a
+/// blank-line terminator that never comes) and exhaust memory. A legitimate
+/// JSON-RPC result is one big line well under the per-line cap, so 4× that is
+/// a generous bound that still defeats runaway aggregation.
+const MCP_EVENT_MAX: usize = 4 * MCP_LINE_MAX;
 
 /// Read one line (including its trailing `\n`) into `buf` (bytes appended;
 /// caller clears `buf` between calls), bounded by `max_bytes`. Returns the
@@ -192,7 +199,15 @@ fn http_client(total: Duration) -> reqwest::blocking::Client {
         // across hosts) to an internal or attacker address.
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .unwrap_or_else(|_| reqwest::blocking::Client::new())
+        .unwrap_or_else(|_| {
+            // Build failure is near-impossible, but the fallback MUST re-apply
+            // the no-redirect policy — a bare Client::new() follows redirects
+            // and would reintroduce the key-leak vector documented above.
+            reqwest::blocking::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("reqwest client build")
+        })
 }
 
 fn pending_new() -> Pending {
@@ -447,7 +462,7 @@ impl Transport for HttpTransport {
             // the first `data:` line of a multi-line event and would drop the
             // rest, losing large JSON-RPC results.
             let mut reader = std::io::BufReader::new(resp);
-            while let Some((_event, data)) = read_sse_event(&mut reader)? {
+            while let Some((_event, data)) = read_sse_event(&mut reader, MCP_EVENT_MAX)? {
                 if let Ok(msg) = serde_json::from_str::<Value>(&data) {
                     if msg.get("id").and_then(|v| v.as_u64()) == Some(id) {
                         return extract_result(msg, method);
@@ -532,7 +547,7 @@ impl SseTransport {
                 let mut reader = BufReader::new(resp);
                 let mut endpoint_sent = false;
                 while !shutdown.load(Ordering::Relaxed) {
-                    let (event, data) = match read_sse_event(&mut reader) {
+                    let (event, data) = match read_sse_event(&mut reader, MCP_EVENT_MAX) {
                         Ok(Some(ev)) => ev,
                         Ok(None) => break, // stream ended
                         Err(e) => {
@@ -648,8 +663,11 @@ impl Drop for SseTransport {
 
 /// Read one SSE event as (event, data); returns `Ok(None)` at end of stream,
 /// `Err` if a line exceeds the cap or the read fails. Handles `event:`,
-/// possibly multi-line `data:`, and skips comments.
-fn read_sse_event<R: BufRead>(reader: &mut R) -> Result<Option<(String, String)>> {
+/// possibly multi-line `data:`, and skips comments. `event_max` bounds the
+/// total aggregated `data:` payload (each line is separately capped by
+/// `read_capped_line`); pluggable so a test can exercise the bound without
+/// allocating `MCP_EVENT_MAX` bytes.
+fn read_sse_event<R: BufRead>(reader: &mut R, event_max: usize) -> Result<Option<(String, String)>> {
     let mut event = String::from("message");
     let mut data = String::new();
     let mut line: Vec<u8> = Vec::new();
@@ -675,6 +693,13 @@ fn read_sse_event<R: BufRead>(reader: &mut R) -> Result<Option<(String, String)>
                 data.push('\n');
             }
             data.push_str(v.trim_start());
+            // Bound runaway aggregation: a server streaming data: lines
+            // without a terminating blank line would grow `data` unbounded.
+            if data.len() > event_max {
+                anyhow::bail!(
+                    "MCP SSE event exceeded {event_max} bytes without a blank-line terminator (runaway or malicious server)"
+                );
+            }
         }
     }
 }
@@ -748,11 +773,11 @@ mod tests {
     fn sse_event_parsing() {
         let raw = b"event: endpoint\ndata: /messages?session=abc\n\nevent: message\ndata: {\"id\":1}\n\n";
         let mut r = BufReader::new(&raw[..]);
-        let (e1, d1) = read_sse_event(&mut r).unwrap().unwrap();
+        let (e1, d1) = read_sse_event(&mut r, MCP_EVENT_MAX).unwrap().unwrap();
         assert_eq!((e1.as_str(), d1.as_str()), ("endpoint", "/messages?session=abc"));
-        let (e2, d2) = read_sse_event(&mut r).unwrap().unwrap();
+        let (e2, d2) = read_sse_event(&mut r, MCP_EVENT_MAX).unwrap().unwrap();
         assert_eq!((e2.as_str(), d2.as_str()), ("message", "{\"id\":1}"));
-        assert!(read_sse_event(&mut r).unwrap().is_none());
+        assert!(read_sse_event(&mut r, MCP_EVENT_MAX).unwrap().is_none());
     }
 
     #[test]
@@ -778,6 +803,25 @@ mod tests {
         // And the next read is a clean EOF.
         buf.clear();
         assert_eq!(read_capped_line(&mut r, &mut buf, cap).unwrap(), 0);
+    }
+
+    #[test]
+    fn read_sse_event_rejects_runaway_aggregation() {
+        // Each data: line is under the per-line cap, but a server that never
+        // sends the blank-line terminator would aggregate them forever. The
+        // event-total cap must bail before memory is exhausted. Use a tiny cap
+        // (the real MCP_EVENT_MAX is 64 MiB — impractical for a unit test).
+        let cap = 32;
+        // Many short data: lines, no blank-line terminator → data grows past cap.
+        let mut raw: Vec<u8> = Vec::new();
+        for _ in 0..100 {
+            raw.extend_from_slice(b"data: chunk\n");
+        }
+        let mut r = BufReader::new(&raw[..]);
+        let err = read_sse_event(&mut r, cap).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("exceeded"), "{msg}");
+        assert!(msg.contains("runaway"), "{msg}");
     }
 
     #[test]

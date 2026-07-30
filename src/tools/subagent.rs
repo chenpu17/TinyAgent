@@ -161,7 +161,7 @@ impl Tool for SubAgent {
         if let Some(flag) = ctx.cancel.clone() {
             child.set_cancel(flag);
         }
-        Ok(run_subagent(&mut child, name, emit))
+        Ok(run_subagent(&mut child, name, emit, ctx.max_output_chars))
     }
 }
 
@@ -171,7 +171,12 @@ impl Tool for SubAgent {
 /// the `ToolOutput`. The child's events are forwarded to `emit`, each wrapped as
 /// `AgentEvent::SubAgent { name, .. }` so the parent stream shows the
 /// sub-agent's progress tagged with its identity.
-fn run_subagent(agent: &mut Agent, name: &str, emit: &mut dyn FnMut(AgentEvent)) -> ToolOutput {
+fn run_subagent(
+    agent: &mut Agent,
+    name: &str,
+    emit: &mut dyn FnMut(AgentEvent),
+    max_output_chars: usize,
+) -> ToolOutput {
     let name_owned = name.to_string();
     // run_as_subagent (not run): the child shares the parent's cancel Arc, and
     // must NOT reset it at entry — otherwise a sibling in a parallel `task`
@@ -183,7 +188,7 @@ fn run_subagent(agent: &mut Agent, name: &str, emit: &mut dyn FnMut(AgentEvent))
             event: Box::new(ev),
         });
     }) {
-        Ok(o) => outcome_to_output(&o, name),
+        Ok(o) => outcome_to_output(&o, name, max_output_chars),
         Err(e) => {
             let mut out = ToolOutput::error(format!("subagent {name} failed: {e:#}"));
             // Honest cost even on failure: the turns the child completed before
@@ -203,12 +208,17 @@ fn run_subagent(agent: &mut Agent, name: &str, emit: &mut dyn FnMut(AgentEvent))
 /// final summary as content, its usage billed to the parent, and a non-alarming
 /// note when it ended short of `end_turn` (max_turns / timeout / cancelled),
 /// tagged with the sub-agent's name so the parent can tell which one stopped.
-fn outcome_to_output(o: &RunOutcome, name: &str) -> ToolOutput {
-    let content = if o.stop_reason == "end_turn" {
+fn outcome_to_output(o: &RunOutcome, name: &str, max_output_chars: usize) -> ToolOutput {
+    let mut content = if o.stop_reason == "end_turn" {
         o.final_text.clone()
     } else {
         format!("[subagent {name} ended: {}]\n{}", o.stop_reason, o.final_text)
     };
+    // Cap the summary to the parent's output budget: a child that ignores the
+    // "concise summary" instruction and dumps its whole transcript would
+    // inject a huge tool result into the parent's context, bloating it toward
+    // the very compression the sub-agent was meant to avoid. Char-boundary safe.
+    tools::truncate(&mut content, max_output_chars);
     ToolOutput {
         content,
         image: None,
@@ -275,7 +285,7 @@ mod tests {
             mock::resp_tool("t1", "noop", json!({}), mock::mk_usage(100, 5)),
             mock::resp_text("done summary", mock::mk_usage(50, 3)),
         ]);
-        let out = run_subagent(&mut agent, "scout", &mut |_| {});
+        let out = run_subagent(&mut agent, "scout", &mut |_| {}, usize::MAX);
         assert_eq!(out.content, "done summary");
         assert!(!out.is_error);
         let u = out.usage.expect("usage billed to parent");
@@ -292,7 +302,7 @@ mod tests {
             mock::resp_tool("t1", "noop", json!({}), mock::mk_usage(100, 5)),
             mock::MockTurn::Err("provider blew up".into()),
         ]);
-        let out = run_subagent(&mut agent, "scout", &mut |_| {});
+        let out = run_subagent(&mut agent, "scout", &mut |_| {}, usize::MAX);
         assert!(out.is_error);
         assert!(out.content.contains("provider blew up"));
         let u = out.usage.expect("failed sub-agent still bills completed turns");
@@ -305,7 +315,7 @@ mod tests {
         // Error on the very first request: nothing was billed, so usage must
         // stay None (the parent folds only Some — a Some(0,0) would be noise).
         let mut agent = mock_agent(vec![mock::MockTurn::Err("instant failure".into())]);
-        let out = run_subagent(&mut agent, "scout", &mut |_| {});
+        let out = run_subagent(&mut agent, "scout", &mut |_| {}, usize::MAX);
         assert!(out.is_error);
         assert!(out.usage.is_none());
     }
@@ -325,7 +335,7 @@ mod tests {
                     _ => {}
                 }
             }
-        });
+        }, usize::MAX);
         assert!(seen.iter().all(|(n, _)| n == "worker-7"), "every event tagged: {seen:?}");
         assert!(seen.iter().any(|(_, t)| t == "hi"), "child text forwarded: {seen:?}");
     }
@@ -343,7 +353,7 @@ mod tests {
             cache_read_input_tokens: 0,
             elapsed: std::time::Duration::from_secs_f64(1.0),
         };
-        let out = outcome_to_output(&o, "a");
+        let out = outcome_to_output(&o, "a", usize::MAX);
         assert_eq!(out.content, "all done");
         assert!(!out.is_error);
         let u = out.usage.expect("usage billed");
@@ -366,10 +376,39 @@ mod tests {
             cache_read_input_tokens: 0,
             elapsed: std::time::Duration::from_secs_f64(2.0),
         };
-        let out = outcome_to_output(&o, "scout");
+        let out = outcome_to_output(&o, "scout", usize::MAX);
         assert!(!out.is_error, "short stop must not be is_error");
         assert!(out.content.starts_with("[subagent scout ended: max_turns_reached]"));
         assert!(out.content.contains("partial"));
+    }
+
+    #[test]
+    fn outcome_to_output_caps_oversized_summary() {
+        // A child that ignores "concise summary" and dumps a huge transcript
+        // must not inject it whole into the parent's context — cap to
+        // max_output_chars (char-safe, with a marker) so the parent's context
+        // stays bounded, the whole point of offloading to a sub-agent.
+        let big = "x".repeat(5000);
+        let o = RunOutcome {
+            final_text: big,
+            turns: 1,
+            stop_reason: "end_turn".into(),
+            tool_calls: vec![],
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            elapsed: std::time::Duration::from_secs_f64(1.0),
+        };
+        let out = outcome_to_output(&o, "scout", 1000);
+        assert!(
+            out.content.len() < 2000,
+            "summary must be capped, got {} bytes",
+            out.content.len()
+        );
+        assert!(out.content.contains("truncated"), "cap must leave a marker");
+        // Only the tail is dropped — the head of the summary survives.
+        assert!(out.content.starts_with("xxxx"));
     }
 
     #[test]

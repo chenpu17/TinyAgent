@@ -1247,6 +1247,14 @@
         assert!(events
             .iter()
             .all(|e| !matches!(e, AgentEvent::Compressed { .. })));
+        // An empty summary silently disabling compression would leave a growing
+        // context unexplained — a one-time Warning must surface the disable.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Warning(w) if w.contains("empty summary"))),
+            "empty summary should warn that compression is disabled"
+        );
     }
 
     #[test]
