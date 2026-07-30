@@ -150,7 +150,10 @@ impl McpClient {
     }
 }
 
-/// Unwrap a JSON-RPC response message into its `result`.
+/// Unwrap a JSON-RPC response message into its `result`. A response with
+/// NEITHER `result` nor `error` is a protocol violation — surfacing it as an
+/// empty tool result would hide it, so fail loudly. (A present-but-null
+/// `result` is legal and passes through.)
 fn extract_result(msg: Value, method: &str) -> Result<Value> {
     if let Some(err) = msg.get("error") {
         bail!(
@@ -159,6 +162,9 @@ fn extract_result(msg: Value, method: &str) -> Result<Value> {
             err["code"],
             err["message"].as_str().unwrap_or("")
         );
+    }
+    if msg.get("result").is_none() {
+        bail!("MCP '{method}' response has neither result nor error (protocol violation)");
     }
     let mut msg = msg;
     Ok(msg["result"].take())
@@ -195,19 +201,26 @@ fn pending_new() -> Pending {
 
 fn pending_dispatch(pending: &Pending, msg: Value) {
     if let Some(id) = msg.get("id").and_then(|v| v.as_u64()) {
-        if let Some(tx) = pending.lock().unwrap().remove(&id) {
+        if let Some(tx) = pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&id) {
             let _ = tx.send(msg);
         }
     }
 }
 
 /// Fail every waiter immediately (server closed the connection),
-/// so callers don't sit out the full CALL_TIMEOUT.
-fn pending_fail_all(pending: &Pending) {
-    let mut map = pending.lock().unwrap();
+/// so callers don't sit out the full CALL_TIMEOUT. `detail` carries any
+/// captured server stderr — a dying server's own error message is the single
+/// best clue for why the handshake/call failed.
+fn pending_fail_all(pending: &Pending, detail: &str) {
+    let mut map = pending.lock().unwrap_or_else(|e| e.into_inner());
+    let message = if detail.trim().is_empty() {
+        "MCP server closed the connection".to_string()
+    } else {
+        format!("MCP server closed the connection; its stderr: {}", detail.trim())
+    };
     for (_, tx) in map.drain() {
         let _ = tx.send(json!({
-            "error": {"code": -32000, "message": "MCP server closed the connection"}
+            "error": {"code": -32000, "message": message}
         }));
     }
 }
@@ -224,19 +237,64 @@ impl StdioTransport {
     fn spawn(cfg: &McpServerConfig) -> Result<Self> {
         use std::process::{Command, Stdio};
         let cmd = cfg.command.as_ref().expect("validated");
-        let mut child = Command::new(cmd)
+        // Spawn the server in its own process group (unix) so Drop can kill
+        // the whole tree — `npx some-mcp-server` forks a node grandchild that
+        // would otherwise be orphaned when we kill only the direct child
+        // (same reasoning as the shell tool's process_group(0)).
+        #[cfg(unix)]
+        let child = {
+            use std::os::unix::process::CommandExt;
+            Command::new(cmd)
+                .args(&cfg.args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .process_group(0)
+                .spawn()
+        };
+        #[cfg(not(unix))]
+        let child = Command::new(cmd)
             .args(&cfg.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .with_context(|| format!("cannot start MCP server '{}': {}", cfg.name, cmd))?;
+            .stderr(Stdio::piped())
+            .spawn();
+        let mut child =
+            child.with_context(|| format!("cannot start MCP server '{}': {}", cfg.name, cmd))?;
+
+        // Capture (don't inherit) the server's stderr: inheriting would scribble
+        // over the TUI's raw-mode screen, and null() (the old behavior) threw
+        // away the exact diagnostics needed when a server dies at startup.
+        // Capped so a chatty server can't grow memory without bound.
+        let stderr_buf: Arc<std::sync::Mutex<String>> = Default::default();
+        {
+            let mut err_pipe = child.stderr.take().expect("stderr piped");
+            let stderr_buf = stderr_buf.clone();
+            std::thread::spawn(move || {
+                use std::io::Read;
+                const CAP: usize = 8 * 1024;
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match err_pipe.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let mut buf = stderr_buf.lock().unwrap_or_else(|e| e.into_inner());
+                            if buf.len() < CAP {
+                                let room = CAP - buf.len();
+                                buf.push_str(&String::from_utf8_lossy(&chunk[..n.min(room)]));
+                            }
+                        }
+                    }
+                }
+            });
+        }
 
         let stdout = child.stdout.take().expect("stdout piped");
         let stdin = child.stdin.take().expect("stdin piped");
         let pending = pending_new();
         {
             let pending = pending.clone();
+            let stderr_buf = stderr_buf.clone();
             std::thread::spawn(move || {
                 let mut reader = BufReader::new(stdout);
                 let mut buf: Vec<u8> = Vec::new();
@@ -263,7 +321,8 @@ impl StdioTransport {
                         }
                     }
                 }
-                pending_fail_all(&pending);
+                let detail = stderr_buf.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                pending_fail_all(&pending, &detail);
             });
         }
         Ok(Self {
@@ -277,7 +336,7 @@ impl StdioTransport {
 impl Transport for StdioTransport {
     fn request(&mut self, id: u64, method: &str, params: Value) -> Result<Value> {
         let (tx, rx) = mpsc::channel();
-        self.pending.lock().unwrap().insert(id, tx);
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).insert(id, tx);
         // Reclaim the pending slot on any failure (write error or timeout):
         // otherwise a flaky server that times out on every call leaks one
         // map entry per call and grows without bound over a long session.
@@ -291,7 +350,7 @@ impl Transport for StdioTransport {
             extract_result(msg, method)
         })();
         if res.is_err() {
-            self.pending.lock().unwrap().remove(&id);
+            self.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
         }
         res
     }
@@ -307,7 +366,18 @@ impl Transport for StdioTransport {
 
 impl Drop for StdioTransport {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        // Kill the whole process group on unix (spawn made the child a group
+        // leader, so its pid IS the group id): a plain child.kill() would
+        // orphan grandchildren the server forked. ESRCH (already reaped) is
+        // harmless. Off unix there are no process groups — kill the child.
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-(self.child.id() as i32), libc::SIGKILL);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = self.child.kill();
+        }
         let _ = self.child.wait();
     }
 }
@@ -456,7 +526,7 @@ impl SseTransport {
             let url = url.to_string();
             std::thread::spawn(move || {
                 let Ok(resp) = req.send() else {
-                    pending_fail_all(&pending);
+                    pending_fail_all(&pending, "");
                     return;
                 };
                 let mut reader = BufReader::new(resp);
@@ -470,7 +540,7 @@ impl SseTransport {
                             // unusable. Fail every waiter so callers don't block
                             // until CALL_TIMEOUT on a dead/abusive server.
                             eprintln!("[warn] MCP SSE read stopped: {e:#}");
-                            pending_fail_all(&pending);
+                            pending_fail_all(&pending, "");
                             return;
                         }
                     };
@@ -486,7 +556,7 @@ impl SseTransport {
                                 Err(e) => {
                                     eprintln!("[warn] MCP SSE endpoint rejected: {e:#}");
                                     let _ = endpoint_tx.send(None);
-                                    pending_fail_all(&pending);
+                                    pending_fail_all(&pending, "");
                                     return;
                                 }
                             }
@@ -499,7 +569,7 @@ impl SseTransport {
                         _ => {}
                     }
                 }
-                pending_fail_all(&pending);
+                pending_fail_all(&pending, "");
             });
         }
         let post_url = endpoint_rx
@@ -544,7 +614,7 @@ impl SseTransport {
 impl Transport for SseTransport {
     fn request(&mut self, id: u64, method: &str, params: Value) -> Result<Value> {
         let (tx, rx) = mpsc::channel();
-        self.pending.lock().unwrap().insert(id, tx);
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).insert(id, tx);
         let res = (|| -> Result<Value> {
             self.post(&frame(id, method, params))?;
             let msg = rx
@@ -553,7 +623,7 @@ impl Transport for SseTransport {
             extract_result(msg, method)
         })();
         if res.is_err() {
-            self.pending.lock().unwrap().remove(&id);
+            self.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
         }
         res
     }

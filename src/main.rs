@@ -1,5 +1,6 @@
 mod agent;
 mod batch;
+mod compress;
 mod config;
 mod harness;
 mod mcp;
@@ -132,6 +133,17 @@ fn main() -> Result<()> {
             // explicitly rather than ignore (the --tui check above is the
             // precedent; this one was missing).
             bail!("--batch and --resume are mutually exclusive");
+        }
+        // Single-run-only flags that batch mode would silently ignore —
+        // rejecting them beats a run that doesn't do what was asked.
+        if !cli.image.is_empty() {
+            bail!("--batch and --image are mutually exclusive (images attach to a single run's initial message)");
+        }
+        if cli.json {
+            bail!("--batch and --json are mutually exclusive (batch writes the --report summary, not an NDJSON stream)");
+        }
+        if cli.output.is_some() {
+            bail!("--batch and --output are mutually exclusive (per-task results go to the batch results dir)");
         }
         // Wire Ctrl-C into batch the same way single-run headless does: first
         // SIGINT flips a shared flag the worker pool gates on (in-flight tasks

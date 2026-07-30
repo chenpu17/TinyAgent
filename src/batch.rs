@@ -1,7 +1,6 @@
-use crate::agent::RunOutcome;
 use crate::config::{Config, PartialConfig};
 use crate::harness;
-use crate::retry::backoff_secs;
+use crate::retry::backoff;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::json;
@@ -76,7 +75,14 @@ pub fn run(
             .filter(|t| !t.success)
             .map(|t| t.name.clone())
             .collect();
-        let kept_successes = prior_tasks.len() - failed_names.len();
+        // Count the prior successes that actually survive the merge (a success
+        // whose name also appears among the failures gets overlaid). Plain
+        // `prior.len() - failed_names.len()` miscounts when a name repeats
+        // (HashSet dedups, the Vec doesn't).
+        let kept_successes = prior_tasks
+            .iter()
+            .filter(|t| t.success && !failed_names.contains(&t.name))
+            .count();
         tasks.retain(|(name, _)| failed_names.contains(name));
         eprintln!(
             "batch --failed: re-running {} failed task(s); {} prior success(es) kept in report",
@@ -99,11 +105,14 @@ pub fn run(
     std::fs::create_dir_all(&results_dir)?;
 
     // One HTTP client (connection pool) shared by all tasks. The total
-    // timeout must cover the largest per-task override.
+    // timeout must cover the largest per-task override — and 0 means
+    // "no timeout", which wins over any finite value.
     let max_timeout = tasks
         .iter()
         .filter_map(|(_, p)| p.limits.as_ref()?.timeout_secs)
-        .fold(base.limits.timeout_secs, |a, b| a.max(b));
+        .fold(base.limits.timeout_secs, |a, b| {
+            if a == 0 || b == 0 { 0 } else { a.max(b) }
+        });
     let client = crate::provider::new_client(max_timeout);
 
     eprintln!(
@@ -194,9 +203,10 @@ pub fn run(
 /// One attempt at a task. Returns a `stop_reason` that signals retryability:
 /// `"error"` is transient (agent.run returned Err — provider/network) and is
 /// retried by `run_one`; `"bad_task"` is a deterministic config problem
-/// (forbidden override, bad JSON, no task) and is NOT retried; any other value
-/// is the model's real stop reason (end_turn / max_turns / …) and is not
-/// retried either.
+/// (forbidden override, bad JSON, no task) and `"setup_error"` a deterministic
+/// environment problem (missing api_key_env, MCP server won't start) — neither
+/// is retried; any other value is the model's real stop reason (end_turn /
+/// max_turns / …) and is not retried either.
 fn run_one_attempt(
     base: &Config,
     name: &str,
@@ -234,18 +244,23 @@ fn run_one_attempt(
         );
     }
 
-    let outcome: Result<(RunOutcome,)> = (|| {
-        let task = cfg.task.clone().expect("checked above");
-        let initial = vec![crate::provider::Message::user(vec![
-            crate::provider::Block::Text(task),
-        ])];
-        let mut agent = crate::build_agent(&cfg, initial, client)?;
-        let o = agent.run(&mut |_| {})?; // quiet: no per-event printing
-        Ok((o,))
-    })();
+    // Agent construction failures are DETERMINISTIC — a missing api_key_env,
+    // an MCP server that won't start, an unknown tool name — retrying them
+    // under --retries just burns backoff time to fail identically. Split them
+    // out of the transient "error" class so run_one doesn't retry them.
+    let task = cfg.task.clone().expect("checked above");
+    let initial = vec![crate::provider::Message::user(vec![
+        crate::provider::Block::Text(task),
+    ])];
+    let mut agent = match crate::build_agent(&cfg, initial, client) {
+        Ok(a) => a,
+        Err(e) => return bad("setup_error", format!("agent setup failed: {e:#}")),
+    };
+
+    let outcome = agent.run(&mut |_| {}); // quiet: no per-event printing
 
     match outcome {
-        Ok((o,)) => {
+        Ok(o) => {
             // A failed result write must not be swallowed: CI reads this file
             // for the full tool_calls/summary. Surface it so report.json does
             // not claim success while the result file is missing.
@@ -290,7 +305,7 @@ fn run_one(
     let mut report = run_one_attempt(base, name, &partial, results_dir, client);
     let mut attempt = 0;
     while report.stop_reason == "error" && attempt < retries {
-        let backoff = std::time::Duration::from_secs(backoff_secs(attempt));
+        let backoff = backoff(attempt);
         eprintln!(
             "[{}] transient error ({}); retry {}/{} in {:?}",
             name,
@@ -538,6 +553,34 @@ mod tests {
     }
 
     #[test]
+    fn setup_error_is_not_retried() {
+        // Agent-construction failures (unset api_key_env here) are
+        // deterministic: with --retries 3 the task must fail ONCE as
+        // setup_error, not burn three backoffs to fail identically. If it were
+        // retried this test would take 1+2+4=7s of backoff; it returns in ms.
+        let dir = std::env::temp_dir().join(format!("ta-batch-su-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("t.json"), r#"{"task":"x"}"#).unwrap();
+        let base: Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"DEFINITELY_UNSET_TA_KEY","model":"m"}"#,
+        )
+        .unwrap();
+        let report = dir.join("report.json");
+        let start = std::time::Instant::now();
+        let code = run(&base, &dir, 1, &report, 3, false, Default::default()).unwrap();
+        assert_eq!(code, 1);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "setup_error must not enter the retry/backoff loop"
+        );
+        let tasks = read_prior_tasks(&report).unwrap();
+        assert_eq!(tasks[0].stop_reason, "setup_error");
+        assert!(!tasks[0].success);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn cancel_during_retry_backoff_marks_task_cancelled() {
         // L4: a Ctrl-C during a RUNNING task's retry backoff must mark that
         // task cancelled (not run another full attempt) and exit 130. This is
@@ -547,8 +590,11 @@ mod tests {
         // attempt would run to completion before the worker's NEXT-task gate
         // caught the cancel.
         //
-        // The task's api_key env is unset → build_agent errors → run_one_attempt
-        // returns the transient "error" stop_reason, entering the retry loop.
+        // The task's base_url points at a closed local port → the provider
+        // request fails with connection refused → agent.run errs → the
+        // transient "error" stop_reason, entering the retry loop. (Setup-level
+        // failures like an unset api_key_env are "setup_error" — deterministic,
+        // NOT retried — so they can't drive this path anymore.)
         // A spawned thread flips cancel ~50ms in, well inside the 1s first
         // backoff, so the post-sleep check trips deterministically (no race:
         // 50ms ≪ 1s). Mirrors single-run's cancel-during-backoff semantics.
@@ -557,15 +603,17 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("t.json"), r#"{"task":"x"}"#).unwrap();
 
+        // Unique env var name so parallel tests can't observe each other's.
+        std::env::set_var("TA_BATCH_BO_KEY", "dummy");
         let base: Config = serde_json::from_str(
-            r#"{"provider":"openai","api_key_env":"DEFINITELY_UNSET_TA_KEY","model":"m"}"#,
+            r#"{"provider":"openai","api_key_env":"TA_BATCH_BO_KEY","model":"m","base_url":"http://127.0.0.1:1"}"#,
         )
         .unwrap();
         let report = dir.join("report.json");
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Flip cancel ~50ms in — inside the first 1s backoff (attempt 0 errors
-        // near-instantly: build_agent fails at the env-var lookup, no network).
+        // near-instantly: connection refused on a closed port, no network).
         let flag = cancel.clone();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(50));

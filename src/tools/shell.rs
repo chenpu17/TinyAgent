@@ -65,7 +65,15 @@ impl Tool for Shell {
         // Drain stdout/stderr on reader threads, capped in memory: beyond the
         // cap the output is discarded but still drained, so the child never
         // blocks on a full pipe.
-        let cap = ctx.max_output_chars.saturating_add(1024);
+        //
+        // This cap is in BYTES, but truncate() below counts CHARS. Size it at
+        // 4 bytes/char (the max UTF-8 width) + slack so that for ANY content —
+        // including CJK/emoji, where 3-4 bytes collapse to one char — enough
+        // bytes survive for the char-based truncate() to hit its threshold and
+        // append the "[truncated]" marker. A naive byte cap of max_output_chars
+        // left multi-byte output silently short of the char limit, so truncate()
+        // never fired and the model got truncated output with no sign it was cut.
+        let cap = ctx.max_output_chars.saturating_mul(4).saturating_add(1024);
         let mut out_pipe = child.stdout.take().expect("stdout piped");
         let mut err_pipe = child.stderr.take().expect("stderr piped");
         let out_thread = std::thread::spawn(move || read_capped(&mut out_pipe, cap));
@@ -108,6 +116,17 @@ impl Tool for Shell {
         let Some(status) = status else {
             let mut out = format!("$ {cmd}\n");
             out.push_str(&String::from_utf8_lossy(&stdout));
+            // Keep stderr on the killed path too: the diagnostics a command
+            // printed before hanging are exactly what's needed to see WHY it
+            // timed out — dropping them makes timeouts undebuggable.
+            let stderr = String::from_utf8_lossy(&stderr);
+            if !stderr.trim().is_empty() {
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push_str("[stderr]\n");
+                out.push_str(&stderr);
+            }
             truncate(&mut out, ctx.max_output_chars);
             if cancelled {
                 out.push_str("\n[command cancelled by user]");
@@ -206,6 +225,33 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(3),
             "cancel should kill within a poll interval, took {elapsed:?}"
+        );
+    }
+
+    /// The byte cap on stdout is sized at 4 bytes/char so the char-based
+    /// truncate() still fires for CJK/emoji (3-4 bytes/char). Without that
+    /// sizing, large multi-byte output falls short of the char limit at the
+    /// byte cap and truncate() never appends its "[truncated]" marker — the
+    /// model gets silently cut output. Emit 5000 中 chars (15000 bytes) under a
+    /// 1000-char limit and require the marker: with the old byte-only cap this
+    /// fails (only ~674 chars survive the byte cap, under the 1000 threshold);
+    /// with the 4× cap it passes (~1674 chars survive, over the threshold).
+    #[cfg(unix)]
+    #[test]
+    fn multibyte_output_marks_truncation_by_chars_not_bytes() {
+        let ctx = ToolCtx {
+            workdir: std::env::temp_dir(),
+            max_output_chars: 1000,
+            restrict_to_workdir: false,
+            cancel: None,
+        };
+        let out = Shell
+            .run(&json!({"command": "printf '中%.0s' $(seq 1 5000)"}), &ctx)
+            .unwrap();
+        assert!(
+            out.content.contains("[truncated"),
+            "multi-byte output must be marked truncated, got: {}",
+            out.content
         );
     }
 }

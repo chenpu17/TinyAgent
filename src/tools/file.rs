@@ -2,6 +2,7 @@ use super::{resolve, truncate, Tool, ToolCtx, ToolOutput};
 use crate::provider::ToolDef;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
+use std::io::Read;
 
 const MAX_LIST_ENTRIES: usize = 500;
 /// edit_file reads the whole file into memory (replace semantics), unlike
@@ -168,19 +169,24 @@ impl Tool for EditFile {
         // edit_file needs the whole file in memory (replace semantics), unlike
         // read_file which streams and stops at max_output_chars. Refuse a file
         // beyond the module-level cap (EDIT_FILE_MAX_BYTES) rather than OOM on
-        // a multi-GB file (e.g. a log in the workdir). metadata() failing (e.g.
-        // broken symlink) falls through to read_to_string's own error.
-        if let Ok(meta) = full.metadata() {
-            if meta.len() > EDIT_FILE_MAX_BYTES {
-                bail!(
-                    "edit_file: {} is {} bytes, over the {EDIT_FILE_MAX_BYTES}-byte limit (edit_file reads the whole file into memory) — use read_file to inspect it, or a streaming editor",
-                    full.display(),
-                    meta.len()
-                );
-            }
-        }
-        let original = std::fs::read_to_string(&full)
+        // a multi-GB file (e.g. a log in the workdir). Read with a `take` cap
+        // instead of metadata()-then-read: the metadata check had a
+        // check-then-read race (a file growing between the two calls slipped
+        // past the limit), the same pattern load_image's take() already avoids.
+        let mut bytes = Vec::new();
+        std::fs::File::open(&full)
+            .with_context(|| format!("cannot read {}", full.display()))?
+            .take(EDIT_FILE_MAX_BYTES + 1)
+            .read_to_end(&mut bytes)
             .with_context(|| format!("cannot read {}", full.display()))?;
+        if bytes.len() as u64 > EDIT_FILE_MAX_BYTES {
+            bail!(
+                "edit_file: {} is over the {EDIT_FILE_MAX_BYTES}-byte limit (edit_file reads the whole file into memory) — use read_file to inspect it, or a streaming editor",
+                full.display(),
+            );
+        }
+        let original = String::from_utf8(bytes)
+            .with_context(|| format!("{} is not valid UTF-8", full.display()))?;
 
         let count = original.matches(old_string).count();
         if count == 0 {
@@ -237,6 +243,7 @@ impl Tool for ListDir {
         let path = input["path"].as_str().unwrap_or(".");
         let full = resolve(ctx, path)?;
         let mut entries: Vec<String> = Vec::new();
+        let mut overflow = false;
         for e in std::fs::read_dir(&full)
             .with_context(|| format!("cannot list {}", full.display()))?
         {
@@ -248,11 +255,17 @@ impl Tool for ListDir {
             };
             entries.push(format!("{}{}", e.file_name().to_string_lossy(), suffix));
             if entries.len() >= MAX_LIST_ENTRIES {
-                entries.push(format!("... [more than {MAX_LIST_ENTRIES} entries]"));
+                overflow = true;
                 break;
             }
         }
         entries.sort();
+        // The overflow marker goes AFTER the sort — inside the loop it sorted
+        // as "..." (byte-wise before most file names) and ended up at the TOP
+        // of the listing, masquerading as a directory entry.
+        if overflow {
+            entries.push(format!("... [more than {MAX_LIST_ENTRIES} entries]"));
+        }
         if entries.is_empty() {
             return Ok(ToolOutput::text("[empty directory]"));
         }
@@ -425,7 +438,8 @@ mod tests {
         // edit_file loads the whole file into memory (replace semantics); a
         // file over EDIT_FILE_MAX_BYTES must be rejected before read_to_string
         // (OOM guard). A sparse file via set_len reports a large len() without
-        // actually allocating the bytes, so this test stays cheap.
+        // actually allocating the bytes; the capped take() read then streams a
+        // hole of zeros, so this test stays cheap either way.
         let dir = std::env::temp_dir().join(format!("ta-edit-big-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let big = dir.join("big.txt");
@@ -443,5 +457,55 @@ mod tests {
         assert!(msg.contains("over the"), "{msg}");
         assert!(msg.contains("limit"), "{msg}");
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn list_dir_overflow_marker_sorts_last() {
+        // Over MAX_LIST_ENTRIES the listing carries a "... [more than N
+        // entries]" marker. It must sit at the END of the sorted output —
+        // pushed before the sort it byte-sorts as "..." ahead of most file
+        // names and ends up at the top, masquerading as a directory entry.
+        let dir = std::env::temp_dir().join(format!("ta-list-big-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        for i in 0..MAX_LIST_ENTRIES + 5 {
+            fs::write(dir.join(format!("f{i:04}")), "").unwrap();
+        }
+        let mut ctx = ctx_in(&dir);
+        ctx.max_output_chars = 1_000_000; // don't truncate the marker away
+        let out = ListDir.run(&json!({}), &ctx).unwrap();
+        let marker = format!("... [more than {MAX_LIST_ENTRIES} entries]");
+        let tail = out.content.rsplit('\n').next().unwrap();
+        assert_eq!(tail, marker, "marker must be the last line: {tail:?}");
+        // And exactly MAX_LIST_ENTRIES real entries precede it.
+        assert_eq!(out.content.lines().count(), MAX_LIST_ENTRIES + 1);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// restrict_to_workdir must refuse a path that escapes via a symlink inside
+    /// the workdir. The whole point of confine()'s canonicalize step (vs a plain
+    /// lexical prefix check) is to resolve symlinks, yet nothing in the suite
+    /// exercised it — the existing escape test uses an absolute path, which a
+    /// lexical check would also catch. This pins the symlink-resolution path so
+    /// a future simplification can't silently drop it.
+    #[cfg(unix)]
+    #[test]
+    fn write_file_rejects_symlink_escape_under_restrict() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!("ta-sym-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        // A target OUTSIDE the workdir, and a symlink inside it pointing there.
+        let outside = std::env::temp_dir().join(format!("ta-sym-out-{}.txt", std::process::id()));
+        fs::write(&outside, "orig").unwrap();
+        symlink(&outside, dir.join("evil")).unwrap();
+        // Writing through the symlink must be rejected before any I/O, and the
+        // outside file must stay untouched.
+        let res = WriteFile.run(
+            &json!({"path": "evil", "content": "hacked"}),
+            &ctx_restricted(&dir),
+        );
+        assert!(res.is_err(), "symlink escape must be rejected under restrict_to_workdir");
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "orig");
+        fs::remove_dir_all(&dir).ok();
+        let _ = fs::remove_file(&outside);
     }
 }

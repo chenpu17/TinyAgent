@@ -36,9 +36,12 @@ enum Row {
     },
     /// Tool result: collapsed shows a truncated preview; expanded shows the
     /// full output (which can be large, but participates in normal scrolling).
+    /// `collapsed` caches the preview at creation (like ToolCall does) so the
+    /// renderer doesn't re-truncate the content every frame.
     ToolResult {
         name: String,
         content: String,
+        collapsed: String,
         is_error: bool,
         expanded: bool,
     },
@@ -363,13 +366,17 @@ pub fn run(
         while let Ok(Some(cmd)) = in_rx.recv() {
             match cmd {
                 Input::Text(text) => {
-                    agent.push_user(vec![Block::Text(text)]);
+                    if let Some(w) = agent.push_user(vec![Block::Text(text)]) {
+                        let _ = out_tx.send(UiMsg::Event(AgentEvent::Warning(w)));
+                    }
                     if !run_once(&mut agent) {
                         return;
                     }
                 }
                 Input::Clear => {
-                    agent.clear_messages();
+                    if let Some(w) = agent.clear_messages() {
+                        let _ = out_tx.send(UiMsg::Event(AgentEvent::Warning(w)));
+                    }
                 }
             }
         }
@@ -465,6 +472,10 @@ fn ui_loop(
     // each scroll tick) don't re-parse the whole conversation. Cleared with
     // `rows` on `/clear`.
     let mut md_cache = MdCache::new();
+    // Dirty flag for the render pass: set by any worker message or terminal
+    // event; while clear (and not busy) the loop skips term.draw entirely.
+    let mut dirty = true; // first frame must paint
+    let mut last_draw = Instant::now();
 
     rows.push(Row::System(format!(
         "tiny-agent · model {} · type a message, Enter to send, Esc to quit",
@@ -500,6 +511,7 @@ fn ui_loop(
                     if busy {
                         busy = false;
                         streaming = false;
+                        dirty = true;
                         rows.push(Row::System(
                             "[worker stopped unexpectedly — press Esc to quit]".into(),
                         ));
@@ -507,6 +519,7 @@ fn ui_loop(
                     break;
                 }
             };
+            dirty = true;
             match msg {
                 UiMsg::Event(ev) => match ev {
                     AgentEvent::TurnStart(n) => {
@@ -540,6 +553,7 @@ fn ui_loop(
                     } => {
                         streaming = false;
                         rows.push(Row::ToolResult {
+                            collapsed: crate::agent::preview(&content),
                             name,
                             content,
                             is_error,
@@ -555,6 +569,9 @@ fn ui_loop(
                         rows.push(Row::System(format!(
                             "[context compressed: dropped {dropped} messages, {kept} kept]"
                         )));
+                    }
+                    AgentEvent::Warning(w) => {
+                        rows.push(Row::System(format!("[warn] {w}")));
                     }
                     AgentEvent::Usage {
                         input_tokens,
@@ -608,6 +625,7 @@ fn ui_loop(
                             } => {
                                 sub_streaming_name = None;
                                 rows.push(Row::ToolResult {
+                                    collapsed: crate::agent::preview(content),
                                     name: format!("[{name}] {tn}"),
                                     content: content.clone(),
                                     is_error: *is_error,
@@ -615,6 +633,10 @@ fn ui_loop(
                                 });
                             }
                             AgentEvent::Done { .. } => sub_streaming_name = None,
+                            AgentEvent::Warning(w) => {
+                                sub_streaming_name = None;
+                                rows.push(Row::System(format!("[{name}] [warn] {w}")));
+                            }
                             _ => {} // TurnStart/Compressed/Usage/SubAgent: noisy or folded
                         }
                     }
@@ -622,15 +644,30 @@ fn ui_loop(
                 UiMsg::Error(e) => {
                     rows.push(Row::System(format!("[error] {e}")));
                     busy = false;
+                    // End every open stream: a leftover `streaming` /
+                    // `sub_streaming_name` would let the NEXT run's first
+                    // TextDelta merge into a stale row (or, when the last row
+                    // is this System row, be silently dropped).
+                    streaming = false;
+                    sub_streaming_name = None;
                 }
                 UiMsg::RunFinished => {
                     busy = false;
+                    streaming = false;
+                    sub_streaming_name = None;
                 }
             }
         }
 
-        // Render.
-        term.draw(|f| {
+        // Render — only when something changed (worker event drained, key or
+        // mouse handled, first frame). While a run is in flight, also redraw
+        // once a second so the status-bar clock keeps ticking. Idle frames
+        // previously repainted the whole conversation at ~16fps for nothing.
+        let clock_tick = busy && last_draw.elapsed() >= Duration::from_secs(1);
+        if dirty || clock_tick {
+            dirty = false;
+            last_draw = Instant::now();
+            term.draw(|f| {
             let area = f.area();
             // Input box grows with the number of lines typed, up to ~40% of
             // the screen so the conversation always stays visible.
@@ -693,6 +730,7 @@ fn ui_loop(
                     Row::ToolResult {
                         name,
                         content,
+                        collapsed,
                         is_error,
                         expanded,
                     } => {
@@ -704,7 +742,7 @@ fn ui_loop(
                         let body = if *expanded {
                             content.clone()
                         } else {
-                            crate::agent::preview(content)
+                            collapsed.clone()
                         };
                         let body_color = if *is_error { Color::Red } else { Color::Yellow };
                         for l in body.lines() {
@@ -762,21 +800,28 @@ fn ui_loop(
             // The input box height is capped (~40% of screen), so a long paste
             // can exceed it. Scroll the box to follow the caret and place the
             // caret within the visible window — otherwise it lands on the
-            // status bar or off-screen.
+            // status bar or off-screen. The same applies HORIZONTALLY: the
+            // Paragraph doesn't wrap, so a line wider than the box is clipped
+            // and an unclamped caret would be drawn past the border, over the
+            // conversation area (or off-screen on a narrow terminal).
             let inner_rows = (input_h as usize).saturating_sub(2);
             let input_scroll = crow
                 .saturating_sub(inner_rows.saturating_sub(1))
                 .min(u16::MAX as usize) as u16;
+            let inner_cols = (chunks[1].width as usize).saturating_sub(2).max(1);
+            let lead = if crow == 0 { prompt.width() } else { 0 };
+            let caret_col = ccol + lead; // display column within the caret's line
+            let (hscroll, caret_x) = input_hscroll(caret_col, inner_cols);
             let input_widget = Paragraph::new(format!("{prompt}{body}"))
                 .block(WBlock::default().borders(Borders::ALL).title("input"))
-                .scroll((input_scroll, 0));
+                .scroll((input_scroll, hscroll));
             f.render_widget(input_widget, chunks[1]);
             // Place the caret. Column = border(1) + display width of the text
-            // before the caret (+ the prompt, on the first line only). Display
-            // width keeps it correct for wide chars.
+            // before the caret (+ the prompt, on the first line only), minus
+            // the horizontal scroll. Display width keeps it correct for wide
+            // chars; hscroll keeps it inside the box on over-wide lines.
             if !busy && mode == Mode::Input {
-                let lead = if crow == 0 { prompt.width() } else { 0 };
-                let x = chunks[1].x + 1 + (ccol + lead).min(u16::MAX as usize) as u16;
+                let x = chunks[1].x + 1 + caret_x;
                 let y = chunks[1].y + 1 + (crow as u16).saturating_sub(input_scroll);
                 f.set_cursor_position((x, y));
             }
@@ -811,13 +856,23 @@ fn ui_loop(
                 Span::raw("  Ctrl-C cancel · Tab browse · Esc quit · PgUp/PgDn·wheel · Shift+drag copy · /export"),
             ]);
             f.render_widget(Paragraph::new(status), chunks[2]);
-        })?;
+            })?;
+        }
 
-        // Keyboard.
-        if event::poll(Duration::from_millis(60))? {
+        // Keyboard. Poll longer when idle: a keypress wakes the poll
+        // immediately, so the longer timeout costs no input latency but
+        // avoids spinning the loop at ~16fps while nothing is happening.
+        let poll_ms = if busy { 60 } else { 250 };
+        if event::poll(Duration::from_millis(poll_ms))? {
             let ev = event::read()?;
+            // Any event may change the view (scroll, caret, mode, …).
+            dirty = true;
             if let Event::Key(key) = ev {
-                if key.kind != KeyEventKind::Press {
+                // Accept key repeats too: on Windows, crossterm reports held
+                // keys as Press once then Repeat — filtering to Press only
+                // makes held Backspace/arrows delete/move a single char.
+                // Release events are still ignored (they'd double-fire).
+                if key.kind == KeyEventKind::Release {
                     continue;
                 }
                 match (key.code, key.modifiers) {
@@ -836,6 +891,7 @@ fn ui_loop(
                             // queued before the stream stops must start a fresh
                             // Assistant row instead of being silently dropped.
                             streaming = false;
+                            sub_streaming_name = None;
                             rows.push(Row::System("[cancelling…]".into()));
                         } else {
                             let _ = in_tx.send(None);
@@ -1151,6 +1207,24 @@ fn push_wrapped(lines: &mut Vec<Line>, label: &str, text: &str, color: Color) {
     }
 }
 
+/// Horizontal scroll for the input box: returns `(scroll_offset, caret_x)`
+/// where `caret_x` is the caret's on-screen column relative to the box's
+/// inner left edge, guaranteed `< inner_cols`. The input Paragraph doesn't
+/// wrap, so a line wider than the box must be horizontally scrolled to keep
+/// the caret visible — an unclamped caret would be drawn past the border,
+/// over the conversation area (or off-screen on a narrow terminal).
+fn input_hscroll(caret_col: usize, inner_cols: usize) -> (u16, u16) {
+    let inner_cols = inner_cols.max(1);
+    let scroll = caret_col
+        .saturating_sub(inner_cols.saturating_sub(1))
+        .min(u16::MAX as usize) as u16;
+    let x = caret_col
+        .saturating_sub(scroll as usize)
+        .min(inner_cols.saturating_sub(1))
+        .min(u16::MAX as usize) as u16;
+    (scroll, x)
+}
+
 /// Wrap one styled line to `width` display columns, returning one `Line` per
 /// visual row. Greedy word wrap: fill a row until the next word won't fit, then
 /// break at the last space; a word longer than `width` is hard-broken. A space
@@ -1436,13 +1510,16 @@ impl InputBuffer {
     }
 
     /// Insert a (possibly multi-line) string at the cursor — used for bracketed
-    /// paste. `\n` splits into a fresh line; a leading `\r` (CRLF pastes) is
-    /// dropped so it doesn't leave a stray CR in the input.
+    /// paste. `\n` splits into a fresh line; the CR of a CRLF pair (Windows
+    /// pastes) is dropped so it doesn't leave a stray CR in the input. A lone
+    /// `\r` is kept — swallowing every CR would corrupt content that uses it
+    /// deliberately (e.g. progress-redraw snippets).
     fn insert_str(&mut self, s: &str) {
-        for c in s.chars() {
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
             match c {
                 '\n' => self.newline(),
-                '\r' => {}
+                '\r' if chars.peek() == Some(&'\n') => {}
                 _ => self.put_char(c),
             }
         }
@@ -1613,6 +1690,12 @@ mod tests {
         let mut b = InputBuffer::new();
         b.insert_str("a\r\nb");
         assert_eq!(b.text(), "a\nb");
+
+        // A LONE \r is kept: only the CR of a CRLF pair is dropped — content
+        // that uses \r deliberately must survive the paste.
+        let mut b = InputBuffer::new();
+        b.insert_str("a\rb");
+        assert_eq!(b.text(), "a\rb");
 
         // Insert mid-line lands at the cursor, splitting the existing text.
         let mut b = InputBuffer::new();
@@ -1788,12 +1871,14 @@ mod tests {
             Row::ToolResult {
                 name: "shell".into(),
                 content: "a.txt".into(),
+                collapsed: "a.txt".into(),
                 is_error: false,
                 expanded: false,
             },
             Row::ToolResult {
                 name: "shell".into(),
                 content: "boom".into(),
+                collapsed: "boom".into(),
                 is_error: true,
                 expanded: false,
             },
@@ -1823,6 +1908,7 @@ mod tests {
             Row::ToolResult {
                 name: "b".into(),
                 content: "c".into(),
+                collapsed: "c".into(),
                 is_error: false,
                 expanded: false,
             },
@@ -2018,6 +2104,59 @@ mod tests {
     }
 
     // ── M6: render cache + owned-line conversion ───────────────────────
+
+    #[test]
+    fn input_hscroll_keeps_caret_inside_the_box() {
+        // Short line: no scroll, caret at its natural column.
+        assert_eq!(input_hscroll(3, 10), (0, 3));
+        // Caret exactly at the last inner column: still no scroll.
+        assert_eq!(input_hscroll(9, 10), (0, 9));
+        // Caret past the right edge: scrolls just enough to show it on the
+        // last inner column — never beyond the border.
+        assert_eq!(input_hscroll(10, 10), (1, 9));
+        assert_eq!(input_hscroll(500, 10), (491, 9));
+        // Degenerate widths can't underflow or place the caret outside.
+        assert_eq!(input_hscroll(0, 0), (0, 0));
+        assert_eq!(input_hscroll(42, 1), (42, 0));
+        // Invariant for a sweep of values: caret_x < inner_cols always.
+        for caret in 0..300usize {
+            for w in 1..20usize {
+                let (_, x) = input_hscroll(caret, w);
+                assert!((x as usize) < w, "caret {caret} at width {w} → x {x}");
+            }
+        }
+    }
+
+    #[test]
+    fn input_box_horizontal_scroll_renders_caret_line_window() {
+        // Widget level (the project's TestBackend convention): with the scroll
+        // from input_hscroll applied, the visible window of an over-wide line
+        // contains the text around the caret, not the line's clipped head.
+        use ratatui::backend::{Backend, TestBackend};
+        use ratatui::layout::Rect;
+
+        let body = "abcdefghijklmnopqrst"; // 20 cols, box shows 6
+        let (scroll, x) = input_hscroll(20, 6); // caret at end
+        assert_eq!(x, 5);
+        let area = Rect::new(0, 0, 8, 3);
+        let mut term = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        term.draw(|f| {
+            let p = Paragraph::new(body)
+                .block(WBlock::default().borders(Borders::ALL))
+                .scroll((0, scroll));
+            f.render_widget(p, area);
+            f.set_cursor_position((1 + x, 1));
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let row: String = (1..7).map(|x| buf[(x, 1)].symbol().to_string()).collect();
+        // Caret at end-of-line (col 20): window shows the tail + the blank
+        // caret cell after 't' — the clipped head "abcd…" is scrolled away.
+        assert_eq!(row, "pqrst ", "scrolled window: {row:?}");
+        // The drawn cursor stays within the box's inner area.
+        let pos = term.backend_mut().get_cursor_position().unwrap();
+        assert!(pos.x >= 1 && pos.x <= 6, "cursor x {} outside inner area", pos.x);
+    }
 
     #[test]
     fn md_cache_recomputes_only_when_text_changes() {

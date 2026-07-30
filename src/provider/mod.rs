@@ -146,15 +146,31 @@ pub fn build(cfg: &Config, api_key: &str, client: reqwest::blocking::Client) -> 
 /// must never outlive the whole run budget — an agent that hangs forever
 /// would stall any CI/eval pipeline it runs in. Clones share one
 /// connection pool (cheap, Arc inside).
+///
+/// `run_timeout_secs == 0` means "no timeout" (mirroring the agent loop):
+/// no client-level total timeout is set at all — a hard 60s floor here
+/// would silently kill any streaming generation longer than a minute even
+/// though the user asked for no limit. Stuck streams are still caught by
+/// the SSE idle timeout, and a bounded run sets per-request timeouts from
+/// its remaining budget on top of this.
 pub fn new_client(run_timeout_secs: u64) -> reqwest::blocking::Client {
-    reqwest::blocking::Client::builder()
+    let mut builder = reqwest::blocking::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(15))
-        .timeout(std::time::Duration::from_secs(run_timeout_secs.max(60)))
         // Don't follow redirects: a custom base_url that redirects could leak
         // the API key header (x-api-key / Authorization) to a third party.
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap_or_else(|_| reqwest::blocking::Client::new())
+        .redirect(reqwest::redirect::Policy::none());
+    if run_timeout_secs > 0 {
+        builder = builder.timeout(std::time::Duration::from_secs(run_timeout_secs.max(60)));
+    }
+    // Build failure is near-impossible (rustls init), but the fallback must
+    // keep the no-redirect policy — a default Client follows redirects and
+    // would reintroduce the key-leak vector above.
+    builder.build().unwrap_or_else(|_| {
+        reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("reqwest client build")
+    })
 }
 
 /// Iterate over the `data:` payloads of an SSE stream.

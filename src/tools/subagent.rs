@@ -146,7 +146,7 @@ impl Tool for SubAgent {
             .filter(|t| t.as_str() != "task")
             .cloned()
             .collect();
-        let mut child_tools = tools::build(&child_tool_names, &self.cfg, &self.client, &self.api_key, &self.mcp_tools)?;
+        let mut child_tools = tools::build(&child_tool_names, &child_cfg, &self.client, &self.api_key, &self.mcp_tools)?;
         child_tools.extend(self.mcp_tools.iter().cloned().map(|t| Box::new(t) as Box<dyn Tool>));
 
         let provider = provider::build(&child_cfg, &self.api_key, self.client.clone());
@@ -184,7 +184,18 @@ fn run_subagent(agent: &mut Agent, name: &str, emit: &mut dyn FnMut(AgentEvent))
         });
     }) {
         Ok(o) => outcome_to_output(&o, name),
-        Err(e) => ToolOutput::error(format!("subagent {name} failed: {e:#}")),
+        Err(e) => {
+            let mut out = ToolOutput::error(format!("subagent {name} failed: {e:#}"));
+            // Honest cost even on failure: the turns the child completed before
+            // erroring were real billed calls — dropping them would understate
+            // the parent run's totals. None when nothing was billed yet (the
+            // caller folds only Some, and a Some(0,0) would be a noise event).
+            let u = agent.usage_so_far();
+            if u.input_tokens > 0 || u.output_tokens > 0 {
+                out.usage = Some(u);
+            }
+            out
+        }
     }
 }
 
@@ -270,6 +281,33 @@ mod tests {
         let u = out.usage.expect("usage billed to parent");
         assert_eq!(u.input_tokens, 150);
         assert_eq!(u.output_tokens, 8);
+    }
+
+    #[test]
+    fn run_subagent_error_still_bills_completed_turns() {
+        // The child completes turn 1 (billed 100/5), then the provider errors
+        // on turn 2. The run fails, but turn 1's tokens were really burned —
+        // they must reach the parent's totals (honest cost), not vanish.
+        let mut agent = mock_agent(vec![
+            mock::resp_tool("t1", "noop", json!({}), mock::mk_usage(100, 5)),
+            mock::MockTurn::Err("provider blew up".into()),
+        ]);
+        let out = run_subagent(&mut agent, "scout", &mut |_| {});
+        assert!(out.is_error);
+        assert!(out.content.contains("provider blew up"));
+        let u = out.usage.expect("failed sub-agent still bills completed turns");
+        assert_eq!(u.input_tokens, 100);
+        assert_eq!(u.output_tokens, 5);
+    }
+
+    #[test]
+    fn run_subagent_error_with_no_completed_turns_has_no_usage() {
+        // Error on the very first request: nothing was billed, so usage must
+        // stay None (the parent folds only Some — a Some(0,0) would be noise).
+        let mut agent = mock_agent(vec![mock::MockTurn::Err("instant failure".into())]);
+        let out = run_subagent(&mut agent, "scout", &mut |_| {});
+        assert!(out.is_error);
+        assert!(out.usage.is_none());
     }
 
     #[test]

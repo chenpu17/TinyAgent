@@ -95,6 +95,16 @@ pub(crate) fn run_with_retries(
                         at_line_start = true;
                         current_sub_name = None;
                     }
+                    AgentEvent::Warning(w) => {
+                        // Warnings go to stderr (stdout carries the transcript);
+                        // break the line first if text is mid-stream.
+                        if !at_line_start {
+                            println!();
+                            at_line_start = true;
+                        }
+                        eprintln!("[warn] {w}");
+                        current_sub_name = None;
+                    }
                     AgentEvent::Usage {
                         input_tokens,
                         output_tokens,
@@ -154,6 +164,14 @@ pub(crate) fn run_with_retries(
                                 current_sub_name = None;
                             }
                             AgentEvent::Done { .. } => {} // implicit in the result
+                            AgentEvent::Warning(w) => {
+                                if !at_line_start {
+                                    println!();
+                                    at_line_start = true;
+                                }
+                                eprintln!("[{name}] [warn] {w}");
+                                current_sub_name = None;
+                            }
                             _ => {} // TurnStart/Compressed/Usage/SubAgent: noisy or folded
                         }
                     }
@@ -163,8 +181,7 @@ pub(crate) fn run_with_retries(
             Ok(o) => break (exit_code_for(&o.stop_reason), Some(o), None),
             Err(e) => {
                 if attempt <= retries {
-                    let backoff =
-                        std::time::Duration::from_secs(crate::retry::backoff_secs(attempt - 1));
+                    let backoff = crate::retry::backoff(attempt - 1);
                     let msg = format!("{e:#}");
                     if json {
                         // Surface the retry to NDJSON consumers between attempts
@@ -173,7 +190,9 @@ pub(crate) fn run_with_retries(
                             "type": "retry",
                             "attempt": attempt,
                             "max": retries,
-                            "backoff_secs": backoff.as_secs(),
+                            // Jittered backoffs are sub-second; round to ms so
+                            // consumers don't see 0 for a 750ms wait.
+                            "backoff_secs": (backoff.as_secs_f64() * 1000.0).round() / 1000.0,
                             "error": msg,
                         });
                         println!(
@@ -274,6 +293,7 @@ fn event_json(ev: &AgentEvent) -> Value {
         AgentEvent::Compressed { dropped, kept } => {
             json!({"type": "compressed", "dropped": *dropped, "kept": *kept})
         }
+        AgentEvent::Warning(w) => json!({"type": "warning", "message": w.clone()}),
         AgentEvent::SubAgent { name, event } => {
             json!({
                 "type": "subagent",
@@ -373,6 +393,19 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp); // don't litter on failure
         return Err(e).with_context(|| format!("cannot save {}", path.display()));
+    }
+    // fsync the parent directory so the rename's directory-entry update
+    // survives a power loss. The file DATA is durable (sync_all above), but on
+    // ext4 (when auto_da_alloc doesn't fire) and xfs the rename itself can be
+    // lost without an explicit directory fsync — a crash could then expose the
+    // pre-rename state (old content, or no file). APFS/NTFS handle directory
+    // durability via their own transaction logs, so this is Unix-only and the
+    // error is ignored: best-effort hardening, and the rename already succeeded.
+    #[cfg(unix)]
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
     }
     Ok(())
 }

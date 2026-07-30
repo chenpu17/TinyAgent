@@ -1,7 +1,7 @@
 use super::{Block, CancellableSse, ChatEvent, ChatRequest, ChatResponse, Message, Provider, Role, SseSource, StreamAbort, ToolDef, Usage};
 #[cfg(test)]
 use super::SseReader;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
 pub struct Anthropic {
@@ -83,29 +83,13 @@ enum Pending {
     ToolUse { id: String, name: String, json: String },
 }
 
-/// Finalize a fully-assembled pending block into a concrete Block. Shared by
-/// the content_block_stop handler and the truncation-recovery flushes
-/// (content_block_start overwrite + end-of-stream).
-fn finalize_pending(p: Pending) -> Result<Block> {
-    Ok(match p {
-        Pending::Text(t) => Block::Text(t),
-        Pending::ToolUse { id, name, json } => {
-            let input = if json.trim().is_empty() {
-                json!({})
-            } else {
-                serde_json::from_str(&json)
-                    .map_err(|e| anyhow!("bad tool input JSON from model: {e}"))?
-            };
-            Block::ToolUse { id, name, input }
-        }
-    })
-}
-
-/// Like finalize_pending but tolerant of incomplete JSON — used when flushing
-/// a block from a truncated stream, where tool arguments may be half-delivered.
-/// Half-JSON becomes {"_raw": ...} instead of failing, so a network/timeout
-/// truncation surfaces as a stream_truncated stop_reason, not a parse error
-/// that (falsely) blames the model.
+/// Finalize a pending block into a concrete Block, tolerant of incomplete
+/// JSON. Shared by the content_block_stop handler and the truncation-recovery
+/// flushes (content_block_start overwrite + end-of-stream). Half-delivered
+/// tool arguments become {"_raw": ...} instead of failing: a truncated stream
+/// surfaces as a stream_truncated stop_reason, and a model's malformed JSON
+/// on a COMPLETE stream reaches the tool layer (which reports the bad input
+/// back to the model) instead of killing the whole run.
 fn finalize_pending_lenient(p: Pending) -> Block {
     match p {
         Pending::Text(t) => Block::Text(t),
@@ -289,10 +273,15 @@ impl Anthropic {
                     match delta["type"].as_str().unwrap_or("") {
                         "text_delta" => {
                             let t = delta["text"].as_str().unwrap_or_default();
+                            // Only emit the UI event when the text actually
+                            // lands in a pending block: a stray text_delta
+                            // with no open text block (out-of-order stream)
+                            // would otherwise show on screen but be missing
+                            // from the assembled history.
                             if let Some(Pending::Text(buf)) = &mut pending {
                                 buf.push_str(t);
+                                on_event(ChatEvent::TextDelta(t.to_string()));
                             }
-                            on_event(ChatEvent::TextDelta(t.to_string()));
                         }
                         "input_json_delta" => {
                             if let Some(Pending::ToolUse { json, .. }) = &mut pending {
@@ -303,8 +292,14 @@ impl Anthropic {
                     }
                 }
                 "content_block_stop" => {
+                    // Lenient here too, not just on the truncated-stream flush
+                    // paths: a model that emits malformed tool JSON on an
+                    // otherwise complete stream gets a {"_raw": ...} input the
+                    // tool layer can reject back to the model (self-heal),
+                    // matching the OpenAI provider — hard-failing the whole run
+                    // on a single model-level JSON slip was needlessly fatal.
                     if let Some(p) = pending.take() {
-                        blocks.push(finalize_pending(p)?);
+                        blocks.push(finalize_pending_lenient(p));
                     }
                 }
                 "message_delta" => {
@@ -467,6 +462,27 @@ mod tests {
         );
         let resp = parse(raw.as_bytes());
         assert_eq!(resp.stop_reason, "stream_truncated");
+        match &resp.blocks[0] {
+            Block::ToolUse { input, .. } => assert!(input.get("_raw").is_some()),
+            other => panic!("expected tool_use, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn complete_block_with_malformed_json_becomes_raw_not_run_error() {
+        // A model-level JSON slip on an OTHERWISE complete stream (proper
+        // content_block_stop, clean end_turn) must not kill the run: the bad
+        // input becomes _raw so the tool layer can report it back to the
+        // model (same contract as the OpenAI provider).
+        let raw = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t\",\"name\":\"shell\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{not json\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let resp = parse(raw.as_bytes());
+        assert_eq!(resp.stop_reason, "tool_use");
         match &resp.blocks[0] {
             Block::ToolUse { input, .. } => assert!(input.get("_raw").is_some()),
             other => panic!("expected tool_use, got {other:?}"),

@@ -21,8 +21,9 @@ pub struct ToolCtx {
     pub restrict_to_workdir: bool,
     /// Cancellation flag shared with the agent run. Pollable tools (shell)
     /// check this between waits so Ctrl-C can interrupt a long-running
-    /// command within ~50ms instead of waiting out its full timeout. None in
-    /// headless mode (no interactive cancellation).
+    /// command within ~50ms instead of waiting out its full timeout. Wired in
+    /// both headless (`main` installs the SIGINT flag and `set_cancel`s it)
+    /// and the TUI (Ctrl-C during a run); None only in tests.
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 

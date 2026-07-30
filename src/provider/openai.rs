@@ -25,6 +25,9 @@ impl OpenAi {
     fn message_jsons(m: &Message) -> Vec<Value> {
         match m.role {
             Role::Assistant => {
+                // Join multiple Text blocks with a newline — a bare collect()
+                // mashes adjacent blocks together ("foo"+"bar" → "foobar"),
+                // corrupting the transcript the model reads back.
                 let text: String = m
                     .content
                     .iter()
@@ -32,7 +35,8 @@ impl OpenAi {
                         Block::Text(t) => Some(t.as_str()),
                         _ => None,
                     })
-                    .collect();
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 let calls: Vec<Value> = m
                     .content
                     .iter()

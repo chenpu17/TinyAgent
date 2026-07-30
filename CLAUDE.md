@@ -32,8 +32,21 @@ cargo clippy --all-targets                # lint headless 版（两个 feature �
   （OpenAI 走 `stream_options.include_usage` + `choices:[]` 末块；Anthropic 走
   `message_start`/`message_delta`）。`provider/mock.rs` 是 `cfg(test)` 的脚本化 Provider，
   供 `agent.rs` 的进程内 loop 回归测试用（不连网）。
-- **核心 loop 在 `agent.rs`**：累计 usage、cancel 复位、上下文压缩都在这里。`AgentEvent` 透传给
-  harness（headless 打印/NDJSON）或 TUI。上下文压缩的摘要请求自身 usage 也计入累计（诚实成本）。
+- **核心 loop 在 `agent.rs`**：累计 usage、cancel 复位、上下文压缩的有状态编排（`compress`/
+  `summarize_prefix`/`summary_call`，读写 Agent 字段 + 驱动 provider）在这里。压缩的**纯函数与常量**
+  （`estimate_tokens`/`find_safe_cut`/`fold_summary`/`window_lines`/`chunk_lines`/`SUMMARY_*` 等）抽到
+  `compress.rs`（单向被 agent 依赖；`window_lines` 反向调 `crate::agent::preview`，不构成环）。`AgentEvent`
+  透传给 harness（headless 打印/NDJSON）或 TUI。上下文压缩的摘要请求自身 usage 也计入累计（诚实成本）。
+- **子 agent（`task` 工具，`tools/subagent.rs`）**：主 agent 把聚焦子任务交给一个全新子 agent
+  （独立历史 + 独立 turn 预算，`SUBAGENT_MAX_TURNS=25` 封顶），只把最终摘要作 tool 结果返回。
+  **同 turn 多个 `task` 调用并行**：`agent.rs` 的工具执行分两遍——叶子工具（shell/read_file/…）
+  顺序跑，`task` 调用收集后用 `std::thread::scope` fan-out（每个一个 scoped thread），结果按原块序
+  拼回（tool_use/tool_result 仍 N:N）。子 agent 的 token 用量经 `ToolOutput::usage` 折进主 run 累计
+  （失败也照计已完成轮次）。事件实时转发，裹成 `AgentEvent::SubAgent{name}` 区分并行的几个。
+  **不可递归**：子 agent 的工具白名单滤掉 `task` 本身（无深度计数）。**不在默认白名单**，配置 `tools`
+  加 `"task"` 才启用。
+- **`retry.rs`** 是 batch `--retries` 与单跑瞬态重试共用的退避模块：指数 1/2/4/8/16/32s 封顶 + ±25%
+  jitter（防并发 worker lockstep 踩踏同一个过载 provider）。只重试 transient（`stop_reason == "error"`）。
 - **headless Ctrl-C** 走 `signal.rs`：首次 SIGINT 翻 cancel 标志（流式 ≤200ms 内断，照常写
   `result.json`，exit 130），二次 SIGINT `libc::_exit(130)` 立即退。handler 只碰 lock-free 原子 + `_exit`
   （async-signal-safe）。**批量模式**（`batch::run`）也装它：cancel 标志由 worker 在起任务前 gate
@@ -66,6 +79,13 @@ cargo clippy --all-targets                # lint headless 版（两个 feature �
   cancel 标志，命中则标 `cancelled` 跳过；在跑的任务照常跑完（"收敛"）。**没有**把 cancel 标志传给
   agent 中断流式——因为多 worker 共享一个 flag 会和 `agent::run()` 入口的 `store(false)` 复位竞争
   （一个 worker 起新 run 会清掉另一个在跑的取消信号）。要立刻退出按第二次 Ctrl-C（`_exit(130)`）。
+- **子 agent 用 `run_as_subagent`，入口不复位 cancel 标志**：子 agent 继承父的 cancel Arc，但不像
+  `agent::run()` 那样在入口 `store(false)`——否则并行批次里后启动的兄弟会清掉刚按下的 Ctrl-C
+  （与上一条「批量 Ctrl-C 不传 flag」同一类竞争，这里 flag 确实共享，靠跳过复位化解）。spawn 时
+  batch gate 保证 flag 为 false，所以运行中见到 `true` 一定是真取消。别给 `run_as_subagent` 加复位。
+- **子 agent 共享父的 MCP 工具（Arc-clone），不重启 server**：`SubAgent` 持父的 `mcp_tools`，建子 agent
+  时 clone 而非重跑 `tools::mcp::build`。旧路径每次 `task` 都 `McpClient::start` 全部 server——并行 task
+  批次会 spawn N×(#servers) 个子进程。改 `SubAgent::new` 签名别漏传 `mcp_tools`。
 - **OpenAI 400 回退**（`openai::body_fix_for_400`）：错误文本提到 `max_tokens` 时改名为
   `max_completion_tokens` 重试一次（reasoning 模型）；提到 `stream_options` 时丢弃该字段重试一次
   （vLLM 等旧网关，之后 usage 走 `None` 降级，`parse_loop` 已容忍）。未知 400 直接 bail。
@@ -75,17 +95,18 @@ cargo clippy --all-targets                # lint headless 版（两个 feature �
 - **MCP 工具名只消毒展示名，wire 名不动**（`tools::mcp::sanitize_name`）：对外名 `mcp_<server>_<tool>`
   非 `[A-Za-z0-9_]` → `_` 并折叠，但 `wire_name` 保留服务器原始工具名，`tools/call` 用它分发。
   改消毒逻辑别误动 `wire_name`，否则分发会找不到工具。`dedup_check` 在消毒后撞名时启动报错。
-- **改 `agent.rs` 核心路径必须配套 loop 测试**。`agent.rs` 的 `#[cfg(test)]` 模块用
-  `provider/mock.rs` 的脚本化 Provider 覆盖不变量：cancel 复位、tool_use/tool_result N:N 配对
-  （含中途取消时合成的 `[cancelled by user]` 进 history 但不进 `tool_calls`）、压缩、usage 累计。
-  动了 loop 逻辑先补/查这些测试，别只靠 mock server 跑一遍就提交。
+- **改 `agent.rs` 核心路径必须配套 loop 测试**。测试外置在 `agent_tests.rs`（`agent.rs` 末尾
+  `#[cfg(test)] #[path = "agent_tests.rs"] mod tests;` 引入，靠 `use super::*` 仍可达 agent 私有项；
+  压缩纯函数的测试靠 `use crate::compress::*`）。用 `provider/mock.rs` 的脚本化 Provider 覆盖不变量：
+  cancel 复位、tool_use/tool_result N:N 配对（含中途取消时合成的 `[cancelled by user]` 进 history
+  但不进 `tool_calls`）、压缩、usage 累计。动了 loop 逻辑先补/查这些测试，别只靠 mock server 跑一遍就提交。
 
 ## 离线 / 视觉验证
 
 - **mock server**：`examples/mock_openai.py`、`examples/mock_anthropic.py` 是零依赖 SSE mock，
   用于无 API key 跑通整个 loop（tool_use 配对、usage 解析、取消）。改动 provider/agent 后用它回归。
-- **进程内回归**：`agent.rs` 的 loop 不变量用 `provider/mock.rs`（脚本化 Provider，不连网）单测覆盖，
-  比 mock server 更快、断言更准。新增/改动 loop 行为优先在这里加用例。
+- **进程内回归**：`agent.rs` 的 loop 不变量用 `provider/mock.rs`（脚本化 Provider，不连网）单测覆盖
+  （测试体在 `agent_tests.rs`），比 mock server 更快、断言更准。新增/改动 loop 行为优先在这里加用例。
 - **TUI 视觉验证**：用 ratatui `TestBackend` 抓 cell grid 做断言（见 `tui::tests`）；端到端交互用
   pty 脚本驱动（项目里惯用 `/tmp/ta-verify/` 放临时 mock + pty 脚本，跑完即删）。**不要只靠
   "看起来对"**——改了渲染/光标/markdown 要真抓屏或单测断言验证。

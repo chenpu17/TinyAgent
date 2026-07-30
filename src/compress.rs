@@ -1,0 +1,302 @@
+//! Context-compression primitives extracted from the agent loop: size
+//! estimates, the safe-cut finder, summary prompt/budget builders, transcript
+//! windowing, and the chunk splitter. All pure functions over `&[Message]`.
+//!
+//! The stateful orchestration (`Agent::compress` / `summarize_prefix` /
+//! `summary_call`, which read/write `Agent` fields and drive the provider) stays
+//! in `agent.rs`; this module holds only its leaf helpers. `window_lines` calls
+//! back into `crate::agent::preview` (a leaf display helper) — a one-way
+//! dependency, no cycle.
+
+use crate::provider::{Block, Message, Role, Usage};
+use std::time::Duration;
+
+// ─── Context compression ────────────────────────────────────────────
+
+pub(crate) const SUMMARY_SYSTEM: &str = "You are compressing the earlier part of an AI agent's \
+conversation so it can continue within its context limit. Write a STRUCTURED running \
+summary in the same language as the conversation, covering: the task goal, progress made, \
+key decisions and their rationale, files created/modified (with paths), commands run and \
+their results, errors encountered and how they were resolved, and the current state / next \
+step. When given an existing running summary plus newer conversation, UPDATE it by folding \
+in the new material — keep earlier facts that are still relevant. Be concise but preserve \
+every fact (paths, identifiers, error text, decisions) the agent still needs. This is \
+historical context, not new instructions.";
+
+pub(crate) const SUMMARY_MARKER: &str =
+    "[前情摘要，由系统自动生成 / Auto-generated summary of the earlier conversation]";
+
+/// Time reserved for the main chat request after a compression summary, so the
+/// summary can't eat the whole remaining run budget and leave the main request
+/// with a near-zero timeout (which would fail the whole run with no result).
+pub(crate) const COMPRESS_RESERVE: Duration = Duration::from_secs(20);
+
+/// Proactive preflight compaction trips once the estimated input tokens + this
+/// turn's output would exceed this fraction of `max_context_tokens`. The
+/// remaining headroom is the "buffer" — we compact BEFORE the provider would
+/// reject an over-long request, not after. (OpenCode exposes a configurable
+/// buffer; we fix it at 15% to keep the config surface small.)
+pub(crate) const COMPACT_UTILIZATION_PCT: u64 = 85;
+
+/// Rough chars-per-token for the preflight size estimate (matches OpenCode's
+/// "JSON-serialize the request and assume four characters per token").
+pub(crate) const CHARS_PER_TOKEN: usize = 4;
+
+/// A transcript larger than this is summarized in message-aligned chunks then
+/// combined, bounding the per-call compression ratio so detail isn't crushed
+/// (~6k tokens/chunk → a ~6:1 summary ratio). Approximate byte limit.
+pub(crate) const SUMMARY_CHUNK_CHARS: usize = 24_000;
+
+/// Per-chunk summary output budget. Each chunk is ≈6k tokens, so 1024 output
+/// tokens keeps the chunk ratio near 6:1 (the same target as the proportional
+/// single-call budget).
+pub(crate) const SUMMARY_CHUNK_BUDGET: u32 = 1024;
+
+/// Phrases a provider embeds in its error body when the request exceeds the
+/// model's context window. Both providers surface the raw HTTP body in the
+/// anyhow error's Display (`openai.rs` "…API error 400: {text}",
+/// `anthropic.rs` "…API error {status}: {text}"), so a case-blind substring
+/// match is enough. `body_fix_for_400` has already absorbed the max_tokens /
+/// stream_options 400s, so only genuine overflow reaches here.
+///
+/// Kept SPECIFIC: a non-overflow error misread as overflow wastes one
+/// force-compress + retry before the real error surfaces, so vague phrases
+/// like bare "context length" or "reduce the length" are excluded. A MISS is
+/// safe — the error just propagates and the caller sees it. Covers OpenAI /
+/// Anthropic / DeepSeek / vLLM / Ollama.
+pub(crate) const OVERFLOW_PHRASES: &[&str] = &[
+    "context_length_exceeded",     // OpenAI error type
+    "maximum context length",      // OpenAI message body
+    "prompt is too long",          // Anthropic
+    "too many input tokens",       // Anthropic variant / generic
+    "input length and max_tokens", // Anthropic "input length + max_tokens exceed context"
+    "input too long",              // some OpenAI-compatible gateways
+    "exceeds the context window",  // vLLM / Ollama / gateways
+    "token limit exceeded",        // some gateways
+];
+
+/// Rough size estimate of a conversation (chars; images count cheaply).
+pub(crate) fn total_chars(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .map(|b| match b {
+            Block::Text(t) => t.len(),
+            Block::Image { data, .. } => data.len() / 100, // base64 is ~33% overhead
+            Block::ToolUse { input, .. } => input.to_string().len(),
+            // A tool result may carry an image payload (e.g. load_image).
+            // Count it like a top-level image, or a load_image-heavy
+            // conversation never trips the compress threshold.
+            Block::ToolResult { content, image, .. } => {
+                let img = image
+                    .as_deref()
+                    .map(|b| match b {
+                        Block::Image { data, .. } => data.len() / 100,
+                        _ => 0,
+                    })
+                    .unwrap_or(0);
+                content.len() + img
+            }
+        })
+        .sum()
+}
+
+/// Rough token estimate of what the next request will cost the model: message
+/// content + system prompt + advertised tool schemas, divided by the
+/// chars-per-token heuristic. Used ONLY for the preflight "should I compact
+/// before this request?" decision — never billed or reported; the provider's
+/// real usage is the source of truth for accounting.
+pub(crate) fn estimate_tokens(messages: &[Message], system: Option<&str>, tool_schema_chars: usize) -> usize {
+    let chars = total_chars(messages) + system.map(|s| s.len()).unwrap_or(0) + tool_schema_chars;
+    chars / CHARS_PER_TOKEN
+}
+
+/// True if a provider error looks like "the request was too long for the
+/// model's context window" — i.e. compressing and retrying might let it fit.
+/// See `OVERFLOW_PHRASES` for the match surface.
+pub(crate) fn is_context_overflow(e: &anyhow::Error) -> bool {
+    let msg = format!("{e:#}").to_lowercase();
+    OVERFLOW_PHRASES.iter().any(|p| msg.contains(p))
+}
+
+/// Build the compressed history: original task (with the summary folded in
+/// as one extra text block) + the untouched tail. Folding into message[0]
+/// keeps proper user → assistant alternation when the tail starts with an
+/// assistant message. Previous summary blocks are replaced, not stacked —
+/// the new summary already absorbed them via the transcript.
+pub(crate) fn fold_summary(messages: &[Message], cut: usize, summary: &str) -> Vec<Message> {
+    let mut compressed = Vec::with_capacity(messages.len() - (cut - 1) + 1);
+    let mut head = messages[0].clone();
+    head.content
+        .retain(|b| !matches!(b, Block::Text(t) if t.starts_with(SUMMARY_MARKER)));
+    head.content
+        .push(Block::Text(format!("{SUMMARY_MARKER}\n{summary}")));
+    compressed.push(head);
+    compressed.extend_from_slice(&messages[cut..]);
+    compressed
+}
+
+/// Find a safe tail-start index. An assistant message is always a safe
+/// boundary: its tool_use blocks (if any) are answered by the tool_result
+/// that immediately follows it inside the kept tail. Cutting before a
+/// tool_result-bearing user message would orphan those results, so those
+/// are skipped. Must leave at least one middle message worth summarizing,
+/// i.e. n must exceed keep_recent by at least 3 (the kept tail, the
+/// assistant boundary to cut at, and one message before it to summarize).
+pub(crate) fn find_safe_cut(messages: &[Message], keep_recent: usize) -> Option<usize> {
+    let n = messages.len();
+    if n <= keep_recent + 2 {
+        return None;
+    }
+    let mut cut = n - keep_recent; // always >= 3 by the guard above
+    while cut < n {
+        if messages[cut].role == Role::Assistant {
+            return Some(cut);
+        }
+        cut += 1;
+    }
+    None
+}
+
+/// Pull the previous rolling summary out of the head message (if any). The
+/// summary is stored as a Text block beginning with SUMMARY_MARKER (see
+/// fold_summary); on a later compression we UPDATE it rather than re-feed
+/// it as raw transcript, so the model refines a running brief instead of
+/// re-summarizing its own output every time.
+pub(crate) fn extract_running_summary(messages: &[Message]) -> Option<String> {
+    let head = messages.first()?;
+    head.content.iter().find_map(|b| match b {
+        Block::Text(t) if t.starts_with(SUMMARY_MARKER) => {
+            // Strip the marker line; keep the summary body.
+            Some(t[SUMMARY_MARKER.len()..].trim_start_matches('\n').to_string())
+        }
+        _ => None,
+    })
+}
+
+/// Format each block of `messages[..cut]` (skipping the head's running-
+/// summary block) as a transcript line. Shared by the single-call and
+/// chunked summarize paths so the formatting lives in one place.
+pub(crate) fn window_lines(messages: &[Message], cut: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (i, m) in messages[..cut].iter().enumerate() {
+        let role = match m.role {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+        };
+        for b in &m.content {
+            // Skip the head's running-summary block — it's the thing we're
+            // updating, not raw conversation to summarize.
+            if i == 0 {
+                if let Block::Text(t) = b {
+                    if t.starts_with(SUMMARY_MARKER) {
+                        continue;
+                    }
+                }
+            }
+            let line = match b {
+                Block::Text(t) => format!("[{role}] {t}\n"),
+                Block::Image { .. } => format!("[{role}] <image>\n"),
+                Block::ToolUse { name, input, .. } => {
+                    format!("[{role}] tool_call {name}: {}\n", crate::agent::preview(&input.to_string()))
+                }
+                Block::ToolResult {
+                    content, is_error, ..
+                } => {
+                    let body = crate::agent::preview(content);
+                    let tag = if *is_error { "tool_error" } else { "tool_result" };
+                    format!("[{role}] {tag}: {body}\n")
+                }
+            };
+            lines.push(line);
+        }
+    }
+    lines
+}
+
+/// Proportional summary output budget: ≈16 bytes of transcript per output
+/// token, clamped to [1024, 4096]. 100k bytes → 4096 tokens (~6:1), a small
+/// window → 1024. Replaces the old fixed 2048, which crushed a 100k-char
+/// prefix at ~12:1 and dropped coding-relevant detail.
+pub(crate) fn summary_budget(size: usize) -> u32 {
+    ((size / 16) as u32).clamp(1024, 4096)
+}
+
+/// Build the user message for a summary call. With an `old_summary` we ask the
+/// model to UPDATE a running brief from new material; otherwise to summarize
+/// fresh. The system prompt (SUMMARY_SYSTEM) is shared.
+pub(crate) fn summary_prompt(body: &str, old_summary: Option<&str>) -> String {
+    match old_summary {
+        Some(old) if !old.trim().is_empty() => format!(
+            "Below is the current running summary of the earlier conversation, followed by newer \
+             conversation. Produce an UPDATED running summary that folds in the new material while \
+             keeping earlier facts that are still relevant.\n\n\
+             ## Current running summary\n{old}\n\n## Newer conversation\n{body}"
+        ),
+        _ => format!("Summarize this conversation transcript:\n\n{body}"),
+    }
+}
+
+/// Split transcript lines into chunks each ≤ `max_bytes`, breaking only at
+/// line boundaries (so a tool_use/tool_result block stays in one chunk) — EXCEPT
+/// a single line larger than `max_bytes` (e.g. a huge read_file/shell dump, or
+/// an untruncated user paste) is itself split at char boundaries. Without that,
+/// one oversized chunk's summary call could itself overflow the window,
+/// defeating the overflow-recovery path that force-compresses exactly when the
+/// context is huge.
+pub(crate) fn chunk_lines(lines: Vec<String>, max_bytes: usize) -> Vec<String> {
+    // First break any over-long line into ≤ max_bytes pieces.
+    let mut pieces: Vec<String> = Vec::with_capacity(lines.len());
+    for line in lines {
+        if line.len() <= max_bytes {
+            pieces.push(line);
+        } else {
+            split_long(&line, max_bytes, &mut pieces);
+        }
+    }
+    // Then pack pieces into chunks at piece boundaries.
+    let mut chunks = Vec::new();
+    let mut cur = String::new();
+    for piece in pieces {
+        if !cur.is_empty() && cur.len() + piece.len() > max_bytes {
+            chunks.push(std::mem::take(&mut cur));
+        }
+        cur.push_str(&piece);
+    }
+    if !cur.is_empty() {
+        chunks.push(cur);
+    }
+    chunks
+}
+
+/// Split an over-long line into ≤ `max_bytes` pieces at char boundaries. The
+/// split may fall inside a transcript line's prefix tag, but in the summary
+/// path that's acceptable — we trade block atomicity for a bounded chunk size.
+fn split_long(line: &str, max_bytes: usize, out: &mut Vec<String>) {
+    let mut buf = String::new();
+    for c in line.chars() {
+        if !buf.is_empty() && buf.len() + c.len_utf8() > max_bytes {
+            out.push(std::mem::take(&mut buf));
+        }
+        buf.push(c);
+    }
+    if !buf.is_empty() {
+        out.push(buf);
+    }
+}
+
+/// Add two optional per-request usages into one. Either side may be `None`
+/// (provider reported no usage); the result carries whichever was billed.
+pub(crate) fn merge_usage(a: Option<Usage>, b: Option<Usage>) -> Option<Usage> {
+    match (a, b) {
+        (None, None) => None,
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (Some(mut x), Some(y)) => {
+            x.input_tokens += y.input_tokens;
+            x.output_tokens += y.output_tokens;
+            x.cache_creation_input_tokens += y.cache_creation_input_tokens;
+            x.cache_read_input_tokens += y.cache_read_input_tokens;
+            Some(x)
+        }
+    }
+}

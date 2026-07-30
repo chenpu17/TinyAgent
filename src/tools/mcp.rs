@@ -21,20 +21,35 @@ pub(crate) struct McpTool {
     def: ToolDef,
 }
 
+/// Cap on a base64 image payload from an MCP tool result, mirroring
+/// load_image's 10 MiB (raw) ≈ 14 MB base64. The text half of a result is
+/// truncated to max_output_chars, but an unbounded image would sail straight
+/// into the history and get re-sent on every request — a buggy or hostile
+/// server could otherwise exhaust memory and the context window.
+const MAX_MCP_IMAGE_B64: usize = 14 * 1024 * 1024;
+
 impl Tool for McpTool {
     fn def(&self) -> ToolDef {
         self.def.clone()
     }
 
     fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
-        let result = self.client.lock().unwrap().call(
-            "tools/call",
-            json!({"name": self.wire_name, "arguments": input}),
-        )?;
+        // Tolerate a poisoned lock: a panic while holding it leaves the client
+        // state consistent (requests are serialized whole), and panicking here
+        // would abort the process outright (release is panic="abort").
+        let result = self
+            .client
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .call(
+                "tools/call",
+                json!({"name": self.wire_name, "arguments": input}),
+            )?;
 
         let mut text = String::new();
         let mut image = None;
         let mut extra_images = 0u32;
+        let mut oversized_images = 0u32;
         for c in result["content"].as_array().cloned().unwrap_or_default() {
             match c["type"].as_str().unwrap_or("") {
                 "text" => {
@@ -44,12 +59,15 @@ impl Tool for McpTool {
                     text.push_str(c["text"].as_str().unwrap_or_default());
                 }
                 "image" => {
+                    let data = c["data"].as_str().unwrap_or_default();
+                    if data.len() > MAX_MCP_IMAGE_B64 {
+                        oversized_images += 1;
                     // ToolOutput carries a single image; keep the first and
                     // note the rest rather than silently dropping them.
-                    if image.is_none() {
+                    } else if image.is_none() {
                         image = Some(Block::Image {
                             media_type: c["mimeType"].as_str().unwrap_or("image/png").to_string(),
-                            data: c["data"].as_str().unwrap_or_default().to_string(),
+                            data: data.to_string(),
                         });
                     } else {
                         extra_images += 1;
@@ -58,11 +76,18 @@ impl Tool for McpTool {
                 _ => {}
             }
         }
-        if extra_images > 0 {
+        for note in [
+            (extra_images > 0).then(|| format!("[{extra_images} additional image(s) omitted]")),
+            (oversized_images > 0)
+                .then(|| format!("[{oversized_images} image(s) dropped: over size limit]")),
+        ]
+        .into_iter()
+        .flatten()
+        {
             if !text.is_empty() {
                 text.push('\n');
             }
-            text.push_str(&format!("[{extra_images} additional image(s) omitted]"));
+            text.push_str(&note);
         }
         if text.is_empty() && image.is_none() {
             text = "[empty tool result]".into();

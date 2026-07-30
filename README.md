@@ -370,19 +370,26 @@ release 下 panic 不触发 `Drop`——调试 destructors（如 TUI 终端还�
 
 ```
 src/
-├── main.rs      (334)  # CLI 入口 + 组装（build_agent）+ --session none
+├── main.rs      (345)  # CLI 入口 + 组装（build_agent）+ --session none
 ├── config.rs    (588)  # 配置解析 + 任务片段合并 + 批量覆盖白名单
 ├── provider/           # LLM 后端
-│   ├── mod.rs   (412)  #   共享 Message/Block、SSE reader、CancellableSse
-│   ├── openai.rs (716) #   OpenAI 兼容（include_usage；400 回退：max_tokens→max_completion_tokens / 丢 stream_options）
-│   ├── anthropic.rs(538) # Anthropic 原生（message_start/message_delta usage）
+│   ├── mod.rs   (428)  #   共享 Message/Block、SSE reader、CancellableSse
+│   ├── openai.rs (720) #   OpenAI 兼容（include_usage；400 回退：max_tokens→max_completion_tokens / 丢 stream_options）
+│   ├── anthropic.rs(554) # Anthropic 原生（message_start/message_delta usage）
 │   └── mock.rs   (216) #   测试用脚本化 Provider（cfg(test)）
-├── agent.rs    (3061) # 核心 loop + usage 累计 + cancel + 上下文压缩（前馈/溢出双触发 + 滚动分块摘要）+ 相邻消息归一 + 回归测试
+├── agent.rs    (3181) # 核心 loop + usage 累计 + cancel + 上下文压缩（前馈/溢出双触发 + 滚动分块摘要）+ 相邻消息归一 + 同 turn 多 task 并行 fan-out（std::thread::scope）+ 回归测试
+├── retry.rs      (69) # batch --retries / 单跑瞬态重试共用的指数退避（±25% jitter 防 worker lockstep）
 ├── signal.rs     (60) # headless SIGINT → cancel（首次优雅 / 二次硬退出 130）
-├── tools/              # 5 个内置工具 + MCP 工具包装
-├── mcp.rs      (732)   # MCP 客户端（stdio / Streamable HTTP / 旧版 SSE）
+├── tools/              # 6 个内置工具（shell/read_file/write_file/edit_file/list_dir/load_image）+ MCP 包装 + task 子 agent
+│   ├── mod.rs   (194) #   Tool trait + ToolCtx + build 白名单组装
+│   ├── shell.rs (222) #   shell 工具
+│   ├── file.rs  (483) #   read_file / write_file / edit_file / list_dir
+│   ├── image.rs  (79) #   load_image 工具
+│   ├── mcp.rs   (261) #   MCP 工具包装（sanitize_name + wire_name 分发）
+│   └── subagent.rs(415) # task 子 agent 工具（独立上下文 + turn 封顶；不可递归；事件转发 + usage 折算）
+├── mcp.rs      (802)   # MCP 客户端（stdio / Streamable HTTP / 旧版 SSE）
 ├── session.rs   (125)  # 会话持久化
-├── batch.rs     (596)  # 批量任务 + --retries/--failed + 报告合并
-├── harness.rs   (472)  # headless 模式 + result.json + NDJSON + exit code
-└── tui.rs      (2042)  # TUI（feature-gated）：InputBuffer / 模式 / 斜杠命令 / bracketed paste
+├── batch.rs     (644)  # 批量任务 + --retries/--failed + 报告合并
+├── harness.rs   (492)  # headless 模式 + result.json + NDJSON + exit code
+└── tui.rs      (2277)  # TUI（feature-gated）：InputBuffer / 模式 / 斜杠命令 / bracketed paste
 ```
