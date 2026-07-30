@@ -1168,6 +1168,50 @@
     }
 
     #[test]
+    fn compress_accepts_summary_truncated_by_max_tokens() {
+        // A summary that hit the output budget (stop_reason max_tokens) is
+        // coherent-but-incomplete text, NOT a half-written/cancelled stream.
+        // Folding the partial summary beats disabling compression: compress_failed
+        // also gates overflow recovery, so disabling here would take out BOTH
+        // compression paths at once. The partial summary must fold (Compressed
+        // event fires, no compression-failed Warning).
+        let mut cfg = cfg_with(5, 0, 30);
+        cfg.limits.keep_recent_messages = 2;
+        let long = "x".repeat(40);
+        let initial = vec![
+            user_text(&long),
+            Message::assistant(vec![Block::Text("a1".into())]),
+            user_text("u1"),
+            Message::assistant(vec![Block::Text("a2".into())]),
+            user_text("u2"),
+        ];
+        let (prov, _) = MockProvider::new(vec![
+            MockTurn::Ok(ChatResponse {
+                blocks: vec![Block::Text("partial summary".into())],
+                stop_reason: "max_tokens".into(),
+                usage: None,
+            }),
+            mock::resp_text("final", None),
+        ]);
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+        let mut events = Vec::new();
+        let o = agent.run(&mut |e| events.push(e)).unwrap();
+        assert_eq!(o.stop_reason, "end_turn");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Compressed { .. })),
+            "truncated (max_tokens) summary must still fold (no Compressed event fired)"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Warning(w) if w.contains("compression failed"))),
+            "truncated summary must NOT disable compression (compress_failed was set)"
+        );
+    }
+
+    #[test]
     fn compress_empty_summary_still_counts_its_usage() {
         // The model returned an empty/unusable summary, but the summarize
         // request still billed tokens. Those must be counted (honest cost) even

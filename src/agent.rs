@@ -988,13 +988,17 @@ impl Agent {
         };
         let resp = self.provider.chat(&req, &mut |_| {})?;
         // parse_loop reports cancel/idle-timeout/truncation as Ok with a
-        // non-end_turn stop_reason and PARTIAL blocks. Folding a half-written
-        // summary into the history would poison every later turn (and the
-        // session file), so treat anything but a clean end_turn as a
-        // compression failure — the caller degrades gracefully (warn, disable
-        // compression for this run, continue uncompressed).
-        if resp.stop_reason != "end_turn" {
-            anyhow::bail!("summary request did not complete (stop_reason={})", resp.stop_reason);
+        // non-end_turn stop_reason and PARTIAL, half-written blocks. Folding
+        // such a summary into the history would poison every later turn, so
+        // bail on those. max_tokens is DIFFERENT: the model stopped at the
+        // output budget, so the text is coherent (just incomplete) — accepting
+        // it beats disabling compression, because compress_failed also gates
+        // the overflow-recovery path (two failures for the price of one).
+        match resp.stop_reason.as_str() {
+            "end_turn" | "max_tokens" => {}
+            other => {
+                anyhow::bail!("summary request did not complete (stop_reason={other})")
+            }
         }
         let text = resp
             .blocks

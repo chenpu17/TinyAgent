@@ -222,6 +222,28 @@ pub(crate) fn run_with_retries(
             }
         }
     };
+    // json 模式下，重试耗尽 / 取消这两条路径 agent.run 没发 Done（Done 只在
+    // 正常完成时由 agent 内部发出，已由上面的 emit_json 转发），补一个终态
+    // 事件——否则 NDJSON 消费者无法区分"失败/取消"与"进程崩了"。
+    if json {
+        if let Some(err) = &error {
+            let stop_reason = if code == EXIT_CANCELLED {
+                "cancelled"
+            } else {
+                "error"
+            };
+            let v = json!({
+                "type": "done",
+                "stop_reason": stop_reason,
+                "error": err.clone(),
+            });
+            println!(
+                "{}",
+                serde_json::to_string(&v).unwrap_or_else(|_| "{}".into())
+            );
+            let _ = std::io::stdout().flush();
+        }
+    }
     // Always produce a result artifact, even on failure: the previous `?` here
     // skipped write_result on any error, leaving CI with nothing but an opaque
     // non-zero exit. Batch (run_one) already did this; single-run now matches.

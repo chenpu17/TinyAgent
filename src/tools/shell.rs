@@ -185,7 +185,11 @@ fn read_capped<R: Read>(r: &mut R, cap: usize) -> Vec<u8> {
 /// the child a group leader, so its pid IS the group id and `-pid` targets
 /// every descendant — plain `child.kill()` only signals the direct child and
 /// orphans grandchildren (a build tool's compilers, a test runner's workers).
-/// ESRCH (already reaped) is harmless, so the return is ignored. No-op off unix.
+/// ESRCH (already reaped) is harmless, so the return is ignored. No process
+/// groups off unix — kill the direct child so a timeout/cancel actually stops
+/// the command (a bare no-op left child.wait() blocking until the command
+/// finished on its own, voiding the 120s timeout and Ctrl-C). Mirrors
+/// StdioTransport::drop's non-unix branch.
 #[cfg(unix)]
 fn kill_process_group(child: &std::process::Child) {
     let pgid = child.id() as i32;
@@ -195,7 +199,9 @@ fn kill_process_group(child: &std::process::Child) {
 }
 
 #[cfg(not(unix))]
-fn kill_process_group(_child: &std::process::Child) {}
+fn kill_process_group(child: &std::process::Child) {
+    let _ = child.kill();
+}
 
 #[cfg(test)]
 mod tests {

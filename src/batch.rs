@@ -104,15 +104,14 @@ pub fn run(
         .join("results");
     std::fs::create_dir_all(&results_dir)?;
 
-    // One HTTP client (connection pool) shared by all tasks. The total
-    // timeout must cover the largest per-task override — and 0 means
-    // "no timeout", which wins over any finite value.
-    let max_timeout = tasks
-        .iter()
-        .filter_map(|(_, p)| p.limits.as_ref()?.timeout_secs)
-        .fold(base.limits.timeout_secs, |a, b| {
-            if a == 0 || b == 0 { 0 } else { a.max(b) }
-        });
+    // One HTTP client (connection pool) shared by all tasks. Its timeout is
+    // the BASE limit: a task fragment can only TIGHTEN timeout (config merges
+    // with min, and timeout_secs==0 means "no override" — see config.rs), so
+    // every task's final timeout is ≤ base. The base is already the loosest
+    // upper bound covering every task; folding the fragments' raw values in
+    // was dead logic that also let a fragment 0 ("no override") punch through
+    // to no-timeout, pinning a worker on a hung read.
+    let max_timeout = base.limits.timeout_secs;
     let client = crate::provider::new_client(max_timeout);
 
     eprintln!(

@@ -90,16 +90,22 @@ enum Pending {
 /// surfaces as a stream_truncated stop_reason, and a model's malformed JSON
 /// on a COMPLETE stream reaches the tool layer (which reports the bad input
 /// back to the model) instead of killing the whole run.
-fn finalize_pending_lenient(p: Pending) -> Block {
+fn finalize_pending_lenient(p: Pending) -> Option<Block> {
     match p {
-        Pending::Text(t) => Block::Text(t),
+        // Skip an empty text block: a content_block_start with no later delta
+        // (stream cut right after the block opened) would otherwise solidify a
+        // Block::Text("") into the history, and the next turn's request is
+        // rejected by Anthropic with 400. OpenAI's parser guards with
+        // !text.is_empty(); this mirrors it.
+        Pending::Text(t) if t.is_empty() => None,
+        Pending::Text(t) => Some(Block::Text(t)),
         Pending::ToolUse { id, name, json } => {
             let input = if json.trim().is_empty() {
                 json!({})
             } else {
                 serde_json::from_str(&json).unwrap_or_else(|_| json!({"_raw": json}))
             };
-            Block::ToolUse { id, name, input }
+            Some(Block::ToolUse { id, name, input })
         }
     }
 }
@@ -256,7 +262,9 @@ impl Anthropic {
                     // (truncated stream) would be overwritten here — flush it
                     // leniently (its tool JSON may be half-delivered).
                     if let Some(p) = pending.take() {
-                        blocks.push(finalize_pending_lenient(p));
+                        if let Some(b) = finalize_pending_lenient(p) {
+                    blocks.push(b);
+                }
                     }
                     let cb = &ev["content_block"];
                     pending = Some(match cb["type"].as_str().unwrap_or("") {
@@ -299,7 +307,9 @@ impl Anthropic {
                     // matching the OpenAI provider — hard-failing the whole run
                     // on a single model-level JSON slip was needlessly fatal.
                     if let Some(p) = pending.take() {
-                        blocks.push(finalize_pending_lenient(p));
+                        if let Some(b) = finalize_pending_lenient(p) {
+                    blocks.push(b);
+                }
                     }
                 }
                 "message_delta" => {
@@ -326,7 +336,9 @@ impl Anthropic {
         // tool JSON becomes _raw) rather than dropping the block or
         // hard-failing on a parse error.
         if let Some(p) = pending.take() {
-            blocks.push(finalize_pending_lenient(p));
+            if let Some(b) = finalize_pending_lenient(p) {
+                    blocks.push(b);
+                }
         }
         // stop_reason priority: explicit abort (cancel/idle) > real
         // message_delta > stream_truncated. Without this an incomplete stream
@@ -367,6 +379,27 @@ mod tests {
         assert_eq!(
             resp.usage.map(|u| (u.input_tokens, u.output_tokens)),
             Some((12, 7))
+        );
+    }
+
+    #[test]
+    fn empty_text_block_is_dropped_not_solidified() {
+        // A content_block_start whose text never receives a delta (stream cut
+        // right after the block opened) must NOT solidify a Block::Text("")
+        // into the history — the next turn's request would be rejected by
+        // Anthropic with 400. The empty block is dropped, mirroring the
+        // OpenAI parser's !text.is_empty() guard.
+        let raw = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+        );
+        let resp = parse(raw.as_bytes());
+        assert_eq!(resp.stop_reason, "end_turn");
+        assert!(
+            resp.blocks.is_empty(),
+            "empty text block must be dropped, got: {:?}",
+            resp.blocks
         );
     }
 
