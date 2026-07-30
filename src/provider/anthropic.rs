@@ -8,14 +8,21 @@ pub struct Anthropic {
     client: reqwest::blocking::Client,
     base_url: String,
     api_key: String,
+    idle: std::time::Duration,
 }
 
 impl Anthropic {
-    pub fn new(client: reqwest::blocking::Client, base_url: String, api_key: &str) -> Self {
+    pub fn new(
+        client: reqwest::blocking::Client,
+        base_url: String,
+        api_key: &str,
+        idle: std::time::Duration,
+    ) -> Self {
         Self {
             client,
             base_url,
             api_key: api_key.to_string(),
+            idle,
         }
     }
 
@@ -133,7 +140,7 @@ impl Provider for Anthropic {
             bail!("Anthropic API error {status}: {text}");
         }
 
-        let mut sse = CancellableSse::new(resp, req.cancel.clone());
+        let mut sse = CancellableSse::new(resp, req.cancel.clone(), self.idle);
         Self::parse_loop(&mut sse, on_event)
     }
 }

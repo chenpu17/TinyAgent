@@ -17,6 +17,9 @@ fn default_compress_threshold() -> usize {
 fn default_keep_recent() -> usize {
     8
 }
+fn default_stream_idle() -> u64 {
+    30
+}
 fn default_max_tokens() -> u32 {
     8192
 }
@@ -56,6 +59,14 @@ pub struct Limits {
     /// it is the last-resort safety net and never depends on client config.
     #[serde(default)]
     pub max_context_tokens: u64,
+    /// Max gap (seconds) between SSE chunks before a stream is treated as
+    /// stalled and aborted. Ordinary chat models have sub-second inter-chunk
+    /// gaps, so 30s is ample; deep-reasoning models with long first-token
+    /// latency (DeepSeek-R1, o-series) can sit silent for minutes before the
+    /// first token and need this raised. The reqwest total timeout
+    /// (`timeout_secs`) remains the hard backstop regardless.
+    #[serde(default = "default_stream_idle")]
+    pub stream_idle_secs: u64,
 }
 
 impl Default for Limits {
@@ -67,6 +78,7 @@ impl Default for Limits {
             compress_threshold_chars: default_compress_threshold(),
             keep_recent_messages: default_keep_recent(),
             max_context_tokens: 0,
+            stream_idle_secs: default_stream_idle(),
         }
     }
 }
@@ -268,11 +280,34 @@ impl Config {
             if let Some(v) = l.max_output_chars {
                 self.limits.max_output_chars = v.min(self.limits.max_output_chars);
             }
+            // compress_threshold_chars is 0-sentineled like timeout_secs and
+            // max_context_tokens: 0 means "no preflight compression" (the
+            // LOOSEST value), so a task setting 0 is a loosening and is
+            // ignored; a finite v can only tighten — enable compaction from a
+            // disabled (0) base, or lower the threshold against an enabled one
+            // (compacts sooner). Without this, a task could set 0 →
+            // min(base,0)==0 → silently disable the base's preflight
+            // compaction, the opposite of every other field's tighten direction.
             if let Some(v) = l.compress_threshold_chars {
-                self.limits.compress_threshold_chars = v.min(self.limits.compress_threshold_chars);
+                if v != 0 {
+                    self.limits.compress_threshold_chars = if self.limits.compress_threshold_chars == 0 {
+                        v
+                    } else {
+                        v.min(self.limits.compress_threshold_chars)
+                    };
+                }
             }
             if let Some(v) = l.keep_recent_messages {
                 self.limits.keep_recent_messages = v.min(self.limits.keep_recent_messages);
+            }
+            // stream_idle_secs: shorter = tighter (a stalled stream fails
+            // sooner). Plain min like max_output_chars/keep_recent_messages;
+            // 0 is nonsensical (instant timeout) so it is clamped to ≥1 at use
+            // in the provider rather than special-cased here. A task can only
+            // shorten the idle window, never lengthen it to mask a hang (the
+            // reqwest total `timeout_secs` is the hard backstop regardless).
+            if let Some(v) = l.stream_idle_secs {
+                self.limits.stream_idle_secs = v.min(self.limits.stream_idle_secs);
             }
             // max_context_tokens is 0-sentineled like timeout_secs: 0 means
             // "no preflight token compaction" (the LOOSEST), so a task setting 0
@@ -355,6 +390,7 @@ pub struct PartialLimits {
     pub compress_threshold_chars: Option<usize>,
     pub keep_recent_messages: Option<usize>,
     pub max_context_tokens: Option<u64>,
+    pub stream_idle_secs: Option<u64>,
 }
 
 #[cfg(test)]
@@ -584,5 +620,100 @@ mod tests {
         .unwrap();
         cfg.apply(partial).unwrap();
         assert_eq!(cfg.limits.max_context_tokens, 100000, "larger task value must not loosen");
+    }
+
+    #[test]
+    fn batch_overlay_compress_threshold_0_sentinel_only_tightens() {
+        // compress_threshold_chars is 0-sentineled like max_context_tokens: 0
+        // means "no preflight compression" (loosest). A task must NOT be able to
+        // disable the base's compaction by setting 0 (min(base,0)==0 would).
+        // 0 in the partial is the no-op sentinel and is ignored.
+        let mut cfg: Config = serde_json::from_str(
+            r#"{"provider":"anthropic","api_key_env":"K","model":"m",
+               "limits":{"compress_threshold_chars":100000}}"#,
+        )
+        .unwrap();
+        let partial: PartialConfig =
+            serde_json::from_str(r#"{"task":"x","limits":{"compress_threshold_chars":0}}"#).unwrap();
+        cfg.apply(partial).unwrap();
+        assert_eq!(
+            cfg.limits.compress_threshold_chars, 100000,
+            "0 sentinel must not disable the base's preflight compaction"
+        );
+
+        // From a disabled base (0), a finite task value is adopted (enables it).
+        let cfg_disabled: Config = serde_json::from_str(
+            r#"{"provider":"anthropic","api_key_env":"K","model":"m",
+               "limits":{"compress_threshold_chars":0}}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg_disabled.limits.compress_threshold_chars, 0);
+        let partial: PartialConfig =
+            serde_json::from_str(r#"{"task":"x","limits":{"compress_threshold_chars":50000}}"#).unwrap();
+        let mut cfg = cfg_disabled;
+        cfg.apply(partial).unwrap();
+        assert_eq!(
+            cfg.limits.compress_threshold_chars, 50000,
+            "finite value adopted from a 0 (disabled) base"
+        );
+
+        // From a finite base, a task can only tighten (min), never loosen.
+        let mut cfg: Config = serde_json::from_str(
+            r#"{"provider":"anthropic","api_key_env":"K","model":"m",
+               "limits":{"compress_threshold_chars":100000}}"#,
+        )
+        .unwrap();
+        let partial: PartialConfig =
+            serde_json::from_str(r#"{"task":"x","limits":{"compress_threshold_chars":200000}}"#).unwrap();
+        cfg.apply(partial).unwrap();
+        assert_eq!(
+            cfg.limits.compress_threshold_chars, 100000,
+            "larger threshold (compress later) must not loosen"
+        );
+    }
+
+    #[test]
+    fn stream_idle_secs_defaults_to_30_and_overridable() {
+        // Deep-reasoning models with long first-token latency need the SSE idle
+        // gap raised above the 30s default; it must be a real config field.
+        let cfg: Config =
+            serde_json::from_str(r#"{"provider":"anthropic","api_key_env":"K","model":"m"}"#).unwrap();
+        assert_eq!(cfg.limits.stream_idle_secs, 30, "default idle gap is 30s");
+
+        let cfg: Config = serde_json::from_str(
+            r#"{"provider":"anthropic","api_key_env":"K","model":"m",
+               "limits":{"stream_idle_secs":180}}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.limits.stream_idle_secs, 180);
+    }
+
+    #[test]
+    fn batch_overlay_stream_idle_only_tightens() {
+        // stream_idle_secs: shorter = tighter (a stalled stream fails sooner).
+        // A task may only shorten it, never lengthen it (the longer window
+        // could mask a hang; the reqwest total timeout is the backstop).
+        let mut cfg: Config = serde_json::from_str(
+            r#"{"provider":"anthropic","api_key_env":"K","model":"m",
+               "limits":{"stream_idle_secs":60}}"#,
+        )
+        .unwrap();
+        let partial: PartialConfig =
+            serde_json::from_str(r#"{"task":"x","limits":{"stream_idle_secs":15}}"#).unwrap();
+        cfg.apply(partial).unwrap();
+        assert_eq!(cfg.limits.stream_idle_secs, 15, "a shorter idle window tightens");
+
+        let mut cfg: Config = serde_json::from_str(
+            r#"{"provider":"anthropic","api_key_env":"K","model":"m",
+               "limits":{"stream_idle_secs":60}}"#,
+        )
+        .unwrap();
+        let partial: PartialConfig =
+            serde_json::from_str(r#"{"task":"x","limits":{"stream_idle_secs":180}}"#).unwrap();
+        cfg.apply(partial).unwrap();
+        assert_eq!(
+            cfg.limits.stream_idle_secs, 60,
+            "a longer idle window must not loosen (mask a stall)"
+        );
     }
 }

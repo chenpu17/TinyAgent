@@ -136,9 +136,14 @@ pub trait Provider: Send + Sync {
 
 pub fn build(cfg: &Config, api_key: &str, client: reqwest::blocking::Client) -> Box<dyn Provider> {
     let base = cfg.base_url();
+    // Clamp ≥1: 0 would be an instant always-firing idle timeout. The 30s
+    // default suits ordinary chat models (sub-second inter-chunk gaps);
+    // deep-reasoning models with long first-token latency (DeepSeek-R1,
+    // o-series) raise it via `limits.stream_idle_secs` in the config.
+    let idle = Duration::from_secs(cfg.limits.stream_idle_secs.max(1));
     match cfg.provider {
-        ProviderKind::Anthropic => Box::new(Anthropic::new(client, base, api_key)),
-        ProviderKind::Openai => Box::new(OpenAi::new(client, base, api_key)),
+        ProviderKind::Anthropic => Box::new(Anthropic::new(client, base, api_key, idle)),
+        ProviderKind::Openai => Box::new(OpenAi::new(client, base, api_key, idle)),
     }
 }
 
@@ -216,7 +221,8 @@ impl<R: Read> SseReader<R> {
 pub(crate) enum StreamAbort {
     /// Caller flipped the shared cancel flag (Esc/Ctrl-C in the TUI).
     Cancelled,
-    /// No new chunk for `STREAM_IDLE_TIMEOUT` — the connection is half-open
+    /// No new chunk for `idle` (the configured `limits.stream_idle_secs`) — the
+/// connection is half-open
     /// (server stopped sending without closing). Distinct from the reqwest
     /// total timeout, which is a backstop for the whole request.
     IdleTimeout,
@@ -244,14 +250,10 @@ impl<R: Read> SseSource for SseReader<R> {
     }
 }
 
-/// No new chunk for this long ⇒ treat the stream as stalled. Tuned for
-/// ordinary chat models whose inter-chunk gap is sub-second; deep-reasoning
-/// models with long first-token latency may need this raised. The reqwest
-/// total timeout (`limits.timeout_secs`) remains the hard backstop.
-const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Cancel/idle poll granularity. Bounds how long after Esc the stream read
 /// actually returns — small enough to feel instant, large enough to avoid
-/// needless wakeups on a healthy stream.
+/// needless wakeups on a healthy stream. (The idle threshold itself comes from
+/// `CancellableSse::idle`, set from `limits.stream_idle_secs`.)
 const POLL_SLICE: Duration = Duration::from_millis(200);
 
 /// Wraps a blocking reader in a worker thread, exposing payloads with an idle
@@ -262,10 +264,18 @@ const POLL_SLICE: Duration = Duration::from_millis(200);
 pub(crate) struct CancellableSse {
     rx: mpsc::Receiver<std::result::Result<String, String>>,
     cancel: Arc<AtomicBool>,
+    /// Max gap between payloads before the stream is treated as stalled.
+    /// Pluggable (from `limits.stream_idle_secs`) so deep-reasoning models
+    /// with long first-token latency aren't wrongly aborted.
+    idle: Duration,
 }
 
 impl CancellableSse {
-    pub(crate) fn new<R: Read + Send + 'static>(reader: R, cancel: Arc<AtomicBool>) -> Self {
+    pub(crate) fn new<R: Read + Send + 'static>(
+        reader: R,
+        cancel: Arc<AtomicBool>,
+        idle: Duration,
+    ) -> Self {
         // The channel carries Result: Ok(payload) for data, Err(message) when
         // the underlying read failed. An IO error is sent before the worker
         // drops the sender, so the receiver distinguishes a failed read from a
@@ -294,7 +304,7 @@ impl CancellableSse {
                 // unless it already saw the Err above.
             })
             .expect("spawn sse-reader thread");
-        Self { rx, cancel }
+        Self { rx, cancel, idle }
     }
 }
 
@@ -302,13 +312,13 @@ impl SseSource for CancellableSse {
     fn next_payload(&mut self) -> std::result::Result<Option<String>, StreamAbort> {
         // Poll in short slices so a cancel flip (Esc/Ctrl-C) is noticed within
         // ~POLL_SLICE, not only when the idle timeout eventually fires. A
-        // stuck connection still hits IdleTimeout after STREAM_IDLE_TIMEOUT.
+        // stuck connection still hits IdleTimeout after `self.idle`.
         let start = Instant::now();
         loop {
             if self.cancel.load(Ordering::Relaxed) {
                 return Err(StreamAbort::Cancelled);
             }
-            if start.elapsed() >= STREAM_IDLE_TIMEOUT {
+            if start.elapsed() >= self.idle {
                 return Err(StreamAbort::IdleTimeout);
             }
             match self.rx.recv_timeout(POLL_SLICE) {
@@ -381,7 +391,7 @@ mod tests {
             }
         }
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut s = CancellableSse::new(ErroringRead, cancel);
+        let mut s = CancellableSse::new(ErroringRead, cancel, Duration::from_secs(30));
         match s.next_payload() {
             Err(StreamAbort::StreamError(msg)) => assert!(msg.contains("reset"), "{msg}"),
             other => panic!("expected StreamError, got {other:?}"),
@@ -392,7 +402,7 @@ mod tests {
     fn cancellable_sse_reads_payloads_then_eof() {
         let raw = b"data: {\"a\":1}\n\ndata: {\"b\":2}\n\n";
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut s = CancellableSse::new(&raw[..], cancel);
+        let mut s = CancellableSse::new(&raw[..], cancel, Duration::from_secs(30));
         assert_eq!(s.next_payload().unwrap().as_deref(), Some("{\"a\":1}"));
         assert_eq!(s.next_payload().unwrap().as_deref(), Some("{\"b\":2}"));
         assert!(s.next_payload().unwrap().is_none()); // reader hit EOF
@@ -411,7 +421,7 @@ mod tests {
             }
         }
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut s = CancellableSse::new(Stall, cancel.clone());
+        let mut s = CancellableSse::new(Stall, cancel.clone(), Duration::from_secs(30));
         let c = cancel;
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(300));

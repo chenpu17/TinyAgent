@@ -210,12 +210,15 @@ tiny-agent --config examples/harness.json --task "跑测试" --retries 3 --outpu
     "max_output_chars": 30000,
     "compress_threshold_chars": 100000,
     "keep_recent_messages": 8,
-    "max_context_tokens": 0
+    "max_context_tokens": 0,
+    "stream_idle_secs": 30
   }
 }
 ```
 
 API key 从 `api_key_env` 指定的环境变量读取，不写进配置文件。
+
+`limits.stream_idle_secs`（默认 30）：流式响应两个 chunk 之间最长允许的静默秒数，超过即判定连接半开并中断。普通对话模型 chunk 间隔在亚秒级，30s 绰绰有余；**深度推理模型**（DeepSeek-R1、o 系列等）首 token 前可能静默数分钟，需要调大（如 180）才不会被误杀——`limits.timeout_secs` 仍是兜底硬上限，不会因此无限挂起。
 
 ### 上下文压缩
 

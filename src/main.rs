@@ -156,6 +156,21 @@ fn main() -> Result<()> {
         std::process::exit(code);
     }
 
+    // Single-run mode (headless or TUI) silently ignores batch-only flags.
+    // Reject the ones a user might pass expecting them to take effect rather
+    // than run a no-op that doesn't do what was asked — the symmetric reverse
+    // of the batch-branch checks above. Detection is by "differs from default",
+    // so passing the default value explicitly is a harmless no-op (not bailed).
+    if cli.failed {
+        bail!("--failed only applies to --batch mode");
+    }
+    if cli.jobs != 1 {
+        bail!("--jobs only applies to --batch mode");
+    }
+    if cli.report.as_path() != std::path::Path::new("report.json") {
+        bail!("--report only applies to --batch mode");
+    }
+
     // ── Single-run mode (headless or TUI) ─────────────────────────────
     let mut initial: Vec<Message> = Vec::new();
     let mut resumed = false;
@@ -237,6 +252,16 @@ fn main() -> Result<()> {
     }
 
     if cli.tui {
+        // Headless-only flags silently ignored in TUI: --json writes the NDJSON
+        // stream and --output writes the result JSON, both of which happen in
+        // harness::run (the non-TUI branch). Reject them rather than run a TUI
+        // session that never produces the promised output.
+        if cli.json {
+            bail!("--json only applies to headless (non-TUI) mode");
+        }
+        if cli.output.is_some() {
+            bail!("--output only applies to headless (non-TUI) mode");
+        }
         #[cfg(feature = "tui")]
         {
             // Resume-aware: only an explicit --task is layered on top of
