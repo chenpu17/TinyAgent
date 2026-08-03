@@ -3,18 +3,16 @@ use crate::config::Config;
 use crate::provider::Block;
 use anyhow::Result;
 use crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
 };
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use crossterm::ExecutableCommand;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::buffer::Buffer;
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block as WBlock, BorderType, Borders, Clear, Paragraph};
-use ratatui::Terminal;
+use ratatui::widgets::{Block as WBlock, BorderType, Borders, Paragraph};
+use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use std::io::stdout;
 use std::sync::mpsc;
 use unicode_width::UnicodeWidthStr;
@@ -45,14 +43,16 @@ const BADGE_BG: Color = Color::Cyan;
 /// Keep prose readable on wide terminals while leaving the reading column
 /// left-anchored. Input and status chrome use the available terminal width.
 const CONTENT_MAX_WIDTH: u16 = 120;
-const WORKSPACE_MARGIN: u16 = 2;
+
+/// Height of the inline viewport (the live band at the bottom of the primary
+/// screen). Splits into a transcript/streaming zone (top), the input box, and
+/// a one-row status bar. Tall enough that the slash popup and a few streaming
+/// lines fit; the host terminal scrolls once committed content outgrows it.
+const INLINE_HEIGHT: u16 = 8;
 
 /// Body indent beneath the standalone conversation role headers.
 const ROLE_BODY_INDENT: usize = 2;
 const TOOL_INDENT: usize = 4;
-
-/// Nav-mode page size for Ctrl-D / Ctrl-U selection jumps.
-const NAV_PAGE: usize = 10;
 
 /// Severity of a `Row::System` notice — drives its color (info dim, warn
 /// yellow, error red). The text keeps its `[warn]`/`[error]`-style prefix, so
@@ -119,14 +119,6 @@ impl Row {
     fn sys_error(text: impl Into<String>) -> Row {
         Row::sys(text, SysLevel::Error)
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    /// Normal: typing edits the input box.
-    Input,
-    /// Browse tool rows: j/k select, Enter/Space toggles expanded, Tab back.
-    Nav,
 }
 
 /// What a `/`-prefixed input line asks for. `Message` = not a command.
@@ -436,23 +428,6 @@ fn slash_popup_lines(popup: &SlashPopup) -> Vec<Line<'static>> {
     lines
 }
 
-/// Popup geometry: floats directly above the input box, overlaying the
-/// conversation's bottom rows; width fits the content but never exceeds the
-/// input box; height fits the rendered rows, clipped by the screen top.
-fn slash_popup_rect(input: Rect, lines: &[Line]) -> Rect {
-    let height = (lines.len() as u16).min(input.y);
-    if height == 0 {
-        return Rect::default(); // no room above the input box: don't render
-    }
-    let content_w = lines.iter().map(|l| l.width()).max().unwrap_or(1) as u16;
-    Rect::new(
-        input.x,
-        input.y - height,
-        content_w.max(1).min(input.width),
-        height,
-    )
-}
-
 /// Render the conversation rows as plain text for `/export` — a readable
 /// transcript mirroring the on-screen layout, minus styling/wrapping. Empty
 /// assistant rows (left while a turn is mid-stream) are skipped so the dump
@@ -541,50 +516,6 @@ fn copy_to_clipboard(text: &str) -> bool {
     false
 }
 
-/// How long the status bar's transient "copied N bytes" notice stays up.
-const COPY_NOTICE_SECS: u64 = 3;
-
-/// Set the status-bar copy notice after a successful copy: a new notice
-/// replaces the old one, resetting its clock. Success feedback lives here
-/// (not as a conversation row) so repeated copies don't pile up sys lines;
-/// FAILURES still push a row — an error must stay visible and retraceable.
-fn set_copy_notice(slot: &mut Option<(String, Instant)>, bytes: usize) {
-    *slot = Some((format!("copied {bytes} bytes"), Instant::now()));
-}
-
-/// Drop the notice once it has outlived COPY_NOTICE_SECS. Returns true when
-/// it expired (the caller sets dirty so the bar repaints without it).
-fn expire_copy_notice(slot: &mut Option<(String, Instant)>, now: Instant) -> bool {
-    let expired = slot
-        .as_ref()
-        .is_some_and(|(_, t)| now.duration_since(*t) >= Duration::from_secs(COPY_NOTICE_SECS));
-    if expired {
-        *slot = None;
-    }
-    expired
-}
-
-/// Expire the copy notice AND the copied selection's highlight with it. The
-/// notice's presence doubles as the "this selection was copied" mark: a
-/// settled copy always sets one (a mid-drag anchor or a failed copy never
-/// does), so an expiring notice retires exactly the band it announced. The
-/// band must age out because a stale one cannot be cleared by events: a
-/// Shift+drag is taken over by the terminal's native selection and never
-/// reaches us, leaving two "selections" on screen. Never cleared mid-drag
-/// (drag_active) — the user is still holding the mouse.
-fn expire_copy_notice_and_selection(
-    notice: &mut Option<(String, Instant)>,
-    text_sel: &mut Option<TextSelection>,
-    drag_active: bool,
-    now: Instant,
-) -> bool {
-    let expired = expire_copy_notice(notice, now);
-    if expired && !drag_active {
-        *text_sel = None;
-    }
-    expired
-}
-
 /// Expand a leading `~/` (and a bare `~`) to `$HOME`, for `/export ~/notes.md`.
 /// Only the current user's home — `~other` is left as-is (rare; not needed
 /// here). `_with` takes home explicitly so the logic is unit-testable without
@@ -608,57 +539,6 @@ fn expand_tilde_with(path: &str, home: Option<&std::ffi::OsStr>) -> String {
 
 fn expand_tilde(path: &str) -> String {
     expand_tilde_with(path, std::env::var_os("HOME").as_deref())
-}
-
-/// A row selectable in Nav mode: every row is — yank now covers messages
-/// and notices, not just tool rows, so j/k walk the whole conversation.
-fn is_selectable(_row: &Row) -> bool {
-    true
-}
-
-/// Next row index matching `pred`, stepping from `from` by `dir` (+1 down /
-/// -1 up). Returns None if none exists in that direction; the caller then
-/// keeps the current selection, so j/k never silently deselect.
-fn next_matching(
-    rows: &[Row],
-    from: Option<usize>,
-    dir: i32,
-    pred: fn(&Row) -> bool,
-) -> Option<usize> {
-    if rows.is_empty() {
-        return None;
-    }
-    let n = rows.len();
-    let first = if dir > 0 {
-        from.map_or(0, |c| c + 1)
-    } else {
-        match from {
-            None => n - 1,
-            // Stepping up from the first row: nothing above (saturating_sub
-            // would re-examine row 0 and match the current row itself).
-            Some(0) => return None,
-            Some(c) => c - 1,
-        }
-    };
-    if first >= n {
-        return None;
-    }
-    if dir > 0 {
-        (first..n).find(|&i| pred(&rows[i]))
-    } else {
-        (0..=first).rev().find(|&i| pred(&rows[i]))
-    }
-}
-
-/// Next selectable row (see is_selectable: all of them) stepping by `dir`.
-fn next_selectable(rows: &[Row], from: Option<usize>, dir: i32) -> Option<usize> {
-    next_matching(rows, from, dir, is_selectable)
-}
-
-/// A turn boundary row: a user message (or its queued ghost) — the targets
-/// of the `[` / `]` turn-jump keys in Nav mode.
-fn is_turn_start(row: &Row) -> bool {
-    matches!(row, Row::User(_) | Row::Queued(_))
 }
 
 enum UiMsg {
@@ -687,18 +567,18 @@ impl Drop for DoneSignal {
     }
 }
 
-/// Restores the terminal on drop. Installed right after raw mode + alternate
-/// screen are entered, so a panic (or a propagated `?` error) inside the UI
-/// loop unwinds through this and still leaves the user's terminal usable —
-/// without it, a panic mid-draw strands them in raw mode with no echo.
+/// Restores the terminal on drop. Installed right after raw mode is entered,
+/// so a panic (or a propagated `?` error) inside the UI loop unwinds through
+/// this and still leaves the user's terminal usable — without it, a panic
+/// mid-draw strands them in raw mode with no echo. Inline mode lives on the
+/// PRIMARY screen (no alternate screen) and captures no mouse, so teardown is
+/// just bracketed-paste + raw-mode — native selection/scroll keep working.
 struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = stdout().execute(DisableMouseCapture);
         let _ = stdout().execute(DisableBracketedPaste);
         let _ = disable_raw_mode();
-        let _ = stdout().execute(LeaveAlternateScreen);
     }
 }
 
@@ -771,26 +651,29 @@ pub fn run(
 
     enable_raw_mode()?;
     // Create the restore guard IMMEDIATELY after the first state-changing
-    // call, so a `?` failure in ANY of the steps below (EnterAlternateScreen /
-    // EnableBracketedPaste / EnableMouseCapture / Terminal::new — e.g. stdout
-    // not a tty, broken pipe) still drops the guard and restores the terminal.
-    // Drop is fully idempotent (every disable is `let _ =`), so creating the
-    // guard before some enables have run is harmless. (Previously the guard
-    // was created after all four enables, leaving a mid-setup failure stranded
-    // in raw mode + alt screen with no echo.)
+    // call, so a `?` failure in ANY of the steps below (EnableBracketedPaste /
+    // Terminal::with_options — e.g. stdout not a tty, broken pipe) still drops
+    // the guard and restores the terminal. Drop is fully idempotent (every
+    // disable is `let _ =`), so creating the guard before some enables have
+    // run is harmless.
     let _guard = TerminalGuard;
-    stdout().execute(EnterAlternateScreen)?;
     // Bracketed paste: terminals that support it deliver a pasted blob as one
     // Event::Paste (newlines included) instead of replaying it as keystrokes —
     // which would hit the Enter handler and send each line as a message.
     stdout().execute(EnableBracketedPaste)?;
-    // Mouse capture so the scroll wheel / trackpad two-finger scroll reaches
-    // the app (crossterm maps vertical trackpad scroll to ScrollUp/Down). The
-    // terminal guard disables it on drop. Note: while captured, click-drag text
-    // selection is intercepted by the app — hold Shift to select/copy as usual
-    // (most terminals bypass app mouse capture under Shift).
-    stdout().execute(EnableMouseCapture)?;
-    let mut term = Terminal::new(ratatui::backend::CrosstermBackend::new(stdout()))?;
+    // Inline viewport: the TUI lives in a fixed INLINE_HEIGHT-row band at the
+    // bottom of the PRIMARY screen — no alternate screen, no mouse capture.
+    // Finalized conversation turns are committed into the terminal's own
+    // scrollback via Terminal::insert_before, so the host terminal's NATIVE
+    // text selection, scrolling, and search all work on the conversation. The
+    // float-on-redraw selection bug of the full-screen model cannot occur
+    // because the conversation lives in real scrollback, not a redrawn frame.
+    let mut term = Terminal::with_options(
+        ratatui::backend::CrosstermBackend::new(stdout()),
+        TerminalOptions {
+            viewport: Viewport::Inline(INLINE_HEIGHT),
+        },
+    )?;
     let result = ui_loop(
         &mut term,
         cfg,
@@ -814,10 +697,15 @@ pub fn run(
     // before, never hanging exit.
     let _ = done_rx.recv_timeout(Duration::from_secs(3));
     drop(worker); // detach if the worker is still stuck past the deadline
-    // Restore the terminal BEFORE reporting discarded queued messages — a
-    // note printed while the alternate screen is still active would be lost.
-    // (The guard's Drop is idempotent, so a panic path below still ends clean.)
+    // Restore the terminal BEFORE reporting discarded queued messages — a note
+    // printed while raw mode is still active would be garbled. The guard's Drop
+    // is idempotent, so a panic path below still ends clean. Inline mode leaves
+    // the committed scrollback intact: the conversation stays in the terminal's
+    // history like ordinary command output.
     drop(_guard);
+    // Step past the inline viewport so the dropped-queue note (and the shell
+    // prompt on return) doesn't overwrite the viewport's last frame.
+    println!();
     if let Ok(dropped) = result {
         if dropped > 0 {
             eprintln!("[tiny-agent] {dropped} queued message(s) discarded on quit");
@@ -835,16 +723,21 @@ fn ui_loop(
     initial_task: Option<&str>,
     auto_start: bool,
 ) -> Result<usize> {
+    // The full conversation, in append order. Finalized prefixes are committed
+    // into the terminal scrollback via insert_before and never re-rendered; the
+    // live viewport only ever shows the tail end (the in-flight streaming row
+    // and queued ghosts), so memory grows with the session but per-frame work
+    // does not.
     let mut rows: Vec<Row> = Vec::new();
-    // Version counter for the FrameCache key: bumped at EVERY rows mutation
-    // (push/pop/clear/remove/toggle). The counter — not the dirty flag —
-    // decides whether a redraw may reuse the cached history frame.
-    let mut rows_version: u64 = 0;
+    // Watermark: rows[0..committed] have already been flushed to scrollback and
+    // are permanent (only Queued ghosts are ever removed, and they live in the
+    // uncommitted tail). See `pending_end` for the finalize rule.
+    let mut committed: usize = 0;
     let mut input = InputBuffer::new();
     let mut busy = false;
     // Messages typed while a run is in flight, oldest first. Enter queues
     // here instead of sending; the RunFinished/Error flush pops one and sends
-    // it (only then pushing its Row::User, so the transcript stays in true
+    // it (only then committing its Row::User, so the transcript stays in true
     // send order).
     let mut queued: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     // Start of the current run (one user message → possibly many turns), for
@@ -853,13 +746,11 @@ fn ui_loop(
     // What the agent is doing right now ("thinking" / "writing" / "→ tool"),
     // shown in the busy status segment; fed by the event stream.
     let mut activity = String::new();
-    let mut scroll_up: usize = 0;
     let mut streaming = false;
     // Transient "agent is thinking" marker: set at TurnStart (and when a
-    // queued message is flushed into a new run), cleared by the first
-    // visible output (text delta or tool call) and at run end. Render-only —
-    // build_history_lines synthesizes a `● …` tail line from it; nothing is
-    // pushed into rows / MdCache / the transcript.
+    // queued message is flushed into a new run), cleared by the first visible
+    // output (text delta or tool call) and at run end. Render-only — the live
+    // viewport renders a `● …` line from it; nothing is committed for it.
     let mut thinking = false;
     // Name of the sub-agent whose text is currently accumulating into the
     // trailing Assistant row, so consecutive deltas from the same sub-agent
@@ -890,57 +781,23 @@ fn ui_loop(
     // the response just appended to the history. Drives the status bar's
     // `ctx` segment.
     let mut ctx_tokens: u64 = 0;
-    // Input vs. browse mode (Tab toggles). In Nav mode select_idx picks a
-    // tool row; j/k move it, Enter/Space toggles its expanded view.
-    let mut mode = Mode::Input;
-    let mut select_idx: Option<usize> = None;
-    // M6: memoize per-row markdown rendering so redraws (each streamed delta,
-    // each scroll tick) don't re-parse the whole conversation. Cleared with
-    // `rows` on `/clear`.
+    // Per-row markdown render cache (M6). Only the in-flight streaming row is
+    // ever re-rendered in the live viewport, so this stays small; committed
+    // rows are rendered once at commit time.
     let mut md_cache = MdCache::new();
-    // D3: per-frame cache of the wrapped history (see FrameCache). Busy clock
-    // ticks hit it whenever the frame key is unchanged.
-    let mut frame_cache = FrameCache::new();
     // Dirty flag for the render pass: set by any worker message or terminal
     // event; while clear (and not busy) the loop skips term.draw entirely.
     let mut dirty = true; // first frame must paint
     let mut last_draw = Instant::now();
-    // Mouse hit-testing state, refreshed on every draw: the conversation
-    // block's area, its current scroll offset, and the visual-line → row map
-    // (a click lands on a wrapped VISUAL line, so the map is built post-wrap).
-    let mut history_area = ratatui::layout::Rect::default();
-    let mut history_scroll: u16 = 0;
-    let mut visual_row_map: Vec<Option<usize>> = Vec::new();
-    // The active selection, in content coordinates (row, line-within-row,
-    // column) so it survives re-wraps and streaming appends; None = no
-    // selection, highlight costs nothing.
-    let mut text_sel: Option<TextSelection> = None;
-    // Scroll bound of the last frame (needed to clamp edge auto-scroll), plus
-    // drag state for the loop-side auto-scroll: crossterm only emits Drag
-    // events while the pointer MOVES, so a drag parked on the top/bottom edge
-    // is driven by the loop timer instead (scroll + extend the head).
-    let mut history_max_scroll: usize = 0;
-    let mut drag_active = false;
-    let mut drag_pointer: Option<(u16, u16)> = None;
-    // Set when the current selection came from a Shift+click extension (head
-    // moved, anchor kept) rather than a drag — Up must not treat it as a
-    // toggle-click.
-    let mut shift_extended = false;
-    // Transient copy feedback ("copied N bytes") shown in the status bar
-    // instead of a conversation row, so repeated copies don't pile up sys
-    // lines; expiring after COPY_NOTICE_SECS (checked every loop wake).
-    let mut copy_notice: Option<(String, Instant)> = None;
 
     rows.push(Row::sys_info(welcome_text(&cfg.model, cfg.tools.len())));
-    rows_version += 1;
-    // Mirror the initial task (already in the agent's history) so the
-    // user sees what's running. Do NOT re-send it over in_tx: main has
-    // already placed it in the agent's messages, and a second send would
-    // duplicate the task and create two adjacent user messages (Anthropic
-    // rejects that with a 400). The worker starts the run itself.
+    // Mirror the initial task (already in the agent's history) so the user
+    // sees what's running. Do NOT re-send it over in_tx: main has already
+    // placed it in the agent's messages, and a second send would duplicate the
+    // task and create two adjacent user messages (Anthropic rejects that 400).
+    // The worker starts the run itself.
     if let Some(task) = initial_task {
         rows.push(Row::User(task.to_string()));
-        rows_version += 1;
     }
     // The worker auto-runs when the session ends with a user message (an
     // initial task, or a resumed session stopped mid-turn). Show "running" so
@@ -970,19 +827,15 @@ fn ui_loop(
                         rows.push(Row::sys_error(
                             "[worker stopped unexpectedly — press Esc to quit]",
                         ));
-                        rows_version += 1;
                     }
                     // Nothing queued can ever be delivered now: drop the
                     // pending texts and their ghost rows. Row removal shifts
-                    // indices, so the index-keyed MdCache, the Nav selection,
-                    // and any drag selection are reset when anything was
-                    // removed.
+                    // indices, so the index-keyed MdCache is reset when
+                    // anything was removed (the watermark stays valid — only
+                    // uncommitted ghosts are ever removed).
                     queued.clear();
                     if drop_queued_ghosts(&mut rows) {
                         md_cache.clear();
-                        select_idx = None;
-                        text_sel = None;
-                        rows_version += 1;
                     }
                     break;
                 }
@@ -1014,7 +867,6 @@ fn ui_loop(
                             activity = "writing".into();
                         }
                         append_delta(&mut rows, &mut streaming, &t);
-                        rows_version += 1;
                     }
                     AgentEvent::ToolCall { name, input } => {
                         streaming = false;
@@ -1032,7 +884,6 @@ fn ui_loop(
                             expanded: false,
                             started: Instant::now(),
                         });
-                        rows_version += 1;
                     }
                     AgentEvent::ToolResult {
                         name,
@@ -1055,7 +906,6 @@ fn ui_loop(
                             expanded,
                             elapsed,
                         });
-                        rows_version += 1;
                     }
                     AgentEvent::Done { stop_reason } => {
                         streaming = false;
@@ -1064,7 +914,6 @@ fn ui_loop(
                         // worth a notice.
                         if !is_normal_stop(&stop_reason) {
                             rows.push(Row::sys_warn(format!("[done: {stop_reason}]")));
-                            rows_version += 1;
                         }
                     }
                     AgentEvent::Compressed {
@@ -1080,11 +929,9 @@ fn ui_loop(
                         rows.push(Row::sys_info(format!(
                             "[context compressed ({how}): dropped {dropped} messages, {kept} kept]"
                         )));
-                        rows_version += 1;
                     }
                     AgentEvent::Warning(w) => {
                         rows.push(Row::sys_warn(format!("[warn] {w}")));
-                        rows_version += 1;
                     }
                     AgentEvent::Usage {
                         input_tokens,
@@ -1129,7 +976,6 @@ fn ui_loop(
                             AgentEvent::TextDelta(t) => {
                                 thinking = false;
                                 append_sub_delta(&mut rows, &mut sub_streaming_name, &name, t);
-                                rows_version += 1;
                             }
                             AgentEvent::ToolCall { name: tn, input } => {
                                 sub_streaming_name = None;
@@ -1144,7 +990,6 @@ fn ui_loop(
                                     expanded: false,
                                     started: Instant::now(),
                                 });
-                                rows_version += 1;
                             }
                             AgentEvent::ToolResult {
                                 name: tn,
@@ -1168,13 +1013,11 @@ fn ui_loop(
                                     expanded,
                                     elapsed,
                                 });
-                                rows_version += 1;
                             }
                             AgentEvent::Done { .. } => sub_streaming_name = None,
                             AgentEvent::Warning(w) => {
                                 sub_streaming_name = None;
                                 rows.push(Row::sys_warn(format!("[{name}] [warn] {w}")));
-                                rows_version += 1;
                             }
                             _ => {} // TurnStart/Compressed/Usage/SubAgent: noisy or folded
                         }
@@ -1182,7 +1025,6 @@ fn ui_loop(
                 },
                 UiMsg::Error(e) => {
                     rows.push(Row::sys_error(format!("[error] {e}")));
-                    rows_version += 1;
                     activity.clear();
                     // End every open stream: a leftover `streaming` /
                     // `sub_streaming_name` would let the NEXT run's first
@@ -1193,303 +1035,220 @@ fn ui_loop(
                     // Flush the queue: send the next queued message right
                     // away, keeping busy=true on success so no idle gap opens
                     // (a Ctrl-C in that gap would quit instead of cancelling).
-                    let flush = flush_next_queued(&mut queued, &mut rows, &mut md_cache, &mut select_idx, &mut text_sel, in_tx);
-                    apply_flush(flush, &mut busy, &mut run_start, &mut activity, &mut thinking, &mut scroll_up, &mut rows_version);
+                    let flush = flush_next_queued(&mut queued, &mut rows, &mut md_cache, in_tx);
+                    apply_flush(flush, &mut busy, &mut run_start, &mut activity, &mut thinking);
                 }
                 UiMsg::RunFinished => {
                     streaming = false;
                     sub_streaming_name = None;
                     activity.clear();
                     // Flush the queue (same contract as the Error branch).
-                    let flush = flush_next_queued(&mut queued, &mut rows, &mut md_cache, &mut select_idx, &mut text_sel, in_tx);
-                    apply_flush(flush, &mut busy, &mut run_start, &mut activity, &mut thinking, &mut scroll_up, &mut rows_version);
+                    let flush = flush_next_queued(&mut queued, &mut rows, &mut md_cache, in_tx);
+                    apply_flush(flush, &mut busy, &mut run_start, &mut activity, &mut thinking);
                 }
             }
         }
 
-        // Expire the transient copy notice — and the copied selection's
-        // highlight with it (they share one lifetime, see
-        // expire_copy_notice_and_selection). Checked on every loop wake —
-        // busy clock ticks and idle poll-timeout cycles alike — so it also
-        // clears when no events are flowing (up to one idle poll late).
-        if expire_copy_notice_and_selection(
-            &mut copy_notice,
-            &mut text_sel,
-            drag_active,
-            Instant::now(),
-        ) {
+        // Commit finalized turns into the terminal scrollback. A row is
+        // "finalized" once it will never mutate again: everything except the
+        // in-flight streaming Assistant row (skipped while a stream is open)
+        // and queued ghosts (removed on flush, never committed). This is the
+        // one place the inline model writes the conversation to scrollback, so
+        // the host terminal's native selection/scroll/search cover it.
+        let stream_open = streaming || sub_streaming_name.is_some();
+        let mut pending_end = rows.len();
+        while pending_end > committed && matches!(rows[pending_end - 1], Row::Queued(_)) {
+            pending_end -= 1;
+        }
+        if stream_open
+            && pending_end > committed
+            && matches!(rows[pending_end - 1], Row::Assistant(_))
+        {
+            pending_end -= 1;
+        }
+        if committed < pending_end {
+            let width = term.size().map(|s| s.width).unwrap_or(80) as usize;
+            commit_rows(term, &rows[committed..pending_end], &mut md_cache, width)?;
+            committed = pending_end;
             dirty = true;
         }
+        // Index of the in-flight row shown live in the viewport's transcript
+        // zone (None when nothing is streaming). It is exactly the row the
+        // watermark held back.
+        let inflight_idx = if stream_open { Some(pending_end) } else { None };
 
-        // Edge auto-scroll while a drag selection is parked on the top/bottom
-        // edge of the conversation: crossterm only reports Drag events while
-        // the pointer moves, so the loop timer drives this instead — scroll
-        // one wheel step per wake and stretch the head to the newly exposed
-        // edge line. Stops on its own at the scroll ends.
-        let edge = drag_edge_dir(history_area, drag_active && text_sel.is_some(), drag_pointer);
-        if edge != 0 {
-            let (new_up, new_scroll) = edge_scroll_step(scroll_up, history_max_scroll, edge, 3);
-            if new_up != scroll_up {
-                scroll_up = new_up;
-                if let (Some(sel), Some((pc, pr))) = (&mut text_sel, drag_pointer) {
-                    let (v, c) =
-                        history_clamp_cell(history_area, new_scroll as u16, visual_row_map.len(), pc, pr);
-                    if let Some(pos) = visual_to_content(&visual_row_map, v, c) {
-                        sel.head = pos;
-                    }
-                }
-                dirty = true;
-            }
-        }
-
-        // Render — only when something changed (worker event drained, key or
-        // mouse handled, first frame). While a run is in flight, also redraw
-        // on a fast tick so the spinner animates and the status-bar elapsed
-        // time keeps moving. Idle frames previously repainted the whole
-        // conversation at ~16fps for nothing.
+        // Render the live viewport — only when something changed (worker event
+        // drained, key handled, first frame). While a run is in flight, also
+        // redraw on a fast tick so the spinner animates and the status-bar
+        // elapsed time keeps moving. Committed turns are already in scrollback,
+        // so this redraws only the small bottom band, not the whole history.
         let clock_tick = busy && last_draw.elapsed() >= Duration::from_millis(120);
         if dirty || clock_tick {
             dirty = false;
             last_draw = Instant::now();
             // The slash popup tracks the input text: any edit sets dirty, so
-            // this refresh rides the same redraw — the FrameCache-cached
-            // history underneath never keys on it and needs no invalidation.
+            // this refresh rides the same redraw.
             popup.update(&input.text());
             term.draw(|f| {
-            let area = f.area();
-            // Input box grows with the number of lines typed, up to ~40% of
-            // the screen so the conversation always stays visible.
-            let max_input = ((area.height as usize) * 2 / 5).max(3);
-            let input_h = (input.line_count() + 2).min(max_input) as u16;
-            let [history_rect, input_rect, status_rect] = workspace_layout(area, input_h);
-            let view_height = history_rect.height as usize;
-            let inner_w = (history_rect.width as usize).max(1);
-            let stream_open = streaming || sub_streaming_name.is_some();
-            // D3: reuse the cached history frame when nothing that shapes it
-            // changed (busy clock ticks during thinking/tool execution).
-            // Streaming deltas bump rows_version each frame — a normal miss.
-            frame_cache.get_or_build(
-                FrameKey {
-                    rows_version,
-                    select_idx,
-                    mode,
-                    inner_w,
-                    stream_open,
-                    thinking,
-                },
-                || {
-                    let (lines, line_rows) = build_history_lines(
-                        &rows,
-                        mode,
-                        select_idx,
-                        &mut md_cache,
-                        inner_w,
-                        stream_open,
-                        thinking,
-                    );
-                    // Pre-wrap to the conversation inner width so the line
-                    // count is the true rendered row count (ratatui's `.wrap()`
-                    // folded at draw time while `lines.len()` counted logical
-                    // lines, making the top of long histories unreachable).
-                    // wrap_history also expands the row map to visual lines.
-                    wrap_history(&lines, &line_rows, inner_w)
-                },
-            );
-            // Cache hit or just-built: borrow, don't clone. Only the visible
-            // tail slice [skip..] needs an owned copy (Paragraph and the
-            // mouse hit map) — cloning the whole wrapped history here would
-            // reintroduce the O(history) per-draw cost FrameCache exists to
-            // avoid, just as a deep copy instead of a re-wrap.
-            let total = frame_cache.wrapped.len();
-            // ratatui's scroll offset is u16: past 65535 scrollable lines the
-            // bottom would be unreachable, so feed only the reachable tail.
-            let (skip, max_scroll) = tail_window(total, view_height);
-            if scroll_up > max_scroll {
-                scroll_up = max_scroll;
-            }
-            let scroll = max_scroll - scroll_up; // ≤ u16::MAX per tail_window
-            // Publish hit-testing state for the mouse handler (next event).
-            history_area = history_rect;
-            history_scroll = scroll as u16;
-            history_max_scroll = max_scroll;
-            visual_row_map = frame_cache.visual_rows[skip..].to_vec();
+                let area = f.area(); // the INLINE_HEIGHT-row band at the bottom
+                let term_w = area.width;
+                // Input box grows with the number of lines typed, up to half
+                // the viewport so the zone + status stay visible.
+                let max_input = ((area.height as usize) / 2).max(3);
+                let input_h = (input.line_count() + 2).min(max_input) as u16;
+                let [zone_rect, input_rect, status_rect] = Layout::vertical([
+                    Constraint::Min(0),
+                    Constraint::Length(input_h),
+                    Constraint::Length(1),
+                ])
+                .areas(area);
+                let content_w = content_width(term_w);
 
-            let mut feed = frame_cache.wrapped[skip..].to_vec();
-            // An active selection rides the owned slice: re-anchor its
-            // content coordinates against THIS frame's visual rows (they shift
-            // on streaming, resize, scroll-head cuts), then reverse-video the
-            // selected visual lines (the cache itself stays clean). A
-            // selection whose row left the history is dropped for good.
-            if let Some(sel) = &text_sel {
-                if resolve_selection(&frame_cache.visual_rows, sel).is_some() {
-                    apply_text_selection(&mut feed, sel, skip, &frame_cache.visual_rows);
-                } else {
-                    text_sel = None;
+                // Transcript zone (the rows above the input box inside the
+                // viewport): the slash popup while typing a command, else the
+                // thinking placeholder before any output, else the in-flight
+                // streaming row. Each is bottom-aligned so its last line sits
+                // flush above the input box. Already-committed turns live in
+                // the host terminal's scrollback above this viewport.
+                if popup.is_open() {
+                    let lines = slash_popup_lines(&popup);
+                    render_zone_tail(f, zone_rect, &lines);
+                } else if thinking {
+                    let line = Line::from(vec![
+                        Span::styled(
+                            "● ".to_string(),
+                            Style::default().fg(AGENT_FG).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled("…", Style::default().fg(DIM_FG)),
+                    ]);
+                    render_zone_tail(f, zone_rect, &[line]);
+                } else if let Some(idx) = inflight_idx {
+                    if let Some(row) = rows.get(idx) {
+                        let l = build_history_lines(
+                            std::slice::from_ref(row),
+                            &mut md_cache,
+                            content_w,
+                            true,
+                            false,
+                        );
+                        let wrapped = wrap_history(&l, content_w);
+                        render_zone_tail(f, zone_rect, &wrapped);
+                    }
                 }
-            }
-            let history = Paragraph::new(feed)
-                .scroll((scroll as u16, 0));
-            f.render_widget(history, history_rect);
 
-            // Spinner frame from the run clock (100ms per frame), so no frame
-            // counter state is needed.
-            let spinner_char = SPINNER
-                [(run_start.map(|t| t.elapsed().as_millis() / 100).unwrap_or(0) as usize)
-                    % SPINNER.len()];
-            // Keep the editing prompt stable while the current run works.
-            // Enter still queues while busy.
-            let (prompt, prompt_style) = if mode == Mode::Nav {
-                (
-                    "j/k move · Enter expand · y copy · Tab input ".to_string(),
-                    Style::default().fg(TOOL_CALL_FG),
-                )
-            } else {
-                (
+                // Input box. The editing prompt is stable; Enter queues while
+                // busy. The border frame tracks the run: busy flips the whole
+                // frame to AGENT_FG so the bottom chrome reads as one busy
+                // unit, idle falls back to USER_FG.
+                let spinner_char = SPINNER
+                    [(run_start.map(|t| t.elapsed().as_millis() / 100).unwrap_or(0) as usize)
+                        % SPINNER.len()];
+                let (prompt, prompt_style) = (
                     "❯ ".to_string(),
                     Style::default().fg(USER_FG).add_modifier(Modifier::BOLD),
-                )
-            };
-            let body = if mode == Mode::Nav {
-                String::new()
-            } else {
-                input.text()
-            };
-            let (crow, ccol) = input.cursor_pos();
-            // The input box height is capped (~40% of screen), so a long paste
-            // can exceed it. Scroll the box to follow the caret and place the
-            // caret within the visible window — otherwise it lands on the
-            // status bar or off-screen. The same applies HORIZONTALLY: the
-            // Paragraph doesn't wrap, so a line wider than the box is clipped
-            // and an unclamped caret would be drawn past the border, over the
-            // conversation area (or off-screen on a narrow terminal).
-            let inner_rows = (input_h as usize).saturating_sub(2);
-            let input_scroll = crow
-                .saturating_sub(inner_rows.saturating_sub(1))
-                .min(u16::MAX as usize) as u16;
-            let inner_cols = (input_rect.width as usize).saturating_sub(2).max(1);
-            let lead = if crow == 0 { prompt.width() } else { 0 };
-            let caret_col = ccol + lead; // display column within the caret's line
-            let (hscroll, caret_x) = input_hscroll(caret_col, inner_cols);
-            // The input box border tracks the mode — and the run: busy flips
-            // the whole frame to the title's AGENT_FG so the bottom chrome
-            // reads as one busy unit, idle/nav fall back to the mode color.
-            let secs = run_start.map(|t| t.elapsed().as_secs()).unwrap_or(0);
-            let act = if activity.is_empty() {
-                "working"
-            } else {
-                activity.as_str()
-            };
-            let input_title = build_input_title(
-                mode,
-                busy,
-                spinner_char,
-                act,
-                secs,
-                queued.len(),
-                // The border row offers the title the box width minus corners.
-                (input_rect.width as usize).saturating_sub(2),
-            );
-            let title_fg = chrome_fg(mode, busy);
-            // Ghost placeholder on an empty input box (Input mode only — Nav
-            // already shows its own hint as the prompt). The caret math below
-            // is unaffected: an empty buffer's caret sits at the prompt end,
-            // in front of the placeholder text.
-            let input_spans = if body.is_empty() && mode == Mode::Input {
-                vec![
-                    Span::styled(prompt.clone(), prompt_style),
-                    Span::styled(INPUT_PLACEHOLDER, Style::default().fg(DIM_FG)),
-                ]
-            } else {
-                vec![Span::styled(prompt.clone(), prompt_style), Span::raw(body)]
-            };
-            let input_widget = Paragraph::new(Line::from(input_spans))
-            .block(
-                WBlock::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(title_fg))
-                    .title(Span::styled(input_title, Style::default().fg(title_fg))),
-            )
-            .scroll((input_scroll, hscroll));
-            f.render_widget(input_widget, input_rect);
-            // Place the caret. Column = border(1) + display width of the text
-            // before the caret (+ the prompt, on the first line only), minus
-            // the horizontal scroll. Display width keeps it correct for wide
-            // chars; hscroll keeps it inside the box on over-wide lines.
-            if mode == Mode::Input {
+                );
+                let body = input.text();
+                let (crow, ccol) = input.cursor_pos();
+                // The input box height is capped, so a long paste can exceed
+                // it. Scroll the box to follow the caret and place the caret
+                // within the visible window. The same applies HORIZONTALLY: the
+                // Paragraph doesn't wrap, so a line wider than the box is
+                // clipped and an unclamped caret would be drawn past the border.
+                let inner_rows = (input_h as usize).saturating_sub(2);
+                let input_scroll = crow
+                    .saturating_sub(inner_rows.saturating_sub(1))
+                    .min(u16::MAX as usize) as u16;
+                let inner_cols = (input_rect.width as usize).saturating_sub(2).max(1);
+                let lead = if crow == 0 { prompt.width() } else { 0 };
+                let caret_col = ccol + lead; // display column within the caret's line
+                let (hscroll, caret_x) = input_hscroll(caret_col, inner_cols);
+                let secs = run_start.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+                let act = if activity.is_empty() {
+                    "working"
+                } else {
+                    activity.as_str()
+                };
+                let input_title = build_input_title(
+                    busy,
+                    spinner_char,
+                    act,
+                    secs,
+                    queued.len(),
+                    (input_rect.width as usize).saturating_sub(2),
+                );
+                let title_fg = chrome_fg(busy);
+                // Ghost placeholder on an empty input box. The caret math below
+                // is unaffected: an empty buffer's caret sits at the prompt end,
+                // in front of the placeholder text.
+                let input_spans = if body.is_empty() {
+                    vec![
+                        Span::styled(prompt.clone(), prompt_style),
+                        Span::styled(INPUT_PLACEHOLDER, Style::default().fg(DIM_FG)),
+                    ]
+                } else {
+                    vec![Span::styled(prompt.clone(), prompt_style), Span::raw(body)]
+                };
+                let input_widget = Paragraph::new(Line::from(input_spans))
+                    .block(
+                        WBlock::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .border_style(Style::default().fg(title_fg))
+                            .title(Span::styled(input_title, Style::default().fg(title_fg))),
+                    )
+                    .scroll((input_scroll, hscroll));
+                f.render_widget(input_widget, input_rect);
+                // Place the caret. Column = border(1) + display width of the text
+                // before the caret (+ the prompt, on the first line only), minus
+                // the horizontal scroll. Display width keeps it correct for wide
+                // chars; hscroll keeps it inside the box on over-wide lines.
                 let x = input_rect.x + 1 + caret_x;
                 let y = input_rect.y + 1 + (crow as u16).saturating_sub(input_scroll);
                 f.set_cursor_position((x, y));
-            }
 
-            // Slash-completion popup: floats directly above the input box,
-            // overlaying the conversation's bottom rows. Painted LAST so it
-            // wins the overlap; Clear wipes the history cells beneath (the
-            // conversation keeps no gaps once the popup closes — the next
-            // redraw repaints it from the cache). Works while busy, like the
-            // input box itself (typing queues).
-            if mode == Mode::Input && popup.is_open() {
-                let lines = slash_popup_lines(&popup);
-                let rect = slash_popup_rect(input_rect, &lines);
-                if rect.height > 0 {
-                    f.render_widget(Clear, rect);
-                    f.render_widget(Paragraph::new(lines), rect);
-                }
-            }
-
-            // Detailed run activity lives in the input title. The status bar
-            // only names the broad state so the two regions do not compete;
-            // idle shows no clock — a forever-growing "session elapsed" reads
-            // as a stuck timer, and the run elapsed is the title's job.
-            let state = if busy { "running" } else { "idle" }.to_string();
-            // Show cache stats only once caching has actually engaged, so the
-            // bar stays uncluttered for providers/requests with no caching.
-            let cache_seg = if cache_read > 0 || cache_create > 0 {
-                format!(
-                    " · cache {}w {}r",
-                    fmt_tokens(cache_create),
-                    fmt_tokens(cache_read)
-                )
-            } else {
-                String::new()
-            };
-            // Scroll-back indicator: lines the view sits above the bottom.
-            // Read after the clamp above, so the value shown is the true one.
-            let scroll_seg = if scroll_up > 0 {
-                format!(" · ↑{scroll_up}")
-            } else {
-                String::new()
-            };
-            let nav_seg = if mode == Mode::Nav { " · nav" } else { "" };
-            let stats = format!(
-                " · {} in · {} out{cache_seg}{scroll_seg}{nav_seg}",
-                fmt_tokens(in_tokens),
-                fmt_tokens(out_tokens),
-            );
-            let compact_stats = format!("{scroll_seg}{nav_seg}");
-            let ctx = fmt_ctx(ctx_tokens, cfg.limits.max_context_tokens);
-            let status = build_status_line(
-                &cfg.model,
-                &state,
-                busy,
-                copy_notice.as_ref().map(|(t, _)| t.as_str()),
-                ctx.as_ref().map(|(t, s)| (t.as_str(), *s)),
-                &stats,
-                &compact_stats,
-                &cwd_path,
-                status_rect.width as usize,
-            );
-            f.render_widget(Paragraph::new(status), status_rect);
+                // Status bar. Detailed run activity lives in the input title;
+                // the bar only names the broad state so the two regions do not
+                // compete. Idle shows no clock — the run elapsed is the title's
+                // job.
+                let state = if busy { "running" } else { "idle" }.to_string();
+                let cache_seg = if cache_read > 0 || cache_create > 0 {
+                    format!(
+                        " · cache {}w {}r",
+                        fmt_tokens(cache_create),
+                        fmt_tokens(cache_read)
+                    )
+                } else {
+                    String::new()
+                };
+                let stats = format!(
+                    " · {} in · {} out{cache_seg}",
+                    fmt_tokens(in_tokens),
+                    fmt_tokens(out_tokens),
+                );
+                let compact_stats = String::new();
+                let ctx = fmt_ctx(ctx_tokens, cfg.limits.max_context_tokens);
+                let status = build_status_line(
+                    &cfg.model,
+                    &state,
+                    busy,
+                    None,
+                    ctx.as_ref().map(|(t, s)| (t.as_str(), *s)),
+                    &stats,
+                    &compact_stats,
+                    &cwd_path,
+                    status_rect.width as usize,
+                );
+                f.render_widget(Paragraph::new(status), status_rect);
             })?;
         }
 
         // Keyboard. Poll longer when idle: a keypress wakes the poll
         // immediately, so the longer timeout costs no input latency but
-        // avoids spinning the loop at ~16fps while nothing is happening.
+        // avoids spinning the loop while nothing is happening.
         let poll_ms = if busy { 60 } else { 250 };
         if event::poll(Duration::from_millis(poll_ms))? {
             let ev = event::read()?;
-            // Any event may change the view (scroll, caret, mode, …).
+            // Any event may change the view (caret, popup, …).
             dirty = true;
             if let Event::Key(key) = ev {
                 // Accept key repeats too: on Windows, crossterm reports held
@@ -1499,19 +1258,12 @@ fn ui_loop(
                 if key.kind == KeyEventKind::Release {
                     continue;
                 }
-                // Esc layers: an active drag selection is cleared first,
-                // then an open popup, then Nav falls back to Input, and
-                // only an idle Input-mode Esc quits.
-                if key.code == KeyCode::Esc && text_sel.is_some() {
-                    text_sel = None;
-                    continue;
-                }
-                // The slash popup gets first crack while open (Input mode
-                // only): Up/Down move its selection instead of the caret,
-                // Tab/Enter complete WITHOUT sending, Esc closes it WITHOUT
-                // quitting. Modifier chords and all other keys fall through
-                // to the normal handlers untouched.
-                if mode == Mode::Input && popup.is_open() {
+                // The slash popup gets first crack while open: Up/Down move
+                // its selection instead of the caret, Tab/Enter complete
+                // WITHOUT sending, Esc closes it WITHOUT quitting. Modifier
+                // chords and all other keys fall through to the normal
+                // handlers untouched.
+                if popup.is_open() {
                     match popup_key(&mut popup, key.code, key.modifiers) {
                         Some(PopupAction::Consumed) => continue,
                         Some(PopupAction::Dismiss) => {
@@ -1527,40 +1279,22 @@ fn ui_loop(
                     }
                 }
                 match (key.code, key.modifiers) {
-                    // Esc layers: an open popup eats it first (above), then
-                    // Nav falls back to Input (dropping the selection), and
-                    // only Input-mode Esc quits. (A drag selection, if one is
-                    // active, already consumed Esc further above.)
-                    (KeyCode::Esc, _) if mode == Mode::Nav => {
-                        mode = Mode::Input;
-                        select_idx = None;
-                    }
-                    (KeyCode::Esc, _) => {
-                        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-                        let _ = in_tx.send(None);
-                        // Report the dropped queue length: the caller prints
-                        // it to stderr AFTER the terminal is restored (rows
-                        // pushed here would never be drawn).
-                        return Ok(queued.len());
-                    }
-                    // Ctrl-C: cancel the in-flight turn (and stay in the TUI);
-                    // when idle, fall back to quitting.
-                    (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                    // Esc / Ctrl-C: cancel the in-flight turn and stay in the
+                    // TUI; when idle, quit. raw mode turns Ctrl-C into a normal
+                    // key, so both behave the same. The transcript lives in
+                    // native scrollback now, so quitting just releases the live
+                    // region — the conversation stays selectable above it.
+                    (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                         if busy {
                             cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                             // End the current assistant bubble: a System row is
-                            // now last, so any trailing TextDelta events still
-                            // queued before the stream stops must start a fresh
-                            // Assistant row instead of merging into a stale one.
+                            // now last, so trailing TextDelta events still in
+                            // flight start a fresh Assistant row.
                             streaming = false;
                             sub_streaming_name = None;
                             rows.push(Row::sys_warn("[cancelling…]"));
-                            rows_version += 1;
-                            // Cancelling means "stop the whole line": queued
-                            // messages are dropped too, not sent after the
-                            // cancelled run ends. Their ghost rows go with
-                            // them (indices shift → MdCache + Nav selection
-                            // reset).
+                            // Cancelling stops the whole line: queued messages
+                            // are dropped too, and their ghost rows go with them.
                             if !queued.is_empty() {
                                 rows.push(Row::sys_warn(format!(
                                     "[dropped {} queued message(s)]",
@@ -1569,122 +1303,21 @@ fn ui_loop(
                                 queued.clear();
                                 if drop_queued_ghosts(&mut rows) {
                                     md_cache.clear();
-                                    select_idx = None;
-                                    text_sel = None;
                                 }
-                                rows_version += 1;
                             }
                         } else {
                             let _ = in_tx.send(None);
                             return Ok(queued.len());
                         }
                     }
-                    // Tab toggles between editing input and browsing tool rows.
-                    (KeyCode::Tab, _) => {
-                        mode = match mode {
-                            Mode::Input => {
-                                // Snap to the LAST row if nothing is selected,
-                                // or if the old selection is stale (points past
-                                // the end, e.g. after /clear shrank the list):
-                                // the view sits at the bottom, so the selection
-                                // should open where the user's eyes already are.
-                                if select_idx.is_some_and(|i| i >= rows.len()) {
-                                    select_idx = None;
-                                }
-                                if select_idx.is_none() {
-                                    select_idx = rows.iter().rposition(is_selectable);
-                                }
-                                Mode::Nav
-                            }
-                            Mode::Nav => Mode::Input,
-                        };
-                    }
-                    // Nav-mode browsing: j/k move the selection among tool rows;
-                    // Enter/Space toggles the selected row's expanded view.
-                    // (Plain Enter in input mode is handled by the arm below.)
-                    (KeyCode::Char('j'), _) if mode == Mode::Nav => {
-                        if let Some(n) = next_selectable(&rows, select_idx, 1) {
-                            select_idx = Some(n);
-                        }
-                    }
-                    (KeyCode::Char('k'), _) if mode == Mode::Nav => {
-                        if let Some(n) = next_selectable(&rows, select_idx, -1) {
-                            select_idx = Some(n);
-                        }
-                    }
-                    // Yank: copy the selected row's full content (pretty JSON
-                    // for a tool call, raw output for a result) to the system
-                    // clipboard — the Nav-mode counterpart of /export.
-                    (KeyCode::Char('y'), _) if mode == Mode::Nav => {
-                        let text = select_idx.and_then(|i| rows.get(i)).and_then(yank_text);
-                        if let Some(t) = text.filter(|t| !t.is_empty()) {
-                            let n = t.len();
-                            if copy_to_clipboard(&t) {
-                                // Success: transient status-bar notice, no row.
-                                set_copy_notice(&mut copy_notice, n);
-                            } else {
-                                rows.push(Row::sys_warn(
-                                    "[no clipboard tool found — use /export instead]",
-                                ));
-                                rows_version += 1;
-                            }
-                        }
-                    }
-                    // g/G: jump to the first/last row; Ctrl-D/U: page the
-                    // selection NAV_PAGE rows down/up.
-                    (KeyCode::Char('g'), _) if mode == Mode::Nav => {
-                        select_idx = rows.iter().position(is_selectable);
-                        // "Scroll to top": the renderer clamps scroll_up to
-                        // max_scroll every frame, so usize::MAX lands exactly
-                        // on the first line.
-                        scroll_up = usize::MAX;
-                    }
-                    (KeyCode::Char('G'), _) if mode == Mode::Nav => {
-                        select_idx = rows.iter().rposition(is_selectable);
-                        scroll_up = 0;
-                    }
-                    // [/]: jump to the previous/next turn (user message,
-                    // queued ghosts included) — the fast way to scan a long
-                    // session by prompts. No match in that direction = stay.
-                    (KeyCode::Char('['), _) if mode == Mode::Nav => {
-                        if let Some(n) = next_matching(&rows, select_idx, -1, is_turn_start) {
-                            select_idx = Some(n);
-                        }
-                    }
-                    (KeyCode::Char(']'), _) if mode == Mode::Nav => {
-                        if let Some(n) = next_matching(&rows, select_idx, 1, is_turn_start) {
-                            select_idx = Some(n);
-                        }
-                    }
-                    (KeyCode::Char(c), KeyModifiers::CONTROL)
-                        if mode == Mode::Nav && (c == 'd' || c == 'u') =>
-                    {
-                        let dir = if c == 'd' { 1 } else { -1 };
-                        for _ in 0..NAV_PAGE {
-                            match next_selectable(&rows, select_idx, dir) {
-                                Some(n) => select_idx = Some(n),
-                                None => break,
-                            }
-                        }
-                    }
-                    (KeyCode::Enter, _) | (KeyCode::Char(' '), _) if mode == Mode::Nav => {
-                        if let Some(i) = select_idx {
-                            if let Some(Row::ToolCall { expanded, .. })
-                            | Some(Row::ToolResult { expanded, .. }) = rows.get_mut(i)
-                            {
-                                *expanded = !*expanded;
-                                rows_version += 1;
-                            }
-                        }
-                    }
-                    // Enter sends (queues while busy); Alt/Shift+Enter inserts
-                    // a newline. The input stays editable during a run.
+                    // Alt/Shift+Enter inserts a newline (portable in raw mode;
+                    // every terminal reports KeyModifiers::SHIFT truthfully).
                     (KeyCode::Enter, KeyModifiers::ALT)
                     | (KeyCode::Enter, KeyModifiers::SHIFT) => {
-                        if mode == Mode::Input {
-                            input.newline();
-                        }
+                        input.newline();
                     }
+                    // Enter sends (queues while busy). The input stays editable
+                    // during a run.
                     (KeyCode::Enter, _) => {
                         if !input.is_empty() {
                             // Strip control chars once at submission, so what
@@ -1700,52 +1333,36 @@ fn ui_loop(
                                         draft.clear();
                                         input.drain_to_string();
                                         if busy {
-                                            // Queue behind the in-flight run.
-                                            // A dim Row::Queued ghost marks the
-                                            // spot; the RunFinished/Error flush
-                                            // swaps it for the real Row::User
-                                            // only when it actually sends, so
-                                            // the transcript stays in true send
-                                            // order. The queue depth shows in
-                                            // the input box title.
+                                            // Queue behind the in-flight run. A
+                                            // dim Row::Queued ghost marks the
+                                            // spot; the flush swaps it for the
+                                            // real Row::User only when it sends,
+                                            // keeping the transcript in true send
+                                            // order. The queue depth shows in the
+                                            // input box title.
                                             queued.push_back(trimmed.clone());
                                             rows.push(Row::Queued(trimmed));
-                                            rows_version += 1;
-                                            scroll_up = 0;
                                         } else {
                                             rows.push(Row::User(trimmed.clone()));
-                                            rows_version += 1;
-                                            scroll_up = 0;
                                             // Deliver before flipping busy. If the
                                             // worker is gone (panicked mid-run in a
                                             // debug build, or tearing down) the send
                                             // fails — don't leave the UI stuck in
                                             // "running" waiting for a RunFinished that
-                                            // will never arrive. The out_rx disconnect
-                                            // path is a backstop, but it only fires on
-                                            // a later frame's drain; handling the send
-                                            // result here is immediate and doesn't
-                                            // rely on the loop reaching that drain.
+                                            // will never arrive.
                                             if in_tx.send(Some(Input::Text(trimmed))).is_err() {
                                                 busy = false;
-                                                // The message never reached the agent — drop it
-                                                // from the transcript so the on-screen history
-                                                // matches what the agent actually saw (otherwise it
-                                                // reads as if the agent ignored the user).
+                                                // The message never reached the agent —
+                                                // drop it from the transcript so the
+                                                // on-screen history matches what the agent
+                                                // actually saw.
                                                 if matches!(rows.last(), Some(Row::User(_))) {
                                                     rows.pop();
-                                                    // The popped slot is reused
-                                                    // by the error row below —
-                                                    // a selection anchored on it
-                                                    // would re-anchor to the
-                                                    // wrong text.
-                                                    text_sel = None;
                                                 }
                                                 rows.push(Row::sys_error(
                                                     "[worker stopped — message not delivered; \
                                                      press Esc to quit]",
                                                 ));
-                                                rows_version += 1;
                                             } else {
                                                 busy = true;
                                                 run_start = Some(Instant::now());
@@ -1760,38 +1377,29 @@ fn ui_loop(
                                         rows.push(Row::sys_warn(
                                             "[busy — /clear is disabled while running]",
                                         ));
-                                        rows_version += 1;
-                                        scroll_up = 0;
                                     }
                                     SlashCmd::Clear => {
                                         // Slash command — handled in the UI,
                                         // never sent to the model. Cleared from
                                         // the input box but NOT recorded in input
                                         // history (so Alt+Up recalls messages,
-                                        // not commands).
+                                        // not commands). Already-committed
+                                        // scrollback is left in place (it's
+                                        // history the user can still scroll to);
+                                        // only the live buffer resets.
                                         input.drain_to_string();
-                                        scroll_up = 0;
                                         rows.clear();
                                         md_cache.clear();
+                                        committed = 0;
                                         in_tokens = 0;
                                         out_tokens = 0;
                                         cache_create = 0;
                                         cache_read = 0;
-                                        // Reset Nav state: select_idx pointed at
-                                        // a now-vanished row, and clearing is an
-                                        // input-mode action. The drag selection
-                                        // goes too: the fresh rows pushed below
-                                        // reuse its row indices.
-                                        select_idx = None;
-                                        text_sel = None;
-                                        mode = Mode::Input;
                                         // Send before claiming success. If the worker is gone
                                         // (panicked mid-run in a debug build, or tearing down)
                                         // the send fails and the agent-side history is NOT
                                         // cleared — report that honestly, mirroring the text
-                                        // path, instead of asserting "[history cleared]". The
-                                        // local UI reset above still applies (the user asked to
-                                        // clear the screen regardless).
+                                        // path. The local UI reset above still applies.
                                         let cleared = in_tx.send(Some(Input::Clear)).is_ok();
                                         rows.push(if cleared {
                                             Row::sys_info("[history cleared]")
@@ -1801,19 +1409,15 @@ fn ui_loop(
                                                  history not cleared]",
                                             )
                                         });
-                                        rows_version += 1;
                                     }
                                     SlashCmd::Export(arg) => {
-                                        // The mouse-capture that enables wheel
-                                        // scroll also intercepts click-drag, so
-                                        // there's no terminal-agnostic way to
-                                        // select the on-screen output. /export
-                                        // is the app-level escape hatch: dump the
-                                        // conversation as text. With a path →
-                                        // that file; without → clipboard if a
-                                        // tool is available, else a default file.
+                                        // /export dumps the conversation as text:
+                                        // with a path → that file; without → the
+                                        // clipboard if a tool is available, else
+                                        // a default file. (Native selection now
+                                        // works too, but /export stays for the
+                                        // machine-readable whole-transcript dump.)
                                         input.drain_to_string();
-                                        scroll_up = 0;
                                         let n = rows.len();
                                         let text = render_transcript(&rows);
                                         let row = match arg {
@@ -1821,13 +1425,12 @@ fn ui_loop(
                                                 use std::fs::OpenOptions;
                                                 use std::io::Write;
                                                 // Expand `~/` so /export ~/notes.md lands in the
-                                                // home dir, not a literal "~/" directory.
-                                                // create_new refuses to clobber an existing file:
-                                                // the TUI has no undo and the success line gave
-                                                // no warning, so a typo'd path (e.g. ~/.zshrc)
-                                                // would otherwise truncate real content silently.
-                                                // (The clipboard-less fallback below keeps
-                                                // overwriting its own scratch file on purpose.)
+                                                // home dir. create_new refuses to clobber an
+                                                // existing file: the TUI has no undo, so a typo'd
+                                                // path (e.g. ~/.zshrc) would otherwise truncate
+                                                // real content silently. (The clipboard-less
+                                                // fallback below keeps overwriting its own scratch
+                                                // file on purpose.)
                                                 let dest = expand_tilde(&path);
                                                 let res = OpenOptions::new()
                                                     .write(true)
@@ -1870,13 +1473,10 @@ fn ui_loop(
                                             }
                                         };
                                         rows.push(row);
-                                        rows_version += 1;
                                     }
                                     cmd => {
                                         input.drain_to_string();
-                                        scroll_up = 0;
                                         rows.push(Row::sys_info(slash_reply(&cmd, cfg)));
-                                        rows_version += 1;
                                     }
                                 }
                             }
@@ -1886,42 +1486,20 @@ fn ui_loop(
                     // must precede the plain Left/Right arms below (match arms
                     // are tried in order); the Ctrl chords likewise precede
                     // the plain-char arm at the bottom.
-                    (KeyCode::Left, KeyModifiers::ALT) if mode == Mode::Input => input.word_left(),
-                    (KeyCode::Right, KeyModifiers::ALT) if mode == Mode::Input => input.word_right(),
-                    (KeyCode::Char('w'), KeyModifiers::CONTROL) if mode == Mode::Input => {
-                        input.delete_word_back();
-                    }
-                    (KeyCode::Char('u'), KeyModifiers::CONTROL) if mode == Mode::Input => {
-                        input.kill_to_line_start();
-                    }
-                    (KeyCode::Char('k'), KeyModifiers::CONTROL) if mode == Mode::Input => {
-                        input.kill_to_line_end();
-                    }
-                    (KeyCode::Char('a'), KeyModifiers::CONTROL) if mode == Mode::Input => {
-                        input.home();
-                    }
-                    (KeyCode::Char('e'), KeyModifiers::CONTROL) if mode == Mode::Input => {
-                        input.end();
-                    }
-                    (KeyCode::Backspace, _) => {
-                        if mode == Mode::Input {
-                            input.backspace();
-                        }
-                    }
-                    (KeyCode::Left, _) => {
-                        if mode == Mode::Input {
-                            input.move_left();
-                        }
-                    }
-                    (KeyCode::Right, _) => {
-                        if mode == Mode::Input {
-                            input.move_right();
-                        }
-                    }
+                    (KeyCode::Left, KeyModifiers::ALT) => input.word_left(),
+                    (KeyCode::Right, KeyModifiers::ALT) => input.word_right(),
+                    (KeyCode::Char('w'), KeyModifiers::CONTROL) => input.delete_word_back(),
+                    (KeyCode::Char('u'), KeyModifiers::CONTROL) => input.kill_to_line_start(),
+                    (KeyCode::Char('k'), KeyModifiers::CONTROL) => input.kill_to_line_end(),
+                    (KeyCode::Char('a'), KeyModifiers::CONTROL) => input.home(),
+                    (KeyCode::Char('e'), KeyModifiers::CONTROL) => input.end(),
+                    (KeyCode::Backspace, _) => input.backspace(),
+                    (KeyCode::Left, _) => input.move_left(),
+                    (KeyCode::Right, _) => input.move_right(),
                     // Alt+Up/Down recall input history; Up/Down move the caret
                     // across lines inside the buffer.
                     (KeyCode::Up, KeyModifiers::ALT) => {
-                        if mode == Mode::Input && !history.is_empty() {
+                        if !history.is_empty() {
                             match hist_idx {
                                 None => {
                                     draft = input.text();
@@ -1936,44 +1514,25 @@ fn ui_loop(
                         }
                     }
                     (KeyCode::Down, KeyModifiers::ALT) => {
-                        if mode == Mode::Input {
-                            if let Some(i) = hist_idx {
-                                if i + 1 < history.len() {
-                                    hist_idx = Some(i + 1);
-                                    input.set_text(&history[i + 1]);
-                                } else {
-                                    hist_idx = None;
-                                    input.set_text(&draft);
-                                }
+                        if let Some(i) = hist_idx {
+                            if i + 1 < history.len() {
+                                hist_idx = Some(i + 1);
+                                input.set_text(&history[i + 1]);
+                            } else {
+                                hist_idx = None;
+                                input.set_text(&draft);
                             }
                         }
                     }
-                    (KeyCode::Up, _) => {
-                        if mode == Mode::Input {
-                            input.move_up();
-                        }
-                    }
-                    (KeyCode::Down, _) => {
-                        if mode == Mode::Input {
-                            input.move_down();
-                        }
-                    }
-                    (KeyCode::Home, _) => {
-                        if mode == Mode::Input {
-                            input.home();
-                        }
-                    }
-                    (KeyCode::End, _) => {
-                        if mode == Mode::Input {
-                            input.end();
-                        }
-                    }
-                    (KeyCode::PageUp, _) => scroll_up = scroll_up.saturating_add(10),
-                    (KeyCode::PageDown, _) => scroll_up = scroll_up.saturating_sub(10),
+                    (KeyCode::Up, _) => input.move_up(),
+                    (KeyCode::Down, _) => input.move_down(),
+                    (KeyCode::Home, _) => input.home(),
+                    (KeyCode::End, _) => input.end(),
+                    // PageUp/PageDown are intentionally not handled: with mouse
+                    // capture off, the terminal owns scrollback paging (and the
+                    // wheel). There is no app-managed transcript to page.
                     (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => {
-                        if mode == Mode::Input {
-                            input.put_char(c);
-                        }
+                        input.put_char(c);
                     }
                     _ => {}
                 }
@@ -1982,142 +1541,12 @@ fn ui_loop(
                 // as one event and is inserted as input — not split into many
                 // Enter-triggered sends the way a raw paste would be. Control
                 // chars (ESC/CSI) are stripped; \n and \t survive.
-                if mode == Mode::Input {
-                    input.insert_str(&strip_controls(&s));
-                }
-            } else if let Event::Mouse(m) = ev {
-                // Mouse wheel / trackpad two-finger scroll. Each notch moves a
-                // few rows; saturating math keeps scroll_up ≥ 0, and the
-                // renderer clamps the top end to max_scroll every frame, so
-                // overflow here is harmless. Works while busy too — scrolling
-                // back to read earlier output shouldn't wait for the run.
-                match m.kind {
-                    MouseEventKind::ScrollUp => scroll_up = scroll_up.saturating_add(3),
-                    MouseEventKind::ScrollDown => scroll_up = scroll_up.saturating_sub(3),
-                    // Drag-select over the conversation: Down drops the
-                    // anchor (and clears any finished selection — a Down
-                    // outside the workspace only clears), Drag extends the
-                    // head, and Up decides click vs. selection (below).
-                    // Coordinates are content-based (row, line, col), so the
-                    // selection survives re-wraps and streaming appends.
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        drag_pointer = Some((m.column, m.row));
-                        if shift_extends_selection(&text_sel, m.modifiers) {
-                            // Shift+click: keep the anchor, move the head to
-                            // the clicked cell. Up settles the copy. No
-                            // drag_active — a shift-click never auto-scrolls.
-                            if let Some(pos) = history_hit_content(
-                                &visual_row_map,
-                                history_area,
-                                history_scroll,
-                                m.column,
-                                m.row,
-                            ) {
-                                if let Some(sel) = &mut text_sel {
-                                    sel.head = pos;
-                                }
-                                shift_extended = true;
-                            }
-                            drag_active = false;
-                        } else {
-                            text_sel = history_hit_content(
-                                &visual_row_map,
-                                history_area,
-                                history_scroll,
-                                m.column,
-                                m.row,
-                            )
-                            .map(|pos| TextSelection { anchor: pos, head: pos });
-                            drag_active = text_sel.is_some();
-                            shift_extended = false;
-                        }
-                        // A drag starting on conversation content takes over
-                        // the highlighting: drop the Nav row selection so the
-                        // screen never shows two "selected" regions at once
-                        // (the Nav bar and the drag band are both REVERSED).
-                        if text_sel.is_some() {
-                            select_idx = None;
-                        }
-                    }
-                    MouseEventKind::Drag(MouseButton::Left) => {
-                        drag_pointer = Some((m.column, m.row));
-                        if let Some(sel) = &mut text_sel {
-                            let (v, c) = history_clamp_cell(
-                                history_area,
-                                history_scroll,
-                                visual_row_map.len(),
-                                m.column,
-                                m.row,
-                            );
-                            // A drag clamped onto a spacer line keeps the old
-                            // head — spacers cannot anchor or end a selection.
-                            if let Some(pos) = visual_to_content(&visual_row_map, v, c) {
-                                sel.head = pos;
-                            }
-                        }
-                    }
-                    MouseEventKind::Up(MouseButton::Left) => {
-                        drag_active = false;
-                        drag_pointer = None;
-                        let extended = std::mem::take(&mut shift_extended);
-                        if let Some(sel) = text_sel {
-                            if sel.anchor == sel.head && !extended {
-                                // Click (no drag movement): toggle a tool
-                                // row's expanded view (same as Enter/Space in
-                                // Nav mode) and move the selection to it. The
-                                // map/scroll/area are from the last draw, so
-                                // the hit matches what's on screen.
-                                if let Some(i) = history_hit_row(
-                                    &visual_row_map,
-                                    history_area,
-                                    history_scroll,
-                                    m.column,
-                                    m.row,
-                                ) {
-                                    if let Some(Row::ToolCall { expanded, .. })
-                                    | Some(Row::ToolResult { expanded, .. }) = rows.get_mut(i)
-                                    {
-                                        *expanded = !*expanded;
-                                        select_idx = Some(i);
-                                        rows_version += 1;
-                                    }
-                                }
-                                // A bare click does not keep a highlight.
-                                text_sel = None;
-                            } else {
-                                // Real drag (or Shift+click): copy the
-                                // selected text (the highlight stays until the
-                                // next Down, so the user sees what was
-                                // copied). A selection whose row vanished
-                                // mid-drag settles to nothing.
-                                if resolve_selection(&frame_cache.visual_rows, &sel).is_none() {
-                                    text_sel = None;
-                                } else {
-                                    let text = extract_text_selection(
-                                        &frame_cache.wrapped,
-                                        &frame_cache.visual_rows,
-                                        &sel,
-                                    );
-                                    if !text.is_empty() {
-                                        let n = text.len();
-                                        if copy_to_clipboard(&text) {
-                                            // Success: transient status-bar
-                                            // notice, no row.
-                                            set_copy_notice(&mut copy_notice, n);
-                                        } else {
-                                            rows.push(Row::sys_warn(
-                                                "[no clipboard tool found — use /export instead]",
-                                            ));
-                                            rows_version += 1;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
+                input.insert_str(&strip_controls(&s));
             }
+            // No mouse handler: with capture off, the terminal owns wheel
+            // scroll and click-drag-select over the committed scrollback — both
+            // "just work" on the real transcript, which is the whole point of
+            // the inline model.
         }
     }
 }
@@ -2203,17 +1632,15 @@ fn push_tool_head(lines: &mut Vec<Line<'static>>, head: Line<'static>, hang: usi
 /// started a turn but produced no visible output yet. It is render-only: not
 /// a row, so MdCache, the transcript, and yank/click hit-testing (its map
 /// entry is None) are all untouched.
+#[allow(clippy::too_many_arguments)]
 fn build_history_lines(
     rows: &[Row],
-    mode: Mode,
-    select_idx: Option<usize>,
     md_cache: &mut MdCache,
     inner_w: usize,
     streaming: bool,
     thinking: bool,
-) -> (Vec<Line<'static>>, Vec<Option<usize>>) {
+) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut line_rows: Vec<Option<usize>> = Vec::new();
     if rows.is_empty() && !thinking {
         // Empty conversation (post-/clear): the guide line plus a two-line
         // key cheat-sheet — cheapest onboarding real estate there is.
@@ -2221,17 +1648,14 @@ fn build_history_lines(
         for l in [
             "  no messages yet — type below; /help lists commands",
             "  / completes commands · Enter sends",
-            "  Tab browses history · y copies · /help details",
+            "  scroll / select / copy are native to your terminal",
         ] {
             lines.push(Line::from(Span::styled(l.to_string(), style)));
-            line_rows.push(None);
         }
-        return (lines, line_rows);
+        return lines;
     }
+    let marker = "    ";
     for (idx, row) in rows.iter().enumerate() {
-        let selected = mode == Mode::Nav && select_idx == Some(idx);
-        let marker = if selected { "  ▶ " } else { "    " };
-        let begin = lines.len();
         match row {
             Row::User(t) => {
                 push_role(
@@ -2406,29 +1830,11 @@ fn build_history_lines(
                 }
             }
         }
-        // Nav selection: reverse the WHOLE row — every line of its body,
-        // message, notice, or tool row alike — padded to the full width
-        // (ratatui patches the line-level style under each span at render;
-        // the end padding covers the trailing gap). One selection contract
-        // for all row kinds.
-        if selected {
-            let style = Style::default().add_modifier(Modifier::REVERSED);
-            for line in &mut lines[begin..] {
-                line.style = line.style.add_modifier(Modifier::REVERSED);
-                let pad = inner_w.saturating_sub(line.width());
-                if pad > 0 {
-                    line.spans.push(Span::styled(" ".repeat(pad), style));
-                }
-            }
-        }
-        // Content maps back to this row for mouse hit-testing. A spacer is
-        // inserted only at turn boundaries. Agent text, tool calls,
-        // and tool results stay visually grouped as one execution flow.
-        line_rows.extend(std::iter::repeat_n(Some(idx), lines.len() - begin));
+        // Turn boundary: a blank spacer separates this execution flow from the
+        // next user message / queued ghost / system line.
         let next = rows.get(idx + 1);
         if next.is_none() || matches!(next, Some(Row::User(_) | Row::Queued(_) | Row::System { .. })) {
             lines.push(Line::default());
-            line_rows.push(None);
         }
     }
     // Transient thinking placeholder: the agent's icon plus an ellipsis while
@@ -2441,9 +1847,8 @@ fn build_history_lines(
             ),
             Span::styled("…", Style::default().fg(DIM_FG)),
         ]));
-        line_rows.push(None);
     }
-    (lines, line_rows)
+    lines
 }
 
 /// Remove the oldest ghost Row::Queued (FIFO, matching `queued.pop_front()`).
@@ -2523,77 +1928,29 @@ fn fmt_elapsed(secs: u64) -> String {
     }
 }
 
-/// Apply a small horizontal workspace margin when the terminal can afford it.
-fn inset_rect(area: Rect) -> Rect {
-    let margin = if area.width > WORKSPACE_MARGIN * 2 {
-        WORKSPACE_MARGIN
-    } else {
-        0
-    };
-    Rect::new(
-        area.x + margin,
-        area.y,
-        area.width.saturating_sub(margin * 2),
-        area.height,
-    )
-}
-
-/// Left-anchor prose at a readable width. The unused space stays to the right
-/// instead of splitting into two gutters that make the conversation float.
-fn history_content_rect(area: Rect) -> Rect {
-    let inset = inset_rect(area);
-    Rect::new(
-        inset.x,
-        inset.y,
-        inset.width.min(CONTENT_MAX_WIDTH),
-        inset.height,
-    )
-}
-
-/// Main screen geometry shared by the live renderer and TestBackend snapshots.
-fn workspace_layout(area: Rect, input_height: u16) -> [Rect; 3] {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(3),
-            Constraint::Length(input_height),
-            Constraint::Length(1),
-        ])
-        .split(area);
-    [
-        history_content_rect(chunks[0]),
-        inset_rect(chunks[1]),
-        inset_rect(chunks[2]),
-    ]
-}
-
 /// Ghost placeholder shown in the empty input box. Keeps the /help pointer:
 /// the welcome line scrolls away, this is the standing discoverability hint.
 const INPUT_PLACEHOLDER: &str = "Message TinyAgent… (/help)";
 
 /// The one color for the bottom chrome (input border + its title): AGENT_FG
 /// while a run is in flight so the frame reads as a single busy unit, the
-/// mode color otherwise. One busy color across chrome AND status bar.
-fn chrome_fg(mode: Mode, busy: bool) -> Color {
+/// idle color otherwise. One busy color across chrome AND status bar.
+fn chrome_fg(busy: bool) -> Color {
     if busy {
         AGENT_FG
     } else {
-        match mode {
-            Mode::Input => USER_FG,
-            Mode::Nav => TOOL_CALL_FG,
-        }
+        USER_FG
     }
 }
 
-/// Input border title for idle/navigation state or the current in-flight run.
-/// `width` is the room the border row offers (input box width minus the two
-/// corners). ratatui clips an over-long title from the RIGHT — silently
-/// dropping the elapsed time, the cancel hint, and the queue count, exactly
-/// the actionable segments — so a busy title that would overflow degrades
-/// here instead: the activity name goes first (the least actionable part),
-/// keeping spinner + elapsed + cancel + queue.
+/// Input border title for idle state or the current in-flight run. `width` is
+/// the room the border row offers (input box width minus the two corners).
+/// ratatui clips an over-long title from the RIGHT — silently dropping the
+/// elapsed time, the cancel hint, and the queue count, exactly the actionable
+/// segments — so a busy title that would overflow degrades here instead: the
+/// activity name goes first (the least actionable part), keeping spinner +
+/// elapsed + cancel + queue.
 fn build_input_title(
-    mode: Mode,
     busy: bool,
     spinner: char,
     activity: &str,
@@ -2614,8 +1971,6 @@ fn build_input_title(
         } else {
             format!(" {spinner} {tail}")
         }
-    } else if mode == Mode::Nav {
-        " Browse tools ".to_string()
     } else {
         " Ask TinyAgent ".to_string()
     }
@@ -2738,289 +2093,59 @@ fn right_path_seg(path: &str, avail: usize) -> Option<Span<'static>> {
     ))
 }
 
-/// Wrap logical history lines to the render width and, in the same pass,
-/// expand the per-logical-line row map into a per-VISUAL-line map: a logical
-/// line that wraps to N visual rows contributes its row index N times. This
-/// is the map mouse hit-testing uses, since a click lands on a visual row.
-fn wrap_history(
-    lines: &[Line<'static>],
-    line_rows: &[Option<usize>],
+/// Wrap logical history lines to the render width. The inline model commits
+/// finalized lines to native scrollback, so there is no per-visual-line row
+/// map to maintain — wrapping is purely about fitting text to the width.
+fn wrap_history(lines: &[Line<'static>], width: usize) -> Vec<Line<'static>> {
+    lines.iter().flat_map(|l| wrap_line(l, width)).collect()
+}
+
+/// Render width for transcript text: the live viewport spans the terminal, so
+/// there is no horizontal inset, but prose is still capped at a readable max.
+fn content_width(term_w: u16) -> usize {
+    (term_w as usize)
+        .min(CONTENT_MAX_WIDTH as usize)
+        .max(1)
+}
+
+/// Render finalized rows to text and commit them into the terminal scrollback
+/// above the inline viewport via `insert_before`. The live region slides down
+/// by exactly the rendered height; the host terminal's native
+/// selection/scroll/search then own those lines.
+fn commit_rows<B: ratatui::backend::Backend>(
+    term: &mut Terminal<B>,
+    rows: &[Row],
+    md_cache: &mut MdCache,
     width: usize,
-) -> (Vec<Line<'static>>, Vec<Option<usize>>) {
-    let mut wrapped = Vec::new();
-    let mut visual_rows = Vec::new();
-    for (l, r) in lines.iter().zip(line_rows.iter()) {
-        let ws = wrap_line(l, width);
-        visual_rows.extend(std::iter::repeat_n(*r, ws.len()));
-        wrapped.extend(ws);
+) -> Result<(), B::Error> {
+    let lines = build_history_lines(rows, md_cache, width, false, false);
+    let wrapped = wrap_history(&lines, width);
+    if wrapped.is_empty() {
+        return Ok(());
     }
-    (wrapped, visual_rows)
-}
-
-/// Map a mouse click to a history row index. `rect` is the borderless
-/// conversation workspace and `scroll` is its current vertical offset.
-/// Returns None outside the workspace or on unattributed spacer lines.
-fn history_hit_row(
-    visual_rows: &[Option<usize>],
-    rect: ratatui::layout::Rect,
-    scroll: u16,
-    col: u16,
-    row: u16,
-) -> Option<usize> {
-    if col < rect.x
-        || col >= rect.x + rect.width
-        || row < rect.y
-        || row >= rect.y + rect.height
-    {
-        return None;
-    }
-    let visual = (row - rect.y) as usize + scroll as usize;
-    visual_rows.get(visual).copied().flatten()
-}
-
-/// A drag selection over the conversation, in CONTENT coordinates that
-/// survive frame-cache rebuilds (a streamed delta rewraps every later line,
-/// a resize changes inner_w — a stored visual line index would silently
-/// retarget to different text): (index into `rows`, the row's within-row
-/// VISUAL line offset, display column). apply/extract re-anchor against the
-/// CURRENT frame's visual-row map on every use; nothing caches visual
-/// positions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TextSelection {
-    anchor: (usize, usize, usize),
-    head: (usize, usize, usize),
-}
-
-/// Map a visual line index + column to content coordinates: the owning row
-/// via the visual-row map, and the line's offset from that row's first
-/// visual line. None on unattributed spacer lines (a selection can neither
-/// anchor nor end there) or past the map.
-fn visual_to_content(
-    visual_rows: &[Option<usize>],
-    visual: usize,
-    col: usize,
-) -> Option<(usize, usize, usize)> {
-    let row = visual_rows.get(visual).copied().flatten()?;
-    let first = visual_rows.iter().position(|r| *r == Some(row))?;
-    Some((row, visual - first, col))
-}
-
-/// Re-anchor a content-coordinate selection to the visual line coordinates
-/// of the CURRENT frame, returning the normalized ((visual, col), (visual,
-/// col)) range. Each endpoint's within-row offset clamps to the row's
-/// current last visual line (the row may have grown since the drag
-/// started); None when either endpoint's row is gone (/clear, queue flush)
-/// — the caller then drops the selection.
-fn resolve_selection(
-    visual_rows: &[Option<usize>],
-    sel: &TextSelection,
-) -> Option<((usize, usize), (usize, usize))> {
-    let to_visual = |pos: (usize, usize, usize)| -> Option<(usize, usize)> {
-        let first = visual_rows.iter().position(|r| *r == Some(pos.0))?;
-        let last = visual_rows.iter().rposition(|r| *r == Some(pos.0))?;
-        Some(((first + pos.1).min(last), pos.2))
-    };
-    let a = to_visual(sel.anchor)?;
-    let b = to_visual(sel.head)?;
-    Some(if a <= b { (a, b) } else { (b, a) })
-}
-
-/// Map a mouse position to a slice-visual line + display column: the on-screen
-/// offset plus the current scroll (the visual-row map of the fed slice makes
-/// it content-addressable). None outside the conversation workspace — a Down
-/// there only clears any finished selection.
-fn history_hit_cell(
-    rect: ratatui::layout::Rect,
-    scroll: u16,
-    col: u16,
-    row: u16,
-) -> Option<(usize, usize)> {
-    if col < rect.x
-        || col >= rect.x + rect.width
-        || row < rect.y
-        || row >= rect.y + rect.height
-    {
-        return None;
-    }
-    Some(((row - rect.y) as usize + scroll as usize, (col - rect.x) as usize))
-}
-
-/// history_hit_cell for drags: positions past the workspace edges clamp to
-/// the border (and the line index to the fed slice's tail), so dragging out
-/// of the area extends the selection to the boundary instead of losing it.
-fn history_clamp_cell(
-    rect: ratatui::layout::Rect,
-    scroll: u16,
-    lines: usize,
-    col: u16,
-    row: u16,
-) -> (usize, usize) {
-    let c = col.clamp(rect.x, rect.x + rect.width.saturating_sub(1)) - rect.x;
-    let r = row.clamp(rect.y, rect.y + rect.height.saturating_sub(1)) - rect.y;
-    let line = (r as usize + scroll as usize).min(lines.saturating_sub(1));
-    (line, c as usize)
-}
-
-/// history_hit_cell + visual_to_content: a mouse position in content
-/// coordinates. None outside the workspace or on a spacer line.
-fn history_hit_content(
-    visual_rows: &[Option<usize>],
-    rect: ratatui::layout::Rect,
-    scroll: u16,
-    col: u16,
-    row: u16,
-) -> Option<(usize, usize, usize)> {
-    let (visual, c) = history_hit_cell(rect, scroll, col, row)?;
-    visual_to_content(visual_rows, visual, c)
-}
-
-/// Edge auto-scroll direction for a held drag: +1 when the pointer sits on
-/// (or past) the conversation's top edge row (scroll towards older lines),
-/// -1 at/past the bottom edge row, 0 anywhere else or when not dragging.
-/// crossterm only reports Drag while the pointer MOVES, so a stationary
-/// edge drag is driven from the event loop with this.
-fn drag_edge_dir(rect: ratatui::layout::Rect, active: bool, pointer: Option<(u16, u16)>) -> i32 {
-    if !active {
-        return 0;
-    }
-    match pointer {
-        Some((_, r)) if r <= rect.y => 1,
-        Some((_, r)) if r >= rect.y + rect.height.saturating_sub(1) => -1,
-        _ => 0,
-    }
-}
-
-/// One edge auto-scroll step: the new scroll_up after stepping `step` lines
-/// in `dir`, clamped to [0, max_scroll], and the matching Paragraph scroll
-/// offset. An unchanged scroll_up means the end was reached — the loop
-/// stops extending the selection head.
-fn edge_scroll_step(scroll_up: usize, max_scroll: usize, dir: i32, step: usize) -> (usize, usize) {
-    let new_up = if dir > 0 {
-        (scroll_up + step).min(max_scroll)
-    } else {
-        scroll_up.saturating_sub(step)
-    };
-    (new_up, max_scroll - new_up)
-}
-
-/// Shift+Left-Down extends an existing selection to the clicked cell (the
-/// anchor stays); with no live selection it degrades to a plain click.
-/// Shift+DRAG never reaches us — the terminal keeps it for native selection.
-fn shift_extends_selection(sel: &Option<TextSelection>, mods: KeyModifiers) -> bool {
-    sel.is_some() && mods.contains(KeyModifiers::SHIFT)
-}
-
-
-/// Byte index of the char at display column `cell`, walking the string by
-/// unicode widths (wide-char safe); text.len() when the line ends first.
-fn cell_to_byte(text: &str, cell: usize) -> usize {
-    let mut w = 0;
-    for (i, c) in text.char_indices() {
-        if w >= cell {
-            return i;
+    let h = wrapped.len() as u16;
+    term.insert_before(h, |buf: &mut Buffer| {
+        for (y, line) in wrapped.iter().enumerate() {
+            // set_line writes the line's spans from x=0, truncating at the
+            // buffer's width — which equals `width` (or wider), so the
+            // pre-wrapped lines never overflow.
+            buf.set_line(0, y as u16, line, width as u16);
         }
-        w += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-    }
-    text.len()
+    })?;
+    Ok(())
 }
 
-/// The clipboard text for a drag selection: the selected lines out of the
-/// wrapped history, the first/last line cut at their display columns, lines
-/// joined by \n, trailing whitespace per line and leading/trailing blank
-/// lines dropped. Empty when nothing visible was selected (no copy, no
-/// notice).
-fn extract_text_selection(
-    lines: &[Line<'static>],
-    visual_rows: &[Option<usize>],
-    sel: &TextSelection,
-) -> String {
-    let Some((start, end)) = resolve_selection(visual_rows, sel) else {
-        return String::new();
-    };
-    let mut out: Vec<String> = Vec::new();
-    for (i, line) in lines.iter().enumerate().take(end.0 + 1).skip(start.0) {
-        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        let text = text.trim_end();
-        let from = if i == start.0 { cell_to_byte(text, start.1) } else { 0 };
-        let to = if i == end.0 { cell_to_byte(text, end.1 + 1) } else { text.len() };
-        out.push(if from < to { text[from..to].to_string() } else { String::new() });
-    }
-    while out.first().is_some_and(|l| l.is_empty()) {
-        out.remove(0);
-    }
-    while out.last().is_some_and(|l| l.is_empty()) {
-        out.pop();
-    }
-    out.join("\n")
-}
-
-/// Split `spans` at the display-column range [from, to), patching REVERSED
-/// onto the covered sub-spans while uncovered parts keep their style. The
-/// per-span column math reuses cell_to_byte's unicode-width accumulation, so
-/// wide chars split exactly where extract_text_selection cuts (a boundary
-/// landing inside a 2-column char folds to that char's edge).
-fn reverse_cols(spans: &mut Vec<Span<'static>>, from: usize, to: usize) {
-    let mut out: Vec<Span<'static>> = Vec::with_capacity(spans.len() + 2);
-    let mut col = 0usize;
-    for span in spans.drain(..) {
-        let w = span.content.width();
-        let span_end = col + w;
-        if w == 0 || span_end <= from || col >= to {
-            out.push(span); // fully outside the selected columns
-        } else {
-            let b_from = cell_to_byte(&span.content, from.saturating_sub(col).min(w));
-            let b_to = cell_to_byte(&span.content, (to - col).min(w));
-            let (before, rest) = span.content.split_at(b_from);
-            let (mid, after) = rest.split_at(b_to - b_from);
-            if !before.is_empty() {
-                out.push(Span::styled(before.to_string(), span.style));
-            }
-            if !mid.is_empty() {
-                out.push(Span::styled(
-                    mid.to_string(),
-                    span.style.add_modifier(Modifier::REVERSED),
-                ));
-            }
-            if !after.is_empty() {
-                out.push(Span::styled(after.to_string(), span.style));
-            }
-        }
-        col = span_end;
-    }
-    *spans = out;
-}
-
-/// Reverse-video the selected COLUMNS of the OWNED history tail slice fed to
-/// the Paragraph (FrameCache.wrapped itself stays clean), so the highlight
-/// matches extract_text_selection's range exactly: the first line reverses
-/// from start_col to its end, the last line up to end_col, middle lines in
-/// full — no trailing-whitespace padding, matching the terminal-native drag
-/// feel. `sel` is in full wrapped-history line coordinates and the slice
-/// starts at `skip`, so only the overlapping part is patched; called only
-/// while a selection is active, so an idle redraw pays nothing.
-fn apply_text_selection(
-    lines: &mut [Line<'static>],
-    sel: &TextSelection,
-    skip: usize,
-    visual_rows: &[Option<usize>],
-) {
-    let Some((start, end)) = resolve_selection(visual_rows, sel) else {
+/// Bottom-align `lines` inside `rect` (the transcript zone above the input
+/// box): the last line sits flush against the input box. Used for the slash
+/// popup, the thinking placeholder, and the in-flight streaming row. Lines
+/// beyond the zone's height are scrolled off the top.
+fn render_zone_tail(f: &mut Frame, rect: Rect, lines: &[Line<'static>]) {
+    if rect.height == 0 {
         return;
-    };
-    if start == end {
-        return; // empty (click) selection: no highlight
     }
-    for (i, line) in lines.iter_mut().enumerate() {
-        let visual = skip + i;
-        if visual < start.0 || visual > end.0 {
-            continue;
-        }
-        let from = if visual == start.0 { start.1 } else { 0 };
-        let to = if visual == end.0 { end.1 + 1 } else { usize::MAX };
-        reverse_cols(&mut line.spans, from, to);
-    }
+    let scroll = (lines.len() as u16).saturating_sub(rect.height);
+    f.render_widget(Paragraph::new(lines.to_vec()).scroll((scroll, 0)), rect);
 }
-
 
 /// Strip control characters (escape sequences, NUL, …) from external text
 /// before it enters the row list — tool output or model text containing ESC /
@@ -3106,14 +2231,11 @@ enum Flush {
 /// verbatim duplicates. Contract: pop_front ↔ remove the oldest ghost row ↔
 /// append the real Row::User at the END (the finished run's trailing output
 /// may already sit after the ghost, so only an append keeps true send order).
-/// Row removal shifts indices, so the index-keyed MdCache, the Nav selection,
-/// and any drag selection (all keyed on row indices) are reset.
+/// Row removal shifts indices, so the index-keyed MdCache is reset.
 fn flush_next_queued(
     queued: &mut std::collections::VecDeque<String>,
     rows: &mut Vec<Row>,
     md_cache: &mut MdCache,
-    select_idx: &mut Option<usize>,
-    text_sel: &mut Option<TextSelection>,
     in_tx: &mpsc::Sender<Option<Input>>,
 ) -> Flush {
     let Some(text) = queued.pop_front() else {
@@ -3121,8 +2243,6 @@ fn flush_next_queued(
     };
     if remove_oldest_queued(rows) {
         md_cache.clear();
-        *select_idx = None;
-        *text_sel = None;
     }
     rows.push(Row::User(text.clone()));
     if in_tx.send(Some(Input::Text(text))).is_ok() {
@@ -3145,21 +2265,15 @@ fn apply_flush(
     run_start: &mut Option<Instant>,
     activity: &mut String,
     thinking: &mut bool,
-    scroll_up: &mut usize,
-    rows_version: &mut u64,
 ) {
     match flush {
         Flush::Sent => {
-            *rows_version += 1;
-            *scroll_up = 0;
             *busy = true;
             *run_start = Some(Instant::now());
             *activity = "thinking".into();
             *thinking = true;
         }
         Flush::Undeliverable => {
-            *rows_version += 1;
-            *scroll_up = 0;
             *busy = false;
             *run_start = None;
             *thinking = false;
@@ -3168,88 +2282,6 @@ fn apply_flush(
             *busy = false;
             *run_start = None;
             *thinking = false;
-        }
-    }
-}
-
-/// Scroll window for the history Paragraph. ratatui's scroll offset is u16,
-/// so a history longer than 65535 + view_height lines would leave the bottom
-/// unreachable. When max_scroll exceeds u16::MAX, only the tail
-/// (u16::MAX + view_height) lines go to the Paragraph and the scroll offset
-/// is relative to that slice — `skip` head lines are dropped from the feed
-/// (they are unreachable anyway). Returns (skip, max_scroll).
-fn tail_window(total: usize, view_height: usize) -> (usize, usize) {
-    let max_scroll = total.saturating_sub(view_height);
-    let cap = u16::MAX as usize;
-    if max_scroll <= cap {
-        (0, max_scroll)
-    } else {
-        (max_scroll - cap, cap)
-    }
-}
-
-/// The clipboard text for a Nav yank, for every row kind: raw message text
-/// (the Assistant row keeps its markdown SOURCE, not the rendered styling),
-/// "You (queued)" for a pending message (mirroring the transcript), the
-/// notice text for a System row (the "· " marker is a render detail, never
-/// in the data), pretty JSON for a tool call, raw output for a tool result.
-fn yank_text(row: &Row) -> Option<String> {
-    match row {
-        Row::User(t) | Row::Assistant(t) => Some(t.clone()),
-        Row::Queued(t) => Some(format!("You (queued)\n{t}")),
-        Row::System { text, .. } => Some(text.clone()),
-        Row::ToolCall { input, .. } => {
-            Some(serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string()))
-        }
-        Row::ToolResult { content, .. } => Some(content.clone()),
-    }
-}
-
-/// Key for the rendered-history frame cache: every input of
-/// build_history_lines + wrap_history that can change the output must be in
-/// it — rows_version covers the row list (bumped at every mutation), the rest
-/// are the direct parameters.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FrameKey {
-    rows_version: u64,
-    select_idx: Option<usize>,
-    mode: Mode,
-    inner_w: usize,
-    stream_open: bool,
-    thinking: bool,
-}
-
-/// Per-frame cache of the wrapped history + visual-row map. Busy clock ticks
-/// (spinner, elapsed time) redraw every 120ms; during thinking / tool
-/// execution nothing about the history changes, so rebuilding and re-wrapping
-/// the whole conversation every tick was pure waste. Streaming deltas bump
-/// rows_version every frame, which is a normal rebuild.
-struct FrameCache {
-    key: Option<FrameKey>,
-    wrapped: Vec<Line<'static>>,
-    visual_rows: Vec<Option<usize>>,
-}
-
-impl FrameCache {
-    fn new() -> Self {
-        Self {
-            key: None,
-            wrapped: Vec::new(),
-            visual_rows: Vec::new(),
-        }
-    }
-    /// Ensure the cache holds the frame for `key`, rebuilding via `build`
-    /// only on a miss (any key component changed).
-    fn get_or_build(
-        &mut self,
-        key: FrameKey,
-        build: impl FnOnce() -> (Vec<Line<'static>>, Vec<Option<usize>>),
-    ) {
-        if self.key.as_ref() != Some(&key) {
-            let (wrapped, visual_rows) = build();
-            self.key = Some(key);
-            self.wrapped = wrapped;
-            self.visual_rows = visual_rows;
         }
     }
 }
@@ -4106,20 +3138,20 @@ mod tests {
     }
 
     /// Build history lines with the test width, not streaming.
-    fn history(rows: &[Row], mode: Mode, select_idx: Option<usize>) -> Vec<Line<'static>> {
+    fn history(rows: &[Row]) -> Vec<Line<'static>> {
         let mut cache = MdCache::new();
-        build_history_lines(rows, mode, select_idx, &mut cache, TEST_W, false, false).0
+        build_history_lines(rows, &mut cache, TEST_W, false, false)
     }
 
     #[test]
     fn history_empty_shows_dim_italic_placeholder() {
-        let lines = history(&[], Mode::Input, None);
+        let lines = history(&[]);
         assert_eq!(
             lines.iter().map(row_text).collect::<Vec<_>>(),
             vec![
                 "  no messages yet — type below; /help lists commands".to_string(),
                 "  / completes commands · Enter sends".to_string(),
-                "  Tab browses history · y copies · /help details".to_string(),
+                "  scroll / select / copy are native to your terminal".to_string(),
             ]
         );
         for l in &lines {
@@ -4135,7 +3167,7 @@ mod tests {
             Row::User("hello".into()),
             Row::Assistant("world".into()),
         ];
-        let lines = history(&rows, Mode::Input, None);
+        let lines = history(&rows);
 
         // User: cyan-bold `❯ ` icon inline on the first body line — no
         // standalone header row. Body text keeps the default color.
@@ -4155,7 +3187,7 @@ mod tests {
     #[test]
     fn history_multiline_role_body_aligns_under_the_icon_text() {
         let rows = vec![Row::User("first\nsecond".into())];
-        let lines = history(&rows, Mode::Input, None);
+        let lines = history(&rows);
         // Continuation lines indent to the icon's text column (2 cells).
         assert_eq!(row_text(&lines[0]), "❯ first");
         assert_eq!(row_text(&lines[1]), "  second");
@@ -4168,7 +3200,7 @@ mod tests {
             tool_result_row("shell", false),
             tool_result_row("shell", true),
         ];
-        let lines = history(&rows, Mode::Input, None);
+        let lines = history(&rows);
 
         // Collapsed tools are one-line lifecycle records under the AI gutter.
         assert_eq!(row_text(&lines[0]), "    → shell  arg summary");
@@ -4200,7 +3232,7 @@ mod tests {
         if let Row::ToolResult { elapsed, .. } = &mut row {
             *elapsed = Some("1.2s".into());
         }
-        let lines = history(&[row], Mode::Input, None);
+        let lines = history(&[row]);
         assert_eq!(row_text(&lines[0]), "    ✓ shell · 1.2s  body line");
     }
 
@@ -4214,53 +3246,9 @@ mod tests {
             expanded: false,
             elapsed: None,
         };
-        let lines = history(&[row], Mode::Input, None);
+        let lines = history(&[row]);
         assert_eq!(row_text(&lines[0]), "    ✓ shell  - old");
         assert!(!row_text(&lines[0]).contains('\x1b'));
-    }
-
-    #[test]
-    fn history_nav_selection_marks_and_highlights_head() {
-        let rows = vec![tool_call_row("shell"), tool_result_row("shell", false)];
-        let lines = history(&rows, Mode::Nav, Some(1));
-        // Selection uses reverse video so it remains visible across terminal
-        // themes, and the bar fills the WHOLE row width — a padding span
-        // reverses the trailing whitespace, not just the text.
-        let sel = &lines[1];
-        assert!(row_text(sel).starts_with("  ▶ ✓ shell  body line"));
-        assert_eq!(row_width(sel), TEST_W, "selection bar must fill the row");
-        // Text spans inherit the reversal from the line-level style at render
-        // (ratatui patches line.style under each span); the padding span
-        // carries it explicitly so the bar reaches the row end.
-        assert!(sel.style.add_modifier.contains(Modifier::REVERSED));
-        let pad = sel.spans.last().expect("a padding span");
-        assert!(pad.content.trim().is_empty(), "padding must be whitespace");
-        assert!(pad.style.add_modifier.contains(Modifier::REVERSED));
-        // Unselected row: normal four-column gutter, no fill, no reverse.
-        assert_eq!(row_text(&lines[0]), "    → shell  arg summary");
-        assert_eq!(lines[0].style.bg, None);
-        // Input mode with a stale select_idx must NOT highlight.
-        let lines = history(&rows, Mode::Input, Some(1));
-        assert_eq!(row_text(&lines[1]), "    ✓ shell  body line");
-        assert!(!lines[1].style.add_modifier.contains(Modifier::REVERSED));
-    }
-
-    #[test]
-    fn history_nav_selection_reverses_every_line_of_a_message_row() {
-        // A multi-line user message: the selection bar covers EVERY body
-        // line, each padded to the full row width — the same contract tool
-        // rows get, applied by the post-pass (no ▶ marker on message rows).
-        let rows = vec![Row::User("line one\nline two\nline three".into())];
-        let lines = history(&rows, Mode::Nav, Some(0));
-        let (body, tail) = lines.split_at(lines.len() - 1);
-        assert_eq!(body.len(), 3, "three body lines: {:?}", lines.iter().map(row_text).collect::<Vec<_>>());
-        assert!(row_text(&body[0]).starts_with("❯ "));
-        for l in body {
-            assert!(l.style.add_modifier.contains(Modifier::REVERSED));
-            assert_eq!(row_width(l), TEST_W, "selection bar must fill the row");
-        }
-        // The trailing turn-boundary spacer is NOT part of the selection.
-        assert!(!tail[0].style.add_modifier.contains(Modifier::REVERSED));
     }
 
     #[test]
@@ -4272,7 +3260,7 @@ mod tests {
         if let Row::ToolCall { collapsed, .. } = &mut row {
             *collapsed = "alpha beta gamma delta epsilon zeta eta theta iota".into();
         }
-        let lines = history(&[row], Mode::Input, None);
+        let lines = history(&[row]);
         let body: Vec<&Line> = lines.iter().filter(|l| !row_text(l).is_empty()).collect();
         assert!(body.len() > 1, "head must wrap at width {TEST_W}");
         let hang = "    → shell  ".width();
@@ -4298,7 +3286,7 @@ mod tests {
             Row::sys_warn("[cancelling…]"),
             Row::sys_error("[error] boom"),
         ];
-        let lines = history(&rows, Mode::Input, None);
+        let lines = history(&rows);
         // Single-line layout: one content line ("· text") + blank per row.
         // Info nests in the tool gutter; warn/error rise to column 0 so they
         // stand out from the execution detail they interrupt.
@@ -4324,12 +3312,12 @@ mod tests {
         // "· " marker, continuation lines align under it — in the gutter for
         // info, at column 0 for warn/error.
         let rows = vec![Row::sys_info("first\nsecond\nthird")];
-        let lines = history(&rows, Mode::Input, None);
+        let lines = history(&rows);
         assert_eq!(row_text(&lines[0]), "    · first");
         assert_eq!(row_text(&lines[1]), "      second");
         assert_eq!(row_text(&lines[2]), "      third");
         assert!(!lines[1].spans[0].style.add_modifier.contains(Modifier::ITALIC));
-        let lines = history(&[Row::sys_warn("w1\nw2")], Mode::Input, None);
+        let lines = history(&[Row::sys_warn("w1\nw2")]);
         assert_eq!(row_text(&lines[0]), "· w1");
         assert_eq!(row_text(&lines[1]), "  w2");
     }
@@ -4341,7 +3329,7 @@ mod tests {
             Row::Assistant("a".into()),
             Row::User("two".into()),
         ];
-        let lines = history(&rows, Mode::Input, None);
+        let lines = history(&rows);
         assert_eq!(row_text(&lines[0]), "❯ one");
         assert_eq!(row_text(&lines[1]), "● a");
         assert_eq!(row_text(&lines[2]), "");
@@ -4358,7 +3346,7 @@ mod tests {
             Row::sys_info(welcome_text("glm", 3)),
             Row::User("hi".into()),
         ];
-        let lines = history(&rows, Mode::Input, None);
+        let lines = history(&rows);
         assert!(
             lines.iter().all(|l| row_text(l) != "─".repeat(TEST_W)),
             "no separator above the first User row"
@@ -4371,7 +3359,7 @@ mod tests {
     #[test]
     fn history_queued_row_renders_as_dim_ghost() {
         let rows = vec![Row::Queued("later".into())];
-        let lines = history(&rows, Mode::Input, None);
+        let lines = history(&rows);
         // Inline dim icon + dim body, tagged `· queued` on the first line.
         assert_eq!(row_text(&lines[0]), "❯ later · queued");
         let icon = lines[0].spans[0].style;
@@ -4387,14 +3375,14 @@ mod tests {
             Row::Assistant("typing".into()),
         ];
         let mut cache = MdCache::new();
-        let (lines, _) = build_history_lines(&rows, Mode::Input, None, &mut cache, TEST_W, true, false);
+        let lines = build_history_lines(&rows, &mut cache, TEST_W, true, false);
         assert_eq!(row_text(&lines[0]), "● done");
         assert_eq!(row_text(&lines[1]), "● typing▌");
         let last = lines[1].spans.last().expect("a cursor span");
         assert_eq!(last.content.as_ref(), "▌");
         assert_eq!(last.style.fg, Some(AGENT_FG));
         // Not streaming: no cursor anywhere.
-        let lines = history(&rows, Mode::Input, None);
+        let lines = history(&rows);
         assert!(!row_text(&lines[1]).contains('▌'));
     }
 
@@ -4402,28 +3390,23 @@ mod tests {
     fn history_thinking_appends_a_transient_placeholder_tail() {
         let rows = vec![Row::User("hi".into())];
         let mut cache = MdCache::new();
-        let (lines, map) =
-            build_history_lines(&rows, Mode::Input, None, &mut cache, TEST_W, false, true);
+        let lines = build_history_lines(&rows, &mut cache, TEST_W, false, true);
         let last = lines.last().expect("a thinking tail line");
         assert_eq!(row_text(last), "● …");
         let icon = last.spans[0].style;
         assert_eq!(icon.fg, Some(AGENT_FG));
         assert!(icon.add_modifier.contains(Modifier::BOLD));
         assert_eq!(last.spans[1].style.fg, Some(DIM_FG));
-        // Render-only: the tail maps to NO row (no yank, no click target).
-        assert_eq!(map.last(), Some(&None));
         // Not thinking: no tail, the trailing spacer stays last.
-        let lines = history(&rows, Mode::Input, None);
+        let lines = history(&rows);
         assert_eq!(row_text(lines.last().unwrap()), "");
         // Thinking on an EMPTY conversation (a run launched with a task,
         // before its first row): the placeholder replaces the onboarding
         // cheat-sheet instead of stacking under it.
         let mut cache = MdCache::new();
-        let (lines, map) =
-            build_history_lines(&[], Mode::Input, None, &mut cache, TEST_W, false, true);
+        let lines = build_history_lines(&[], &mut cache, TEST_W, false, true);
         assert_eq!(lines.len(), 1);
         assert_eq!(row_text(&lines[0]), "● …");
-        assert_eq!(map, vec![None]);
     }
 
     #[test]
@@ -4480,16 +3463,12 @@ mod tests {
     #[test]
     fn input_title_merges_activity_elapsed_cancel_and_queue() {
         assert_eq!(
-            build_input_title(Mode::Input, true, '⠋', "running shell", 65, 2, 200),
+            build_input_title(true, '⠋', "running shell", 65, 2, 200),
             " ⠋ running shell… · 1m05s · Ctrl-C cancel · 2 queued "
         );
         assert_eq!(
-            build_input_title(Mode::Input, false, '⠋', "", 0, 0, 200),
+            build_input_title(false, '⠋', "", 0, 0, 200),
             " Ask TinyAgent "
-        );
-        assert_eq!(
-            build_input_title(Mode::Nav, false, '⠋', "", 0, 0, 200),
-            " Browse tools "
         );
     }
 
@@ -4498,28 +3477,20 @@ mod tests {
         // ratatui clips an over-long title from the right — which would eat
         // exactly the elapsed/cancel/queue tail. The title degrades instead:
         // the activity name goes first.
-        let full = build_input_title(Mode::Input, true, '⠋', "running shell", 65, 2, 200);
+        let full = build_input_title(true, '⠋', "running shell", 65, 2, 200);
         // Exactly at the boundary the full title still fits; one column less
         // degrades to spinner + elapsed + cancel + queue.
         assert_eq!(
-            build_input_title(Mode::Input, true, '⠋', "running shell", 65, 2, full.width()),
+            build_input_title(true, '⠋', "running shell", 65, 2, full.width()),
             full
         );
         assert_eq!(
-            build_input_title(
-                Mode::Input,
-                true,
-                '⠋',
-                "running shell",
-                65,
-                2,
-                full.width() - 1
-            ),
+            build_input_title(true, '⠋', "running shell", 65, 2, full.width() - 1),
             " ⠋ 1m05s · Ctrl-C cancel · 2 queued "
         );
         // No queue: the degraded tail drops that segment too.
         assert_eq!(
-            build_input_title(Mode::Input, true, '⠋', "thinking", 8, 0, 10),
+            build_input_title(true, '⠋', "thinking", 8, 0, 10),
             " ⠋ 8s · Ctrl-C cancel "
         );
     }
@@ -4675,63 +3646,6 @@ mod tests {
     }
 
     #[test]
-    fn copy_notice_sets_overrides_and_expires() {
-        let mut slot = None;
-        set_copy_notice(&mut slot, 10);
-        assert_eq!(slot.as_ref().map(|(t, _)| t.as_str()), Some("copied 10 bytes"));
-        // A second copy overrides the text AND resets the clock.
-        set_copy_notice(&mut slot, 283);
-        let set_at = slot.as_ref().unwrap().1;
-        assert_eq!(slot.as_ref().map(|(t, _)| t.as_str()), Some("copied 283 bytes"));
-        // Alive before 3s from the LAST set; gone at/after the deadline.
-        assert!(!expire_copy_notice(&mut slot, set_at + Duration::from_secs(COPY_NOTICE_SECS - 1)));
-        assert!(slot.is_some());
-        assert!(expire_copy_notice(&mut slot, set_at + Duration::from_secs(COPY_NOTICE_SECS)));
-        assert!(slot.is_none());
-        // Expiring an empty slot is a no-op (false → the caller stays clean).
-        assert!(!expire_copy_notice(&mut slot, Instant::now()));
-    }
-
-    #[test]
-    fn copied_selection_expires_with_the_notice_but_never_mid_drag() {
-        let sel = Some(TextSelection { anchor: (2, 0, 0), head: (2, 0, 8) });
-        let mut notice = None;
-        set_copy_notice(&mut notice, 42);
-        let set_at = notice.as_ref().unwrap().1;
-        let before_deadline = set_at + Duration::from_secs(COPY_NOTICE_SECS - 1);
-        let at_deadline = set_at + Duration::from_secs(COPY_NOTICE_SECS);
-
-        // Notice still young: the selection stays.
-        let mut n = notice.clone();
-        let mut s = sel;
-        assert!(!expire_copy_notice_and_selection(&mut n, &mut s, false, before_deadline));
-        assert_eq!(s, sel);
-        assert!(n.is_some());
-
-        // Expired and idle: the highlight retires with the notice.
-        let mut n = notice.clone();
-        let mut s = sel;
-        assert!(expire_copy_notice_and_selection(&mut n, &mut s, false, at_deadline));
-        assert_eq!(s, None);
-        assert!(n.is_none());
-
-        // Expired but mid-drag: the notice goes, the in-flight selection
-        // must NOT be yanked from under the mouse.
-        let mut n = notice.clone();
-        let mut s = sel;
-        assert!(expire_copy_notice_and_selection(&mut n, &mut s, true, at_deadline));
-        assert_eq!(s, sel);
-        assert!(n.is_none());
-
-        // No notice (never copied, bare anchor): nothing to expire, the
-        // selection is untouched.
-        let mut n = None;
-        let mut s = sel;
-        assert!(!expire_copy_notice_and_selection(&mut n, &mut s, false, at_deadline));
-        assert_eq!(s, sel);
-    }
-
-    #[test]
     fn fmt_ctx_formats_grades_and_hides_until_first_usage() {
         // No Usage event yet → no segment at all.
         assert!(fmt_ctx(0, 256_000).is_none());
@@ -4752,335 +3666,11 @@ mod tests {
     }
 
     #[test]
-    fn chrome_fg_is_one_busy_color_across_modes() {
-        assert_eq!(chrome_fg(Mode::Input, true), AGENT_FG);
-        assert_eq!(chrome_fg(Mode::Nav, true), AGENT_FG);
-        assert_eq!(chrome_fg(Mode::Input, false), USER_FG);
-        assert_eq!(chrome_fg(Mode::Nav, false), TOOL_CALL_FG);
-    }
-
-    #[test]
-    fn wrap_history_expands_the_row_map_to_visual_lines() {
-        // "abcdefghij" wraps to 2 visual rows at width 5; "xy" fits one.
-        let lines = vec![
-            span_line("abcdefghij", Color::Cyan),
-            span_line("xy", Color::Cyan),
-        ];
-        let map = vec![Some(0), Some(1)];
-        let (wrapped, visual) = wrap_history(&lines, &map, 5);
-        assert_eq!(wrapped.len(), 3);
-        assert_eq!(visual, vec![Some(0), Some(0), Some(1)]);
-        // A line with no attributable row (placeholder) maps to None.
-        let (wrapped, visual) = wrap_history(&lines[..1], &[None], 5);
-        assert_eq!(visual, vec![None, None]);
-        assert_eq!(wrapped.len(), 2);
-    }
-
-    #[test]
-    fn history_hit_row_maps_clicks_through_borders_and_scroll() {
-        use ratatui::layout::Rect;
-        let rect = Rect::new(2, 3, 10, 5);
-        let map = vec![Some(0), Some(1), None, Some(2), Some(3), Some(4)];
-        // Top workspace line, no scroll → first visual row.
-        assert_eq!(history_hit_row(&map, rect, 0, 5, 3), Some(0));
-        // A line mapping to None (placeholder) hits nothing.
-        assert_eq!(history_hit_row(&map, rect, 0, 5, 5), None);
-        // Scroll shifts the window: visual = (row - rect.y) + scroll.
-        assert_eq!(history_hit_row(&map, rect, 2, 5, 3), None); // visual 2 → None
-        assert_eq!(history_hit_row(&map, rect, 2, 5, 4), Some(2)); // visual 3
-        assert_eq!(history_hit_row(&map, rect, 2, 5, 5), Some(3)); // visual 4
-        // Outside the borderless workspace is not a hit.
-        assert_eq!(history_hit_row(&map, rect, 0, 1, 3), None);
-        assert_eq!(history_hit_row(&map, rect, 0, 5, 2), None);
-        assert_eq!(history_hit_row(&map, rect, 0, 5, 8), None);
-        assert_eq!(history_hit_row(&map, rect, 0, 12, 3), None);
-        // Past the end of the map → None.
-        assert_eq!(history_hit_row(&map, rect, 10, 5, 5), None);
-    }
-
-    #[test]
-    fn history_hit_cell_maps_to_full_history_coordinates() {
-        use ratatui::layout::Rect;
-        let rect = Rect::new(2, 3, 10, 5);
-        // Inside: scroll + on-screen offset, column relative to x. The fed
-        // slice's own coordinates — the head-cut is already in the slice.
-        assert_eq!(history_hit_cell(rect, 0, 2, 3), Some((0, 0)));
-        assert_eq!(history_hit_cell(rect, 2, 5, 4), Some((3, 3)));
-        assert_eq!(history_hit_cell(rect, 102, 5, 4), Some((103, 3)));
-        // Outside the workspace → None (a Down there only clears).
-        assert_eq!(history_hit_cell(rect, 0, 1, 3), None);
-        assert_eq!(history_hit_cell(rect, 0, 12, 3), None);
-        assert_eq!(history_hit_cell(rect, 0, 5, 2), None);
-        assert_eq!(history_hit_cell(rect, 0, 5, 8), None);
-    }
-
-    #[test]
-    fn history_clamp_cell_pulls_outside_drags_back_to_the_edges() {
-        use ratatui::layout::Rect;
-        let rect = Rect::new(2, 3, 10, 5);
-        // Inside passes through like history_hit_cell.
-        assert_eq!(history_clamp_cell(rect, 0, 50, 5, 4), (1, 3));
-        // Left/right/top/bottom overshoot clamps to the border cells.
-        assert_eq!(history_clamp_cell(rect, 0, 50, 0, 4), (1, 0));
-        assert_eq!(history_clamp_cell(rect, 0, 50, 30, 4), (1, 9));
-        assert_eq!(history_clamp_cell(rect, 0, 50, 5, 0), (0, 3));
-        assert_eq!(history_clamp_cell(rect, 0, 50, 5, 20), (4, 3));
-        // Scroll counts, and the line index caps at the slice's tail.
-        assert_eq!(history_clamp_cell(rect, 17, 12, 5, 20), (11, 3));
-    }
-
-    #[test]
-    fn cell_to_byte_walks_display_columns_wide_char_safe() {
-        assert_eq!(cell_to_byte("hello", 0), 0);
-        assert_eq!(cell_to_byte("hello", 3), 3);
-        assert_eq!(cell_to_byte("hello", 5), 5);
-        assert_eq!(cell_to_byte("hello", 99), 5);
-        // "你好x": 你 covers columns 0-1, 好 2-3, x column 4.
-        assert_eq!(cell_to_byte("你好x", 1), 3); // inside 你 → next char
-        assert_eq!(cell_to_byte("你好x", 2), 3);
-        assert_eq!(cell_to_byte("你好x", 4), 6);
-    }
-
-    #[test]
-    fn extract_text_selection_cuts_columns_and_trims() {
-        let lines: Vec<Line<'static>> = vec![
-            Line::from("❯ hello world"),
-            Line::from("● first answer"),
-            Line::from("   continued   "),
-            Line::from(""),
-            Line::from("❯ next"),
-        ];
-        // Each visual line is its own row here (no wrap, no spacers).
-        let vrows: Vec<Option<usize>> = (0..lines.len()).map(Some).collect();
-        // Single line, partial columns (head cell included).
-        let sel = TextSelection { anchor: (0, 0, 2), head: (0, 0, 6) };
-        assert_eq!(extract_text_selection(&lines, &vrows, &sel), "hello");
-        // Multi-line: full middle lines, trailing whitespace trimmed, the
-        // blank line inside the range kept as an empty join line.
-        let sel = TextSelection { anchor: (1, 0, 2), head: (4, 0, 3) };
-        assert_eq!(
-            extract_text_selection(&lines, &vrows, &sel),
-            "first answer\n   continued\n\n❯ ne"
-        );
-        // Dragging UP selects the same range (anchor/head normalized).
-        let up = TextSelection { anchor: (4, 0, 3), head: (1, 0, 2) };
-        assert_eq!(extract_text_selection(&lines, &vrows, &up), extract_text_selection(&lines, &vrows, &sel));
-        // Wide chars: columns are display cells, not bytes/chars.
-        let wide: Vec<Line<'static>> = vec![Line::from("你好x")];
-        let sel = TextSelection { anchor: (0, 0, 2), head: (0, 0, 4) };
-        assert_eq!(extract_text_selection(&wide, &[Some(0)], &sel), "好x");
-        // A selection over only blank/unattributed lines copies nothing.
-        let sel = TextSelection { anchor: (3, 0, 0), head: (3, 0, 5) };
-        assert_eq!(extract_text_selection(&lines, &vrows, &sel), "");
-    }
-
-    #[test]
-    fn apply_text_selection_reverses_exact_columns() {
-        use ratatui::backend::TestBackend;
-        // Multi-span line: split at the selected columns — the covered
-        // sub-span goes REVERSED, uncovered parts keep their style.
-        let styled = || {
-            Line::from(vec![
-                Span::styled("ab".to_string(), Style::default().fg(USER_FG)),
-                Span::styled("cdef".to_string(), Style::default().fg(DIM_FG)),
-            ])
-        };
-        let lines: Vec<Line<'static>> = vec![
-            Line::from("one"),
-            styled(), // "abcdef" across two spans
-            Line::from("three"),
-            Line::from("four"),
-        ];
-        let vrows: Vec<Option<usize>> = (0..lines.len()).map(Some).collect();
-        // First line from start_col to its end, last line up to end_col.
-        let sel = TextSelection { anchor: (1, 0, 1), head: (2, 0, 3) };
-        let mut feed = lines.clone();
-        apply_text_selection(&mut feed, &sel, 0, &vrows);
-        // Line 0 (outside the range) untouched.
-        assert_eq!(feed[0].spans.len(), 1);
-        assert!(!feed[0].spans[0].style.add_modifier.contains(Modifier::REVERSED));
-        // Line 1, cols 1..end: "a" keeps USER_FG, "b" USER_FG+REVERSED,
-        // "cdef" DIM_FG+REVERSED — the split crosses the span boundary.
-        let texts: Vec<&str> = feed[1].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(texts, ["a", "b", "cdef"]);
-        assert_eq!(feed[1].spans[0].style.fg, Some(USER_FG));
-        assert!(!feed[1].spans[0].style.add_modifier.contains(Modifier::REVERSED));
-        assert_eq!(feed[1].spans[1].style.fg, Some(USER_FG));
-        assert!(feed[1].spans[1].style.add_modifier.contains(Modifier::REVERSED));
-        assert_eq!(feed[1].spans[2].style.fg, Some(DIM_FG));
-        assert!(feed[1].spans[2].style.add_modifier.contains(Modifier::REVERSED));
-        // Line 2, cols 0..=3: "thre" reversed, the tail "e" not.
-        let texts: Vec<&str> = feed[2].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(texts, ["thre", "e"]);
-        assert!(feed[2].spans[0].style.add_modifier.contains(Modifier::REVERSED));
-        assert!(!feed[2].spans[1].style.add_modifier.contains(Modifier::REVERSED));
-        // Line 3 (outside) untouched; an empty (click) selection highlights
-        // nothing at all.
-        assert_eq!(feed[3].spans.len(), 1);
-        assert!(!feed[3].spans[0].style.add_modifier.contains(Modifier::REVERSED));
-        let click = TextSelection { anchor: (1, 0, 2), head: (1, 0, 2) };
-        let mut feed2 = lines.clone();
-        apply_text_selection(&mut feed2, &click, 0, &vrows);
-        assert_eq!(feed2[1].spans.len(), 2, "no split on an empty selection");
-        // skip shifts the coordinates: with skip=3 the selection is above
-        // the fed slice and nothing is patched.
-        let mut feed = lines.clone();
-        apply_text_selection(&mut feed, &sel, 3, &vrows);
-        assert_eq!(feed[1].spans.len(), 2, "no split above the slice");
-
-        // Wide chars: columns are display cells. Selecting cols 2-3 of
-        // "你好x" reverses exactly "好"; an end boundary inside a wide char
-        // folds to include the whole char, matching extraction.
-        let wide: Vec<Line<'static>> = vec![Line::from("你好x")];
-        let sel = TextSelection { anchor: (0, 0, 2), head: (0, 0, 3) };
-        let mut feed = wide.clone();
-        apply_text_selection(&mut feed, &sel, 0, &[Some(0)]);
-        let texts: Vec<&str> = feed[0].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(texts, ["你", "好", "x"]);
-        assert!(feed[0].spans[1].style.add_modifier.contains(Modifier::REVERSED));
-        assert!(!feed[0].spans[0].style.add_modifier.contains(Modifier::REVERSED));
-        assert!(!feed[0].spans[2].style.add_modifier.contains(Modifier::REVERSED));
-        let sel = TextSelection { anchor: (0, 0, 0), head: (0, 0, 1) };
-        let mut feed = wide.clone();
-        apply_text_selection(&mut feed, &sel, 0, &[Some(0)]);
-        let texts: Vec<&str> = feed[0].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(texts, ["你", "好x"], "end col inside 你 folds to the whole char");
-        assert!(feed[0].spans[0].style.add_modifier.contains(Modifier::REVERSED));
-        assert!(!feed[0].spans[1].style.add_modifier.contains(Modifier::REVERSED));
-
-        // Snapshot: cells inside the range render REVERSED; cells of the
-        // SAME line outside the range do not.
-        let area = ratatui::layout::Rect::new(0, 0, 10, 4);
-        let mut feed = lines;
-        let sel = TextSelection { anchor: (1, 0, 1), head: (2, 0, 3) };
-        apply_text_selection(&mut feed, &sel, 0, &vrows);
-        let mut term = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
-        term.draw(|f| {
-            f.render_widget(Paragraph::new(feed), area);
-        })
-        .unwrap();
-        let buf = term.backend().buffer();
-        assert!(!buf[(0, 0)].modifier.contains(Modifier::REVERSED));
-        assert!(!buf[(0, 1)].modifier.contains(Modifier::REVERSED)); // "a" before the range
-        assert!(buf[(1, 1)].modifier.contains(Modifier::REVERSED)); // "b"
-        assert!(buf[(5, 1)].modifier.contains(Modifier::REVERSED)); // "f" of "cdef"
-        assert!(buf[(3, 2)].modifier.contains(Modifier::REVERSED)); // "thre" tail
-        assert!(!buf[(4, 2)].modifier.contains(Modifier::REVERSED)); // "e" past end_col
-        assert!(!buf[(0, 3)].modifier.contains(Modifier::REVERSED));
-    }
-
-    #[test]
-    fn visual_to_content_maps_through_the_row_map() {
-        let vrows = [Some(0), None, Some(1), Some(1), Some(2)];
-        // Content line → its (row, line-within-row); the column passes through.
-        assert_eq!(visual_to_content(&vrows, 0, 3), Some((0, 0, 3)));
-        assert_eq!(visual_to_content(&vrows, 3, 0), Some((1, 1, 0)));
-        assert_eq!(visual_to_content(&vrows, 4, 7), Some((2, 0, 7)));
-        // Spacer lines and out-of-range positions cannot anchor a selection.
-        assert_eq!(visual_to_content(&vrows, 1, 0), None);
-        assert_eq!(visual_to_content(&vrows, 9, 0), None);
-    }
-
-    #[test]
-    fn selection_reanchors_after_cache_rebuilds() {
-        // Content coordinates must follow their ROW across anything that
-        // rebuilds the frame cache: streaming growth, edits, resizes.
-        let build = |rows: &[Row], width: usize| {
-            let mut cache = MdCache::new();
-            let (lines, map) =
-                build_history_lines(rows, Mode::Input, None, &mut cache, width, false, false);
-            wrap_history(&lines, &map, width)
-        };
-        let rows = || {
-            vec![
-                Row::User("question one".to_string()),
-                Row::Assistant("short".to_string()),
-                Row::User("question two".to_string()),
-            ]
-        };
-        let sel = TextSelection { anchor: (2, 0, 0), head: (2, 0, 99) };
-        let (wrapped, vrows) = build(&rows(), TEST_W);
-        let base_len = wrapped.len();
-        assert_eq!(extract_text_selection(&wrapped, &vrows, &sel), "❯ question two");
-        // The middle row grows (streaming): every visual line below it
-        // shifts, the extracted text does not.
-        let mut grown = rows();
-        grown[1] = Row::Assistant("a much longer answer that wraps over several visual lines at this width".to_string());
-        let (wrapped2, vrows2) = build(&grown, TEST_W);
-        assert!(wrapped2.len() > base_len, "growth must shift visual positions");
-        assert_eq!(extract_text_selection(&wrapped2, &vrows2, &sel), "❯ question two");
-        // A resize re-wraps everything; the selection still reads the same.
-        let (wrapped3, vrows3) = build(&rows(), 120);
-        assert_eq!(extract_text_selection(&wrapped3, &vrows3, &sel), "❯ question two");
-    }
-
-    #[test]
-    fn selection_drops_when_its_row_vanishes() {
-        // The selection's row is gone from the map (e.g. /clear): no anchor,
-        // no extraction, no highlight.
-        let vrows = [Some(0), Some(1)];
-        let sel = TextSelection { anchor: (3, 0, 0), head: (3, 0, 5) };
-        assert_eq!(resolve_selection(&vrows, &sel), None);
-        let lines: Vec<Line<'static>> = vec![Line::from("a"), Line::from("b")];
-        assert_eq!(extract_text_selection(&lines, &vrows, &sel), "");
-        // A line-within-row past the row's current end clamps to its LAST
-        // visual line (the row shrank after a re-wrap), never into the next
-        // row's lines.
-        let vrows = [Some(0), Some(0), Some(1), Some(1), Some(1)];
-        let sel = TextSelection { anchor: (0, 0, 0), head: (1, 99, 3) };
-        assert_eq!(resolve_selection(&vrows, &sel), Some(((0, 0), (4, 3))));
-    }
-
-    #[test]
-    fn drag_edge_dir_detects_top_and_bottom_edges() {
-        use ratatui::layout::Rect;
-        let rect = Rect::new(2, 3, 40, 10); // rows 3..=12
-        // Top edge scrolls up (dir +1), bottom edge scrolls down (dir -1),
-        // even outside the vertical band (the pointer can overshoot).
-        assert_eq!(drag_edge_dir(rect, true, Some((10, 3))), 1);
-        assert_eq!(drag_edge_dir(rect, true, Some((10, 0))), 1);
-        assert_eq!(drag_edge_dir(rect, true, Some((10, 12))), -1);
-        assert_eq!(drag_edge_dir(rect, true, Some((10, 20))), -1);
-        // Middle rows, an inactive drag, and a missing pointer: nothing.
-        assert_eq!(drag_edge_dir(rect, true, Some((10, 8))), 0);
-        assert_eq!(drag_edge_dir(rect, false, Some((10, 3))), 0);
-        assert_eq!(drag_edge_dir(rect, true, None), 0);
-    }
-
-    #[test]
-    fn edge_scroll_step_steps_and_stops_at_the_ends() {
-        // (scroll_up, max_scroll, dir, step) → (new scroll_up, new scroll).
-        assert_eq!(edge_scroll_step(0, 10, 1, 3), (3, 7));
-        // Top of the history: clamps, scroll reaches 0.
-        assert_eq!(edge_scroll_step(9, 10, 1, 3), (10, 0));
-        // Bottom edge: scroll_up decreases (view moves down)…
-        assert_eq!(edge_scroll_step(10, 10, -1, 3), (7, 3));
-        // …and stops at the live tail.
-        assert_eq!(edge_scroll_step(2, 10, -1, 3), (0, 10));
-    }
-
-    #[test]
-    fn edge_head_extension_maps_pointer_to_new_edge_line() {
-        use ratatui::layout::Rect;
-        // After an edge scroll the pointer still sits on the same screen row;
-        // the head must extend to the content line now showing there.
-        let rect = Rect::new(0, 0, 10, 3);
-        let vrows: Vec<Option<usize>> = (0..6).map(Some).collect();
-        let (new_up, new_scroll) = edge_scroll_step(0, 5, 1, 3);
-        assert_eq!((new_up, new_scroll), (3, 2));
-        let (v, c) = history_clamp_cell(rect, new_scroll as u16, vrows.len(), 4, 0);
-        assert_eq!((v, c), (2, 4));
-        assert_eq!(visual_to_content(&vrows, v, c), Some((2, 0, 4)));
-    }
-
-    #[test]
-    fn shift_extends_only_with_a_live_selection() {
-        let sel = Some(TextSelection { anchor: (0, 0, 0), head: (1, 0, 2) });
-        assert!(shift_extends_selection(&sel, KeyModifiers::SHIFT));
-        // No selection, or no SHIFT: an ordinary click/drag.
-        assert!(!shift_extends_selection(&None, KeyModifiers::SHIFT));
-        assert!(!shift_extends_selection(&sel, KeyModifiers::NONE));
-        assert!(!shift_extends_selection(&sel, KeyModifiers::CONTROL));
+    fn chrome_fg_is_one_busy_color_for_chrome_and_status() {
+        // Busy: the whole bottom chrome (input border + status state) reads as
+        // one AGENT_FG unit. Idle: the USER_FG idle color.
+        assert_eq!(chrome_fg(true), AGENT_FG);
+        assert_eq!(chrome_fg(false), USER_FG);
     }
 
     #[test]
@@ -5250,50 +3840,6 @@ mod tests {
         assert!(!lines[0].style.add_modifier.contains(Modifier::REVERSED));
         assert!(lines[1].style.add_modifier.contains(Modifier::REVERSED));
     }
-
-    #[test]
-    fn slash_popup_floats_above_the_input_box() {
-        use ratatui::backend::TestBackend;
-
-        let area = Rect::new(0, 0, 60, 16);
-        let [_, input_rect, _] = workspace_layout(area, 3);
-        let mut p = SlashPopup::new();
-        p.update("/");
-        p.next(); // select /export
-        let lines = slash_popup_lines(&p);
-        let rect = slash_popup_rect(input_rect, &lines);
-        // Directly above the input box, within its width, on screen.
-        assert_eq!(rect.y + rect.height, input_rect.y);
-        assert_eq!(rect.x, input_rect.x);
-        assert!(rect.width <= input_rect.width);
-        assert_eq!(rect.height, SLASH_COMMANDS.len() as u16);
-
-        let mut term = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
-        term.draw(|f| {
-            // Some conversation text the popup must paint over.
-            f.render_widget(Paragraph::new("ZZZMARKER beneath"), area);
-            f.render_widget(Clear, rect);
-            f.render_widget(Paragraph::new(lines), rect);
-        })
-        .unwrap();
-        let buffer = term.backend().buffer();
-        // First popup row: "/clear …" — the conversation text beneath is wiped.
-        let row0: String = (rect.x..rect.x + rect.width)
-            .map(|x| buffer[(x, rect.y)].symbol().to_string())
-            .collect();
-        assert!(row0.starts_with("/clear"), "popup row: {row0:?}");
-        assert!(!row0.contains("ZZZMARKER"), "history bled through: {row0:?}");
-        // The selected row (/export, second row) is reversed, the first is not.
-        let sel_y = rect.y + 1;
-        assert!(buffer[(rect.x, sel_y)].modifier.contains(Modifier::REVERSED));
-        assert!(!buffer[(rect.x, rect.y)].modifier.contains(Modifier::REVERSED));
-        // The reversal covers the padded tail of the selected row.
-        assert!(buffer[(rect.x + rect.width - 1, sel_y)]
-            .modifier
-            .contains(Modifier::REVERSED));
-    }
-
-    // ── stream deltas / queue flush / control stripping ────────────────
 
     #[test]
     fn append_delta_never_drops_text_when_tail_is_not_assistant() {
@@ -5482,29 +4028,24 @@ mod tests {
             Row::Queued("q2".into()),
         ];
         let mut cache = MdCache::new();
-        let mut select_idx = Some(0);
-        let mut text_sel = Some(TextSelection { anchor: (2, 0, 0), head: (2, 0, 4) });
 
         // First flush: oldest message out, ITS ghost removed, the real
-        // Row::User appended at the END (send order); every row-index-keyed
-        // state (Nav selection, drag selection) is reset.
-        let out = flush_next_queued(&mut queued, &mut rows, &mut cache, &mut select_idx, &mut text_sel, &tx);
+        // Row::User appended at the END (send order).
+        let out = flush_next_queued(&mut queued, &mut rows, &mut cache, &tx);
         assert_eq!(out, Flush::Sent);
-        assert_eq!(select_idx, None);
-        assert_eq!(text_sel, None, "ghost removal shifts row indices — the selection must go");
         assert!(matches!(rx.try_recv(), Ok(Some(Input::Text(t))) if t == "q1"));
         assert!(matches!(&rows[1], Row::Queued(t) if t == "q2")); // q2's ghost stays put
         assert!(matches!(rows.last(), Some(Row::User(t)) if t == "q1"));
 
         // Second flush: FIFO — q2 next.
-        let out = flush_next_queued(&mut queued, &mut rows, &mut cache, &mut select_idx, &mut text_sel, &tx);
+        let out = flush_next_queued(&mut queued, &mut rows, &mut cache, &tx);
         assert_eq!(out, Flush::Sent);
         assert!(matches!(rx.try_recv(), Ok(Some(Input::Text(t))) if t == "q2"));
         assert!(!rows.iter().any(|r| matches!(r, Row::Queued(_))));
 
         // Empty queue: no mutation at all.
         let before = rows.len();
-        let out = flush_next_queued(&mut queued, &mut rows, &mut cache, &mut select_idx, &mut text_sel, &tx);
+        let out = flush_next_queued(&mut queued, &mut rows, &mut cache, &tx);
         assert_eq!(out, Flush::Empty);
         assert_eq!(rows.len(), before);
 
@@ -5513,84 +4054,10 @@ mod tests {
         queued.push_back("q3".to_string());
         rows.push(Row::Queued("q3".into()));
         drop(rx);
-        let out = flush_next_queued(&mut queued, &mut rows, &mut cache, &mut select_idx, &mut text_sel, &tx);
+        let out = flush_next_queued(&mut queued, &mut rows, &mut cache, &tx);
         assert_eq!(out, Flush::Undeliverable);
         assert!(rows.iter().any(|r| matches!(r, Row::User(t) if t == "q3")));
         assert!(rows.iter().any(|r| matches!(r, Row::System { level: SysLevel::Error, .. })));
-    }
-
-    #[test]
-    fn tail_window_caps_the_scroll_offset_at_u16() {
-        // Small history: no slicing, max_scroll is the plain remainder.
-        assert_eq!(tail_window(100, 10), (0, 90));
-        // Exactly at the cap: still no slicing.
-        let cap = u16::MAX as usize;
-        assert_eq!(tail_window(cap + 10, 10), (0, cap));
-        // Past the cap: the head is sliced so max_scroll fits u16 AND the
-        // bottom stays reachable — skip + max_scroll + view == total.
-        let (skip, max_scroll) = tail_window(200_000, 10);
-        assert_eq!(max_scroll, cap);
-        assert_eq!(skip + max_scroll + 10, 200_000);
-        // View taller than the content: nothing to scroll.
-        assert_eq!(tail_window(5, 10), (0, 0));
-    }
-
-    #[test]
-    fn frame_cache_hits_until_any_key_component_changes() {
-        let mut cache = FrameCache::new();
-        let key = |v: u64| FrameKey {
-            rows_version: v,
-            select_idx: None,
-            mode: Mode::Input,
-            inner_w: 40,
-            stream_open: false,
-            thinking: false,
-        };
-        let build_a = || (vec![Line::from("A")], vec![Some(0)]);
-        let build_b = || (vec![Line::from("B")], vec![Some(1)]);
-
-        cache.get_or_build(key(1), build_a);
-        assert_eq!(row_text(&cache.wrapped[0]), "A");
-        // Same key: the distinguishing builder is IGNORED (hit).
-        cache.get_or_build(key(1), build_b);
-        assert_eq!(row_text(&cache.wrapped[0]), "A", "unchanged key must hit the cache");
-        // Version bump (rows mutated) → rebuild.
-        cache.get_or_build(key(2), build_b);
-        assert_eq!(row_text(&cache.wrapped[0]), "B");
-        assert_eq!(cache.visual_rows, vec![Some(1)]);
-        // Any other component change also misses (here: select_idx).
-        let mut k3 = key(2);
-        k3.select_idx = Some(3);
-        cache.get_or_build(k3, build_a);
-        assert_eq!(row_text(&cache.wrapped[0]), "A");
-    }
-
-    #[test]
-    fn yank_text_maps_every_row_kind() {
-        let call = Row::ToolCall {
-            name: "shell".into(),
-            input: serde_json::json!({"cmd": "ls"}),
-            collapsed: String::new(),
-            expanded: false,
-            started: Instant::now(),
-        };
-        let text = yank_text(&call).expect("tool call yanks pretty JSON");
-        assert!(text.contains("\"cmd\": \"ls\""), "pretty JSON: {text:?}");
-        let result = tool_result_row("shell", false);
-        assert_eq!(yank_text(&result).as_deref(), Some("body line"));
-        // Every other row yanks too: raw message text (Assistant keeps its
-        // markdown source), the queued ghost mirrors the transcript header,
-        // a System row its notice text without the render-time "· " marker.
-        assert_eq!(yank_text(&Row::User("hi".into())).as_deref(), Some("hi"));
-        assert_eq!(
-            yank_text(&Row::Assistant("# T\n**b**".into())).as_deref(),
-            Some("# T\n**b**")
-        );
-        assert_eq!(
-            yank_text(&Row::Queued("later".into())).as_deref(),
-            Some("You (queued)\nlater")
-        );
-        assert_eq!(yank_text(&Row::sys_info("n")).as_deref(), Some("n"));
     }
 
     #[test]
@@ -5612,7 +4079,7 @@ mod tests {
             expanded: true,
             elapsed: None,
         };
-        let lines = history(&[call, result], Mode::Input, None);
+        let lines = history(&[call, result]);
         let texts: Vec<String> = lines.iter().map(row_text).collect();
         assert!(texts.iter().any(|t| t.contains("\"cmd\": \"ls\"")), "pretty JSON: {texts:?}");
         assert!(!texts.iter().any(|t| t.contains("summary")), "collapsed leaked: {texts:?}");
@@ -5642,31 +4109,6 @@ mod tests {
                 l.spans
             );
         }
-    }
-
-    #[test]
-    fn history_line_rows_attribute_every_line() {
-        // The map attributes every icon/body line to its source row and
-        // turn-boundary whitespace to None.
-        let rows = vec![
-            Row::User("one".into()),
-            Row::Assistant("a".into()),
-            Row::User("two".into()),
-        ];
-        let mut cache = MdCache::new();
-        let (_, map) = build_history_lines(&rows, Mode::Input, None, &mut cache, TEST_W, false, false);
-        assert_eq!(
-            map,
-            vec![
-                Some(0), // ❯ one
-                Some(1), None, // ● a, turn boundary
-                Some(2), None, // ❯ two, trailing spacer
-            ]
-        );
-        // Empty conversation: the three placeholder lines are unattributable.
-        let mut cache = MdCache::new();
-        let (_, map) = build_history_lines(&[], Mode::Input, None, &mut cache, TEST_W, false, false);
-        assert_eq!(map, vec![None; 3]);
     }
 
     #[test]
@@ -5963,73 +4405,6 @@ mod tests {
     }
 
     #[test]
-    fn next_selectable_walks_every_row() {
-        let rows = vec![
-            Row::User("hi".into()),
-            Row::ToolCall {
-                name: "a".into(),
-                input: serde_json::Value::Null,
-                collapsed: String::new(),
-                expanded: false,
-                started: Instant::now(),
-            },
-            Row::Assistant("x".into()),
-            Row::ToolResult {
-                name: "b".into(),
-                content: "c".into(),
-                collapsed: "c".into(),
-                is_error: false,
-                expanded: false,
-                elapsed: None,
-            },
-            Row::sys_info("s"),
-        ];
-        // Every row is selectable now: from None the walk starts at the
-        // first (downward) or last (upward) row, then steps one at a time.
-        assert_eq!(next_selectable(&rows, None, 1), Some(0));
-        assert_eq!(next_selectable(&rows, None, -1), Some(4));
-        assert_eq!(next_selectable(&rows, Some(1), 1), Some(2));
-        assert_eq!(next_selectable(&rows, Some(3), -1), Some(2));
-        // Past the ends → None (caller keeps the current selection).
-        assert_eq!(next_selectable(&rows, Some(4), 1), None);
-        assert_eq!(next_selectable(&rows, Some(0), -1), None);
-    }
-
-    #[test]
-    fn next_matching_turn_start_jumps_between_user_rows() {
-        let tool = || Row::ToolCall {
-            name: "a".into(),
-            input: serde_json::Value::Null,
-            collapsed: String::new(),
-            expanded: false,
-            started: Instant::now(),
-        };
-        let rows = vec![
-            Row::User("one".into()),
-            tool(),
-            Row::Assistant("a".into()),
-            Row::Queued("two".into()),
-            tool(),
-        ];
-        // `[` / `]` land on User/Queued rows only, skipping tool output.
-        assert_eq!(next_matching(&rows, Some(4), -1, is_turn_start), Some(3));
-        assert_eq!(next_matching(&rows, Some(3), -1, is_turn_start), Some(0));
-        assert_eq!(next_matching(&rows, Some(0), 1, is_turn_start), Some(3));
-        assert_eq!(next_matching(&rows, None, 1, is_turn_start), Some(0));
-        assert_eq!(next_matching(&rows, None, -1, is_turn_start), Some(3));
-        // No turn boundary in that direction → None (selection stays put).
-        assert_eq!(next_matching(&rows, Some(0), -1, is_turn_start), None);
-        assert_eq!(next_matching(&rows, Some(3), 1, is_turn_start), None);
-    }
-
-    #[test]
-    fn next_selectable_empty() {
-        let empty: Vec<Row> = vec![];
-        assert_eq!(next_selectable(&empty, None, 1), None);
-        assert_eq!(next_selectable(&empty, None, -1), None);
-    }
-
-    #[test]
     fn fmt_tokens_compact() {
         assert_eq!(fmt_tokens(0), "0");
         assert_eq!(fmt_tokens(999), "999");
@@ -6147,208 +4522,6 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(row_width(&rows[0]), 0);
     }
-
-    #[test]
-    fn scroll_reaches_both_ends_of_wrapped_content() {
-        // End-to-end at the widget layer: one long line wraps to several rows,
-        // and scrolling through [0, max_scroll] must reveal BOTH the first and
-        // the last wrapped row. The old code computed max_scroll from the
-        // logical line count (1 here), so max_scroll was 0 and everything past
-        // the first screenful was unreachable — this pins that the wrap-based
-        // count fixes it (and that dropping `.wrap()` still renders the rows).
-        use ratatui::backend::TestBackend;
-        use ratatui::layout::Rect;
-
-        let text = "abcdefghijklmnopqrst"; // 20 chars, no spaces → hard-break wrap
-        let inner_w = 6usize;
-        let wrapped: Vec<Line> = wrap_line(&span_line(text, Color::Cyan), inner_w);
-        assert_eq!(wrapped.len(), 4, "20 cols at width 6 → 4 rows");
-
-        let view_h = 2usize;
-        let max_scroll = wrapped.len().saturating_sub(view_h);
-        assert_eq!(max_scroll, 2);
-
-        let area = Rect::new(0, 0, inner_w as u16 + 2, view_h as u16 + 2);
-        let visible = |skip: u16| -> String {
-            let mut term = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
-            term.draw(|f| {
-                let p = Paragraph::new(wrapped.clone())
-                    .block(WBlock::default().borders(Borders::ALL))
-                    .scroll((skip, 0));
-                f.render_widget(p, area);
-            })
-            .unwrap();
-            let buf = term.backend().buffer();
-            (1..=view_h as u16)
-                .map(|y| {
-                    (1..area.width.saturating_sub(1))
-                        .map(|x| buf[(x, y)].symbol().to_string())
-                        .collect::<String>()
-                })
-                .collect::<Vec<_>>()
-                .join("│")
-        };
-
-        let top = visible(0);
-        let bottom = visible(max_scroll as u16);
-        // scroll=0 → first two wrapped rows.
-        assert!(top.contains("abcdef") && top.contains("ghijkl"), "top: {top:?}");
-        // scroll=max_scroll → last two wrapped rows (previously unreachable).
-        assert!(bottom.contains("mnopqr"), "bottom: {bottom:?}");
-        assert!(bottom.contains("st"), "bottom tail: {bottom:?}");
-    }
-
-    #[test]
-    fn workspace_layout_and_testbackend_snapshot_are_calm_and_non_overlapping() {
-        use ratatui::backend::TestBackend;
-
-        let area = Rect::new(0, 0, 160, 14);
-        let [history_rect, input_rect, status_rect] = workspace_layout(area, 3);
-        assert_eq!(history_rect, Rect::new(2, 0, 120, 10));
-        assert_eq!(input_rect, Rect::new(2, 10, 156, 3));
-        assert_eq!(status_rect, Rect::new(2, 13, 156, 1));
-
-        let rows = vec![
-            Row::User("hello".into()),
-            Row::Assistant("world".into()),
-            tool_call_row("shell"),
-            tool_result_row("shell", false),
-        ];
-        let mut cache = MdCache::new();
-        let (history, map) =
-            build_history_lines(&rows, Mode::Input, None, &mut cache, 120, false, false);
-        let (history, _) = wrap_history(&history, &map, 120);
-
-        let mut term = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
-        term.draw(|frame| {
-            frame.render_widget(Paragraph::new(history), history_rect);
-            frame.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled("❯ ", Style::default().fg(USER_FG)),
-                    Span::styled(INPUT_PLACEHOLDER, Style::default().fg(DIM_FG)),
-                ]))
-                .block(
-                    WBlock::default()
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded)
-                        .border_style(Style::default().fg(chrome_fg(Mode::Input, true)))
-                        .title(build_input_title(
-                            Mode::Input,
-                            true,
-                            '⠋',
-                            "running shell",
-                            8,
-                            0,
-                            (input_rect.width as usize).saturating_sub(2),
-                        )),
-                ),
-                input_rect,
-            );
-            frame.render_widget(
-                Paragraph::new(build_status_line(
-                    "glm-5.2",
-                    "running",
-                    true,
-                    None,
-                    Some(("ctx 21% (54.7k/256k)", Style::default().fg(DIM_FG))),
-                    " · 2.1k in · 164 out",
-                    "",
-                    "/Users/chenpu/workspace/claude-code/TinyAgent",
-                    status_rect.width as usize,
-                )),
-                status_rect,
-            );
-        })
-        .unwrap();
-
-        let buffer = term.backend().buffer();
-        let screen = (0..area.height)
-            .map(|y| {
-                (0..area.width)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>();
-        assert!(screen[0].starts_with("  ❯ hello"));
-        assert!(screen[1].starts_with("  ● world"));
-        assert!(screen[10].contains("⠋ running shell… · 8s · Ctrl-C cancel"));
-        assert!(screen[11].contains("Message TinyAgent… (/help)"));
-        // Busy flips the whole input frame — border included — to AGENT_FG.
-        assert_eq!(buffer[(input_rect.x, input_rect.y)].fg, AGENT_FG);
-        assert_eq!(buffer[(input_rect.x, input_rect.y + 1)].fg, AGENT_FG);
-        assert!(screen[13].starts_with("   glm-5.2 "));
-        assert!(screen[13].contains("2.1k in · 164 out"));
-        // The context-window segment sits between the state and the stats.
-        assert!(screen[13].contains("ctx 21% (54.7k/256k) · 2.1k in"));
-        // The cwd path pins to the right edge of the status bar.
-        assert!(
-            screen[13].trim_end().ends_with("/Users/chenpu/workspace/claude-code/TinyAgent"),
-            "status row: {:?}",
-            screen[13]
-        );
-        // Idle carries no clock anywhere on the screen.
-        assert!(!screen.join("\n").contains("idle ·"));
-        assert!(!screen.join("\n").contains("Ask TinyAgent"));
-        assert!(!screen.join("\n").contains("conversation"));
-    }
-
-    #[test]
-    fn narrow_workspace_keeps_activity_title_inside_input_border() {
-        use ratatui::backend::TestBackend;
-
-        let area = Rect::new(0, 0, 50, 12);
-        let [history_rect, input_rect, status_rect] = workspace_layout(area, 3);
-        assert_eq!(history_rect, Rect::new(2, 0, 46, 8));
-        assert_eq!(input_rect, Rect::new(2, 8, 46, 3));
-        assert_eq!(status_rect, Rect::new(2, 11, 46, 1));
-
-        let mut term = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
-        term.draw(|frame| {
-            frame.render_widget(
-                Paragraph::new("❯ Message TinyAgent…").block(
-                    WBlock::default()
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded)
-                        .title(build_input_title(
-                            Mode::Input,
-                            true,
-                            '⠋',
-                            "running a deliberately long tool name",
-                            65,
-                            3,
-                            (input_rect.width as usize).saturating_sub(2),
-                        )),
-                ),
-                input_rect,
-            );
-        })
-        .unwrap();
-
-        let buffer = term.backend().buffer();
-        let top = (0..area.width)
-            .map(|x| buffer[(x, input_rect.y)].symbol())
-            .collect::<String>();
-        let body = (0..area.width)
-            .map(|x| buffer[(x, input_rect.y + 1)].symbol())
-            .collect::<String>();
-        // The long activity name doesn't fit: the title degrades to spinner +
-        // elapsed + cancel + queue (the actionable tail) instead of letting
-        // ratatui clip that tail off the right edge.
-        assert!(top.contains("⠋ 1m05s · Ctrl-C cancel · 3 queued"), "title row: {top:?}");
-        assert!(!top.contains("deliberately"), "activity should degrade away: {top:?}");
-        assert_eq!(buffer[(input_rect.right() - 1, input_rect.y)].symbol(), "╮");
-        assert_eq!(buffer[(input_rect.right() - 1, input_rect.y + 1)].symbol(), "│");
-        assert!(body.contains("Message TinyAgent…"));
-
-        let tiny = Rect::new(0, 0, 4, 8);
-        let [tiny_history, tiny_input, tiny_status] = workspace_layout(tiny, 3);
-        assert_eq!(tiny_history.x, 0);
-        assert_eq!(tiny_input.x, 0);
-        assert_eq!(tiny_status.x, 0);
-        assert_eq!(tiny_input.width, 4);
-    }
-
-    // ── M6: render cache + owned-line conversion ───────────────────────
 
     #[test]
     fn input_hscroll_keeps_caret_inside_the_box() {
