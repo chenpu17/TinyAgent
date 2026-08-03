@@ -8,6 +8,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// What triggered a history compression: the per-turn preflight estimate
+/// crossing the configured threshold, or overflow recovery after the
+/// provider rejected a request as too long for the context window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompressTrigger {
+    Preflight,
+    Overflow,
+}
+
 /// Events emitted during a run; frontends (headless printer / TUI) consume them.
 pub enum AgentEvent {
     TurnStart(u32),
@@ -25,8 +34,12 @@ pub enum AgentEvent {
         cache_read_input_tokens: u64,
     },
     /// History was compressed: how many middle messages were dropped,
-    /// and how many remain.
-    Compressed { dropped: usize, kept: usize },
+    /// how many remain, and which path triggered it.
+    Compressed {
+        dropped: usize,
+        kept: usize,
+        trigger: CompressTrigger,
+    },
     /// A non-fatal problem worth surfacing (session save failed, compression
     /// disabled after an error, …). Frontends decide how to show it — the
     /// headless printer writes stderr, the TUI renders a system line. NEVER
@@ -866,6 +879,13 @@ impl Agent {
         events(AgentEvent::Compressed {
             dropped,
             kept: self.messages.len(),
+            // force=true is the overflow-recovery call (the provider rejected
+            // the request as too long); the gated call is the preflight path.
+            trigger: if force {
+                CompressTrigger::Overflow
+            } else {
+                CompressTrigger::Preflight
+            },
         });
         // The summary is a real billed request — pass its usage through so the
         // caller can add it to the totals. If the provider didn't report usage,

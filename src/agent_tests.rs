@@ -1008,8 +1008,8 @@
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, AgentEvent::Compressed { dropped: 2, kept: 3 })),
-            "compress should drop 2 middle messages, keep 3"
+                .any(|e| matches!(e, AgentEvent::Compressed { dropped: 2, kept: 3, trigger: CompressTrigger::Preflight })),
+            "compress should drop 2 middle messages, keep 3, tagged preflight"
         );
         // The main (2nd) request saw the folded history: 3 messages.
         let cap = state.captured();
@@ -1081,7 +1081,7 @@
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, AgentEvent::Compressed { dropped: 4, kept: 3 })),
+                .any(|e| matches!(e, AgentEvent::Compressed { dropped: 4, kept: 3, .. })),
             "should drop 4 prefix messages, keep 3 (head + the tail pair)"
         );
         // MAIN (2nd) request: head + asst(2 tool_use) + user(2 tool_result).
@@ -1288,7 +1288,7 @@
         // Compression did run...
         assert!(events
             .iter()
-            .any(|e| matches!(e, AgentEvent::Compressed { dropped: 2, kept: 3 })));
+            .any(|e| matches!(e, AgentEvent::Compressed { dropped: 2, kept: 3, .. })));
         // ...but emitted exactly ONE Usage event (the main call's), not a
         // spurious second Usage{0,0} for the usage-less summary.
         let usage_events = events
@@ -1406,7 +1406,7 @@
         assert_eq!(state.calls(), 2);
         assert!(events
             .iter()
-            .any(|e| matches!(e, AgentEvent::Compressed { dropped: 2, kept: 3 })));
+            .any(|e| matches!(e, AgentEvent::Compressed { dropped: 2, kept: 3, .. })));
         let cap = state.captured();
         assert_eq!(cap[1].message_count, 3, "main call saw the folded history");
     }
@@ -1445,7 +1445,9 @@
         assert_eq!(state.calls(), 3);
         assert!(events
             .iter()
-            .any(|e| matches!(e, AgentEvent::Compressed { dropped: 2, kept: 3 })));
+            .any(|e| matches!(e, AgentEvent::Compressed { dropped: 2, kept: 3, trigger: CompressTrigger::Overflow })),
+            "forced compression after the overflow error must be tagged overflow"
+        );
         let cap = state.captured();
         assert_eq!(cap[0].message_count, 5, "first (overflowing) call saw full history");
         assert_eq!(cap[2].message_count, 3, "retried call saw the folded history");
@@ -1613,7 +1615,7 @@
         assert_eq!(cap[3].message_count, 3);
         assert!(events
             .iter()
-            .any(|e| matches!(e, AgentEvent::Compressed { dropped: 2, kept: 3 })));
+            .any(|e| matches!(e, AgentEvent::Compressed { dropped: 2, kept: 3, .. })));
     }
 
     #[test]

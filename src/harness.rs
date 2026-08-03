@@ -90,8 +90,18 @@ pub(crate) fn run_with_retries(
                         at_line_start = true;
                         current_sub_name = None;
                     }
-                    AgentEvent::Compressed { dropped, kept } => {
-                        println!("\n[context compressed: dropped {dropped} messages, {kept} kept]");
+                    AgentEvent::Compressed {
+                        dropped,
+                        kept,
+                        trigger,
+                    } => {
+                        let how = match trigger {
+                            crate::agent::CompressTrigger::Preflight => "preflight",
+                            crate::agent::CompressTrigger::Overflow => "overflow",
+                        };
+                        println!(
+                            "\n[context compressed ({how}): dropped {dropped} messages, {kept} kept]"
+                        );
                         at_line_start = true;
                         current_sub_name = None;
                     }
@@ -312,8 +322,17 @@ fn event_json(ev: &AgentEvent) -> Value {
                 "cache_read_input_tokens": *cache_read_input_tokens,
             })
         }
-        AgentEvent::Compressed { dropped, kept } => {
-            json!({"type": "compressed", "dropped": *dropped, "kept": *kept})
+        AgentEvent::Compressed {
+            dropped,
+            kept,
+            trigger,
+        } => {
+            let how = match trigger {
+                crate::agent::CompressTrigger::Preflight => "preflight",
+                crate::agent::CompressTrigger::Overflow => "overflow",
+            };
+            // Additive field: existing consumers of dropped/kept are unaffected.
+            json!({"type": "compressed", "dropped": *dropped, "kept": *kept, "trigger": how})
         }
         AgentEvent::Warning(w) => json!({"type": "warning", "message": w.clone()}),
         AgentEvent::SubAgent { name, event } => {

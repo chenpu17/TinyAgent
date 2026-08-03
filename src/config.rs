@@ -12,7 +12,10 @@ fn default_max_output() -> usize {
     30_000
 }
 fn default_compress_threshold() -> usize {
-    100_000
+    // ≈100k tokens at 4 chars/token: sized for modern 128k–1M windows. Small
+    // (32k-class) windows overshoot it, but the always-on overflow recovery
+    // (force-compress + retry on the provider's 400) is the backstop there.
+    400_000
 }
 fn default_keep_recent() -> usize {
     8
