@@ -196,15 +196,7 @@ pub(crate) fn run_with_retries(
                     if json {
                         // Surface the retry to NDJSON consumers between attempts
                         // so they can follow progress, not just see a gap.
-                        let v = json!({
-                            "type": "retry",
-                            "attempt": attempt,
-                            "max": retries,
-                            // Jittered backoffs are sub-second; round to ms so
-                            // consumers don't see 0 for a 750ms wait.
-                            "backoff_secs": (backoff.as_secs_f64() * 1000.0).round() / 1000.0,
-                            "error": msg,
-                        });
+                        let v = retry_event_json(attempt, retries, backoff, &msg);
                         println!(
                             "{}",
                             serde_json::to_string(&v).unwrap_or_else(|_| "{}".into())
@@ -242,11 +234,7 @@ pub(crate) fn run_with_retries(
             } else {
                 "error"
             };
-            let v = json!({
-                "type": "done",
-                "stop_reason": stop_reason,
-                "error": err.clone(),
-            });
+            let v = done_event_json(stop_reason, err);
             println!(
                 "{}",
                 serde_json::to_string(&v).unwrap_or_else(|_| "{}".into())
@@ -357,6 +345,41 @@ fn emit_json(ev: &AgentEvent) {
     let _ = std::io::stdout().flush();
 }
 
+/// NDJSON event emitted between attempts when a transient error is retried
+/// (`--json` mode only). Lets a consumer follow retry progress instead of
+/// seeing a gap. Factored out (like `event_json`) so its schema is unit-tested
+/// — it's a consumer-facing contract, and a field-name typo would otherwise
+/// go uncaught (the `json=true` path has no end-to-end test).
+fn retry_event_json(
+    attempt: usize,
+    max: usize,
+    backoff: std::time::Duration,
+    error: &str,
+) -> Value {
+    json!({
+        "type": "retry",
+        "attempt": attempt,
+        "max": max,
+        // Jittered backoffs are sub-second; round to ms so consumers don't
+        // see 0 for a 750ms wait.
+        "backoff_secs": (backoff.as_secs_f64() * 1000.0).round() / 1000.0,
+        "error": error,
+    })
+}
+
+/// Synthetic terminal NDJSON event for the retry-exhausted / cancelled paths
+/// (`--json` only): `agent.run` never emits a `Done` there (Done is emitted
+/// only on a normal finish), so without this a consumer can't tell a
+/// failure/cancel from a process that simply crashed. Factored out for the
+/// same testability reason as `retry_event_json`.
+fn done_event_json(stop_reason: &str, error: &str) -> Value {
+    json!({
+        "type": "done",
+        "stop_reason": stop_reason,
+        "error": error,
+    })
+}
+
 pub fn write_result(
     path: &Path,
     outcome: Option<&RunOutcome>,
@@ -458,7 +481,7 @@ fn compact(v: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{RunOutcome, ToolCallRecord};
+    use crate::agent::{CompressTrigger, RunOutcome, ToolCallRecord};
     use serde_json::json;
 
     #[test]
@@ -542,5 +565,148 @@ mod tests {
         assert_eq!(v["name"], "scout");
         assert_eq!(v["event"]["type"], "text");
         assert_eq!(v["event"]["delta"], "hi");
+    }
+
+    #[test]
+    fn event_json_maps_each_variant_to_its_schema() {
+        // Lock the NDJSON per-event schema: each variant maps to a distinct
+        // `type` tag with its fields. A field-name typo here would silently
+        // break every --json consumer, and before this only the SubAgent
+        // variant had a test. (SubAgent stays covered by the test above.)
+        // TurnStart → {"type":"turn","n":..}
+        let v = event_json(&AgentEvent::TurnStart(3));
+        assert_eq!(v["type"], "turn");
+        assert_eq!(v["n"], 3);
+        // TextDelta → {"type":"text","delta":..}
+        let v = event_json(&AgentEvent::TextDelta("hi".into()));
+        assert_eq!(v["type"], "text");
+        assert_eq!(v["delta"], "hi");
+        // ToolCall → {"type":"tool_call","name","input"}
+        let v = event_json(&AgentEvent::ToolCall {
+            name: "read_file".into(),
+            input: json!({"path": "a.txt"}),
+        });
+        assert_eq!(v["type"], "tool_call");
+        assert_eq!(v["name"], "read_file");
+        assert_eq!(v["input"]["path"], "a.txt");
+        // ToolResult → {"type":"tool_result","name","is_error","content"}
+        let v = event_json(&AgentEvent::ToolResult {
+            name: "read_file".into(),
+            is_error: false,
+            content: "hello".into(),
+        });
+        assert_eq!(v["type"], "tool_result");
+        assert_eq!(v["name"], "read_file");
+        assert_eq!(v["is_error"], false);
+        assert_eq!(v["content"], "hello");
+        // Usage → cache_* fields round-trip by exact name (a typo drops cache
+        // cost from any downstream token accounting).
+        let v = event_json(&AgentEvent::Usage {
+            input_tokens: 100,
+            output_tokens: 5,
+            cache_creation_input_tokens: 200,
+            cache_read_input_tokens: 300,
+        });
+        assert_eq!(v["type"], "usage");
+        assert_eq!(v["input_tokens"], 100);
+        assert_eq!(v["output_tokens"], 5);
+        assert_eq!(v["cache_creation_input_tokens"], 200);
+        assert_eq!(v["cache_read_input_tokens"], 300);
+        // Compressed → trigger stringifies for both variants.
+        let v = event_json(&AgentEvent::Compressed {
+            dropped: 3,
+            kept: 5,
+            trigger: CompressTrigger::Preflight,
+        });
+        assert_eq!(v["type"], "compressed");
+        assert_eq!(v["dropped"], 3);
+        assert_eq!(v["kept"], 5);
+        assert_eq!(v["trigger"], "preflight");
+        let v = event_json(&AgentEvent::Compressed {
+            dropped: 1,
+            kept: 2,
+            trigger: CompressTrigger::Overflow,
+        });
+        assert_eq!(v["trigger"], "overflow");
+        // Warning → {"type":"warning","message":..}
+        let v = event_json(&AgentEvent::Warning("careful".into()));
+        assert_eq!(v["type"], "warning");
+        assert_eq!(v["message"], "careful");
+        // Done → {"type":"done","stop_reason":..}
+        let v = event_json(&AgentEvent::Done {
+            stop_reason: "end_turn".into(),
+        });
+        assert_eq!(v["type"], "done");
+        assert_eq!(v["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn retry_event_json_schema_rounds_backoff_to_millis() {
+        let v = retry_event_json(2, 3, std::time::Duration::from_millis(750), "boom");
+        assert_eq!(v["type"], "retry");
+        assert_eq!(v["attempt"], 2);
+        assert_eq!(v["max"], 3);
+        assert_eq!(v["error"], "boom");
+        // 750ms must surface as 0.75, not 0 — the whole point of the ms
+        // rounding (sub-second jittered backoffs would otherwise look instant).
+        assert_eq!(v["backoff_secs"], 0.75);
+    }
+
+    #[test]
+    fn done_event_json_carries_reason_and_error() {
+        let v = done_event_json("error", "provider 503");
+        assert_eq!(v["type"], "done");
+        assert_eq!(v["stop_reason"], "error");
+        assert_eq!(v["error"], "provider 503");
+    }
+
+    #[test]
+    fn compact_previews_a_json_value() {
+        // compact feeds a JSON value's string form through agent::preview; for
+        // a short value nothing is truncated, so the key survives.
+        let s = compact(&json!({"path": "a.txt"}));
+        assert!(s.contains("a.txt"), "compact dropped the value: {s}");
+    }
+
+    #[test]
+    fn atomic_write_creates_missing_parent_dirs() {
+        let base =
+            std::env::temp_dir().join(format!("ta-atomic-parent-{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        // Neither `a/b` nor `a` exists — atomic_write must mkdir -p them (the
+        // create_dir_all branch the basic test skips by pre-making the dir).
+        let path = base.join("a/b/out.json");
+        atomic_write(&path, b"ok").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "ok");
+        assert!(!base.join("a/b/out.tmp").exists(), "temp file left behind");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn write_result_records_nonzero_cache_tokens() {
+        let dir = std::env::temp_dir().join(format!("ta-res-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let o = RunOutcome {
+            final_text: "done".into(),
+            turns: 1,
+            stop_reason: "end_turn".into(),
+            tool_calls: vec![],
+            input_tokens: 1000,
+            output_tokens: 50,
+            cache_creation_input_tokens: 800,
+            cache_read_input_tokens: 200,
+            elapsed: std::time::Duration::from_secs(2),
+        };
+        let path = dir.join("cache.json");
+        write_result(&path, Some(&o), None, 3).unwrap();
+        // Parse back and assert by field name — a typo in the cache_* names
+        // would silently drop cache cost from downstream accounting, and
+        // substring checks couple to pretty-print spacing.
+        let parsed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed["cache_creation_input_tokens"], 800);
+        assert_eq!(parsed["cache_read_input_tokens"], 200);
+        assert_eq!(parsed["attempts"], 3);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
