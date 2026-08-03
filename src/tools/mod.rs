@@ -150,6 +150,16 @@ pub(crate) fn resolve(ctx: &ToolCtx, path: &str) -> Result<PathBuf> {
 /// existing ancestor (so writes to not-yet-existing files are checked too)
 /// and re-appends the remainder; the workdir itself is canonicalized at
 /// config load, so a plain prefix comparison is sound.
+///
+/// **Best-effort sandbox, not a hard security boundary.** A classic TOCTOU
+/// window exists between this check and the caller's actual I/O: a path
+/// component swapped for a symlink pointing outside the workdir during that
+/// gap would slip through. `restrict_to_workdir` exists to keep the *model*
+/// from accidentally straying outside the workdir (its own `../` or absolute
+/// paths), not to resist an adversarial process with concurrent filesystem
+/// access to the workdir. A TOCTOU-hardened version (openat / `O_NOFOLLOW`
+/// directory-fd walk) would need platform-specific code on Windows and is
+/// out of scope for this threat model.
 fn confine(ctx: &ToolCtx, full: &Path) -> Result<PathBuf> {
     let mut ancestor: &Path = full;
     let mut rest: Vec<std::ffi::OsString> = Vec::new();

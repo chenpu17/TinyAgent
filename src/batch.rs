@@ -126,10 +126,17 @@ pub fn run(
     let rx = Mutex::new(rx);
     let reports: Mutex<Vec<TaskReport>> = Mutex::new(Vec::new());
 
+    // Worker Mutexes tolerate poisoning (.unwrap_or_else(into_inner), matching
+    // mcp.rs): a panic while holding `rx`/`reports` unwinds out of the scope
+    // (debug panic="unwind") or aborts outright (release panic="abort"); into_inner
+    // keeps a surviving thread from re-panicking on a poisoned lock. NB: under
+    // panic="abort" a worker panic aborts the process immediately regardless of
+    // lock state, so this is a debug/CI-robustness + consistency measure, not a
+    // release-abort guard — a panicking worker still loses the report in release.
     std::thread::scope(|s| {
         for _ in 0..jobs.max(1) {
             s.spawn(|| loop {
-                let next = rx.lock().unwrap().recv();
+                let next = rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
                 let (name, partial) = match next {
                     Ok(t) => t,
                     Err(_) => return, // channel drained
@@ -164,7 +171,7 @@ pub fn run(
                         .map(|e| format!(", {e}"))
                         .unwrap_or_default()
                 );
-                reports.lock().unwrap().push(report);
+                reports.lock().unwrap_or_else(|e| e.into_inner()).push(report);
             });
         }
         for t in tasks {
@@ -173,7 +180,7 @@ pub fn run(
         drop(tx); // workers exit once the queue is drained
     });
 
-    let mut reports = reports.into_inner().unwrap();
+    let mut reports = reports.into_inner().unwrap_or_else(|e| e.into_inner());
     reports.sort_by(|a, b| a.name.cmp(&b.name));
     // For --failed: overlay the re-run results onto the prior report so the
     // written file reflects the full task set (prior successes preserved,
