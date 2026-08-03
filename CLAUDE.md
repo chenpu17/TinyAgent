@@ -55,6 +55,15 @@ cargo clippy --all-targets                # lint headless 版（两个 feature �
   关闭读写，与 `--resume` 互斥（直接 bail）。
 - **TUI 是可选 feature**（`ratatui` + `crossterm` + `tui-markdown` + `unicode-width`），
   `src/tui.rs` 在 `#[cfg(feature = "tui")]` 后。默认 headless 版不含它，保持体积。
+  **内联/流式渲染**（非全屏 alternate-screen，与 Claude Code / Codex 同款）：
+  `Terminal::with_options(Viewport::Inline(INLINE_HEIGHT=8))` 在主屏底部锚定一个固定高度 live 区
+  （流式 zone + 输入框 + 状态行），每帧 `term.draw` 重绘；已定稿的对话块经 `term.insert_before`
+  **提交进终端原生 scrollback**（`commit_rows` + `committed` watermark 追踪已提交行）。原生选择 /
+  滚动 / 搜索交给终端——**没有鼠标 handler、没有 app 托管的滚动/选区**（旧全屏重绘模型的选区漂移
+  bug 由此根治）。流式中的在途 Assistant 行由 watermark 暂留（不提交）、live 区里带 `▌` 光标渲染、
+  回合结束（stream 关闭）才整条提交。**`ratatui` 的 `scrolling-regions` feature 已在 Cargo.toml 启用**：
+  默认回退路径每次 `insert_before` 都 `Terminal::clear()`（发一个 DSR 光标查询 `\x1b[6n`），开了
+  scrolling-regions 走 CSR(DECSTBM) 滚动区路径、无此查询且渲染更平滑（CSR 现代终端普遍支持）。
 
 ## 容易踩的坑
 

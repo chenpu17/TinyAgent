@@ -73,10 +73,10 @@ enum Row {
     Queued(String),
     Assistant(String),
     /// Tool call: collapsed shows a compact one-line arg summary; expanded
-    /// pretty-prints the full input JSON. `expanded` is toggled in Nav mode.
-    /// `collapsed` caches the compact arg summary at creation so the renderer
-    /// doesn't re-serialize the input JSON every frame. `started` stamps the
-    /// call's arrival so the matching result can show a wall-clock duration.
+    /// pretty-prints the full input JSON. In the inline model rows commit to
+    /// scrollback at their default state, so `expanded` stays at its initial
+    /// `false` (a one-line summary) — there's no in-app cursor to toggle it
+    /// post-commit. `collapsed` caches the compact arg summary at creation so
     ToolCall {
         name: String,
         input: serde_json::Value,
@@ -248,9 +248,8 @@ const POPUP_MAX_ROWS: usize = 8;
 
 /// Floating slash-command completion state. Pure state machine, no terminal:
 /// `update` recomputes the visible matches from the input text (empty list =
-/// closed), the key handling lives in `popup_key`. NO mouse support — click-
-/// to-complete buys little over Tab/Enter and the popup overlays live
-/// conversation rows whose click handlers should keep working.
+/// closed), the key handling lives in `popup_key`. No mouse support —
+/// click-to-complete buys little over Tab/Enter.
 struct SlashPopup {
     /// The `/`-stripped prefix the current matches were filtered with;
     /// selection resets whenever it changes.
@@ -395,8 +394,8 @@ fn visible_window(len: usize, sel: usize, max: usize) -> (usize, usize) {
 }
 
 /// Render the popup rows: "/name [arg]  one-line description", the selected
-/// row in reverse video padded out to the popup's content width (the bar
-/// fills the row, not just the text — same contract as Nav selection).
+/// row in reverse video padded out to the popup's content width so the bar
+/// fills the whole row, not just the text.
 ///
 /// `max_rows` is the live zone height: windowing to the ACTUAL band (not just
 /// the `POPUP_MAX_ROWS` ceiling) keeps the selection on-screen when the command
@@ -1231,16 +1230,13 @@ fn ui_loop(
                     fmt_tokens(in_tokens),
                     fmt_tokens(out_tokens),
                 );
-                let compact_stats = String::new();
                 let ctx = fmt_ctx(ctx_tokens, cfg.limits.max_context_tokens);
                 let status = build_status_line(
                     &cfg.model,
                     &state,
                     busy,
-                    None,
                     ctx.as_ref().map(|(t, s)| (t.as_str(), *s)),
                     &stats,
-                    &compact_stats,
                     &cwd_path,
                     status_rect.width as usize,
                 );
@@ -1620,24 +1616,19 @@ fn push_tool_head(lines: &mut Vec<Line<'static>>, head: Line<'static>, hang: usi
     lines.extend(wrapped);
 }
 
-/// Build styled history lines for the borderless conversation workspace, plus a
-/// per-logical-line map back to the source row index (None for the empty
-/// placeholder and turn-boundary spacer lines, so clicks there hit nothing).
-/// Split out of the draw closure so role hierarchy, colors, `│ ` guides,
-/// nav selection, streaming cursor, and empty placeholder are unit-testable
-/// without a terminal.
+/// Build styled history lines for the conversation. Used two ways: to render
+/// finalized rows into the terminal scrollback (via `commit_rows`), and to
+/// render the in-flight streaming row live in the viewport zone. Split out of
+/// the draw/commit paths so role hierarchy, colors, `│ ` guides, the streaming
+/// cursor, and the empty placeholder are unit-testable without a terminal.
 ///
-/// Nav selection adds a `▶ ` marker and reverse video, which remains visible
-/// across light, dark, 16-color, and custom terminal themes.
-///
-/// `inner_w` is the workspace width.
+/// `inner_w` is the content width.
 /// `streaming` appends a `▌` cursor to the in-flight assistant row's last
 /// line — the lines are clones out of MdCache, so the cached render stays
 /// clean.
 /// `thinking` synthesizes one transient `● …` tail line while the agent has
 /// started a turn but produced no visible output yet. It is render-only: not
-/// a row, so MdCache, the transcript, and yank/click hit-testing (its map
-/// entry is None) are all untouched.
+/// a row, so MdCache and the transcript are untouched.
 #[allow(clippy::too_many_arguments)]
 fn build_history_lines(
     rows: &[Row],
@@ -1907,8 +1898,8 @@ fn tool_elapsed_for(rows: &[Row], name: &str) -> Option<String> {
 
 /// Auto-expand contract for a tool result row: a FAILED call with SHORT
 /// output (a command's stderr) opens so the user reads the error right away;
-/// long dumps stay collapsed so they don't flood the screen, and successful
-/// results never auto-open. Nav's manual toggle is unaffected either way.
+/// long dumps stay collapsed so they don't flood the scrollback, and
+/// successful results never auto-open.
 fn auto_expand_result(is_error: bool, content: &str) -> bool {
     is_error && content.lines().count() <= 20
 }
@@ -1982,15 +1973,12 @@ fn build_input_title(
     }
 }
 
-/// Assemble the status bar in three density levels. Wide terminals get token
-/// detail, medium ones keep the scroll/nav state, and narrow ones preserve
-/// only the model and broad run state. The context-window segment (`ctx`) is
-/// the most decision-relevant number, so it outlives the stats: it is kept in
-/// every tier it fits, even after the stats drop out. The transient copy
-/// notice sits between the state and ctx but only rides the FULL tier, so a
-/// narrowing bar sheds it before the stats degrade. The cwd path pins to
-/// the right edge in whatever room the left side leaves (it is the first
-/// thing narrow terminals lose). Keyboard help lives behind `/help`.
+/// Assemble the status bar in two density levels. Wide terminals get token
+/// detail; medium ones keep the context-window segment (`ctx`) after the stats
+/// drop out (it's the most decision-relevant number, so it outlives the stats);
+/// narrow ones preserve only the model badge and broad run state. The cwd path
+/// pins to the right edge in whatever room the left side leaves (it is the
+/// first thing narrow terminals lose). Keyboard help lives behind `/help`.
 // The bar is assembled from independent segments; grouping them into a
 // struct would only shuffle the same fields to every call site.
 #[allow(clippy::too_many_arguments)]
@@ -1998,10 +1986,8 @@ fn build_status_line(
     model: &str,
     state: &str,
     busy: bool,
-    notice: Option<&str>,
     ctx: Option<(&str, Style)>,
     stats: &str,
-    compact_stats: &str,
     path: &str,
     width: usize,
 ) -> Line<'static> {
@@ -2018,18 +2004,9 @@ fn build_status_line(
         Span::styled(badge, Style::default().fg(BADGE_FG).bg(BADGE_BG)),
         Span::styled(state_seg, state_style),
     ];
-    let mut used = spans.iter().map(|s| s.content.width()).sum::<usize>();
+    let used = spans.iter().map(|s| s.content.width()).sum::<usize>();
     let ctx_seg = ctx.map(|(t, _)| format!(" · {t}"));
     let ctx_w = ctx_seg.as_ref().map_or(0, |s| s.width());
-    let notice_seg = notice.map(|t| format!(" · {t}"));
-    let notice_w = notice_seg.as_ref().map_or(0, |s| s.width());
-    // The notice only rides the FULL tier (badge+state+notice+ctx+stats must
-    // all fit): it sheds before the stats degrade and can never squeeze out
-    // the badge/state.
-    if notice_w > 0 && used + notice_w + ctx_w + stats.width() <= width {
-        spans.push(Span::styled(notice_seg.unwrap(), Style::default().fg(DIM_FG)));
-        used += notice_w;
-    }
     let push_ctx = |spans: &mut Vec<Span<'static>>| {
         if let (Some(seg), Some((_, style))) = (&ctx_seg, ctx) {
             spans.push(Span::styled(seg.clone(), style));
@@ -2038,12 +2015,6 @@ fn build_status_line(
     if used + ctx_w + stats.width() <= width {
         push_ctx(&mut spans);
         spans.push(Span::styled(stats.to_string(), Style::default().fg(DIM_FG)));
-    } else if used + ctx_w + compact_stats.width() <= width {
-        push_ctx(&mut spans);
-        spans.push(Span::styled(
-            compact_stats.to_string(),
-            Style::default().fg(DIM_FG),
-        ));
     } else if used + ctx_w <= width {
         // Stats are gone but the context fill still fits on its own.
         push_ctx(&mut spans);
@@ -3585,27 +3556,25 @@ mod tests {
     #[test]
     fn build_status_line_reduces_detail_on_narrow_terminals() {
         let stats = " · 5 in · 6 out";
-        let compact = " · nav";
         // Wide: full token detail appears as a dim third span.
-        let wide = build_status_line("glm", "idle", false, None, None, stats, compact, "", 200);
+        let wide = build_status_line("glm", "idle", false, None, stats, "", 200);
         assert_eq!(wide.spans.len(), 3);
         assert_eq!(wide.spans[2].content.as_ref(), stats);
         assert_eq!(wide.spans[2].style.fg, Some(DIM_FG));
-        // Medium: retain scroll/nav state, drop token detail.
-        let medium_width = " glm ".width() + "  idle".width() + compact.width();
-        let medium = build_status_line("glm", "idle", false, None, None, stats, compact, "", medium_width);
-        assert_eq!(medium.spans.len(), 3);
-        assert_eq!(medium.spans[2].content.as_ref(), compact);
+        // Medium: stats no longer fit, so the bar drops to badge+state only.
+        let medium_width = " glm ".width() + "  idle".width();
+        let medium = build_status_line("glm", "idle", false, None, stats, "", medium_width);
+        assert_eq!(medium.spans.len(), 2);
         // Narrow: model and live state remain, everything else disappears.
-        let narrow = build_status_line("glm", "idle", false, None, None, stats, compact, "", 12);
+        let narrow = build_status_line("glm", "idle", false, None, stats, "", 12);
         assert_eq!(narrow.spans.len(), 2);
         // Busy state pops AGENT_FG bold — the one busy color, matching the
         // input chrome; idle is dim and carries no clock.
-        let busy = build_status_line("glm", "running", true, None, None, stats, compact, "", 200);
+        let busy = build_status_line("glm", "running", true, None, stats, "", 200);
         let st = busy.spans[1].style;
         assert_eq!(st.fg, Some(AGENT_FG));
         assert!(st.add_modifier.contains(Modifier::BOLD));
-        let idle = build_status_line("glm", "idle", false, None, None, stats, compact, "", 200);
+        let idle = build_status_line("glm", "idle", false, None, stats, "", 200);
         assert_eq!(idle.spans[1].style.fg, Some(DIM_FG));
         // Model badge keeps its black-on-cyan look.
         assert_eq!(wide.spans[0].style.bg, Some(Color::Cyan));
@@ -3614,23 +3583,17 @@ mod tests {
     #[test]
     fn build_status_line_ctx_outlives_the_stats() {
         let stats = " · 5 in · 6 out";
-        let compact = " · nav";
         let ctx = Some(("ctx 21% (54.7k/256k)", Style::default().fg(DIM_FG)));
         // Wide: ctx sits between the state and the stats, keeping its style.
-        let wide = build_status_line("glm", "idle", false, None, ctx, stats, compact, "", 200);
+        let wide = build_status_line("glm", "idle", false, ctx, stats, "", 200);
         assert_eq!(wide.spans.len(), 4);
         assert_eq!(wide.spans[2].content.as_ref(), " · ctx 21% (54.7k/256k)");
         assert_eq!(wide.spans[2].style.fg, Some(DIM_FG));
         assert_eq!(wide.spans[3].content.as_ref(), stats);
-        // Medium: stats degrade to compact, ctx stays.
-        let medium_width =
-            " glm ".width() + "  idle".width() + " · ctx 21% (54.7k/256k)".width() + compact.width();
-        let medium = build_status_line("glm", "idle", false, None, ctx, stats, compact, "", medium_width);
-        assert_eq!(medium.spans.len(), 4);
-        assert_eq!(medium.spans[3].content.as_ref(), compact);
-        // Narrower still: stats gone entirely, ctx is the last segment standing.
+        // Narrower: stats drop out but ctx stays — it's the most decision-relevant
+        // number, so it outlives the stats and is the last segment standing.
         let ctx_only_width = " glm ".width() + "  idle".width() + " · ctx 21% (54.7k/256k)".width();
-        let minimal = build_status_line("glm", "idle", false, None, ctx, stats, compact, "", ctx_only_width);
+        let minimal = build_status_line("glm", "idle", false, ctx, stats, "", ctx_only_width);
         assert_eq!(minimal.spans.len(), 3);
         assert_eq!(minimal.spans[2].content.as_ref(), " · ctx 21% (54.7k/256k)");
     }
@@ -3660,35 +3623,13 @@ mod tests {
         let stats = " · 5 in · 6 out";
         // Left side uses 5 + 6 + 13 = 24 columns of the 40: the path
         // right-aligns into the remaining 16.
-        let line = build_status_line("glm", "idle", false, None, None, stats, "", "/tmp/proj", 40);
+        let line = build_status_line("glm", "idle", false, None, stats, "/tmp/proj", 40);
         let last = line.spans.last().expect("a path span");
         assert!(last.content.ends_with("/tmp/proj"));
         assert_eq!(line.width(), 40, "left + padded path fills the bar");
-        // Narrow terminal: stats drop to compact AND the path (< 12 left).
-        let line = build_status_line("glm", "idle", false, None, None, stats, " · nav", "/tmp/proj", 26);
+        // Narrow terminal: stats still fit but leave no room for the path.
+        let line = build_status_line("glm", "idle", false, None, stats, "/tmp/proj", 26);
         assert_eq!(line.spans.len(), 3, "no path span: {:?}", line.spans);
-    }
-
-    #[test]
-    fn build_status_line_notice_rides_only_the_full_tier() {
-        let stats = " · 5 in · 6 out";
-        let compact = " · nav";
-        let notice = Some("copied 283 bytes");
-        // Full tier: the notice sits between the state and the stats, dim.
-        let wide = build_status_line("glm", "idle", false, notice, None, stats, compact, "", 200);
-        assert_eq!(wide.spans.len(), 4);
-        assert_eq!(wide.spans[2].content.as_ref(), " · copied 283 bytes");
-        assert_eq!(wide.spans[2].style.fg, Some(DIM_FG));
-        assert_eq!(wide.spans[3].content.as_ref(), stats);
-        // One column short of the full tier: the notice sheds FIRST — the
-        // full stats stay (never the other way round).
-        let full_w = " glm ".width() + "  idle".width() + " · copied 283 bytes".width() + stats.width();
-        let tight = build_status_line("glm", "idle", false, notice, None, stats, compact, "", full_w - 1);
-        assert_eq!(tight.spans.len(), 3);
-        assert_eq!(tight.spans[2].content.as_ref(), stats);
-        // The notice can never squeeze out the badge/state on a tiny bar.
-        let tiny = build_status_line("glm", "idle", false, notice, None, stats, compact, "", 10);
-        assert_eq!(tiny.spans.len(), 2);
     }
 
     #[test]
@@ -4158,16 +4099,18 @@ mod tests {
     }
 
     #[test]
-    fn build_status_line_width_boundary_selects_full_then_compact_stats() {
+    fn build_status_line_width_boundary_keeps_then_drops_stats() {
         let state = "idle · 3s";
         let stats = " · 5 in · 6 out";
-        let compact = " · nav";
         let used = " glm ".width() + format!("  {state}").width() + stats.width();
         let exact = used;
-        let full = build_status_line("glm", state, false, None, None, stats, compact, "", exact);
+        // At the exact fit, the full stats are the third span.
+        let full = build_status_line("glm", state, false, None, stats, "", exact);
         assert_eq!(full.spans[2].content.as_ref(), stats);
-        let compact_line = build_status_line("glm", state, false, None, None, stats, compact, "", exact - 1);
-        assert_eq!(compact_line.spans[2].content.as_ref(), compact);
+        // One column short: stats no longer fit and there's no ctx to fall back
+        // to, so the bar is just badge+state.
+        let dropped = build_status_line("glm", state, false, None, stats, "", exact - 1);
+        assert_eq!(dropped.spans.len(), 2);
     }
 
     #[test]
