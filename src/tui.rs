@@ -397,8 +397,14 @@ fn visible_window(len: usize, sel: usize, max: usize) -> (usize, usize) {
 /// Render the popup rows: "/name [arg]  one-line description", the selected
 /// row in reverse video padded out to the popup's content width (the bar
 /// fills the row, not just the text — same contract as Nav selection).
-fn slash_popup_lines(popup: &SlashPopup) -> Vec<Line<'static>> {
-    let (skip, take) = visible_window(popup.matches.len(), popup.sel, POPUP_MAX_ROWS);
+///
+/// `max_rows` is the live zone height: windowing to the ACTUAL band (not just
+/// the `POPUP_MAX_ROWS` ceiling) keeps the selection on-screen when the command
+/// list is taller than the zone (7 commands in a ~3-row band would otherwise
+/// scroll the highlighted row out the top).
+fn slash_popup_lines(popup: &SlashPopup, max_rows: usize) -> Vec<Line<'static>> {
+    let max = max_rows.clamp(1, POPUP_MAX_ROWS);
+    let (skip, take) = visible_window(popup.matches.len(), popup.sel, max);
     let mut lines: Vec<Line<'static>> = popup.matches[skip..skip + take]
         .iter()
         .map(|c| {
@@ -1111,8 +1117,8 @@ fn ui_loop(
                 // flush above the input box. Already-committed turns live in
                 // the host terminal's scrollback above this viewport.
                 if popup.is_open() {
-                    let lines = slash_popup_lines(&popup);
-                    render_zone_tail(f, zone_rect, &lines);
+                    let lines = slash_popup_lines(&popup, zone_rect.height as usize);
+                    render_zone_top(f, zone_rect, &lines);
                 } else if thinking {
                     let line = Line::from(vec![
                         Span::styled(
@@ -2135,16 +2141,56 @@ fn commit_rows<B: ratatui::backend::Backend>(
     Ok(())
 }
 
-/// Bottom-align `lines` inside `rect` (the transcript zone above the input
-/// box): the last line sits flush against the input box. Used for the slash
-/// popup, the thinking placeholder, and the in-flight streaming row. Lines
-/// beyond the zone's height are scrolled off the top.
-fn render_zone_tail(f: &mut Frame, rect: Rect, lines: &[Line<'static>]) {
-    if rect.height == 0 {
+/// Top-anchored render for a menu (the slash popup): line 0 sits at the top of
+/// `rect`. The caller windows `lines` down to the zone height first (see
+/// `slash_popup_lines`), keeping the selection on-screen — so this just paints
+/// top-down with no scroll, and the highlighted row can never be the one scrolled
+/// out of view.
+fn render_zone_top(f: &mut Frame, rect: Rect, lines: &[Line<'static>]) {
+    if rect.height == 0 || lines.is_empty() {
         return;
     }
-    let scroll = (lines.len() as u16).saturating_sub(rect.height);
-    f.render_widget(Paragraph::new(lines.to_vec()).scroll((scroll, 0)), rect);
+    f.render_widget(Paragraph::new(lines.to_vec()), rect);
+}
+
+/// Bottom-align `lines` inside `rect` (the transcript zone above the input box):
+/// the last line sits flush against the input box. Used for the thinking
+/// placeholder and the in-flight streaming row. When the content FITS it is
+/// padded down to the bottom of the zone; when it OVERFLOWS, a dim `↑ +N`
+/// indicator caps the top and the tail fills the rest — so it's clear the live
+/// answer is taller than the band (the full text commits to scrollback once the
+/// turn ends, and is scrollable there).
+fn render_zone_tail(f: &mut Frame, rect: Rect, lines: &[Line<'static>]) {
+    if rect.height == 0 || lines.is_empty() {
+        return;
+    }
+    let n = lines.len();
+    let h = rect.height as usize;
+    if n <= h {
+        // Fits: pad the top so the last line lands flush above the input box.
+        let pad = (h - n) as u16;
+        let body = if pad > 0 {
+            let [_, b] = Layout::vertical([Constraint::Length(pad), Constraint::Min(0)]).areas(rect);
+            b
+        } else {
+            rect
+        };
+        f.render_widget(Paragraph::new(lines.to_vec()), body);
+        return;
+    }
+    // Overflow: a one-row truncation hint at the top, the tail below it. The
+    // hint occupies one of the h rows, so the content rows left are h-1 — the
+    // hidden count is what the tail CAN'T show.
+    let hidden = n - (h - 1);
+    let hint = Line::from(Span::styled(
+        format!("↑ +{hidden} line{} above", if hidden == 1 { "" } else { "s" }),
+        Style::default().fg(DIM_FG).add_modifier(Modifier::ITALIC),
+    ));
+    let [hint_rect, tail_rect] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(rect);
+    f.render_widget(Paragraph::new(hint), hint_rect);
+    let take = (tail_rect.height as usize).min(n);
+    f.render_widget(Paragraph::new(lines[n - take..].to_vec()), tail_rect);
 }
 
 /// Strip control characters (escape sequences, NUL, …) from external text
@@ -3816,7 +3862,7 @@ mod tests {
     fn slash_popup_lines_format_highlight_and_pad_the_selection() {
         let mut p = SlashPopup::new();
         p.update("/");
-        let lines = slash_popup_lines(&p);
+        let lines = slash_popup_lines(&p, POPUP_MAX_ROWS);
         assert_eq!(lines.len(), SLASH_COMMANDS.len());
         // Row format: "/name" + optional " [arg]" + "  description".
         assert_eq!(
@@ -3836,7 +3882,7 @@ mod tests {
         assert!(!lines[1].style.add_modifier.contains(Modifier::REVERSED));
         // Moving the selection moves the highlight.
         p.next();
-        let lines = slash_popup_lines(&p);
+        let lines = slash_popup_lines(&p, POPUP_MAX_ROWS);
         assert!(!lines[0].style.add_modifier.contains(Modifier::REVERSED));
         assert!(lines[1].style.add_modifier.contains(Modifier::REVERSED));
     }
@@ -4695,6 +4741,71 @@ mod tests {
         let rendered = cells_of(borrowed);
         assert!(rendered.contains("more"), "list text missing: {rendered:?}");
         assert!(rendered.contains('标'), "CJK header glyph missing: {rendered:?}");
+    }
+
+    #[test]
+    fn render_zone_tail_bottom_aligns_short_content_and_truncates_overflow() {
+        // The transcript zone above the input box: content that FITS is padded
+        // to the bottom (latest line flush against the input box); content that
+        // OVERFLOWS gets a dim `↑ +N` hint on top and the tail below it.
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Rect;
+        let rows_of = |lines: Vec<Line<'static>>, h: u16| -> Vec<String> {
+            let area = Rect::new(0, 0, 20, h);
+            let mut term = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+            term.draw(|f| render_zone_tail(f, area, &lines)).unwrap();
+            let buf = term.backend().buffer();
+            (0..area.height)
+                .map(|y| {
+                    (0..area.width)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect()
+        };
+        // Fits (1 line in a 3-row zone): bottom-aligned — the top two rows blank.
+        let out = rows_of(vec![Line::from("only")], 3);
+        assert_eq!(out.len(), 3);
+        assert!(out[0].trim().is_empty(), "top must be blank (bottom-align): {out:?}");
+        assert!(out[1].trim().is_empty(), "middle must be blank: {out:?}");
+        assert!(out[2].trim_start().starts_with("only"), "content on the bottom row: {out:?}");
+        // Overflow (5 lines in a 3-row zone): the hint takes one row, leaving 2
+        // for the tail — so 3 of 5 lines are hidden. Row 0 = hint, rows 1-2 = tail.
+        let many: Vec<Line<'static>> = (0..5u32).map(|i| Line::from(format!("line{i}"))).collect();
+        let out = rows_of(many, 3);
+        assert!(out[0].contains('↑'), "overflow must show the truncation hint: {out:?}");
+        assert!(out[0].contains("+3"), "hint must name the hidden count (3): {out:?}");
+        assert!(out[1].trim_start().starts_with("line3"), "tail row 1 wrong: {out:?}");
+        assert!(out[2].trim_start().starts_with("line4"), "tail must end on the last line: {out:?}");
+    }
+
+    #[test]
+    fn slash_popup_lines_windows_to_zone_height_keeping_selection_visible() {
+        // 7 commands in a 3-row zone: windowing to the ACTUAL height (not the
+        // POPUP_MAX_ROWS ceiling) keeps the highlighted row on-screen wherever
+        // the selection is. The old code rendered all 7 then scrolled the tail,
+        // stranding the selection off the top.
+        let mut p = SlashPopup::new();
+        p.update("/"); // every command starts with '/'
+        assert_eq!(p.matches.len(), SLASH_COMMANDS.len());
+        // Top of the list: window starts at 0, selection (0) is the first row.
+        p.sel = 0;
+        let top = slash_popup_lines(&p, 3);
+        assert_eq!(top.len(), 3, "popup must cap to the zone height");
+        assert!(top[0].style.add_modifier.contains(Modifier::REVERSED));
+        // Bottom of the list: the window follows so the last selection shows.
+        p.sel = SLASH_COMMANDS.len() - 1;
+        let bot = slash_popup_lines(&p, 3);
+        assert_eq!(bot.len(), 3);
+        assert!(
+            bot[2].style.add_modifier.contains(Modifier::REVERSED),
+            "last selection must be the bottom visible row"
+        );
+        let want = format!("/{}", p.matches[p.sel].name);
+        assert!(
+            bot.iter().any(|l| row_text(l).starts_with(&want)),
+            "selected command {want:?} not among visible rows"
+        );
     }
 
     // ── Word motion / line editing (Alt+←→, Ctrl-W/U/K/A/E) ──────────
