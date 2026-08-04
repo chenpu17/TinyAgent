@@ -603,6 +603,39 @@ pub fn run(
     // Cancellation: Esc sets this; the agent checks it at each turn boundary.
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    // Set up the terminal BEFORE spawning the worker. The worker may fire an
+    // initial task immediately (agent.ends_with_user() → run_once), and every
+    // step below can fail with `?` (stdout not a tty, broken pipe, Terminal
+    // creation). When setup preceded the spawn, such a failure returned early
+    // and skipped the cancel/join cleanup below — leaving the agent running API
+    // calls and tools in the background with no UI and no cancel signal. Doing
+    // this first means a setup failure simply returns before any worker exists.
+    enable_raw_mode()?;
+    // Create the restore guard IMMEDIATELY after the first state-changing
+    // call, so a `?` failure in ANY of the steps below (EnableBracketedPaste /
+    // Terminal::with_options — e.g. stdout not a tty, broken pipe) still drops
+    // the guard and restores the terminal. Drop is fully idempotent (every
+    // disable is `let _ =`), so creating the guard before some enables have
+    // run is harmless.
+    let _guard = TerminalGuard;
+    // Bracketed paste: terminals that support it deliver a pasted blob as one
+    // Event::Paste (newlines included) instead of replaying it as keystrokes —
+    // which would hit the Enter handler and send each line as a message.
+    stdout().execute(EnableBracketedPaste)?;
+    // Inline viewport: the TUI lives in a fixed INLINE_HEIGHT-row band at the
+    // bottom of the PRIMARY screen — no alternate screen, no mouse capture.
+    // Finalized conversation turns are committed into the terminal's own
+    // scrollback via Terminal::insert_before, so the host terminal's NATIVE
+    // text selection, scrolling, and search all work on the conversation. The
+    // float-on-redraw selection bug of the full-screen model cannot occur
+    // because the conversation lives in real scrollback, not a redrawn frame.
+    let mut term = Terminal::with_options(
+        ratatui::backend::CrosstermBackend::new(stdout()),
+        TerminalOptions {
+            viewport: Viewport::Inline(INLINE_HEIGHT),
+        },
+    )?;
+
     // The worker thread owns the agent and drives run() per user input.
     let worker_cancel = cancel.clone();
     let worker = std::thread::spawn(move || {
@@ -654,31 +687,6 @@ pub fn run(
         }
     });
 
-    enable_raw_mode()?;
-    // Create the restore guard IMMEDIATELY after the first state-changing
-    // call, so a `?` failure in ANY of the steps below (EnableBracketedPaste /
-    // Terminal::with_options — e.g. stdout not a tty, broken pipe) still drops
-    // the guard and restores the terminal. Drop is fully idempotent (every
-    // disable is `let _ =`), so creating the guard before some enables have
-    // run is harmless.
-    let _guard = TerminalGuard;
-    // Bracketed paste: terminals that support it deliver a pasted blob as one
-    // Event::Paste (newlines included) instead of replaying it as keystrokes —
-    // which would hit the Enter handler and send each line as a message.
-    stdout().execute(EnableBracketedPaste)?;
-    // Inline viewport: the TUI lives in a fixed INLINE_HEIGHT-row band at the
-    // bottom of the PRIMARY screen — no alternate screen, no mouse capture.
-    // Finalized conversation turns are committed into the terminal's own
-    // scrollback via Terminal::insert_before, so the host terminal's NATIVE
-    // text selection, scrolling, and search all work on the conversation. The
-    // float-on-redraw selection bug of the full-screen model cannot occur
-    // because the conversation lives in real scrollback, not a redrawn frame.
-    let mut term = Terminal::with_options(
-        ratatui::backend::CrosstermBackend::new(stdout()),
-        TerminalOptions {
-            viewport: Viewport::Inline(INLINE_HEIGHT),
-        },
-    )?;
     let result = ui_loop(
         &mut term,
         cfg,
@@ -1061,16 +1069,7 @@ fn ui_loop(
         // one place the inline model writes the conversation to scrollback, so
         // the host terminal's native selection/scroll/search cover it.
         let stream_open = streaming || sub_streaming_name.is_some();
-        let mut pending_end = rows.len();
-        while pending_end > committed && matches!(rows[pending_end - 1], Row::Queued(_)) {
-            pending_end -= 1;
-        }
-        if stream_open
-            && pending_end > committed
-            && matches!(rows[pending_end - 1], Row::Assistant(_))
-        {
-            pending_end -= 1;
-        }
+        let pending_end = commit_pending_end(&rows, committed, stream_open);
         if committed < pending_end {
             let width = term.size().map(|s| s.width).unwrap_or(80) as usize;
             commit_rows(term, &rows[committed..pending_end], &mut md_cache, width)?;
@@ -2089,6 +2088,44 @@ fn content_width(term_w: u16) -> usize {
 /// above the inline viewport via `insert_before`. The live region slides down
 /// by exactly the rendered height; the host terminal's native
 /// selection/scroll/search then own those lines.
+/// How far the commit watermark may advance from `committed`. Two things are
+/// held back, never written into the terminal's permanent scrollback:
+///
+/// 1. The **first `Row::Queued` ghost**, and therefore everything after it. A
+///    queued ghost is a placeholder for a not-yet-sent user message; while it
+///    waits, the in-flight run keeps appending real rows after it (tool calls,
+///    tool results, warnings, compress notices, sub-agent rows). The old logic
+///    only stripped *trailing* `Queued` rows, so the moment any real row landed
+///    after a ghost the ghost was no longer trailing and got committed —
+///    permanently leaving a dim placeholder in scrollback, AND breaking the
+///    watermark's own invariant ("only uncommitted ghosts are ever removed"):
+///    `flush_next_queued` would later `remove` that already-committed row,
+///    shifting indices under `committed` and silently dropping the next real
+///    row. Capping at the *first* ghost fixes both: the ghost and every later
+///    row stay out of scrollback until the queue flushes (flush removes only
+///    this still-uncommitted ghost, so the index invariant stays sound).
+/// 2. While a stream is open, a trailing **`Row::Assistant`** — the in-flight
+///    reply is still mutating and is shown live in the viewport, not committed
+///    until the stream closes.
+fn commit_pending_end(rows: &[Row], committed: usize, stream_open: bool) -> usize {
+    // Cap at the first queued ghost (holds the ghost + everything after back).
+    let mut pending_end = match rows[committed..]
+        .iter()
+        .position(|r| matches!(r, Row::Queued(_)))
+    {
+        Some(i) => committed + i,
+        None => rows.len(),
+    };
+    // Hold back an in-flight trailing Assistant while its stream is open.
+    if stream_open
+        && pending_end > committed
+        && matches!(rows[pending_end - 1], Row::Assistant(_))
+    {
+        pending_end -= 1;
+    }
+    pending_end
+}
+
 fn commit_rows<B: ratatui::backend::Backend>(
     term: &mut Terminal<B>,
     rows: &[Row],
@@ -2100,9 +2137,15 @@ fn commit_rows<B: ratatui::backend::Backend>(
     if wrapped.is_empty() {
         return Ok(());
     }
-    let h = wrapped.len() as u16;
+    // Cap at u16::MAX: insert_before's height is a u16, and `y as u16` in the
+    // loop would wrap past 65,535 rendered lines — silently reserving too few
+    // rows while the loop overwrites past them. A single commit reaching that
+    // size is not realistic (a ~65k-line turn), but capping drops the
+    // unreachable tail instead of corrupting the layout.
+    let n = wrapped.len().min(u16::MAX as usize);
+    let h = n as u16;
     term.insert_before(h, |buf: &mut Buffer| {
-        for (y, line) in wrapped.iter().enumerate() {
+        for (y, line) in wrapped[..n].iter().enumerate() {
             // set_line writes the line's spans from x=0, truncating at the
             // buffer's width — which equals `width` (or wider), so the
             // pre-wrapped lines never overflow.
@@ -4045,6 +4088,60 @@ mod tests {
         assert_eq!(out, Flush::Undeliverable);
         assert!(rows.iter().any(|r| matches!(r, Row::User(t) if t == "q3")));
         assert!(rows.iter().any(|r| matches!(r, Row::System { level: SysLevel::Error, .. })));
+    }
+
+    #[test]
+    fn commit_pending_end_advances_to_end_with_no_queue_or_stream() {
+        let rows = vec![Row::User("hi".into()), Row::Assistant("hey".into())];
+        assert_eq!(commit_pending_end(&rows, 0, false), 2);
+    }
+
+    #[test]
+    fn commit_pending_end_holds_back_a_trailing_streaming_assistant() {
+        let rows = vec![Row::User("hi".into()), Row::Assistant("streaming".into())];
+        // Stream open: the in-flight Assistant (last row) stays in the live
+        // viewport, not committed to scrollback until the stream closes.
+        assert_eq!(commit_pending_end(&rows, 0, true), 1);
+    }
+
+    #[test]
+    fn commit_pending_end_holds_back_a_trailing_queued_ghost() {
+        let rows = vec![Row::User("hi".into()), Row::Queued("next".into())];
+        assert_eq!(commit_pending_end(&rows, 0, false), 1);
+    }
+
+    #[test]
+    fn commit_pending_end_holds_back_a_ghost_even_when_a_real_row_follows_it() {
+        // The regression from the audit: while a message is queued, the
+        // in-flight run appends a REAL row (here a system warning) AFTER the
+        // ghost. The old trailing-only strip left the ghost non-trailing and
+        // committed it; the fix caps at the FIRST ghost, so the ghost AND the
+        // later real row stay out of scrollback, while the Assistant before the
+        // ghost still commits.
+        let rows = vec![
+            Row::Assistant("run output".into()),
+            Row::Queued("queued msg".into()),
+            Row::sys_warn("[warn] something"),
+        ];
+        assert_eq!(
+            commit_pending_end(&rows, 0, false),
+            1,
+            "ghost + post-ghost row must stay out of scrollback"
+        );
+    }
+
+    #[test]
+    fn commit_pending_end_respects_an_existing_committed_watermark() {
+        // Mid-conversation: rows[0..1] already committed. Only the uncommitted
+        // prefix up to the ghost (the Assistant) may commit; the ghost and the
+        // following row are held back.
+        let rows = vec![
+            Row::User("u1".into()),      // 0 — committed
+            Row::Assistant("a1".into()),  // 1 — commits
+            Row::Queued("q".into()),      // 2 — cap here
+            Row::sys_warn("late warn"),   // 3 — held back
+        ];
+        assert_eq!(commit_pending_end(&rows, 1, false), 2);
     }
 
     #[test]

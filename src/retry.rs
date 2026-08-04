@@ -14,6 +14,33 @@ pub(crate) fn backoff(attempt: usize) -> Duration {
     backoff_with(attempt, jitter_seed())
 }
 
+/// Sleep for `dur`, but return early (returning `true`) as soon as `cancel` is
+/// set — checking roughly every 100ms. Used between retry attempts so a Ctrl-C
+/// during the (up to ~40s with jitter) backoff is honored within ~100ms instead
+/// of after the whole sleep, which would let the next attempt run a full task
+/// the user just asked to abort. The final sub-100ms tail is slept whole after
+/// one last cancel check, and `cancel` is re-checked on return so a signal
+/// landing in that tail is still caught before the caller proceeds.
+pub(crate) fn sleep_cancelable(cancel: &std::sync::atomic::AtomicBool, dur: Duration) -> bool {
+    use std::sync::atomic::Ordering;
+    const SLICE: Duration = Duration::from_millis(100);
+    let mut remaining = dur;
+    while remaining > SLICE {
+        if cancel.load(Ordering::Relaxed) {
+            return true;
+        }
+        std::thread::sleep(SLICE);
+        remaining = remaining.saturating_sub(SLICE);
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return true;
+    }
+    if remaining > Duration::ZERO {
+        std::thread::sleep(remaining);
+    }
+    cancel.load(Ordering::Relaxed)
+}
+
 /// Base backoff in milliseconds (before jitter).
 fn base_millis(attempt: usize) -> u64 {
     1000u64 << attempt.min(5)
@@ -65,5 +92,28 @@ mod tests {
             let d = backoff(attempt).as_millis() as u64;
             assert!(d >= base * 3 / 4 && d <= base * 5 / 4, "attempt {attempt}: {d}ms");
         }
+    }
+
+    #[test]
+    fn sleep_cancelable_returns_promptly_when_already_cancelled() {
+        use std::sync::atomic::AtomicBool;
+        let cancel = AtomicBool::new(true);
+        let start = Instant::now();
+        let cancelled = sleep_cancelable(&cancel, Duration::from_secs(10));
+        assert!(cancelled);
+        // Already cancelled: the very first check returns without sleeping 10s.
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn sleep_cancelable_sleeps_the_whole_duration_when_not_cancelled() {
+        use std::sync::atomic::AtomicBool;
+        let cancel = AtomicBool::new(false);
+        let start = Instant::now();
+        let cancelled = sleep_cancelable(&cancel, Duration::from_millis(150));
+        assert!(!cancelled);
+        // 150ms = one 100ms slice + a 50ms tail; at least the slice slept.
+        assert!(start.elapsed() >= Duration::from_millis(100));
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 }

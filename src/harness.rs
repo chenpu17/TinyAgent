@@ -72,7 +72,22 @@ pub(crate) fn run_with_retries(
                     } else {
                         eprintln!("[transient] {msg}; retry {attempt}/{retries} in {backoff:?}");
                     }
-                    sleep(backoff);
+                    // Slice the backoff so a Ctrl-C during it is noticed within
+                    // ~100ms (the agent.cancelled() check below then breaks)
+                    // instead of after the full ~40s sleep. The injected `sleep`
+                    // is honored per slice (a no-op in tests).
+                    let mut remaining = backoff;
+                    let slice = std::time::Duration::from_millis(100);
+                    while remaining > slice {
+                        if agent.cancelled() {
+                            break;
+                        }
+                        sleep(slice);
+                        remaining = remaining.saturating_sub(slice);
+                    }
+                    if !agent.cancelled() && remaining > std::time::Duration::ZERO {
+                        sleep(remaining);
+                    }
                     // A Ctrl-C during the backoff flips the cancel flag, but
                     // the next agent.run clears it at entry and would proceed
                     // — making the first Ctrl-C look like a no-op (only the

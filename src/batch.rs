@@ -320,11 +320,11 @@ fn run_one(
             retries,
             backoff,
         );
-        std::thread::sleep(backoff);
-        // Honor a Ctrl-C that landed during the backoff: otherwise the next
-        // run_one_attempt runs to completion (a full task the user wanted to
-        // abort) and only the gate on the NEXT task stops the batch.
-        if cancel.load(Ordering::Relaxed) {
+        // Sleep the backoff in ~100ms slices so a Ctrl-C during it (up to ~40s
+        // with jitter) is honored within ~100ms instead of after the whole
+        // sleep — otherwise the next run_one_attempt runs a full task the user
+        // wanted to abort, and only the gate on the NEXT task stops the batch.
+        if crate::retry::sleep_cancelable(cancel.as_ref(), backoff) {
             report = TaskReport {
                 name: name.into(),
                 success: false,

@@ -432,5 +432,5 @@ src/
 ├── session.rs   (125)  # 会话持久化
 ├── batch.rs     (644)  # 批量任务 + --retries/--failed + 报告合并
 ├── harness.rs   (492)  # headless 模式 + result.json + NDJSON + exit code
-└── tui.rs      (6654)  # TUI（feature-gated）：InputBuffer / 模式 / 斜杠命令+补全弹窗 / markdown+ANSI 渲染 / 导航与鼠标 / bracketed paste
+└── tui.rs      (4978)  # TUI（feature-gated）：内联流式渲染（对话进原生 scrollback，原生选择/滚动/搜索）/ InputBuffer 多行输入+历史 / 斜杠命令+补全弹窗 / markdown+ANSI 渲染 / bracketed paste
 ```
