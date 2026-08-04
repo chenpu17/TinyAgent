@@ -1896,6 +1896,206 @@
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ── end-to-end harness verification: realistic multi-turn, tool-using
+    // tasks driven through harness::run_with_retries (the full agent loop +
+    // real tool execution + event flow + result.json + exit code) — the kind
+    // of scenario a human writes to eval the harness, not single-event units.
+    // All run in-process via MockProvider; retries=0 (retry behavior is pinned
+    // by the single_run_* tests above).
+
+    /// A tool that always returns an error result — verifies the harness
+    /// records tool errors (is_error=true) while the run can still succeed.
+    struct ErrTool;
+    impl Tool for ErrTool {
+        fn def(&self) -> ToolDef {
+            ToolDef {
+                name: "fail".into(),
+                description: "test tool that always errors".into(),
+                schema: json!({"type": "object", "properties": {}}),
+            }
+        }
+        fn run(&self, _input: &Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+            Ok(ToolOutput::error("boom: simulated failure"))
+        }
+    }
+
+    /// Unique result.json path under temp for an E2E harness test (label
+    /// disambiguates parallel tests that share one pid).
+    fn harness_out(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("ta-e2e-{label}-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        (dir.clone(), dir.join("r.json"))
+    }
+
+    #[test]
+    fn harness_tool_task_records_call_tokens_and_succeeds() {
+        // The canonical eval: the model calls a tool, the harness runs it for
+        // real, the model answers. result.json must carry the tool call, the
+        // final summary, accumulated tokens, and success — and the tool must
+        // actually have executed (not merely been recorded).
+        let cfg = cfg_with(5, 0, 100_000); // big compress threshold: no compression
+        let (prov, state) = MockProvider::new(vec![
+            mock::resp_tool("t1", "echo", json!({"x": 1}), mock::mk_usage(50, 7)),
+            mock::resp_text("the answer is 42", mock::mk_usage(30, 5)),
+        ]);
+        let ran = Arc::new(AtomicBool::new(false));
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![Box::new(EchoTool::tracking("echo", ran.clone()))],
+            vec![user_text("go")],
+            test_ctx(),
+        );
+        let (dir, out) = harness_out("tool");
+        let code =
+            crate::harness::run_with_retries(&mut agent, Some(&out), false, 0, |_| {}).unwrap();
+        assert_eq!(code, 0, "recovered → exit 0");
+        assert_eq!(state.calls(), 2, "two turns");
+        assert!(ran.load(Ordering::Relaxed), "the tool must actually have executed");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(parsed["success"], true);
+        assert!(parsed["summary"].as_str().unwrap().contains("42"));
+        assert_eq!(parsed["tool_calls"].as_array().unwrap().len(), 1);
+        assert_eq!(parsed["tool_calls"][0]["name"], "echo");
+        assert_eq!(parsed["tool_calls"][0]["output"].as_str().unwrap(), "ok");
+        assert_eq!(parsed["tool_calls"][0]["is_error"], false);
+        // Tokens accumulate across both turns (50+30 ↑, 7+5 ↓).
+        assert_eq!(parsed["input_tokens"], 80);
+        assert_eq!(parsed["output_tokens"], 12);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn harness_multi_turn_records_each_tool_call_in_order() {
+        // A run that calls two distinct tools across two turns must record both,
+        // in the order they ran.
+        let cfg = cfg_with(5, 0, 100_000);
+        let (prov, state) = MockProvider::new(vec![
+            mock::resp_tool("t1", "a", json!({}), None),
+            mock::resp_tool("t2", "b", json!({}), None),
+            mock::resp_text("done", None),
+        ]);
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![Box::new(EchoTool::new("a")), Box::new(EchoTool::new("b"))],
+            vec![user_text("go")],
+            test_ctx(),
+        );
+        let (dir, out) = harness_out("multi");
+        let code =
+            crate::harness::run_with_retries(&mut agent, Some(&out), false, 0, |_| {}).unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(state.calls(), 3, "a, b, then done");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        let names: Vec<&str> = parsed["tool_calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["a", "b"], "tool calls recorded in order");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn harness_records_a_tool_error_while_still_succeeding() {
+        // A tool that errors is recorded with is_error=true; the run can still
+        // succeed when the model recovers in a following turn.
+        let cfg = cfg_with(5, 0, 100_000);
+        let (prov, state) = MockProvider::new(vec![
+            mock::resp_tool("t1", "fail", json!({}), None),
+            mock::resp_text("recovered after the error", None),
+        ]);
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![Box::new(ErrTool)],
+            vec![user_text("go")],
+            test_ctx(),
+        );
+        let (dir, out) = harness_out("toolerr");
+        let code =
+            crate::harness::run_with_retries(&mut agent, Some(&out), false, 0, |_| {}).unwrap();
+        assert_eq!(code, 0, "model recovered → exit 0");
+        assert_eq!(state.calls(), 2);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(parsed["success"], true);
+        assert_eq!(parsed["tool_calls"][0]["is_error"], true);
+        assert!(parsed["tool_calls"][0]["output"]
+            .as_str()
+            .unwrap()
+            .contains("boom"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn harness_max_turns_runaway_exits_nonzero() {
+        // A task that never stops calling tools hits the max_turns cap: exit 1,
+        // stop_reason max_turns_reached, success false. More mock tool_use turns
+        // than the cap guarantees the limit — not a drained script — ends the
+        // run (so stop_reason is max_turns, never a mock-exhausted "error").
+        let cfg = cfg_with(2, 0, 100_000);
+        let (prov, _state) = MockProvider::new(vec![
+            mock::resp_tool("t1", "echo", json!({}), None),
+            mock::resp_tool("t2", "echo", json!({}), None),
+            mock::resp_tool("t3", "echo", json!({}), None),
+            mock::resp_tool("t4", "echo", json!({}), None),
+        ]);
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![Box::new(EchoTool::new("echo"))],
+            vec![user_text("loop forever")],
+            test_ctx(),
+        );
+        let (dir, out) = harness_out("maxturns");
+        let code =
+            crate::harness::run_with_retries(&mut agent, Some(&out), false, 0, |_| {}).unwrap();
+        assert_eq!(code, 1, "max_turns → exit 1");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(parsed["success"], false);
+        assert_eq!(parsed["stop_reason"], "max_turns_reached");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn harness_json_mode_runs_clean_and_writes_result() {
+        // The json=true (NDJSON) path has no end-to-end test — every other
+        // harness test uses json=false. Drive a real multi-turn, tool-using run
+        // through it so the per-event emit_json path (and the agent-emitted Done
+        // on success) runs without panicking and result.json is still written
+        // with the same contract. NDJSON line content can't be asserted from a
+        // parallel test binary — its schema is locked by the event_json unit
+        // tests; this guards the wiring + result file.
+        let cfg = cfg_with(5, 0, 100_000);
+        let (prov, _state) = MockProvider::new(vec![
+            mock::resp_tool("t1", "echo", json!({"q": "hi"}), mock::mk_usage(10, 2)),
+            mock::resp_text("final via ndjson", mock::mk_usage(5, 3)),
+        ]);
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![Box::new(EchoTool::new("echo"))],
+            vec![user_text("go")],
+            test_ctx(),
+        );
+        let (dir, out) = harness_out("json");
+        let code =
+            crate::harness::run_with_retries(&mut agent, Some(&out), true, 0, |_| {}).unwrap();
+        assert_eq!(code, 0);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(parsed["success"], true);
+        assert_eq!(parsed["tool_calls"].as_array().unwrap().len(), 1);
+        assert!(parsed["summary"].as_str().unwrap().contains("ndjson"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn normalize_adjacent_merges_same_role_neighbors() {
         // [user a][user b] → one user with both blocks; alternation preserved.
