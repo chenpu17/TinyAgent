@@ -17,6 +17,19 @@ struct TaskReport {
     turns: u32,
     elapsed_secs: f64,
     error: Option<String>,
+    // Token totals for the task (honest cost across all attempts, P2). A failed
+    // task that burned tokens before erroring reports them here, not zero —
+    // otherwise report.json undercounts a batch's real spend. `#[serde(default)]`
+    // so prior reports written before these fields existed still parse for
+    // `--failed` (missing ⇒ treated as 0).
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    cache_creation_input_tokens: u64,
+    #[serde(default)]
+    cache_read_input_tokens: u64,
 }
 
 /// Run every `*.json` task fragment in `dir` against the base config,
@@ -174,6 +187,10 @@ pub fn run(
                         turns: 0,
                         elapsed_secs: 0.0,
                         error: Some("cancelled by user (not started)".into()),
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
                     }
                 } else {
                     run_one(base, &name, partial, &results_dir, &client, retries, &cancel)
@@ -248,14 +265,22 @@ fn run_one_attempt(
     acc: &mut RunCost,
 ) -> TaskReport {
     let start = std::time::Instant::now();
-    let bad = |stop: &str, msg: String| TaskReport {
+    // `usage` is the token cost to bill this report. bad_task / setup_error burn
+    // nothing (zero); the transient-error path bills the accumulated cost across
+    // attempts (passed in from the caller after `acc.add_failed`).
+    let bad = |stop: &str, msg: String, usage: &crate::provider::Usage| TaskReport {
         name: name.into(),
         success: false,
         stop_reason: stop.into(),
         turns: 0,
         elapsed_secs: start.elapsed().as_secs_f64(),
         error: Some(msg),
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cache_creation_input_tokens: usage.cache_creation_input_tokens,
+        cache_read_input_tokens: usage.cache_read_input_tokens,
     };
+    let zero = crate::provider::Usage::default();
 
     let mut cfg = base.clone();
     if let Some(field) = partial.forbidden_batch_override() {
@@ -265,15 +290,17 @@ fn run_one_attempt(
                 "task file must not override '{field}' (only task/system_prompt/model/max_tokens/limits \
                  are overridable in batch mode)"
             ),
+            &zero,
         );
     }
     if let Err(e) = cfg.apply(partial.clone()) {
-        return bad("bad_task", format!("{e:#}"));
+        return bad("bad_task", format!("{e:#}"), &zero);
     }
     if cfg.task.is_none() {
         return bad(
             "bad_task",
             "task file did not set \"task\" and base config has none".into(),
+            &zero,
         );
     }
 
@@ -287,7 +314,7 @@ fn run_one_attempt(
     ])];
     let mut agent = match crate::build_agent(&cfg, initial, client) {
         Ok(a) => a,
-        Err(e) => return bad("setup_error", format!("agent setup failed: {e:#}")),
+        Err(e) => return bad("setup_error", format!("agent setup failed: {e:#}"), &zero),
     };
 
     let outcome = agent.run(&mut |_| {}); // quiet: no per-event printing
@@ -303,7 +330,7 @@ fn run_one_attempt(
             // not claim success while the result file is missing.
             let mut error = None;
             if let Err(e) =
-                harness::write_result(&results_dir.join(format!("{name}.json")), Some(&o), None, attempt_no, "error")
+                harness::write_result(&results_dir.join(format!("{name}.json")), Some(&o), None, attempt_no, "error", None)
             {
                 eprintln!("[warn] {name}: failed to write result file: {e:#}");
                 error = Some(format!("result file not written: {e:#}"));
@@ -316,6 +343,10 @@ fn run_one_attempt(
                 turns: o.turns,
                 elapsed_secs: o.elapsed.as_secs_f64(),
                 error,
+                input_tokens: o.input_tokens,
+                output_tokens: o.output_tokens,
+                cache_creation_input_tokens: o.cache_creation_input_tokens,
+                cache_read_input_tokens: o.cache_read_input_tokens,
             }
         }
         Err(re) => {
@@ -323,7 +354,9 @@ fn run_one_attempt(
             // and ran tools — accumulate them so the next attempt (if any)
             // bills them, and so a final success isn't undercosted.
             acc.add_failed(&re);
-            bad("error", format!("{re:#}"))
+            // Bill the accumulated cost (this attempt + any prior retries) so a
+            // failed task reports honest token totals in report.json, not zero.
+            bad("error", format!("{re:#}"), &acc.usage)
         }
     }
 }
@@ -373,6 +406,12 @@ fn run_one(
                 turns: report.turns,
                 elapsed_secs: start.elapsed().as_secs_f64(),
                 error: Some("cancelled by user during retry backoff".into()),
+                // Preserve the tokens burned by the failed attempts before the
+                // cancel (P2): a cancelled retry still cost real money.
+                input_tokens: acc.usage.input_tokens,
+                output_tokens: acc.usage.output_tokens,
+                cache_creation_input_tokens: acc.usage.cache_creation_input_tokens,
+                cache_read_input_tokens: acc.usage.cache_read_input_tokens,
             };
             break;
         }
@@ -441,6 +480,10 @@ fn write_report(path: &Path, reports: &[TaskReport]) -> Result<()> {
                 "stop_reason": r.stop_reason,
                 "turns": r.turns,
                 "elapsed_secs": r.elapsed_secs,
+                "input_tokens": r.input_tokens,
+                "output_tokens": r.output_tokens,
+                "cache_creation_input_tokens": r.cache_creation_input_tokens,
+                "cache_read_input_tokens": r.cache_read_input_tokens,
                 "error": r.error,
             })
         })
@@ -509,6 +552,10 @@ mod tests {
             turns: 1,
             elapsed_secs: 1.0,
             error: if success { None } else { Some("e".into()) },
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
         }
     }
 

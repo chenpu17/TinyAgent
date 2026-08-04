@@ -79,9 +79,9 @@ trait Transport: Send {
     fn request(&mut self, id: u64, method: &str, params: Value) -> Result<Value>;
     fn notify(&mut self, method: &str, params: Value) -> Result<()>;
     /// Arm cancel-aware teardown. Default no-op; `StdioTransport` overrides it
-    /// to spawn a reaper that kills the child process group on cancel, so a
-    /// stuck call unblocks (see `StdioTransport::set_cancel`).
-    fn set_cancel(&mut self, _cancel: &Arc<AtomicBool>) {}
+    /// to spawn a reaper that kills the child process group on shutdown, so a
+    /// stuck call unblocks (see `StdioTransport::set_shutdown`).
+    fn set_shutdown(&mut self, _shutdown: &Arc<AtomicBool>) {}
 }
 
 pub struct McpClient {
@@ -150,11 +150,12 @@ impl McpClient {
         Ok((client, infos))
     }
 
-    /// Arm cancel-aware teardown on the underlying transport (stdio servers
-    /// spawn a reaper that kills the child on cancel). Called by the agent
-    /// when it receives its shared cancel flag, via `McpTool::set_cancel`.
-    pub(crate) fn set_cancel(&mut self, cancel: &Arc<AtomicBool>) {
-        self.transport.set_cancel(cancel);
+    /// Arm teardown on the underlying transport (stdio servers spawn a reaper
+    /// that kills the child on shutdown). Called by the agent via
+    /// `McpTool::set_shutdown` when the FRONTEND wires a shutdown signal
+    /// (distinct from the per-turn cancel flag — see `StdioTransport`).
+    pub(crate) fn set_shutdown(&mut self, shutdown: &Arc<AtomicBool>) {
+        self.transport.set_shutdown(shutdown);
     }
 
     fn notify(&mut self, method: &str, params: Value) -> Result<()> {
@@ -257,14 +258,17 @@ struct StdioTransport {
     child: std::process::Child,
     stdin: std::process::ChildStdin,
     pending: Pending,
-    /// Cleared in Drop so the cancel-reaper stops referencing this child once
+    /// Cleared in Drop so the shutdown-reaper stops referencing this child once
     /// it's reaped — a kill on a process-group id the OS later reused for an
     /// unrelated process would be catastrophic. Shared with the reaper thread.
     alive: Arc<AtomicBool>,
-    /// The cancel-reaper thread (spawned by `set_cancel`), joined in Drop so it
-    /// is guaranteed done BEFORE `wait()` reaps the pid. That closes the
+    /// The shutdown-reaper thread (spawned by `set_shutdown`), joined in Drop so
+    /// it is guaranteed done BEFORE `wait()` reaps the pid. That closes the
     /// stale-pgid window: the reaper only ever kills while `alive` is true,
-    /// i.e. while this transport still owns the live child.
+    /// i.e. while this transport still owns the live child. The reaper watches
+    /// the **shutdown** flag (session end), NOT the per-turn `cancel` flag —
+    /// killing the MCP child is irreversible, so it must never fire on a
+    /// recoverable turn-interrupt.
     reaper: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -370,16 +374,23 @@ impl StdioTransport {
     }
 }
 
-/// Spawn the cancel-reaper used by `StdioTransport::set_cancel`: a worker that
-/// kills the child's whole process group the moment `cancel` fires, then exits.
-/// Factored out so the kill-on-cancel behavior is unit-testable with a real
-/// subprocess. `alive` is cleared by `StdioTransport::drop` to stand the reaper
-/// down once the child is reaped (so it never kills a process-group id the OS
-/// has reused for an unrelated process).
+/// Spawn the shutdown-reaper used by `StdioTransport::set_shutdown`: a worker
+/// that kills the child's whole process group the moment `shutdown` fires, then
+/// exits. Factored out so the kill-on-shutdown behavior is unit-testable with a
+/// real subprocess. `alive` is cleared by `StdioTransport::drop` to stand the
+/// reaper down once the child is reaped (so it never kills a process-group id
+/// the OS has reused for an unrelated process).
+///
+/// **Why `shutdown`, not the run's `cancel` flag**: `cancel` is overloaded —
+/// both "interrupt the current turn" (TUI Esc/Ctrl-C, recoverable: the next
+/// turn reuses the same MCP server) and "the session is ending". Killing the
+/// MCP child is irreversible (no server restart), so the reaper must only fire
+/// on the latter. `shutdown` is a separate signal the frontend sets ONLY on
+/// session end (TUI quit), never on a per-turn cancel.
 fn spawn_reaper(
     pgid: i32,
     alive: Arc<AtomicBool>,
-    cancel: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("mcp-reaper".into())
@@ -387,7 +398,7 @@ fn spawn_reaper(
             #[cfg(unix)]
             {
                 while alive.load(Ordering::Relaxed) {
-                    if cancel.load(Ordering::Relaxed) {
+                    if shutdown.load(Ordering::Relaxed) {
                         // ESRCH (already reaped) is harmless.
                         unsafe { libc::kill(-pgid, libc::SIGKILL) };
                         return;
@@ -398,7 +409,7 @@ fn spawn_reaper(
             }
             #[cfg(not(unix))]
             {
-                let _ = (pgid, alive, cancel);
+                let _ = (pgid, alive, shutdown);
             }
         })
         .expect("spawn mcp-reaper thread")
@@ -434,17 +445,23 @@ impl Transport for StdioTransport {
         Ok(())
     }
 
-    /// Arm cancel-aware teardown: spawn a reaper that kills the child's whole
-    /// process group the moment cancel fires. This unblocks a stuck MCP call —
-    /// the worker is blocked in `request()` waiting on a server that never
-    /// responds; killing the child → its stdout EOFs → the reader thread exits
-    /// → `pending_fail_all` → the blocked `request()` returns Err → the worker
-    /// proceeds, the run ends, the agent is dropped, and `Drop` kills+reaps
-    /// cleanly. Without this, a TUI quit's bounded join (3s) times out while
-    /// the worker is stuck in a 120s `CALL_TIMEOUT`, the worker detaches with
-    /// the agent undropped, and the MCP server child is orphaned (reparented to
-    /// init). Idempotent: arming twice is a no-op.
-    fn set_cancel(&mut self, cancel: &Arc<AtomicBool>) {
+    /// Arm shutdown-aware teardown: spawn a reaper that kills the child's whole
+    /// process group the moment **shutdown** (session end) fires. This unblocks
+    /// a stuck MCP call on quit — the worker is blocked in `request()` waiting
+    /// on a server that never responds; killing the child → its stdout EOFs →
+    /// the reader thread exits → `pending_fail_all` → the blocked `request()`
+    /// returns Err → the worker proceeds, the run ends, the agent is dropped,
+    /// and `Drop` kills+reaps cleanly. Without this, a TUI quit's bounded join
+    /// (3s) times out while the worker is stuck in a 120s `CALL_TIMEOUT`, the
+    /// worker detaches with the agent undropped, and the MCP server child is
+    /// orphaned (reparented to init). Idempotent: arming twice is a no-op.
+    ///
+    /// **`shutdown`, not `cancel`**: the run's `cancel` flag is also raised on
+    /// a recoverable per-turn interrupt (TUI Esc / Ctrl-C), where the next turn
+    /// reuses the same MCP server. Killing the child there is a correctness
+    /// defect (no restart) — so the reaper is armed on a SEPARATE shutdown
+    /// signal the frontend sets ONLY on session end, never on a turn cancel.
+    fn set_shutdown(&mut self, shutdown: &Arc<AtomicBool>) {
         if self.reaper.is_some() {
             return;
         }
@@ -454,21 +471,21 @@ impl Transport for StdioTransport {
             self.reaper = Some(spawn_reaper(
                 self.child.id() as i32,
                 self.alive.clone(),
-                cancel.clone(),
+                shutdown.clone(),
             ));
         }
         // Off unix there are no process groups; Drop's child.kill() handles
-        // teardown, and cancel can't pre-empt a stuck read here.
+        // teardown, and shutdown can't pre-empt a stuck read here.
         #[cfg(not(unix))]
         {
-            let _ = cancel;
+            let _ = shutdown;
         }
     }
 }
 
 impl Drop for StdioTransport {
     fn drop(&mut self) {
-        // Stand the cancel-reaper down BEFORE reaping. Setting alive=false
+        // Stand the shutdown-reaper down BEFORE reaping. Setting alive=false
         // makes its loop exit; joining guarantees it has fully exited before
         // `wait()` reaps the pid below — so the reaper can never kill a
         // process-group id the OS has already reused for another process. The
@@ -866,14 +883,18 @@ fn resolve_endpoint(sse_url: &str, endpoint: &str) -> Result<String> {
 mod tests {
     use super::*;
 
-    /// P2-6: arming the cancel-reaper and firing cancel must kill the child's
-    /// whole process group — this is what unblocks a stuck MCP call on TUI
-    /// quit / Ctrl-C so the agent can drop instead of leaving the server
-    /// orphaned (reparented to init). Mirrors StdioTransport::spawn's
-    /// process-group setup so the reaper's group kill (-pgid) reaches the child.
+    /// P2-6: arming the shutdown-reaper and firing shutdown must kill the child's
+    /// whole process group — this is what unblocks a stuck MCP call on TUI quit
+    /// so the agent can drop instead of leaving the server orphaned (reparented
+    /// to init). Mirrors StdioTransport::spawn's process-group setup so the
+    /// reaper's group kill (-pgid) reaches the child.
+    ///
+    /// Note the reaper watches `shutdown` (session end), NOT `cancel`: a
+    /// per-turn cancel is recoverable and must leave the server alive for the
+    /// next turn. This test exercises the teardown path only.
     #[cfg(unix)]
     #[test]
-    fn reaper_kills_child_process_group_on_cancel() {
+    fn reaper_kills_child_process_group_on_shutdown() {
         use std::os::unix::process::CommandExt;
         use std::process::Command;
         // A long sleep stands in for a wedged MCP server that never responds.
@@ -882,22 +903,22 @@ mod tests {
         let mut child = cmd.spawn().expect("spawn sleep");
         let pgid = child.id() as i32;
         let alive = Arc::new(AtomicBool::new(true));
-        let cancel = Arc::new(AtomicBool::new(false));
-        let reaper = spawn_reaper(pgid, alive.clone(), cancel.clone());
-        // Before cancel, the child must stay alive (no spurious kill).
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let reaper = spawn_reaper(pgid, alive.clone(), shutdown.clone());
+        // Before shutdown, the child must stay alive (no spurious kill).
         std::thread::sleep(Duration::from_millis(150));
         assert!(
             child.try_wait().ok().flatten().is_none(),
-            "child should still be alive before cancel"
+            "child should still be alive before shutdown"
         );
-        // Fire cancel → reaper SIGKILLs the group → child dies well inside the
+        // Fire shutdown → reaper SIGKILLs the group → child dies well inside the
         // 30s sleep (reaper polls every 100ms).
-        cancel.store(true, Ordering::Relaxed);
+        shutdown.store(true, Ordering::Relaxed);
         let died = (0..40).any(|_| {
             std::thread::sleep(Duration::from_millis(50));
             child.try_wait().ok().flatten().is_some()
         });
-        assert!(died, "reaper did not kill the child within ~2s of cancel");
+        assert!(died, "reaper did not kill the child within ~2s of shutdown");
         let _ = child.wait(); // reap to avoid a zombie
         // The reaper returned right after the kill; joining must not block.
         let _ = reaper.join();
@@ -916,10 +937,10 @@ mod tests {
         cmd.arg("30").process_group(0);
         let mut child = cmd.spawn().expect("spawn sleep");
         let alive = Arc::new(AtomicBool::new(true));
-        let cancel = Arc::new(AtomicBool::new(false));
-        let reaper = spawn_reaper(child.id() as i32, alive.clone(), cancel);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let reaper = spawn_reaper(child.id() as i32, alive.clone(), shutdown);
         std::thread::sleep(Duration::from_millis(150));
-        // Drop the "transport": clear alive (reaper stands down) WITHOUT cancel.
+        // Drop the "transport": clear alive (reaper stands down) WITHOUT shutdown.
         alive.store(false, Ordering::Relaxed);
         // Reaper must exit promptly (≤ its 100ms poll granularity).
         let joined = (0..40).any(|_| {

@@ -601,7 +601,15 @@ pub fn run(
     // Worker → UI: agent events.
     let (out_tx, out_rx) = mpsc::channel::<UiMsg>();
     // Cancellation: Esc sets this; the agent checks it at each turn boundary.
+    // This is the RECOVERABLE per-turn interrupt — the next turn reuses the same
+    // MCP server child, so it must never tear it down.
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Teardown: set ONLY on session end (the quit path below), never on a
+    // per-turn Esc. The MCP shutdown-reaper watches this — firing it kills the
+    // server child so a stuck call unblocks on quit. Split from `cancel` so a
+    // recoverable turn-interrupt doesn't irreversibly kill the MCP server the
+    // next turn couldn't restart (P1 audit fix).
+    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Set up the terminal BEFORE spawning the worker. The worker may fire an
     // initial task immediately (agent.ends_with_user() → run_once), and every
@@ -638,12 +646,16 @@ pub fn run(
 
     // The worker thread owns the agent and drives run() per user input.
     let worker_cancel = cancel.clone();
+    let worker_shutdown = shutdown.clone();
     let worker = std::thread::spawn(move || {
         // Signal completion on ANY exit (normal loop end or early return) via
         // Drop, so the quit path can join within a bounded wait.
         let _done = DoneSignal(done_tx);
         let mut agent = agent;
         agent.set_cancel(worker_cancel);
+        // Arm the MCP shutdown-reaper on the session-end flag (NOT cancel): a
+        // per-turn Esc leaves the server alive; only a real quit kills it.
+        agent.set_shutdown(worker_shutdown);
 
         // Run one agent turn. Returns false once the UI has gone away
         // (out_rx dropped) so the loop can stop instead of pushing into
@@ -701,13 +713,21 @@ pub fn run(
     // errors out below, the worker has already been told to stop (and is
     // detached on scope exit) instead of running unchecked to its next limit.
     cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    // Session end: fire the SEPARATE teardown flag so the MCP shutdown-reaper
+    // kills a wedged server child and unblocks the worker's bounded join below.
+    // (cancel alone won't: the worker may be stuck inside a 120s MCP call, not
+    // at a turn boundary where cancel is checked.) This is the ONLY place
+    // shutdown is raised — a per-turn Esc never reaches here.
+    shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
     drop(in_tx); // signal worker to exit
     // Wait a bounded time for the worker to actually exit. A cancel-aware
     // shell kills its process group within ~50ms, so joining here prevents the
     // orphan-on-quit case where the process exits mid-tool and reparents a
-    // running shell to init. A wedged, non-cancel-aware tool (e.g. a stuck MCP
-    // call up to its timeout) just lets this time out — we then detach as
-    // before, never hanging exit.
+    // running shell to init. A wedged MCP call is now killed by the shutdown
+    // reaper armed above (child killed → stdout EOF → blocked request returns)
+    // within the reaper's 100ms poll, so it too unblocks here. A genuinely
+    // non-cancel-aware tool with no teardown just lets this time out — we then
+    // detach as before, never hanging exit.
     let _ = done_rx.recv_timeout(Duration::from_secs(3));
     drop(worker); // detach if the worker is still stuck past the deadline
     // Restore the terminal BEFORE reporting discarded queued messages — a note

@@ -286,6 +286,14 @@ fn main() -> Result<()> {
         // reads Ctrl-C as a key event in raw mode.
         let cancel = Arc::new(AtomicBool::new(false));
         agent.set_cancel(cancel.clone());
+        // Headless Ctrl-C always precedes process exit, so the per-turn cancel
+        // and the session-end teardown coincide here: arm the MCP shutdown-reaper
+        // on the SAME flag so a Ctrl-C stuck inside an MCP call (blocked in the
+        // 120s CALL_TIMEOUT, not at a turn boundary) still unblocks by killing
+        // the server child — the run then ends and `drop(agent)` reaps cleanly.
+        // (In the TUI these are SEPARATE flags: a per-turn Esc must NOT kill the
+        // server the next turn reuses.)
+        agent.set_shutdown(cancel.clone());
         signal::install_sigint_cancel(cancel);
         let code = harness::run(&mut agent, cli.output.as_deref(), cli.json, cli.retries)?;
         // Drop the agent before exit so MCP stdio children are killed via

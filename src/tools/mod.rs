@@ -79,13 +79,21 @@ pub trait Tool: Send + Sync {
         self.run(input, ctx)
     }
 
-    /// Receive the run's shared cancel flag. Tools that own un-interruptible
-    /// blocking resources (an MCP stdio server's child process) override this
-    /// to arm a watcher that tears the resource down on cancel — so a stuck
-    /// call unblocks (the worker can then drop the agent) instead of leaving
-    /// the resource orphaned when the frontend gives up waiting. Default no-op
-    /// for leaf tools with nothing to tear down.
-    fn set_cancel(&mut self, _cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>) {}
+    /// Receive a SEPARATE shutdown flag, distinct from the run's per-turn
+    /// `cancel` flag. Tools that own un-interruptible blocking resources (an MCP
+    /// stdio server's child process) override this to arm a watcher that tears
+    /// the resource down on **session end** — so a stuck call unblocks (the
+    /// worker can then drop the agent) instead of leaving the resource orphaned
+    /// when the frontend gives up waiting. Default no-op for leaf tools with
+    /// nothing to tear down.
+    ///
+    /// Why a separate flag from `cancel`: `cancel` is also raised on a
+    /// recoverable per-turn interrupt (TUI Esc / Ctrl-C), where the next turn
+    /// reuses the same resource. Tearing down (e.g. killing the MCP server) is
+    /// irreversible there, so teardown must be armed on `shutdown`, which the
+    /// frontend sets ONLY on session end. The per-turn `cancel` flag is wired
+    /// separately via `ToolCtx` and never reaches this method.
+    fn set_shutdown(&mut self, _shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>) {}
 }
 
 /// Instantiate the built-in tools named in the config whitelist.

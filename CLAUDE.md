@@ -51,8 +51,11 @@ cargo clippy --all-targets                # lint headless 版（两个 feature �
 - **`retry.rs`** 是 batch `--retries` 与单跑瞬态重试共用的退避模块：指数 1/2/4/8/16/32s 封顶 + ±25%
   jitter（防并发 worker lockstep 踩踏同一个过载 provider）。只重试 transient（`stop_reason == "error"`）。
   **重试诚实成本**：`agent.run()` 失败返回 `RunError`（带 `usage` + `tool_calls`——失败轮已烧的 token / 已跑的
-  tool，副作用已落盘）；`harness::run_with_retries` 与 batch `run_one` 用 `RunCost` 累计失败轮成本，fold 进
-  最终成功 outcome 再写 `result.json`（`RunCost::fold_into`/`add_failed`）。改重试/返回类型的人要保住这条。
+  tool，副作用已落盘）；`harness::run_with_retries` 与 batch `run_one` 用 `RunCost` 累计失败轮成本：成功则 fold 进
+  最终 outcome 再写 `result.json`（`RunCost::fold_into`）；**全部失败**（重试耗尽 / 取消）也把 acc 传给
+  `write_result` 的 None 分支（`write_result(..., Some(&acc))`）写入 token + tool_calls，而不是清零；batch 的
+  `TaskReport` 同样带 4 个 token 字段，失败任务的 report.json 照计 acc（`run_one_attempt` 的 Err 路径用 `&acc.usage`，
+  取消路径亦然）。`RunCost::add_failed`/`fold_into` 是共用的累加原语。改重试/返回类型/写结果文件的人要保住这条。
 - **headless Ctrl-C** 走 `signal.rs`：首次 SIGINT 翻 cancel 标志（流式 ≤200ms 内断，照常写
   `result.json`，exit 130），二次 SIGINT `libc::_exit(130)` 立即退。handler 只碰 lock-free 原子 + `_exit`
   （async-signal-safe）。**批量模式**（`batch::run`）也装它：cancel 标志由 worker 在起任务前 gate
@@ -76,12 +79,21 @@ cargo clippy --all-targets                # lint headless 版（两个 feature �
 - **`panic = "abort"`（`[profile.release]`）**：release 下 panic **不触发 `Drop`**。TUI 的终端还原
   (`TerminalGuard`)、MCP 子进程清理（`StdioTransport::drop`）都依赖 Drop——调试这些行为用
   **debug 构建**。`std::process::exit` 也跳过 Drop，headless 模式退出前显式 `drop(agent)`。
-  **MCP stdio 现在有 cancel-aware teardown**：`Agent::set_cancel` 把 cancel Arc 经 `Tool::set_cancel`→
-  `McpTool`→`McpClient`→`StdioTransport::set_cancel` 传下去，后者 spawn 一个 `mcp-reaper` 线程（`spawn_reaper`），
-  cancel 一翻就 `libc::kill(-pgid, SIGKILL)` 杀整个进程组——卡死的 MCP 调用（worker 阻塞在 `request()` 等
-  120s `CALL_TIMEOUT`）由此立即解锁（child 死 → stdout EOF → reader 退 → `pending_fail_all`），worker 才能
-  drop agent、走正常 Drop 清理。否则 TUI 退出 3s join 超时 detach → agent 没 drop → MCP server 变孤儿。
-  reaper 用 `alive` Arc + Drop 里 `join` 保证不在 child 被 reap 后误杀被 OS 复用的 pgid。改这条链路别漏传 cancel。
+  **MCP stdio 有 shutdown-aware teardown（cancel 与 shutdown 是两个独立标志）**：
+  `Agent::set_shutdown` 把一个**独立于 cancel** 的 shutdown Arc 经 `Tool::set_shutdown`→
+  `McpTool`→`McpClient`→`StdioTransport::set_shutdown` 传下去，后者 spawn 一个 `mcp-reaper` 线程
+  （`spawn_reaper`），**shutdown** 一翻就 `libc::kill(-pgid, SIGKILL)` 杀整个进程组——卡死的 MCP 调用
+  （worker 阻塞在 `request()` 等 120s `CALL_TIMEOUT`）由此立即解锁（child 死 → stdout EOF → reader 退 →
+  `pending_fail_all`），worker 才能 drop agent、走正常 Drop 清理。否则 TUI 退出 3s join 超时 detach →
+  agent 没 drop → MCP server 变孤儿。reaper 用 `alive` Arc + Drop 里 `join` 保证不在 child 被 reap 后误杀
+  被 OS 复用的 pgid。
+  **为什么是 shutdown 而不是 cancel**：`cancel` 是**可恢复的轮中断**（TUI Esc/Ctrl-C，下一轮复用同一个
+  MCP server），杀 child 是不可逆的（无重启）——所以 reaper 只能监听 shutdown。shutdown 由前端**仅在会话
+  结束**时置位：TUI 退出路径（`tui::run` 末尾）同时置 cancel + shutdown；headless Ctrl-C 总在进程退出前，
+  故 cancel 与 shutdown 重合（`main.rs` 用同一个 Arc 调 `set_cancel` + `set_shutdown`）。**轮取消（TUI 忙时
+  Esc）只置 cancel、不置 shutdown**，MCP server 不被杀。`Agent::set_cancel` **不再**向 tools 传播（删掉了
+  那个 for 循环）；改这条链路别把 reaper 接回 cancel，也别给 `set_cancel` 加回 tools 传播。子 agent 共享父的
+  MCP client（Arc-clone），父的 `set_shutdown` 已在共享 client 上 arm 了 reaper，子 agent 不必再调。
 - **`serde_json::json!` 宏按所有权取值**：`From<&Value>` / `From<Option<_>>` 不存在。给宏传
   `&String`/`&Value` 要 `.clone()`；`Option<&str>` 要显式转成 `Value::Null` 或 `json!(s)`。
 - **Anthropic 不允许相邻两条 user 消息**（400）；且 N 个 `tool_use` 必须配 N 个 `tool_result`。

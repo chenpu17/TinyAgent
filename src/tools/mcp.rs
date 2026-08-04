@@ -104,15 +104,18 @@ impl Tool for McpTool {
         })
     }
 
-    /// Forward the run's cancel flag to the shared MCP client, which arms
-    /// cancel-aware teardown on the transport (a stdio server's child gets
-    /// killed on cancel, unblocking a stuck call so the agent can drop). All
-    /// McpTools sharing this client arm the same reaper idempotently.
-    fn set_cancel(&mut self, cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    /// Forward the session-end shutdown flag to the shared MCP client, which
+    /// arms shutdown-aware teardown on the transport (a stdio server's child is
+    /// killed on shutdown, unblocking a stuck call so the agent can drop). This
+    /// is the **session-end** signal, NOT the per-turn cancel — the latter is
+    /// recoverable and must leave the server alive for the next turn, so it
+    /// never reaches the reaper. All McpTools sharing this client arm the same
+    /// reaper idempotently.
+    fn set_shutdown(&mut self, shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
         self.client
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .set_cancel(cancel);
+            .set_shutdown(shutdown);
     }
 }
 

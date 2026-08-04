@@ -139,7 +139,7 @@ impl std::error::Error for RunError {
 /// `run_one`, which both accumulate each failed attempt's `RunError` cost and
 /// fold it into the final outcome they report.
 #[derive(Default, Clone)]
-pub(crate) struct RunCost {
+pub struct RunCost {
     pub usage: Usage,
     pub tool_calls: Vec<ToolCallRecord>,
 }
@@ -182,7 +182,17 @@ pub struct Agent {
     ctx: ToolCtx,
     session_path: Option<std::path::PathBuf>,
     /// Set by the frontend (e.g. TUI Esc) to stop at the next turn boundary.
+    /// This is the RECOVERABLE per-turn interrupt: the next turn reuses the
+    /// same agent, tools, and (notably) the same MCP server child. So it must
+    /// NEVER tear down an irreversible resource.
     cancel: Option<Arc<AtomicBool>>,
+    /// Separate teardown signal, armed on tools via `set_shutdown`. The frontend
+    /// sets this ONLY on session end (TUI quit), never on a per-turn cancel.
+    /// Tools that own un-interruptible blocking resources (MCP stdio servers)
+    /// arm a watcher on it to kill their child — unblocking a stuck call so the
+    /// agent can drop. Split from `cancel` so a recoverable turn-interrupt does
+    /// not irreversibly kill the MCP server (no restart) the audit found.
+    shutdown: Option<Arc<AtomicBool>>,
     /// One compression failure disables further attempts for this run,
     /// so a persistent error doesn't retry (and warn) every single turn.
     compress_failed: bool,
@@ -223,25 +233,40 @@ impl Agent {
             ctx,
             session_path: None,
             cancel: None,
+            shutdown: None,
             compress_failed: false,
             usage: Usage::default(),
             tool_schema_chars,
         }
     }
 
-    /// Attach a cancellation flag; checked at every turn boundary and shared
-    /// with tools (via ToolCtx) so a running shell can be interrupted too,
-    /// not only the streaming read.
+    /// Attach the RECOVERABLE per-turn cancellation flag; checked at every
+    /// turn boundary and shared with tools (via ToolCtx) so a running shell can
+    /// be interrupted too, not only the streaming read.
+    ///
+    /// Deliberately does NOT arm teardown on tools. The per-turn cancel is
+    /// recoverable — the next turn reuses the same agent and the same MCP server
+    /// child — so killing the server here would be an irreversible defect.
+    /// Teardown (for tools that need it, e.g. MCP stdio servers) is armed on the
+    /// separate `set_shutdown` signal, which the frontend fires ONLY on session
+    /// end. (P1 audit fix: previously this propagated `cancel` to the MCP
+    /// reaper, so a TUI Esc killed the server the next turn couldn't reuse.)
     pub fn set_cancel(&mut self, flag: Arc<AtomicBool>) {
         self.ctx.cancel = Some(flag.clone());
-        // Arm cancel-aware teardown on tools that own un-interruptible blocking
-        // resources (MCP stdio servers): on cancel they kill their child so a
-        // stuck call unblocks and the agent can drop — otherwise the child is
-        // orphaned when the frontend stops waiting (TUI quit / Ctrl-C).
-        for t in &mut self.tools {
-            t.set_cancel(&flag);
-        }
         self.cancel = Some(flag);
+    }
+
+    /// Attach the session-end TEARDOWN flag and arm shutdown-aware teardown on
+    /// tools that own un-interruptible blocking resources (MCP stdio servers):
+    /// on shutdown they kill their child so a stuck call unblocks and the agent
+    /// can drop — otherwise the child is orphaned when the frontend stops
+    /// waiting (TUI quit). This is distinct from the per-turn `cancel`: shutdown
+    /// is irreversible, so the frontend must fire it ONLY on session end.
+    pub fn set_shutdown(&mut self, flag: Arc<AtomicBool>) {
+        for t in &mut self.tools {
+            t.set_shutdown(&flag);
+        }
+        self.shutdown = Some(flag);
     }
 
     pub(crate) fn cancelled(&self) -> bool {

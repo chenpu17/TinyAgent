@@ -242,7 +242,32 @@
         }
     }
 
-    /// A tool that bills synthetic usage to the parent run — pins that
+    /// A tool that records whether `set_shutdown` was called on it, and how
+    /// many times. Guards the P1 audit fix: a per-turn `set_cancel` must NOT
+    /// propagate to tools (arming MCP teardown), only `set_shutdown` may.
+    struct ShutdownTrackingTool {
+        shutdown_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Tool for ShutdownTrackingTool {
+        fn def(&self) -> ToolDef {
+            ToolDef {
+                name: "track".into(),
+                description: "test tool recording set_shutdown calls".into(),
+                schema: json!({"type": "object", "properties": {}}),
+            }
+        }
+        fn run(&self, _input: &Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+            Ok(ToolOutput::text("ok"))
+        }
+        fn set_shutdown(
+            &mut self,
+            _shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ) {
+            self.shutdown_calls.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+
     /// `ToolOutput::usage` folds into the agent's totals and emits a Usage
     /// event. This is the path the `task` sub-agent relies on for honest cost.
     struct BillTool;
@@ -693,6 +718,51 @@
         assert!(
             flag.load(Ordering::Relaxed),
             "entry must not have cleared the shared flag"
+        );
+    }
+
+    #[test]
+    fn set_cancel_does_not_arm_tool_teardown_only_set_shutdown_does() {
+        // P1 audit fix: the per-turn `cancel` flag and the session-end
+        // `shutdown` flag are now SEPARATE. `set_cancel` (TUI Esc / headless
+        // Ctrl-C) is recoverable — the next turn reuses the same MCP server —
+        // so it must NOT arm teardown on tools. Only `set_shutdown` (session
+        // end) may. Previously set_cancel propagated to the MCP reaper, so a
+        // single Esc killed the server the next turn couldn't reuse. Pin the
+        // wiring so that regression cannot return silently.
+        let cfg = cfg_with(5, 0, 0);
+        let (prov, _) = MockProvider::new(vec![mock::resp_text("x", None)]);
+        let shutdown_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tool = ShutdownTrackingTool {
+            shutdown_calls: shutdown_calls.clone(),
+        };
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![Box::new(tool)],
+            vec![user_text("hi")],
+            test_ctx(),
+        );
+        // A per-turn cancel must NOT reach the tool's teardown path.
+        agent.set_cancel(Arc::new(AtomicBool::new(false)));
+        assert_eq!(
+            shutdown_calls.load(Ordering::Relaxed),
+            0,
+            "set_cancel must not arm tool teardown (per-turn cancel is recoverable)"
+        );
+        // The session-end shutdown DOES arm teardown (once).
+        agent.set_shutdown(Arc::new(AtomicBool::new(false)));
+        assert_eq!(
+            shutdown_calls.load(Ordering::Relaxed),
+            1,
+            "set_shutdown must arm tool teardown exactly once"
+        );
+        // A second cancel still must not double-arm or interfere.
+        agent.set_cancel(Arc::new(AtomicBool::new(false)));
+        assert_eq!(
+            shutdown_calls.load(Ordering::Relaxed),
+            1,
+            "set_cancel after set_shutdown must not re-arm teardown"
         );
     }
 
@@ -1919,6 +1989,56 @@
         assert!(s.contains("\"success\": false"));
         assert!(s.contains("\"stop_reason\": \"error\""));
         assert!(s.contains("503"), "last error surfaced: {s}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn single_run_all_attempts_fail_still_bills_accumulated_cost() {
+        // P2: when EVERY attempt fails (retries exhausted), the failure
+        // result.json must still bill the tokens each attempt burned — the
+        // None-outcome path folds `acc` in, it doesn't zero everything. Each
+        // attempt bills on turn 1 (a tool_use) then errors on turn 2; the
+        // RunError carries that turn's usage, acc accumulates across attempts,
+        // and the final failure record reports the sum.
+        let cfg = cfg_with(5, 0, 0);
+        let (prov, _state) = MockProvider::new(vec![
+            // Attempt 1: bill 100/10 via a tool call, then error.
+            mock::resp_tool("t1", "echo", json!({}), mock::mk_usage(100, 10)),
+            MockTurn::Err("503 transient".into()),
+            // Attempt 2: bill 50/5 via a tool call, then error.
+            mock::resp_tool("t2", "echo", json!({}), mock::mk_usage(50, 5)),
+            MockTurn::Err("503 transient".into()),
+        ]);
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![Box::new(EchoTool::new("echo"))],
+            vec![user_text("go")],
+            test_ctx(),
+        );
+        let dir = std::env::temp_dir().join(format!("ta-retry-fail-cost-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let out = dir.join("r.json");
+        let code =
+            crate::harness::run_with_retries(&mut agent, Some(&out), false, 1, |_| {}).unwrap();
+        assert_eq!(code, 1, "all attempts failed → exit 1");
+        let s = std::fs::read_to_string(&out).unwrap();
+        assert!(s.contains("\"success\": false"), "{s}");
+        // Accumulated honest cost across both failed attempts: 100+50 input,
+        // 10+5 output — NOT zeroed just because no attempt succeeded.
+        assert!(
+            s.contains("\"input_tokens\": 150"),
+            "failed attempts' input tokens dropped on the failure path: {s}"
+        );
+        assert!(
+            s.contains("\"output_tokens\": 15"),
+            "failed attempts' output tokens dropped on the failure path: {s}"
+        );
+        // Both attempts' tool calls survive in the audit list.
+        assert!(
+            s.matches("\"name\": \"echo\"").count() == 2,
+            "expected both attempts' tool calls in the failure record: {s}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

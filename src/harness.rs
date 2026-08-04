@@ -150,7 +150,7 @@ pub(crate) fn run_with_retries(
         } else {
             "error"
         };
-        write_result(path, outcome.as_ref(), error.as_deref(), attempt, none_sr)?;
+        write_result(path, outcome.as_ref(), error.as_deref(), attempt, none_sr, Some(&acc))?;
         if !json {
             eprintln!("result written to {}", path.display());
         }
@@ -293,6 +293,13 @@ pub fn write_result(
     // outcome — e.g. cancelled during retry backoff, or a setup/provider
     // error). Ignored when outcome is Some (its own stop_reason is used).
     none_stop_reason: &str,
+    // Accumulated partial cost from failed attempts, written ONLY when outcome
+    // is None. A transient failure doesn't undo the tokens already streamed or
+    // the tools already run — their side effects are in the history / on disk —
+    // so the final result.json must fold them in for an honest total (P2). When
+    // outcome is Some, its totals already include any folded-in cost, so this
+    // is ignored. None ⇒ all-zero / empty (e.g. a setup error before any turn).
+    none_acc: Option<&RunCost>,
 ) -> Result<()> {
     // json! takes values by ownership, so the &RunOutcome fields are cloned
     // here; Option<&str> is turned into a JSON null/string explicitly (Value
@@ -330,12 +337,35 @@ pub fn write_result(
                 "error": error_val,
             })
         }
-        None => json!({
-            "success": false,
-            "stop_reason": none_stop_reason,
-            "attempts": attempts,
-            "error": error_val,
-        }),
+        None => {
+            // No final outcome, but the failed attempts still burned tokens and
+            // ran tools. Fold the accumulated cost in so result.json reports an
+            // honest total instead of silently zeroing everything (P2).
+            let acc = none_acc.cloned().unwrap_or_default();
+            let tool_calls: Vec<_> = acc
+                .tool_calls
+                .iter()
+                .map(|c| {
+                    json!({
+                        "name": c.name.clone(),
+                        "input": c.input.clone(),
+                        "output": c.output.clone(),
+                        "is_error": c.is_error,
+                    })
+                })
+                .collect();
+            json!({
+                "success": false,
+                "stop_reason": none_stop_reason,
+                "attempts": attempts,
+                "input_tokens": acc.usage.input_tokens,
+                "output_tokens": acc.usage.output_tokens,
+                "cache_creation_input_tokens": acc.usage.cache_creation_input_tokens,
+                "cache_read_input_tokens": acc.usage.cache_read_input_tokens,
+                "tool_calls": tool_calls,
+                "error": error_val,
+            })
+        }
     };
     let bytes = serde_json::to_string_pretty(&result)?;
     atomic_write(path, bytes.as_bytes())
@@ -645,7 +675,7 @@ mod tests {
         };
         // Success path: tool output + token totals + summary all present.
         let path = dir.join("out.json");
-        write_result(&path, Some(&o), None, 1, "error").unwrap();
+        write_result(&path, Some(&o), None, 1, "error", None).unwrap();
         let s = std::fs::read_to_string(&path).unwrap();
         assert!(s.contains("\"output\"") && s.contains("hello world"), "tool output missing");
         assert!(
@@ -657,10 +687,65 @@ mod tests {
         // Failure path: agent.run returned Err — still write a result artifact
         // (this is the gap the old `?`-skips-write_result had).
         let epath = dir.join("err.json");
-        write_result(&epath, None, Some("provider 503"), 1, "error").unwrap();
+        write_result(&epath, None, Some("provider 503"), 1, "error", None).unwrap();
         let es = std::fs::read_to_string(&epath).unwrap();
         assert!(es.contains("\"success\": false"));
         assert!(es.contains("provider 503"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_result_failure_path_keeps_accumulated_cost() {
+        // P2: a run that fails after burning tokens must still report them. The
+        // final-failure paths (retries exhausted, cancel during backoff) call
+        // write_result with outcome=None and the accumulated RunCost — the
+        // result.json must fold that cost in, not silently zero everything.
+        let dir = std::env::temp_dir().join(format!("ta-res-acc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Two failed attempts' worth of tokens + a tool call, as RunCost would
+        // hold after two add_failed() calls.
+        let acc = RunCost {
+            usage: crate::provider::Usage {
+                input_tokens: 300,
+                output_tokens: 40,
+                cache_creation_input_tokens: 100,
+                cache_read_input_tokens: 50,
+            },
+            tool_calls: vec![ToolCallRecord {
+                name: "shell".into(),
+                input: json!({"command": "ls"}),
+                output: "a.txt".into(),
+                is_error: false,
+            }],
+        };
+        let path = dir.join("fail.json");
+        write_result(&path, None, Some("provider 503"), 2, "error", Some(&acc)).unwrap();
+        let parsed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // Failure semantics.
+        assert_eq!(parsed["success"], false);
+        assert_eq!(parsed["stop_reason"], "error");
+        assert_eq!(parsed["attempts"], 2);
+        assert_eq!(parsed["error"], "provider 503");
+        // Honest cost: the accumulated tokens survive into the failure record.
+        assert_eq!(parsed["input_tokens"], 300);
+        assert_eq!(parsed["output_tokens"], 40);
+        assert_eq!(parsed["cache_creation_input_tokens"], 100);
+        assert_eq!(parsed["cache_read_input_tokens"], 50);
+        // And the tool call from the failed attempt is recorded too.
+        assert_eq!(parsed["tool_calls"][0]["name"], "shell");
+        assert_eq!(parsed["tool_calls"][0]["output"], "a.txt");
+
+        // No accumulated cost (e.g. a setup error before any turn) ⇒ zeros,
+        // never missing keys (schema stays stable for CI consumers).
+        let zpath = dir.join("zero.json");
+        write_result(&zpath, None, Some("setup failed"), 1, "error", None).unwrap();
+        let zparsed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&zpath).unwrap()).unwrap();
+        assert_eq!(zparsed["input_tokens"], 0);
+        assert_eq!(zparsed["output_tokens"], 0);
+        assert_eq!(zparsed["tool_calls"].as_array().unwrap().len(), 0);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -822,7 +907,7 @@ mod tests {
             elapsed: std::time::Duration::from_secs(2),
         };
         let path = dir.join("cache.json");
-        write_result(&path, Some(&o), None, 3, "error").unwrap();
+        write_result(&path, Some(&o), None, 3, "error", None).unwrap();
         // Parse back and assert by field name — a typo in the cache_* names
         // would silently drop cache cost from downstream accounting, and
         // substring checks couple to pretty-print spacing.
