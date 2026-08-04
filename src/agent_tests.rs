@@ -2096,6 +2096,181 @@
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ── real-build integration: the agent drives its REAL write_file + shell
+    // tools to write an actual program, run it, and verify the outcome. The
+    // model side is scripted (MockProvider), but the build + verification are
+    // real I/O — far stronger than an EchoTool returning "ok".
+
+    fn python3_available() -> bool {
+        std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_ok()
+    }
+
+    /// Real write_file + shell tools (not test doubles), so a scripted model
+    /// actually writes files and runs commands. client/api_key are unused by
+    /// leaf tools but required by tools::build's signature.
+    fn real_leaf_tools() -> Vec<Box<dyn Tool>> {
+        let cfg = cfg_with(5, 0, 100_000);
+        let client = crate::provider::new_client(60);
+        crate::tools::build(
+            &["write_file".to_string(), "shell".to_string()],
+            &cfg,
+            &client,
+            "unused-api-key",
+            &[],
+        )
+        .expect("build real leaf tools")
+    }
+
+    /// An isolated temp workdir + ToolCtx with restrict_to_workdir on, so real
+    /// write_file paths are confined (exercising the real confine() path too).
+    /// The workdir is canonicalized — confine() compares against a canonicalized
+    /// workdir (config load canonicalizes it), and on macOS /tmp is a symlink to
+    /// /private/tmp, so a non-canonical workdir would make every starts_with
+    /// check falsely reject the path as "escaping".
+    fn build_ctx(label: &str) -> (ToolCtx, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("ta-build-{label}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let canon = dir.canonicalize().unwrap();
+        let ctx = ToolCtx {
+            workdir: canon.clone(),
+            max_output_chars: 10_000,
+            restrict_to_workdir: true,
+            cancel: None,
+        };
+        (ctx, canon)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn harness_builds_and_verifies_a_python_web_service() {
+        if !python3_available() {
+            eprintln!("skipping: python3 not on PATH");
+            return;
+        }
+        // A stdlib-only HTTP server: binds a free port (0), serves one request
+        // to itself, prints the body, exits — no curl, no backgrounding, no port
+        // conflicts. A single `python3 svc.py` run, fully self-contained.
+        let svc = r#"import http.server, socketserver, threading, urllib.request
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Hello from TinyAgent")
+    def log_message(self, *a): pass
+srv = socketserver.TCPServer(("127.0.0.1", 0), H)
+port = srv.server_address[1]
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+print(urllib.request.urlopen(f"http://127.0.0.1:{port}/").read().decode())
+srv.shutdown()
+"#;
+        let cfg = cfg_with(5, 0, 100_000);
+        let (prov, _state) = MockProvider::new(vec![
+            mock::resp_tool("w", "write_file", json!({"path": "svc.py", "content": svc}), None),
+            mock::resp_tool("s", "shell", json!({"command": "python3 svc.py"}), None),
+            mock::resp_text("The service works: it returned Hello from TinyAgent", None),
+        ]);
+        let (ctx, dir) = build_ctx("websvc");
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            real_leaf_tools(),
+            vec![user_text("build and verify a web service")],
+            ctx,
+        );
+        let (rdir, out) = harness_out("websvc");
+        let code =
+            crate::harness::run_with_retries(&mut agent, Some(&out), false, 0, |_| {}).unwrap();
+        assert_eq!(code, 0, "build + verify run should succeed");
+        // Real write_file: the file actually landed in the workdir.
+        let svc_path = dir.join("svc.py");
+        assert!(svc_path.exists(), "svc.py not written to workdir");
+        assert!(
+            std::fs::read_to_string(&svc_path)
+                .unwrap()
+                .contains("BaseHTTPRequestHandler"),
+            "written file has the server code"
+        );
+        // Real shell: the service actually ran and its HTTP response was captured
+        // in the shell tool's recorded output.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(parsed["success"], true);
+        let shell_out = parsed["tool_calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"].as_str() == Some("shell"))
+            .expect("shell tool call recorded")["output"]
+            .as_str()
+            .unwrap();
+        assert!(
+            shell_out.contains("Hello from TinyAgent"),
+            "service response should be in shell output: {shell_out}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&rdir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn harness_builds_and_runs_a_python_data_pipeline() {
+        if !python3_available() {
+            eprintln!("skipping: python3 not on PATH");
+            return;
+        }
+        // A stdin word-counter: write it, pipe text through it, check the count.
+        let counter = "import sys\nprint(f\"words: {len(sys.stdin.read().split())}\")\n";
+        let cfg = cfg_with(5, 0, 100_000);
+        let (prov, _state) = MockProvider::new(vec![
+            mock::resp_tool(
+                "w",
+                "write_file",
+                json!({"path": "count.py", "content": counter}),
+                None,
+            ),
+            mock::resp_tool(
+                "s",
+                "shell",
+                json!({"command": "printf 'one two three four\\n' | python3 count.py"}),
+                None,
+            ),
+            mock::resp_text("Counted 4 words", None),
+        ]);
+        let (ctx, dir) = build_ctx("count");
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            real_leaf_tools(),
+            vec![user_text("count the words")],
+            ctx,
+        );
+        let (rdir, out) = harness_out("count");
+        let code =
+            crate::harness::run_with_retries(&mut agent, Some(&out), false, 0, |_| {}).unwrap();
+        assert_eq!(code, 0);
+        assert!(dir.join("count.py").exists(), "count.py not written");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(parsed["success"], true);
+        let shell_out = parsed["tool_calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"].as_str() == Some("shell"))
+            .expect("shell tool call recorded")["output"]
+            .as_str()
+            .unwrap();
+        assert!(
+            shell_out.contains("words: 4"),
+            "computed word count should be in output: {shell_out}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&rdir);
+    }
+
     #[test]
     fn normalize_adjacent_merges_same_role_neighbors() {
         // [user a][user b] → one user with both blocks; alternation preserved.
