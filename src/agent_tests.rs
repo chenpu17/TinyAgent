@@ -267,7 +267,7 @@
         }
     }
 
-
+    /// A tool that bills synthetic usage to the parent run — pins that
     /// `ToolOutput::usage` folds into the agent's totals and emits a Usage
     /// event. This is the path the `task` sub-agent relies on for honest cost.
     struct BillTool;
@@ -958,6 +958,57 @@
         assert_eq!(o.stop_reason, "max_turns_reached");
         assert_eq!(o.turns, 1);
         assert_eq!(state.calls(), 1, "only one chat call within the budget");
+    }
+
+    #[test]
+    fn max_total_tokens_caps_the_loop_with_budget_exceeded() {
+        // max_total_tokens=100: turn 1 streams a tool_use whose usage totals
+        // 110, pushing the accumulated spend past the cap. The cap is checked
+        // at the next turn boundary (like timeout_secs), so turn 1 finishes
+        // normally (tool runs, assistant message kept) and the run stops with
+        // stop_reason "budget_exceeded" instead of starting turn 2. max_turns
+        // is left high so it cannot mask the budget stop.
+        let mut cfg = cfg_with(99, 0, 0);
+        cfg.limits.max_total_tokens = 100;
+        let (prov, state) = MockProvider::new(vec![
+            mock::resp_tool("a", "echo", json!({}), mock::mk_usage(80, 30)),
+            mock::resp_text("done", None), // turn 2, never reached
+        ]);
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![Box::new(EchoTool::new("echo"))],
+            vec![user_text("hi")],
+            test_ctx(),
+        );
+        let o = agent.run(&mut |_| {}).unwrap();
+        assert_eq!(o.stop_reason, "budget_exceeded");
+        assert_eq!(o.turns, 1, "turn 1 ran; the cap refused to start turn 2");
+        assert_eq!(state.calls(), 1, "no second chat call once the budget was crossed");
+        // The turn that crossed the cap still bills its usage honestly.
+        assert_eq!(o.input_tokens, 80);
+        assert_eq!(o.output_tokens, 30);
+    }
+
+    #[test]
+    fn max_total_tokens_zero_means_no_cap() {
+        // 0 is the "no cap" sentinel: the run must proceed to a normal
+        // end_turn even though usage accumulates, never hitting a budget stop.
+        let cfg = cfg_with(99, 0, 0); // max_total_tokens defaults to 0
+        let (prov, _) = MockProvider::new(vec![
+            mock::resp_tool("a", "echo", json!({}), mock::mk_usage(999, 999)),
+            mock::resp_text("done", None),
+        ]);
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![Box::new(EchoTool::new("echo"))],
+            vec![user_text("hi")],
+            test_ctx(),
+        );
+        let o = agent.run(&mut |_| {}).unwrap();
+        assert_eq!(o.stop_reason, "end_turn");
+        assert_eq!(o.turns, 2);
     }
 
     #[test]

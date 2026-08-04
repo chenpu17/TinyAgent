@@ -62,6 +62,18 @@ pub struct Limits {
     /// it is the last-resort safety net and never depends on client config.
     #[serde(default)]
     pub max_context_tokens: u64,
+    /// Whole-run token budget: input + output + cache creation + cache read,
+    /// summed across every turn, sub-agent, and compression call. When the
+    /// accumulated total crosses this, the run stops with `stop_reason:
+    /// "budget_exceeded"` (exit 125) instead of starting another turn. `0`
+    /// (default) = no cap. Checked at turn boundaries, like `timeout_secs` —
+    /// the turn that pushes the total past the cap finishes normally (its
+    /// tools run, its assistant message is kept); the cap only refuses to
+    /// start the NEXT turn, so the transcript and tool_use/tool_result pairing
+    /// stay intact. A batch task file may only TIGHTEN it (smaller value); 0
+    /// means "no cap" (the loosest) and is ignored when set by a task.
+    #[serde(default)]
+    pub max_total_tokens: u64,
     /// Max gap (seconds) between SSE chunks before a stream is treated as
     /// stalled and aborted. Ordinary chat models have sub-second inter-chunk
     /// gaps, so 30s is ample; deep-reasoning models with long first-token
@@ -81,6 +93,7 @@ impl Default for Limits {
             compress_threshold_chars: default_compress_threshold(),
             keep_recent_messages: default_keep_recent(),
             max_context_tokens: 0,
+            max_total_tokens: 0,
             stream_idle_secs: default_stream_idle(),
         }
     }
@@ -326,6 +339,20 @@ impl Config {
                     };
                 }
             }
+            // max_total_tokens is 0-sentineled like max_context_tokens: 0
+            // means "no budget cap" (the LOOSEST), so a task setting 0 is a
+            // loosening and is ignored; a finite v can only tighten — adopt
+            // from a 0/disabled base, or min against a finite base (stops
+            // sooner). A task can never raise or remove the base's cap.
+            if let Some(v) = l.max_total_tokens {
+                if v != 0 {
+                    self.limits.max_total_tokens = if self.limits.max_total_tokens == 0 {
+                        v
+                    } else {
+                        v.min(self.limits.max_total_tokens)
+                    };
+                }
+            }
         }
         if let Some(v) = p.mcp_servers {
             self.mcp_servers = v;
@@ -393,6 +420,7 @@ pub struct PartialLimits {
     pub compress_threshold_chars: Option<usize>,
     pub keep_recent_messages: Option<usize>,
     pub max_context_tokens: Option<u64>,
+    pub max_total_tokens: Option<u64>,
     pub stream_idle_secs: Option<u64>,
 }
 

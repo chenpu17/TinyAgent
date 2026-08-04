@@ -97,6 +97,20 @@ pub struct Usage {
     pub cache_read_input_tokens: u64,
 }
 
+impl Usage {
+    /// Sum of all token axes — input + output + cache write + cache read.
+    /// The run's `max_total_tokens` budget guard checks this against the cap at
+    /// each turn boundary. Includes cache_read even though providers discount
+    /// it: it still reflects tokens transmitted, and the guard is a coarse
+    /// "stop the runaway" backstop, not a billing-precise meter.
+    pub fn total(&self) -> u64 {
+        self.input_tokens
+            + self.output_tokens
+            + self.cache_creation_input_tokens
+            + self.cache_read_input_tokens
+    }
+}
+
 /// A completed assistant turn.
 pub struct ChatResponse {
     pub blocks: Vec<Block>,

@@ -164,12 +164,14 @@ pub(crate) fn run_with_retries(
 /// JSON carries the precise stop_reason / error for detail.
 const EXIT_ERROR: i32 = 1;
 const EXIT_TIMEOUT: i32 = 124;
+const EXIT_BUDGET: i32 = 125;
 const EXIT_CANCELLED: i32 = 130;
 
 fn exit_code_for(stop_reason: &str) -> i32 {
     match stop_reason {
         "end_turn" => 0,
         "timeout" => EXIT_TIMEOUT,
+        "budget_exceeded" => EXIT_BUDGET,
         "cancelled" => EXIT_CANCELLED,
         _ => EXIT_ERROR,
     }
@@ -754,6 +756,7 @@ mod tests {
     fn exit_code_distinguishes_outcomes() {
         assert_eq!(exit_code_for("end_turn"), 0);
         assert_eq!(exit_code_for("timeout"), 124);
+        assert_eq!(exit_code_for("budget_exceeded"), 125);
         assert_eq!(exit_code_for("cancelled"), 130);
         assert_eq!(exit_code_for("max_turns_reached"), 1);
         assert_eq!(exit_code_for("max_tokens"), 1);

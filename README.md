@@ -76,7 +76,7 @@ tiny-agent --config examples/chat.json --tui
 ```
 
 - 每个任务独立跑完整 agent 流程，结果写 `results/<task>.json`（与 `--output` 同格式）
-- `--jobs N` 控制并发（默认 1）；`--report` 写汇总：`{total, succeeded, failed, tasks[]}`
+- `--jobs N` 控制并发（默认 1）；`--report` 写汇总：`{total, succeeded, failed, totals, averages, tasks[]}`（`totals`/`averages` 为 4 个 token 轴的总和与 per-task 均值）
 - ⚠ `--jobs > 1` 时所有任务**共用同一个 workdir**（base 配置的，任务片段不能覆盖）——并发写同名文件的任务会互相覆盖、污染结果。需要隔离的写文件任务用 `--jobs 1`，或让各任务写不同路径；任务只读 / 纯推理则无此问题，可放心并发
 - exit code：全部成功 → 0，否则 1，可直接做 CI 门禁
 
@@ -94,6 +94,7 @@ tiny-agent --config examples/chat.json --tui
 | `error` | provider/网络错误（transient） | ✅ |
 | `bad_task` | 任务片段非法（禁用字段 / 缺 task / JSON 错） | ❌ |
 | `max_turns_reached` / `max_tokens` | 模型跑满上限 | ❌ |
+| `budget_exceeded` | 累计 token 触顶 `limits.max_total_tokens` | ❌ |
 | `end_turn` | 正常完成 | ❌（已成功） |
 
 `report.json` 的 `elapsed_secs` 含重试与退避的总耗时。
@@ -115,7 +116,7 @@ tiny-agent --config examples/harness.json --batch examples/tasks --failed --retr
 
 `--retries N` 在**单跑 headless** 模式同样生效：`agent.run` 返回 `Err`（provider/网络/超时，即 transient
 失败）时按指数退避（1/2/4/8/16/32s 封顶）原地重试，最多 N 次额外尝试；确定性结局（`end_turn` /
-`max_turns` / `cancelled` / `timeout`）是 `Ok`，**不重试**。退出码与无重试时一致（成功 0、失败 1），
+`max_turns` / `cancelled` / `timeout` / `budget_exceeded`）是 `Ok`，**不重试**。退出码与无重试时一致（成功 0、失败 1），
 `result.json` 的 `attempts` 字段记录实际运行次数（`>1` 即发生过重试）。`--json` 模式每次重试前另吐一行
 `{"type":"retry","attempt":N,"max":M,"backoff_secs":B,"error":"..."}` 方便管道跟进。
 
@@ -249,6 +250,7 @@ length / error 等）才显示警告。工具输出里的 ANSI 颜色序列（�
     "compress_threshold_chars": 400000,
     "keep_recent_messages": 8,
     "max_context_tokens": 0,
+    "max_total_tokens": 0,
     "stream_idle_secs": 30
   }
 }
@@ -259,6 +261,8 @@ API key 从 `api_key_env` 指定的环境变量读取，不写进配置文件。
 `limits.stream_idle_secs`（默认 30）：流式响应两个 chunk 之间最长允许的静默秒数，超过即判定连接半开并中断。普通对话模型 chunk 间隔在亚秒级，30s 绰绰有余；**深度推理模型**（DeepSeek-R1、o 系列等）首 token 前可能静默数分钟，需要调大（如 180）才不会被误杀——`limits.timeout_secs` 仍是**模型请求层面**的软上限（约束每轮 chat 请求与轮次边界；shell/MCP/子 agent 各有各自独立超时，不受此值硬截止），不会因此无限挂起。
 
 > **`timeout_secs: 0`（不设超时）时的单请求兜底**：即便关掉整轮超时，单次 chat 请求仍有一个 **10 分钟**的总时长上限（`STREAM_BACKSTOP`）。这是**泄漏兜底**而非功能限制——流式读取线程阻塞在 reqwest 的 `read()` 里、无法观测取消标志，若没有任何单请求上限，一条半开连接会让该线程及其 TCP 连接一直挂到进程退出。该上限只约束**单次请求**，从不约束**整轮 run**（一轮由多次请求组成），所以「不设超时」仍意味着 run 可以无限长，只是不会无限卡在单次请求上。设了 `timeout_secs > 0` 时此兜底不生效，单请求上限改由剩余预算推导。
+
+`limits.max_total_tokens`（默认 `0` = 不限）：整个 run 的 token 预算上限（input + output + cache 写 + cache 读，跨所有轮次 / 子 agent / 压缩调用累计）。累计超过即以 `stop_reason: "budget_exceeded"`（exit 125）停下，不再开新一轮——语义同 `timeout_secs` 的**轮次边界**停：把总额顶破上限的那一轮照常跑完（工具执行、assistant 消息入历史），上限只阻止**下一轮**开始，故 transcript 与 tool_use/tool_result 配对不受影响。评测 / CI 场景用来给"跑飞钱包"装闸门：usage 累计本就含子 agent、压缩、失败轮（诚实成本，失败也计费），这个闸门只是在地基上加一道关。批量任务片段可设此项**只收紧**（更小值）；`0` 意为"无上限"（最松），任务片段设 0 会被忽略。
 
 ### 上下文压缩
 
@@ -310,6 +314,19 @@ Anthropic 原生 provider 默认开启 prompt caching：每个请求自动在 **
      `workdir` 的路径（`../` 与绝对路径，对新建文件同样生效）；
   3. 必要时用 `"tools"` 白名单去掉 `shell`。
 
+## Non-goals（明确不做）
+
+TinyAgent 的定位是**可审计、可无人值守的 agent 执行单元**——一个跑完一定留下完整、诚实、机器可读账单的一次性进程。下面这些方向与该定位冲突，明确不做（把力气挡在护城河上）：
+
+- **不做 `--serve` / HTTP 服务模式**：长驻、多租户、鉴权是另一个产品，与"一次性执行单元"直接冲突。要集成的用户用 `--json`（NDJSON 流）+ exit code 包一层即可。
+- **不自建沙箱 / 命令过滤**：半吊子过滤只制造虚假安全感。隔离的官方答案是**在容器或受限用户下运行**（见上文安全说明）。
+- **不做插件系统**：工具是编译期的内置 + MCP，不引入运行时加载。
+- **TUI 冻结在当前完成度**：它是 dogfooding / 演示工具，对标全职迭代的 Claude Code / Codex，追平是负 ROI；之后只修 bug，不加新功能。
+
+### 特性试金石
+
+一个新特性只有让**无人值守执行**更**可信 / 可审计 / 更便宜 / 更可移植**时才进 backlog。用这把尺子挡掉"听起来很酷但偏定位"的诱惑。
+
 ## 结果文件（`--output result.json`）
 
 ```json
@@ -344,6 +361,7 @@ Anthropic 原生 provider 默认开启 prompt caching：每个请求自动在 **
 |---|---|
 | `0` | 正常完成（`stop_reason == "end_turn"`）|
 | `124` | 超时（`timeout`，沿用 GNU `timeout` 约定）|
+| `125` | 预算超限（`budget_exceeded`，累计 token 触顶 `max_total_tokens`）|
 | `130` | 用户取消（`cancelled`，128 + SIGINT）|
 | `1` | 其它（`max_turns_reached` / `max_tokens` / provider 错误等）|
 
@@ -353,7 +371,7 @@ headless 模式下 `Ctrl-C` 走**优雅取消**：首次 SIGINT 在流式 chunk 
 照常合并写出 `--report` 后 exit 130；再次 `Ctrl-C` 立即 exit 130。TUI 模式下 `Ctrl-C` 是普通按键，按上面的按键表处理。
 
 `--json` 模式额外在每个事件吐一行 NDJSON（`type`: `turn` / `text` / `tool_call` / `tool_result` /
-`usage` / `compressed` / `done`），可在结果文件落盘前实时跟进进度。
+`usage` / `compressed` / `warning` / `subagent` / `done`，重试时另吐 `retry`），可在结果文件落盘前实时跟进进度。
 
 ## 内置工具
 

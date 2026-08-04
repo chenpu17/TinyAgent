@@ -40,6 +40,12 @@ cargo clippy --all-targets                # lint headless 版（两个 feature �
   （`estimate_tokens`/`find_safe_cut`/`fold_summary`/`window_lines`/`chunk_lines`/`SUMMARY_*` 等）抽到
   `compress.rs`（单向被 agent 依赖；`window_lines` 反向调 `crate::agent::preview`，不构成环）。`AgentEvent`
   透传给 harness（headless 打印/NDJSON）或 TUI。上下文压缩的摘要请求自身 usage 也计入累计（诚实成本）。
+- **token 预算闸门**（`limits.max_total_tokens`，0=不限）：run loop 每轮开头用累计 usage 的
+  `Usage::total()`（input+output+cache 写+读）比对预算，超则以 `stop_reason: "budget_exceeded"`
+  （exit 125）停。turn 边界语义同 `timeout_secs`——顶破上限的那轮照常跑完（工具执行、assistant 入历史），
+  闸门只拒开下一轮，故 transcript 与 tool_use/tool_result 配对不破。batch task 片段只能收紧（更小值），
+  0 视为"无上限"被忽略。闸门复用已累计的 usage，不加新的记账；它和 `max_turns`/`timeout` 是 loop 的
+  三个 turn 边界停止条件。
 - **子 agent（`task` 工具，`tools/subagent.rs`）**：主 agent 把聚焦子任务交给一个全新子 agent
   （独立历史 + 独立 turn 预算，`SUBAGENT_MAX_TURNS=25` 封顶），只把最终摘要作 tool 结果返回。
   **同 turn 多个 `task` 调用并行**：`agent.rs` 的工具执行分两遍——叶子工具（shell/read_file/…）

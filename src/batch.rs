@@ -354,9 +354,31 @@ fn run_one_attempt(
             // and ran tools — accumulate them so the next attempt (if any)
             // bills them, and so a final success isn't undercosted.
             acc.add_failed(&re);
+            let msg = format!("{re:#}");
+            // Write a per-task result file for the failure too — audit parity
+            // with single-run (which always produces a result artifact). The
+            // accumulated tokens + tool_calls land here via write_result's None
+            // branch, so a failed batch task's tool calls are recoverable from
+            // results/<name>.json, not just the token totals in report.json. A
+            // later successful attempt overwrites this; on all-fail the last
+            // attempt's record is what remains. (P2 follow-up: batch failures
+            // previously wrote no result file at all.)
+            if let Err(e) = harness::write_result(
+                &results_dir.join(format!("{name}.json")),
+                None,
+                Some(&msg),
+                attempt_no,
+                "error",
+                // `acc` is a &mut param here, so pass it directly (an implicit
+                // shared reborrow to &RunCost) — not `&acc` (a needless double
+                // borrow). The later `&acc.usage` still borrows fine.
+                Some(acc),
+            ) {
+                eprintln!("[warn] {name}: failed to write result file: {e:#}");
+            }
             // Bill the accumulated cost (this attempt + any prior retries) so a
             // failed task reports honest token totals in report.json, not zero.
-            bad("error", format!("{re:#}"), &acc.usage)
+            bad("error", msg, &acc.usage)
         }
     }
 }
@@ -489,10 +511,36 @@ fn write_report(path: &Path, reports: &[TaskReport]) -> Result<()> {
         })
         .collect();
     let succeeded = reports.iter().filter(|r| r.success).count();
+    // Top-level token aggregates — the "bill" view. Per-task totals already
+    // live in `tasks[]`; these sums (and per-task averages) let a CI pipeline
+    // read a batch's real spend at a glance instead of summing the array after
+    // each `--failed` iteration. All four token axes are summed; cache_read is
+    // included because it still reflects tokens moved over the wire.
+    let (mut ti, mut to, mut tcc, mut tcr) = (0u64, 0u64, 0u64, 0u64);
+    for r in reports {
+        ti += r.input_tokens;
+        to += r.output_tokens;
+        tcc += r.cache_creation_input_tokens;
+        tcr += r.cache_read_input_tokens;
+    }
+    // per-task average; 0 when there are no tasks (avoids div-by-zero).
+    let avg = |t: u64| if reports.is_empty() { 0.0 } else { t as f64 / reports.len() as f64 };
     let report = json!({
         "total": reports.len(),
         "succeeded": succeeded,
         "failed": reports.len() - succeeded,
+        "totals": {
+            "input_tokens": ti,
+            "output_tokens": to,
+            "cache_creation_input_tokens": tcc,
+            "cache_read_input_tokens": tcr,
+        },
+        "averages": {
+            "input_tokens": avg(ti),
+            "output_tokens": avg(to),
+            "cache_creation_input_tokens": avg(tcc),
+            "cache_read_input_tokens": avg(tcr),
+        },
         "tasks": tasks,
     });
     let bytes = serde_json::to_string_pretty(&report)?;
@@ -557,6 +605,63 @@ mod tests {
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
         }
+    }
+
+    // Like `tr` but with explicit token totals, for the aggregation test.
+    fn tr_tok(name: &str, success: bool, i: u64, o: u64, cc: u64, cr: u64) -> TaskReport {
+        let mut r = tr(name, success);
+        r.input_tokens = i;
+        r.output_tokens = o;
+        r.cache_creation_input_tokens = cc;
+        r.cache_read_input_tokens = cr;
+        r
+    }
+
+    #[test]
+    fn write_report_aggregates_token_totals_and_averages() {
+        let dir = std::env::temp_dir().join(format!("ta-batch-agg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("report.json");
+        let reports = vec![
+            tr_tok("a", true, 100, 10, 5, 20),
+            tr_tok("b", false, 200, 30, 15, 80),
+        ];
+        write_report(&path, &reports).unwrap();
+
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // Top-level totals sum every token axis across tasks.
+        let totals = v.get("totals").unwrap();
+        assert_eq!(totals["input_tokens"].as_u64().unwrap(), 300);
+        assert_eq!(totals["output_tokens"].as_u64().unwrap(), 40);
+        assert_eq!(totals["cache_creation_input_tokens"].as_u64().unwrap(), 20);
+        assert_eq!(totals["cache_read_input_tokens"].as_u64().unwrap(), 100);
+        // Averages are per-task (total / task count).
+        let averages = v.get("averages").unwrap();
+        assert_eq!(averages["input_tokens"].as_f64().unwrap(), 150.0);
+        assert_eq!(averages["output_tokens"].as_f64().unwrap(), 20.0);
+        assert_eq!(averages["cache_read_input_tokens"].as_f64().unwrap(), 50.0);
+        // Per-task totals in tasks[] are unchanged.
+        assert_eq!(v["tasks"][0]["input_tokens"].as_u64().unwrap(), 100);
+        assert_eq!(v["tasks"][1]["input_tokens"].as_u64().unwrap(), 200);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_report_aggregates_are_zero_for_empty_batch() {
+        let dir = std::env::temp_dir().join(format!("ta-batch-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("report.json");
+        write_report(&path, &[]).unwrap();
+
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["totals"]["input_tokens"].as_u64().unwrap(), 0);
+        // No div-by-zero: averages fall back to 0.0 for an empty batch.
+        assert_eq!(v["averages"]["input_tokens"].as_f64().unwrap(), 0.0);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

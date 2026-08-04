@@ -466,6 +466,20 @@ impl Agent {
                     break;
                 }
             }
+            // Token budget guard: refuse to start another turn once the
+            // accumulated spend (every turn + sub-agent + compression call)
+            // has crossed the cap. Turn-boundary semantics, matching
+            // timeout_secs / max_turns — the turn that blew past the cap
+            // already finished (its tools ran, its assistant message +
+            // tool_results are in history); this only prevents a fresh turn
+            // from starting, so the transcript and N:N tool pairing stay
+            // intact. 0 = no cap.
+            if self.limits.max_total_tokens > 0
+                && self.usage.total() >= self.limits.max_total_tokens
+            {
+                stop_reason = "budget_exceeded".into();
+                break;
+            }
             turns += 1;
             events(AgentEvent::TurnStart(turns));
             // Preflight compression: if the history is large enough that this
