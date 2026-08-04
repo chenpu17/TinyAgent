@@ -2108,14 +2108,18 @@
             .is_ok()
     }
 
-    /// Real write_file + shell tools (not test doubles), so a scripted model
-    /// actually writes files and runs commands. client/api_key are unused by
-    /// leaf tools but required by tools::build's signature.
+    /// Real write_file + edit_file + shell tools (not test doubles), so a
+    /// scripted model actually writes/edits files and runs commands. client/
+    /// api_key are unused by leaf tools but required by tools::build's signature.
     fn real_leaf_tools() -> Vec<Box<dyn Tool>> {
         let cfg = cfg_with(5, 0, 100_000);
         let client = crate::provider::new_client(60);
         crate::tools::build(
-            &["write_file".to_string(), "shell".to_string()],
+            &[
+                "write_file".to_string(),
+                "edit_file".to_string(),
+                "shell".to_string(),
+            ],
             &cfg,
             &client,
             "unused-api-key",
@@ -2266,6 +2270,221 @@ srv.shutdown()
         assert!(
             shell_out.contains("words: 4"),
             "computed word count should be in output: {shell_out}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&rdir);
+    }
+
+    /// Level up from the single-file builds: the agent writes a *multi-file*
+    /// project (a module + its unittest suite), runs the suite, and the real
+    /// shell captures unittest's "Ran 3 tests" / "OK" summary. unittest writes
+    /// its summary to STDERR, so it lands under the shell tool's `[stderr]`
+    /// section — proving stderr capture works end-to-end through the harness,
+    /// not just in the shell unit test. `python3 -m unittest test_calc` puts the
+    /// workdir on sys.path, so `from calc import ...` in the test module
+    /// resolves to the calc.py the agent just wrote.
+    #[cfg(unix)]
+    #[test]
+    fn harness_builds_a_multi_file_project_and_runs_its_test_suite() {
+        if !python3_available() {
+            eprintln!("skipping: python3 not on PATH");
+            return;
+        }
+        let calc = r#"def add(a, b):
+    return a + b
+
+
+def factorial(n):
+    r = 1
+    for i in range(2, n + 1):
+        r *= i
+    return r
+
+
+def is_prime(n):
+    if n < 2:
+        return False
+    for i in range(2, int(n**0.5) + 1):
+        if n % i == 0:
+            return False
+    return True
+"#;
+        let test_calc = r#"import unittest
+from calc import add, factorial, is_prime
+
+
+class TestCalc(unittest.TestCase):
+    def test_add(self):
+        self.assertEqual(add(2, 3), 5)
+
+    def test_factorial(self):
+        self.assertEqual(factorial(5), 120)
+
+    def test_is_prime(self):
+        self.assertTrue(is_prime(7))
+        self.assertFalse(is_prime(8))
+
+
+if __name__ == "__main__":
+    unittest.main()
+"#;
+        let cfg = cfg_with(8, 0, 100_000);
+        let (prov, _state) = MockProvider::new(vec![
+            mock::resp_tool("w1", "write_file", json!({"path": "calc.py", "content": calc}), None),
+            mock::resp_tool(
+                "w2",
+                "write_file",
+                json!({"path": "test_calc.py", "content": test_calc}),
+                None,
+            ),
+            mock::resp_tool(
+                "s",
+                "shell",
+                json!({"command": "python3 -m unittest test_calc"}),
+                None,
+            ),
+            mock::resp_text("All 3 tests passed", None),
+        ]);
+        let (ctx, dir) = build_ctx("multifile");
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            real_leaf_tools(),
+            vec![user_text("build a calc module with tests and run them")],
+            ctx,
+        );
+        let (rdir, out) = harness_out("multifile");
+        let code =
+            crate::harness::run_with_retries(&mut agent, Some(&out), false, 0, |_| {}).unwrap();
+        assert_eq!(code, 0, "multi-file build + test run should succeed");
+        assert!(dir.join("calc.py").exists(), "calc.py not written");
+        assert!(dir.join("test_calc.py").exists(), "test_calc.py not written");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(parsed["success"], true);
+        let shell_out = parsed["tool_calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"].as_str() == Some("shell"))
+            .expect("shell tool call recorded")["output"]
+            .as_str()
+            .unwrap();
+        // unittest prints its summary to stderr → captured under [stderr].
+        assert!(
+            shell_out.contains("Ran 3 tests"),
+            "unittest 'Ran 3 tests' summary (on stderr) should be captured: {shell_out}"
+        );
+        assert!(
+            shell_out.contains("OK"),
+            "unittest 'OK' result line should be captured: {shell_out}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&rdir);
+    }
+
+    /// The iterative debug loop: write a *buggy* program, run it and observe
+    /// the wrong output, edit_file the one-line fix, re-run and observe the
+    /// right output. This is the first test to exercise the real edit_file
+    /// tool end-to-end through the harness (not just its unit tests) AND to
+    /// assert tool_calls are recorded in execution order across turns — the
+    /// first shell prints 24 (factorial(5) with an off-by-one `range(2, n)`),
+    /// the second prints 120 (after `range(2, n + 1)`). It also guards a real
+    /// footgun: real_leaf_tools() must register edit_file, or the tool_result
+    /// silently becomes "unknown tool: edit_file" and the run still "succeeds"
+    /// without ever fixing the bug.
+    #[cfg(unix)]
+    #[test]
+    fn harness_edits_a_bug_and_re_verifies_the_fix() {
+        if !python3_available() {
+            eprintln!("skipping: python3 not on PATH");
+            return;
+        }
+        // Buggy factorial: range(2, n) stops one short, so 5! = 2*3*4 = 24.
+        let buggy = r#"import sys
+
+
+def factorial(n):
+    r = 1
+    for i in range(2, n):
+        r *= i
+    return r
+
+
+print(factorial(int(sys.argv[1])))
+"#;
+        let cfg = cfg_with(8, 0, 100_000);
+        let (prov, _state) = MockProvider::new(vec![
+            mock::resp_tool("w", "write_file", json!({"path": "prog.py", "content": buggy}), None),
+            mock::resp_tool(
+                "s1",
+                "shell",
+                json!({"command": "python3 prog.py 5"}),
+                None,
+            ),
+            mock::resp_tool(
+                "e",
+                "edit_file",
+                json!({"path": "prog.py", "old_string": "range(2, n)", "new_string": "range(2, n + 1)"}),
+                None,
+            ),
+            mock::resp_tool(
+                "s2",
+                "shell",
+                json!({"command": "python3 prog.py 5"}),
+                None,
+            ),
+            mock::resp_text("Fixed: 5! = 120", None),
+        ]);
+        let (ctx, dir) = build_ctx("editbug");
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            real_leaf_tools(),
+            vec![user_text("find the factorial bug, fix it, re-verify")],
+            ctx,
+        );
+        let (rdir, out) = harness_out("editbug");
+        let code =
+            crate::harness::run_with_retries(&mut agent, Some(&out), false, 0, |_| {}).unwrap();
+        assert_eq!(code, 0, "edit-and-reverify run should succeed");
+        // The real edit_file mutated the file on disk: the fix is present, the
+        // buggy line is gone.
+        let patched = std::fs::read_to_string(dir.join("prog.py")).unwrap();
+        assert!(
+            patched.contains("range(2, n + 1)"),
+            "patched file should contain the fix: {patched}"
+        );
+        assert!(
+            !patched.contains("for i in range(2, n):"),
+            "buggy line should be gone after edit: {patched}"
+        );
+        // tool_calls are in execution order: first shell = buggy 24, second =
+        // fixed 120. (filter, not find: there are two shell calls this time.)
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(parsed["success"], true);
+        let shell_runs: Vec<&str> = parsed["tool_calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["name"].as_str() == Some("shell"))
+            .map(|c| c["output"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            shell_runs.len(),
+            2,
+            "expected two shell runs (buggy then fixed)"
+        );
+        assert!(
+            shell_runs[0].contains("24"),
+            "first (buggy) run should print 24: {}",
+            shell_runs[0]
+        );
+        assert!(
+            shell_runs[1].contains("120"),
+            "second (fixed) run should print 120: {}",
+            shell_runs[1]
         );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&rdir);
