@@ -121,6 +121,24 @@ pub fn run(
         retries,
         results_dir.display()
     );
+    // Concurrent workers all share base.workdir (task fragments can't override
+    // it), so jobs>1 with write-file tasks can corrupt each other's results.
+    // Surface this at startup so it's an informed choice, not a silent trap.
+    // (Per-task workdir isolation would need a copy per task — impractical for
+    // large repos — so the contract is: shared by default, user opts into jobs=1
+    // when tasks write overlapping paths.)
+    if jobs > 1 {
+        let wd = base
+            .workdir
+            .as_deref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<current dir>".to_string());
+        eprintln!(
+            "note: --jobs {jobs} shares one workdir ({wd}); tasks writing the same \
+             files can corrupt each other — use --jobs 1 if tasks write overlapping \
+             paths."
+        );
+    }
 
     let (tx, rx) = mpsc::channel::<(String, PartialConfig)>();
     let rx = Mutex::new(rx);
