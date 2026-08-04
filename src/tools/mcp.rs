@@ -103,6 +103,17 @@ impl Tool for McpTool {
             usage: None,
         })
     }
+
+    /// Forward the run's cancel flag to the shared MCP client, which arms
+    /// cancel-aware teardown on the transport (a stdio server's child gets
+    /// killed on cancel, unblocking a stuck call so the agent can drop). All
+    /// McpTools sharing this client arm the same reaper idempotently.
+    fn set_cancel(&mut self, cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self.client
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_cancel(cancel);
+    }
 }
 
 /// Start every configured MCP server and collect their tools.

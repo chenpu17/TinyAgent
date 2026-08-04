@@ -52,6 +52,11 @@ pub(crate) struct Captured {
     /// `cache:true`. The mock doesn't build an HTTP body, so this records the
     /// agent's intent rather than the wire-level cache_control markup.
     pub(crate) cache: bool,
+    /// The per-request timeout the agent set. Lets a test assert the
+    /// reader-thread leak backstop is always present (a streaming request is
+    /// never sent with `None`, which would let the sse-reader worker thread
+    /// linger forever on a half-open connection). See `agent::STREAM_BACKSTOP`.
+    pub(crate) per_request_timeout: Option<std::time::Duration>,
 }
 
 /// Shared, interior-mutable state — cloned by the test so it survives the
@@ -139,6 +144,7 @@ impl Provider for MockProvider {
             tool_result_ids,
             user_texts,
             cache: req.cache,
+            per_request_timeout: req.per_request_timeout,
         });
 
         // Pop the next scripted turn; running off the end is a test bug.

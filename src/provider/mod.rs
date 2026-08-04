@@ -153,11 +153,14 @@ pub fn build(cfg: &Config, api_key: &str, client: reqwest::blocking::Client) -> 
 /// connection pool (cheap, Arc inside).
 ///
 /// `run_timeout_secs == 0` means "no timeout" (mirroring the agent loop):
-/// no client-level total timeout is set at all — a hard 60s floor here
-/// would silently kill any streaming generation longer than a minute even
-/// though the user asked for no limit. Stuck streams are still caught by
-/// the SSE idle timeout, and a bounded run sets per-request timeouts from
-/// its remaining budget on top of this.
+/// no client-level TOTAL timeout is set — a hard 60s floor here would
+/// silently kill any streaming generation longer than a minute even though
+/// the user asked for no limit. The reader-thread leak backstop is handled
+/// separately, as a per-request timeout set on each streaming request in
+/// `agent::run_impl` (see `STREAM_BACKSTOP`) — reqwest's blocking client
+/// exposes no idle-read timeout, so a per-request total cap is the only
+/// available way to guarantee the `sse-reader` worker thread terminates on
+/// a half-open connection. See `CancellableSse`.
 pub fn new_client(run_timeout_secs: u64) -> reqwest::blocking::Client {
     let mut builder = reqwest::blocking::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(15))
@@ -258,9 +261,14 @@ const POLL_SLICE: Duration = Duration::from_millis(200);
 
 /// Wraps a blocking reader in a worker thread, exposing payloads with an idle
 /// timeout and cancel check. The reader thread can't observe cancel (it's
-/// blocked in `read`), so on cancel/timeout the caller stops polling and the
-/// thread lingers until reqwest's per-request timeout aborts the underlying
-/// read (then it exits) or the process exits. Bounded, no busy-wait.
+/// blocked in `read`), so on cancel/timeout the caller stops polling. The
+/// thread then exits as soon as its blocked read returns — which is guaranteed
+/// because every streaming request carries a per-request timeout (from the
+/// run budget, or the `STREAM_BACKSTOP` in `agent` when there is no budget):
+/// that cap aborts the underlying read, so the thread can never linger
+/// indefinitely on a half-open connection. reqwest's blocking client has no
+/// idle-read timeout, so this per-request cap is the only available backstop.
+/// Bounded, no busy-wait.
 pub(crate) struct CancellableSse {
     rx: mpsc::Receiver<std::result::Result<String, String>>,
     cancel: Arc<AtomicBool>,

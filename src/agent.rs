@@ -8,6 +8,23 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Per-request timeout used as a leak backstop when the run has no deadline
+/// (`limits.timeout_secs == 0`). The `sse-reader` worker thread is blocked in
+/// a reqwest `read()` it can't observe the cancel flag during, so without ANY
+/// per-request timeout a half-open connection leaves it lingering forever
+/// after the caller has already given up (idle/cancel) — the worker thread and
+/// its TCP connection leak until process exit. reqwest's blocking client
+/// exposes no idle-read timeout, so a total per-request cap is the only
+/// available guarantee the reader thread exits.
+///
+/// Generous on purpose: a single chat response taking longer than this is
+/// effectively a stuck connection, not a legit generation. It caps ONE
+/// request, never the RUN (a run is many requests) — so "no timeout" still
+/// means an unbounded run, just not an unbounded single request. A run with a
+/// real budget (`timeout_secs > 0`) ignores this and derives per-request from
+/// the remaining budget instead.
+const STREAM_BACKSTOP: Duration = Duration::from_secs(10 * 60);
+
 /// What triggered a history compression: the per-turn preflight estimate
 /// crossing the configured threshold, or overflow recovery after the
 /// provider rejected a request as too long for the context window.
@@ -82,6 +99,77 @@ pub struct RunOutcome {
     pub elapsed: Duration,
 }
 
+/// A run that failed after burning tokens / running tools. Carries the partial
+/// cost so a retry loop can bill the failed attempt honestly: its tokens were
+/// spent (the provider streamed them before erroring) and its tool calls
+/// already had their side effects (files written, shells run — they're in the
+/// history and on disk). Charging only the final successful attempt in
+/// `result.json` understates the true cost, which is why `run_with_retries`
+/// and batch `run_one` fold this back into the outcome they report.
+///
+/// `Display`/`Debug` delegate to `source`, so existing `{e}` / `{e:#}`
+/// formatting at call sites is unchanged.
+pub struct RunError {
+    pub source: anyhow::Error,
+    /// Tokens burned by chat requests in this run before it errored.
+    pub usage: Usage,
+    /// Tool calls executed in this run before it errored.
+    pub tool_calls: Vec<ToolCallRecord>,
+}
+
+impl std::fmt::Display for RunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.source, f)
+    }
+}
+impl std::fmt::Debug for RunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.source, f)
+    }
+}
+impl std::error::Error for RunError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+/// Accumulated partial run cost (tokens + tool calls) from failed attempts,
+/// folded into a successful outcome so `result.json` bills every attempt
+/// honestly (P2-3). Shared between single-run `run_with_retries` and batch
+/// `run_one`, which both accumulate each failed attempt's `RunError` cost and
+/// fold it into the final outcome they report.
+#[derive(Default, Clone)]
+pub(crate) struct RunCost {
+    pub usage: Usage,
+    pub tool_calls: Vec<ToolCallRecord>,
+}
+
+impl RunCost {
+    /// Add a failed attempt's partial cost: the tokens it burned and the tools
+    /// it ran (whose side effects already landed in the history / on disk).
+    /// `&RunError` (not by value) so the caller can still format the error.
+    pub(crate) fn add_failed(&mut self, re: &RunError) {
+        self.usage.input_tokens += re.usage.input_tokens;
+        self.usage.output_tokens += re.usage.output_tokens;
+        self.usage.cache_creation_input_tokens += re.usage.cache_creation_input_tokens;
+        self.usage.cache_read_input_tokens += re.usage.cache_read_input_tokens;
+        self.tool_calls.extend(re.tool_calls.iter().cloned());
+    }
+
+    /// Fold this accumulated cost into a successful outcome so its reported
+    /// totals cover EVERY attempt. Tool calls from earlier (failed) attempts
+    /// come first — they happened first chronologically.
+    pub(crate) fn fold_into(&mut self, o: &mut RunOutcome) {
+        o.input_tokens += self.usage.input_tokens;
+        o.output_tokens += self.usage.output_tokens;
+        o.cache_creation_input_tokens += self.usage.cache_creation_input_tokens;
+        o.cache_read_input_tokens += self.usage.cache_read_input_tokens;
+        // Earlier attempts first, then this attempt's tool calls.
+        self.tool_calls.append(&mut o.tool_calls);
+        o.tool_calls = std::mem::take(&mut self.tool_calls);
+    }
+}
+
 pub struct Agent {
     provider: Box<dyn Provider>,
     tools: Vec<Box<dyn Tool>>,
@@ -99,8 +187,9 @@ pub struct Agent {
     /// so a persistent error doesn't retry (and warn) every single turn.
     compress_failed: bool,
     /// Running token totals for the current run (reset at run_impl entry).
-    /// Kept on self — not a local — so a sub-agent that fails MID-run can
-    /// still bill the turns it already burned (honest cost) via usage_so_far.
+    /// Kept on self — not a local — so `run_error` can snapshot the partial
+    /// cost into the returned `RunError` when a run fails mid-way, letting a
+    /// retry loop bill the failed attempt's burned tokens (honest cost).
     usage: Usage,
     /// Pre-serialized size of the tool definitions (name + description +
     /// schema JSON). tool_defs never changes after construction, so
@@ -145,6 +234,13 @@ impl Agent {
     /// not only the streaming read.
     pub fn set_cancel(&mut self, flag: Arc<AtomicBool>) {
         self.ctx.cancel = Some(flag.clone());
+        // Arm cancel-aware teardown on tools that own un-interruptible blocking
+        // resources (MCP stdio servers): on cancel they kill their child so a
+        // stuck call unblocks and the agent can drop — otherwise the child is
+        // orphaned when the frontend stops waiting (TUI quit / Ctrl-C).
+        for t in &mut self.tools {
+            t.set_cancel(&flag);
+        }
         self.cancel = Some(flag);
     }
 
@@ -163,13 +259,6 @@ impl Agent {
             .unwrap_or_else(|| Arc::new(AtomicBool::new(false)))
     }
 
-    /// Token totals accumulated so far in the current/last run. A sub-agent
-    /// that fails mid-run bills these to the parent — the turns it completed
-    /// were real billed calls even though the run errored (honest cost).
-    pub(crate) fn usage_so_far(&self) -> Usage {
-        self.usage
-    }
-
     /// Fold one request's usage into the run totals and emit the per-request
     /// Usage event. Single site for the accumulate+emit pair — the four call
     /// sites (preflight/forced compression, main chat, tool-billed usage) used
@@ -186,6 +275,18 @@ impl Agent {
             cache_creation_input_tokens: u.cache_creation_input_tokens,
             cache_read_input_tokens: u.cache_read_input_tokens,
         });
+    }
+
+    /// Wrap a mid-run error with the partial cost burned so far (this run's
+    /// accumulated `usage` + the `records` of tools already executed), so a
+    /// retry loop can bill the failed attempt honestly. Called at every
+    /// error-return point in `run_impl`.
+    fn run_error(&self, source: anyhow::Error, records: &[ToolCallRecord]) -> RunError {
+        RunError {
+            source,
+            usage: self.usage,
+            tool_calls: records.to_vec(),
+        }
     }
 
     /// Test-only view of the trailing user message's tool_result contents —
@@ -258,7 +359,7 @@ impl Agent {
     /// Resets a stale cancel flag from a previous run (this `Agent` may be
     /// reused across runs — TUI follow-ups, harness retries — so a Ctrl-C that
     /// ended the last run must not bleed into this one).
-    pub fn run(&mut self, events: &mut dyn FnMut(AgentEvent)) -> Result<RunOutcome> {
+    pub fn run(&mut self, events: &mut dyn FnMut(AgentEvent)) -> Result<RunOutcome, RunError> {
         self.run_impl(events, /* reset_cancel */ true)
     }
 
@@ -275,7 +376,7 @@ impl Agent {
     pub(crate) fn run_as_subagent(
         &mut self,
         events: &mut dyn FnMut(AgentEvent),
-    ) -> Result<RunOutcome> {
+    ) -> Result<RunOutcome, RunError> {
         self.run_impl(events, /* reset_cancel */ false)
     }
 
@@ -283,7 +384,7 @@ impl Agent {
         &mut self,
         events: &mut dyn FnMut(AgentEvent),
         reset_cancel: bool,
-    ) -> Result<RunOutcome> {
+    ) -> Result<RunOutcome, RunError> {
         let start = Instant::now();
         // Each top-level run gets a fresh compression budget. In the TUI the
         // same Agent is reused across follow-ups; without this reset, one
@@ -378,8 +479,11 @@ impl Agent {
                         tools: &self.tool_defs,
                         model: &self.model,
                         max_tokens: self.max_tokens,
-                        per_request_timeout: deadline
-                            .map(|d| d.saturating_duration_since(Instant::now())),
+                        per_request_timeout: Some(
+                            deadline
+                                .map(|d| d.saturating_duration_since(Instant::now()))
+                                .unwrap_or(STREAM_BACKSTOP),
+                        ),
                         // Shared cancel flag: the streaming reader checks it
                         // between chunks, so Esc/Ctrl-C can interrupt a stuck
                         // request mid-read (not only at the next turn boundary).
@@ -425,9 +529,9 @@ impl Agent {
                                 continue;
                             }
                         }
-                        return Err(e);
+                        return Err(self.run_error(e, &records));
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => return Err(self.run_error(e, &records)),
                 }
             };
             if let Some(u) = resp.usage {
@@ -1000,11 +1104,16 @@ impl Agent {
             // Even share of (remaining − reserve) across all summary calls, so
             // a multi-chunk compression can't starve the main chat that follows
             // in the same turn.
-            per_request_timeout: deadline.map(|d| {
-                let remaining = d
-                    .saturating_duration_since(Instant::now())
-                    .saturating_sub(compress::COMPRESS_RESERVE);
-                remaining / (n_calls as u32)
+            per_request_timeout: Some(match deadline {
+                Some(d) => {
+                    let remaining = d
+                        .saturating_duration_since(Instant::now())
+                        .saturating_sub(compress::COMPRESS_RESERVE);
+                    remaining / (n_calls as u32)
+                }
+                // No run budget: the summary calls still get a per-request
+                // cap (the reader-thread leak backstop), evenly shared.
+                None => STREAM_BACKSTOP / (n_calls as u32),
             }),
             cancel: self.cancel_flag(),
             // The summary is one-off: the next compression summarizes a

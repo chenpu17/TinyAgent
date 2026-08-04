@@ -1,3 +1,4 @@
+use crate::agent::RunCost;
 use crate::config::{Config, PartialConfig};
 use crate::harness;
 use crate::retry::backoff;
@@ -240,6 +241,11 @@ fn run_one_attempt(
     // 1-based attempt index, written to result.json's `attempts` so CI can
     // see how many tries a retried task actually took (was hardcoded 1).
     attempt_no: usize,
+    // Accumulated partial cost from earlier FAILED attempts (tokens burned +
+    // tools run, whose side effects already landed). Folded into this
+    // attempt's outcome on success so result.json bills every attempt
+    // honestly (P2-3); extended on a transient error for the next try.
+    acc: &mut RunCost,
 ) -> TaskReport {
     let start = std::time::Instant::now();
     let bad = |stop: &str, msg: String| TaskReport {
@@ -287,7 +293,11 @@ fn run_one_attempt(
     let outcome = agent.run(&mut |_| {}); // quiet: no per-event printing
 
     match outcome {
-        Ok(o) => {
+        Ok(mut o) => {
+            // Bill every attempt: fold the failed attempts' accumulated cost
+            // into this outcome before writing, so result.json's token totals
+            // and tool-call list cover the whole task, not just the last try.
+            acc.fold_into(&mut o);
             // A failed result write must not be swallowed: CI reads this file
             // for the full tool_calls/summary. Surface it so report.json does
             // not claim success while the result file is missing.
@@ -308,7 +318,13 @@ fn run_one_attempt(
                 error,
             }
         }
-        Err(e) => bad("error", format!("{e:#}")),
+        Err(re) => {
+            // This attempt failed transiently, but it already burned tokens
+            // and ran tools — accumulate them so the next attempt (if any)
+            // bills them, and so a final success isn't undercosted.
+            acc.add_failed(&re);
+            bad("error", format!("{re:#}"))
+        }
     }
 }
 
@@ -329,7 +345,11 @@ fn run_one(
     cancel: &Arc<std::sync::atomic::AtomicBool>,
 ) -> TaskReport {
     let start = std::time::Instant::now();
-    let mut report = run_one_attempt(base, name, &partial, results_dir, client, 1);
+    // Honest-cost accumulator across attempts (P2-3): a fresh agent is built per
+    // attempt, so each failed attempt's tokens/tools can only be recovered via
+    // the RunError it returns — accumulate here and fold into the final result.
+    let mut acc = RunCost::default();
+    let mut report = run_one_attempt(base, name, &partial, results_dir, client, 1, &mut acc);
     let mut attempt = 0;
     while report.stop_reason == "error" && attempt < retries {
         let backoff = backoff(attempt);
@@ -357,7 +377,7 @@ fn run_one(
             break;
         }
         attempt += 1;
-        report = run_one_attempt(base, name, &partial, results_dir, client, attempt + 1);
+        report = run_one_attempt(base, name, &partial, results_dir, client, attempt + 1, &mut acc);
     }
     // run_one_attempt stamps per-attempt elapsed; overwrite with the total
     // across attempts + backoffs so report.json reflects real wall cost.

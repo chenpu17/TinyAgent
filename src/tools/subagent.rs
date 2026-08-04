@@ -189,15 +189,15 @@ fn run_subagent(
         });
     }) {
         Ok(o) => outcome_to_output(&o, name, max_output_chars),
-        Err(e) => {
-            let mut out = ToolOutput::error(format!("subagent {name} failed: {e:#}"));
+        Err(re) => {
+            let mut out = ToolOutput::error(format!("subagent {name} failed: {re:#}"));
             // Honest cost even on failure: the turns the child completed before
             // erroring were real billed calls — dropping them would understate
-            // the parent run's totals. None when nothing was billed yet (the
-            // caller folds only Some, and a Some(0,0) would be a noise event).
-            let u = agent.usage_so_far();
-            if u.input_tokens > 0 || u.output_tokens > 0 {
-                out.usage = Some(u);
+            // the parent run's totals. The RunError carries exactly the partial
+            // usage burned (None-equivalent when nothing was billed yet: a
+            // Some(0,0) would be a noise event, so gate on >0).
+            if re.usage.input_tokens > 0 || re.usage.output_tokens > 0 {
+                out.usage = Some(re.usage);
             }
             out
         }

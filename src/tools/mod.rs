@@ -78,6 +78,14 @@ pub trait Tool: Send + Sync {
         let _ = emit;
         self.run(input, ctx)
     }
+
+    /// Receive the run's shared cancel flag. Tools that own un-interruptible
+    /// blocking resources (an MCP stdio server's child process) override this
+    /// to arm a watcher that tears the resource down on cancel — so a stuck
+    /// call unblocks (the worker can then drop the agent) instead of leaving
+    /// the resource orphaned when the frontend gives up waiting. Default no-op
+    /// for leaf tools with nothing to tear down.
+    fn set_cancel(&mut self, _cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>) {}
 }
 
 /// Instantiate the built-in tools named in the config whitelist.

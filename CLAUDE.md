@@ -26,7 +26,10 @@ cargo clippy --all-targets                # lint headless 版（两个 feature �
 ## 架构要点
 
 - **同步**：`reqwest::blocking` + rustls，没有 tokio。流式用一个 worker 线程 + `CancellableSse`
-  （chunk 间 ≤200ms 响应 cancel，30s idle 超时）。
+  （chunk 间 ≤200ms 响应 cancel，30s idle 超时）。`sse-reader` 线程阻塞在 reqwest `read()` 里、读不到
+  cancel 标志，所以**每个流式请求必带 per-request timeout 兜底**（`STREAM_BACKSTOP`，10min；有 run budget
+  时改用剩余预算）——否则半开连接会让 reader 线程在 caller 已放弃（idle/cancel）后无限挂住（线程+连接泄漏）。
+  reqwest blocking 没有 idle-read timeout，per-request total cap 是唯一能保证 reader 退出的手段。
 - **两个 provider** 共享 `parse_loop` 与 `Message`/`Block` 类型：`provider/openai.rs`（兼容协议，
   覆盖 DeepSeek/vLLM/Ollama）与 `provider/anthropic.rs`（原生）。两者都解析 token 用量
   （OpenAI 走 `stream_options.include_usage` + `choices:[]` 末块；Anthropic 走
@@ -47,6 +50,9 @@ cargo clippy --all-targets                # lint headless 版（两个 feature �
   加 `"task"` 才启用。
 - **`retry.rs`** 是 batch `--retries` 与单跑瞬态重试共用的退避模块：指数 1/2/4/8/16/32s 封顶 + ±25%
   jitter（防并发 worker lockstep 踩踏同一个过载 provider）。只重试 transient（`stop_reason == "error"`）。
+  **重试诚实成本**：`agent.run()` 失败返回 `RunError`（带 `usage` + `tool_calls`——失败轮已烧的 token / 已跑的
+  tool，副作用已落盘）；`harness::run_with_retries` 与 batch `run_one` 用 `RunCost` 累计失败轮成本，fold 进
+  最终成功 outcome 再写 `result.json`（`RunCost::fold_into`/`add_failed`）。改重试/返回类型的人要保住这条。
 - **headless Ctrl-C** 走 `signal.rs`：首次 SIGINT 翻 cancel 标志（流式 ≤200ms 内断，照常写
   `result.json`，exit 130），二次 SIGINT `libc::_exit(130)` 立即退。handler 只碰 lock-free 原子 + `_exit`
   （async-signal-safe）。**批量模式**（`batch::run`）也装它：cancel 标志由 worker 在起任务前 gate
@@ -70,6 +76,12 @@ cargo clippy --all-targets                # lint headless 版（两个 feature �
 - **`panic = "abort"`（`[profile.release]`）**：release 下 panic **不触发 `Drop`**。TUI 的终端还原
   (`TerminalGuard`)、MCP 子进程清理（`StdioTransport::drop`）都依赖 Drop——调试这些行为用
   **debug 构建**。`std::process::exit` 也跳过 Drop，headless 模式退出前显式 `drop(agent)`。
+  **MCP stdio 现在有 cancel-aware teardown**：`Agent::set_cancel` 把 cancel Arc 经 `Tool::set_cancel`→
+  `McpTool`→`McpClient`→`StdioTransport::set_cancel` 传下去，后者 spawn 一个 `mcp-reaper` 线程（`spawn_reaper`），
+  cancel 一翻就 `libc::kill(-pgid, SIGKILL)` 杀整个进程组——卡死的 MCP 调用（worker 阻塞在 `request()` 等
+  120s `CALL_TIMEOUT`）由此立即解锁（child 死 → stdout EOF → reader 退 → `pending_fail_all`），worker 才能
+  drop agent、走正常 Drop 清理。否则 TUI 退出 3s join 超时 detach → agent 没 drop → MCP server 变孤儿。
+  reaper 用 `alive` Arc + Drop 里 `join` 保证不在 child 被 reap 后误杀被 OS 复用的 pgid。改这条链路别漏传 cancel。
 - **`serde_json::json!` 宏按所有权取值**：`From<&Value>` / `From<Option<_>>` 不存在。给宏传
   `&String`/`&Value` 要 `.clone()`；`Option<&str>` 要显式转成 `Value::Null` 或 `json!(s)`。
 - **Anthropic 不允许相邻两条 user 消息**（400）；且 N 个 `tool_use` 必须配 N 个 `tool_result`。

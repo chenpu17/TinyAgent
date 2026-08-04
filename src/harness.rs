@@ -1,4 +1,4 @@
-use crate::agent::{Agent, AgentEvent, RunOutcome};
+use crate::agent::{Agent, AgentEvent, RunCost, RunOutcome};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::io::Write;
@@ -29,9 +29,11 @@ pub fn run(
 /// flag at entry, so a retry starts clean. Caveat: if compression fired on a
 /// failed attempt it already folded the history (and saved the session), so the
 /// retry runs on the shorter history — safe and idempotent (it won't re-compress
-/// or double-bill), just not a perfect in-place restart. Token totals reflect
-/// only the final attempt (matching batch); `attempts` in result.json records
-/// how many ran.
+/// or double-bill), just not a perfect in-place restart. Token totals and the
+/// tool-call list cover EVERY attempt: a failed attempt's `RunError` carries the
+/// tokens it burned and the tools it ran (their side effects are already in the
+/// history/on disk), and we fold that into the final outcome so the reported
+/// cost stays honest. `attempts` in result.json records how many ran.
 pub(crate) fn run_with_retries(
     agent: &mut Agent,
     output_path: Option<&Path>,
@@ -45,21 +47,32 @@ pub(crate) fn run_with_retries(
     // Owns the two output sinks (stdout/stderr live, in-memory Vecs in tests)
     // and the cross-event line-tracking state. See HumanRenderer below.
     let mut renderer = HumanRenderer::new(std::io::stdout(), std::io::stderr());
+    // Accumulated partial cost from failed attempts. A transient error
+    // doesn't undo the tokens already streamed or the tools already run —
+    // their side effects are in the history and on disk — so the final
+    // result.json must fold these in for an honest total (P2-3).
+    let mut acc = RunCost::default();
     let (code, outcome, error) = loop {
-        let result: std::result::Result<RunOutcome, anyhow::Error> =
-            agent.run(&mut |ev| {
-                if json {
-                    emit_json(&ev);
-                    return;
-                }
-                renderer.render(&ev);
-            });
+        let result = agent.run(&mut |ev| {
+            if json {
+                emit_json(&ev);
+                return;
+            }
+            renderer.render(&ev);
+        });
         match result {
-            Ok(o) => break (exit_code_for(&o.stop_reason), Some(o), None),
-            Err(e) => {
+            Ok(mut o) => {
+                // Bill every attempt: fold the failed attempts' cost into the
+                // successful outcome before it's reported/written.
+                acc.fold_into(&mut o);
+                break (exit_code_for(&o.stop_reason), Some(o), None);
+            }
+            Err(re) => {
+                // Record what this failed attempt burned before retrying.
+                acc.add_failed(&re);
                 if attempt <= retries {
                     let backoff = crate::retry::backoff(attempt - 1);
-                    let msg = format!("{e:#}");
+                    let msg = format!("{re:#}");
                     if json {
                         // Surface the retry to NDJSON consumers between attempts
                         // so they can follow progress, not just see a gap.
@@ -102,7 +115,7 @@ pub(crate) fn run_with_retries(
                     attempt += 1;
                     continue;
                 }
-                break (EXIT_ERROR, None, Some(format!("{e:#}")));
+                break (EXIT_ERROR, None, Some(format!("{re:#}")));
             }
         }
     };

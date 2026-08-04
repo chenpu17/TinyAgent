@@ -650,6 +650,29 @@
     }
 
     #[test]
+    fn streaming_request_carries_timeout_backstop_without_run_deadline() {
+        // P2-7: a streaming request must ALWAYS carry a per-request timeout,
+        // even when the run has no deadline (`timeout_secs == 0`). The
+        // `sse-reader` worker thread is blocked in a reqwest `read()` it can't
+        // observe cancel during, so a `None` timeout would let it linger
+        // forever on a half-open connection after the caller has given up
+        // (idle/cancel) — a thread + TCP connection leak. The leak backstop is
+        // `STREAM_BACKSTOP` whenever the run budget is `None`.
+        let cfg = cfg_with(5, 0, 0); // timeout_secs=0 → no run deadline
+        let (prov, state) = MockProvider::new(vec![mock::resp_text("done", None)]);
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], vec![user_text("hi")], test_ctx());
+        let o = agent.run(&mut |_| {}).unwrap();
+        assert_eq!(o.stop_reason, "end_turn");
+        let caps = state.captured();
+        assert!(!caps.is_empty(), "provider must have been called");
+        assert_eq!(
+            caps[0].per_request_timeout,
+            Some(STREAM_BACKSTOP),
+            "streaming request without a run deadline must still set the leak backstop"
+        );
+    }
+
+    #[test]
     fn run_as_subagent_does_not_reset_a_set_cancel_flag() {
         // The `task` sub-agent's child shares the parent's cancel Arc and runs
         // via run_as_subagent, which — unlike the top-level run — must NOT reset
@@ -1820,6 +1843,55 @@
         let s = std::fs::read_to_string(&out).unwrap();
         assert!(s.contains("\"attempts\": 3"), "attempts not recorded: {s}");
         assert!(s.contains("\"success\": true"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn single_run_folds_failed_attempt_cost_into_final_totals() {
+        // P2-3 (honest cost): a retried run's result.json must bill EVERY
+        // attempt, not just the last. Attempt 1 bills 100/10 streamed tokens
+        // and runs a tool (EchoTool) on turn 1, then errors on turn 2; the
+        // RunError carries that partial cost. Attempt 2 succeeds billing 50/5.
+        // The final outcome must fold the failed attempt's 100/10 + its tool
+        // call into the totals — otherwise the real cost (tokens spent, tool
+        // run, side effects on disk) is silently dropped on a retry.
+        let cfg = cfg_with(5, 0, 0);
+        let (prov, _state) = MockProvider::new(vec![
+            // Attempt 1, turn 1: tool_use that bills streamed usage, then…
+            mock::resp_tool("t", "echo", json!({}), mock::mk_usage(100, 10)),
+            // Attempt 1, turn 2: provider error → run fails carrying turn 1's cost.
+            MockTurn::Err("503 transient".into()),
+            // Attempt 2, turn 1: clean recovery.
+            mock::resp_text("done", mock::mk_usage(50, 5)),
+        ]);
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![Box::new(EchoTool::new("echo"))],
+            vec![user_text("go")],
+            test_ctx(),
+        );
+        let dir = std::env::temp_dir().join(format!("ta-retry-fold-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let out = dir.join("r.json");
+        let code =
+            crate::harness::run_with_retries(&mut agent, Some(&out), false, 2, |_| {}).unwrap();
+        assert_eq!(code, 0, "recovered → exit 0");
+        let s = std::fs::read_to_string(&out).unwrap();
+        // Folded: 100 (failed attempt) + 50 (success) input; 10 + 5 output.
+        assert!(
+            s.contains("\"input_tokens\": 150"),
+            "failed attempt's input tokens not folded in: {s}"
+        );
+        assert!(
+            s.contains("\"output_tokens\": 15"),
+            "failed attempt's output tokens not folded in: {s}"
+        );
+        // The failed attempt's tool call survives in the audit list.
+        assert!(
+            s.contains("\"name\": \"echo\""),
+            "failed attempt's tool call not preserved: {s}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
