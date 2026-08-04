@@ -39,15 +39,12 @@ pub(crate) fn run_with_retries(
     retries: usize,
     mut sleep: impl FnMut(std::time::Duration),
 ) -> Result<i32> {
-    let mut at_line_start = true;
-    // Which sub-agent's text currently owns the stdout line (None = the parent
-    // agent or no one). When a different sub-agent's TextDelta arrives mid-line,
-    // we break to a new line and re-tag it — parallel sub-agents interleave, and
-    // without this their streamed text would mash together unlabelled.
-    let mut current_sub_name: Option<String> = None;
     // 1-based count of completed tries → result.json's `attempts`. We retry
     // while `attempt <= retries`, i.e. at most retries+1 total attempts.
     let mut attempt = 1usize;
+    // Owns the two output sinks (stdout/stderr live, in-memory Vecs in tests)
+    // and the cross-event line-tracking state. See HumanRenderer below.
+    let mut renderer = HumanRenderer::new(std::io::stdout(), std::io::stderr());
     let (code, outcome, error) = loop {
         let result: std::result::Result<RunOutcome, anyhow::Error> =
             agent.run(&mut |ev| {
@@ -55,137 +52,7 @@ pub(crate) fn run_with_retries(
                     emit_json(&ev);
                     return;
                 }
-                match ev {
-                    AgentEvent::TurnStart(n) => {
-                        if !at_line_start {
-                            println!();
-                        }
-                        eprintln!("── turn {n} ──");
-                        at_line_start = true; // we're on a fresh stdout line now
-                        current_sub_name = None;
-                    }
-                    AgentEvent::TextDelta(t) => {
-                        print!("{t}");
-                        let _ = std::io::stdout().flush();
-                        at_line_start = t.ends_with('\n');
-                        current_sub_name = None; // parent agent owns this line now
-                    }
-                    AgentEvent::ToolCall { name, input } => {
-                        println!("\n[tool →] {name} {}", compact(&input));
-                        at_line_start = true; // println ended on a fresh line
-                        current_sub_name = None;
-                    }
-                    AgentEvent::ToolResult {
-                        name,
-                        is_error,
-                        content,
-                    } => {
-                        let tag = if is_error { "[tool ✗]" } else { "[tool ✓]" };
-                        println!("{tag} {name}: {}", crate::agent::preview(&content));
-                        at_line_start = true;
-                        current_sub_name = None;
-                    }
-                    AgentEvent::Done { stop_reason } => {
-                        println!("\n[done: {stop_reason}]");
-                        at_line_start = true;
-                        current_sub_name = None;
-                    }
-                    AgentEvent::Compressed {
-                        dropped,
-                        kept,
-                        trigger,
-                    } => {
-                        let how = match trigger {
-                            crate::agent::CompressTrigger::Preflight => "preflight",
-                            crate::agent::CompressTrigger::Overflow => "overflow",
-                        };
-                        println!(
-                            "\n[context compressed ({how}): dropped {dropped} messages, {kept} kept]"
-                        );
-                        at_line_start = true;
-                        current_sub_name = None;
-                    }
-                    AgentEvent::Warning(w) => {
-                        // Warnings go to stderr (stdout carries the transcript);
-                        // break the line first if text is mid-stream.
-                        if !at_line_start {
-                            println!();
-                            at_line_start = true;
-                        }
-                        eprintln!("[warn] {w}");
-                        current_sub_name = None;
-                    }
-                    AgentEvent::Usage {
-                        input_tokens,
-                        output_tokens,
-                        cache_creation_input_tokens,
-                        cache_read_input_tokens,
-                    } => {
-                        let cache = if cache_creation_input_tokens > 0 || cache_read_input_tokens > 0 {
-                            format!(
-                                " · cache {}write {}read",
-                                cache_creation_input_tokens, cache_read_input_tokens
-                            )
-                        } else {
-                            String::new()
-                        };
-                        eprintln!("[tokens: {input_tokens}↑ {output_tokens}↓{cache}]");
-                    }
-                    AgentEvent::SubAgent { name, event } => {
-                        // Render the child's event prefixed with its identity, so
-                        // a human can follow each sub-agent's progress —
-                        // especially when several run in parallel and interleave.
-                        // Usage is already folded into the run totals at the agent
-                        // level, so it's not re-shown here.
-                        match &*event {
-                            AgentEvent::TextDelta(t) => {
-                                // Tag a sub-agent's text with [name]. Print the tag
-                                // once at the start of ITS run of text — not on
-                                // every streamed chunk (else fragments render as
-                                // "[scout] Hel[scout] lo[scout] world"). And if a
-                                // DIFFERENT sub-agent's text arrives mid-line
-                                // (parallel interleaving), break to a new line and
-                                // re-tag, so their streams don't mash together.
-                                let same = current_sub_name.as_deref() == Some(name.as_str());
-                                if at_line_start || !same {
-                                    if !at_line_start {
-                                        println!();
-                                    }
-                                    print!("[{name}] ");
-                                    current_sub_name = Some(name.clone());
-                                }
-                                print!("{t}");
-                                let _ = std::io::stdout().flush();
-                                at_line_start = t.ends_with('\n');
-                            }
-                            AgentEvent::ToolCall { name: tn, input } => {
-                                println!("\n[{name}] [tool →] {tn} {}", compact(input));
-                                at_line_start = true;
-                                current_sub_name = None;
-                            }
-                            AgentEvent::ToolResult {
-                                name: tn,
-                                is_error,
-                                content,
-                            } => {
-                                let tag = if *is_error { "[tool ✗]" } else { "[tool ✓]" };
-                                println!("[{name}] {tag} {tn}: {}", crate::agent::preview(content));
-                                at_line_start = true;
-                                current_sub_name = None;
-                            }
-                            AgentEvent::Done { .. } => {} // implicit in the result
-                            AgentEvent::Warning(w) => {
-                                if !at_line_start {
-                                    println!();
-                                    at_line_start = true;
-                                }
-                                eprintln!("[{name}] [warn] {w}");
-                                current_sub_name = None;
-                            }
-                            _ => {} // TurnStart/Compressed/Usage/SubAgent: noisy or folded
-                        }
-                    }
-                }
+                renderer.render(&ev);
             });
         match result {
             Ok(o) => break (exit_code_for(&o.stop_reason), Some(o), None),
@@ -478,6 +345,171 @@ fn compact(v: &serde_json::Value) -> String {
     crate::agent::preview(&v.to_string())
 }
 
+/// Streams the human-readable transcript of an agent run to two sinks:
+/// `out` carries the transcript (streamed text, tool calls/results, the done
+/// line, compression notices); `err` carries out-of-band chrome (turn headers,
+/// token counts, warnings). Factored out of `run_with_retries` so the rendering
+/// is unit-testable against in-memory sinks instead of capturing process
+/// stdout/stderr (which isn't safely doable from a parallel test binary).
+///
+/// `at_line_start` / `current_sub_name` persist across events: streamed text
+/// appends to the current line, and parallel sub-agents are tagged `[name]` and
+/// broken onto their own lines so their interleaved output doesn't mash
+/// together. I/O errors are ignored (best-effort): under Rust's default
+/// SIG_IGN a closed downstream pipe returns `EPIPE` rather than killing us, and
+/// panicking the whole run on a broken pipe is worse than silently dropping the
+/// rest — the live path passes `Stdout`/`Stderr`, tests pass `Vec<u8>`.
+struct HumanRenderer<Out: Write, Err: Write> {
+    out: Out,
+    err: Err,
+    at_line_start: bool,
+    current_sub_name: Option<String>,
+}
+
+impl<Out: Write, Err: Write> HumanRenderer<Out, Err> {
+    fn new(out: Out, err: Err) -> Self {
+        Self {
+            out,
+            err,
+            at_line_start: true,
+            current_sub_name: None,
+        }
+    }
+
+    fn render(&mut self, ev: &AgentEvent) {
+        match ev {
+            AgentEvent::TurnStart(n) => {
+                if !self.at_line_start {
+                    let _ = writeln!(self.out);
+                }
+                let _ = writeln!(self.err, "── turn {n} ──");
+                self.at_line_start = true; // we're on a fresh stdout line now
+                self.current_sub_name = None;
+            }
+            AgentEvent::TextDelta(t) => {
+                let _ = write!(self.out, "{t}");
+                let _ = self.out.flush();
+                self.at_line_start = t.ends_with('\n');
+                self.current_sub_name = None; // parent agent owns this line now
+            }
+            AgentEvent::ToolCall { name, input } => {
+                let _ = writeln!(self.out, "\n[tool →] {name} {}", compact(input));
+                self.at_line_start = true; // writeln ended on a fresh line
+                self.current_sub_name = None;
+            }
+            AgentEvent::ToolResult {
+                name,
+                is_error,
+                content,
+            } => {
+                let tag = if *is_error { "[tool ✗]" } else { "[tool ✓]" };
+                let _ = writeln!(self.out, "{tag} {name}: {}", crate::agent::preview(content));
+                self.at_line_start = true;
+                self.current_sub_name = None;
+            }
+            AgentEvent::Done { stop_reason } => {
+                let _ = writeln!(self.out, "\n[done: {stop_reason}]");
+                self.at_line_start = true;
+                self.current_sub_name = None;
+            }
+            AgentEvent::Compressed {
+                dropped,
+                kept,
+                trigger,
+            } => {
+                let how = match trigger {
+                    crate::agent::CompressTrigger::Preflight => "preflight",
+                    crate::agent::CompressTrigger::Overflow => "overflow",
+                };
+                let _ = writeln!(
+                    self.out,
+                    "\n[context compressed ({how}): dropped {dropped} messages, {kept} kept]"
+                );
+                self.at_line_start = true;
+                self.current_sub_name = None;
+            }
+            AgentEvent::Warning(w) => {
+                // Warnings go to stderr (stdout carries the transcript); break
+                // the line first if text is mid-stream.
+                if !self.at_line_start {
+                    let _ = writeln!(self.out);
+                    self.at_line_start = true;
+                }
+                let _ = writeln!(self.err, "[warn] {w}");
+                self.current_sub_name = None;
+            }
+            AgentEvent::Usage {
+                input_tokens,
+                output_tokens,
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+            } => {
+                let cache = if *cache_creation_input_tokens > 0 || *cache_read_input_tokens > 0 {
+                    format!(
+                        " · cache {}write {}read",
+                        cache_creation_input_tokens, cache_read_input_tokens
+                    )
+                } else {
+                    String::new()
+                };
+                let _ = writeln!(self.err, "[tokens: {input_tokens}↑ {output_tokens}↓{cache}]");
+            }
+            AgentEvent::SubAgent { name, event } => {
+                // Render the child's event prefixed with its identity, so a human
+                // can follow each sub-agent's progress — especially when several
+                // run in parallel and interleave. Usage is already folded into
+                // the run totals at the agent level, so it's not re-shown here.
+                match &**event {
+                    AgentEvent::TextDelta(t) => {
+                        // Tag a sub-agent's text with [name]. Print the tag once
+                        // at the start of ITS run of text — not on every streamed
+                        // chunk (else fragments render as "[scout] Hel[scout]
+                        // lo[scout] world"). And if a DIFFERENT sub-agent's text
+                        // arrives mid-line (parallel interleaving), break to a new
+                        // line and re-tag, so their streams don't mash together.
+                        let same = self.current_sub_name.as_deref() == Some(name.as_str());
+                        if self.at_line_start || !same {
+                            if !self.at_line_start {
+                                let _ = writeln!(self.out);
+                            }
+                            let _ = write!(self.out, "[{name}] ");
+                            self.current_sub_name = Some(name.clone());
+                        }
+                        let _ = write!(self.out, "{t}");
+                        let _ = self.out.flush();
+                        self.at_line_start = t.ends_with('\n');
+                    }
+                    AgentEvent::ToolCall { name: tn, input } => {
+                        let _ = writeln!(self.out, "\n[{name}] [tool →] {tn} {}", compact(input));
+                        self.at_line_start = true;
+                        self.current_sub_name = None;
+                    }
+                    AgentEvent::ToolResult {
+                        name: tn,
+                        is_error,
+                        content,
+                    } => {
+                        let tag = if *is_error { "[tool ✗]" } else { "[tool ✓]" };
+                        let _ = writeln!(self.out, "[{name}] {tag} {tn}: {}", crate::agent::preview(content));
+                        self.at_line_start = true;
+                        self.current_sub_name = None;
+                    }
+                    AgentEvent::Done { .. } => {} // implicit in the result
+                    AgentEvent::Warning(w) => {
+                        if !self.at_line_start {
+                            let _ = writeln!(self.out);
+                            self.at_line_start = true;
+                        }
+                        let _ = writeln!(self.err, "[{name}] [warn] {w}");
+                        self.current_sub_name = None;
+                    }
+                    _ => {} // TurnStart/Compressed/Usage/SubAgent: noisy or folded
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -708,5 +740,85 @@ mod tests {
         assert_eq!(parsed["cache_read_input_tokens"], 200);
         assert_eq!(parsed["attempts"], 3);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn renderer_routes_transcript_to_out_and_chrome_to_err() {
+        let mut r: HumanRenderer<Vec<u8>, Vec<u8>> = HumanRenderer::new(Vec::new(), Vec::new());
+
+        // Chrome (out-of-band) → stderr.
+        r.render(&AgentEvent::TurnStart(1));
+        r.render(&AgentEvent::Warning("careful".into()));
+        r.render(&AgentEvent::Usage {
+            input_tokens: 10,
+            output_tokens: 2,
+            cache_creation_input_tokens: 5,
+            cache_read_input_tokens: 8,
+        });
+        let err_s = String::from_utf8_lossy(&r.err).into_owned();
+        assert!(err_s.contains("turn 1"));
+        assert!(err_s.contains("[warn] careful"));
+        assert!(
+            err_s.contains("[tokens: 10↑ 2↓ · cache 5write 8read]"),
+            "cache suffix format: {err_s}"
+        );
+
+        // Transcript → stdout.
+        r.render(&AgentEvent::TextDelta("hello".into()));
+        r.render(&AgentEvent::ToolCall {
+            name: "shell".into(),
+            input: json!({"command": "ls"}),
+        });
+        r.render(&AgentEvent::ToolResult {
+            name: "shell".into(),
+            is_error: false,
+            content: "ok".into(),
+        });
+        r.render(&AgentEvent::ToolResult {
+            name: "shell".into(),
+            is_error: true,
+            content: "boom".into(),
+        });
+        r.render(&AgentEvent::Compressed {
+            dropped: 3,
+            kept: 5,
+            trigger: CompressTrigger::Preflight,
+        });
+        r.render(&AgentEvent::Done {
+            stop_reason: "end_turn".into(),
+        });
+        let out_s = String::from_utf8_lossy(&r.out).into_owned();
+        assert!(out_s.contains("hello"));
+        assert!(out_s.contains("[tool →] shell"));
+        assert!(out_s.contains("[tool ✓] shell"));
+        assert!(out_s.contains("[tool ✗] shell"));
+        assert!(out_s.contains("[context compressed (preflight): dropped 3 messages, 5 kept]"));
+        assert!(out_s.contains("[done: end_turn]"));
+        // Chrome must not leak into the transcript.
+        assert!(!out_s.contains("[tokens:") && !out_s.contains("[warn]"));
+    }
+
+    #[test]
+    fn renderer_tags_interleaved_subagent_streams_on_separate_lines() {
+        fn sub_text(name: &str, t: &str) -> AgentEvent {
+            AgentEvent::SubAgent {
+                name: name.into(),
+                event: Box::new(AgentEvent::TextDelta(t.into())),
+            }
+        }
+        let mut r: HumanRenderer<Vec<u8>, Vec<u8>> = HumanRenderer::new(Vec::new(), Vec::new());
+        // scout streams two contiguous chunks → tagged once at the start of its run.
+        r.render(&sub_text("scout", "Hel"));
+        r.render(&sub_text("scout", "lo"));
+        // A different sub-agent mid-line breaks to a new line and re-tags.
+        r.render(&sub_text("worker", "x"));
+        let out_s = String::from_utf8_lossy(&r.out).into_owned();
+        assert_eq!(
+            out_s.matches("[scout]").count(),
+            1,
+            "tag should print once per contiguous run, not per chunk: {out_s}"
+        );
+        assert!(out_s.contains("[scout] Hello"), "scout's chunks should join: {out_s}");
+        assert!(out_s.contains("[worker] x"), "second agent on its own tagged line: {out_s}");
     }
 }

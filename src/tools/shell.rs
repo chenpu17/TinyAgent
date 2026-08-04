@@ -260,4 +260,80 @@ mod tests {
             out.content
         );
     }
+
+    fn ctx(workdir: std::path::PathBuf, max_output_chars: usize) -> ToolCtx {
+        ToolCtx {
+            workdir,
+            max_output_chars,
+            restrict_to_workdir: false,
+            cancel: None,
+        }
+    }
+
+    #[test]
+    fn runs_command_and_reports_zero_exit() {
+        let out = Shell
+            .run(&json!({"command": "echo hello"}), &ctx(std::env::temp_dir(), 1000))
+            .unwrap();
+        assert!(!out.is_error, "echo should exit 0: {}", out.content);
+        assert!(out.content.contains("hello"));
+        assert!(out.content.contains("[exit code: 0]"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonzero_exit_is_flagged_error_with_code() {
+        let out = Shell
+            .run(&json!({"command": "exit 7"}), &ctx(std::env::temp_dir(), 1000))
+            .unwrap();
+        assert!(out.is_error);
+        assert!(out.content.contains("[exit code: 7]"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stderr_is_captured_under_a_section_header() {
+        let out = Shell
+            .run(&json!({"command": "echo oops >&2"}), &ctx(std::env::temp_dir(), 1000))
+            .unwrap();
+        assert!(
+            out.content.contains("[stderr]"),
+            "stderr section missing: {}",
+            out.content
+        );
+        assert!(out.content.contains("oops"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runs_in_the_configured_working_directory() {
+        let dir = std::env::temp_dir().join(format!("ta-shell-wd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = Shell
+            .run(&json!({"command": "pwd"}), &ctx(dir.clone(), 1000))
+            .unwrap();
+        // pwd may resolve a symlink (e.g. /tmp → /private/tmp on macOS);
+        // accept either spelling.
+        let canonical = dir.canonicalize().unwrap();
+        assert!(
+            out.content.contains(dir.to_string_lossy().as_ref())
+                || out.content.contains(canonical.to_string_lossy().as_ref()),
+            "pwd should run in the configured workdir, got: {}",
+            out.content
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ascii_output_marks_truncation() {
+        // ~1000 chars under a 50-char cap → the char-based truncate() must fire.
+        let out = Shell
+            .run(
+                &json!({"command": "printf 'x%.0s' $(seq 1 1000)"}),
+                &ctx(std::env::temp_dir(), 50),
+            )
+            .unwrap();
+        assert!(out.content.contains("[truncated"), "got: {}", out.content);
+    }
 }

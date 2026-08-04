@@ -201,4 +201,79 @@ mod tests {
         assert!(s.chars().count() < 200);
         assert!(s.contains("[truncated, limit 100 chars]"));
     }
+
+    /// A unique, canonicalized temp workdir for confine/resolve tests. confine
+    /// compares against a canonicalized workdir (config load canonicalizes it),
+    /// so the test must too — on macOS /tmp is a symlink to /private/tmp, and a
+    /// non-canonical workdir would make every starts_with check falsely fail.
+    fn workdir(label: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("ta-confine-{label}-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn resolve_rejects_dotdot_escape_when_restricted() {
+        let ctx = ToolCtx {
+            workdir: workdir("escape"),
+            max_output_chars: 1000,
+            restrict_to_workdir: true,
+            cancel: None,
+        };
+        let err = resolve(&ctx, "../outside.txt").unwrap_err();
+        assert!(
+            err.to_string().contains("escapes the working directory"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn resolve_allows_a_nested_not_yet_existing_path() {
+        let dir = workdir("inside");
+        let ctx = ToolCtx {
+            workdir: dir.clone(),
+            max_output_chars: 1000,
+            restrict_to_workdir: true,
+            cancel: None,
+        };
+        // write_file targets not-yet-existing files; resolve (via confine) must
+        // allow a path whose deeper components don't exist yet (it canonicalizes
+        // the deepest existing ancestor — the workdir — and re-appends the rest).
+        let resolved = resolve(&ctx, "a/b/c.txt").unwrap();
+        assert!(resolved.starts_with(&dir));
+        assert!(resolved.ends_with("a/b/c.txt"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_skips_confinement_when_unrestricted() {
+        let ctx = ToolCtx {
+            workdir: std::env::temp_dir(),
+            max_output_chars: 1000,
+            restrict_to_workdir: false,
+            cancel: None,
+        };
+        // With restrict off, resolve just joins — no escape check, no error.
+        let resolved = resolve(&ctx, "../outside.txt").unwrap();
+        assert!(resolved.ends_with("../outside.txt"));
+    }
+
+    #[test]
+    fn confine_rejects_an_existing_path_outside_workdir() {
+        let dir = workdir("abs");
+        let ctx = ToolCtx {
+            workdir: dir.clone(),
+            max_output_chars: 1000,
+            restrict_to_workdir: true,
+            cancel: None,
+        };
+        // The workdir's own parent exists and is, by definition, not under it.
+        let outside = dir.parent().unwrap();
+        let err = confine(&ctx, outside).unwrap_err();
+        assert!(
+            err.to_string().contains("escapes the working directory"),
+            "{err}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
