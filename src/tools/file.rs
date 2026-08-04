@@ -10,6 +10,11 @@ const MAX_LIST_ENTRIES: usize = 500;
 /// a multi-GB file (e.g. a log in the workdir). Module-level so a test can
 /// reference the real value instead of a drift-prone literal.
 const EDIT_FILE_MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// Upper bound on a replace_all RESULT: the input is capped at EDIT_FILE_MAX_BYTES,
+/// but many short matches expanded into a large new_string can otherwise produce a
+/// multi-GB string and OOM before it ever hits disk. The estimate is checked BEFORE
+/// the allocation.
+const EDIT_FILE_OUTPUT_MAX: u128 = 64 * 1024 * 1024;
 
 pub struct ReadFile;
 
@@ -38,6 +43,14 @@ impl Tool for ReadFile {
         let f = std::fs::File::open(&full)
             .with_context(|| format!("cannot read {}", full.display()))?;
         let reader = std::io::BufReader::new(f);
+        // Bound the BYTES read from disk so a newline-less huge file can't OOM
+        // on a single line allocation — reader.lines() buffers a whole line
+        // into memory before the per-line truncation below can throw it away,
+        // so without this cap a multi-GB single-line file defeats the "bounded
+        // read". 4× the char cap + slack mirrors the shell tool's byte budget:
+        // ample for the output window, and no single line can exceed it.
+        let max_bytes = (ctx.max_output_chars.saturating_mul(4)).saturating_add(1024) as u64;
+        let reader = reader.take(max_bytes);
 
         let offset = input["offset"].as_u64().unwrap_or(1).max(1) as usize;
         let limit = input["limit"].as_u64().map(|n| n as usize);
@@ -212,6 +225,22 @@ impl Tool for EditFile {
             );
         }
 
+        // Guard replace_all's RESULT size: original is ≤8 MiB, but many short
+        // matches replaced by a large new_string can balloon the output into a
+        // multi-GB allocation (and OOM) before it hits disk. Estimate without
+        // allocating and bail when it would exceed the cap.
+        if replace_all {
+            let est = (original.len() as u128)
+                .saturating_add((count as u128).saturating_mul(new_string.len() as u128))
+                .saturating_sub((count as u128).saturating_mul(old_string.len() as u128));
+            if est > EDIT_FILE_OUTPUT_MAX {
+                bail!(
+                    "edit_file: replace_all would produce ~{est} bytes ({count} × {:?} → {:?}); over the {EDIT_FILE_OUTPUT_MAX}-byte result limit — narrow old_string or edit in smaller chunks",
+                    old_string,
+                    new_string
+                );
+            }
+        }
         let updated = if replace_all {
             original.replace(old_string, new_string)
         } else {

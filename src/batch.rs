@@ -219,6 +219,9 @@ fn run_one_attempt(
     partial: &PartialConfig,
     results_dir: &Path,
     client: &reqwest::blocking::Client,
+    // 1-based attempt index, written to result.json's `attempts` so CI can
+    // see how many tries a retried task actually took (was hardcoded 1).
+    attempt_no: usize,
 ) -> TaskReport {
     let start = std::time::Instant::now();
     let bad = |stop: &str, msg: String| TaskReport {
@@ -272,7 +275,7 @@ fn run_one_attempt(
             // not claim success while the result file is missing.
             let mut error = None;
             if let Err(e) =
-                harness::write_result(&results_dir.join(format!("{name}.json")), Some(&o), None, 1)
+                harness::write_result(&results_dir.join(format!("{name}.json")), Some(&o), None, attempt_no, "error")
             {
                 eprintln!("[warn] {name}: failed to write result file: {e:#}");
                 error = Some(format!("result file not written: {e:#}"));
@@ -308,7 +311,7 @@ fn run_one(
     cancel: &Arc<std::sync::atomic::AtomicBool>,
 ) -> TaskReport {
     let start = std::time::Instant::now();
-    let mut report = run_one_attempt(base, name, &partial, results_dir, client);
+    let mut report = run_one_attempt(base, name, &partial, results_dir, client, 1);
     let mut attempt = 0;
     while report.stop_reason == "error" && attempt < retries {
         let backoff = backoff(attempt);
@@ -336,7 +339,7 @@ fn run_one(
             break;
         }
         attempt += 1;
-        report = run_one_attempt(base, name, &partial, results_dir, client);
+        report = run_one_attempt(base, name, &partial, results_dir, client, attempt + 1);
     }
     // run_one_attempt stamps per-attempt elapsed; overwrite with the total
     // across attempts + backoffs so report.json reflects real wall cost.

@@ -1077,9 +1077,10 @@ fn ui_loop(
             dirty = true;
         }
         // Index of the in-flight row shown live in the viewport's transcript
-        // zone (None when nothing is streaming). It is exactly the row the
-        // watermark held back.
-        let inflight_idx = if stream_open { Some(pending_end) } else { None };
+        // zone (None when nothing is streaming). Computed independently of the
+        // commit watermark above — see inflight_row_index — so a streaming
+        // Assistant that opened AFTER a queued ghost still renders.
+        let inflight_idx = inflight_row_index(&rows, stream_open);
 
         // Render the live viewport — only when something changed (worker event
         // drained, key handled, first frame). While a run is in flight, also
@@ -2124,6 +2125,22 @@ fn commit_pending_end(rows: &[Row], committed: usize, stream_open: bool) -> usiz
         pending_end -= 1;
     }
     pending_end
+}
+
+/// Index of the row to render live in the viewport's transcript zone while a
+/// stream is open, else None. This is the row `append_delta` is currently
+/// mutating — the LAST `Row::Assistant` in `rows` — which a queued ghost may
+/// sit behind. It is deliberately INDEPENDENT of `commit_pending_end`: that
+/// watermark caps at the first queued ghost, so when a new turn streams AFTER
+/// a ghost, the watermark points at the stale pre-ghost Assistant, not the
+/// live one. Deriving the in-flight index from the watermark (the old code)
+/// rendered that stale row and hid the real streaming output.
+fn inflight_row_index(rows: &[Row], stream_open: bool) -> Option<usize> {
+    if stream_open {
+        rows.iter().rposition(|r| matches!(r, Row::Assistant(_)))
+    } else {
+        None
+    }
 }
 
 fn commit_rows<B: ratatui::backend::Backend>(
@@ -4142,6 +4159,45 @@ mod tests {
             Row::sys_warn("late warn"),   // 3 — held back
         ];
         assert_eq!(commit_pending_end(&rows, 1, false), 2);
+    }
+
+    #[test]
+    fn inflight_row_index_is_the_last_assistant_while_streaming() {
+        let rows = vec![Row::User("hi".into()), Row::Assistant("streaming".into())];
+        assert_eq!(inflight_row_index(&rows, true), Some(1));
+        assert_eq!(inflight_row_index(&rows, false), None);
+    }
+
+    #[test]
+    fn inflight_row_index_follows_a_new_stream_past_a_queued_ghost() {
+        // The regression: a queued ghost sits in the middle, and a NEW turn's
+        // Assistant streams after it. The live zone must render that new
+        // streaming Assistant (last one), NOT the stale pre-ghost Assistant
+        // that the commit watermark (capped at the first ghost) would point at.
+        let rows = vec![
+            Row::User("u".into()),          // 0
+            Row::Assistant("turn 1".into()), // 1 — stale, pre-ghost
+            Row::Queued("queued".into()),    // 2 — ghost
+            Row::sys_warn("warn"),           // 3
+            Row::Assistant("turn 2".into()), // 4 — the live streaming row
+        ];
+        assert_eq!(
+            inflight_row_index(&rows, true),
+            Some(4),
+            "must render the last Assistant (turn 2), not the pre-ghost one"
+        );
+    }
+
+    #[test]
+    fn inflight_row_index_handles_a_ghost_pushed_after_the_streaming_row() {
+        // User queues WHILE an Assistant streams: the ghost lands after it.
+        // The streaming row is still the last Assistant.
+        let rows = vec![
+            Row::User("u".into()),           // 0
+            Row::Assistant("streaming".into()), // 1
+            Row::Queued("next".into()),       // 2 — pushed during the stream
+        ];
+        assert_eq!(inflight_row_index(&rows, true), Some(1));
     }
 
     #[test]

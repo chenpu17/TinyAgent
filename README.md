@@ -255,7 +255,7 @@ length / error 等）才显示警告。工具输出里的 ANSI 颜色序列（�
 
 API key 从 `api_key_env` 指定的环境变量读取，不写进配置文件。
 
-`limits.stream_idle_secs`（默认 30）：流式响应两个 chunk 之间最长允许的静默秒数，超过即判定连接半开并中断。普通对话模型 chunk 间隔在亚秒级，30s 绰绰有余；**深度推理模型**（DeepSeek-R1、o 系列等）首 token 前可能静默数分钟，需要调大（如 180）才不会被误杀——`limits.timeout_secs` 仍是兜底硬上限，不会因此无限挂起。
+`limits.stream_idle_secs`（默认 30）：流式响应两个 chunk 之间最长允许的静默秒数，超过即判定连接半开并中断。普通对话模型 chunk 间隔在亚秒级，30s 绰绰有余；**深度推理模型**（DeepSeek-R1、o 系列等）首 token 前可能静默数分钟，需要调大（如 180）才不会被误杀——`limits.timeout_secs` 仍是**模型请求层面**的软上限（约束每轮 chat 请求与轮次边界；shell/MCP/子 agent 各有各自独立超时，不受此值硬截止），不会因此无限挂起。
 
 ### 上下文压缩
 

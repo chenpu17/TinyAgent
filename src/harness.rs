@@ -128,7 +128,16 @@ pub(crate) fn run_with_retries(
     // skipped write_result on any error, leaving CI with nothing but an opaque
     // non-zero exit. Batch (run_one) already did this; single-run now matches.
     if let Some(path) = output_path {
-        write_result(path, outcome.as_ref(), error.as_deref(), attempt)?;
+        // When there's no outcome, record WHY: a cancel (exit 130) is
+        // "cancelled", anything else is "error". Otherwise result.json would
+        // claim "error" for a user-initiated cancel, disagreeing with the exit
+        // code and the NDJSON terminal event (both already say "cancelled").
+        let none_sr = if code == EXIT_CANCELLED {
+            "cancelled"
+        } else {
+            "error"
+        };
+        write_result(path, outcome.as_ref(), error.as_deref(), attempt, none_sr)?;
         if !json {
             eprintln!("result written to {}", path.display());
         }
@@ -267,6 +276,10 @@ pub fn write_result(
     outcome: Option<&RunOutcome>,
     error: Option<&str>,
     attempts: usize,
+    // stop_reason recorded when `outcome` is None (run never produced an
+    // outcome — e.g. cancelled during retry backoff, or a setup/provider
+    // error). Ignored when outcome is Some (its own stop_reason is used).
+    none_stop_reason: &str,
 ) -> Result<()> {
     // json! takes values by ownership, so the &RunOutcome fields are cloned
     // here; Option<&str> is turned into a JSON null/string explicitly (Value
@@ -306,7 +319,7 @@ pub fn write_result(
         }
         None => json!({
             "success": false,
-            "stop_reason": "error",
+            "stop_reason": none_stop_reason,
             "attempts": attempts,
             "error": error_val,
         }),
@@ -319,7 +332,24 @@ pub fn write_result(
 /// directory, then rename. A crash mid-write never leaves a half-file —
 /// result.json and report.json are read by CI, so they must not corrupt.
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp");
+    // Unique temp name in the SAME directory as the target (atomic rename
+    // needs the same filesystem). The pid + counter suffix (a) avoids
+    // collisions between concurrent writes — e.g. batch workers sharing a
+    // workdir editing same-named files — and (b) makes the path unpredictable,
+    // so a pre-placed symlink at a fixed ".tmp" name can't redirect the write
+    // outside the workdir.
+    let tmp = {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        match path.file_name() {
+            Some(name) => {
+                let mut base = name.to_os_string();
+                base.push(format!(".{}.{}.tmp", std::process::id(), n));
+                path.with_file_name(base)
+            }
+            None => path.with_extension("tmp"),
+        }
+    };
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
@@ -331,6 +361,13 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     {
         let mut f = std::fs::File::create(&tmp)
             .with_context(|| format!("cannot create {}", tmp.display()))?;
+        // Preserve the existing target's permissions — above all the executable
+        // bit: File::create makes a fresh default-mode file, so without this an
+        // edit_file on a +x script silently strips -x. Best-effort no-op when
+        // the target doesn't exist yet (write_file creating a new file).
+        if let Ok(meta) = std::fs::metadata(path) {
+            let _ = f.set_permissions(meta.permissions());
+        }
         f.write_all(bytes)
             .with_context(|| format!("cannot write {}", tmp.display()))?;
         f.sync_all()
@@ -538,11 +575,38 @@ mod tests {
         let path = dir.join("out.json");
         atomic_write(&path, b"{\"ok\":true}").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"ok\":true}");
-        // The temp file must be gone after the rename.
-        assert!(!dir.join("out.tmp").exists());
+        // The temp file must be gone after the rename (the name is now unique
+        // per call, so scan the dir for any *.tmp leftover rather than a fixed
+        // name).
+        let no_tmp = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .all(|e| !e.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(no_tmp, "temp file must be gone after rename");
         // Overwriting an existing file is also atomic.
         atomic_write(&path, b"v2").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "v2");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserves_executable_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("ta-atomic-x-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("script.sh");
+        // Create the target with the executable bit set.
+        std::fs::write(&path, b"#!/bin/sh\necho old\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // atomic_write must carry the +x through to the new file.
+        atomic_write(&path, b"#!/bin/sh\necho new\n").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert!(
+            mode & 0o111 != 0,
+            "executable bit lost after atomic_write: mode {mode:o}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "#!/bin/sh\necho new\n");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -568,7 +632,7 @@ mod tests {
         };
         // Success path: tool output + token totals + summary all present.
         let path = dir.join("out.json");
-        write_result(&path, Some(&o), None, 1).unwrap();
+        write_result(&path, Some(&o), None, 1, "error").unwrap();
         let s = std::fs::read_to_string(&path).unwrap();
         assert!(s.contains("\"output\"") && s.contains("hello world"), "tool output missing");
         assert!(
@@ -580,7 +644,7 @@ mod tests {
         // Failure path: agent.run returned Err — still write a result artifact
         // (this is the gap the old `?`-skips-write_result had).
         let epath = dir.join("err.json");
-        write_result(&epath, None, Some("provider 503"), 1).unwrap();
+        write_result(&epath, None, Some("provider 503"), 1, "error").unwrap();
         let es = std::fs::read_to_string(&epath).unwrap();
         assert!(es.contains("\"success\": false"));
         assert!(es.contains("provider 503"));
@@ -745,7 +809,7 @@ mod tests {
             elapsed: std::time::Duration::from_secs(2),
         };
         let path = dir.join("cache.json");
-        write_result(&path, Some(&o), None, 3).unwrap();
+        write_result(&path, Some(&o), None, 3, "error").unwrap();
         // Parse back and assert by field name — a typo in the cache_* names
         // would silently drop cache cost from downstream accounting, and
         // substring checks couple to pretty-print spacing.
