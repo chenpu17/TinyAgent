@@ -28,13 +28,18 @@ const STREAM_BACKSTOP: Duration = Duration::from_secs(10 * 60);
 /// What triggered a history compression: the per-turn preflight estimate
 /// crossing the configured threshold, or overflow recovery after the
 /// provider rejected a request as too long for the context window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum CompressTrigger {
     Preflight,
     Overflow,
 }
 
 /// Events emitted during a run; frontends (headless printer / TUI) consume them.
+///
+/// `Serialize` is derived so the Python / TypeScript bindings can hand each event
+/// to host code as a native dict / object (via `pythonize` / napi serde interop)
+/// without a separate DTO. The recursive `SubAgent` variant serializes fine.
+#[derive(Debug, serde::Serialize)]
 pub enum AgentEvent {
     TurnStart(u32),
     TextDelta(String),
@@ -238,6 +243,31 @@ impl Agent {
             usage: Usage::default(),
             tool_schema_chars,
         }
+    }
+
+    // ── Read-only accessors (state for library users / bindings) ─────────────
+
+    /// Conversation history accumulated so far (user / assistant / tool_result
+    /// blocks). Multi-turn library callers read this to persist or inspect state
+    /// between [`Agent::run`] calls.
+    pub fn messages(&self) -> &[Message] {
+        &self.messages
+    }
+
+    /// Running token totals for the current/latest run. Reset at the start of
+    /// each [`Agent::run`]; after a run returns it holds that run's summed usage.
+    pub fn usage(&self) -> Usage {
+        self.usage
+    }
+
+    /// The model name this agent sends with each request (from the config).
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// The limits (max_turns / timeout / token budget / …) in effect.
+    pub fn limits(&self) -> &Limits {
+        &self.limits
     }
 
     /// Attach the RECOVERABLE per-turn cancellation flag; checked at every
@@ -878,7 +908,7 @@ fn run_tool(
     }
 }
 
-pub(crate) fn preview(s: &str) -> String {
+pub fn preview(s: &str) -> String {
     const MAX: usize = 200;
     // Single pass: take MAX chars, then test whether anything remained. The
     // old `.chars().count() > MAX` walked the WHOLE string just to decide

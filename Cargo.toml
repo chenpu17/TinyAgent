@@ -4,9 +4,24 @@ version = "0.2.0"
 edition = "2021"
 description = "A minimal single-binary AI agent: one JSON config, two modes (headless / TUI)"
 
+# bin + lib share this package: the binary (`tiny-agent`) keeps its existing
+# behavior byte-for-byte; the library (`tiny_agent`) exposes the agent loop,
+# tools, and providers for third-party / FFI use. Cargo auto-links the in-package
+# lib to the bin, so main.rs does `use tiny_agent::...`.
+[lib]
+name = "tiny_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tiny-agent"
+path = "src/main.rs"
+
 [features]
 default = []
 tui = ["dep:ratatui", "dep:crossterm", "dep:tui-markdown", "dep:unicode-width"]
+# Expose the scripted `provider::mock` (otherwise cfg(test)-only) so binding
+# crates and downstream users can run offline / dry-run loops without a key.
+mock = []
 
 [dependencies]
 anyhow = "1"

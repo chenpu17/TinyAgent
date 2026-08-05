@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 /// One scripted outcome of a `chat()` call: either a completed response or an
 /// injected error (consumed in FIFO order).
-pub(crate) enum MockTurn {
+pub enum MockTurn {
     Ok(ChatResponse),
     Err(String),
 }
@@ -20,57 +20,57 @@ pub(crate) enum MockTurn {
 /// What a `chat()` call saw — enough to assert the loop's structural
 /// invariants (message count, N tool_use ↔ N tool_result pairing).
 #[derive(Clone)]
-pub(crate) struct Captured {
-    pub(crate) message_count: usize,
-    pub(crate) last_role: Option<Role>,
+pub struct Captured {
+    pub message_count: usize,
+    pub last_role: Option<Role>,
     /// Role of every message in the request, in order — lets tests assert no
     /// two adjacent messages share a role (Anthropic rejects that with a 400).
-    pub(crate) roles: Vec<Role>,
+    pub roles: Vec<Role>,
     /// Every `tool_use` id in the request, in message/block order, across ALL
     /// messages. Paired with `tool_result_ids`, this lets a test enforce the
     /// Anthropic N:N invariant — each `tool_use` must have exactly one matching
     /// `tool_result` — over the WHOLE history (e.g. after context compression
     /// folds the prefix), not just the trailing message.
-    pub(crate) tool_use_ids: Vec<String>,
+    pub tool_use_ids: Vec<String>,
     /// Every `tool_result`'s `tool_use_id` in the request, in order. A
     /// multiset-equal check against `tool_use_ids` is the N:N bijection.
-    pub(crate) tool_result_ids: Vec<String>,
+    pub tool_result_ids: Vec<String>,
     /// tool_use blocks on the trailing assistant message. Captured for
     /// symmetry with `trailing_tool_results` and ad-hoc debugging; the
     /// cross-history N:N check lives in `tool_use_ids`/`tool_result_ids`.
     #[allow(dead_code)]
-    pub(crate) trailing_tool_uses: usize,
+    pub trailing_tool_uses: usize,
     /// tool_result blocks on the trailing user message.
-    pub(crate) trailing_tool_results: usize,
+    pub trailing_tool_results: usize,
     /// Every `Block::Text` body in a USER-role message, in order. The summary /
     /// combine calls build a single user message carrying their prompt, so this
     /// lets a test assert what the summarizer was fed (a running-summary update
     /// vs. fresh transcript, chunk segments vs. the combined brief).
-    pub(crate) user_texts: Vec<String>,
+    pub user_texts: Vec<String>,
     /// The `cache` flag on the request — lets tests assert that one-off calls
     /// (the compression summary) request `cache:false` while agent turns send
     /// `cache:true`. The mock doesn't build an HTTP body, so this records the
     /// agent's intent rather than the wire-level cache_control markup.
-    pub(crate) cache: bool,
+    pub cache: bool,
     /// The per-request timeout the agent set. Lets a test assert the
     /// reader-thread leak backstop is always present (a streaming request is
     /// never sent with `None`, which would let the sse-reader worker thread
     /// linger forever on a half-open connection). See `agent::STREAM_BACKSTOP`.
-    pub(crate) per_request_timeout: Option<std::time::Duration>,
+    pub per_request_timeout: Option<std::time::Duration>,
 }
 
 /// Shared, interior-mutable state — cloned by the test so it survives the
 /// provider being moved into the agent.
-pub(crate) struct MockState {
+pub struct MockState {
     queue: Mutex<VecDeque<MockTurn>>,
     captured: Mutex<Vec<Captured>>,
 }
 
 impl MockState {
-    pub(crate) fn calls(&self) -> usize {
+    pub fn calls(&self) -> usize {
         self.captured.lock().unwrap().len()
     }
-    pub(crate) fn captured(&self) -> Vec<Captured> {
+    pub fn captured(&self) -> Vec<Captured> {
         // Captured is Clone — snapshot the whole vec in one call rather than
         // hand-copying each field (which silently drops new fields when someone
         // forgets to update the mapping; adding `roles` already bit us once).
@@ -78,14 +78,14 @@ impl MockState {
     }
 }
 
-pub(crate) struct MockProvider {
+pub struct MockProvider {
     state: Arc<MockState>,
 }
 
 impl MockProvider {
     /// Returns the provider (to box into an agent) and a handle to its shared
     /// state (to assert on after the run).
-    pub(crate) fn new(turns: Vec<MockTurn>) -> (Self, Arc<MockState>) {
+    pub fn new(turns: Vec<MockTurn>) -> (Self, Arc<MockState>) {
         let state = Arc::new(MockState {
             queue: Mutex::new(turns.into()),
             captured: Mutex::new(Vec::new()),
@@ -174,7 +174,7 @@ impl Provider for MockProvider {
 // ── response builders ───────────────────────────────────────────────
 
 /// A normal turn that ends the run with some text.
-pub(crate) fn resp_text(text: &str, usage: Option<Usage>) -> MockTurn {
+pub fn resp_text(text: &str, usage: Option<Usage>) -> MockTurn {
     MockTurn::Ok(ChatResponse {
         blocks: vec![Block::Text(text.into())],
         stop_reason: "end_turn".into(),
@@ -184,7 +184,7 @@ pub(crate) fn resp_text(text: &str, usage: Option<Usage>) -> MockTurn {
 
 /// A turn requesting one tool call (stop_reason "tool_use"), so the loop
 /// continues into tool execution.
-pub(crate) fn resp_tool(id: &str, name: &str, input: Value, usage: Option<Usage>) -> MockTurn {
+pub fn resp_tool(id: &str, name: &str, input: Value, usage: Option<Usage>) -> MockTurn {
     MockTurn::Ok(ChatResponse {
         blocks: vec![Block::ToolUse {
             id: id.into(),
@@ -196,7 +196,7 @@ pub(crate) fn resp_tool(id: &str, name: &str, input: Value, usage: Option<Usage>
     })
 }
 
-pub(crate) fn mk_usage(input_tokens: u64, output_tokens: u64) -> Option<Usage> {
+pub fn mk_usage(input_tokens: u64, output_tokens: u64) -> Option<Usage> {
     Some(Usage {
         input_tokens,
         output_tokens,
@@ -207,7 +207,7 @@ pub(crate) fn mk_usage(input_tokens: u64, output_tokens: u64) -> Option<Usage> {
 
 /// Like `mk_usage` but also sets the prompt-cache fields — for tests asserting
 /// cache tokens flow through the agent loop honestly.
-pub(crate) fn mk_usage_cache(
+pub fn mk_usage_cache(
     input_tokens: u64,
     output_tokens: u64,
     cache_creation_input_tokens: u64,

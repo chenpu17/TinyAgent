@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 /// each child instead of re-running `McpClient::start` (re-spawning every MCP
 /// server per sub-agent call).
 #[derive(Clone)]
-pub(crate) struct McpTool {
+pub struct McpTool {
     client: Arc<Mutex<McpClient>>,
     wire_name: String,
     def: ToolDef,

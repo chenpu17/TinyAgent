@@ -25,6 +25,16 @@ cargo clippy --all-targets                # lint headless 版（两个 feature �
 
 ## 架构要点
 
+- **bin + lib 同包双 target**：`Cargo.toml` 同时声明 `[lib]`（`tiny_agent`，src/lib.rs）与
+  `[[bin]]`（`tiny-agent`，src/main.rs）。核心模块（agent/compress/config/provider/tools/mcp/
+  harness/batch/session/retry）属 lib，门面 re-export 在 `lib.rs`；`src/main.rs` 只保留进程级薄壳
+  （clap 参数、SIGINT、`process::exit`、可选 `mod tui`），靠 `pub(crate) use tiny_agent::{...}`
+  把 lib 模块拉进 bin crate 根——故 main.rs/tui.rs 里 `crate::agent::...` 等路径仍解析。
+  **改 lib 内部代码不用动 bin**；bin 行为是 lib 之上的薄壳。lib 内 `crate::` 指 lib 根（lib.rs 声明了
+  全部 `pub mod`），所以模块互引零改动。`mock` feature 把 `provider::mock`（否则 `cfg(test)`）放出，
+  供绑定/下游离线 dry-run。自定义工具共享底座 `tools::CallbackTool`（包闭包，impl `Tool`）——Python/TS
+  绑定的 callable 经 GIL/ThreadsafeFunction 闭包塞进来，共享同一 `Tool` impl。
+
 - **同步**：`reqwest::blocking` + rustls，没有 tokio。流式用一个 worker 线程 + `CancellableSse`
   （chunk 间 ≤200ms 响应 cancel，30s idle 超时）。`sse-reader` 线程阻塞在 reqwest `read()` 里、读不到
   cancel 标志，所以**每个流式请求必带 per-request timeout 兜底**（`STREAM_BACKSTOP`，10min；有 run budget
@@ -52,8 +62,9 @@ cargo clippy --all-targets                # lint headless 版（两个 feature �
   顺序跑，`task` 调用收集后用 `std::thread::scope` fan-out（每个一个 scoped thread），结果按原块序
   拼回（tool_use/tool_result 仍 N:N）。子 agent 的 token 用量经 `ToolOutput::usage` 折进主 run 累计
   （失败也照计已完成轮次）。事件实时转发，裹成 `AgentEvent::SubAgent{name}` 区分并行的几个。
-  **不可递归**：子 agent 的工具白名单滤掉 `task` 本身（无深度计数）。**不在默认白名单**，配置 `tools`
-  加 `"task"` 才启用。
+  **不可递归**：子 agent 的工具白名单滤掉 `task` 本身（无深度计数）。**在默认白名单**（`config::default_tools`
+  含 `task`）——headless 评测任务也会默认能 spawn 子 agent；评测若要锁定行为/成本，在 config 的 `tools`
+  里显式去掉 `task`。
 - **`retry.rs`** 是 batch `--retries` 与单跑瞬态重试共用的退避模块：指数 1/2/4/8/16/32s 封顶 + ±25%
   jitter（防并发 worker lockstep 踩踏同一个过载 provider）。只重试 transient（`stop_reason == "error"`）。
   **重试诚实成本**：`agent.run()` 失败返回 `RunError`（带 `usage` + `tool_calls`——失败轮已烧的 token / 已跑的

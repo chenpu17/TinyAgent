@@ -1,18 +1,17 @@
-mod agent;
-mod batch;
-mod compress;
-mod config;
-mod harness;
-mod mcp;
-mod provider;
-mod retry;
-mod session;
 mod signal;
-mod tools;
 #[cfg(feature = "tui")]
 mod tui;
 
-use agent::Agent;
+// Core modules live in the `tiny_agent` library (src/lib.rs). Re-export them at
+// this binary's crate root so the rest of main.rs — and `mod tui`, which reaches
+// them as `crate::agent::…` — keeps resolving unchanged. The binary is only the
+// process-level shell: arg parsing, SIGINT, exit codes, and the optional TUI.
+pub(crate) use tiny_agent::{batch, build_agent, config, harness, provider, session, tools};
+// `agent` itself is only reached by the TUI (`crate::agent::…`); gate it so a
+// headless build doesn't warn about an unused re-export.
+#[cfg(feature = "tui")]
+pub(crate) use tiny_agent::agent;
+
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use config::Config;
@@ -20,7 +19,6 @@ use provider::{Block, Message, Role};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use tools::ToolCtx;
 
 #[derive(Parser)]
 #[command(
@@ -302,40 +300,6 @@ fn main() -> Result<()> {
         drop(agent);
         std::process::exit(code);
     }
-}
-
-/// Wire together provider + tools (built-in whitelist + MCP servers) + agent.
-pub(crate) fn build_agent(
-    cfg: &Config,
-    initial: Vec<Message>,
-    client: &reqwest::blocking::Client,
-) -> Result<Agent> {
-    let workdir = cfg
-        .workdir
-        .clone()
-        .unwrap_or(std::env::current_dir().context("cannot determine current directory")?);
-    let api_key = cfg.api_key()?;
-    let provider = provider::build(cfg, &api_key, client.clone());
-
-    // Build MCP tools ONCE. The parent boxes them into its own tool list, and
-    // tools::build hands SubAgent a clone of the same set — so a `task` call
-    // shares the parent's MCP connections instead of re-spawning every server
-    // (the old path called mcp::build inside SubAgent per task call).
-    let mcp_tools = if !cfg.mcp_servers.is_empty() {
-        tools::mcp::build(&cfg.mcp_servers)?
-    } else {
-        Vec::new()
-    };
-    let mut tool_list = tools::build(&cfg.tools, cfg, client, &api_key, &mcp_tools)?;
-    tool_list.extend(mcp_tools.into_iter().map(|t| Box::new(t) as Box<dyn tools::Tool>));
-
-    let ctx = ToolCtx {
-        workdir,
-        max_output_chars: cfg.limits.max_output_chars,
-        restrict_to_workdir: cfg.restrict_to_workdir,
-        cancel: None,
-    };
-    Ok(Agent::new(cfg, provider, tool_list, initial, ctx))
 }
 
 /// Resolve the `--session` value into the persistence target, if any. The

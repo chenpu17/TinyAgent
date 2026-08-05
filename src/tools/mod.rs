@@ -1,10 +1,10 @@
 mod file;
 mod image;
-pub(crate) mod mcp;
+pub mod mcp;
 mod shell;
 mod subagent;
 
-pub(crate) use image::load_block;
+pub use image::load_block;
 
 use crate::agent::AgentEvent;
 use crate::config::Config;
@@ -94,6 +94,56 @@ pub trait Tool: Send + Sync {
     /// frontend sets ONLY on session end. The per-turn `cancel` flag is wired
     /// separately via `ToolCtx` and never reaches this method.
     fn set_shutdown(&mut self, _shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>) {}
+}
+
+/// A tool backed by a closure — the zero-boilerplate way to add a custom tool,
+/// and the shared base the Python / TypeScript bindings build on. The closure
+/// receives the model's parsed JSON arguments and the shared [`ToolCtx`], and
+/// returns a [`ToolOutput`].
+///
+/// Bindings don't implement [`Tool`] directly: each wraps its host-language
+/// callable into a closure that handles the GIL / threadsafe-function dance,
+/// then hands that closure here so the `Tool` impl is written once. A plain
+/// Rust user can also use it to make a tool without defining a struct:
+///
+/// ```no_run
+/// # use tiny_agent::{CallbackTool, ToolDef};
+/// # use serde_json::json;
+/// let def = ToolDef {
+///     name: "echo".into(),
+///     description: "echo back the argument".into(),
+///     schema: json!({"type": "object", "properties": {"msg": {"type": "string"}}}),
+/// };
+/// let tool = CallbackTool::new(def, |input, _ctx| {
+///     Ok(tiny_agent::ToolOutput::text(input["msg"].as_str().unwrap_or("").to_string()))
+/// });
+/// ```
+/// Boxed closure backing a [`CallbackTool`]. Factored into an alias so the
+/// `+ Send + Sync` bounds don't trip clippy's `type_complexity` and so the
+/// bindings can name the same signature if they ever expose it directly.
+pub type ToolFn = Box<dyn Fn(&Value, &ToolCtx) -> Result<ToolOutput> + Send + Sync>;
+
+pub struct CallbackTool {
+    def: ToolDef,
+    func: ToolFn,
+}
+
+impl CallbackTool {
+    pub fn new<F>(def: ToolDef, func: F) -> Self
+    where
+        F: Fn(&Value, &ToolCtx) -> Result<ToolOutput> + Send + Sync + 'static,
+    {
+        Self { def, func: Box::new(func) }
+    }
+}
+
+impl Tool for CallbackTool {
+    fn def(&self) -> ToolDef {
+        self.def.clone()
+    }
+    fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        (self.func)(input, ctx)
+    }
 }
 
 /// Instantiate the built-in tools named in the config whitelist.

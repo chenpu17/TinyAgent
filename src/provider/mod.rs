@@ -1,7 +1,10 @@
 mod anthropic;
 mod openai;
-#[cfg(test)]
-pub(crate) mod mock;
+// The scripted mock provider is test-only by default; the `mock` cargo feature
+// (used by the Python / TypeScript bindings and downstream dry-runs) exposes it
+// so an agent loop can be driven offline, with no API key or HTTP server.
+#[cfg(any(test, feature = "mock"))]
+pub mod mock;
 
 pub use anthropic::Anthropic;
 pub use openai::OpenAi;

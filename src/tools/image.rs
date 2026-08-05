@@ -23,7 +23,7 @@ pub(crate) fn media_type_for(path: &Path) -> Option<&'static str> {
 }
 
 /// Read an image file into a base64 Block (shared by the tool and --image flag).
-pub(crate) fn load_block(full: &Path) -> Result<Block> {
+pub fn load_block(full: &Path) -> Result<Block> {
     let media_type = media_type_for(full)
         .with_context(|| format!("unsupported image format: {}", full.display()))?;
     // Bound the read directly rather than trusting stat then reading: a file

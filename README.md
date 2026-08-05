@@ -7,12 +7,13 @@
 - **单一可执行文件**，无运行时依赖；musl 静态编译后可丢到路由器 / 树莓派 / CI runner 直接跑
 - **两种 LLM 后端**：Anthropic 原生 API + OpenAI 兼容协议（覆盖 DeepSeek / vLLM / Ollama 等），均带 token 用量统计
 - **图片输入**：`--image` 参数或 `load_image` 工具（png / jpeg / gif / webp，base64）
-- **精炼工具集**：`shell`、`read_file`、`write_file`、`edit_file`、`list_dir`、`load_image`，外加 `task`（子 agent；同 turn 多调用并行），配置白名单启用
+- **精炼工具集**：`shell`、`read_file`、`write_file`、`edit_file`、`list_dir`、`task`（子 agent；同 turn 多调用并行）默认启用；`load_image`（视觉）需在 `tools` 显式加入。均可在 config 的 `tools` 里裁剪
 - **Harness 契约**：`--output result.json` 写结构化结果（含 token 用量、每次工具调用的 input/output），`--json` 流式 NDJSON；exit code 语义化（`0` 成功 / `124` 超时 / `130` 取消 / `1` 其它），可直接进 CI / 评测 pipeline
 - **CLI 覆盖**：`--model` / `--max-turns` / `--timeout` 免改配置做 A/B 对照
 - **批量任务**：`--batch <dir>` 并发跑一组任务片段，`--retries` 对 transient 失败指数退避重试，`--failed` 只重跑上一轮失败的任务并合并进完整报告
 - **TUI（可选 feature）**：ratatui 对话界面——内联/流式渲染（对话进终端原生 scrollback，原生选择/滚动/搜索开箱即用）、多行输入、输入历史、斜杠命令、token 状态条；默认不编译，保持 headless 版极小
 - **同步实现**（无 tokio），`reqwest::blocking` + rustls，核心 agent loop 集中在 `agent.rs`
+- **库 API**：核心逻辑同时编译为 `tiny_agent` 库（bin + lib 同包双 target），第三方 Rust 程序可直接 `tiny_agent = "..."` 驱动 agent loop、注册自定义工具（`CallbackTool`）、读回诚实 token 账单；Python（PyO3）/ TypeScript（napi-rs）绑定构建其上。`mock` feature 放出脚本化 provider 供离线 dry-run
 
 ## 构建
 
@@ -29,6 +30,44 @@ cross build --release --target aarch64-unknown-linux-musl
 cross build --release --target armv7-unknown-linux-musleabihf
 cross build --release --target x86_64-pc-windows-msvc
 ```
+
+## 库 API（程序化调用）
+
+除二进制外，同一份源码也编译为 `tiny_agent` 库（`src/lib.rs`），供第三方 Rust 程序——以及即将提供的 Python / TypeScript 绑定——直接驱动 agent。二进制本身只是这个库之上的一层薄壳（CLI 参数解析、SIGINT、`process::exit`、可选 TUI），行为与库完全一致。
+
+```sh
+cargo build --lib                # 只编库
+cargo build --lib --features mock # 含脚本化 mock provider，离线 dry-run
+```
+
+最小用法（`build_agent` 一把梭：按 config 装 provider + 内置工具 + MCP + Agent）：
+
+```rust,no_run
+use tiny_agent::{build_agent, AgentEvent, Config};
+
+let cfg = Config::load(std::path::Path::new("chat.json"))?;
+let client = tiny_agent::provider::new_client(cfg.limits.timeout_secs);
+let mut agent = build_agent(&cfg, Vec::new(), &client)?;
+agent.run(&mut |ev: AgentEvent| if let AgentEvent::TextDelta(t) = ev { print!("{t}"); })?;
+```
+
+完整控制（自定义 provider / 自定义工具）：`Agent::new` 直接接收 `Box<dyn Provider>` 与 `Vec<Box<dyn Tool>>`——两者都是 trait object，注入即可，无需改 trait。自定义工具用 `CallbackTool` 零样板包一个闭包：
+
+```rust,no_run
+use tiny_agent::{CallbackTool, ToolDef, ToolOutput};
+use serde_json::json;
+
+let tool = CallbackTool::new(
+    ToolDef {
+        name: "get_weather".into(),
+        description: "current weather for a city".into(),
+        schema: json!({"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}),
+    },
+    |input, _ctx| Ok(ToolOutput::text(format!("sunny in {}", input["city"]))),
+);
+```
+
+run 结束后从 [`RunOutcome`](src/agent.rs)（或 `Agent::usage()` / `messages()` / `model()` getter）读回诚实的 token 账单与历史。`AgentEvent` 派生了 `Serialize`，绑定层可直接序列化成宿主语言的 dict / object。
 
 ## 使用
 
@@ -149,12 +188,12 @@ tiny-agent --config examples/harness.json --task "跑测试" --retries 3 --outpu
 | `↑`/`↓` | 输入区跨行移动（补全弹窗打开时为移动弹窗选中） |
 | `Alt+↑`/`Alt+↓` | 输入历史翻页 |
 | `Ctrl-C` | 忙 → 取消当前轮（同时丢弃排队消息）；空闲 → 退出 |
-| `Esc` | 退出（补全弹窗打开时只关弹窗） |
+| `Esc` | 忙 → 取消当前轮；空闲 → 清空输入框（补全弹窗打开时只关弹窗）。退出用 `/quit`、`/exit` 或 `Ctrl-C` |
 
 运行中（running）输入框保持可编辑：可以继续打字，`Enter` 会把消息排队——live 区显示暗色的
 `❯ … · queued` 占位行，输入框标题同步显示队列长度；当前轮结束后最老的
 占位行换成真实消息并自动发送；`Ctrl-C` 取消当前轮会**连同排队消息一起丢弃**；`/clear` 在运行中禁用，
-其余斜杠命令照常可用。
+其余斜杠命令（`/export`、`/model`、`/limits`、`/tools`、`/system`、`/help`，以及退出用的 `/quit` / `/exit`）照常可用。
 
 **原生选择 / 滚动 / 搜索**：已定稿的对话（你的消息、助手回复、工具调用与结果、系统行）都在终端
 scrollback 里，是真正的终端文本——鼠标拖选即选中原文，复制走终端自身机制（macOS 上选中即复制）；
