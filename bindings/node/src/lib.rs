@@ -21,9 +21,12 @@
 // file so a genuine useless conversion elsewhere still trips.
 #![allow(clippy::useless_conversion)]
 
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction, ThreadsafeFunctionCallMode};
@@ -60,6 +63,122 @@ impl ToNapiValue for Outcome {
     unsafe fn to_napi_value(env: napi::sys::napi_env, val: Self) -> Result<napi::sys::napi_value> {
         <Value as ToNapiValue>::to_napi_value(env, val.0)
     }
+}
+
+// ── custom JS tools: TSFN round-trip ────────────────────────────────────────
+//
+// A JS tool's `run(args)` callback can't be called synchronously from the
+// agent's worker thread (JS functions are bound to the main thread), and napi's
+// `ThreadsafeFunction` is fire-and-forget (its return value is lost). So a tool
+// call round-trips: the worker thread sends `{ id, args }` to the JS `run`
+// (via a TSFN), then blocks on a oneshot channel; the JS side (wrapped by
+// `wrapper.js`) runs the user's function and calls back the exported
+// `resolveTool(id, result)`, which looks up the id and fulfills the channel.
+// No tokio, no core change — reuses the lib's `CallbackTool` (same path the
+// Python binding takes).
+
+/// Monotonic id tagging each in-flight tool call so `resolveTool` can find the
+/// waiting channel. `i64` (not u64) because napi only reads JS numbers as i64.
+static NEXT_TOOL_ID: AtomicI64 = AtomicI64::new(1);
+
+/// id → fulfillment sender for each tool call awaiting a JS result. Cleared by
+/// `resolveTool` (success) or by the closure's timeout/error path.
+static PENDING_TOOLS: OnceLock<Mutex<HashMap<i64, mpsc::Sender<ToolResult>>>> = OnceLock::new();
+
+fn pending_tools() -> &'static Mutex<HashMap<i64, mpsc::Sender<ToolResult>>> {
+    PENDING_TOOLS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Payload handed to the JS `run` callback: the call's id (to report back via
+/// `resolveTool`) and the model's parsed arguments as a plain object.
+#[napi(object)]
+pub struct ToolRequest {
+    pub id: i64,
+    pub args: Value,
+}
+
+/// What `resolveTool` receives from JS. `content` becomes the tool's textual
+/// result; `is_error` marks a failed tool.
+#[napi(object)]
+pub struct ToolResult {
+    pub content: String,
+    pub is_error: bool,
+}
+
+/// Turn each JS tool `{ name, description, schema, run }` into a `CallbackTool`
+/// whose closure drives the TSFN round-trip. Called on the JS thread (the
+/// `Function`s are taken from JS and converted to `ThreadsafeFunction`s here,
+/// before the agent's worker thread ever runs).
+fn build_extra_tools(env: Env, tools: Option<Vec<Object>>) -> Result<Vec<Box<dyn ta::Tool>>> {
+    let mut out: Vec<Box<dyn ta::Tool>> = Vec::new();
+    let Some(tools) = tools else { return Ok(out) };
+    for t in tools {
+        let name: String = t
+            .get("name")?
+            .ok_or_else(|| err("custom tool missing \"name\""))?;
+        let description: String = t
+            .get("description")?
+            .ok_or_else(|| err("custom tool missing \"description\""))?;
+        let schema: Value = t
+            .get("schema")?
+            .ok_or_else(|| err("custom tool missing \"schema\""))?;
+        let run: JsFunction = t
+            .get("run")?
+            .ok_or_else(|| err("custom tool missing \"run\""))?;
+
+        // The TSFN hands the JS callback a single ToolRequest (CalleeHandled:
+        // env.create_threadsafe_function returns this strategy, so JS receives
+        // `(err, value)` — wrapper.js reads `value` and ignores `err`, which is
+        // always null since we only ever `call(Ok(req))`). The user's `run(args)`
+        // is wrapped (in wrapper.js) to read `req.args`, run, then call
+        // resolveTool(req.id, result) — the closure below blocks until then.
+        let tsfn = env.create_threadsafe_function(&run, 0, |ctx| Ok(vec![ctx.value]))?;
+
+        let def = ta::ToolDef { name: name.clone(), description, schema };
+        let tool = ta::CallbackTool::new(def, move |input: &Value, _ctx: &ta::ToolCtx| {
+            let id = NEXT_TOOL_ID.fetch_add(1, Ordering::Relaxed);
+            let (tx, rx) = mpsc::channel();
+            pending_tools().lock().unwrap().insert(id, tx);
+
+            let req = ToolRequest { id, args: input.clone() };
+            if tsfn.call(Ok(req), ThreadsafeFunctionCallMode::NonBlocking) != Status::Ok {
+                pending_tools().lock().unwrap().remove(&id);
+                return Err(anyhow::anyhow!("tool \"{name}\": dispatch to JS failed"));
+            }
+
+            // Block the agent worker thread for the JS result. The JS main
+            // thread is free (the run() caller awaits it), so the wrapped run
+            // resolves the channel promptly; the timeout is a backstop against
+            // a user tool that never returns.
+            match rx.recv_timeout(Duration::from_secs(120)) {
+                Ok(r) => Ok(ta::ToolOutput {
+                    content: r.content,
+                    is_error: r.is_error,
+                    image: None,
+                    usage: None,
+                }),
+                Err(_) => {
+                    pending_tools().lock().unwrap().remove(&id);
+                    Err(anyhow::anyhow!(
+                        "tool \"{name}\": JS callback did not resolve within 120s"
+                    ))
+                }
+            }
+        });
+        out.push(Box::new(tool));
+    }
+    Ok(out)
+}
+
+/// Fulfill the channel for an in-flight tool call. Called from JS after the
+/// user's `run` returns. A missing id means the call already timed out (the
+/// closure dropped its sender) — the late result is dropped, harmless.
+#[napi(js_name = "resolveTool")]
+pub fn resolve_tool(id: i64, result: ToolResult) -> Result<()> {
+    if let Some(tx) = pending_tools().lock().unwrap().remove(&id) {
+        let _ = tx.send(result);
+    }
+    Ok(())
 }
 
 // ── run task: drives one agent.run() on a libuv worker thread ────────────────
@@ -155,14 +274,20 @@ pub struct Agent {
 #[napi]
 impl Agent {
     #[napi(constructor)]
-    pub fn new(config_path: String, api_key: Option<String>) -> Result<Self> {
+    pub fn new(
+        env: Env,
+        config_path: String,
+        tools: Option<Vec<Object>>,
+        api_key: Option<String>,
+    ) -> Result<Self> {
         let cfg = ta::Config::load(Path::new(&config_path)).map_err(err)?;
         let api_key = match api_key {
             Some(k) => k,
             None => cfg.api_key().map_err(err)?,
         };
         let client = ta::provider::new_client(cfg.limits.timeout_secs);
-        let agent = ta::build_agent_with(&cfg, Vec::new(), &client, Vec::new(), &api_key)
+        let extra = build_extra_tools(env, tools)?;
+        let agent = ta::build_agent_with(&cfg, Vec::new(), &client, extra, &api_key)
             .map_err(err)?;
         Ok(Self { inner: Arc::new(Mutex::new(agent)) })
     }
@@ -228,32 +353,40 @@ impl Agent {
 
 /// One-shot: build an agent from `configPath`, send `message`, run to
 /// completion, and resolve with the `RunOutcome` object. Optional `onEvent`
-/// streams events as plain objects. The config load + agent build happen on the
-/// worker thread, so a missing key / unreadable config rejects the promise
-/// rather than throwing synchronously at call time.
+/// streams events as plain objects; optional `tools` injects custom JS tools.
+/// The config load + agent build happen on the worker thread, so a missing key
+/// / unreadable config rejects the promise rather than throwing synchronously
+/// at call time. (Malformed `tools`, by contrast, throw synchronously — the
+/// tool `Function`s must be taken from JS before the worker thread runs.)
 #[napi]
 pub fn chat(
+    env: Env,
     config_path: String,
     message: String,
     on_event: Option<ThreadsafeFunction<Value, ErrorStrategy::Fatal>>,
+    tools: Option<Vec<Object>>,
     api_key: Option<String>,
-) -> AsyncTask<ChatRunTask> {
-    AsyncTask::new(ChatRunTask {
+) -> Result<AsyncTask<ChatRunTask>> {
+    let extra = build_extra_tools(env, tools)?;
+    Ok(AsyncTask::new(ChatRunTask {
         config_path,
         message,
         api_key,
         on_event,
-    })
+        tools: extra,
+    }))
 }
 
 /// chat() builds its agent on the worker thread (config + key resolved there),
 /// so it uses its own task rather than [`RunTask`] (which assumes a pre-built
-/// agent). Same Value-bridged outcome + event forwarding.
+/// agent). Same Value-bridged outcome + event forwarding; carries any injected
+/// tools through to the worker thread.
 pub struct ChatRunTask {
     pub config_path: String,
     pub message: String,
     pub api_key: Option<String>,
     pub on_event: Option<ThreadsafeFunction<Value, ErrorStrategy::Fatal>>,
+    pub tools: Vec<Box<dyn ta::Tool>>,
 }
 
 impl Task for ChatRunTask {
@@ -267,8 +400,11 @@ impl Task for ChatRunTask {
             None => cfg.api_key().map_err(err)?,
         };
         let client = ta::provider::new_client(cfg.limits.timeout_secs);
+        // Move the tools out of `&mut self` (build_agent_with takes them by
+        // value); they're spent once the agent owns them.
+        let tools = std::mem::take(&mut self.tools);
         let mut agent =
-            ta::build_agent_with(&cfg, Vec::new(), &client, Vec::new(), &api_key).map_err(err)?;
+            ta::build_agent_with(&cfg, Vec::new(), &client, tools, &api_key).map_err(err)?;
         agent.push_user(vec![ta::Block::Text(self.message.clone())]);
 
         let on_event = &self.on_event;

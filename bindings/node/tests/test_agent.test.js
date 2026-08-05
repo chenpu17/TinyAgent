@@ -50,7 +50,7 @@ test('chat one-shot: built-in write_file tool round-trip + side effect', async (
   t.after(() => mock.stop());
 
   const { cfgPath, workdir } = writeConfig(t, mock.url);
-  const out = await chat(cfgPath, 'write the file', null, MOCK_KEY);
+  const out = await chat(cfgPath, 'write the file', { apiKey: MOCK_KEY });
 
   assert.ok(out.final_text.includes('Task complete'), out.final_text);
   assert.strictEqual(out.tool_calls[0].name, 'write_file');
@@ -70,7 +70,7 @@ test('Agent multi-turn: events stream, getters reflect state', async (t) => {
   t.after(() => mock.stop());
 
   const { cfgPath } = writeConfig(t, mock.url);
-  const a = new Agent(cfgPath, MOCK_KEY);
+  const a = new Agent(cfgPath, { apiKey: MOCK_KEY });
   assert.strictEqual(a.model(), 'mock-model');
 
   a.pushUser('write a.txt');
@@ -99,7 +99,7 @@ test('cancel interrupts the in-flight run', async (t) => {
   t.after(() => mock.stop());
 
   const { cfgPath } = writeConfig(t, mock.url, { tools: [], streamIdleSecs: 30 });
-  const a = new Agent(cfgPath, MOCK_KEY);
+  const a = new Agent(cfgPath, { apiKey: MOCK_KEY });
   a.pushUser('hi');
   const tok = new CancelToken();
   a.setCancel(tok);
@@ -128,9 +128,69 @@ test('usage four axes are reported', async (t) => {
   t.after(() => mock.stop());
 
   const { cfgPath } = writeConfig(t, mock.url, { tools: [] });
-  const out = await chat(cfgPath, 'hi', null, MOCK_KEY);
+  const out = await chat(cfgPath, 'hi', { apiKey: MOCK_KEY });
   assert.strictEqual(out.input_tokens, 12);               // 42 − 30 cached
   assert.strictEqual(out.output_tokens, 9);
   assert.strictEqual(out.cache_read_input_tokens, 30);
   assert.strictEqual(out.cache_creation_input_tokens, 0);  // OpenAI has no creation axis
+});
+
+// ── 5. custom JS tool is invoked (the headline capability) ───────────────────
+
+test('custom JS tool (sync return) is invoked and recorded', async (t) => {
+  const seen = [];
+  const mock = await ScriptedMock.start([
+    (_body, res) => respondSse(res, toolCallSse('c1', 'get_weather', { city: 'Boston' })),
+    (_body, res) => respondSse(res, textSse('The weather in Boston is sunny.')),
+  ]);
+  t.after(() => mock.stop());
+
+  const { cfgPath } = writeConfig(t, mock.url, { tools: [] });
+  const out = await chat(cfgPath, 'weather in Boston?', {
+    apiKey: MOCK_KEY,
+    tools: [{
+      name: 'get_weather',
+      description: 'Look up the weather for a city.',
+      schema: {
+        type: 'object',
+        properties: { city: { type: 'string' } },
+        required: ['city'],
+      },
+      run: (args) => {
+        seen.push(args);
+        return { content: 'sunny, 72F' };
+      },
+    }],
+  });
+
+  // The user's run ran once, with the model's parsed args.
+  assert.deepStrictEqual(seen, [{ city: 'Boston' }]);
+  // The call is recorded with its input and the tool's textual output.
+  assert.strictEqual(out.tool_calls[0].name, 'get_weather');
+  assert.strictEqual(out.tool_calls[0].input.city, 'Boston');
+  assert.ok(out.tool_calls[0].output.includes('sunny'));
+  assert.ok(out.final_text.includes('sunny'));
+});
+
+// ── 6. custom async JS tool + str return shorthand ──────────────────────────
+
+test('custom async JS tool, str-return shorthand', async (t) => {
+  const mock = await ScriptedMock.start([
+    (_body, res) => respondSse(res, toolCallSse('c1', 'echo', { msg: 'hi' })),
+    (_body, res) => respondSse(res, textSse('done')),
+  ]);
+  t.after(() => mock.stop());
+
+  const { cfgPath } = writeConfig(t, mock.url, { tools: [] });
+  const out = await chat(cfgPath, 'echo hi', {
+    apiKey: MOCK_KEY,
+    tools: [{
+      name: 'echo',
+      description: 'echo back',
+      schema: { type: 'object', properties: { msg: { type: 'string' } }, required: ['msg'] },
+      // async + plain string return (shorthand for { content: str }).
+      run: async (args) => `echo:${args.msg}`,
+    }],
+  });
+  assert.strictEqual(out.tool_calls[0].output, 'echo:hi');
 });

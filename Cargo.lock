@@ -2495,6 +2495,7 @@ dependencies = [
 name = "tiny-agent-node"
 version = "0.2.0"
 dependencies = [
+ "anyhow",
  "napi",
  "napi-build",
  "napi-derive",

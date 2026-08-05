@@ -2,8 +2,8 @@
   "name": "tiny-agent",
   "version": "0.2.0",
   "description": "Node.js / TypeScript bindings for TinyAgent",
-  "main": "index.js",
-  "types": "index.d.ts",
+  "main": "wrapper.js",
+  "types": "wrapper.d.ts",
   "napi": {
     "name": "tiny-agent",
     "triples": {}
