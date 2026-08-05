@@ -1,0 +1,19 @@
+{
+  "name": "tiny-agent",
+  "version": "0.2.0",
+  "description": "Node.js / TypeScript bindings for TinyAgent",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "napi": {
+    "name": "tiny-agent",
+    "triples": {}
+  },
+  "scripts": {
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform",
+    "test": "node --test --test-timeout=15000"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.0"
+  }
+}

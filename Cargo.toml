@@ -4,11 +4,11 @@ version = "0.2.0"
 edition = "2021"
 description = "A minimal single-binary AI agent: one JSON config, two modes (headless / TUI)"
 
-# Workspace so the language bindings (bindings/python, later bindings/node) are
+# Workspace so the language bindings (bindings/python, bindings/node) are
 # path-dependencies that evolve with the core library. The root package is a
 # member too (it provides the `tiny_agent` lib + `tiny-agent` bin).
 [workspace]
-members = [".", "bindings/python"]
+members = [".", "bindings/python", "bindings/node"]
 resolver = "2"
 
 # bin + lib share this package: the binary (`tiny-agent`) keeps its existing
