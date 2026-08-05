@@ -33,6 +33,11 @@ fn default_tools() -> Vec<String> {
         "write_file".into(),
         "edit_file".into(),
         "list_dir".into(),
+        // `task` spawns a focused sub-agent (independent history + turn budget)
+        // for decomposed/parallel work. Enabled by default so a TUI conversation
+        // or headless run can delegate sub-tasks without extra config; it is
+        // non-recursive (a sub-agent's tool whitelist drops `task` itself).
+        "task".into(),
     ]
 }
 
@@ -439,7 +444,7 @@ mod tests {
         assert_eq!(cfg.provider, ProviderKind::Anthropic);
         assert_eq!(cfg.base_url(), "https://api.anthropic.com");
         assert_eq!(cfg.limits.max_turns, 30);
-        assert_eq!(cfg.tools, vec!["shell", "read_file", "write_file", "edit_file", "list_dir"]);
+        assert_eq!(cfg.tools, vec!["shell", "read_file", "write_file", "edit_file", "list_dir", "task"]);
     }
 
     #[test]

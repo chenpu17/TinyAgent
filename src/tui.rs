@@ -135,6 +135,10 @@ enum SlashCmd {
     Tools,
     System,
     Help,
+    /// `/quit` (or `/exit`): leave the TUI. Always quits, even mid-run — the
+    /// quit path cancels the in-flight turn and tears down. Esc in idle no
+    /// longer quits, so this is the intentional way out (plus Ctrl-C).
+    Quit,
     Unknown(String),
 }
 
@@ -165,6 +169,7 @@ fn classify(trimmed: &str) -> SlashCmd {
         "tools" if !stray_arg => SlashCmd::Tools,
         "system" if !stray_arg => SlashCmd::System,
         "help" if !stray_arg => SlashCmd::Help,
+        "quit" | "exit" if !stray_arg => SlashCmd::Quit,
         _ => SlashCmd::Unknown(rest.to_string()),
     }
 }
@@ -218,7 +223,7 @@ fn slash_reply(cmd: &SlashCmd, cfg: &Config) -> String {
         // Message/Clear/Export never reach here; empty keeps the match
         // exhaustive. Export and Clear have their own side-effecting arms in
         // the key handler.
-        SlashCmd::Message | SlashCmd::Clear | SlashCmd::Export(_) => String::new(),
+        SlashCmd::Message | SlashCmd::Clear | SlashCmd::Export(_) | SlashCmd::Quit => String::new(),
     }
 }
 
@@ -233,7 +238,7 @@ struct SlashSpec {
     desc: &'static str,
 }
 
-const SLASH_COMMANDS: [SlashSpec; 7] = [
+const SLASH_COMMANDS: [SlashSpec; 8] = [
     SlashSpec { name: "clear", arg_hint: "", desc: "clear the conversation history" },
     SlashSpec { name: "export", arg_hint: "[path]", desc: "dump the transcript to a file (or clipboard)" },
     SlashSpec { name: "model", arg_hint: "", desc: "model, provider, max_tokens, base URL" },
@@ -241,6 +246,7 @@ const SLASH_COMMANDS: [SlashSpec; 7] = [
     SlashSpec { name: "tools", arg_hint: "", desc: "enabled tool list" },
     SlashSpec { name: "system", arg_hint: "", desc: "the active system prompt" },
     SlashSpec { name: "help", arg_hint: "", desc: "list commands" },
+    SlashSpec { name: "quit", arg_hint: "", desc: "exit the TUI (alias: /exit)" },
 ];
 
 /// Popup height cap; the match window scrolls to keep the selection visible.
@@ -858,7 +864,7 @@ fn ui_loop(
                         sub_streaming_name = None;
                         dirty = true;
                         rows.push(Row::sys_error(
-                            "[worker stopped unexpectedly — press Esc to quit]",
+                            "[worker stopped unexpectedly — type /quit to exit]",
                         ));
                     }
                     // Nothing queued can ever be delivered now: drop the
@@ -1302,10 +1308,13 @@ fn ui_loop(
                 }
                 match (key.code, key.modifiers) {
                     // Esc / Ctrl-C: cancel the in-flight turn and stay in the
-                    // TUI; when idle, quit. raw mode turns Ctrl-C into a normal
-                    // key, so both behave the same. The transcript lives in
-                    // native scrollback now, so quitting just releases the live
-                    // region — the conversation stays selectable above it.
+                    // TUI. When idle the two now DIVERGE: Esc clears the input
+                    // box (it quit before, which was easy to hit by accident
+                    // right after a run — quit via /quit or /exit now), while
+                    // Ctrl-C still quits. raw mode turns Ctrl-C into a normal
+                    // key. The transcript lives in native scrollback, so quitting
+                    // just releases the live region — the conversation stays
+                    // selectable above it.
                     (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                         if busy {
                             cancel.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1327,9 +1336,15 @@ fn ui_loop(
                                     md_cache.clear();
                                 }
                             }
-                        } else {
+                        } else if matches!(key.code, KeyCode::Char('c')) {
+                            // Ctrl-C in idle quits (Esc no longer does — use
+                            // /quit, /exit, or Ctrl-C).
                             let _ = in_tx.send(None);
                             return Ok(queued.len());
+                        } else {
+                            // Esc in idle: clear the input box instead of
+                            // quitting. Quit via /quit or /exit.
+                            input.drain_to_string();
                         }
                     }
                     // Alt/Shift+Enter inserts a newline (portable in raw mode;
@@ -1383,7 +1398,7 @@ fn ui_loop(
                                                 }
                                                 rows.push(Row::sys_error(
                                                     "[worker stopped — message not delivered; \
-                                                     press Esc to quit]",
+                                                     type /quit to exit]",
                                                 ));
                                             } else {
                                                 busy = true;
@@ -1431,6 +1446,16 @@ fn ui_loop(
                                                  history not cleared]",
                                             )
                                         });
+                                    }
+                                    SlashCmd::Quit => {
+                                        // /quit (or /exit): leave the TUI. Works
+                                        // mid-run too — the quit path cancels the
+                                        // in-flight turn and tears down. Esc in
+                                        // idle no longer quits, so this (or
+                                        // Ctrl-C) is the intentional way out.
+                                        input.drain_to_string();
+                                        let _ = in_tx.send(None);
+                                        return Ok(queued.len());
                                     }
                                     SlashCmd::Export(arg) => {
                                         // /export dumps the conversation as text:
@@ -2346,7 +2371,7 @@ fn flush_next_queued(
         Flush::Sent
     } else {
         rows.push(Row::sys_error(
-            "[worker stopped — queued message not delivered; press Esc to quit]",
+            "[worker stopped — queued message not delivered; type /quit to exit]",
         ));
         Flush::Undeliverable
     }
@@ -3803,7 +3828,7 @@ mod tests {
         assert_eq!(p.sel, 0, "wrap to top");
         p.prev();
         assert_eq!(p.sel, SLASH_COMMANDS.len() - 1, "wrap to bottom");
-        assert_eq!(p.completion().as_deref(), Some("/help"));
+        assert_eq!(p.completion().as_deref(), Some("/quit"));
         // Editing the filter resets the selection to the top.
         p.update("/s");
         assert_eq!(p.sel, 0);
@@ -4488,6 +4513,8 @@ mod tests {
         assert_eq!(classify("/tools"), SlashCmd::Tools);
         assert_eq!(classify("/system"), SlashCmd::System);
         assert_eq!(classify("/help"), SlashCmd::Help);
+        assert_eq!(classify("/quit"), SlashCmd::Quit);
+        assert_eq!(classify("/exit"), SlashCmd::Quit); // alias
         // Case-sensitive: /Model is not /model.
         assert_eq!(classify("/Model"), SlashCmd::Unknown("Model".into()));
         assert_eq!(classify("/foo"), SlashCmd::Unknown("foo".into()));

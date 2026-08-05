@@ -4,6 +4,6 @@
   "model": "claude-haiku-4-5-20251001",
   "max_tokens": 8192,
   "system_prompt": "You are a concise, capable assistant running inside tiny-agent. Use tools when they help.",
-  "tools": ["shell", "read_file", "write_file", "edit_file", "list_dir", "load_image"],
+  "tools": ["shell", "read_file", "write_file", "edit_file", "list_dir", "load_image", "task"],
   "limits": { "max_turns": 30, "timeout_secs": 600, "max_output_chars": 30000 }
 }
