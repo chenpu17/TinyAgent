@@ -1,14 +1,19 @@
 'use strict';
 
 // User-facing JS layer over the raw napi addon (./index.js). It hides the
-// custom-tool round-trip ceremony: the native side hands each JS tool callback
-// a `(err, req)` CalleeHandled TSFN call and expects it to call back
-// `resolveTool(req.id, result)`; here we wrap the user's idiomatic
-// `run(args)` into that shape, so users just write `run(args) => 'result'`.
+// custom-tool AND custom-provider round-trip ceremony:
 //
-// Also presents an options-object API (new Agent(path, { tools, apiKey }) and
-// chat(path, message, { onEvent, tools, apiKey })) instead of the raw positional
-// one.
+//   tool:     native hands the wrapped JS `run` a `(err, req)` CalleeHandled
+//             TSFN call and expects `resolveTool(req.id, result)` back; here we
+//             wrap the user's idiomatic `run(args)` into that shape.
+//   provider: same pattern — native hands the wrapped provider `(err, call)`
+//             and expects `resolveProvider(call.id, result)` back; here we wrap
+//             the user's `provider(request)` (a function or `{ chat }` object)
+//             into that shape.
+//
+// Also presents an options-object API (new Agent(path, { tools, provider,
+// apiKey }) and chat(path, message, { onEvent, tools, provider, apiKey }))
+// instead of the raw positional one.
 
 const native = require('./index.js');
 
@@ -20,6 +25,19 @@ function normalizeResult(r) {
   return {
     content: r.content == null ? '' : String(r.content),
     isError: !!r.isError,
+  };
+}
+
+/** Normalize a custom provider's return into the SimpleChatResponse shape the
+ *  Rust side parses: a plain string is shorthand for { text: str }; an object
+ *  carries text + optional stop_reason / usage. */
+function normalizeProviderResult(r) {
+  if (r == null) return { text: '' };
+  if (typeof r === 'string') return { text: r };
+  return {
+    text: r.text == null ? '' : String(r.text),
+    stop_reason: r.stop_reason == null ? undefined : String(r.stop_reason),
+    usage: r.usage == null ? undefined : r.usage,
   };
 }
 
@@ -48,14 +66,45 @@ function wrapTools(tools) {
   }));
 }
 
+/** Wrap the user's provider (a function or `{ chat }` object) into the TSFN
+ *  callback shape the native side expects: `{ chat: async (err, call) => … }`.
+ *  Runs the user fn on call.request, then fulfills via
+ *  resolveProvider(call.id, result). A thrown provider resolves with a
+ *  `{__error}` marker so the run fails honestly instead of hanging on the
+ *  120s timeout (an unhandled TSFN promise rejection can't reach Rust). */
+function wrapProvider(provider) {
+  if (provider == null) return undefined;
+  const fn = typeof provider === 'function' ? provider : provider.chat;
+  if (typeof fn !== 'function') {
+    throw new TypeError("provider must be a function or an object with a 'chat' method");
+  }
+  return {
+    chat: async function (_err, call) {
+      try {
+        const r = await fn(call.request);
+        native.resolveProvider(call.id, normalizeProviderResult(r));
+      } catch (e) {
+        native.resolveProvider(call.id, { __error: String((e && e.message) || e) });
+      }
+    },
+  };
+}
+
 class Agent extends native.Agent {
   constructor(configPath, opts = {}) {
-    super(configPath, wrapTools(opts.tools), opts.apiKey);
+    super(configPath, wrapTools(opts.tools), wrapProvider(opts.provider), opts.apiKey);
   }
 }
 
 async function chat(configPath, message, opts = {}) {
-  return native.chat(configPath, message, opts.onEvent, wrapTools(opts.tools), opts.apiKey);
+  return native.chat(
+    configPath,
+    message,
+    opts.onEvent,
+    wrapTools(opts.tools),
+    wrapProvider(opts.provider),
+    opts.apiKey,
+  );
 }
 
 module.exports = {

@@ -25,7 +25,7 @@ provider/agent 后，两个绑定的测试都要跟着跑一遍回归。
 cd bindings/python && maturin develop && python -m pytest tests/ -q
 
 # Node（napi-rs；index.js/index.d.ts/*.node 是 napi build 生成的，已 gitignore——别提交）
-cd bindings/node && npm run build:debug && npm test   # node --test，6 项全离线
+cd bindings/node && npm run build:debug && npm test   # node --test --test-force-exit，离线
 cargo clippy -p tiny-agent-py          # 绑定 crate 也要单独过 clippy
 cargo clippy -p tiny-agent-node
 ```
@@ -121,6 +121,26 @@ cargo clippy -p tiny-agent-node
     主循环 → worker 永久阻塞 → 死锁。`resolveTool` / `PENDING_TOOLS` / `build_extra_tools` 三者是一套，
     改其一要保住另两个。`env.create_threadsafe_function` 固定返回 `CalleeHandled`（JS 收 `(err,value)`），
     所以 wrapper 的 `run` 签名是 `(err, req)`——别改成单参。
+- **绑定层自定义 provider 回调**（`provider=` / `{ chat }`）：让 Python/JS 函数整个替换内置 HTTP
+  provider（不连网、不要 key）。**非流式 v1**：host 函数收 `{system, messages, tools, model, max_tokens}`，
+  返回 `str` 或 `{text, stop_reason?, usage?}`（`SimpleChatResponse`）；核心 `ChatResponse::from_simple`
+  把整段文本合成**单条** `TextDelta`。不支持 tool_use（要工具调用用内置 provider + 自定义 `Tool`）。
+  - **共享装配**：核心 `build_agent_with_provider(cfg, provider, initial, client, extra_tools, api_key)`
+    与 `build_agent_with` 同走 `assemble`（tools/MCP/ctx 装配），只把 `provider::build` 换成传入的
+    `Box<dyn Provider>`。`api_key` 仍要传（`task` 子 agent 自建内置 provider 需要）；纯 custom-provider
+    无 `task` 时传 `""`。绑定层 provider 给定时，`api_key` 缺省用 `""` 而非读 env（custom provider 不要 key）。
+  - **Python**：`PyProvider{chat_fn: Py<PyAny>}` impl `Provider`，`chat()` 在 worker 线程 `Python::with_gil`
+    调 host 函数（与工具同款 GIL round-trip），返回值经 `py_to_simple`（str 速记 / dict）→ `from_simple`。
+    host 抛异常 → `chat()` 返 `Err` → **诚实地 fail 该轮**（不静默空回复）。
+  - **Node**：`NodeProvider{tsfn}` impl `Provider`，与工具同款 TSFN round-trip——agent 线程把 `{id,request}`
+    经 TSFN 派给 JS、阻塞 `mpsc` 等结果；`wrapper.js` 跑完 host 函数后调 `resolveProvider(id, result)`
+    （`PENDING_PROVIDERS: i64→Sender` 注册表，120s 兜底）。host 抛异常时 wrapper 解析成 `{__error: msg}`
+    标记，`NodeProvider::chat` 见 `__error` 即返 `Err`（匹配 Python 的诚实 fail）。`resolveProvider` /
+    `PENDING_PROVIDERS` / `build_provider` 三者是一套，改其一保住另两个（与工具那套对称）。
+  - **`--test-force-exit`**：`bindings/node` 的 `npm test` 带 `--test-force-exit`。napi 的 TSFN 在 Agent
+    drop 时释放 libuv async handle 有时机问题（**工具/ provider 都有，预先存在**）——独立脚本 run 完不会
+    自然退出；`node --test` 的 pending-promise 检查会因此误判文件 hang。force-exit 是 napi 绑定测试的
+    标准做法，不掩盖功能 bug（测试仍验证正确性）。
 - **`panic = "abort"`（`[profile.release]`）**：release 下 panic **不触发 `Drop`**。TUI 的终端还原
   (`TerminalGuard`)、MCP 子进程清理（`StdioTransport::drop`）都依赖 Drop——调试这些行为用
   **debug 构建**。`std::process::exit` 也跳过 Drop，headless 模式退出前显式 `drop(agent)`。

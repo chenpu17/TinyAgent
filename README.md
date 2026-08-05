@@ -67,6 +67,8 @@ let tool = CallbackTool::new(
 );
 ```
 
+自定义 provider 同理：实现 `Provider` trait（或用 `build_agent_with_provider` 复用 config 的工具/MCP 装配、只换 provider）。非流式 provider 可返回 `SimpleChatResponse`（`{text, stop_reason?, usage?}`），经 `ChatResponse::from_simple` 合成单条 delta——Python/Node 绑定的自定义 provider 走的就是这条路。
+
 run 结束后从 [`RunOutcome`](src/agent.rs)（或 `Agent::usage()` / `messages()` / `model()` getter）读回诚实的 token 账单与历史。`AgentEvent` 派生了 `Serialize`，绑定层可直接序列化成宿主语言的 dict / object。
 
 ### Python / TypeScript 绑定
@@ -100,6 +102,18 @@ print(a.run(on_event=lambda e: print(e))["final_text"])
 
 `run()` 同步阻塞但**释放 GIL**（`py.allow_threads`），长网络等待期间其他 Python 线程可跑；事件回调用 `with_gil` 短暂重获。
 
+**自定义 provider 回调**：传 `provider=` 一个 Python callable，整个替换内置 HTTP provider（不连网、不要 key）。callable 收 `{system, messages, tools, model, max_tokens}`，返回 `str`（=纯文本）或 `{text, stop_reason?, usage?}`：
+
+```python
+# 一个 mock / 适配器 provider：agent 驱动 loop，但每轮回复来自这个函数
+def echo_provider(request):
+    return {"text": f"you said: {request['messages'][-1]}", "stop_reason": "end_turn"}
+
+a = tiny_agent.Agent("chat.json", provider=echo_provider)  # 无 api_key
+```
+
+非流式 v1：返回整段文本，作为单条 delta 发出；不支持 tool_use（需要工具调用请用内置 provider + 自定义 `Tool`）。provider 抛异常会**诚实地 fail 该轮**。
+
 **Node.js / TypeScript（`import { chat, Agent }`，napi-rs）**
 
 ```sh
@@ -128,6 +142,18 @@ console.log((await a.run(ev => console.log(ev))).final_text);
 ```
 
 `run()` 是 `Promise`——agent loop 在 libuv worker 线程跑（**无 tokio**），事件经 `ThreadsafeFunction` 回主线程；自定义 JS 工具经 TSFN round-trip（agent 线程触发 JS → JS 调 `resolveTool(id, result)` 唤醒 worker）。
+
+**自定义 provider 回调**：传 `provider:` 一个函数（或 `{ chat }` 对象），整个替换内置 HTTP provider（不连网、不要 key）。收 `{system, messages, tools, model, max_tokens}`，返回 `string`（=纯文本）或 `{text, stop_reason?, usage?}`：
+
+```javascript
+// 一个 mock / 适配器 provider：agent 驱动 loop，每轮回复来自这个函数
+const a = new Agent('chat.json', {
+  provider: (request) => ({ text: `you said: ${request.messages.at(-1)}`, stop_reason: 'end_turn' }),
+});
+await a.run();
+```
+
+与自定义工具同款 TSFN round-trip（JS 调 `resolveProvider(id, result)` 唤醒 worker）。非流式 v1：返回整段文本，作为单条 delta 发出；不支持 tool_use（需要工具调用请用内置 provider + 自定义 `Tool`）。provider 抛异常会**诚实地 reject 该轮**。
 
 ## 使用
 

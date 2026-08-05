@@ -8,6 +8,7 @@ Run:  cd bindings/python && python -m pytest tests/ -v
 """
 from __future__ import annotations
 
+import json
 import threading
 import time
 
@@ -250,3 +251,254 @@ def test_events_stream_to_callback():
         assert any(isinstance(e, dict) and "Done" in e for e in events), events
     finally:
         mock.stop()
+
+
+# ── 9. custom Python provider (no HTTP server at all) ────────────────────────
+
+def test_custom_provider_returns_text(tmp_path):
+    """A user-supplied provider callable replaces the built-in HTTP provider
+    entirely: the agent drives the loop, but each turn's response comes from the
+    Python function (no mock server, no API key). The returned text becomes the
+    assistant message; usage/stop_reason flow back honestly."""
+    seen = {"requests": []}
+
+    def provider(request):
+        seen["requests"].append(request)
+        return {
+            "text": "hello from custom provider",
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 7, "output_tokens": 4},
+        }
+
+    cfg = openai_config("http://unused-no-http-here", tools=[], workdir=str(tmp_path))
+    a = tiny_agent.Agent(cfg, provider=provider)
+    a.push_user("hi")
+    out = a.run()
+
+    assert out["final_text"] == "hello from custom provider"
+    assert out["stop_reason"] == "end_turn"
+    # The provider's usage was folded into the run's honest accounting.
+    assert out["input_tokens"] == 7
+    assert out["output_tokens"] == 4
+    # The provider saw the request shape: model + the user message.
+    assert len(seen["requests"]) == 1
+    req = seen["requests"][0]
+    assert req["model"] == "mock-model"
+    assert req["max_tokens"] == 1024
+    # messages is the conversation; the user's "hi" text is somewhere in it.
+    assert "hi" in json.dumps(req["messages"])
+
+
+def test_custom_provider_str_shorthand(tmp_path):
+    """A plain `str` return is shorthand for `{text: str}` (end_turn, no usage)."""
+    def provider(request):
+        return "just a string"
+
+    cfg = openai_config("http://unused", tools=[], workdir=str(tmp_path))
+    out = tiny_agent.chat(cfg, "hi", provider=provider)
+    assert out["final_text"] == "just a string"
+    assert out["stop_reason"] == "end_turn"
+
+
+def test_custom_provider_multi_turn_sees_growing_history(tmp_path):
+    """Across turns the provider receives the full accumulated conversation —
+    the custom provider participates in the agent's stateful loop, not a
+    one-shot call."""
+    seen = {"turns": []}
+
+    def provider(request):
+        # Echo back how many assistant messages are already in history.
+        msgs = request["messages"]
+        assistant_count = sum(1 for m in msgs if m["role"] == "assistant")
+        seen["turns"].append(assistant_count)
+        return {"text": f"turn-{assistant_count}", "stop_reason": "end_turn"}
+
+    cfg = openai_config("http://unused", tools=[], max_turns=3, workdir=str(tmp_path))
+    a = tiny_agent.Agent(cfg, provider=provider)
+    a.push_user("first")
+    a.run()
+    a.push_user("second")
+    a.run()
+
+    # Turn 1 sees 0 prior assistant msgs; turn 2 sees the 1 we just added.
+    assert seen["turns"] == [0, 1]
+
+
+def test_custom_provider_streams_one_delta(tmp_path):
+    """The non-streaming v1 contract: the whole text arrives as a single
+    TextDelta event (the provider can't incrementally stream yet)."""
+    events = []
+
+    def provider(request):
+        return {"text": "whole text at once", "stop_reason": "end_turn"}
+
+    def on_event(e):
+        events.append(e)
+
+    cfg = openai_config("http://unused", tools=[], workdir=str(tmp_path))
+    tiny_agent.chat(cfg, "hi", provider=provider, on_event=on_event)
+    deltas = [e["TextDelta"] for e in events if isinstance(e, dict) and "TextDelta" in e]
+    assert deltas == ["whole text at once"]
+
+
+def test_custom_provider_combines_with_custom_tool(tmp_path):
+    """A custom provider can still be paired with a custom tool: the tool is
+    registered normally; the provider just can't *emit* a tool_use block (it's
+    text-only in v1), so this is a one-turn text + tool-presence smoke test."""
+    def provider(request):
+        tools = request["tools"]
+        return {"text": f"i see {len(tools)} tool(s)", "stop_reason": "end_turn"}
+
+    tool = tiny_agent.Tool(
+        name="get_weather",
+        description="Look up the weather.",
+        schema={"type": "object", "properties": {}, "required": []},
+        callback=lambda args: "sunny",
+    )
+
+    cfg = openai_config("http://unused", tools=[], workdir=str(tmp_path))
+    a = tiny_agent.Agent(cfg, tools=[tool], provider=provider)
+    a.push_user("hi")
+    out = a.run()
+    assert out["final_text"] == "i see 1 tool(s)"
+
+
+def test_custom_provider_empty_text_terminates_cleanly(tmp_path):
+    """Empty text must not loop forever or persist a bad assistant message:
+    from_simple yields zero blocks, the agent loop breaks at the empty-turn
+    guard, and the run ends with empty final_text."""
+    def provider(request):
+        return {"text": "", "stop_reason": "end_turn"}
+
+    cfg = openai_config("http://unused", tools=[], workdir=str(tmp_path))
+    out = tiny_agent.chat(cfg, "hi", provider=provider)
+    assert out["final_text"] == ""
+    assert out["stop_reason"] == "end_turn"
+
+
+# ── 10. custom provider: depth — cancel / recovery / shape / stop_reason ─────
+
+def test_custom_provider_cancel_takes_effect_after_call(tmp_path):
+    """cancel flipped DURING the provider call: the host function can't be
+    interrupted (it holds the GIL / blocks the worker), but once it returns the
+    loop sees the flag at the turn boundary and overrides stop_reason to
+    'cancelled'. So the run reports cancelled, but only after the provider call
+    runs to completion — not mid-call."""
+    def slow(request):
+        time.sleep(0.4)
+        return {"text": "done", "stop_reason": "end_turn"}
+
+    cfg = openai_config("http://unused", tools=[], workdir=str(tmp_path))
+    a = tiny_agent.Agent(cfg, provider=slow)
+    tok = tiny_agent.CancelToken()
+    a.set_cancel(tok)
+    a.push_user("hi")
+    threading.Timer(0.1, tok.cancel).start()
+
+    start = time.monotonic()
+    out = a.run()
+    elapsed = time.monotonic() - start
+
+    assert out["stop_reason"] == "cancelled"
+    assert tok.is_cancelled()
+    # The provider ran to completion (≈0.4s) — cancel did NOT cut it short.
+    assert elapsed >= 0.35, f"provider should run to completion, cancelled at {elapsed:.2f}s"
+
+
+def test_custom_provider_concurrent_runs_release_gil(tmp_path):
+    """Two agents running on separate Python threads, each with a sleeping
+    custom provider (time.sleep releases the GIL, modeling an I/O-bound LLM
+    call). Because run() releases the GIL (py.allow_threads) and sleep releases
+    it too, the two runs overlap in time — total ≈ one sleep, not two. This is
+    the real-concurrency proof that functional single-threaded tests can't give
+    (cf. the project's 'thread the mock e2e' note)."""
+    sleep_s = 0.4
+
+    def llm(request):
+        time.sleep(sleep_s)
+        return {"text": "ok", "stop_reason": "end_turn"}
+
+    cfg = openai_config("http://unused", tools=[], workdir=str(tmp_path))
+    results: list[str] = []
+    results_lock = threading.Lock()
+
+    def run_one():
+        a = tiny_agent.Agent(cfg, provider=llm)
+        a.push_user("hi")
+        out = a.run()
+        with results_lock:
+            results.append(out["final_text"])
+
+    start = time.monotonic()
+    threads = [threading.Thread(target=run_one) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    elapsed = time.monotonic() - start
+
+    assert results == ["ok", "ok"]
+    # Serial would be ≈ 2×sleep = 0.8s; concurrent ≈ 1×sleep = 0.4s. The 0.6s
+    # cut separates them with margin for thread startup / GIL handoff jitter.
+    assert elapsed < 0.6, f"runs serialized (GIL not released?): {elapsed:.2f}s"
+
+
+def test_custom_provider_recovers_after_error(tmp_path):
+    """A provider that throws on turn 1 fails the run honestly, but the agent's
+    state isn't corrupted: turn 2 (after the provider stops failing) runs fine,
+    and the failed turn left no partial assistant message in history."""
+    state = {"fail": True}
+
+    def flaky(request):
+        if state["fail"]:
+            raise RuntimeError("boom on first call")
+        return {"text": "recovered", "stop_reason": "end_turn"}
+
+    cfg = openai_config("http://unused", tools=[], workdir=str(tmp_path))
+    a = tiny_agent.Agent(cfg, provider=flaky)
+    a.push_user("first")
+    with pytest.raises(RuntimeError, match="boom"):
+        a.run()
+
+    state["fail"] = False
+    a.push_user("second")
+    out = a.run()
+    assert out["final_text"] == "recovered"
+
+
+def test_custom_provider_request_messages_shape(tmp_path):
+    """Lock down the JSON shape handed to the provider (users parse this):
+    messages is a list of {role, content: [blocks]}, where a text block is the
+    externally-tagged {'text': str}. role is lowercase 'user'/'assistant'."""
+    seen = {}
+
+    def llm(request):
+        seen["messages"] = request["messages"]
+        return {"text": "ok", "stop_reason": "end_turn"}
+
+    cfg = openai_config("http://unused", tools=[], workdir=str(tmp_path))
+    a = tiny_agent.Agent(cfg, provider=llm)
+    a.push_user("hello world")
+    a.run()
+
+    msgs = seen["messages"]
+    assert msgs[0]["role"] == "user"
+    assert msgs[0]["content"] == [{"text": "hello world"}]
+
+
+def test_custom_provider_passes_through_non_end_turn_stop_reason(tmp_path):
+    """A non-end_turn stop_reason flows through to the RunOutcome unchanged.
+    'max_tokens' exercises the loop's abort path (which strips partial tool_use
+    but keeps text and the original stop_reason) — text-only still reports it."""
+    def llm(request):
+        return {
+            "text": "cut off",
+            "stop_reason": "max_tokens",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }
+
+    cfg = openai_config("http://unused", tools=[], workdir=str(tmp_path))
+    out = tiny_agent.chat(cfg, "hi", provider=llm)
+    assert out["stop_reason"] == "max_tokens"
+    assert out["final_text"] == "cut off"
+

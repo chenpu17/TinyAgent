@@ -182,7 +182,71 @@ impl PyTool {
     }
 }
 
-// ── Agent ───────────────────────────────────────────────────────────────────
+// ── Provider: a custom provider from a Python callable ──────────────────────
+
+/// The request shape handed to a Python custom provider: the conversation +
+/// model params the host function needs to produce a response. Excludes the
+/// `cancel` flag / per-request timeout / cache hint — those are agent-internal
+/// plumbing the host function shouldn't see (a non-streaming custom provider
+/// runs to completion; cancel lands at the next turn boundary).
+#[derive(serde::Serialize)]
+struct ProviderRequest<'a> {
+    system: Option<&'a str>,
+    messages: &'a [ta::Message],
+    tools: &'a [ta::ToolDef],
+    model: &'a str,
+    max_tokens: u32,
+}
+
+/// Accept a Python provider's return value: a plain `str` (shorthand for just
+/// the text) or a `dict` with `text` and optional `stop_reason` / `usage`.
+fn py_to_simple(bound: &Bound<'_, PyAny>) -> anyhow::Result<ta::SimpleChatResponse> {
+    if let Ok(s) = bound.extract::<String>() {
+        return Ok(ta::SimpleChatResponse { text: s, stop_reason: None, usage: None });
+    }
+    depythonize::<ta::SimpleChatResponse>(bound).map_err(|e| {
+        anyhow::anyhow!("provider must return str or dict {{text, stop_reason?, usage?}}: {e}")
+    })
+}
+
+/// A custom provider backed by a Python callable `chat(request) -> str | dict`.
+///
+/// `chat` runs on the agent's worker thread — the run loop released the GIL via
+/// `allow_threads`, so `Python::with_gil` re-acquires it for the duration of the
+/// host call (blocking, like any provider's network round-trip). The host
+/// returns the **whole** text at once (non-streaming v1); it is emitted as a
+/// single `TextDelta` via [`ta::ChatResponse::from_simple`], so the agent's
+/// event stream / display still sees the assistant message.
+struct PyProvider {
+    chat_fn: Py<PyAny>,
+}
+
+impl ta::Provider for PyProvider {
+    fn chat(
+        &self,
+        req: &ta::ChatRequest,
+        on_event: &mut dyn FnMut(ta::provider::ChatEvent),
+    ) -> anyhow::Result<ta::ChatResponse> {
+        Python::with_gil(|py| -> anyhow::Result<ta::ChatResponse> {
+            let req_view = ProviderRequest {
+                system: req.system,
+                messages: req.messages,
+                tools: req.tools,
+                model: req.model,
+                max_tokens: req.max_tokens,
+            };
+            let req_dict = pythonize(py, &req_view).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let ret = self
+                .chat_fn
+                .call1(py, (req_dict,))
+                .map_err(|e| anyhow::anyhow!("provider callback raised: {e}"))?;
+            let simple = py_to_simple(ret.bind(py))?;
+            Ok(ta::ChatResponse::from_simple(simple, on_event))
+        })
+    }
+}
+
+
 
 /// A multi-turn agent. Construct from a config (path or dict), optionally with
 /// custom tools and an explicit API key; call `.run()` per turn.
@@ -194,22 +258,36 @@ pub struct Agent {
 #[pymethods]
 impl Agent {
     #[new]
-    #[pyo3(signature = (config, *, tools=None, api_key=None))]
+    #[pyo3(signature = (config, *, tools=None, provider=None, api_key=None))]
     fn new(
         config: &Bound<'_, PyAny>,
         tools: Option<Vec<Py<PyTool>>>,
+        provider: Option<Py<PyAny>>,
         api_key: Option<String>,
         py: Python<'_>,
     ) -> PyResult<Self> {
         let cfg = load_config(config)?;
+        // A custom provider needs no API key for the main agent; only fall back
+        // to cfg.api_key() (which reads the env var) when using the built-in
+        // provider. `task` sub-agents, if enabled, still build their own
+        // built-in provider and would need a real key — documented limitation.
         let api_key = match api_key {
             Some(k) => k,
-            None => cfg.api_key().map_err(to_pyerr)?,
+            None => match &provider {
+                Some(_) => String::new(),
+                None => cfg.api_key().map_err(to_pyerr)?,
+            },
         };
         let client = ta::provider::new_client(cfg.limits.timeout_secs);
         let extra = build_extra_tools(tools, py)?;
-        let agent = ta::build_agent_with(&cfg, Vec::new(), &client, extra, &api_key)
-            .map_err(to_pyerr)?;
+        let agent = match provider {
+            Some(chat_fn) => {
+                let prov: Box<dyn ta::Provider> = Box::new(PyProvider { chat_fn });
+                ta::build_agent_with_provider(&cfg, prov, Vec::new(), &client, extra, &api_key)
+            }
+            None => ta::build_agent_with(&cfg, Vec::new(), &client, extra, &api_key),
+        }
+        .map_err(to_pyerr)?;
         Ok(Self { inner: Mutex::new(agent) })
     }
 
@@ -262,24 +340,34 @@ impl Agent {
 /// One-shot: build an agent from `config`, send `message`, run to completion,
 /// and return the `RunOutcome` dict. Optional `on_event` streams events.
 #[pyfunction]
-#[pyo3(signature = (config, message, *, on_event=None, tools=None, api_key=None))]
+#[pyo3(signature = (config, message, *, on_event=None, tools=None, provider=None, api_key=None))]
 fn chat(
     config: &Bound<'_, PyAny>,
     message: &str,
     on_event: Option<PyObject>,
     tools: Option<Vec<Py<PyTool>>>,
+    provider: Option<Py<PyAny>>,
     api_key: Option<String>,
     py: Python<'_>,
 ) -> PyResult<PyObject> {
     let cfg = load_config(config)?;
     let api_key = match api_key {
         Some(k) => k,
-        None => cfg.api_key().map_err(to_pyerr)?,
+        None => match &provider {
+            Some(_) => String::new(),
+            None => cfg.api_key().map_err(to_pyerr)?,
+        },
     };
     let client = ta::provider::new_client(cfg.limits.timeout_secs);
     let extra = build_extra_tools(tools, py)?;
-    let mut agent = ta::build_agent_with(&cfg, Vec::new(), &client, extra, &api_key)
-        .map_err(to_pyerr)?;
+    let mut agent = match provider {
+        Some(chat_fn) => {
+            let prov: Box<dyn ta::Provider> = Box::new(PyProvider { chat_fn });
+            ta::build_agent_with_provider(&cfg, prov, Vec::new(), &client, extra, &api_key)
+        }
+        None => ta::build_agent_with(&cfg, Vec::new(), &client, extra, &api_key),
+    }
+    .map_err(to_pyerr)?;
     agent.push_user(vec![ta::Block::Text(message.into())]);
     run_agent(&mut agent, on_event, py)
 }

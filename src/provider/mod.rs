@@ -70,7 +70,7 @@ impl Message {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ToolDef {
     pub name: String,
     pub description: String,
@@ -92,11 +92,18 @@ pub enum ChatEvent {
 /// default to 0 when the provider doesn't report caching. `input_tokens` is the
 /// *non-cached* input (the two cache fields are separate), so the honest billed
 /// input is `input_tokens + cache_creation*1.25 + cache_read*0.1`.
-#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct Usage {
+    /// Defaults to 0 when a custom provider omits it (`#[serde(default)]` — an
+    /// unreported axis reads as "no tokens here", matching how the built-in
+    /// providers treat axes the server didn't return).
+    #[serde(default)]
     pub input_tokens: u64,
+    #[serde(default)]
     pub output_tokens: u64,
+    #[serde(default)]
     pub cache_creation_input_tokens: u64,
+    #[serde(default)]
     pub cache_read_input_tokens: u64,
 }
 
@@ -120,6 +127,67 @@ pub struct ChatResponse {
     /// "end_turn" | "tool_use" | "max_tokens" | provider-specific value.
     pub stop_reason: String,
     pub usage: Option<Usage>,
+}
+
+/// A simplified, **non-streaming** chat response shape: the full assistant text
+/// plus optional `stop_reason` and `usage`. This is the contract the Python /
+/// TypeScript bindings ask a user-supplied custom provider to return, and a
+/// convenience for Rust callers who don't want to assemble [`Block`]s by hand.
+///
+/// A custom provider returns the whole text at once (no incremental deltas);
+/// [`ChatResponse::from_simple`] emits that text as a single [`ChatEvent::
+/// TextDelta`] so the agent loop — which drives display via `on_event` — still
+/// sees the assistant message exactly once. Real streaming is the built-in
+/// providers' job; a non-streaming custom provider still drives the loop
+/// correctly for mock / adapter / non-streaming-LLM use cases.
+///
+/// `text` is the only required field. Omitting `stop_reason` defaults to
+/// `"end_turn"`; omitting `usage` reports no token cost for the turn. This
+/// shape is text-only — a custom provider cannot emit `tool_use` blocks via
+/// this path (use the built-in provider + custom [`crate::tools::Tool`]s for
+/// tool use).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SimpleChatResponse {
+    /// The full assistant text for this turn.
+    pub text: String,
+    /// Defaults to `"end_turn"` when omitted or `None`.
+    #[serde(default)]
+    pub stop_reason: Option<String>,
+    /// Token usage for this turn; `None` means "unreported" (the turn is free).
+    #[serde(default)]
+    pub usage: Option<Usage>,
+}
+
+impl SimpleChatResponse {
+    /// Parse from an arbitrary JSON [`Value`] (e.g. what a binding received from
+    /// the host language). Missing `stop_reason`/`usage` default per the struct's
+    /// `#[serde(default)]` rules.
+    pub fn from_value(v: &Value) -> Result<Self> {
+        serde_json::from_value(v.clone()).map_err(|e| anyhow::anyhow!("custom provider response: {e}"))
+    }
+}
+
+impl ChatResponse {
+    /// Assemble a [`ChatResponse`] from a [`SimpleChatResponse`], emitting the
+    /// full text as a single [`ChatEvent::TextDelta`] via `on_event` (so the
+    /// agent's streaming display / event forwarding sees it). Empty text yields
+    /// **no blocks** — matching the agent loop's "don't persist an empty
+    /// assistant turn" invariant (an empty assistant message makes strict APIs
+    /// reject the next request); the loop breaks without saving it. Non-empty
+    /// text produces exactly one [`Block::Text`].
+    pub fn from_simple(s: SimpleChatResponse, on_event: &mut dyn FnMut(ChatEvent)) -> ChatResponse {
+        let blocks = if s.text.is_empty() {
+            Vec::new()
+        } else {
+            on_event(ChatEvent::TextDelta(s.text.clone()));
+            vec![Block::Text(s.text)]
+        };
+        ChatResponse {
+            blocks,
+            stop_reason: s.stop_reason.unwrap_or_else(|| "end_turn".to_string()),
+            usage: s.usage,
+        }
+    }
 }
 
 pub struct ChatRequest<'a> {

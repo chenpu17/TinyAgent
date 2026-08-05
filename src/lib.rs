@@ -37,7 +37,7 @@ pub mod tools;
 // ── Facade re-exports (the library's public face) ──────────────────────────
 pub use agent::{Agent, AgentEvent, CompressTrigger, RunCost, RunError, RunOutcome, ToolCallRecord};
 pub use config::{Config, Limits};
-pub use provider::{Block, ChatRequest, ChatResponse, Message, Provider, Role, ToolDef, Usage};
+pub use provider::{Block, ChatRequest, ChatResponse, Message, Provider, Role, SimpleChatResponse, ToolDef, Usage};
 pub use tools::{CallbackTool, Tool, ToolCtx, ToolOutput};
 
 /// Wire together provider + tools (the config's built-in whitelist + any MCP
@@ -74,6 +74,50 @@ pub fn build_agent_with(
     extra_tools: Vec<Box<dyn tools::Tool>>,
     api_key: &str,
 ) -> anyhow::Result<Agent> {
+    let (tool_list, ctx) = assemble(cfg, client, extra_tools, api_key)?;
+    Ok(Agent::new(
+        cfg,
+        provider::build(cfg, api_key, client.clone()),
+        tool_list,
+        initial,
+        ctx,
+    ))
+}
+
+/// Like [`build_agent_with`], but the caller supplies the [`Provider`] directly
+/// instead of it being built from the config. The Python / TypeScript bindings
+/// use this to inject a user-supplied custom provider (host-language function
+/// wrapped in a `Provider` impl).
+///
+/// `api_key` is still required because the built-in tool whitelist may include
+/// `task` (sub-agent), whose child agents build their *own* provider from the
+/// config + key. A purely custom-provider setup with no `task` tool can pass an
+/// empty string. The injected `provider` drives the **main** agent only.
+pub fn build_agent_with_provider(
+    cfg: &Config,
+    provider: Box<dyn Provider>,
+    initial: Vec<Message>,
+    client: &reqwest::blocking::Client,
+    extra_tools: Vec<Box<dyn tools::Tool>>,
+    api_key: &str,
+) -> anyhow::Result<Agent> {
+    let (tool_list, ctx) = assemble(cfg, client, extra_tools, api_key)?;
+    Ok(Agent::new(cfg, provider, tool_list, initial, ctx))
+}
+
+/// Shared tool-list + [`ToolCtx`] assembly for the `build_agent*` helpers:
+/// resolve `workdir`, build the config's MCP tools once, wire the config's
+/// built-in tool whitelist (passing the shared MCP set so a `task` sub-agent
+/// reuses the parent's connections rather than re-spawning), then append MCP +
+/// any extra tools. Factored out so [`build_agent_with`] and
+/// [`build_agent_with_provider`] stay in lockstep — only the provider
+/// construction differs between them.
+fn assemble(
+    cfg: &Config,
+    client: &reqwest::blocking::Client,
+    extra_tools: Vec<Box<dyn tools::Tool>>,
+    api_key: &str,
+) -> anyhow::Result<(Vec<Box<dyn tools::Tool>>, ToolCtx)> {
     use anyhow::Context;
     let workdir = cfg
         .workdir
@@ -98,5 +142,5 @@ pub fn build_agent_with(
         restrict_to_workdir: cfg.restrict_to_workdir,
         cancel: None,
     };
-    Ok(Agent::new(cfg, provider::build(cfg, api_key, client.clone()), tool_list, initial, ctx))
+    Ok((tool_list, ctx))
 }

@@ -194,3 +194,215 @@ test('custom async JS tool, str-return shorthand', async (t) => {
   });
   assert.strictEqual(out.tool_calls[0].output, 'echo:hi');
 });
+
+// ── 7. custom JS provider (no HTTP server at all) ───────────────────────────
+
+// A config for custom-provider tests: base_url is never hit (the provider
+// replaces the HTTP call entirely), so a dummy url suffices.
+function providerConfig(t, opts = {}) {
+  return writeConfig(t, 'http://unused-no-http-here', { tools: opts.tools ?? [], maxTurns: opts.maxTurns ?? 6 });
+}
+
+test('custom provider returns text + honest usage', async (t) => {
+  const seen = [];
+  const { cfgPath } = providerConfig(t);
+
+  const a = new Agent(cfgPath, {
+    provider: (request) => {
+      seen.push(request);
+      return {
+        text: 'hello from custom provider',
+        stop_reason: 'end_turn',
+        usage: { input_tokens: 7, output_tokens: 4 },
+      };
+    },
+  });
+  a.pushUser('hi');
+  const out = await a.run();
+
+  assert.strictEqual(out.final_text, 'hello from custom provider');
+  assert.strictEqual(out.stop_reason, 'end_turn');
+  assert.strictEqual(out.input_tokens, 7);
+  assert.strictEqual(out.output_tokens, 4);
+
+  // The provider saw the request shape: model + the user message.
+  assert.strictEqual(seen.length, 1);
+  assert.strictEqual(seen[0].model, 'mock-model');
+  assert.strictEqual(seen[0].max_tokens, 1024);
+  assert.ok(JSON.stringify(seen[0].messages).includes('hi'));
+});
+
+test('custom provider, plain-string return shorthand', async (t) => {
+  const { cfgPath } = providerConfig(t);
+  const out = await chat(cfgPath, 'hi', {
+    provider: () => 'just a string',
+  });
+  assert.strictEqual(out.final_text, 'just a string');
+  assert.strictEqual(out.stop_reason, 'end_turn');
+});
+
+test('custom provider as { chat } object', async (t) => {
+  // The object form (provider = { chat(request) }) is accepted too.
+  const { cfgPath } = providerConfig(t);
+  const out = await chat(cfgPath, 'hi', {
+    provider: { chat: () => ({ text: 'object form', stop_reason: 'end_turn' }) },
+  });
+  assert.strictEqual(out.final_text, 'object form');
+});
+
+test('custom provider sees growing history across turns', async (t) => {
+  const seen = [];
+  const { cfgPath } = providerConfig(t, { maxTurns: 3 });
+
+  const a = new Agent(cfgPath, {
+    provider: (request) => {
+      const n = request.messages.filter((m) => m.role === 'assistant').length;
+      seen.push(n);
+      return { text: `turn-${n}`, stop_reason: 'end_turn' };
+    },
+  });
+  a.pushUser('first');
+  await a.run();
+  a.pushUser('second');
+  await a.run();
+
+  assert.deepStrictEqual(seen, [0, 1]);
+});
+
+test('custom provider emits the whole text as one delta', async (t) => {
+  // Non-streaming v1: the full text arrives as a single TextDelta event.
+  const events = [];
+  const { cfgPath } = providerConfig(t);
+  await chat(cfgPath, 'hi', {
+    provider: () => ({ text: 'whole text at once', stop_reason: 'end_turn' }),
+    onEvent: (e) => events.push(e),
+  });
+  const deltas = events.filter((e) => 'TextDelta' in e).map((e) => e.TextDelta);
+  assert.deepStrictEqual(deltas, ['whole text at once']);
+});
+
+test('custom provider that throws fails the run honestly', async (t) => {
+  // A thrown provider rejects the run (the {__error} marker), rather than
+  // silently producing an empty turn or hanging on the 120s timeout.
+  const { cfgPath } = providerConfig(t);
+  await assert.rejects(
+    () => chat(cfgPath, 'hi', { provider: () => { throw new Error('boom'); } }),
+    /boom/,
+  );
+});
+
+test('custom provider empty text terminates cleanly', async (t) => {
+  // Empty text must not loop forever or persist a bad assistant message:
+  // from_simple yields zero blocks, the loop breaks at the empty-turn guard.
+  const { cfgPath } = providerConfig(t);
+  const out = await chat(cfgPath, 'hi', { provider: () => ({ text: '', stop_reason: 'end_turn' }) });
+  assert.strictEqual(out.final_text, '');
+  assert.strictEqual(out.stop_reason, 'end_turn');
+});
+
+// ── 8. custom provider: depth — cancel / concurrency / recovery / shape ─────
+
+test('custom provider cancel takes effect after the call', async (t) => {
+  // cancel flipped DURING the provider call: the JS provider (on the main
+  // thread) can't be interrupted, and the worker blocks on the TSFN round-trip
+  // — so cancel lands only after the provider resolves, at the turn boundary.
+  // The run reports 'cancelled', but only once the provider call completes.
+  const { cfgPath } = providerConfig(t);
+  const a = new Agent(cfgPath, {
+    provider: async () => {
+      await new Promise((r) => setTimeout(r, 400));
+      return { text: 'done', stop_reason: 'end_turn' };
+    },
+  });
+  const tok = new CancelToken();
+  a.setCancel(tok);
+  a.pushUser('hi');
+  setTimeout(() => tok.cancel(), 100);
+
+  const start = Date.now();
+  const out = await a.run();
+  const elapsed = Date.now() - start;
+
+  assert.strictEqual(out.stop_reason, 'cancelled');
+  assert.strictEqual(tok.isCancelled(), true);
+  // The provider ran to completion (≈400ms) — cancel did NOT cut it short.
+  assert.ok(elapsed >= 350, `provider should run to completion, cancelled at ${elapsed}ms`);
+});
+
+test('custom provider: async providers run concurrently via the event loop', async (t) => {
+  // Two agents running simultaneously: their run() calls overlap on libuv
+  // worker threads, and — because the provider is ASYNC — its callback yields
+  // the main thread at the first `await` (the TSFN call returns a promise napi
+  // doesn't block on). So both sleeps run concurrently in the event loop, just
+  // like the Python binding's GIL-released sleeping provider. The property
+  // under test: no TSFN/worker deadlock under concurrent use, AND the two
+  // async providers overlap in time (total ≈ one sleep, not two). A
+  // *synchronous* provider WOULD serialize on the main thread — not tested
+  // here, but documented.
+  const { cfgPath } = providerConfig(t);
+  const make = () => new Agent(cfgPath, {
+    provider: async () => {
+      await new Promise((r) => setTimeout(r, 120));
+      return { text: 'ok', stop_reason: 'end_turn' };
+    },
+  });
+  const runOne = async () => {
+    const a = make();
+    a.pushUser('hi');
+    return (await a.run()).final_text;
+  };
+
+  const start = Date.now();
+  const results = await Promise.all([runOne(), runOne()]);
+  const elapsed = Date.now() - start;
+
+  assert.deepStrictEqual(results, ['ok', 'ok']);
+  // Concurrent: 2×120ms serialized would be ≈240ms; overlapped ≈120ms.
+  // 200ms separates them with margin for timer coarseness / worker handoff.
+  assert.ok(elapsed < 200, `expected concurrent (<200ms), got ${elapsed}ms — serialized?`);
+});
+
+test('custom provider recovers after an error', async (t) => {
+  // A provider that throws on turn 1 rejects the run (the {__error} marker),
+  // but the agent's state isn't corrupted: turn 2 runs fine after the provider
+  // stops failing, and the failed turn left no partial assistant message.
+  const state = { fail: true };
+  const { cfgPath } = providerConfig(t);
+  const a = new Agent(cfgPath, {
+    provider: () => {
+      if (state.fail) throw new Error('boom');
+      return { text: 'recovered', stop_reason: 'end_turn' };
+    },
+  });
+  a.pushUser('first');
+  await assert.rejects(() => a.run(), /boom/);
+  state.fail = false;
+  a.pushUser('second');
+  const out = await a.run();
+  assert.strictEqual(out.final_text, 'recovered');
+});
+
+test('custom provider request messages shape', async (t) => {
+  // Lock down the JSON shape handed to the provider: messages is a list of
+  // {role, content: [blocks]}, a text block is the externally-tagged {text: str}.
+  let seen;
+  const { cfgPath } = providerConfig(t);
+  const a = new Agent(cfgPath, {
+    provider: (req) => { seen = req; return { text: 'ok', stop_reason: 'end_turn' }; },
+  });
+  a.pushUser('hello world');
+  await a.run();
+  assert.deepStrictEqual(seen.messages[0], { role: 'user', content: [{ text: 'hello world' }] });
+});
+
+test('custom provider passes through non-end-turn stop_reason', async (t) => {
+  // A non-end_turn stop_reason flows through unchanged. 'max_tokens'
+  // exercises the loop's abort path (strips partial tool_use, keeps text +
+  // the original stop_reason) — text-only still reports it.
+  const { cfgPath } = providerConfig(t);
+  const out = await chat(cfgPath, 'hi', {
+    provider: () => ({ text: 'cut off', stop_reason: 'max_tokens', usage: { input_tokens: 1, output_tokens: 1 } }),
+  });
+  assert.strictEqual(out.stop_reason, 'max_tokens');
+  assert.strictEqual(out.final_text, 'cut off');
+});

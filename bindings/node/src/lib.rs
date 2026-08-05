@@ -181,6 +181,124 @@ pub fn resolve_tool(id: i64, result: ToolResult) -> Result<()> {
     Ok(())
 }
 
+// ── custom JS provider: TSFN round-trip (mirrors the tool round-trip) ────────
+//
+// A custom provider is a JS function `chat(request) -> Promise<{text, …}>`.
+// Like a JS tool it can't run on the agent's worker thread, so its call
+// round-trips: the worker sends `{ id, request }` to JS (via a TSFN), blocks on
+// a channel; the wrapped JS provider runs on the main thread and fulfills via
+// `resolveProvider(id, result)`. The result is a `serde_json::Value` (the raw
+// JS object), parsed into [`ta::SimpleChatResponse`] on the Rust side.
+//
+// Non-streaming v1: the provider returns the *whole* text at once; it's emitted
+// as a single `TextDelta` via [`ta::ChatResponse::from_simple`]. Incremental
+// streaming from a JS provider is future work (it'd need a second TSFN to push
+// deltas JS→Rust mid-call).
+
+static NEXT_PROVIDER_ID: AtomicI64 = AtomicI64::new(1);
+static PENDING_PROVIDERS: OnceLock<Mutex<HashMap<i64, mpsc::Sender<Value>>>> = OnceLock::new();
+
+fn pending_providers() -> &'static Mutex<HashMap<i64, mpsc::Sender<Value>>> {
+    PENDING_PROVIDERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Payload handed to the wrapped JS provider callback: the call's id (to report
+/// back via `resolveProvider`) and the request object.
+#[napi(object)]
+pub struct ProviderCall {
+    pub id: i64,
+    pub request: Value,
+}
+
+/// Fulfill the channel for an in-flight provider call. Called from JS after the
+/// wrapped provider resolves. A missing id means the call already timed out —
+/// the late result is dropped, harmless (same discipline as `resolveTool`).
+#[napi(js_name = "resolveProvider")]
+pub fn resolve_provider(id: i64, result: Value) -> Result<()> {
+    if let Some(tx) = pending_providers().lock().unwrap().remove(&id) {
+        let _ = tx.send(result);
+    }
+    Ok(())
+}
+
+/// The request shape handed to a JS custom provider (excludes cancel / timeout
+/// / cache — agent-internal plumbing the host function shouldn't see).
+#[derive(serde::Serialize)]
+struct ProviderRequest<'a> {
+    system: Option<&'a str>,
+    messages: &'a [ta::Message],
+    tools: &'a [ta::ToolDef],
+    model: &'a str,
+    max_tokens: u32,
+}
+
+fn provider_request_value(req: &ta::ChatRequest) -> Result<Value> {
+    serde_json::to_value(ProviderRequest {
+        system: req.system,
+        messages: req.messages,
+        tools: req.tools,
+        model: req.model,
+        max_tokens: req.max_tokens,
+    })
+    .map_err(err)
+}
+
+/// A custom provider backed by a JS function (wrapped by `wrapper.js` into the
+/// `(err, call)` CalleeHandled TSFN shape). Holds the TSFN; `chat` drives the
+/// round-trip and blocks the agent worker thread for the JS result.
+struct NodeProvider {
+    tsfn: ThreadsafeFunction<ProviderCall, ErrorStrategy::CalleeHandled>,
+}
+
+impl ta::Provider for NodeProvider {
+    fn chat(
+        &self,
+        req: &ta::ChatRequest,
+        on_event: &mut dyn FnMut(ta::provider::ChatEvent),
+    ) -> anyhow::Result<ta::ChatResponse> {
+        let id = NEXT_PROVIDER_ID.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel();
+        pending_providers().lock().unwrap().insert(id, tx);
+
+        let call = ProviderCall { id, request: provider_request_value(req)? };
+        if self.tsfn.call(Ok(call), ThreadsafeFunctionCallMode::NonBlocking) != Status::Ok {
+            pending_providers().lock().unwrap().remove(&id);
+            return Err(err("provider: dispatch to JS failed").into());
+        }
+
+        // Block the agent worker thread for the JS result. The JS main thread
+        // is free (the run() caller awaits it), so the wrapped provider
+        // resolves promptly; the timeout is a backstop against a provider that
+        // never returns.
+        let resp = rx
+            .recv_timeout(Duration::from_secs(120))
+            .map_err(|_| err("provider: JS callback did not resolve within 120s"))?;
+        // The wrapper signals a thrown user provider via a `{__error}` marker so
+        // the run fails honestly (mirroring the Python binding, where a raised
+        // exception fails the turn) instead of producing a silent empty turn.
+        if let Some(msg) = resp.get("__error").and_then(|v| v.as_str()) {
+            return Err(anyhow::anyhow!("provider callback failed: {msg}"));
+        }
+        let simple = ta::SimpleChatResponse::from_value(&resp)?;
+        Ok(ta::ChatResponse::from_simple(simple, on_event))
+    }
+}
+
+/// Turn the user's wrapped JS provider `{ chat: async (err, call) => … }` into a
+/// `Provider` trait object. `wrapper.js` normalizes the user's `provider`
+/// (function or `{ chat }` object) into that single-callable shape, the same way
+/// it wraps tools — so here we just extract `.chat` as a TSFN.
+fn build_provider(env: Env, provider: Option<Object>) -> Result<Option<Box<dyn ta::Provider>>> {
+    let Some(p) = provider else {
+        return Ok(None);
+    };
+    let chat_fn: JsFunction = p
+        .get("chat")?
+        .ok_or_else(|| err("custom provider object missing \"chat\""))?;
+    let tsfn = env.create_threadsafe_function(&chat_fn, 0, |ctx| Ok(vec![ctx.value]))?;
+    Ok(Some(Box::new(NodeProvider { tsfn })))
+}
+
 // ── run task: drives one agent.run() on a libuv worker thread ────────────────
 
 /// The async unit of work for `Agent#run()`. `compute` runs off the JS thread
@@ -278,17 +396,29 @@ impl Agent {
         env: Env,
         config_path: String,
         tools: Option<Vec<Object>>,
+        provider: Option<Object>,
         api_key: Option<String>,
     ) -> Result<Self> {
         let cfg = ta::Config::load(Path::new(&config_path)).map_err(err)?;
+        // A custom provider needs no API key for the main agent; only fall back
+        // to cfg.api_key() when using the built-in provider.
         let api_key = match api_key {
             Some(k) => k,
-            None => cfg.api_key().map_err(err)?,
+            None => match &provider {
+                Some(_) => String::new(),
+                None => cfg.api_key().map_err(err)?,
+            },
         };
         let client = ta::provider::new_client(cfg.limits.timeout_secs);
         let extra = build_extra_tools(env, tools)?;
-        let agent = ta::build_agent_with(&cfg, Vec::new(), &client, extra, &api_key)
-            .map_err(err)?;
+        // The TSFN must be created on the JS thread (env); build_provider does
+        // that, then the trait object is Send and safe to thread into the agent.
+        let prov = build_provider(env, provider)?;
+        let agent = match prov {
+            Some(p) => ta::build_agent_with_provider(&cfg, p, Vec::new(), &client, extra, &api_key),
+            None => ta::build_agent_with(&cfg, Vec::new(), &client, extra, &api_key),
+        }
+        .map_err(err)?;
         Ok(Self { inner: Arc::new(Mutex::new(agent)) })
     }
 
@@ -365,15 +495,20 @@ pub fn chat(
     message: String,
     on_event: Option<ThreadsafeFunction<Value, ErrorStrategy::Fatal>>,
     tools: Option<Vec<Object>>,
+    provider: Option<Object>,
     api_key: Option<String>,
 ) -> Result<AsyncTask<ChatRunTask>> {
     let extra = build_extra_tools(env, tools)?;
+    // Build the provider TSFN on the JS thread (env); the trait object is Send
+    // and threads safely into the worker task.
+    let prov = build_provider(env, provider)?;
     Ok(AsyncTask::new(ChatRunTask {
         config_path,
         message,
         api_key,
         on_event,
         tools: extra,
+        provider: prov,
     }))
 }
 
@@ -387,6 +522,9 @@ pub struct ChatRunTask {
     pub api_key: Option<String>,
     pub on_event: Option<ThreadsafeFunction<Value, ErrorStrategy::Fatal>>,
     pub tools: Vec<Box<dyn ta::Tool>>,
+    /// A custom provider (TSFN built on the JS thread), or None to build the
+    /// configured openai/anthropic provider from the config on the worker.
+    pub provider: Option<Box<dyn ta::Provider>>,
 }
 
 impl Task for ChatRunTask {
@@ -397,14 +535,23 @@ impl Task for ChatRunTask {
         let cfg = ta::Config::load(Path::new(&self.config_path)).map_err(err)?;
         let api_key = match &self.api_key {
             Some(k) => k.clone(),
-            None => cfg.api_key().map_err(err)?,
+            None => match &self.provider {
+                Some(_) => String::new(),
+                None => cfg.api_key().map_err(err)?,
+            },
         };
         let client = ta::provider::new_client(cfg.limits.timeout_secs);
-        // Move the tools out of `&mut self` (build_agent_with takes them by
-        // value); they're spent once the agent owns them.
+        // Move the tools + provider out of `&mut self` (the builders take them
+        // by value); they're spent once the agent owns them.
         let tools = std::mem::take(&mut self.tools);
-        let mut agent =
-            ta::build_agent_with(&cfg, Vec::new(), &client, tools, &api_key).map_err(err)?;
+        let provider = self.provider.take();
+        let mut agent = match provider {
+            Some(p) => {
+                ta::build_agent_with_provider(&cfg, p, Vec::new(), &client, tools, &api_key)
+            }
+            None => ta::build_agent_with(&cfg, Vec::new(), &client, tools, &api_key),
+        }
+        .map_err(err)?;
         agent.push_user(vec![ta::Block::Text(self.message.clone())]);
 
         let on_event = &self.on_event;
