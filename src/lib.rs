@@ -50,18 +50,35 @@ pub use tools::{CallbackTool, Tool, ToolCtx, ToolOutput};
 /// binary — so behavior is identical.
 ///
 /// For full control (custom [`Provider`] or a hand-built tool list), construct
-/// an [`Agent`] directly via [`Agent::new`].
+/// an [`Agent`] directly via [`Agent::new`], or use [`build_agent_with`] to add
+/// extra tools on top of the config's whitelist.
 pub fn build_agent(
     cfg: &Config,
     initial: Vec<Message>,
     client: &reqwest::blocking::Client,
+) -> anyhow::Result<Agent> {
+    let api_key = cfg.api_key()?;
+    build_agent_with(cfg, initial, client, Vec::new(), &api_key)
+}
+
+/// Like [`build_agent`], but appends `extra_tools` (e.g. a Python/TypeScript
+/// caller's custom callbacks wrapped in [`CallbackTool`]) after the config's
+/// built-in + MCP tools, and takes the API key explicitly (so a library caller
+/// can pass one without it being read from the environment). The agent
+/// dispatches by tool name, so an extra tool effectively extends the model's
+/// available toolset.
+pub fn build_agent_with(
+    cfg: &Config,
+    initial: Vec<Message>,
+    client: &reqwest::blocking::Client,
+    extra_tools: Vec<Box<dyn tools::Tool>>,
+    api_key: &str,
 ) -> anyhow::Result<Agent> {
     use anyhow::Context;
     let workdir = cfg
         .workdir
         .clone()
         .unwrap_or(std::env::current_dir().context("cannot determine current directory")?);
-    let api_key = cfg.api_key()?;
 
     // Build MCP tools ONCE. The parent boxes them into its own tool list, and
     // tools::build hands SubAgent a clone of the same set — so a `task` call
@@ -71,8 +88,9 @@ pub fn build_agent(
     } else {
         Vec::new()
     };
-    let mut tool_list = tools::build(&cfg.tools, cfg, client, &api_key, &mcp_tools)?;
+    let mut tool_list = tools::build(&cfg.tools, cfg, client, api_key, &mcp_tools)?;
     tool_list.extend(mcp_tools.into_iter().map(|t| Box::new(t) as Box<dyn tools::Tool>));
+    tool_list.extend(extra_tools);
 
     let ctx = ToolCtx {
         workdir,
@@ -80,5 +98,5 @@ pub fn build_agent(
         restrict_to_workdir: cfg.restrict_to_workdir,
         cancel: None,
     };
-    Ok(Agent::new(cfg, provider::build(cfg, &api_key, client.clone()), tool_list, initial, ctx))
+    Ok(Agent::new(cfg, provider::build(cfg, api_key, client.clone()), tool_list, initial, ctx))
 }

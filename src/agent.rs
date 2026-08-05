@@ -77,7 +77,7 @@ pub enum AgentEvent {
     Done { stop_reason: String },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ToolCallRecord {
     pub name: String,
     pub input: Value,
@@ -88,6 +88,7 @@ pub struct ToolCallRecord {
     pub is_error: bool,
 }
 
+#[derive(serde::Serialize)]
 pub struct RunOutcome {
     pub final_text: String,
     pub turns: u32,

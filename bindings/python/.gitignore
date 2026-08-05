@@ -1,0 +1,8 @@
+# Python build / test artifacts (the Rust cdylib itself lands in the
+# workspace-root /target, same as every other crate).
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/
