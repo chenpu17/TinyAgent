@@ -15,6 +15,21 @@ cargo clippy --all-targets                # lint headless 版（两个 feature �
 每次改完**两个 clippy 都要跑**：TUI 代码在 `#[cfg(feature = "tui")]` 后，默认构建看不到，
 默认配置的 clippy 也看不到 TUI 代码——单跑一个会漏。
 
+### 语言绑定（workspace 成员 `bindings/python`、`bindings/node`）
+
+两者 path-依赖根库（`features = ["mock"]`），都复用 `CallbackTool` 注入自定义工具、不改核心。改了核心
+provider/agent 后，两个绑定的测试都要跟着跑一遍回归。
+
+```sh
+# Python（PyO3 + maturin；raw cargo build 链接不了 cdylib，必须走 maturin）
+cd bindings/python && maturin develop && python -m pytest tests/ -q
+
+# Node（napi-rs；index.js/index.d.ts/*.node 是 napi build 生成的，已 gitignore——别提交）
+cd bindings/node && npm run build:debug && npm test   # node --test，6 项全离线
+cargo clippy -p tiny-agent-py          # 绑定 crate 也要单独过 clippy
+cargo clippy -p tiny-agent-node
+```
+
 ## 提交约定
 
 - commit message 用**中文**，**不要包含任何 claude 相关字样**（包括 Co-Authored-By 之类）。
@@ -93,6 +108,19 @@ cargo clippy --all-targets                # lint headless 版（两个 feature �
 
 ## 容易踩的坑
 
+- **语言绑定的工具回调是跨线程 round-trip，不能简化成同步直调**：
+  - **Python**（`bindings/python`）：`Agent` 存进 `Mutex<Agent>`，`run()` 经 `py.allow_threads` **释放 GIL**
+    跑 loop；自定义工具的闭包在 agent 线程执行，用 `Python::with_gil` **短暂重获 GIL** 调回 Python。
+    `set_cancel(token)` **必须在 `run()` 之前**调（把共享 `Arc<AtomicBool>` 装进 agent）——run 期间持有
+    mutex，`run()` 入口不复位 cancel（与主 agent 一致）。改这条别在 run 持锁期间调会阻塞主线程的同步方法。
+  - **Node**（`bindings/node`）：`run()` 是 `AsyncTask`（libuv worker 线程，**无 tokio**），事件经
+    `ThreadsafeFunction` 回主线程。自定义 JS 工具是 **TSFN round-trip**：agent 线程把 `{id,args}` 经 TSFN
+    派给 JS、阻塞 `mpsc` 等结果；JS（`wrapper.js` 把 `run(args)` 包成 `(err,req)` 形状）调完用户函数后调
+    导出的 `resolveTool(id, result)`，经全局 `PENDING_TOOLS: i64→Sender` 注册表唤醒 worker（120s
+    `recv_timeout` 兜底）。**JS 主线程在 `run()` 期间必须空闲**（调用方 `await`），否则 TSFN 回调排不进
+    主循环 → worker 永久阻塞 → 死锁。`resolveTool` / `PENDING_TOOLS` / `build_extra_tools` 三者是一套，
+    改其一要保住另两个。`env.create_threadsafe_function` 固定返回 `CalleeHandled`（JS 收 `(err,value)`），
+    所以 wrapper 的 `run` 签名是 `(err, req)`——别改成单参。
 - **`panic = "abort"`（`[profile.release]`）**：release 下 panic **不触发 `Drop`**。TUI 的终端还原
   (`TerminalGuard`)、MCP 子进程清理（`StdioTransport::drop`）都依赖 Drop——调试这些行为用
   **debug 构建**。`std::process::exit` 也跳过 Drop，headless 模式退出前显式 `drop(agent)`。

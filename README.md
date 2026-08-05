@@ -33,7 +33,7 @@ cross build --release --target x86_64-pc-windows-msvc
 
 ## 库 API（程序化调用）
 
-除二进制外，同一份源码也编译为 `tiny_agent` 库（`src/lib.rs`），供第三方 Rust 程序——以及即将提供的 Python / TypeScript 绑定——直接驱动 agent。二进制本身只是这个库之上的一层薄壳（CLI 参数解析、SIGINT、`process::exit`、可选 TUI），行为与库完全一致。
+除二进制外，同一份源码也编译为 `tiny_agent` 库（`src/lib.rs`），供第三方 Rust 程序——以及 Python（PyO3）/ TypeScript（napi-rs）绑定——直接驱动 agent。二进制本身只是这个库之上的一层薄壳（CLI 参数解析、SIGINT、`process::exit`、可选 TUI），行为与库完全一致。
 
 ```sh
 cargo build --lib                # 只编库
@@ -68,6 +68,66 @@ let tool = CallbackTool::new(
 ```
 
 run 结束后从 [`RunOutcome`](src/agent.rs)（或 `Agent::usage()` / `messages()` / `model()` getter）读回诚实的 token 账单与历史。`AgentEvent` 派生了 `Serialize`，绑定层可直接序列化成宿主语言的 dict / object。
+
+### Python / TypeScript 绑定
+
+两个语言绑定是 workspace 成员（`bindings/python`、`bindings/node`），各自 path-依赖根库，把上面同一套能力（agent loop、自定义工具、流式事件、取消、诚实 usage）导出给宿主语言。两者都**复用 `CallbackTool`** 注入自定义工具，**不改核心代码**。
+
+**Python（`import tiny_agent`，PyO3 + maturin）**
+
+```sh
+cd bindings/python && maturin develop   # 装进当前 Python 环境
+python -m pytest tests/                 # 离线测试（对进程内 SSE mock）
+```
+
+```python
+import tiny_agent
+
+# 一次性：
+out = tiny_agent.chat("chat.json", "天气怎样？", api_key=os.environ["KEY"])
+print(out["final_text"], out["input_tokens"], out["output_tokens"])
+
+# 多轮 + 自定义 Python 工具（让用户「自行开发 agent」的关键能力）：
+get_weather = tiny_agent.Tool(
+    "get_weather", "查城市天气",
+    {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+    lambda args: {"content": f"sunny in {args['city']}"},
+)
+a = tiny_agent.Agent("chat.json", tools=[get_weather], api_key=os.environ["KEY"])
+a.push_user("波士顿天气？")
+print(a.run(on_event=lambda e: print(e))["final_text"])
+```
+
+`run()` 同步阻塞但**释放 GIL**（`py.allow_threads`），长网络等待期间其他 Python 线程可跑；事件回调用 `with_gil` 短暂重获。
+
+**Node.js / TypeScript（`import { chat, Agent }`，napi-rs）**
+
+```sh
+cd bindings/node && npm install && npm run build   # 生成 .node + wrapper.js
+npm test                                            # 离线测试（node --test，对进程内 SSE mock）
+```
+
+```javascript
+const { chat, Agent } = require('tiny-agent');
+
+// 一次性 + 自定义（可 async）JS 工具：
+const out = await chat('chat.json', '天气怎样？', {
+  apiKey: process.env.KEY,
+  tools: [{
+    name: 'get_weather', description: '查城市天气',
+    schema: { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] },
+    run: async (args) => `sunny in ${args.city}`,   // 返回 str 或 { content, isError }
+  }],
+});
+console.log(out.final_text, out.input_tokens, out.output_tokens);
+
+// 多轮：
+const a = new Agent('chat.json', { apiKey: process.env.KEY });
+a.pushUser('波士顿天气？');
+console.log((await a.run(ev => console.log(ev))).final_text);
+```
+
+`run()` 是 `Promise`——agent loop 在 libuv worker 线程跑（**无 tokio**），事件经 `ThreadsafeFunction` 回主线程；自定义 JS 工具经 TSFN round-trip（agent 线程触发 JS → JS 调 `resolveTool(id, result)` 唤醒 worker）。
 
 ## 使用
 
