@@ -19,6 +19,8 @@ use provider::{Block, Message, Role};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+#[cfg(feature = "tui")]
+use std::io::IsTerminal;
 
 #[derive(Parser)]
 #[command(
@@ -231,15 +233,44 @@ fn main() -> Result<()> {
         bail!("--image requires a task (--task or config \"task\")");
     }
 
-    if !cli.tui {
-        match initial.last() {
-            Some(m) if m.role == Role::User => {}
-            Some(_) => bail!(
+    // Decide TUI vs headless. Explicit `--tui` → TUI. An initial task (the
+    // session ends with a user message) → headless. Otherwise a bare
+    // invocation defaults to the TUI on an interactive terminal —
+    // claude/codex-style "just run it" — but only in a `tui` build; a
+    // non-interactive stdin (pipe/CI) keeps the old "needs a task" error so a
+    // bare `tiny-agent` inside a script never blocks waiting for input. The
+    // decision core is `default_tui_mode` (pure, unit-tested below).
+    let tui_mode = if cli.tui {
+        true
+    } else {
+        let last_is_user = initial.last().is_some_and(|m| m.role == Role::User);
+        let has_initial = !initial.is_empty();
+        #[cfg(feature = "tui")]
+        let is_tty = std::io::stdin().is_terminal();
+        #[cfg(not(feature = "tui"))]
+        let is_tty = false; // irrelevant: tui_built=false makes the TUI arm unreachable
+        #[cfg(feature = "tui")]
+        let tui_built = true;
+        #[cfg(not(feature = "tui"))]
+        let tui_built = false;
+        match default_tui_mode(last_is_user, has_initial, is_tty, tui_built) {
+            TuiDefault::Headless => false,
+            TuiDefault::Tui => true,
+            TuiDefault::ErrAssistantTail => bail!(
                 "session already ends with an assistant message; provide --task to continue"
             ),
-            None => bail!("headless mode requires a task: set \"task\" in the config or pass --task"),
+            TuiDefault::ErrNoTask => {
+                #[cfg(feature = "tui")]
+                {
+                    bail!("headless mode requires a task: set \"task\" in the config or pass --task (stdin is not a tty, so the interactive TUI default did not apply)")
+                }
+                #[cfg(not(feature = "tui"))]
+                {
+                    bail!("headless mode requires a task: set \"task\" in the config or pass --task (or rebuild with --features tui for the interactive TUI default)")
+                }
+            }
         }
-    }
+    };
 
     // Whether the worker will auto-start a run on launch: it kicks off when
     // the session ends with a user message (an initial task, or a resumed
@@ -253,7 +284,7 @@ fn main() -> Result<()> {
         agent.enable_session(path.to_path_buf());
     }
 
-    if cli.tui {
+    if tui_mode {
         // Headless-only flags silently ignored in TUI: --json writes the NDJSON
         // stream and --output writes the result JSON, both of which happen in
         // harness::run (the non-TUI branch). Reject them rather than run a TUI
@@ -315,6 +346,39 @@ fn session_target(raw: &std::path::Path) -> Option<&std::path::Path> {
         None
     } else {
         Some(raw)
+    }
+}
+
+/// Outcome of deciding whether a bare (no `--tui`, no initial task) invocation
+/// should default into the TUI. Pure (no env / stdin / cfg), so it is unit-
+/// tested directly; the stdin probe and the `feature = "tui"` gate live in the
+/// caller, which passes the results in as plain bools.
+#[derive(Debug, PartialEq, Eq)]
+enum TuiDefault {
+    /// An initial task is present → run headless.
+    Headless,
+    /// No task, interactive tty, tui build → open the TUI.
+    Tui,
+    /// Resumed session ends with an assistant message — needs --task to go on.
+    ErrAssistantTail,
+    /// No task on a non-interactive stdin, or a binary built without `tui`.
+    ErrNoTask,
+}
+
+fn default_tui_mode(
+    last_is_user: bool,
+    has_initial: bool,
+    is_tty: bool,
+    tui_built: bool,
+) -> TuiDefault {
+    if last_is_user {
+        TuiDefault::Headless
+    } else if has_initial {
+        TuiDefault::ErrAssistantTail
+    } else if is_tty && tui_built {
+        TuiDefault::Tui
+    } else {
+        TuiDefault::ErrNoTask
     }
 }
 
@@ -416,7 +480,9 @@ fn missing_config_error(default: Option<&Path>) -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{choose_config_path, default_config_path_in, session_target};
+    use super::{
+        choose_config_path, default_config_path_in, default_tui_mode, session_target, TuiDefault,
+    };
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -527,5 +593,51 @@ mod tests {
     fn default_path_none_without_home_or_xdg() {
         // No usable XDG and no $HOME → cannot locate a default.
         assert!(default_config_path_in(None, None).is_none());
+    }
+
+    #[test]
+    fn tui_default_explicit_task_is_headless() {
+        // An initial task (session ends with a user message) always runs
+        // headless regardless of tty — the task is what was asked to run.
+        assert_eq!(default_tui_mode(true, true, true, true), TuiDefault::Headless);
+        assert_eq!(default_tui_mode(true, true, false, false), TuiDefault::Headless);
+    }
+
+    #[test]
+    fn tui_default_resumed_assistant_tail_errors() {
+        // Resumed session ends with an assistant message: nothing to run
+        // without an explicit --task.
+        assert_eq!(
+            default_tui_mode(false, true, true, true),
+            TuiDefault::ErrAssistantTail
+        );
+    }
+
+    #[test]
+    fn tui_default_bare_on_tty_opens_tui() {
+        // claude/codex-style: a bare invocation on an interactive terminal
+        // opens the TUI (when the binary was built with the tui feature).
+        assert_eq!(default_tui_mode(false, false, true, true), TuiDefault::Tui);
+    }
+
+    #[test]
+    fn tui_default_bare_non_tty_errors() {
+        // Script/pipe safety: a bare invocation with non-interactive stdin must
+        // NOT block on the TUI — it errors so a stray `tiny-agent` in CI fails
+        // loudly instead of hanging.
+        assert_eq!(
+            default_tui_mode(false, false, false, true),
+            TuiDefault::ErrNoTask
+        );
+    }
+
+    #[test]
+    fn tui_default_bare_without_tui_build_errors() {
+        // A binary built without the tui feature can't open the TUI even on a
+        // tty; guide the user toward headless (or a rebuild).
+        assert_eq!(
+            default_tui_mode(false, false, true, false),
+            TuiDefault::ErrNoTask
+        );
     }
 }
