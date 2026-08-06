@@ -353,6 +353,32 @@ length / error 等）才显示警告。工具输出里的 ANSI 颜色序列（�
 
 不支持的边角：Streamable HTTP 的 GET 流（server-initiated 消息）。`examples/mcp_echo.py`（stdio）与 `examples/mcp_http_echo.py`（/mcp + /sse 双端点）是零依赖测试服务器，也是协议参考实现。内置工具白名单（`tools`）与 MCP 工具互不影响。
 
+### 联网搜索 / 抓取（Web Search MCP）
+
+给 agent 加联网能力，最省事的是挂一个搜索类 MCP server——核心不改，config 里声明即可。**推荐 DuckDuckGo MCP（`duckduckgo-mcp-server`）**：免费、无需 API key，中英文搜索质量都不错，注册两个工具：
+
+- `mcp_web_search(query, max_results, region)` — 搜索，返回标题 / URL / 摘要
+- `mcp_web_fetch_content(url, start_index, max_length)` — 抓取网页正文（去导航，支持分页）
+
+```sh
+# 一次性安装（装成持久命令；uvx 直跑在国内会卡 PyPI 索引解析，装成工具则冷启动 ~2s）
+uv tool install duckduckgo-mcp-server        # 国内前置 UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+```json
+"mcp_servers": [
+  {"name": "web", "command": "duckduckgo-mcp-server", "args": []}
+]
+```
+
+工具注册为 `mcp_web_search` / `mcp_web_fetch_content`（`mcp_<server>_<tool>`）。完整可跑示例见 `examples/web-search.json`：
+
+```sh
+tiny-agent --config examples/web-search.json --task "搜一下 Anthropic 最近发布的模型，给出名称和发布日期"
+```
+
+> **备选：SearXNG MCP**（`ihor-sokoliuk/mcp-searxng`）——完全自有索引、无第三方抓取、无反爬 / 隐私顾虑，但需先自托管一个 SearXNG 实例 + MCP 桥（两层容器），部署成本更高。适合生产 / 隐私场景；日常开箱用 DuckDuckGo 即可。
+
 ## 配置（`config.json`）
 
 ```json

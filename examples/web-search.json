@@ -1,0 +1,12 @@
+{
+  "provider": "anthropic",
+  "api_key_env": "ANTHROPIC_API_KEY",
+  "model": "claude-haiku-4-5-20251001",
+  "max_tokens": 1024,
+  "system_prompt": "You are a concise assistant. Use the mcp_web_search tool to search the web when you need current information, and mcp_web_fetch_content to read a page. Cite the URLs you used.",
+  "tools": [],
+  "mcp_servers": [
+    {"name": "web", "command": "duckduckgo-mcp-server", "args": []}
+  ],
+  "limits": { "max_turns": 8, "timeout_secs": 180, "stream_idle_secs": 60 }
+}
