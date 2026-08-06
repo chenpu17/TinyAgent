@@ -16,7 +16,7 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use config::Config;
 use provider::{Block, Message, Role};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -26,9 +26,12 @@ use std::sync::Arc;
     about = "A minimal single-binary AI agent: one JSON config, two modes"
 )]
 struct Cli {
-    /// Path to the JSON config file
+    /// Path to the JSON config file. Optional: when omitted, the config is
+    /// discovered via $TINYAGENT_CONFIG, then ~/.config/tinyagent/config.json
+    /// (see `resolve_config_path`). Giving `--config` always uses exactly
+    /// that path — it never falls back to a discovered default.
     #[arg(long)]
-    config: PathBuf,
+    config: Option<PathBuf>,
 
     /// Interactive TUI chat mode (requires the `tui` build feature)
     #[arg(long)]
@@ -100,7 +103,8 @@ struct Cli {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let cli_task = cli.task.clone();
-    let mut cfg = Config::load(&cli.config)?;
+    let config_path = resolve_config_path(cli.config.clone())?;
+    let mut cfg = Config::load(&config_path)?;
     if let Some(t) = cli.task {
         cfg.task = Some(t);
     }
@@ -314,10 +318,106 @@ fn session_target(raw: &std::path::Path) -> Option<&std::path::Path> {
     }
 }
 
+/// Resolve which config file to load, in priority order:
+///
+/// 1. `--config <path>` — returned as-is even when the file does not exist,
+///    so `Config::load` reports the usual "cannot read" error instead of
+///    silently substituting a default.
+/// 2. `$TINYAGENT_CONFIG` (if set to a non-empty value).
+/// 3. The XDG default (`default_config_path`) — but only if it exists.
+/// 4. Otherwise a friendly error naming where to create one.
+///
+/// Thin env-reading shell over `choose_config_path` (the pure decision) and
+/// `default_config_path` (the pure path builder), so all branching is covered
+/// by env-free unit tests.
+fn resolve_config_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
+    let env_val = std::env::var(CONFIG_ENV).ok();
+    let default = default_config_path();
+    let default_exists = default.as_ref().is_some_and(|p| p.exists());
+    choose_config_path(explicit, env_val, default, default_exists)
+}
+
+/// Name of the env var that can stand in for `--config` when it's omitted.
+const CONFIG_ENV: &str = "TINYAGENT_CONFIG";
+
+/// Pure decision core: `explicit` > `$TINYAGENT_CONFIG` > (default if it
+/// exists). Tested without touching the real environment.
+fn choose_config_path(
+    explicit: Option<PathBuf>,
+    env_val: Option<String>,
+    default: Option<PathBuf>,
+    default_exists: bool,
+) -> Result<PathBuf> {
+    if let Some(p) = explicit {
+        return Ok(p);
+    }
+    if let Some(v) = env_val.filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(v));
+    }
+    if default_exists {
+        if let Some(p) = default {
+            return Ok(p);
+        }
+    }
+    Err(missing_config_error(default.as_deref()))
+}
+
+/// `$XDG_CONFIG_HOME/tinyagent/config.json` when `XDG_CONFIG_HOME` is a
+/// non-empty absolute path; otherwise `$HOME/.config/tinyagent/config.json`.
+/// `None` when neither yields a base (e.g. `$HOME` unset). Reads the real
+/// environment; the pure, testable core is `default_config_path_in`.
+fn default_config_path() -> Option<PathBuf> {
+    default_config_path_in(
+        std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )
+}
+
+fn default_config_path_in(xdg: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
+    let base = match xdg {
+        // Per the XDG spec, a relative or empty XDG_CONFIG_HOME is ignored.
+        Some(x) if !x.is_empty() && Path::new(x).is_absolute() => PathBuf::from(x),
+        _ => home
+            .filter(|h| !h.is_empty())
+            .map(|h| PathBuf::from(h).join(".config"))?,
+    };
+    Some(base.join("tinyagent").join("config.json"))
+}
+
+/// Friendly error for the "no config found" case. `default` is the path we
+/// looked at (and would have used had it existed), if any. Rendered as a
+/// static `concat!` body so the JSON braces and indentation are literal, not
+/// at the mercy of `format!`/`\`-continuation escaping.
+fn missing_config_error(default: Option<&Path>) -> anyhow::Error {
+    let where_to = default
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "~/.config/tinyagent/config.json".to_string());
+    const BODY: &str = concat!(
+        "Minimal example (OpenAI-compatible endpoint — e.g. GLM, DeepSeek, vLLM):\n",
+        "  {\n",
+        "    \"provider\": \"openai\",\n",
+        "    \"base_url\": \"https://your-gateway/v1\",\n",
+        "    \"api_key_env\": \"YOUR_API_KEY\",\n",
+        "    \"model\": \"your-model\",\n",
+        "    \"max_tokens\": 8192\n",
+        "  }\n",
+        "\n",
+        "Then export the key the config points at and launch:\n",
+        "  export YOUR_API_KEY=...\n",
+        "  tiny-agent --tui\n",
+        "\n",
+        "Or point at a file directly with --config, or set $TINYAGENT_CONFIG.",
+    );
+    anyhow::anyhow!(
+        "No config file found.\nCreate one at:\n  {where_to}\n\n{body}",
+        body = BODY,
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::session_target;
-    use std::path::Path;
+    use super::{choose_config_path, default_config_path_in, session_target};
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn session_target_none_disables_persistence() {
@@ -339,5 +439,93 @@ mod tests {
             session_target(Path::new("/tmp/ta/chat.json")),
             Some(Path::new("/tmp/ta/chat.json"))
         );
+    }
+
+    #[test]
+    fn choose_explicit_config_wins() {
+        // An explicit path is returned as-is even if it doesn't exist; env and
+        // default are never consulted.
+        let p = choose_config_path(
+            Some(PathBuf::from("/explicit.json")),
+            Some("/from/env.json".into()),
+            Some(PathBuf::from("/default.json")),
+            true,
+        )
+        .unwrap();
+        assert_eq!(p, PathBuf::from("/explicit.json"));
+    }
+
+    #[test]
+    fn choose_env_when_no_explicit() {
+        let p = choose_config_path(
+            None,
+            Some("/from/env.json".into()),
+            Some(PathBuf::from("/default.json")),
+            true,
+        )
+        .unwrap();
+        assert_eq!(p, PathBuf::from("/from/env.json"));
+    }
+
+    #[test]
+    fn choose_empty_env_falls_through_to_default() {
+        // An empty $TINYAGENT_CONFIG is treated as unset (never an empty path).
+        let p = choose_config_path(None, Some(String::new()), Some(PathBuf::from("/d.json")), true)
+            .unwrap();
+        assert_eq!(p, PathBuf::from("/d.json"));
+    }
+
+    #[test]
+    fn choose_default_only_when_it_exists() {
+        let p =
+            choose_config_path(None, None, Some(PathBuf::from("/d.json")), true).unwrap();
+        assert_eq!(p, PathBuf::from("/d.json"));
+    }
+
+    #[test]
+    fn choose_errors_when_default_missing() {
+        // The default path was located but the file doesn't exist → friendly
+        // error naming exactly that path so the user knows where to create it.
+        let err =
+            choose_config_path(None, None, Some(PathBuf::from("/dft.json")), false).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("No config file found"), "{msg}");
+        assert!(msg.contains("/dft.json"), "{msg}");
+    }
+
+    #[test]
+    fn choose_errors_when_no_default_locatable() {
+        // No $HOME → no default path at all. The message still names the
+        // conventional location so the user knows what to aim for.
+        let err = choose_config_path(None, None, None, false).unwrap_err();
+        assert!(err.to_string().contains("config file"), "{}", err);
+    }
+
+    #[test]
+    fn default_path_prefers_absolute_xdg() {
+        let p = default_config_path_in(Some("/custom/xdg"), Some("/home/u")).unwrap();
+        assert_eq!(p, PathBuf::from("/custom/xdg/tinyagent/config.json"));
+    }
+
+    #[test]
+    fn default_path_ignores_relative_or_empty_xdg() {
+        // A relative (or empty) XDG_CONFIG_HOME is ignored per the XDG spec and
+        // falls back to $HOME/.config.
+        for xdg in ["relative/xdg", ""] {
+            let p = default_config_path_in(Some(xdg), Some("/home/u")).unwrap();
+            assert_eq!(p, PathBuf::from("/home/u/.config/tinyagent/config.json"), "{xdg:?}");
+        }
+    }
+
+    #[test]
+    fn default_path_falls_back_to_home() {
+        let p = default_config_path_in(None, Some("/home/u")).unwrap();
+        assert_eq!(p, PathBuf::from("/home/u/.config/tinyagent/config.json"));
+    }
+
+    #[test]
+    fn default_path_none_without_home_or_xdg() {
+        // No usable XDG and no $HOME → cannot locate a default.
+        assert!(default_config_path_in(None, None).is_none());
     }
 }

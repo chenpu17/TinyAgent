@@ -157,6 +157,16 @@ await a.run();
 
 ## 使用
 
+`--config` 是可选的:省略时按以下顺序查找配置文件:
+
+1. `--config <path>`(显式;即使文件不存在也直接用它,报读错误而非回落)
+2. `$TINYAGENT_CONFIG`(非空才用)
+3. `$XDG_CONFIG_HOME/tinyagent/config.json`,否则 `~/.config/tinyagent/config.json`
+
+把模型配置放进 `~/.config/tinyagent/config.json` 后,直接 `tiny-agent --tui`
+即可启动(类似 `claude` / `codex`)。首次找不到任何配置时,会打印一个最小
+config 样例和该文件的绝对路径,指明怎么建。
+
 ```sh
 # headless 执行任务，输出结构化结果
 tiny-agent --config examples/harness.json --output result.json
