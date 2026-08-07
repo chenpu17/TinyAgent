@@ -32,6 +32,7 @@ pub mod mcp;
 pub mod provider;
 pub mod retry;
 pub mod session;
+pub mod skills;
 pub mod tools;
 
 // ── Facade re-exports (the library's public face) ──────────────────────────
@@ -74,10 +75,10 @@ pub fn build_agent_with(
     extra_tools: Vec<Box<dyn tools::Tool>>,
     api_key: &str,
 ) -> anyhow::Result<Agent> {
-    let (tool_list, ctx) = assemble(cfg, client, extra_tools, api_key)?;
+    let (tool_list, ctx, cfg) = assemble(cfg, client, extra_tools, api_key)?;
     Ok(Agent::new(
-        cfg,
-        provider::build(cfg, api_key, client.clone()),
+        &cfg,
+        provider::build(&cfg, api_key, client.clone()),
         tool_list,
         initial,
         ctx,
@@ -101,8 +102,8 @@ pub fn build_agent_with_provider(
     extra_tools: Vec<Box<dyn tools::Tool>>,
     api_key: &str,
 ) -> anyhow::Result<Agent> {
-    let (tool_list, ctx) = assemble(cfg, client, extra_tools, api_key)?;
-    Ok(Agent::new(cfg, provider, tool_list, initial, ctx))
+    let (tool_list, ctx, cfg) = assemble(cfg, client, extra_tools, api_key)?;
+    Ok(Agent::new(&cfg, provider, tool_list, initial, ctx))
 }
 
 /// Shared tool-list + [`ToolCtx`] assembly for the `build_agent*` helpers:
@@ -112,12 +113,13 @@ pub fn build_agent_with_provider(
 /// any extra tools. Factored out so [`build_agent_with`] and
 /// [`build_agent_with_provider`] stay in lockstep — only the provider
 /// construction differs between them.
+#[allow(clippy::type_complexity)] // returns (tools, ctx, cfg): cfg carries the skill-augmented system_prompt
 fn assemble(
     cfg: &Config,
     client: &reqwest::blocking::Client,
     extra_tools: Vec<Box<dyn tools::Tool>>,
     api_key: &str,
-) -> anyhow::Result<(Vec<Box<dyn tools::Tool>>, ToolCtx)> {
+) -> anyhow::Result<(Vec<Box<dyn tools::Tool>>, ToolCtx, Config)> {
     use anyhow::Context;
     let workdir = cfg
         .workdir
@@ -136,11 +138,42 @@ fn assemble(
     tool_list.extend(mcp_tools.into_iter().map(|t| Box::new(t) as Box<dyn tools::Tool>));
     tool_list.extend(extra_tools);
 
+    // Skills (progressive disclosure): scan global + project dirs, preload only
+    // each skill's name+description into the system prompt (level 1), and pair a
+    // ReadSkill tool so the model can pull a skill's full body / sidecar files
+    // into history on demand (levels 2/3). One bad skill never breaks startup —
+    // malformed entries are skipped with a stderr warning. ReadSkill is NOT in
+    // the config whitelist; it is injected here, so sub-agents (which build
+    // their own whitelist-based tool list) don't carry it. The intro is appended
+    // to a clone of the config (assembly never mutates caller state); Agent::new
+    // then reads the augmented system_prompt from this clone.
+    let skill_dirs = resolve_skill_dirs(&workdir);
+    let (index, warnings) = skills::scan(&skill_dirs);
+    for w in &warnings {
+        eprintln!("[skill] {w}");
+    }
+    let mut cfg = cfg.clone();
+    if !index.is_empty() {
+        cfg.system_prompt = Some(skills::render_intro(cfg.system_prompt.as_deref(), &index));
+        tool_list.push(Box::new(tools::ReadSkill::new(index)) as Box<dyn tools::Tool>);
+    }
+
     let ctx = ToolCtx {
         workdir,
         max_output_chars: cfg.limits.max_output_chars,
         restrict_to_workdir: cfg.restrict_to_workdir,
         cancel: None,
     };
-    Ok((tool_list, ctx))
+    Ok((tool_list, ctx, cfg))
+}
+
+/// Skill search dirs, global first + project last (so the project dir overrides
+/// the global on a name clash). Missing dirs are fine — `scan` silently skips.
+fn resolve_skill_dirs(workdir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(g) = skills::default_global_skills_dir() {
+        dirs.push(g);
+    }
+    dirs.push(workdir.join(".tinyagent").join("skills"));
+    dirs
 }

@@ -2,9 +2,11 @@ mod file;
 mod image;
 pub mod mcp;
 mod shell;
+mod skill;
 mod subagent;
 
 pub use image::load_block;
+pub use skill::ReadSkill;
 
 use crate::agent::AgentEvent;
 use crate::config::Config;

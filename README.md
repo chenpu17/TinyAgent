@@ -574,6 +574,74 @@ headless 模式下 `Ctrl-C` 走**优雅取消**：首次 SIGINT 在流式 chunk 
 "tools": ["shell", "read_file", "write_file", "edit_file", "list_dir"]
 ```
 
+## Skill（技能）
+
+Skill 是可命名、按需加载的**指令/知识包**：把"怎么做某类任务"的步骤打包成一个文件夹，agent
+启动时自动发现、需要时再读取完整指令。设计对齐 [Claude Code Agent Skills](https://www.anthropic.com/engineering/equipping-agents-for-the-real-world-with-agent-skills)
+的渐进式披露——简介常驻、全文按需，避免把所有指令一次性塞进上下文。
+
+### 目录约定
+
+启动时扫描两个目录，**项目覆盖全局**（同名以项目为准）：
+
+- 全局：`~/.config/tinyagent/skills/`（或 `$XDG_CONFIG_HOME/tinyagent/skills/`）——个人通用技能。
+- 项目：`<工作目录>/.tinyagent/skills/`——随仓库分发、团队共享。
+
+每个技能是该目录下的一个**子目录**，至少含一个 `SKILL.md`：
+
+```
+~/.config/tinyagent/skills/
+└── code-review/
+    ├── SKILL.md          # 必需：frontmatter + 正文
+    └── checklist.md      # 可选：附属文件，正文里按名引用
+```
+
+### `SKILL.md` 格式
+
+以 YAML frontmatter 开头（只需 `name` + `description`），正文是完整指令：
+
+```
+---
+name: code-review
+description: 审查 git diff，聚焦 bug 与安全隐患，按严重度排序输出
+---
+
+# Code Review
+
+1. 读 git diff ...
+2. 需要逐项清单时，读附属文件 checklist.md ...
+```
+
+- `name` 匹配 `[A-Za-z0-9_-]+`（通常就是目录名）。
+- `description` 写在一行——它进 system prompt，是模型判断"是否需要这个技能"的唯一依据，写清楚很关键。
+- 多行 YAML 折叠不支持；描述压成一行。
+
+### 三级加载
+
+| 级别 | 何时加载 | 落点 | 成本 |
+|---|---|---|---|
+| ① 简介（name+description） | 启动时，所有技能 | 拼进 **system prompt**（常驻） | 极低，且被 prompt cache 缓存 |
+| ② 全文（SKILL.md 正文） | 模型判断相关时调 `read_skill` | 作为 tool_result 进**对话历史** | 按需，可被上下文压缩回收 |
+| ③ 附属文件 | 正文引用、任务需要时 `read_skill {file}` | 同上 | 同上 |
+
+### `read_skill` 工具
+
+加载某技能的完整指令或同目录附属文件：
+
+```
+{ "skill": "code-review" }                          # 读 SKILL.md
+{ "skill": "code-review", "file": "checklist.md" }  # 读附属文件
+```
+
+`file` 默认 `SKILL.md`，必须是技能目录内的单个文件名（禁路径分隔符与 `..`，防逃逸）。
+
+### 行为细节
+
+- **自动配套，不在工具白名单**：扫到技能，`read_skill` 就自动可用（技能与 `config.tools` 工具是正交两层，不混在白名单里）。
+- **子 agent 不继承**：子 agent（`task`）用专属 system prompt、按白名单建工具集，看不到技能简介、也没有 `read_skill`。需要时由主 agent 在 `task` 的 prompt 里带要点。
+- **坏技能跳过 + 告警**：缺 `SKILL.md`、frontmatter 缺字段、`name` 非法的技能被跳过并在 **stderr** 打印 `[skill] ...`，不影响其他技能与启动。
+- **无技能目录时行为不变**：没扫到技能，system prompt 与工具集与原来完全一致（纯向后兼容）。
+
 ## 开发
 
 ```sh

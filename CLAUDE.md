@@ -91,6 +91,21 @@ cargo clippy -p tiny-agent-node
   **不可递归**：子 agent 的工具白名单滤掉 `task` 本身（无深度计数）。**在默认白名单**（`config::default_tools`
   含 `task`）——headless 评测任务也会默认能 spawn 子 agent；评测若要锁定行为/成本，在 config 的 `tools`
   里显式去掉 `task`。
+- **Skill（技能，`skills.rs` + `tools/skill.rs`）**：对齐 Claude Code Agent Skills 的渐进式披露。
+  启动时（`lib.rs::assemble`）扫描全局 `~/.config/tinyagent/skills/`（`skills::default_global_skills_dir`
+  镜像 `main.rs` 的手写 XDG 定位，无 dirs crate）+ 项目 `<workdir>/.tinyagent/skills/`，项目覆盖全局同名
+  （`scan` 按 name 排序去重）。每个 skill 是子目录含 `SKILL.md`（YAML frontmatter `name`+`description` + 正文），
+  **手写 2 字段 frontmatter 解析（无 YAML 依赖）**。三级加载：①简介（name+description）拼进 **system_prompt**
+  （常驻——压缩只动 messages 不动 system，故简介安全；但计入 `estimate_tokens`，必须短）②全文（SKILL.md 正文）
+  经 `read_skill` 工具读进 **history**（tool_result，可被压缩回收，**不**常驻 system）③附属文件
+  （`read_skill {file}`，默认 SKILL.md）。`read_skill` **不在 `cfg.tools` 白名单**（skill≠tool，刻意决策）——
+  扫到技能时由 `assemble` 自动配套注入（`tool_list.push(ReadSkill)`）。**子 agent 不继承**：`subagent.rs:133`
+  硬编码 system_prompt 覆盖为 `SUBAGENT_SYSTEM_PROMPT`，且子 agent 走白名单建工具集，故既无简介也无 `read_skill`
+  （决策，不改 subagent.rs）。坏 skill（缺 SKILL.md / 缺 frontmatter 字段 / name 非法 `[A-Za-z0-9_-]+`）跳过 +
+  stderr `[skill]` 告警，**不 fatal**（一个坏技能不挡启动）。`read_skill` 的 `file` 做路径安全校验（禁分隔符 / `..`，
+  防逃逸出技能目录）。`assemble` 为注入简介 **clone cfg**（改 `cfg2.system_prompt`）并返回 `(tool_list, ctx, cfg)`
+  三元组（带 `#[allow(clippy::type_complexity)]`）——`Agent::new` 从该 clone 读 system_prompt；改 `assemble` 签名
+  的人注意两个调用点（`build_agent_with` / `build_agent_with_provider`）都要拿返回的 cfg 传给 `Agent::new`。
 - **`retry.rs`** 是 batch `--retries` 与单跑瞬态重试共用的退避模块：指数 1/2/4/8/16/32s 封顶 + ±25%
   jitter（防并发 worker lockstep 踩踏同一个过载 provider）。只重试 transient（`stop_reason == "error"`）。
   **重试诚实成本**：`agent.run()` 失败返回 `RunError`（带 `usage` + `tool_calls`——失败轮已烧的 token / 已跑的
