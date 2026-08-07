@@ -2344,6 +2344,7 @@
     // model side is scripted (MockProvider), but the build + verification are
     // real I/O — far stronger than an EchoTool returning "ok".
 
+    #[cfg(unix)]
     fn python3_available() -> bool {
         std::process::Command::new("python3")
             .arg("--version")
@@ -2354,6 +2355,7 @@
     /// Real write_file + edit_file + shell tools (not test doubles), so a
     /// scripted model actually writes/edits files and runs commands. client/
     /// api_key are unused by leaf tools but required by tools::build's signature.
+    #[cfg(unix)]
     fn real_leaf_tools() -> Vec<Box<dyn Tool>> {
         let cfg = cfg_with(5, 0, 100_000);
         let client = crate::provider::new_client(60);
@@ -2377,6 +2379,7 @@
     /// workdir (config load canonicalizes it), and on macOS /tmp is a symlink to
     /// /private/tmp, so a non-canonical workdir would make every starts_with
     /// check falsely reject the path as "escaping".
+    #[cfg(unix)]
     fn build_ctx(label: &str) -> (ToolCtx, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("ta-build-{label}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

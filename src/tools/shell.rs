@@ -89,7 +89,7 @@ impl Tool for Shell {
             if let Some(c) = &ctx.cancel {
                 if c.load(std::sync::atomic::Ordering::Relaxed) {
                     cancelled = true;
-                    kill_process_group(&child);
+                    kill_process_group(&mut child);
                     let _ = child.wait();
                     break None;
                 }
@@ -97,13 +97,13 @@ impl Tool for Shell {
             match child.try_wait() {
                 Ok(Some(s)) => break Some(s),
                 Ok(None) if Instant::now() >= deadline => {
-                    kill_process_group(&child);
+                    kill_process_group(&mut child);
                     let _ = child.wait();
                     break None;
                 }
                 Ok(None) => std::thread::sleep(Duration::from_millis(50)),
                 Err(e) => {
-                    kill_process_group(&child);
+                    kill_process_group(&mut child);
                     let _ = child.wait();
                     return Err(e).context("shell: failed to wait on command");
                 }
@@ -191,7 +191,7 @@ fn read_capped<R: Read>(r: &mut R, cap: usize) -> Vec<u8> {
 /// finished on its own, voiding the 120s timeout and Ctrl-C). Mirrors
 /// StdioTransport::drop's non-unix branch.
 #[cfg(unix)]
-fn kill_process_group(child: &std::process::Child) {
+fn kill_process_group(child: &mut std::process::Child) {
     let pgid = child.id() as i32;
     unsafe {
         libc::kill(-pgid, libc::SIGKILL);
@@ -199,17 +199,21 @@ fn kill_process_group(child: &std::process::Child) {
 }
 
 #[cfg(not(unix))]
-fn kill_process_group(child: &std::process::Child) {
+fn kill_process_group(child: &mut std::process::Child) {
     let _ = child.kill();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::sync::atomic::AtomicBool;
+    #[cfg(unix)]
     use std::sync::Arc;
+    #[cfg(unix)]
     use std::time::{Duration, Instant};
 
+    #[cfg(unix)]
     #[test]
     fn cancel_flag_kills_a_running_command_promptly() {
         // Cancel pre-set: the poll loop must notice it on the first iteration

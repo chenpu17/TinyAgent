@@ -389,6 +389,7 @@ impl StdioTransport {
 /// MCP child is irreversible (no server restart), so the reaper must only fire
 /// on the latter. `shutdown` is a separate signal the frontend sets ONLY on
 /// session end (TUI quit), never on a per-turn cancel.
+#[cfg(unix)]
 fn spawn_reaper(
     pgid: i32,
     alive: Arc<AtomicBool>,
@@ -397,22 +398,15 @@ fn spawn_reaper(
     std::thread::Builder::new()
         .name("mcp-reaper".into())
         .spawn(move || {
-            #[cfg(unix)]
-            {
-                while alive.load(Ordering::Relaxed) {
-                    if shutdown.load(Ordering::Relaxed) {
-                        // ESRCH (already reaped) is harmless.
-                        unsafe { libc::kill(-pgid, libc::SIGKILL) };
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_millis(100));
+            while alive.load(Ordering::Relaxed) {
+                if shutdown.load(Ordering::Relaxed) {
+                    // ESRCH (already reaped) is harmless.
+                    unsafe { libc::kill(-pgid, libc::SIGKILL) };
+                    return;
                 }
-                // alive went false → transport is dropping; stand down.
+                std::thread::sleep(Duration::from_millis(100));
             }
-            #[cfg(not(unix))]
-            {
-                let _ = (pgid, alive, shutdown);
-            }
+            // alive went false → transport is dropping; stand down.
         })
         .expect("spawn mcp-reaper thread")
 }

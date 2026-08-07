@@ -569,8 +569,14 @@ mod tests {
 
     #[test]
     fn default_path_prefers_absolute_xdg() {
-        let p = default_config_path_in(Some("/custom/xdg"), Some("/home/u")).unwrap();
-        assert_eq!(p, PathBuf::from("/custom/xdg/tinyagent/config.json"));
+        // `is_absolute()` is platform-dependent: a `/`-rooted path is absolute
+        // on unix but NOT on Windows (which needs a drive letter / UNC). Pass a
+        // host-absolute path or the test hits the home-fallback branch on
+        // Windows and the assertion can never hold. Build the expected path
+        // with join() so the assertion is separator-agnostic.
+        let xdg = if cfg!(unix) { "/custom/xdg" } else { "C:/custom/xdg" };
+        let p = default_config_path_in(Some(xdg), Some("/home/u")).unwrap();
+        assert_eq!(p, PathBuf::from(xdg).join("tinyagent").join("config.json"));
     }
 
     #[test]
