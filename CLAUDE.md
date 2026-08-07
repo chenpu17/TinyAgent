@@ -124,9 +124,12 @@ cargo clippy -p tiny-agent-node
   `write_result` 的 None 分支（`write_result(..., Some(&acc))`）写入 token + tool_calls，而不是清零；batch 的
   `TaskReport` 同样带 4 个 token 字段，失败任务的 report.json 照计 acc（`run_one_attempt` 的 Err 路径用 `&acc.usage`，
   取消路径亦然）。`RunCost::add_failed`/`fold_into` 是共用的累加原语。改重试/返回类型/写结果文件的人要保住这条。
-- **headless Ctrl-C** 走 `signal.rs`：首次 SIGINT 翻 cancel 标志（流式 ≤200ms 内断，照常写
-  `result.json`，exit 130），二次 SIGINT `libc::_exit(130)` 立即退。handler 只碰 lock-free 原子 + `_exit`
-  （async-signal-safe）。**批量模式**（`batch::run`）也装它：cancel 标志由 worker 在起任务前 gate
+- **headless Ctrl-C** 走 `signal.rs`：首次按 Ctrl-C 翻 cancel 标志（流式 ≤200ms 内断，照常写
+  `result.json`，exit 130），二次立即退 130。**unix** 用 `signal(SIGINT, …)`，handler 只碰 lock-free
+  原子 + `libc::_exit`（async-signal-safe）；**Windows** 用 `SetConsoleCtrlHandler`（kernel32 FFI，
+  无新依赖），handler 跑在独立线程（非中断），首次返回 TRUE 翻 flag（抑制默认终止，让 run 在 cancel
+  检查处中断并写 result.json），二次 `process::exit(130)`。两平台同构：`CANCEL_PTR` 静态 + 计数
+  （首次优雅 / 二次硬退）。**批量模式**（`batch::run`）也装它：cancel 标志由 worker 在起任务前 gate
   （在跑的跑完、未起的标记 `cancelled`、照常合并 report、exit 130）。TUI 不用它——raw 模式下 crossterm 把 Ctrl-C 当普通按键。
 - **会话持久化**由 `session.rs` 负责；`--session none`（`main::session_target` 判定字面量 `none`）
   关闭读写，与 `--resume` 互斥（直接 bail）。
