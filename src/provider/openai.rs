@@ -377,12 +377,21 @@ impl OpenAi {
                 text.push_str(t);
                 on_event(ChatEvent::TextDelta(t.to_string()));
             }
-            // Reasoning models (DeepSeek-R1 / GLM / o-series via gateways)
-            // stream the thinking trace under `reasoning_content`. Surface it as
-            // a ThinkingDelta event ONLY — never into `text`/blocks: the reply
-            // is `content`, and no major API asks thinking to be echoed back.
+            // Reasoning models stream the thinking trace to the UI. Surface it as
+            // a ThinkingDelta event ONLY — never into `text`/blocks: the reply is
+            // `content`, and no major API asks thinking to be echoed back.
             // Field absent → non-reasoning model, zero behavior change.
-            if let Some(r) = delta["reasoning_content"].as_str() {
+            //
+            // The field name is NOT standardized across OpenAI-compatible gateways:
+            //   - DeepSeek-R1 / GLM / o-series (direct) → delta.reasoning_content
+            //   - OpenRouter (normalizes every vendor's thinking) → delta.reasoning
+            // Try the vendor-native field first, fall back to OpenRouter's name.
+            // `reasoning_details` (OpenRouter's structured array) is intentionally
+            // ignored: `reasoning` is its plain-text projection, enough for the UI.
+            if let Some(r) = delta["reasoning_content"]
+                .as_str()
+                .or(delta["reasoning"].as_str())
+            {
                 if !r.is_empty() {
                     on_event(ChatEvent::ThinkingDelta(r.to_string()));
                 }
@@ -664,6 +673,32 @@ mod tests {
         // Reasoning did NOT leak into the reply text / blocks.
         assert_eq!(resp.blocks.len(), 1);
         assert!(matches!(&resp.blocks[0], Block::Text(t) if t == "hi"));
+    }
+
+    #[test]
+    fn stream_openrouter_reasoning_field_surfaces_thinking() {
+        // OpenRouter normalizes EVERY vendor's thinking into delta.reasoning
+        // (paired with a reasoning_details array we ignore), NOT reasoning_content.
+        // Direct DeepSeek/GLM still use reasoning_content (covered above). Both
+        // must surface as ThinkingDelta and stay out of the assembled reply text.
+        let raw = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"reasoning\":\"step 1 \",\"reasoning_details\":[{\"type\":\"reasoning.text\"}]}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"step 2\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut thinking = String::new();
+        let resp = OpenAi::parse_stream(raw.as_bytes(), &mut |e| {
+            if let crate::provider::ChatEvent::ThinkingDelta(t) = e {
+                thinking.push_str(&t);
+            }
+        })
+        .unwrap();
+        assert_eq!(thinking, "step 1 step 2");
+        // reasoning + reasoning_details did NOT leak into the reply text / blocks.
+        assert_eq!(resp.blocks.len(), 1);
+        assert!(matches!(&resp.blocks[0], Block::Text(t) if t == "ok"));
     }
 
     #[test]

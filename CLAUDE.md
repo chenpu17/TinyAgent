@@ -62,7 +62,7 @@ cargo clippy -p tiny-agent-node
   供 `agent.rs` 的进程内 loop 回归测试用（不连网）。
 - **思考（reasoning/thinking）透出 + 程度配置**：`ChatEvent`/`AgentEvent` 各有 `ThinkingDelta(String)` 变体
   （`AgentEvent` serde 外部 tag → `{"ThinkingDelta":"..."}`，TinyWorker 后端零改动接到）。**只透出不入历史**——
-  openai 解析 `delta.reasoning_content`、anthropic 解析 `thinking` content block（`content_block_start` 的 type=
+  openai 解析 `delta.reasoning_content`（DeepSeek/GLM 官方）或 `delta.reasoning`（OpenRouter 归一化各厂商思考，`reasoning_details` 数组忽略——`reasoning` 是其纯文本投影）、anthropic 解析 `thinking` content block（`content_block_start` 的 type=
   `thinking`/`redacted_thinking` → `Pending::Thinking`；`thinking_delta` 增量在 `delta.thinking`，`signature_delta`
   忽略），都只发事件、**不**进 `text`/`blocks`（`finalize_pending_lenient` 对 `Thinking` 返 `None`）。`reasoning_effort`
   是 `Option<String>` **按字符串原样透传、不做枚举校验**（各家档位碎片化且随代际变动，别加枚举）：openai 直接发
