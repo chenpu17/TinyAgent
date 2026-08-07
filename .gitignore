@@ -1,6 +1,8 @@
 /target
 /run-tui.sh
+/run-tui.bat
 /run-harness.sh
+/config.json
 /.tinyagent-session.json
 /.tinyagent-harness-session.json
 /glm-tui.json
