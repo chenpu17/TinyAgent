@@ -341,11 +341,14 @@ length / error 等）才显示警告。工具输出里的 ANSI 颜色序列（�
 
 ```json
 "mcp_servers": [
-  {"name": "fs", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]},
+  {"name": "fs", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+   "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "可选，stdio 注入的环境变量"}},
   {"name": "remote", "url": "http://host:3000/mcp", "transport": "auto",
    "headers": {"Authorization": "Bearer xxx"}}
 ]
 ```
+
+stdio server 可注入环境变量（`env`，叠加在宿主环境之上、同名以配置为准）——GUI 应用从 Finder/Dock 启动没有 shell 环境，靠 env 传凭据的 server（GitHub MCP 的 `GITHUB_PERSONAL_ACCESS_TOKEN`、数据库连接串、各类 `XXX_API_KEY`）必须走这条。`env` 仅对 stdio 生效，HTTP 传输忽略它。社区主流 MCP 配置（Claude Desktop / Code、VS Code）都含此字段，复制过来即可用。
 
 支持三种传输（`command` 与 `url` 二选一）：
 
@@ -404,6 +407,7 @@ tiny-agent --config examples/web-search.json --task "搜一下 Anthropic 最近�
   "restrict_to_workdir": false,
   "tools": ["shell", "read_file", "write_file", "edit_file", "list_dir", "load_image"],
   "mcp_servers": [],
+  "reasoning_effort": "可选，思考程度字符串原样透传（none/low/medium/high/xhigh/max），不校验",
   "limits": {
     "max_turns": 30,
     "timeout_secs": 600,
@@ -424,6 +428,10 @@ API key 从 `api_key_env` 指定的环境变量读取，不写进配置文件。
 > **`timeout_secs: 0`（不设超时）时的单请求兜底**：即便关掉整轮超时，单次 chat 请求仍有一个 **10 分钟**的总时长上限（`STREAM_BACKSTOP`）。这是**泄漏兜底**而非功能限制——流式读取线程阻塞在 reqwest 的 `read()` 里、无法观测取消标志，若没有任何单请求上限，一条半开连接会让该线程及其 TCP 连接一直挂到进程退出。该上限只约束**单次请求**，从不约束**整轮 run**（一轮由多次请求组成），所以「不设超时」仍意味着 run 可以无限长，只是不会无限卡在单次请求上。设了 `timeout_secs > 0` 时此兜底不生效，单请求上限改由剩余预算推导。
 
 `limits.max_total_tokens`（默认 `0` = 不限）：整个 run 的 token 预算上限（input + output + cache 写 + cache 读，跨所有轮次 / 子 agent / 压缩调用累计）。累计超过即以 `stop_reason: "budget_exceeded"`（exit 125）停下，不再开新一轮——语义同 `timeout_secs` 的**轮次边界**停：把总额顶破上限的那一轮照常跑完（工具执行、assistant 消息入历史），上限只阻止**下一轮**开始，故 transcript 与 tool_use/tool_result 配对不受影响。评测 / CI 场景用来给"跑飞钱包"装闸门：usage 累计本就含子 agent、压缩、失败轮（诚实成本，失败也计费），这个闸门只是在地基上加一道关。批量任务片段可设此项**只收紧**（更小值）；`0` 意为"无上限"（最松），任务片段设 0 会被忽略。
+
+`reasoning_effort`（可选字符串，默认不设）：思考程度，**按字符串原样透传给 provider，不做枚举校验**——各家档位碎片化且随模型代际变动，TinyAgent 不维护映射表，由 provider/server 拒绝未知值。取值参考：OpenAI `none`/`low`/`medium`/`high`/`xhigh`/`max`（随模型代际扩张）、Anthropic `low`/`medium`/`high`/`max`（Claude 4.6+ adaptive thinking；Opus 4.7 起旧 `budget_tokens` 已移除）、DeepSeek `low`/`high`/`xhigh`/`max`、GLM 仅开关（`enabled`/`disabled`）。映射：OpenAI 系直接发 `reasoning_effort` 字段（老网关不认会 400，`body_fix_for_400` 自动 drop 重试，与 `max_tokens`/`stream_options` 同款）；Anthropic 发 `thinking: {"type": "adaptive"}` + `output_config: {"effort": "..."}`（effort 在**独立顶层 `output_config` 对象**里，不在 thinking 内、也不是裸顶层字段——裸顶层会被静默忽略，这是该 API 最常见的坑），`"none"` 发 `{"type": "disabled"}`。
+
+**思考内容透出**：推理模型的思考过程作为 `ThinkingDelta` 事件流式透出（OpenAI 系 `delta.reasoning_content`、Anthropic `thinking` content block），`--json` 下为 `{"type":"thinking","delta":...}`；**不进对话历史正文与上下文回传**（各家 API 也不要求回传，故只作事件透出给 UI）。GUI（如 TinyWorker）据此渲染可折叠"思考过程"区块；headless 终端把思考写到 **stderr**（不污染 stdout 的最终回复 / `summary`）；TUI 内联显示（冻结，仅保证可见，不做独立可折叠区块）。批量任务片段可覆盖此项（软字段，与 `model`/`max_tokens` 同类，不在 `forbidden_batch_override`）。
 
 ### 上下文压缩
 
@@ -531,8 +539,8 @@ headless 模式下 `Ctrl-C` 走**优雅取消**：首次 SIGINT 在流式 chunk 
 **批量模式**（`--batch`）同样生效：首次 SIGINT 后在跑的任务跑完、不再起新任务（未起的标记 `cancelled`），
 照常合并写出 `--report` 后 exit 130；再次 `Ctrl-C` 立即 exit 130。TUI 模式下 `Ctrl-C` 是普通按键，按上面的按键表处理。
 
-`--json` 模式额外在每个事件吐一行 NDJSON（`type`: `turn` / `text` / `tool_call` / `tool_result` /
-`usage` / `compressed` / `warning` / `subagent` / `done`，重试时另吐 `retry`），可在结果文件落盘前实时跟进进度。
+`--json` 模式额外在每个事件吐一行 NDJSON（`type`: `turn` / `text` / `thinking` / `tool_call` /
+`tool_result` / `usage` / `compressed` / `warning` / `subagent` / `done`，重试时另吐 `retry`），可在结果文件落盘前实时跟进进度。
 
 ## 内置工具
 

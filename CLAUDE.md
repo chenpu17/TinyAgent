@@ -60,6 +60,17 @@ cargo clippy -p tiny-agent-node
   （OpenAI 走 `stream_options.include_usage` + `choices:[]` 末块；Anthropic 走
   `message_start`/`message_delta`）。`provider/mock.rs` 是 `cfg(test)` 的脚本化 Provider，
   供 `agent.rs` 的进程内 loop 回归测试用（不连网）。
+- **思考（reasoning/thinking）透出 + 程度配置**：`ChatEvent`/`AgentEvent` 各有 `ThinkingDelta(String)` 变体
+  （`AgentEvent` serde 外部 tag → `{"ThinkingDelta":"..."}`，TinyWorker 后端零改动接到）。**只透出不入历史**——
+  openai 解析 `delta.reasoning_content`、anthropic 解析 `thinking` content block（`content_block_start` 的 type=
+  `thinking`/`redacted_thinking` → `Pending::Thinking`；`thinking_delta` 增量在 `delta.thinking`，`signature_delta`
+  忽略），都只发事件、**不**进 `text`/`blocks`（`finalize_pending_lenient` 对 `Thinking` 返 `None`）。`reasoning_effort`
+  是 `Option<String>` **按字符串原样透传、不做枚举校验**（各家档位碎片化且随代际变动，别加枚举）：openai 直接发
+  `reasoning_effort` 字段；anthropic 走 adaptive thinking（`Some(non-none)` → `thinking:{"type":"adaptive"}`+
+  `output_config:{"effort":...}`——effort 在**独立顶层 `output_config` 对象**里，**不**在 thinking 内、**不**是裸
+  顶层字段（裸顶层会被静默忽略，这是 API 头号坑），`Some("none")` → `{"type":"disabled"}`，`None` 不加字段）——**不走老 `budget_tokens`**（Opus 4.7 起传了 400）。
+  `Config`/`ChatRequest`/`Agent`/`PartialConfig` 四层透传；`summary_call` 传 `None`（压缩摘要不思考）。子 agent 复用
+  父 cfg 自动继承。软字段（同 `model`/`max_tokens`），允许 batch 任务片段覆盖，不在 `forbidden_batch_override`。
 - **核心 loop 在 `agent.rs`**：累计 usage、cancel 复位、上下文压缩的有状态编排（`compress`/
   `summarize_prefix`/`summary_call`，读写 Agent 字段 + 驱动 provider）在这里。压缩的**纯函数与常量**
   （`estimate_tokens`/`find_safe_cut`/`fold_summary`/`window_lines`/`chunk_lines`/`SUMMARY_*` 等）抽到
@@ -186,13 +197,24 @@ cargo clippy -p tiny-agent-node
   批次会 spawn N×(#servers) 个子进程。改 `SubAgent::new` 签名别漏传 `mcp_tools`。
 - **OpenAI 400 回退**（`openai::body_fix_for_400`）：错误文本提到 `max_tokens` 时改名为
   `max_completion_tokens` 重试一次（reasoning 模型）；提到 `stream_options` 时丢弃该字段重试一次
-  （vLLM 等旧网关，之后 usage 走 `None` 降级，`parse_loop` 已容忍）。未知 400 直接 bail。
+  （vLLM 等旧网关，之后 usage 走 `None` 降级，`parse_loop` 已容忍）；提到 `reasoning_effort` 时丢弃该字段
+  重试一次（老网关不认）。三条 fix 各管一个独立字段，可连续修三次满足同时拒全部三个字段的网关。未知 400 直接 bail。
   改请求体字段的人要知道这条重试路径，别在 fix 后又引入新 400。
 - **`--session none` 是关闭持久化的字面量哨兵**（不是文件名）——真要叫 `none` 的文件没法用，
   但它语义清晰、够用。改 `session_target` 判定前先想清楚。
 - **MCP 工具名只消毒展示名，wire 名不动**（`tools::mcp::sanitize_name`）：对外名 `mcp_<server>_<tool>`
   非 `[A-Za-z0-9_]` → `_` 并折叠，但 `wire_name` 保留服务器原始工具名，`tools/call` 用它分发。
   改消毒逻辑别误动 `wire_name`，否则分发会找不到工具。`dedup_check` 在消毒后撞名时启动报错。
+- **MCP stdio `env` 注入**（`McpServerConfig.env` + `StdioTransport::spawn` 的 `.envs(&cfg.env)`）：
+  stdio 子进程的额外环境变量，叠加在宿主环境之上（同名以配置为准）。GUI 进程无 shell 环境靠它传凭据
+  （`GITHUB_PERSONAL_ACCESS_TOKEN` / 连接串 / `XXX_API_KEY`）。`#[serde(default)]` 向后兼容；`validate()` 不拦
+  （HTTP 传输忽略 env，不报错——env 只对 stdio 生效）。两条 Command 链（unix `process_group(0)` + `#[cfg(not(unix))]`）
+  都要加 `.envs`，别只改一条。
+- **思考内容展示策略**：`ThinkingDelta` 在 `harness` 的 `--json` NDJSON 发 `{"type":"thinking","delta":...}`；
+  headless 终端打印写 **stderr**（不进 stdout 的 `summary`，可 `2>/dev/null` 屏蔽）；TUI 用 or 模式
+  `TextDelta(t) | ThinkingDelta(t)` 折进同一渲染分支（TUI 冻结，只保证可见，不做可折叠区块——那是 TinyWorker 的事）。
+  子 agent 的思考经 `AgentEvent::SubAgent` 整体包装转发（`subagent.rs` 不逐变体 match），harness 的 SubAgent 内嵌
+  match 单独把它写 stderr 带 `[name]` 前缀。
 - **改 `agent.rs` 核心路径必须配套 loop 测试**。测试外置在 `agent_tests.rs`（`agent.rs` 末尾
   `#[cfg(test)] #[path = "agent_tests.rs"] mod tests;` 引入，靠 `use super::*` 仍可达 agent 私有项；
   压缩纯函数的测试靠 `use crate::compress::*`）。用 `provider/mock.rs` 的脚本化 Provider 覆盖不变量：

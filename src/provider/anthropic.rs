@@ -88,6 +88,9 @@ impl Anthropic {
 enum Pending {
     Text(String),
     ToolUse { id: String, name: String, json: String },
+    /// A `thinking` content block. Buffered only to coalesce its deltas into
+    /// ThinkingDelta events; finalize drops it (thinking never enters history).
+    Thinking(String),
 }
 
 /// Finalize a pending block into a concrete Block, tolerant of incomplete
@@ -114,6 +117,10 @@ fn finalize_pending_lenient(p: Pending) -> Option<Block> {
             };
             Some(Block::ToolUse { id, name, input })
         }
+        // Thinking is event-only: its deltas already went out as ThinkingDelta.
+        // It never solidifies into a history block (no major API asks thinking
+        // to be echoed back on the next turn).
+        Pending::Thinking(_) => None,
     }
 }
 
@@ -164,6 +171,28 @@ impl Anthropic {
             "stream": true,
             "messages": req.messages.iter().map(Self::message_json).collect::<Vec<_>>(),
         });
+        // Adaptive thinking (Claude 4.6+). The effort string is forwarded
+        // verbatim — NOT mapped to an enum, since Anthropic's own ladder
+        // (low/medium/high/max) shifts across generations and the old
+        // budget_tokens path was removed in Opus 4.7 (sending it 400s). "none"
+        // disables thinking; any other value enables adaptive + tags effort at
+        // the top level; None leaves the server default. Field shape follows
+        // the 2026-08 adaptive-thinking API — adjust here if the API moves.
+        match req.reasoning_effort {
+            Some("none") => {
+                body["thinking"] = json!({"type": "disabled"});
+            }
+            Some(eff) => {
+                body["thinking"] = json!({"type": "adaptive"});
+                // effort lives in a SEPARATE top-level `output_config` object —
+                // NOT inside `thinking` and NOT as a bare top-level field. This
+                // is the API's #1 footgun (per the official docs + AWS Bedrock):
+                // a bare `effort` is silently ignored, so the knob would appear
+                // to work but have no effect.
+                body["output_config"] = json!({"effort": eff});
+            }
+            None => {}
+        }
         if let Some(sys) = req.system {
             if req.cache {
                 // System must be a content-block array (not a bare string) to
@@ -280,6 +309,13 @@ impl Anthropic {
                             name: cb["name"].as_str().unwrap_or_default().to_string(),
                             json: String::new(),
                         },
+                        // Extended-thinking blocks. `thinking` streams its text
+                        // via later thinking_delta events (surfaced as
+                        // ThinkingDelta); `redacted_thinking` carries no readable
+                        // text (only a signature), so it stays a silent
+                        // placeholder. Neither enters history — finalize drops
+                        // Pending::Thinking.
+                        "thinking" | "redacted_thinking" => Pending::Thinking(String::new()),
                         _ => Pending::Text(String::new()),
                     });
                 }
@@ -301,6 +337,22 @@ impl Anthropic {
                         "input_json_delta" => {
                             if let Some(Pending::ToolUse { json, .. }) = &mut pending {
                                 json.push_str(delta["partial_json"].as_str().unwrap_or_default());
+                            }
+                        }
+                        // Anthropic extended-thinking streaming: each delta
+                        // carries a `thinking` text fragment. Surface it as
+                        // ThinkingDelta (event-only); the buffer is kept solely
+                        // so a later non-thinking delta can't misattach to it.
+                        // `signature_delta` (the thinking block's integrity tag)
+                        // falls through to `_` — we never echo thinking back, so
+                        // the signature is irrelevant to us.
+                        "thinking_delta" => {
+                            if let Some(Pending::Thinking(buf)) = &mut pending {
+                                let t = delta["thinking"].as_str().unwrap_or_default();
+                                if !t.is_empty() {
+                                    buf.push_str(t);
+                                    on_event(ChatEvent::ThinkingDelta(t.to_string()));
+                                }
                             }
                         }
                         _ => {}
@@ -387,6 +439,34 @@ mod tests {
             resp.usage.map(|u| (u.input_tokens, u.output_tokens)),
             Some((12, 7))
         );
+    }
+
+    #[test]
+    fn thinking_block_surfaces_event_and_stays_out_of_history() {
+        // Extended thinking: a `thinking` content block streams its text via
+        // thinking_delta. The trace surfaces as ThinkingDelta events AND never
+        // enters the assembled blocks (no major API asks thinking echoed back).
+        let raw = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5}}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"reasoning here\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n",
+        );
+        let mut thinking = String::new();
+        let resp = Anthropic::parse_stream(raw.as_bytes(), &mut |e| {
+            if let crate::provider::ChatEvent::ThinkingDelta(t) = e {
+                thinking.push_str(&t);
+            }
+        })
+        .unwrap();
+        assert_eq!(thinking, "reasoning here");
+        // Only the text block survives into history; thinking is event-only.
+        assert_eq!(resp.blocks.len(), 1);
+        assert!(matches!(&resp.blocks[0], Block::Text(t) if t == "ok"));
     }
 
     #[test]
@@ -531,7 +611,7 @@ mod tests {
 
     /// A representative agent-turn request: system prompt + two tools + two
     /// messages (so the last-message and last-tool paths are both exercised).
-    fn sample_req(cache: bool) -> ChatRequest<'static> {
+    fn sample_req(cache: bool, effort: Option<&'static str>) -> ChatRequest<'static> {
         let tools = vec![
             ToolDef {
                 name: "shell".into(),
@@ -560,6 +640,7 @@ mod tests {
             per_request_timeout: None,
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cache,
+            reasoning_effort: effort,
         }
     }
 
@@ -568,7 +649,7 @@ mod tests {
         // cache=true (an agent turn) → up to three ephemeral breakpoints:
         // system array, the last tool def, and the last block of the last
         // message. The whole run stays under Anthropic's 4-breakpoint cap.
-        let body = Anthropic::build_body(&sample_req(true));
+        let body = Anthropic::build_body(&sample_req(true, None));
         let s = serde_json::to_string(&body).unwrap();
         let n = s.matches("cache_control").count();
         assert_eq!(n, 3, "expected 3 breakpoints, body was:\n{s}");
@@ -582,13 +663,34 @@ mod tests {
         // cache=false (a one-off compression-summary request) → no breakpoint
         // markup at all: paying the 1.25× write premium on content that's never
         // re-read would be pure waste. System falls back to a bare string.
-        let body = Anthropic::build_body(&sample_req(false));
+        let body = Anthropic::build_body(&sample_req(false, None));
         let s = serde_json::to_string(&body).unwrap();
         assert!(
             !s.contains("cache_control"),
             "one-off request must not carry cache_control, body was:\n{s}"
         );
         assert_eq!(body["system"], "you are a helpful agent", "bare string form");
+    }
+
+    #[test]
+    fn build_body_adaptive_thinking_maps_effort() {
+        // effort (non-"none") → thinking:{"type":"adaptive"} + top-level effort;
+        // "none" → thinking:{"type":"disabled"}; None → no thinking field at all
+        // (server default). Forwarded verbatim — no enum mapping.
+        let hi = Anthropic::build_body(&sample_req(true, Some("high")));
+        assert_eq!(hi["thinking"]["type"], "adaptive");
+        assert_eq!(hi["output_config"]["effort"], "high");
+        // effort must NOT be a bare top-level field (silently ignored) nor in thinking.
+        assert!(hi.get("effort").is_none());
+        assert!(hi["thinking"].get("effort").is_none());
+
+        let off = Anthropic::build_body(&sample_req(true, Some("none")));
+        assert_eq!(off["thinking"]["type"], "disabled");
+        assert!(off.get("effort").is_none());
+
+        let dflt = Anthropic::build_body(&sample_req(true, None));
+        assert!(dflt.get("thinking").is_none());
+        assert!(dflt.get("effort").is_none());
     }
 }
 

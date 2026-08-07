@@ -172,6 +172,13 @@ impl Provider for OpenAi {
             "stream_options": {"include_usage": true},
             "messages": messages,
         });
+        // Forward the reasoning-effort knob verbatim. NOT validated: every
+        // vendor's ladder differs and shifts across generations, so a fixed enum
+        // here would lag reality. An old gateway that doesn't know the field
+        // will 400 — `body_fix_for_400` drops it and retries once.
+        if let Some(eff) = req.reasoning_effort {
+            body["reasoning_effort"] = json!(eff);
+        }
         if !req.tools.is_empty() {
             body["tools"] = Self::tools_json(req.tools);
         }
@@ -180,12 +187,13 @@ impl Provider for OpenAi {
 
         // A 400 may name a field this gateway doesn't accept (newer reasoning
         // models reject `max_tokens`; older gateways/vLLM reject the unknown
-        // `stream_options`). Apply known fixes and retry — at most a couple of
-        // times. Each fix mutates a distinct field, so a gateway rejecting BOTH
-        // (reasoning model on an old vLLM gateway) is satisfied by two sequential
-        // fixes; when no known fix applies the 400 bails with the text. The cap
-        // is a backstop — there are only two known fixes, and a fix that can't
-        // change anything returns None and bails, so the loop always converges.
+        // `stream_options` / `reasoning_effort`). Apply known fixes and retry —
+        // at most three times. Each fix mutates a distinct field, so a gateway
+        // rejecting ALL THREE (reasoning model on an old vLLM gateway) is
+        // satisfied by three sequential fixes; when no known fix applies the 400
+        // bails with the text. The cap is a backstop — there are three known
+        // fixes, and a fix that can't change anything returns None and bails, so
+        // the loop always converges.
         for _ in 0..3 {
             if resp.status() != reqwest::StatusCode::BAD_REQUEST {
                 break;
@@ -249,6 +257,13 @@ impl OpenAi {
             }
         }
         if text.contains("stream_options") && obj.remove("stream_options").is_some() {
+            return Some(next);
+        }
+        // Older OpenAI-compatible gateways / vLLM don't know `reasoning_effort`
+        // and 400 on it — drop and retry. Distinct field from the two above, so
+        // a gateway rejecting several fields is still satisfied by sequential
+        // fixes.
+        if text.contains("reasoning_effort") && obj.remove("reasoning_effort").is_some() {
             return Some(next);
         }
         None
@@ -362,6 +377,16 @@ impl OpenAi {
                 text.push_str(t);
                 on_event(ChatEvent::TextDelta(t.to_string()));
             }
+            // Reasoning models (DeepSeek-R1 / GLM / o-series via gateways)
+            // stream the thinking trace under `reasoning_content`. Surface it as
+            // a ThinkingDelta event ONLY — never into `text`/blocks: the reply
+            // is `content`, and no major API asks thinking to be echoed back.
+            // Field absent → non-reasoning model, zero behavior change.
+            if let Some(r) = delta["reasoning_content"].as_str() {
+                if !r.is_empty() {
+                    on_event(ChatEvent::ThinkingDelta(r.to_string()));
+                }
+            }
             if let Some(tc) = delta["tool_calls"].as_array() {
                 for call in tc {
                     // Servers that omit `index`: a chunk carrying an unseen
@@ -471,6 +496,18 @@ mod tests {
         // A 400 that names neither field has no known fix → caller bails.
         let body = json!({"model": "m", "max_tokens": 100});
         assert!(OpenAi::body_fix_for_400("your account is out of credits", &body).is_none());
+    }
+
+    #[test]
+    fn body_fix_drops_reasoning_effort() {
+        // Older OpenAI-compatible gateways / vLLM don't know `reasoning_effort`
+        // and 400 on it — drop and retry, same drop-and-retry as stream_options.
+        let body = json!({"model": "m", "max_tokens": 100, "reasoning_effort": "high"});
+        let fixed =
+            OpenAi::body_fix_for_400("Unrecognized request argument: reasoning_effort", &body)
+                .unwrap();
+        assert!(fixed.get("reasoning_effort").is_none());
+        assert_eq!(fixed.get("max_tokens"), Some(&json!(100))); // untouched
     }
 
     #[test]
@@ -602,6 +639,31 @@ mod tests {
             resp.usage.map(|u| (u.input_tokens, u.output_tokens)),
             Some((42, 9))
         );
+    }
+
+    #[test]
+    fn stream_reasoning_content_surfaces_thinking_not_text() {
+        // DeepSeek-R1 / GLM / o-series via gateways stream the thinking trace
+        // under delta.reasoning_content. It must surface as a ThinkingDelta
+        // event AND stay out of the assembled text (the reply is `content`).
+        let raw = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"let me think\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" more\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut thinking = String::new();
+        let resp = OpenAi::parse_stream(raw.as_bytes(), &mut |e| {
+            if let crate::provider::ChatEvent::ThinkingDelta(t) = e {
+                thinking.push_str(&t);
+            }
+        })
+        .unwrap();
+        assert_eq!(thinking, "let me think more");
+        // Reasoning did NOT leak into the reply text / blocks.
+        assert_eq!(resp.blocks.len(), 1);
+        assert!(matches!(&resp.blocks[0], Block::Text(t) if t == "hi"));
     }
 
     #[test]

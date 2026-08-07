@@ -81,6 +81,13 @@ pub struct ToolDef {
 /// Incremental events emitted while streaming a response.
 pub enum ChatEvent {
     TextDelta(String),
+    /// Reasoning/thinking increment from a reasoning model (OpenAI-style
+    /// `reasoning_content`, Anthropic `thinking` blocks). Surfaced as an event
+    /// ONLY — it never enters the conversation history (`text`/`blocks`), since
+    /// no major API requires thinking to be echoed back on the next turn
+    /// (DeepSeek V4 thinking + tool-use multi-turn is the documented exception;
+    /// not handled here).
+    ThinkingDelta(String),
 }
 
 /// Token usage for one chat. Best-effort: None when the server didn't report
@@ -211,6 +218,10 @@ pub struct ChatRequest<'a> {
     /// 1.25× cache-write premium on content that will never be a cache read.
     /// OpenAI caching is implicit and ignores this.
     pub cache: bool,
+    /// Reasoning effort forwarded to the provider verbatim (no enum validation
+    /// — vendor ladders differ and shift across generations); `None` = server
+    /// default. One-off requests (the compression summary) pass `None`.
+    pub reasoning_effort: Option<&'a str>,
 }
 
 pub trait Provider: Send + Sync {

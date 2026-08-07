@@ -258,6 +258,7 @@ mod tests {
             restrict_to_workdir: false,
             limits: crate::config::Limits::default(),
             mcp_servers: vec![],
+            reasoning_effort: None,
         };
         let (prov, _state) = MockProvider::new(turns);
         Agent::new(
@@ -449,6 +450,7 @@ mod tests {
             restrict_to_workdir: false,
             limits: crate::config::Limits::default(),
             mcp_servers: vec![],
+            reasoning_effort: None,
         }
     }
 }

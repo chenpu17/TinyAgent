@@ -187,6 +187,7 @@ fn event_json(ev: &AgentEvent) -> Value {
     match ev {
         AgentEvent::TurnStart(n) => json!({"type": "turn", "n": *n}),
         AgentEvent::TextDelta(t) => json!({"type": "text", "delta": t.clone()}),
+        AgentEvent::ThinkingDelta(t) => json!({"type": "thinking", "delta": t.clone()}),
         AgentEvent::ToolCall { name, input } => {
             json!({"type": "tool_call", "name": name.clone(), "input": input.clone()})
         }
@@ -489,6 +490,15 @@ impl<Out: Write, Err: Write> HumanRenderer<Out, Err> {
                 self.at_line_start = t.ends_with('\n');
                 self.current_sub_name = None; // parent agent owns this line now
             }
+            AgentEvent::ThinkingDelta(t) => {
+                // Reasoning trace → stderr only. stdout carries the assistant's
+                // reply (and the --output summary is built from it), so thinking
+                // must never mingle with it. Still visible on the terminal for
+                // debugging, and redirectable away (2>/dev/null / separate stream
+                // from --json's structured events).
+                let _ = write!(self.err, "{t}");
+                let _ = self.err.flush();
+            }
             AgentEvent::ToolCall { name, input } => {
                 let _ = writeln!(self.out, "\n[tool →] {name} {}", compact(input));
                 self.at_line_start = true; // writeln ended on a fresh line
@@ -575,6 +585,12 @@ impl<Out: Write, Err: Write> HumanRenderer<Out, Err> {
                         let _ = write!(self.out, "{t}");
                         let _ = self.out.flush();
                         self.at_line_start = t.ends_with('\n');
+                    }
+                    AgentEvent::ThinkingDelta(t) => {
+                        // Sub-agent reasoning → stderr, tagged with the child's
+                        // name so interleaved thinking streams stay legible.
+                        let _ = write!(self.err, "[{name}] {t}");
+                        let _ = self.err.flush();
                     }
                     AgentEvent::ToolCall { name: tn, input } => {
                         let _ = writeln!(self.out, "\n[{name}] [tool →] {tn} {}", compact(input));

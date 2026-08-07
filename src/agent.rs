@@ -43,6 +43,10 @@ pub enum CompressTrigger {
 pub enum AgentEvent {
     TurnStart(u32),
     TextDelta(String),
+    /// Reasoning/thinking increment from a reasoning model — serializes as
+    /// `{"ThinkingDelta": "..."}` so a downstream UI (TinyWorker) renders a
+    /// collapsible "thinking" block. Not part of the reply text nor history.
+    ThinkingDelta(String),
     ToolCall { name: String, input: Value },
     ToolResult { name: String, is_error: bool, content: String },
     /// Token usage reported by the provider for the latest chat request.
@@ -184,6 +188,8 @@ pub struct Agent {
     system: Option<String>,
     model: String,
     max_tokens: u32,
+    /// Reasoning effort forwarded to the provider verbatim (None = default).
+    reasoning_effort: Option<String>,
     limits: Limits,
     ctx: ToolCtx,
     session_path: Option<std::path::PathBuf>,
@@ -235,6 +241,7 @@ impl Agent {
             system: cfg.system_prompt.clone(),
             model: cfg.model.clone(),
             max_tokens: cfg.max_tokens,
+            reasoning_effort: cfg.reasoning_effort.clone(),
             limits: cfg.limits.clone(),
             ctx,
             session_path: None,
@@ -562,9 +569,11 @@ impl Agent {
                         // the stable prefix across turns); one-off requests opt
                         // out.
                         cache: true,
+                        reasoning_effort: self.reasoning_effort.as_deref(),
                     };
                     self.provider.chat(&req, &mut |e| match e {
                         ChatEvent::TextDelta(t) => events(AgentEvent::TextDelta(t)),
+                        ChatEvent::ThinkingDelta(t) => events(AgentEvent::ThinkingDelta(t)),
                     })
                 }; // req dropped here → &self.messages borrow released
                 // Baseline AFTER normalize_adjacent, so a same-role merge that
@@ -1190,6 +1199,9 @@ impl Agent {
             // different transcript, so a cache breakpoint would only ever pay
             // the 1.25× write premium with no subsequent read. Skip caching.
             cache: false,
+            // Summaries don't reason — drop the thinking config so a reasoning
+            // model doesn't burn a thinking trace on a compression call.
+            reasoning_effort: None,
         };
         let resp = self.provider.chat(&req, &mut |_| {})?;
         // parse_loop reports cancel/idle-timeout/truncation as Ok with a

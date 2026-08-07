@@ -147,6 +147,13 @@ pub struct McpServerConfig {
     pub transport: Option<McpTransport>,
     #[serde(default)]
     pub headers: std::collections::HashMap<String, String>,
+    /// stdio transport only: extra env vars passed to the spawned child, added
+    /// on top of the inherited host environment (same-name clash: config wins).
+    /// Ignored for url transports. GUI apps launched without a shell rely on
+    /// this to pass credentials (GITHUB_PERSONAL_ACCESS_TOKEN, DB URLs, …) to
+    /// stdio MCP servers — matching the Claude Desktop / VS Code config shape.
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
 }
 
 impl McpServerConfig {
@@ -202,6 +209,15 @@ pub struct Config {
     /// External MCP tool servers (stdio transport).
     #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
+    /// Reasoning effort forwarded to the provider verbatim as a string (e.g.
+    /// "none" | "low" | "medium" | "high" | "xhigh" | "max"). NOT validated
+    /// against an enum: every vendor's effort ladder differs and shifts across
+    /// model generations (OpenAI minimal/none/low/medium/high/xhigh/max,
+    /// Anthropic low/medium/high/max, GLM enabled/disabled, DeepSeek
+    /// low/high/xhigh/max), so we forward the raw value and let the provider
+    /// reject unknown ones. `None` = server default.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 impl Config {
@@ -273,6 +289,9 @@ impl Config {
         }
         if let Some(v) = p.restrict_to_workdir {
             self.restrict_to_workdir = v;
+        }
+        if p.reasoning_effort.is_some() {
+            self.reasoning_effort = p.reasoning_effort;
         }
         if let Some(l) = p.limits {
             // Batch task files are untrusted: a task may only TIGHTEN resource
@@ -382,6 +401,7 @@ pub struct PartialConfig {
     pub restrict_to_workdir: Option<bool>,
     pub limits: Option<PartialLimits>,
     pub mcp_servers: Option<Vec<McpServerConfig>>,
+    pub reasoning_effort: Option<String>,
 }
 
 impl PartialConfig {
@@ -486,6 +506,35 @@ mod tests {
         assert_eq!(cfg.limits.max_turns, 3);
         assert_eq!(cfg.limits.timeout_secs, 100); // untouched
         assert_eq!(cfg.tools, vec!["shell"]); // untouched
+    }
+
+    #[test]
+    fn reasoning_effort_and_mcp_env_parse() {
+        // reasoning_effort is an optional string, passed through verbatim (no
+        // enum validation). env on a stdio MCP server is a string→string map.
+        let json = r#"{
+            "provider": "openai", "api_key_env": "K", "model": "m",
+            "reasoning_effort": "xhigh",
+            "mcp_servers": [{"name":"fs","command":"npx","env":{"FOO":"bar","BAZ":"qux"}}]
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.reasoning_effort.as_deref(), Some("xhigh"));
+        assert_eq!(cfg.mcp_servers[0].env.get("FOO").map(String::as_str), Some("bar"));
+        assert_eq!(cfg.mcp_servers[0].env.get("BAZ").map(String::as_str), Some("qux"));
+    }
+
+    #[test]
+    fn partial_config_overlays_reasoning_effort_without_being_forbidden() {
+        // reasoning_effort is a soft field like model/max_tokens: a batch task
+        // fragment may override it, and it is NOT in forbidden_batch_override.
+        let mut cfg: Config =
+            serde_json::from_str(r#"{"provider":"anthropic","api_key_env":"K","model":"m"}"#)
+                .unwrap();
+        let partial: PartialConfig =
+            serde_json::from_str(r#"{"reasoning_effort":"low"}"#).unwrap();
+        assert!(partial.forbidden_batch_override().is_none());
+        cfg.apply(partial).unwrap();
+        assert_eq!(cfg.reasoning_effort.as_deref(), Some("low"));
     }
 
     #[test]

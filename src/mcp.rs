@@ -285,6 +285,7 @@ impl StdioTransport {
             use std::os::unix::process::CommandExt;
             Command::new(cmd)
                 .args(&cfg.args)
+                .envs(&cfg.env)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -294,6 +295,7 @@ impl StdioTransport {
         #[cfg(not(unix))]
         let child = Command::new(cmd)
             .args(&cfg.args)
+            .envs(&cfg.env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

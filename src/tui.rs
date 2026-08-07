@@ -887,9 +887,15 @@ fn ui_loop(
                         activity = "thinking".into();
                         thinking = true;
                     }
-                    AgentEvent::TextDelta(t) => {
+                    AgentEvent::TextDelta(t) | AgentEvent::ThinkingDelta(t) => {
                         // First visible output: the thinking placeholder is
                         // superseded by real content (same below at ToolCall).
+                        // NOTE: a ThinkingDelta (reasoning-model trace) is folded
+                        // into the same assistant row as reply text — the TUI is
+                        // frozen (README Non-goals: bugfix-only), so it only
+                        // guarantees the trace is VISIBLE, not styled as a
+                        // separate collapsible block. TinyWorker's GUI renders
+                        // that block off the same event.
                         thinking = false;
                         // Parent speaks: close any open sub-agent bubble AND
                         // keep this delta out of it — streaming=false forces
@@ -1012,7 +1018,9 @@ fn ui_loop(
                         // activity segment) is terminal-safe.
                         let name = strip_controls(&name);
                         match &*event {
-                            AgentEvent::TextDelta(t) => {
+                            AgentEvent::TextDelta(t) | AgentEvent::ThinkingDelta(t) => {
+                                // ThinkingDelta folded in alongside TextDelta
+                                // (TUI shows the trace inline; see main match).
                                 thinking = false;
                                 append_sub_delta(&mut rows, &mut sub_streaming_name, &name, t);
                             }
