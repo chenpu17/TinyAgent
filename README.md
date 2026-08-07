@@ -576,9 +576,11 @@ headless 模式下 `Ctrl-C` 走**优雅取消**：首次 SIGINT 在流式 chunk 
 
 ## Skill（技能）
 
-Skill 是可命名、按需加载的**指令/知识包**：把"怎么做某类任务"的步骤打包成一个文件夹，agent
-启动时自动发现、需要时再读取完整指令。设计对齐 [Claude Code Agent Skills](https://www.anthropic.com/engineering/equipping-agents-for-the-real-world-with-agent-skills)
-的渐进式披露——简介常驻、全文按需，避免把所有指令一次性塞进上下文。
+Skill 是可命名、按需加载的**指令/知识包**：把"怎么做某类任务"的步骤、脚本、参考资料打包成
+一个文件夹，agent 启动时自动发现、需要时再读取完整指令与资源。实现遵循 [Agent Skills 开放标准](
+https://agentskills.io/specification)——三级渐进式披露、6 字段 frontmatter、`scripts/`/`references/`/
+`assets/` 子目录约定。（Claude Code 的私有扩展字段如 `disable-model-invocation`/`context:fork`/
+`$ARGUMENTS` 依赖其特有的会话/权限/子代理模型，TinyAgent 不实现。）
 
 ### 目录约定
 
@@ -587,60 +589,94 @@ Skill 是可命名、按需加载的**指令/知识包**：把"怎么做某类�
 - 全局：`~/.config/tinyagent/skills/`（或 `$XDG_CONFIG_HOME/tinyagent/skills/`）——个人通用技能。
 - 项目：`<工作目录>/.tinyagent/skills/`——随仓库分发、团队共享。
 
-每个技能是该目录下的一个**子目录**，至少含一个 `SKILL.md`：
+每个技能是该目录下的一个**子目录**，至少含一个 `SKILL.md`，可按约定放资源子目录：
 
 ```
 ~/.config/tinyagent/skills/
-└── code-review/
-    ├── SKILL.md          # 必需：frontmatter + 正文
-    └── checklist.md      # 可选：附属文件，正文里按名引用
+└── pdf-forms/
+    ├── SKILL.md                  # 必需：frontmatter + 正文
+    ├── scripts/extract.py        # 可选：可执行脚本
+    ├── references/REFERENCE.md   # 可选：详细参考文档
+    └── assets/template.json      # 可选：模板 / 数据等静态资源
 ```
 
 ### `SKILL.md` 格式
 
-以 YAML frontmatter 开头（只需 `name` + `description`），正文是完整指令：
+以 YAML frontmatter 开头，正文是完整指令。frontmatter 支持**标准 6 字段**：
+
+| 字段 | 必需 | 说明 |
+|---|---|---|
+| `name` | 是 | 1-64 字符，仅小写字母/数字/连字符 `-`，首尾不能是 `-`，不能有连续 `--`，**必须等于所在目录名** |
+| `description` | 是 | ≤1024 字符；写清"做什么 + 何时用"，含关键词帮模型识别。进 system prompt |
+| `license` | 否 | 许可证名或打包的许可证文件 |
+| `compatibility` | 否 | ≤500 字符；环境要求（运行时、系统包、网络等） |
+| `metadata` | 否 | `key: value` 映射，扩展属性（缩进块） |
+| `allowed-tools` | 否 | 空格分隔的预批准工具名（实验性，见下） |
 
 ```
 ---
-name: code-review
-description: 审查 git diff，聚焦 bug 与安全隐患，按严重度排序输出
+name: pdf-forms
+description: 从 PDF 表单抽取字段并输出 JSON。处理表单类文档时用。
+license: Apache-2.0
+compatibility: needs python3
+allowed-tools: shell read_file
+metadata:
+  author: docs-team
 ---
 
-# Code Review
+# PDF Forms
 
-1. 读 git diff ...
-2. 需要逐项清单时，读附属文件 checklist.md ...
+1. 用 scripts/extract.py 抽取 ...
+2. 字段格式参考 references/REFERENCE.md ...
 ```
 
-- `name` 匹配 `[A-Za-z0-9_-]+`（通常就是目录名）。
-- `description` 写在一行——它进 system prompt，是模型判断"是否需要这个技能"的唯一依据，写清楚很关键。
-- 多行 YAML 折叠不支持；描述压成一行。
+> 单行标量字段只支持单行值（多行 YAML 折叠不支持）；`metadata` 是唯一支持缩进 `key: value` 块的字段。
+> 未知字段忽略（标准允许）。
 
-### 三级加载
+### 三级渐进式加载
 
 | 级别 | 何时加载 | 落点 | 成本 |
 |---|---|---|---|
 | ① 简介（name+description） | 启动时，所有技能 | 拼进 **system prompt**（常驻） | 极低，且被 prompt cache 缓存 |
 | ② 全文（SKILL.md 正文） | 模型判断相关时调 `read_skill` | 作为 tool_result 进**对话历史** | 按需，可被上下文压缩回收 |
-| ③ 附属文件 | 正文引用、任务需要时 `read_skill {file}` | 同上 | 同上 |
+| ③ 资源文件（scripts/references/assets） | 先 `list_skill` 发现、再 `read_skill {file}` 读 | 同上 | 同上 |
 
-### `read_skill` 工具
+### `read_skill` / `list_skill` 工具
 
-加载某技能的完整指令或同目录附属文件：
+扫到技能时自动配套（不进 `config.tools` 白名单）：
 
 ```
-{ "skill": "code-review" }                          # 读 SKILL.md
-{ "skill": "code-review", "file": "checklist.md" }  # 读附属文件
+{ "skill": "pdf-forms" }                                  # 读 SKILL.md
+{ "skill": "pdf-forms", "file": "scripts/extract.py" }    # 读子目录资源（相对路径）
+{ "skill": "pdf-forms", "file": "references/REF.md" }     # 读参考文档
 ```
 
-`file` 默认 `SKILL.md`，必须是技能目录内的单个文件名（禁路径分隔符与 `..`，防逃逸）。
+- `read_skill`：`file` 默认 `SKILL.md`，支持相对路径读子目录资源（`scripts/foo.sh`、`references/...`、
+  `assets/...`）。路径被限制在技能目录内：禁 `..`、绝对路径、反斜杠；规范化的真实边界由 canonicalize
+  + `starts_with(技能目录)` 兜底（挡模型误入，非抗敌对进程的硬隔离）。
+- `list_skill`：列出某技能目录下的全部文件（含子目录，相对路径），用于**自主发现**资源后再读取。
+
+### `allowed-tools`（实验性）
+
+标准字段，空格分隔的工具名。TinyAgent **只解析 + 告警，不强制**：装配时检查声明的工具是否在
+`config.tools` 白名单 ∪ {`read_skill`,`list_skill`} 中，缺失则 stderr 打印 `[skill] ... not in the
+tool whitelist`。真正的"按轮临时预批准"需要每轮权限/激活层（Claude Code 的语义），TinyAgent 架构不同，
+不做。仅字面量名匹配，不支持 glob/`Tool(spec)` 模式。
 
 ### 行为细节
 
-- **自动配套，不在工具白名单**：扫到技能，`read_skill` 就自动可用（技能与 `config.tools` 工具是正交两层，不混在白名单里）。
-- **子 agent 不继承**：子 agent（`task`）用专属 system prompt、按白名单建工具集，看不到技能简介、也没有 `read_skill`。需要时由主 agent 在 `task` 的 prompt 里带要点。
-- **坏技能跳过 + 告警**：缺 `SKILL.md`、frontmatter 缺字段、`name` 非法的技能被跳过并在 **stderr** 打印 `[skill] ...`，不影响其他技能与启动。
+- **自动配套，不在工具白名单**：扫到技能，`read_skill` + `list_skill` 就自动可用（技能与 `config.tools`
+  工具是正交两层，不混在白名单里）。
+- **子 agent 不继承**：子 agent（`task`）用专属 system prompt、按白名单建工具集，看不到技能简介、
+  也没有 `read_skill`/`list_skill`。需要时由主 agent 在 `task` 的 prompt 里带要点。
+- **坏技能跳过 + 告警**：缺 `SKILL.md`、frontmatter 缺 `name`/`description`、`name` 不合规（字符集/
+  长度/首尾连字符/`--`/与目录名不一致）、`description` 超 1024 字符的技能被跳过并在 **stderr** 打印
+  `[skill] ...`，不影响其他技能与启动。
 - **无技能目录时行为不变**：没扫到技能，system prompt 与工具集与原来完全一致（纯向后兼容）。
+
+> **从旧版升级**：早期版本对 `name` 校验较宽（允许大写/下划线、不校验目录名）。标准对齐后，不合规的
+> 技能（如 `name: Deploy_V2`、或 frontmatter `name` 与目录名不一致）会跳过并告警——把目录名与 `name`
+> 统一成小写+连字符形式即可。
 
 ## 开发
 

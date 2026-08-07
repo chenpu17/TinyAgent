@@ -21,15 +21,29 @@
 //! system prompt needs. See the Anthropic engineering post on Agent Skills for
 //! the rationale (metadata preloaded; body read into context only when used).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// One discovered skill: its declared identity + the directory holding
-/// `SKILL.md` (and any sidecar files).
-#[derive(Clone, Debug)]
+/// `SKILL.md` (and any sidecar files). Carries the full agentskills.io
+/// frontmatter — `license`/`compatibility`/`allowed_tools`/`metadata` are
+/// parsed and stored so a standard skill loads without error, though only
+/// `name`+`description` surface in the level-1 system-prompt intro (the intro
+/// is permanent context and counts toward the compression estimate, so it must
+/// stay short). `allowed_tools` additionally drives a whitelist check at
+/// assembly. `Default` is derived so tests can build one with `..Default::default()`.
+#[derive(Clone, Debug, Default)]
 pub struct SkillEntry {
     pub name: String,
     pub description: String,
     pub dir: PathBuf,
+    pub license: Option<String>,
+    pub compatibility: Option<String>,
+    /// `allowed-tools` frontmatter, split on whitespace. Experimental per the
+    /// spec; TinyAgent only warns at assembly (no per-turn activation layer).
+    pub allowed_tools: Vec<String>,
+    /// `metadata` frontmatter block (string→string). Accepted, not surfaced.
+    pub metadata: HashMap<String, String>,
 }
 
 /// Discovered skills, queryable by name and sorted by name for a stable,
@@ -104,7 +118,7 @@ pub fn scan(dirs: &[PathBuf]) -> (SkillIndex, Vec<String>) {
                     continue;
                 }
             };
-            let (name, description) = match parse_frontmatter(&content) {
+            let fm = match parse_frontmatter(&content) {
                 Some(v) => v,
                 None => {
                     warnings.push(format!(
@@ -114,17 +128,44 @@ pub fn scan(dirs: &[PathBuf]) -> (SkillIndex, Vec<String>) {
                     continue;
                 }
             };
-            if !valid_skill_name(&name) {
+            if !valid_skill_name(&fm.name) {
                 warnings.push(format!(
-                    "skill dir {} has invalid name {:?} (need [A-Za-z0-9_-]+), skipped",
+                    "skill dir {} has invalid name {:?} (standard: 1-64 chars, [a-z0-9] only, \
+                     no leading/trailing '-' or '--'), skipped",
                     sub.display(),
-                    name
+                    fm.name
+                ));
+                continue;
+            }
+            // agentskills.io: name must match the parent directory name.
+            let dir_name = sub.file_name().and_then(|s| s.to_str());
+            if dir_name != Some(fm.name.as_str()) {
+                warnings.push(format!(
+                    "skill dir {} frontmatter name {:?} must match the directory name, skipped",
+                    sub.display(),
+                    fm.name
+                ));
+                continue;
+            }
+            if fm.description.len() > 1024 {
+                warnings.push(format!(
+                    "skill dir {} description exceeds 1024 chars ({}, standard max), skipped",
+                    sub.display(),
+                    fm.description.len()
                 ));
                 continue;
             }
             upsert(
                 &mut index.entries,
-                SkillEntry { name, description, dir: sub.clone() },
+                SkillEntry {
+                    name: fm.name,
+                    description: fm.description,
+                    dir: sub.clone(),
+                    license: fm.license,
+                    compatibility: fm.compatibility,
+                    allowed_tools: fm.allowed_tools,
+                    metadata: fm.metadata,
+                },
             );
         }
     }
@@ -144,13 +185,32 @@ fn upsert(entries: &mut Vec<SkillEntry>, e: SkillEntry) {
     }
 }
 
-/// Parse a two-field YAML frontmatter block (`name`, `description`) delimited
-/// by `---` lines. Only single-line values are supported (multi-line YAML
-/// folding is out of scope — the format asks for one-line descriptions).
-/// Unknown keys are ignored. Returns `None` if there is no frontmatter or
-/// either required field is missing/empty. Expects the conventional
-/// `key: value` shape (no space before the colon).
-fn parse_frontmatter(content: &str) -> Option<(String, String)> {
+/// Parsed agentskills.io frontmatter — all six standard fields. `scan` consumes
+/// this, applies the name/description validation rules, and assembles a
+/// [`SkillEntry`]. Kept separate from `SkillEntry` so validation stays out of
+/// the parser.
+struct ParsedFrontmatter {
+    name: String,
+    description: String,
+    license: Option<String>,
+    compatibility: Option<String>,
+    allowed_tools: Vec<String>,
+    metadata: HashMap<String, String>,
+}
+
+/// Parse the agentskills.io YAML frontmatter block delimited by `---` lines.
+///
+/// All six standard fields are recognized: `name`/`description` (required),
+/// `license`/`compatibility` (optional single-line), `allowed-tools` (optional,
+/// whitespace-split into a list), and `metadata` (optional indented `key:
+/// value` block → map). Only single-line scalar values are supported for the
+/// scalar fields; `metadata` is the one block form and is collected by a small
+/// indent-driven state machine (no nested YAML). Unknown keys are ignored —
+/// the open spec permits them (only Claude Code's upload path rejects unknown
+/// keys). Returns `None` if there is no frontmatter or either required field is
+/// missing/empty. Expects the conventional `key: value` shape (no space before
+/// the colon).
+fn parse_frontmatter(content: &str) -> Option<ParsedFrontmatter> {
     let mut lines = content.lines();
     let first = lines.next()?;
     if first.trim() != "---" {
@@ -158,21 +218,58 @@ fn parse_frontmatter(content: &str) -> Option<(String, String)> {
     }
     let mut name = None;
     let mut description = None;
+    let mut license = None;
+    let mut compatibility = None;
+    let mut allowed_tools: Vec<String> = Vec::new();
+    let mut metadata: HashMap<String, String> = HashMap::new();
+    let mut in_metadata = false;
     for line in lines {
         let t = line.trim();
         if t == "---" {
             break; // end of frontmatter
         }
+        if t.is_empty() {
+            continue;
+        }
+        let indented = line.starts_with(' ') || line.starts_with('\t');
+        // Inside a `metadata:` block: collect indented `key: value` lines until
+        // a non-indented line ends the block.
+        if in_metadata {
+            if indented {
+                if let Some((k, v)) = split_kv(t) {
+                    metadata.insert(k.to_string(), unquote(v));
+                }
+                continue;
+            }
+            in_metadata = false;
+        }
         if let Some(v) = strip_key(t, "name") {
             name = Some(v);
         } else if let Some(v) = strip_key(t, "description") {
             description = Some(v);
+        } else if let Some(v) = strip_key(t, "license") {
+            license = Some(v);
+        } else if let Some(v) = strip_key(t, "compatibility") {
+            compatibility = Some(v);
+        } else if let Some(v) = strip_key(t, "allowed-tools") {
+            allowed_tools = v.split_whitespace().map(String::from).collect();
+        } else if strip_key(t, "metadata").is_some() {
+            // `metadata:` introduces an indented block; any inline value is
+            // ignored (the spec models metadata as a map, not a scalar).
+            in_metadata = true;
         }
         // other keys ignored
     }
     let name = name.filter(|n| !n.is_empty())?;
     let description = description.filter(|d| !d.is_empty())?;
-    Some((name, description))
+    Some(ParsedFrontmatter {
+        name,
+        description,
+        license,
+        compatibility,
+        allowed_tools,
+        metadata,
+    })
 }
 
 /// Match `key: value` (after trim), returning the value trimmed and with a
@@ -180,6 +277,19 @@ fn parse_frontmatter(content: &str) -> Option<(String, String)> {
 fn strip_key(line: &str, key: &str) -> Option<String> {
     let rest = line.strip_prefix(&format!("{key}:"))?;
     Some(unquote(rest.trim()))
+}
+
+/// Split a `key: value` line at the first colon (used for `metadata` entries,
+/// whose keys are arbitrary). Returns `None` if there is no colon or the key is
+/// empty.
+fn split_kv(s: &str) -> Option<(&str, &str)> {
+    let idx = s.find(':')?;
+    let k = s[..idx].trim();
+    let v = s[idx + 1..].trim();
+    if k.is_empty() {
+        return None;
+    }
+    Some((k, v))
 }
 
 fn unquote(s: &str) -> String {
@@ -192,10 +302,17 @@ fn unquote(s: &str) -> String {
     }
 }
 
-/// A skill name must be a safe directory component and a stable identifier
-/// (same character set the MCP tool-name sanitizer allows).
+/// A skill name per the agentskills.io spec: 1-64 chars, only lowercase letters,
+/// digits, and hyphens; must not start or end with a hyphen or contain `--`.
+/// (All allowed chars are ASCII one-byte, so byte length == char count.)
 fn valid_skill_name(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    !s.is_empty()
+        && s.len() <= 64
+        && !s.starts_with('-')
+        && !s.ends_with('-')
+        && !s.contains("--")
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 /// Render the level-1 intro appended to the system prompt. Lists each skill's
@@ -218,7 +335,8 @@ pub fn render_intro(prefix: Option<&str>, index: &SkillIndex) -> String {
     out.push_str("## 可用技能 (skills)\n");
     out.push_str(
         "需要时调用 read_skill 加载某个技能的完整指令 \
-         (参数 {\"skill\": ...}, 可选 \"file\" 默认 SKILL.md, 可读同目录附属文件):\n",
+         (参数 {\"skill\": ...}, 可选 \"file\" 默认 SKILL.md, 支持相对路径读 scripts/ 等子目录附属文件);\
+         先用 list_skill 列出某技能目录下的全部文件以发现资源:\n",
     );
     for e in index.entries() {
         out.push_str(&format!("- {}: {}\n", e.name, e.description));
@@ -242,56 +360,101 @@ mod tests {
         d
     }
 
+    fn fm(content: &str) -> ParsedFrontmatter {
+        parse_frontmatter(content).expect("frontmatter should parse")
+    }
+
     #[test]
     fn frontmatter_parses_name_and_description() {
-        let c = "---\nname: deploy\ndescription: ship to prod\n---\nbody";
-        assert_eq!(
-            parse_frontmatter(c),
-            Some(("deploy".into(), "ship to prod".into()))
-        );
+        let f = fm("---\nname: deploy\ndescription: ship to prod\n---\nbody");
+        assert_eq!(f.name, "deploy");
+        assert_eq!(f.description, "ship to prod");
+        // optional fields default when absent
+        assert!(f.license.is_none());
+        assert!(f.compatibility.is_none());
+        assert!(f.allowed_tools.is_empty());
+        assert!(f.metadata.is_empty());
     }
 
     #[test]
     fn frontmatter_strips_surrounding_quotes() {
-        let c = "---\nname: \"deploy\"\ndescription: 'ship it'\n---\n";
-        assert_eq!(
-            parse_frontmatter(c),
-            Some(("deploy".into(), "ship it".into()))
-        );
+        let f = fm("---\nname: \"deploy\"\ndescription: 'ship it'\n---\n");
+        assert_eq!(f.name, "deploy");
+        assert_eq!(f.description, "ship it");
+    }
+
+    #[test]
+    fn frontmatter_parses_all_optional_fields() {
+        let c = "---\n\
+                 name: pdf-forms\n\
+                 description: extract form fields\n\
+                 license: Apache-2.0\n\
+                 compatibility: needs python3\n\
+                 allowed-tools: read_file shell list_dir\n\
+                 ---\n";
+        let f = fm(c);
+        assert_eq!(f.license.as_deref(), Some("Apache-2.0"));
+        assert_eq!(f.compatibility.as_deref(), Some("needs python3"));
+        assert_eq!(f.allowed_tools, vec!["read_file", "shell", "list_dir"]);
+    }
+
+    #[test]
+    fn frontmatter_parses_metadata_block() {
+        // Note: written on one line with explicit \n and REAL leading spaces —
+        // Rust's `\` line-continuation would strip the very indentation the
+        // metadata-block parser keys off.
+        let c = "---\nname: x\ndescription: y\nmetadata:\n  author: alice\n  version: '2'\n---\n";
+        let f = fm(c);
+        assert_eq!(f.metadata.get("author").map(String::as_str), Some("alice"));
+        assert_eq!(f.metadata.get("version").map(String::as_str), Some("2"));
+    }
+
+    #[test]
+    fn frontmatter_metadata_block_ends_at_nonindented_line() {
+        // A top-level key after the indented metadata block is parsed normally.
+        let c = "---\nname: x\ndescription: y\nmetadata:\n  a: 1\nlicense: MIT\n---\n";
+        let f = fm(c);
+        assert_eq!(f.metadata.get("a").map(String::as_str), Some("1"));
+        assert_eq!(f.license.as_deref(), Some("MIT"));
     }
 
     #[test]
     fn frontmatter_ignores_unknown_keys() {
-        let c = "---\nname: x\ndescription: y\nversion: 1.2\nauthor: me\n---\n";
-        assert_eq!(parse_frontmatter(c), Some(("x".into(), "y".into())));
+        let f = fm("---\nname: x\ndescription: y\nversion: 1.2\nauthor: me\n---\n");
+        assert_eq!(f.name, "x");
+        assert_eq!(f.description, "y");
     }
 
     #[test]
     fn frontmatter_description_may_contain_colons() {
         // Only the first `key:` is split; a colon inside the value is fine.
-        let c = "---\nname: deploy\ndescription: deploy: staging then prod\n---\n";
-        assert_eq!(
-            parse_frontmatter(c),
-            Some(("deploy".into(), "deploy: staging then prod".into()))
-        );
+        let f = fm("---\nname: deploy\ndescription: deploy: staging then prod\n---\n");
+        assert_eq!(f.description, "deploy: staging then prod");
     }
 
     #[test]
     fn frontmatter_missing_returns_none() {
-        assert_eq!(parse_frontmatter("no frontmatter here"), None);
-        assert_eq!(parse_frontmatter("---\ndescription: no name\n---\n"), None);
-        assert_eq!(parse_frontmatter("---\nname: no desc\n---\n"), None);
+        assert!(parse_frontmatter("no frontmatter here").is_none());
+        assert!(parse_frontmatter("---\ndescription: no name\n---\n").is_none());
+        assert!(parse_frontmatter("---\nname: no desc\n---\n").is_none());
     }
 
     #[test]
     fn valid_skill_name_rules() {
         assert!(valid_skill_name("code-review"));
-        assert!(valid_skill_name("deploy_v2"));
+        assert!(valid_skill_name("deploy"));
         assert!(valid_skill_name("a"));
+        assert!(valid_skill_name("pdf-form-extraction"));
+        // standard rejections
         assert!(!valid_skill_name(""));
+        assert!(!valid_skill_name("Deploy")); // uppercase not allowed
+        assert!(!valid_skill_name("deploy_v2")); // underscore not allowed
+        assert!(!valid_skill_name("-leading"));
+        assert!(!valid_skill_name("trailing-"));
+        assert!(!valid_skill_name("double--hyphen"));
+        assert!(!valid_skill_name(&"x".repeat(65))); // >64 chars
         assert!(!valid_skill_name("has space"));
         assert!(!valid_skill_name("slash/here"));
-        assert!(!valid_skill_name("dot."));
     }
 
     #[test]
@@ -352,12 +515,59 @@ mod tests {
     }
 
     #[test]
+    fn scan_rejects_name_not_matching_directory() {
+        let dir = tmpd("namemismatch");
+        // directory "ship-it" but frontmatter name "deploy" — spec: name must
+        // match the parent directory name.
+        write_skill(&dir, "ship-it", "---\nname: deploy\ndescription: x\n---\n");
+        let (idx, warns) = scan(std::slice::from_ref(&dir));
+        assert!(idx.is_empty(), "should be skipped");
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(warns[0].contains("must match the directory name"), "{warns:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn scan_rejects_oversized_description() {
+        let dir = tmpd("bigdesc");
+        let long = "x".repeat(1025);
+        write_skill(&dir, "big", &format!("---\nname: big\ndescription: {long}\n---\n"));
+        let (idx, warns) = scan(std::slice::from_ref(&dir));
+        assert!(idx.is_empty());
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(warns[0].contains("exceeds 1024"), "{warns:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn scan_stores_optional_frontmatter_fields() {
+        let dir = tmpd("optional");
+        let sub = dir.join("rich");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(
+            sub.join("SKILL.md"),
+            "---\nname: rich\ndescription: d\nlicense: MIT\ncompatibility: py3\n\
+             allowed-tools: shell read_file\nmetadata:\n  k: v\n---\n",
+        )
+        .unwrap();
+        let (idx, warns) = scan(std::slice::from_ref(&dir));
+        assert!(warns.is_empty(), "{warns:?}");
+        let e = idx.entries().iter().find(|e| e.name == "rich").unwrap();
+        assert_eq!(e.license.as_deref(), Some("MIT"));
+        assert_eq!(e.compatibility.as_deref(), Some("py3"));
+        assert_eq!(e.allowed_tools, vec!["shell", "read_file"]);
+        assert_eq!(e.metadata.get("k").map(String::as_str), Some("v"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn render_intro_appends_to_existing_prompt() {
         let idx = SkillIndex {
             entries: vec![SkillEntry {
                 name: "deploy".into(),
                 description: "ship it".into(),
                 dir: PathBuf::from("/x/deploy"),
+                ..Default::default()
             }],
         };
         let out = render_intro(Some("you are an agent"), &idx);
@@ -373,6 +583,7 @@ mod tests {
                 name: "x".into(),
                 description: "y".into(),
                 dir: PathBuf::from("/x"),
+                ..Default::default()
             }],
         };
         let out = render_intro(None, &idx);

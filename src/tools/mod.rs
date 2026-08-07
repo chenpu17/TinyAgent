@@ -6,7 +6,7 @@ mod skill;
 mod subagent;
 
 pub use image::load_block;
-pub use skill::ReadSkill;
+pub use skill::{ListSkill, ReadSkill};
 
 use crate::agent::AgentEvent;
 use crate::config::Config;
@@ -214,21 +214,29 @@ pub(crate) fn resolve(ctx: &ToolCtx, path: &str) -> Result<PathBuf> {
     Ok(full)
 }
 
-/// Check that `full` stays inside the workdir. Canonicalizes the deepest
-/// existing ancestor (so writes to not-yet-existing files are checked too)
-/// and re-appends the remainder; the workdir itself is canonicalized at
-/// config load, so a plain prefix comparison is sound.
+/// Check that `full` stays inside `root`. Canonicalizes `root` first, then the
+/// deepest existing ancestor of `full` (so writes to not-yet-existing files are
+/// checked too) and re-appends the remainder; a plain prefix comparison against
+/// the canonicalized root is then sound. `label` is plugged into the escape
+/// error message (e.g. "working directory", "skill directory") so the user
+/// knows which boundary was crossed.
+///
+/// Shared by the workdir sandbox (`confine`, via [`ToolCtx::workdir`]) and the
+/// per-skill-directory sandbox (`read_skill`/`list_skill` file reads), which is
+/// why the root is taken as a parameter rather than read off `ToolCtx`.
 ///
 /// **Best-effort sandbox, not a hard security boundary.** A classic TOCTOU
 /// window exists between this check and the caller's actual I/O: a path
-/// component swapped for a symlink pointing outside the workdir during that
-/// gap would slip through. `restrict_to_workdir` exists to keep the *model*
-/// from accidentally straying outside the workdir (its own `../` or absolute
-/// paths), not to resist an adversarial process with concurrent filesystem
-/// access to the workdir. A TOCTOU-hardened version (openat / `O_NOFOLLOW`
-/// directory-fd walk) would need platform-specific code on Windows and is
-/// out of scope for this threat model.
-fn confine(ctx: &ToolCtx, full: &Path) -> Result<PathBuf> {
+/// component swapped for a symlink pointing outside `root` during that gap
+/// would slip through. This exists to keep the *model* from accidentally
+/// straying outside the allowed directory (its own `../` or absolute paths),
+/// not to resist an adversarial process with concurrent filesystem access. A
+/// TOCTOU-hardened version (openat / `O_NOFOLLOW` directory-fd walk) would need
+/// platform-specific code on Windows and is out of scope for this threat model.
+pub(crate) fn confined_to(root: &Path, full: &Path, label: &str) -> Result<PathBuf> {
+    let root_c = root
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("cannot canonicalize root {}: {}", root.display(), e))?;
     let mut ancestor: &Path = full;
     let mut rest: Vec<std::ffi::OsString> = Vec::new();
     loop {
@@ -237,13 +245,10 @@ fn confine(ctx: &ToolCtx, full: &Path) -> Result<PathBuf> {
                 for comp in rest.iter().rev() {
                     resolved.push(comp);
                 }
-                if resolved.starts_with(&ctx.workdir) {
+                if resolved.starts_with(&root_c) {
                     return Ok(resolved);
                 }
-                bail!(
-                    "path escapes the working directory (restrict_to_workdir): {}",
-                    full.display()
-                );
+                bail!("path escapes the {label}: {}", full.display());
             }
             Err(_) => match ancestor.file_name() {
                 Some(name) => {
@@ -256,6 +261,14 @@ fn confine(ctx: &ToolCtx, full: &Path) -> Result<PathBuf> {
             },
         }
     }
+}
+
+/// Check that `full` stays inside the workdir. Thin wrapper over [`confined_to`]
+/// for the workdir-rooted sandbox used by `restrict_to_workdir`. The workdir is
+/// canonicalized at config load, and `confined_to` canonicalizes it again
+/// (idempotent), so the prefix comparison is sound.
+fn confine(ctx: &ToolCtx, full: &Path) -> Result<PathBuf> {
+    confined_to(&ctx.workdir, full, "working directory (restrict_to_workdir)")
 }
 
 #[cfg(test)]

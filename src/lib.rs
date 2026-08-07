@@ -138,24 +138,43 @@ fn assemble(
     tool_list.extend(mcp_tools.into_iter().map(|t| Box::new(t) as Box<dyn tools::Tool>));
     tool_list.extend(extra_tools);
 
-    // Skills (progressive disclosure): scan global + project dirs, preload only
-    // each skill's name+description into the system prompt (level 1), and pair a
-    // ReadSkill tool so the model can pull a skill's full body / sidecar files
-    // into history on demand (levels 2/3). One bad skill never breaks startup —
-    // malformed entries are skipped with a stderr warning. ReadSkill is NOT in
-    // the config whitelist; it is injected here, so sub-agents (which build
-    // their own whitelist-based tool list) don't carry it. The intro is appended
-    // to a clone of the config (assembly never mutates caller state); Agent::new
-    // then reads the augmented system_prompt from this clone.
+    // Skills (progressive disclosure, agentskills.io open standard): scan global
+    // + project dirs, preload only each skill's name+description into the system
+    // prompt (level 1), and pair ReadSkill (load SKILL.md / a resource file →
+    // history, levels 2/3) + ListSkill (discover a skill's bundled files, level
+    // 3). One bad skill never breaks startup — malformed entries are skipped
+    // with a stderr warning. Neither tool is in the config whitelist; both are
+    // injected here, so sub-agents (which build their own whitelist-based tool
+    // list) don't carry them. The intro is appended to a clone of the config
+    // (assembly never mutates caller state); Agent::new then reads the augmented
+    // system_prompt from this clone.
     let skill_dirs = resolve_skill_dirs(&workdir);
     let (index, warnings) = skills::scan(&skill_dirs);
     for w in &warnings {
         eprintln!("[skill] {w}");
     }
+    // allowed-tools (experimental frontmatter field): warn-only — TinyAgent has
+    // no per-turn permission/activation layer, so it can't grant a skill's
+    // declared tools for a single turn the way Claude Code does. Surface a
+    // declared tool that isn't available so the author notices the mismatch;
+    // literal-name match only (the spec is space-separated tool names; Claude
+    // Code's glob/`Tool(spec)` patterns are an extension we don't support).
+    for e in index.entries() {
+        for t in &e.allowed_tools {
+            let known = cfg.tools.iter().any(|c| c == t) || t == "read_skill" || t == "list_skill";
+            if !known {
+                eprintln!(
+                    "[skill] {} declares allowed-tool {:?} not in the tool whitelist",
+                    e.name, t
+                );
+            }
+        }
+    }
     let mut cfg = cfg.clone();
     if !index.is_empty() {
         cfg.system_prompt = Some(skills::render_intro(cfg.system_prompt.as_deref(), &index));
-        tool_list.push(Box::new(tools::ReadSkill::new(index)) as Box<dyn tools::Tool>);
+        tool_list.push(Box::new(tools::ReadSkill::new(index.clone())) as Box<dyn tools::Tool>);
+        tool_list.push(Box::new(tools::ListSkill::new(index)) as Box<dyn tools::Tool>);
     }
 
     let ctx = ToolCtx {
