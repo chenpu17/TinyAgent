@@ -560,12 +560,10 @@ headless 模式下 `Ctrl-C` 走**优雅取消**：首次 SIGINT 在流式 chunk 
 
 - **并行仅限同 turn 的多个 `task` 调用**：一次 turn 内多个 `task` 并行；叶子工具顺序。工作目录隔离（worktree）不做——子 agent 共享主工作目录，约定并发子 agent 不写同一文件即可。
 - **不可递归**：子 agent 的工具白名单会滤掉 `task` 本身，所以子 agent 不能再开子 agent（无需深度计数）。
-- **不进默认白名单**：在配置的 `tools` 里显式加 `"task"` 才启用。
-
-启用：在配置 `tools` 数组加入 `"task"` 即可。
+- **默认启用**：`task` 在内置工具默认白名单中，TUI 对话或 headless 运行无需额外配置即可委派子任务。评测 / CI 若想锁定行为与成本，在 config 的 `tools` 里显式列出、去掉 `"task"`：
 
 ```json
-"tools": ["shell", "read_file", "write_file", "edit_file", "list_dir", "task"]
+"tools": ["shell", "read_file", "write_file", "edit_file", "list_dir"]
 ```
 
 ## 开发
