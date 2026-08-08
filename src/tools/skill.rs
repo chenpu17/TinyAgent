@@ -388,7 +388,9 @@ mod tests {
             .unwrap();
         assert!(!out.is_error, "{}", out.content);
         assert!(out.content.contains("SKILL.md"), "{}", out.content);
-        assert!(out.content.contains("scripts/release.sh"), "{}", out.content);
+        // walk_skill emits paths with the platform separator (\ on Windows).
+        let sep = if cfg!(unix) { "/" } else { "\\" };
+        assert!(out.content.contains(&format!("scripts{sep}release.sh")), "{}", out.content);
         assert!(out.content.contains("references.md"), "{}", out.content);
         fs::remove_dir_all(&dir).ok();
     }

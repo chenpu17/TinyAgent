@@ -592,9 +592,13 @@ mod tests {
 
     #[test]
     fn global_dir_follows_xdg_then_home() {
+        // is_absolute() is platform-dependent (Windows needs a drive letter),
+        // so pass a host-absolute XDG path or the "xdg wins" branch isn't taken
+        // on Windows. Build the expected path with join() (separator-agnostic).
+        let xdg = if cfg!(unix) { "/custom/xdg" } else { "C:/custom/xdg" };
         assert_eq!(
-            default_global_skills_dir_in(Some("/custom/xdg"), None),
-            Some(PathBuf::from("/custom/xdg/tinyagent/skills"))
+            default_global_skills_dir_in(Some(xdg), None),
+            Some(PathBuf::from(xdg).join("tinyagent").join("skills"))
         );
         assert_eq!(
             default_global_skills_dir_in(None, Some("/home/me")),
