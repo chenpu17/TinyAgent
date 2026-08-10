@@ -295,6 +295,13 @@ fn main() -> Result<()> {
         if cli.output.is_some() {
             bail!("--output only applies to headless (non-TUI) mode");
         }
+        if cli.retries != 0 {
+            // Each TUI message is a single run with its own (Esc/Ctrl-C)
+            // cancellation — there's no transient-retry loop to wire into, so a
+            // --retries value here would be silently ignored. Reject it rather
+            // than let the user think retries are in effect.
+            bail!("--retries only applies to headless (non-TUI) mode");
+        }
         #[cfg(feature = "tui")]
         {
             // Resume-aware: only an explicit --task is layered on top of

@@ -50,12 +50,20 @@ pub fn run(
     failed: bool,
     cancel: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<i32> {
+    // If --report points at a *.json inside the batch dir, a re-run would pick
+    // up the prior report.json as a task fragment (it's a *.json sitting in
+    // `dir`). Canonicalize lets us skip exactly that file when it already
+    // exists; on a first run the report isn't there yet, so nothing matches.
+    let report_canon = report_path.canonicalize().ok();
     let mut files: Vec<PathBuf> = Vec::new();
     for e in std::fs::read_dir(dir)
         .with_context(|| format!("cannot read batch dir: {}", dir.display()))?
     {
         let p = e?.path();
         if p.extension().and_then(|s| s.to_str()) == Some("json") {
+            if matches!(&report_canon, Some(rc) if p.canonicalize().ok().as_ref() == Some(rc)) {
+                continue;
+            }
             files.push(p);
         }
     }
@@ -266,20 +274,22 @@ fn run_one_attempt(
 ) -> TaskReport {
     let start = std::time::Instant::now();
     // `usage` is the token cost to bill this report. bad_task / setup_error burn
-    // nothing (zero); the transient-error path bills the accumulated cost across
-    // attempts (passed in from the caller after `acc.add_failed`).
-    let bad = |stop: &str, msg: String, usage: &crate::provider::Usage| TaskReport {
-        name: name.into(),
-        success: false,
-        stop_reason: stop.into(),
-        turns: 0,
-        elapsed_secs: start.elapsed().as_secs_f64(),
-        error: Some(msg),
-        input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens,
-        cache_creation_input_tokens: usage.cache_creation_input_tokens,
-        cache_read_input_tokens: usage.cache_read_input_tokens,
-    };
+    // nothing (zero, turns=0); the transient-error path bills the accumulated
+    // cost across attempts (passed in from the caller after `acc.add_failed`),
+    // including the turns those failed attempts actually completed.
+    let bad =
+        |stop: &str, msg: String, usage: &crate::provider::Usage, turns: u32| TaskReport {
+            name: name.into(),
+            success: false,
+            stop_reason: stop.into(),
+            turns,
+            elapsed_secs: start.elapsed().as_secs_f64(),
+            error: Some(msg),
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            cache_read_input_tokens: usage.cache_read_input_tokens,
+        };
     let zero = crate::provider::Usage::default();
 
     let mut cfg = base.clone();
@@ -291,16 +301,18 @@ fn run_one_attempt(
                  are overridable in batch mode)"
             ),
             &zero,
+            0,
         );
     }
     if let Err(e) = cfg.apply(partial.clone()) {
-        return bad("bad_task", format!("{e:#}"), &zero);
+        return bad("bad_task", format!("{e:#}"), &zero, 0);
     }
     if cfg.task.is_none() {
         return bad(
             "bad_task",
             "task file did not set \"task\" and base config has none".into(),
             &zero,
+            0,
         );
     }
 
@@ -314,7 +326,7 @@ fn run_one_attempt(
     ])];
     let mut agent = match crate::build_agent(&cfg, initial, client) {
         Ok(a) => a,
-        Err(e) => return bad("setup_error", format!("agent setup failed: {e:#}"), &zero),
+        Err(e) => return bad("setup_error", format!("agent setup failed: {e:#}"), &zero, 0),
     };
 
     let outcome = agent.run(&mut |_| {}); // quiet: no per-event printing
@@ -378,7 +390,7 @@ fn run_one_attempt(
             }
             // Bill the accumulated cost (this attempt + any prior retries) so a
             // failed task reports honest token totals in report.json, not zero.
-            bad("error", msg, &acc.usage)
+            bad("error", msg, &acc.usage, acc.turns)
         }
     }
 }
@@ -425,7 +437,7 @@ fn run_one(
                 name: name.into(),
                 success: false,
                 stop_reason: "cancelled".into(),
-                turns: report.turns,
+                turns: acc.turns,
                 elapsed_secs: start.elapsed().as_secs_f64(),
                 error: Some("cancelled by user during retry backoff".into()),
                 // Preserve the tokens burned by the failed attempts before the
@@ -550,6 +562,13 @@ fn write_report(path: &Path, reports: &[TaskReport]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    /// Recorded [start, end] window for each request the mock served — used to
+    /// prove two batch tasks' provider calls actually overlapped in wall clock.
+    type Spans = Arc<Mutex<Vec<(Instant, Instant)>>>;
 
     #[test]
     fn failed_names_from_report_selects_failures() {
@@ -836,6 +855,176 @@ mod tests {
                 .contains("backoff"),
             "expected a backoff-cancel message, got {:?}",
             tasks[0].error
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ─── HTTP-mock helpers for batch integration tests ─────────────────
+    //
+    // Minimal HTTP/1.1 server on a loopback port. reqwest::blocking talks
+    // HTTP/1.1 to it as it would to a real gateway. Each response carries
+    // Content-Length AND `connection: close` so reqwest opens a fresh socket
+    // per request (no pool reuse). Thread-per-connection so concurrent batch
+    // workers are served in parallel — a single accept thread would serialize
+    // them and mask the very concurrency these tests exist to prove (the same
+    // reason examples/mock_openai.py uses ThreadingHTTPServer).
+
+    /// Read one HTTP request's body off `stream` (parse headers for
+    /// Content-Length, then read exactly that many bytes).
+    fn read_http_body(stream: &std::net::TcpStream) -> String {
+        let mut reader = BufReader::new(stream.try_clone().expect("clone tcp"));
+        let mut content_length = 0usize;
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let trimmed = line.trim_end_matches(['\r', '\n']);
+            if trimmed.is_empty() {
+                break; // end of headers
+            }
+            if let Some(v) = trimmed.to_ascii_lowercase().strip_prefix("content-length:") {
+                content_length = v.trim().parse().unwrap_or(0);
+            }
+        }
+        let mut body = vec![0u8; content_length];
+        if content_length > 0 {
+            let _ = reader.read_exact(&mut body);
+        }
+        String::from_utf8_lossy(&body).into_owned()
+    }
+
+    /// Loopback mock that sleeps `delay` on every request then returns a
+    /// minimal success SSE, recording each request's [start, end] window.
+    /// Thread-per-connection (see note above) so two concurrent workers'
+    /// sleep windows actually overlap in wall clock.
+    fn slow_ok_mock(delay: Duration) -> (String, Spans) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let spans: Spans = Arc::new(Mutex::new(Vec::new()));
+        let spans_c = spans.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let stream = match stream {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let spans_c2 = spans_c.clone();
+                std::thread::spawn(move || {
+                    let mut s = stream;
+                    let _body = read_http_body(&s);
+                    let start = Instant::now();
+                    std::thread::sleep(delay);
+                    let end = Instant::now();
+                    spans_c2.lock().unwrap().push((start, end));
+                    let payload = concat!(
+                        "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"done\"}}]}\n\n",
+                        "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n",
+                        "data: [DONE]\n\n",
+                    );
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        payload.len(),
+                    );
+                    let _ = s.write_all(head.as_bytes());
+                    let _ = s.write_all(payload.as_bytes());
+                    let _ = s.flush();
+                });
+            }
+        });
+        (url, spans)
+    }
+
+    #[test]
+    fn report_json_inside_batch_dir_is_skipped_as_a_task() {
+        // Low12: when --report points at a *.json INSIDE the batch dir, the task
+        // scanner must skip it (canonicalize compare) — otherwise the prior
+        // report.json is parsed as a task fragment and fails (it has report-shape
+        // keys; PartialConfig's deny_unknown_fields rejects them). We pre-write
+        // report.json at the exact report path plus one real task, cancel-gate
+        // the run so no provider is needed, and assert exactly one task was
+        // scanned. If the skip were broken, run() would Err at parse time (or a
+        // second phantom task would appear) — the count==1 assertion catches it.
+        let dir = std::env::temp_dir().join(format!("ta-batch-skip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let report = dir.join("report.json");
+        // A realistic prior report sitting in the batch dir — valid JSON but a
+        // REPORT, not a task fragment.
+        std::fs::write(
+            &report,
+            r#"{"total":1,"succeeded":1,"failed":0,"tasks":[{"name":"task-a","success":true}]}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("task-a.json"), r#"{"task":"do a"}"#).unwrap();
+
+        let base: Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"MOCK_API_KEY","model":"m"}"#,
+        )
+        .unwrap();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(true)); // gate everything
+
+        let code = run(&base, &dir, 1, &report, 0, false, cancel).unwrap();
+        assert_eq!(code, 130);
+
+        let tasks = read_prior_tasks(&report).unwrap();
+        // Exactly one task scanned+gated — report.json was NOT treated as a task.
+        assert_eq!(
+            tasks.len(),
+            1,
+            "report.json inside the batch dir must be skipped, not scanned as a task"
+        );
+        assert_eq!(tasks[0].name, "task-a");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn jobs_runs_tasks_in_parallel() {
+        // G-1: prove --jobs N actually overlaps task execution in wall-clock
+        // time. A serial worker pool (or a std::thread::scope that accidentally
+        // awaited each task before spawning the next) still passes every
+        // functional test — only a timing assertion on a thread-per-connection
+        // mock catches the regression. Per the project's own guidance: concurrency
+        // needs a threaded-mock e2e, not a functional unit test.
+        //
+        // Two tasks, jobs=2, each driving one 400ms provider request. The mock
+        // records each request's [start, end] sleep window; the rigorous check
+        // is that those two windows OVERLAP (serial execution would leave a
+        // strict gap: window B starts only after window A ends).
+        let delay = Duration::from_millis(400);
+        let (url, spans) = slow_ok_mock(delay);
+        let dir = std::env::temp_dir().join(format!("ta-batch-par-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.json"), r#"{"task":"do a"}"#).unwrap();
+        std::fs::write(dir.join("b.json"), r#"{"task":"do b"}"#).unwrap();
+
+        // Unique env var so parallel tests can't observe each other's state.
+        std::env::set_var("TA_BATCH_PAR_KEY", "dummy");
+        let base: Config = serde_json::from_str(&format!(
+            r#"{{"provider":"openai","api_key_env":"TA_BATCH_PAR_KEY","model":"m","base_url":"{}"}}"#,
+            url
+        ))
+        .unwrap();
+        let report = dir.join("report.json");
+
+        let code = run(&base, &dir, 2, &report, 0, false, Default::default()).unwrap();
+        assert_eq!(code, 0, "both tasks should succeed against the mock");
+
+        let s = spans.lock().unwrap();
+        assert_eq!(s.len(), 2, "exactly two provider requests (one per task)");
+        let (a, b) = (s[0], s[1]);
+        // Standard interval-overlap test: [a.0,a.1] and [b.0,b.1] overlap iff
+        // a.0 <= b.1 && b.0 <= a.1. Serial execution → b.0 > a.1 (a's window
+        // closes before b's opens) → the second conjunct fails. With 400ms
+        // sleeps and near-simultaneous worker startup, parallel overlap is
+        // hundreds of ms — not a boundary case.
+        assert!(
+            a.0 <= b.1 && b.0 <= a.1,
+            "request intervals must overlap for true parallelism: A={a:?} B={b:?}"
         );
 
         std::fs::remove_dir_all(&dir).ok();

@@ -1685,6 +1685,26 @@
     }
 
     #[test]
+    fn is_context_overflow_distinguishes_input_from_output_token_limit() {
+        // Unambiguous context-overflow phrases match (compressing may help).
+        assert!(is_context_overflow(&anyhow::anyhow!("context_length_exceeded")));
+        assert!(is_context_overflow(&anyhow::anyhow!("prompt is too long")));
+        // A bare "token limit exceeded" is some gateways' INPUT-overflow wording
+        // → matches (compressing may help).
+        assert!(is_context_overflow(&anyhow::anyhow!("token limit exceeded")));
+        // …but the same phrase in an OUTPUT / completion context must NOT match —
+        // compressing the input won't fix a max-output-tokens error, and treating
+        // it as overflow wastes one force-compress + retry that fails identically.
+        assert!(!is_context_overflow(&anyhow::anyhow!("max output token limit exceeded")));
+        assert!(!is_context_overflow(&anyhow::anyhow!(
+            "completion token limit exceeded"
+        )));
+        // Control: unrelated errors never match.
+        assert!(!is_context_overflow(&anyhow::anyhow!("rate limit exceeded")));
+        assert!(!is_context_overflow(&anyhow::anyhow!("invalid api key")));
+    }
+
+    #[test]
     fn build_window_transcript_strips_marker_returns_old_summary() {
         // The rolling-summary mechanism: when the head already carries a summary
         // block (a later compression), build_window_transcript must (a) return

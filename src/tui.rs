@@ -518,7 +518,19 @@ fn copy_to_clipboard(text: &str) -> bool {
         // and Rust's `Child::drop` does NOT reap on Unix — leaking a zombie
         // until process exit. wait() runs unconditionally; its result still
         // combines with `fed` so a failed write reports failure.
-        let exited_ok = child.wait().map(|s| s.success()).unwrap_or(false);
+        //
+        // Bound the wait at 3s: a clipboard tool that holds stdin open without
+        // exiting (e.g. xclip daemonizing in some modes) would otherwise hang
+        // the whole TUI. The thread owns the child and reaps it whenever it
+        // finally exits; on timeout we just stop blocking the UI.
+        let exited_ok = {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(child.wait().map(|s| s.success()).unwrap_or(false));
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap_or(false)
+        };
         let ok = fed && exited_ok;
         if ok {
             return true;
@@ -862,6 +874,10 @@ fn ui_loop(
                         run_start = None;
                         streaming = false;
                         sub_streaming_name = None;
+                        // TurnStart sets this true; without resetting it here a
+                        // worker that dies during the thinking phase (before any
+                        // TextDelta clears it) would leave a stale flag.
+                        thinking = false;
                         dirty = true;
                         rows.push(Row::sys_error(
                             "[worker stopped unexpectedly — type /quit to exit]",

@@ -14,31 +14,44 @@ pub(crate) fn backoff(attempt: usize) -> Duration {
     backoff_with(attempt, jitter_seed())
 }
 
+/// Slice `dur` into ~100ms pieces, sleeping via `sleep` and aborting early as
+/// soon as `cancelled()` returns true (returning `true`). The pure-logic core
+/// shared by the live path (`sleep_cancelable`: real `thread::sleep` + an
+/// `AtomicBool`) and the testable harness retry path (an injected no-op `sleep`
+/// + `agent.cancelled()`), so the two callers can't drift apart.
+pub(crate) fn sleep_cancelable_with(
+    dur: Duration,
+    sleep: &mut impl FnMut(Duration),
+    cancelled: impl Fn() -> bool,
+) -> bool {
+    const SLICE: Duration = Duration::from_millis(100);
+    let mut remaining = dur;
+    while remaining > SLICE {
+        if cancelled() {
+            return true;
+        }
+        sleep(SLICE);
+        remaining = remaining.saturating_sub(SLICE);
+    }
+    if cancelled() {
+        return true;
+    }
+    if remaining > Duration::ZERO {
+        sleep(remaining);
+    }
+    cancelled()
+}
+
 /// Sleep for `dur`, but return early (returning `true`) as soon as `cancel` is
 /// set — checking roughly every 100ms. Used between retry attempts so a Ctrl-C
 /// during the (up to ~40s with jitter) backoff is honored within ~100ms instead
 /// of after the whole sleep, which would let the next attempt run a full task
-/// the user just asked to abort. The final sub-100ms tail is slept whole after
-/// one last cancel check, and `cancel` is re-checked on return so a signal
-/// landing in that tail is still caught before the caller proceeds.
+/// the user just asked to abort. Delegates to the shared `sleep_cancelable_with`
+/// core with real sleep + an atomic cancel flag.
 pub(crate) fn sleep_cancelable(cancel: &std::sync::atomic::AtomicBool, dur: Duration) -> bool {
     use std::sync::atomic::Ordering;
-    const SLICE: Duration = Duration::from_millis(100);
-    let mut remaining = dur;
-    while remaining > SLICE {
-        if cancel.load(Ordering::Relaxed) {
-            return true;
-        }
-        std::thread::sleep(SLICE);
-        remaining = remaining.saturating_sub(SLICE);
-    }
-    if cancel.load(Ordering::Relaxed) {
-        return true;
-    }
-    if remaining > Duration::ZERO {
-        std::thread::sleep(remaining);
-    }
-    cancel.load(Ordering::Relaxed)
+    let mut s = std::thread::sleep;
+    sleep_cancelable_with(dur, &mut s, || cancel.load(Ordering::Relaxed))
 }
 
 /// Base backoff in milliseconds (before jitter).

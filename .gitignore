@@ -7,3 +7,5 @@
 /.tinyagent-harness-session.json
 /glm-tui.json
 /测试模型.md
+*.swp
+*.swo

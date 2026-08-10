@@ -6,11 +6,15 @@ Behavior:
     on mock_output.txt.
   - Second request (has a `tool` message): streams a final text answer.
 
+Threaded (ThreadingHTTPServer) so concurrent batch workers (--jobs N) are
+served in parallel instead of serialized behind a single connection — a
+single-threaded mock silently masks concurrency bugs.
+
 Usage: python3 mock_openai.py [port]   (default 8791)
 """
 import json
 import sys
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8791
 
@@ -61,4 +65,4 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     print(f"mock OpenAI server on http://127.0.0.1:{PORT}", file=sys.stderr)
-    HTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+    ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()

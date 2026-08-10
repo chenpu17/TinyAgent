@@ -125,6 +125,12 @@ pub struct RunError {
     pub usage: Usage,
     /// Tool calls executed in this run before it errored.
     pub tool_calls: Vec<ToolCallRecord>,
+    /// Turns completed before the error — surfaced in result.json on failure so
+    /// the schema matches the success path (a CI consumer reads `.turns` /
+    /// `.elapsed_secs` regardless of `.success`).
+    pub turns: u32,
+    /// Compute time elapsed before the error.
+    pub elapsed: Duration,
 }
 
 impl std::fmt::Display for RunError {
@@ -152,6 +158,10 @@ impl std::error::Error for RunError {
 pub struct RunCost {
     pub usage: Usage,
     pub tool_calls: Vec<ToolCallRecord>,
+    /// Turns accumulated across failed attempts (folded into the outcome so
+    /// `result.json`'s `turns`/`elapsed_secs` stay consistent on success).
+    pub turns: u32,
+    pub elapsed: Duration,
 }
 
 impl RunCost {
@@ -164,6 +174,8 @@ impl RunCost {
         self.usage.cache_creation_input_tokens += re.usage.cache_creation_input_tokens;
         self.usage.cache_read_input_tokens += re.usage.cache_read_input_tokens;
         self.tool_calls.extend(re.tool_calls.iter().cloned());
+        self.turns += re.turns;
+        self.elapsed += re.elapsed;
     }
 
     /// Fold this accumulated cost into a successful outcome so its reported
@@ -177,6 +189,8 @@ impl RunCost {
         // Earlier attempts first, then this attempt's tool calls.
         self.tool_calls.append(&mut o.tool_calls);
         o.tool_calls = std::mem::take(&mut self.tool_calls);
+        o.turns += self.turns;
+        o.elapsed += self.elapsed;
     }
 }
 
@@ -344,11 +358,19 @@ impl Agent {
     /// accumulated `usage` + the `records` of tools already executed), so a
     /// retry loop can bill the failed attempt honestly. Called at every
     /// error-return point in `run_impl`.
-    fn run_error(&self, source: anyhow::Error, records: &[ToolCallRecord]) -> RunError {
+    fn run_error(
+        &self,
+        source: anyhow::Error,
+        records: &[ToolCallRecord],
+        turns: u32,
+        elapsed: Duration,
+    ) -> RunError {
         RunError {
             source,
             usage: self.usage,
             tool_calls: records.to_vec(),
+            turns,
+            elapsed,
         }
     }
 
@@ -608,9 +630,9 @@ impl Agent {
                                 continue;
                             }
                         }
-                        return Err(self.run_error(e, &records));
+                        return Err(self.run_error(e, &records, turns, start.elapsed()));
                     }
-                    Err(e) => return Err(self.run_error(e, &records)),
+                    Err(e) => return Err(self.run_error(e, &records, turns, start.elapsed())),
                 }
             };
             if let Some(u) = resp.usage {

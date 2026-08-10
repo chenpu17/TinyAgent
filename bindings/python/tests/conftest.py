@@ -22,9 +22,23 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import pytest
+
 # Repo root (…/TinyAgent): tests/ → python/ → bindings/ → root.
 REPO_ROOT = Path(__file__).resolve().parents[3]
 MOCK_OPENAI = REPO_ROOT / "examples" / "mock_openai.py"
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_skills_dir(tmp_path, monkeypatch):
+    """Pin XDG_CONFIG_HOME at an empty temp dir so the agent's skill scan
+    (`default_global_skills_dir` reads XDG_CONFIG_HOME) never picks up the
+    developer's real ~/.config/tinyagent/skills/. Without this, any test that
+    builds an Agent through assemble() auto-injects read_skill/list_skill on
+    machines with global skills installed, breaking tool-count assertions.
+    `monkeypatch.setenv` calls os.putenv, which updates the C-level environ
+    the in-process Rust extension reads via std::env::var."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
 
 
 def _free_port() -> int:

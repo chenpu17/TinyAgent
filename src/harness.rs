@@ -86,26 +86,19 @@ pub(crate) fn run_with_retries(
                         eprintln!("[transient] {msg}; retry {attempt}/{retries} in {backoff:?}");
                     }
                     // Slice the backoff so a Ctrl-C during it is noticed within
-                    // ~100ms (the agent.cancelled() check below then breaks)
-                    // instead of after the full ~40s sleep. The injected `sleep`
-                    // is honored per slice (a no-op in tests).
-                    let mut remaining = backoff;
-                    let slice = std::time::Duration::from_millis(100);
-                    while remaining > slice {
-                        if agent.cancelled() {
-                            break;
-                        }
-                        sleep(slice);
-                        remaining = remaining.saturating_sub(slice);
-                    }
-                    if !agent.cancelled() && remaining > std::time::Duration::ZERO {
-                        sleep(remaining);
-                    }
-                    // A Ctrl-C during the backoff flips the cancel flag, but
-                    // the next agent.run clears it at entry and would proceed
-                    // — making the first Ctrl-C look like a no-op (only the
-                    // second SIGINT force-exits). Honor it here instead.
-                    if agent.cancelled() {
+                    // ~100ms instead of after the full ~40s sleep. The shared
+                    // slice core (retry::sleep_cancelable_with) honors the
+                    // injected `sleep` per slice (a no-op in tests) and reads
+                    // the agent's own cancel flag. A Ctrl-C during the backoff
+                    // flips that flag, but the next agent.run clears it at entry
+                    // and would proceed — making the first Ctrl-C look like a
+                    // no-op (only the second SIGINT force-exits) — so honor it
+                    // here instead of falling through to the next attempt.
+                    if crate::retry::sleep_cancelable_with(
+                        backoff,
+                        &mut sleep,
+                        || agent.cancelled(),
+                    ) {
                         break (
                             EXIT_CANCELLED,
                             None,
@@ -360,11 +353,14 @@ pub fn write_result(
             json!({
                 "success": false,
                 "stop_reason": none_stop_reason,
+                "turns": acc.turns,
                 "attempts": attempts,
+                "elapsed_secs": acc.elapsed.as_secs_f64(),
                 "input_tokens": acc.usage.input_tokens,
                 "output_tokens": acc.usage.output_tokens,
                 "cache_creation_input_tokens": acc.usage.cache_creation_input_tokens,
                 "cache_read_input_tokens": acc.usage.cache_read_input_tokens,
+                "summary": "",
                 "tool_calls": tool_calls,
                 "error": error_val,
             })
@@ -736,6 +732,8 @@ mod tests {
                 output: "a.txt".into(),
                 is_error: false,
             }],
+            turns: 3,
+            elapsed: std::time::Duration::from_secs(12),
         };
         let path = dir.join("fail.json");
         write_result(&path, None, Some("provider 503"), 2, "error", Some(&acc)).unwrap();
@@ -751,6 +749,12 @@ mod tests {
         assert_eq!(parsed["output_tokens"], 40);
         assert_eq!(parsed["cache_creation_input_tokens"], 100);
         assert_eq!(parsed["cache_read_input_tokens"], 50);
+        // turns/elapsed_secs/summary are present on the failure path too, so
+        // CI consumers reading result.json get a stable schema regardless of
+        // success (the failure path used to omit these keys entirely).
+        assert_eq!(parsed["turns"], 3);
+        assert_eq!(parsed["elapsed_secs"], 12.0);
+        assert_eq!(parsed["summary"], "");
         // And the tool call from the failed attempt is recorded too.
         assert_eq!(parsed["tool_calls"][0]["name"], "shell");
         assert_eq!(parsed["tool_calls"][0]["output"], "a.txt");

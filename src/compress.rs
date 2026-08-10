@@ -56,8 +56,9 @@ pub(crate) const SUMMARY_CHUNK_BUDGET: u32 = 1024;
 /// model's context window. Both providers surface the raw HTTP body in the
 /// anyhow error's Display (`openai.rs` "…API error 400: {text}",
 /// `anthropic.rs` "…API error {status}: {text}"), so a case-blind substring
-/// match is enough. `body_fix_for_400` has already absorbed the max_tokens /
-/// stream_options 400s, so only genuine overflow reaches here.
+/// match is enough. The OpenAI 400-fix path (`diagnose_400`/`apply_fix`) has
+/// already absorbed the max_tokens / stream_options / reasoning_effort 400s, so
+/// only genuine overflow reaches here.
 ///
 /// Kept SPECIFIC: a non-overflow error misread as overflow wastes one
 /// force-compress + retry before the real error surfaces, so vague phrases
@@ -72,7 +73,11 @@ pub(crate) const OVERFLOW_PHRASES: &[&str] = &[
     "input length and max_tokens", // Anthropic "input length + max_tokens exceed context"
     "input too long",              // some OpenAI-compatible gateways
     "exceeds the context window",  // vLLM / Ollama / gateways
-    "token limit exceeded",        // some gateways
+    // NOTE: bare "token limit exceeded" is intentionally NOT here — some
+    // gateways use it for context overflow, but it ALSO appears in OUTPUT-token-
+    // limit errors, which compressing won't fix (the failure would repeat on the
+    // shorter history, wasting one force-compress + retry). It's matched with a
+    // guard in `is_context_overflow` instead.
 ];
 
 /// Rough size estimate of a conversation (chars; images count cheaply).
@@ -113,10 +118,19 @@ pub(crate) fn estimate_tokens(messages: &[Message], system: Option<&str>, tool_s
 
 /// True if a provider error looks like "the request was too long for the
 /// model's context window" — i.e. compressing and retrying might let it fit.
-/// See `OVERFLOW_PHRASES` for the match surface.
+/// See `OVERFLOW_PHRASES` for the unambiguous match surface, plus the guarded
+/// "token limit exceeded" below.
 pub(crate) fn is_context_overflow(e: &anyhow::Error) -> bool {
     let msg = format!("{e:#}").to_lowercase();
-    OVERFLOW_PHRASES.iter().any(|p| msg.contains(p))
+    if OVERFLOW_PHRASES.iter().any(|p| msg.contains(p)) {
+        return true;
+    }
+    // "token limit exceeded" is ambiguous: some gateways emit it for INPUT
+    // context overflow (compressing helps), but it also appears in OUTPUT-token-
+    // limit errors (compressing does NOT help — the failure repeats on the
+    // shorter history, wasting one force-compress + retry). Match it only when
+    // the message doesn't name an output/completion context.
+    msg.contains("token limit exceeded") && !msg.contains("output") && !msg.contains("completion")
 }
 
 /// Build the compressed history: original task (with the summary folded in
@@ -125,7 +139,10 @@ pub(crate) fn is_context_overflow(e: &anyhow::Error) -> bool {
 /// assistant message. Previous summary blocks are replaced, not stacked —
 /// the new summary already absorbed them via the transcript.
 pub(crate) fn fold_summary(messages: &[Message], cut: usize, summary: &str) -> Vec<Message> {
-    let mut compressed = Vec::with_capacity(messages.len() - (cut - 1) + 1);
+    // Exact count: one retained head + the tail `messages[cut..]`. Saturating
+    // so a pathological cut (find_safe_cut guarantees cut>=3, but don't rely on
+    // an invariant upstream to avoid a usize underflow here) can't underflow.
+    let mut compressed = Vec::with_capacity(messages.len().saturating_sub(cut) + 1);
     let mut head = messages[0].clone();
     head.content
         .retain(|b| !matches!(b, Block::Text(t) if t.starts_with(SUMMARY_MARKER)));

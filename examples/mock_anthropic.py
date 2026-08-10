@@ -9,11 +9,14 @@ Behavior:
     split into two chunks to exercise reassembly).
   - Request containing a tool_result → stream a final text answer.
 
+Threaded (ThreadingHTTPServer) so concurrent batch workers (--jobs N) are
+served in parallel instead of serialized behind a single connection.
+
 Usage: python3 mock_anthropic.py [port]   (default 8793)
 """
 import json
 import sys
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8793
 
@@ -97,4 +100,4 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     print(f"mock Anthropic server on http://127.0.0.1:{PORT}", file=sys.stderr)
-    HTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+    ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()

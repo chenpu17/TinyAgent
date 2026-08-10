@@ -634,7 +634,16 @@ impl SseTransport {
             .connect_timeout(CONNECT_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .unwrap_or_else(|_| reqwest::blocking::Client::new());
+            .unwrap_or_else(|_| {
+                // Same key-leak rationale as http_client(): this GET carries
+                // cfg.headers (possibly Authorization), so the fallback MUST
+                // re-apply the no-redirect policy — a bare Client::new() follows
+                // redirects and would reintroduce the documented leak vector.
+                reqwest::blocking::Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .expect("reqwest client build")
+            });
         let mut req = client
             .get(url)
             .header("accept", "text/event-stream");

@@ -10,6 +10,14 @@ pub struct OpenAi {
     base_url: String,
     api_key: String,
     idle: std::time::Duration,
+    /// Body fixes learned from prior 400s on THIS gateway, applied proactively
+    /// to every subsequent request so a reasoning model on an old gateway
+    /// doesn't re-trigger the same 400 (and its wasted round-trip) on every
+    /// turn. Mutex because `chat` takes `&self` and the agent reuses one
+    /// provider across turns; it never contends in practice (the agent's chat
+    /// loop is single-threaded), but interior mutability from a shared ref is
+    /// the correct shape for a `dyn Provider`.
+    fixes: std::sync::Mutex<LearnedFixes>,
 }
 
 impl OpenAi {
@@ -24,6 +32,7 @@ impl OpenAi {
             base_url,
             api_key: api_key.to_string(),
             idle,
+            fixes: std::sync::Mutex::new(LearnedFixes::default()),
         }
     }
 
@@ -155,6 +164,37 @@ struct PendingCall {
     arguments: String,
 }
 
+/// A single request-body fix for a 400 the gateway returns when it doesn't
+/// accept a field the spec/model emits. Distinct fields → composable fixes.
+#[derive(Clone, Copy)]
+enum BodyFix {
+    /// Rename `max_tokens` → `max_completion_tokens` (reasoning models).
+    MaxCompletionTokens,
+    /// Omit `stream_options` (old gateways/vLLM); usage then unreported.
+    DropStreamOptions,
+    /// Omit `reasoning_effort` (old gateways don't know it).
+    DropReasoningEffort,
+}
+
+/// Fixes already learned for this gateway, applied proactively each turn so the
+/// 400 that taught them isn't re-triggered on every subsequent request.
+#[derive(Default)]
+struct LearnedFixes {
+    max_completion_tokens: bool,
+    no_stream_options: bool,
+    no_reasoning_effort: bool,
+}
+
+impl LearnedFixes {
+    fn record(&mut self, fix: BodyFix) {
+        match fix {
+            BodyFix::MaxCompletionTokens => self.max_completion_tokens = true,
+            BodyFix::DropStreamOptions => self.no_stream_options = true,
+            BodyFix::DropReasoningEffort => self.no_reasoning_effort = true,
+        }
+    }
+}
+
 impl Provider for OpenAi {
     fn chat(&self, req: &ChatRequest, on_event: &mut dyn FnMut(ChatEvent)) -> Result<ChatResponse> {
         let mut messages: Vec<Value> = Vec::new();
@@ -175,33 +215,44 @@ impl Provider for OpenAi {
         // Forward the reasoning-effort knob verbatim. NOT validated: every
         // vendor's ladder differs and shifts across generations, so a fixed enum
         // here would lag reality. An old gateway that doesn't know the field
-        // will 400 — `body_fix_for_400` drops it and retries once.
+        // will 400 — the diagnose_400/apply_fix path drops it (and records the
+        // fix so the next turn omits it up front).
         if let Some(eff) = req.reasoning_effort {
             body["reasoning_effort"] = json!(eff);
         }
         if !req.tools.is_empty() {
             body["tools"] = Self::tools_json(req.tools);
         }
+        // Apply fixes learned from prior turns' 400s proactively: a reasoning
+        // model on an old gateway otherwise 400s on `max_tokens` every single
+        // turn (and eats the retry round-trip each time). Learned fixes are
+        // sticky for the provider's lifetime — a gateway's quirks don't change
+        // mid-session.
+        {
+            let learned = self.fixes.lock().unwrap();
+            Self::apply_learned(&mut body, &learned);
+        }
 
         let mut resp = self.post(&body, req.per_request_timeout)?;
 
         // A 400 may name a field this gateway doesn't accept (newer reasoning
         // models reject `max_tokens`; older gateways/vLLM reject the unknown
-        // `stream_options` / `reasoning_effort`). Apply known fixes and retry —
-        // at most three times. Each fix mutates a distinct field, so a gateway
-        // rejecting ALL THREE (reasoning model on an old vLLM gateway) is
-        // satisfied by three sequential fixes; when no known fix applies the 400
-        // bails with the text. The cap is a backstop — there are three known
-        // fixes, and a fix that can't change anything returns None and bails, so
-        // the loop always converges.
+        // `stream_options` / `reasoning_effort`). Diagnose, apply the fix, and
+        // RECORD it so the next turn's body is already fixed. At most three
+        // turns of the loop (three distinct fields); when no known fix applies
+        // the 400 bails with the text.
         for _ in 0..3 {
             if resp.status() != reqwest::StatusCode::BAD_REQUEST {
                 break;
             }
             let text = resp.text().unwrap_or_default();
-            match Self::body_fix_for_400(&text, &body) {
-                Some(fixed) => {
-                    body = fixed;
+            match Self::diagnose_400(&text, &body) {
+                Some(fix) => {
+                    Self::apply_fix(&mut body, fix);
+                    {
+                        let mut learned = self.fixes.lock().unwrap();
+                        learned.record(fix);
+                    }
                     resp = self
                         .post(&body, req.per_request_timeout)
                         .context("retry after adjusting request for 400 failed")?;
@@ -245,28 +296,74 @@ impl OpenAi {
     /// - `max_tokens`     → rename to `max_completion_tokens` (reasoning models).
     /// - `stream_options` → drop it (older gateways / vLLM). Usage then goes
     ///   unreported, which `parse_loop` already tolerates as `None`.
+    /// - `reasoning_effort` → drop it (old gateways don't know the field).
     ///
-    /// Returns `None` for an unknown 400 (the caller bails with the error text).
+    /// Thin wrapper over `diagnose_400` + `apply_fix` so the live path can
+    /// RECORD the specific fix (to skip the 400 next turn) while this stays a
+    /// pure function the tests assert against. Returns `None` for an unknown 400.
+    #[cfg(test)]
     fn body_fix_for_400(text: &str, body: &Value) -> Option<Value> {
+        let fix = Self::diagnose_400(text, body)?;
         let mut next = body.clone();
-        let obj = next.as_object_mut()?;
-        if text.contains("max_tokens") {
-            if let Some(mt) = obj.remove("max_tokens") {
-                obj.insert("max_completion_tokens".into(), mt);
-                return Some(next);
-            }
+        Self::apply_fix(&mut next, fix);
+        Some(next)
+    }
+
+    /// Classify a 400 into the single field fix it implies, iff that field is
+    /// actually present in the body (so a fix never no-ops — `apply_fix` would
+    /// change nothing and the loop would loop forever on the same 400).
+    fn diagnose_400(text: &str, body: &Value) -> Option<BodyFix> {
+        if text.contains("max_tokens") && body.get("max_tokens").is_some() {
+            return Some(BodyFix::MaxCompletionTokens);
         }
-        if text.contains("stream_options") && obj.remove("stream_options").is_some() {
-            return Some(next);
+        if text.contains("stream_options") && body.get("stream_options").is_some() {
+            return Some(BodyFix::DropStreamOptions);
         }
-        // Older OpenAI-compatible gateways / vLLM don't know `reasoning_effort`
-        // and 400 on it — drop and retry. Distinct field from the two above, so
-        // a gateway rejecting several fields is still satisfied by sequential
-        // fixes.
-        if text.contains("reasoning_effort") && obj.remove("reasoning_effort").is_some() {
-            return Some(next);
+        if text.contains("reasoning_effort") && body.get("reasoning_effort").is_some() {
+            return Some(BodyFix::DropReasoningEffort);
         }
         None
+    }
+
+    /// Apply one fix to a body. `body` is always a JSON object (the chat body).
+    fn apply_fix(body: &mut Value, fix: BodyFix) {
+        let obj = match body.as_object_mut() {
+            Some(o) => o,
+            None => return,
+        };
+        match fix {
+            BodyFix::MaxCompletionTokens => {
+                if let Some(mt) = obj.remove("max_tokens") {
+                    obj.insert("max_completion_tokens".into(), mt);
+                }
+            }
+            BodyFix::DropStreamOptions => {
+                obj.remove("stream_options");
+            }
+            BodyFix::DropReasoningEffort => {
+                obj.remove("reasoning_effort");
+            }
+        }
+    }
+
+    /// Apply ALL fixes learned from prior 400s to a fresh per-turn body, so the
+    /// first request of the turn is already adjusted (no wasted 400 round-trip).
+    fn apply_learned(body: &mut Value, learned: &LearnedFixes) {
+        let obj = match body.as_object_mut() {
+            Some(o) => o,
+            None => return,
+        };
+        if learned.max_completion_tokens {
+            if let Some(mt) = obj.remove("max_tokens") {
+                obj.insert("max_completion_tokens".into(), mt);
+            }
+        }
+        if learned.no_stream_options {
+            obj.remove("stream_options");
+        }
+        if learned.no_reasoning_effort {
+            obj.remove("reasoning_effort");
+        }
     }
 
     /// Assemble a full response from an SSE byte stream (sync, for tests).
@@ -388,13 +485,15 @@ impl OpenAi {
             // Try the vendor-native field first, fall back to OpenRouter's name.
             // `reasoning_details` (OpenRouter's structured array) is intentionally
             // ignored: `reasoning` is its plain-text projection, enough for the UI.
+            // An EMPTY `reasoning_content` (some gateways emit it as a placeholder
+            // on the first chunk) must NOT shadow a non-empty `reasoning`: filter
+            // empties before the fallback so we still pick up the real trace.
             if let Some(r) = delta["reasoning_content"]
                 .as_str()
-                .or(delta["reasoning"].as_str())
+                .filter(|s| !s.is_empty())
+                .or_else(|| delta["reasoning"].as_str().filter(|s| !s.is_empty()))
             {
-                if !r.is_empty() {
-                    on_event(ChatEvent::ThinkingDelta(r.to_string()));
-                }
+                on_event(ChatEvent::ThinkingDelta(r.to_string()));
             }
             if let Some(tc) = delta["tool_calls"].as_array() {
                 for call in tc {
@@ -472,6 +571,10 @@ impl OpenAi {
 mod tests {
     use super::*;
     use crate::provider::Message;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn body_fix_renames_max_tokens() {
@@ -820,5 +923,175 @@ mod tests {
         let resp = OpenAi::parse_stream(raw.as_bytes(), &mut |_| {}).unwrap();
         assert!(matches!(&resp.blocks[0], Block::Text(t) if t == "hi"));
         assert_eq!(resp.stop_reason, "end_turn");
+    }
+
+    // ─── HTTP-mock helpers for provider integration tests ───────────────
+    //
+    // Minimal HTTP/1.1 servers on a loopback port. reqwest::blocking talks
+    // HTTP/1.1 to them exactly as it would to a real gateway. Every response
+    // carries Content-Length AND `connection: close` so reqwest opens a fresh
+    // socket per request (no pool reuse) — exactly one mock accept per request,
+    // in arrival order, with no keep-alive ambiguity.
+
+    /// Read one HTTP request's body off `stream`: parse the headers for
+    /// Content-Length, then read exactly that many bytes. Consumes the request
+    /// so the response can be written back on the same socket.
+    fn read_http_body(stream: &std::net::TcpStream) -> String {
+        let mut reader = BufReader::new(stream.try_clone().expect("clone tcp"));
+        let mut content_length = 0usize;
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let trimmed = line.trim_end_matches(['\r', '\n']);
+            if trimmed.is_empty() {
+                break; // end of headers
+            }
+            if let Some(v) = trimmed.to_ascii_lowercase().strip_prefix("content-length:") {
+                content_length = v.trim().parse().unwrap_or(0);
+            }
+        }
+        let mut body = vec![0u8; content_length];
+        if content_length > 0 {
+            let _ = reader.read_exact(&mut body);
+        }
+        String::from_utf8_lossy(&body).into_owned()
+    }
+
+    /// Loopback OpenAI-compatible mock driven by the REQUEST BODY (not request
+    /// position): any request whose body carries the `max_tokens` key gets a
+    /// 400 naming it (driving diagnose_400 → MaxCompletionTokens); every other
+    /// request gets a minimal success SSE. Records each received body in
+    /// arrival order so the test can assert exactly which field names were sent.
+    fn max_tokens_400_mock() -> (String, Arc<Mutex<Vec<Value>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let bodies: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let bodies_c = bodies.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = match stream {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let body = read_http_body(&stream);
+                if let Ok(v) = serde_json::from_str::<Value>(&body) {
+                    bodies_c.lock().unwrap().push(v);
+                }
+                // A 400 iff the body still carries the OLD field name. (The
+                // renamed key `max_completion_tokens` does NOT contain the
+                // quoted substring `"max_tokens"` — see the test below.)
+                let is_400 = body.contains("\"max_tokens\"");
+                let (status, ct, payload): (&str, &str, &str) = if is_400 {
+                    (
+                        "400 Bad Request",
+                        "application/json",
+                        r#"{"error":{"message":"Unrecognized request argument: max_tokens","type":"invalid_request_error"}}"#,
+                    )
+                } else {
+                    (
+                        "200 OK",
+                        "text/event-stream",
+                        concat!(
+                            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"}}]}\n\n",
+                            "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n",
+                            "data: [DONE]\n\n",
+                        ),
+                    )
+                };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: {ct}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    payload.len(),
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(payload.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (url, bodies)
+    }
+
+    #[test]
+    fn learned_fix_persists_so_the_second_turn_skips_the_400() {
+        // The learned-fix cache (Mutex<LearnedFixes>) must persist across turns:
+        // a gateway that 400s on `max_tokens` once should NOT re-400 on turn 2,
+        // because turn 1's diagnose_400 → record() made turn 2's apply_learned()
+        // rename the field up front. Counting requests to a stateful mock proves
+        // the whole chain end to end: turn 1 = 1×(400) + 1×(success) = 2 requests;
+        // turn 2 = 1×(success, already fixed) = 1 request. If the cache were
+        // broken (Mutex/record/apply_learned wiring), turn 2 would re-400 and
+        // retry → 4 requests total, failing the count assertion.
+        let (url, bodies) = max_tokens_400_mock();
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("reqwest client");
+        let provider = OpenAi::new(
+            client,
+            url,
+            "k",
+            std::time::Duration::from_secs(30),
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        // Turn 1: 400 on `max_tokens` → diagnose_400 → rename to
+        // `max_completion_tokens` → record → retry succeeds.
+        let m1 = vec![Message::user(vec![Block::Text("turn one".into())])];
+        let req1 = ChatRequest {
+            system: None,
+            messages: &m1,
+            tools: &[],
+            model: "m",
+            max_tokens: 100,
+            per_request_timeout: Some(std::time::Duration::from_secs(10)),
+            cancel: cancel.clone(),
+            cache: true,
+            reasoning_effort: None,
+        };
+        let r1 = provider.chat(&req1, &mut |_| {}).expect("turn 1 recovers after fix");
+        assert_eq!(r1.stop_reason, "end_turn");
+
+        // Turn 2: body already carries `max_completion_tokens` (apply_learned
+        // fired at the top of chat()) → the gateway does NOT 400.
+        let m2 = vec![Message::user(vec![Block::Text("turn two".into())])];
+        let req2 = ChatRequest {
+            system: None,
+            messages: &m2,
+            tools: &[],
+            model: "m",
+            max_tokens: 100,
+            per_request_timeout: Some(std::time::Duration::from_secs(10)),
+            cancel: cancel.clone(),
+            cache: true,
+            reasoning_effort: None,
+        };
+        let r2 = provider.chat(&req2, &mut |_| {}).expect("turn 2 succeeds");
+        assert_eq!(r2.stop_reason, "end_turn");
+
+        let received = bodies.lock().unwrap().clone();
+        // THE cross-turn assertion: exactly 3 requests (turn 1's 400 + retry,
+        // turn 2's lone success). A broken cache makes turn 2 re-400 → 4.
+        assert_eq!(
+            received.len(),
+            3,
+            "learned fix should make turn 2 skip the 400; saw {} requests",
+            received.len()
+        );
+        // Turn 1's first request carried the old field name.
+        assert!(received[0].get("max_tokens").is_some());
+        // Turn 1's retry already renamed it.
+        assert!(received[1].get("max_completion_tokens").is_some());
+        // Turn 2's single request was proactively renamed by apply_learned.
+        assert!(
+            received[2].get("max_completion_tokens").is_some(),
+            "turn 2 body should already carry max_completion_tokens"
+        );
+        assert!(
+            received[2].get("max_tokens").is_none(),
+            "turn 2 body should NOT carry the old max_tokens key"
+        );
     }
 }

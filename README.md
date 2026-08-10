@@ -1,6 +1,6 @@
 # TinyAgent
 
-一个极简的单二进制 AI agent：一个 JSON 配置即可运行。两种模式 —— headless 执行任务（harness 场景）或 TUI 对话。目标：嵌入式低配 Linux、macOS、Windows，工具精炼、约 1 万行核心代码（核心 agent loop 集中在 `agent.rs`；可选 TUI 约 5 千行），结构清晰可快速通读并自行定制。
+一个极简的单二进制 AI agent：一个 JSON 配置即可运行。两种模式 —— headless 执行任务（harness 场景）或 TUI 对话。目标：嵌入式低配 Linux、macOS、Windows，工具精炼、约 1.5 万行核心代码（核心 agent loop 集中在 `agent.rs`；可选 TUI 约 5 千行），结构清晰可快速通读并自行定制。
 
 ## 特性
 
@@ -610,7 +610,7 @@ https://agentskills.io/specification)——三级渐进式披露、6 字段 fron
 | `name` | 是 | 1-64 字符，仅小写字母/数字/连字符 `-`，首尾不能是 `-`，不能有连续 `--`，**必须等于所在目录名** |
 | `description` | 是 | ≤1024 字符；写清"做什么 + 何时用"，含关键词帮模型识别。进 system prompt |
 | `license` | 否 | 许可证名或打包的许可证文件 |
-| `compatibility` | 否 | ≤500 字符；环境要求（运行时、系统包、网络等） |
+| `compatibility` | 否 | 建议 ≤500 字符（不强制）；环境要求（运行时、系统包、网络等） |
 | `metadata` | 否 | `key: value` 映射，扩展属性（缩进块） |
 | `allowed-tools` | 否 | 空格分隔的预批准工具名（实验性，见下） |
 

@@ -121,10 +121,13 @@ impl Usage {
     /// it: it still reflects tokens transmitted, and the guard is a coarse
     /// "stop the runaway" backstop, not a billing-precise meter.
     pub fn total(&self) -> u64 {
+        // saturating_add so a garbage u64 axis (e.g. a buggy/malicious
+        // provider feeding huge values) can't wrap the sum past the
+        // max_total_tokens budget guard — it saturates at u64::MAX instead.
         self.input_tokens
-            + self.output_tokens
-            + self.cache_creation_input_tokens
-            + self.cache_read_input_tokens
+            .saturating_add(self.output_tokens)
+            .saturating_add(self.cache_creation_input_tokens)
+            .saturating_add(self.cache_read_input_tokens)
     }
 }
 

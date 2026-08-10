@@ -194,9 +194,11 @@ fn run_subagent(
             // Honest cost even on failure: the turns the child completed before
             // erroring were real billed calls — dropping them would understate
             // the parent run's totals. The RunError carries exactly the partial
-            // usage burned (None-equivalent when nothing was billed yet: a
-            // Some(0,0) would be a noise event, so gate on >0).
-            if re.usage.input_tokens > 0 || re.usage.output_tokens > 0 {
+            // usage burned (None-equivalent when nothing was billed yet: attaching
+            // a zero usage would be a noise event, so gate on total > 0). `total`
+            // covers cache read/creation too — a child whose only cost was a
+            // prompt-cache hit (input/output zero) must still be billed.
+            if re.usage.total() > 0 {
                 out.usage = Some(re.usage);
             }
             out
