@@ -156,6 +156,7 @@ fn build_extra_tools(env: Env, tools: Option<Vec<Object>>) -> Result<Vec<Box<dyn
                     is_error: r.is_error,
                     image: None,
                     usage: None,
+                    meta: None,
                 }),
                 Err(_) => {
                     pending_tools().lock().unwrap().remove(&id);

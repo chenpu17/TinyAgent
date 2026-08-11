@@ -187,7 +187,7 @@
     /// agent never calls `api_key()`; the test wires a MockProvider directly).
     fn cfg_with(max_turns: u32, timeout_secs: u64, compress: usize) -> Config {
         let mut c = serde_json::from_str::<Config>(
-            r#"{"provider":"openai","api_key_env":"MOCK_API_KEY","model":"m"}"#,
+            r#"{"provider":"openai","api_key_env":"MOCK_API_KEY","model":"m","inject_environment":false}"#,
         )
         .expect("valid test config");
         c.limits.max_turns = max_turns;
@@ -290,6 +290,7 @@
                     cache_creation_input_tokens: 0,
                     cache_read_input_tokens: 0,
                 }),
+                meta: None,
             })
         }
     }
@@ -368,6 +369,7 @@
                     cache_creation_input_tokens: 0,
                     cache_read_input_tokens: 0,
                 }),
+                meta: None,
             })
         }
     }
@@ -2867,4 +2869,217 @@ print(factorial(int(sys.argv[1])))
         for w in roles.windows(2) {
             assert_ne!(w[0], w[1], "adjacent same-role leaked: {roles:?}");
         }
+    }
+
+    // ── `todo` plan derivation (feature A) ────────────────────────────────
+    // `extract_plan` derives the final plan from the records log (the last
+    // non-error `todo` call's input). Records live outside `messages`, so the
+    // derivation is immune to context compression — that's the whole reason it
+    // lives here rather than as an Agent field.
+
+    fn todo_rec(todos: Value, is_error: bool) -> ToolCallRecord {
+        ToolCallRecord {
+            name: "todo".into(),
+            input: todos,
+            output: "rendered".into(),
+            is_error,
+            meta: None,
+        }
+    }
+
+    #[test]
+    fn extract_plan_picks_last_nonerror_todo() {
+        let recs = vec![
+            todo_rec(json!({"todos":[{"subject":"a","status":"pending"}]}), false),
+            ToolCallRecord {
+                name: "shell".into(),
+                input: json!({}),
+                output: "y".into(),
+                is_error: false,
+                meta: None,
+            },
+            todo_rec(
+                json!({"todos":[
+                    {"subject":"a","status":"completed"},
+                    {"subject":"b","status":"in_progress"}
+                ]}),
+                false,
+            ),
+        ];
+        let plan = extract_plan(&recs).expect("last todo wins");
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].status, "completed");
+        assert_eq!(plan[1].subject, "b");
+    }
+
+    #[test]
+    fn extract_plan_skips_errored_todo_and_falls_back() {
+        // A `todo` call that errored carries no usable plan (its input may be
+        // the malformed thing the tool rejected) — fall back to the last good one.
+        let recs = vec![
+            todo_rec(json!({"todos":[{"subject":"a","status":"pending"}]}), false),
+            todo_rec(json!({"todos":[{"subject":"bad"}]}), true),
+        ];
+        let plan = extract_plan(&recs).expect("errored todo skipped");
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].subject, "a");
+    }
+
+    #[test]
+    fn extract_plan_none_when_no_todo() {
+        let recs = vec![ToolCallRecord {
+            name: "shell".into(),
+            input: json!({}),
+            output: "y".into(),
+            is_error: false,
+            meta: None,
+        }];
+        assert!(extract_plan(&recs).is_none());
+    }
+
+    #[test]
+    fn extract_plan_none_on_malformed_input() {
+        // Defensive parse: garbage in the records (shouldn't happen — the tool
+        // validates — but a hand-built record could) must never poison result.json.
+        assert!(extract_plan(&[todo_rec(json!({"todos":"notarray"}), false)]).is_none());
+        assert!(extract_plan(&[todo_rec(json!({}), false)]).is_none());
+        assert!(
+            extract_plan(&[todo_rec(
+                json!({"todos":[{"subject":"a","status":"bogus"}]}),
+                false
+            )])
+            .is_none(),
+            "bad status → None"
+        );
+    }
+
+    #[test]
+    fn todo_loop_final_plan_reflects_last_call() {
+        // Drive the real agent loop with the real `todo` tool: two `todo` calls
+        // then end_turn. The derived plan must be the LAST call's state (full
+        // replacement), proving the records-log derivation works end-to-end.
+        // Because records live outside `messages`, this same derivation is what
+        // keeps the plan correct even after context compression folds the old
+        // `todo` tool_results into the summary.
+        let cfg = cfg_with(5, 0, 0);
+        let (prov, _) = MockProvider::new(vec![
+            mock::resp_tool(
+                "t1",
+                "todo",
+                json!({"todos":[
+                    {"subject":"step a","status":"pending"},
+                    {"subject":"step b","status":"pending"}
+                ]}),
+                None,
+            ),
+            mock::resp_tool(
+                "t2",
+                "todo",
+                json!({"todos":[
+                    {"subject":"step a","status":"completed"},
+                    {"subject":"step b","status":"in_progress"}
+                ]}),
+                None,
+            ),
+            mock::resp_text("all done", None),
+        ]);
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![Box::new(crate::tools::todo::Todo)],
+            vec![user_text("do the thing")],
+            test_ctx(),
+        );
+        let o = agent.run(&mut |_| {}).unwrap();
+        let plan = extract_plan(&o.tool_calls).expect("plan derived from records");
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].subject, "step a");
+        assert_eq!(plan[0].status, "completed", "last call's state wins");
+        assert_eq!(plan[1].status, "in_progress");
+        // Both todo calls are in the records log.
+        let todo_calls = o.tool_calls.iter().filter(|r| r.name == "todo").count();
+        assert_eq!(todo_calls, 2);
+    }
+
+    #[test]
+    fn todo_loop_emits_todoupdate_event() {
+        // Each `todo` call streams an AgentEvent::TodoUpdate so --json pipelines
+        // can render live progress.
+        let cfg = cfg_with(5, 0, 0);
+        let (prov, _) = MockProvider::new(vec![
+            mock::resp_tool(
+                "t1",
+                "todo",
+                json!({"todos":[{"subject":"only","status":"in_progress"}]}),
+                None,
+            ),
+            mock::resp_text("done", None),
+        ]);
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![Box::new(crate::tools::todo::Todo)],
+            vec![user_text("go")],
+            test_ctx(),
+        );
+        let mut events = Vec::new();
+        agent.run(&mut |e| events.push(e)).unwrap();
+        let updates: Vec<usize> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::TodoUpdate { todos } => Some(todos.len()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(updates, vec![1], "exactly one TodoUpdate with the 1-item plan");
+    }
+
+    #[test]
+    fn system_with_env_prepends_block_and_keeps_base() {
+        // base present → env block first, blank-line separator, then the caller
+        // prompt in full.
+        let s = system_with_env(Some("You are a coder."), "macos", "sh -c", "/tmp/proj")
+            .expect("Some");
+        assert!(s.starts_with("# Environment\n"));
+        assert!(s.contains("- OS: macos"));
+        assert!(s.contains("- Shell: sh -c"));
+        assert!(s.contains("- Working directory: /tmp/proj"));
+        assert!(s.contains("\n\nYou are a coder."));
+        // base absent → env block stands alone (still Some, no dangling blank).
+        let alone = system_with_env(None, "linux", "sh -c", "/home").expect("Some");
+        assert!(alone.starts_with("# Environment\n"));
+        assert!(!alone.contains("\n\n"));
+        // empty base behaves like None.
+        let empty = system_with_env(Some(""), "linux", "sh -c", "/x").expect("Some");
+        assert!(!empty.contains("\n\n"));
+    }
+
+    #[test]
+    fn system_with_env_windows_vs_unix_shell_label() {
+        // Cross-platform shape is verifiable off-platform: the shell fact tracks
+        // the exact invocation shell.rs uses (sh -c on unix, cmd /C on windows).
+        let win = system_with_env(None, "windows", "cmd /C", r"C:\proj").unwrap();
+        assert!(win.contains("- OS: windows"));
+        assert!(win.contains("- Shell: cmd /C"));
+        assert!(win.contains(r"- Working directory: C:\proj"));
+
+        let lin = system_with_env(None, "linux", "sh -c", "/home/x").unwrap();
+        assert!(lin.contains("- Shell: sh -c"));
+        assert!(!lin.contains("cmd /C"));
+    }
+
+    #[test]
+    fn agent_constructs_and_runs_with_environment_injection_on() {
+        // inject_environment defaults false in cfg_with for hermeticism; flip it
+        // on explicitly and confirm Agent::new (reading ctx.workdir, building the
+        // env block) doesn't panic and a trivial loop still completes. The mock
+        // can't observe the system prompt, so this is a construction + smoke check.
+        let mut cfg = cfg_with(3, 30, 0);
+        cfg.inject_environment = true;
+        cfg.system_prompt = Some("base prompt".into());
+        let (prov, _) = MockProvider::new(vec![mock::resp_text("ok", None)]);
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], vec![], test_ctx());
+        let outcome = agent.run(&mut |_| {});
+        let o = outcome.expect("run completes");
+        assert_eq!(o.stop_reason, "end_turn");
     }

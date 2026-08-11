@@ -7,7 +7,7 @@
 - **单一可执行文件**，无运行时依赖；musl 静态编译后可丢到路由器 / 树莓派 / CI runner 直接跑
 - **两种 LLM 后端**：Anthropic 原生 API + OpenAI 兼容协议（覆盖 DeepSeek / vLLM / Ollama 等），均带 token 用量统计
 - **图片输入**：`--image` 参数或 `load_image` 工具（png / jpeg / gif / webp，base64）
-- **精炼工具集**：`shell`、`read_file`、`write_file`、`edit_file`、`list_dir`、`task`（子 agent；同 turn 多调用并行）默认启用；`load_image`（视觉）需在 `tools` 显式加入。均可在 config 的 `tools` 里裁剪
+- **精炼工具集**：`shell`、`read_file`、`write_file`、`edit_file`、`list_dir`、`task`（子 agent；同 turn 多调用并行）、`todo`（任务计划，落进 result.json 的 `plan` 字段）默认启用；`load_image`（视觉）需在 `tools` 显式加入。均可在 config 的 `tools` 里裁剪
 - **Harness 契约**：`--output result.json` 写结构化结果（含 token 用量、每次工具调用的 input/output），`--json` 流式 NDJSON；exit code 语义化（`0` 成功 / `124` 超时 / `130` 取消 / `1` 其它），可直接进 CI / 评测 pipeline
 - **CLI 覆盖**：`--model` / `--max-turns` / `--timeout` 免改配置做 A/B 对照
 - **批量任务**：`--batch <dir>` 并发跑一组任务片段，`--retries` 对 transient 失败指数退避重试，`--failed` 只重跑上一轮失败的任务并合并进完整报告
@@ -312,8 +312,9 @@ running 时输入框标题显示 spinner、当前活动（thinking / writing / �
 （并行开多个窗口时一眼区分，过长时左侧截断加 `…` 前缀，剩余不足 12 列则整段隐藏——窄屏时它最先消失）。
 上下文占用显示为 `ctx 54.7k`；在配置的
 `limits.max_context_tokens` 里设了模型上下文窗口后变为 `ctx 21% (54.7k/256k)`，占用 ≥60% 转黄、
-≥80% 转红。
-终端变窄时状态条先省略 token，上下文段保留到最后，只保留模型和运行状态为止。退出
+≥80% 转红。agent 用过 `todo` 后，状态条另显一段 `plan done/total`（如 `plan 2/5`，全部完成转绿、
+进行中为黄），实时反映任务计划进度——完整 checklist 仍在最近一条 `todo` 工具结果行里。
+终端变窄时状态条先省略 token、再省略 plan，上下文段保留到最后，只保留模型和运行状态为止。退出
 （Esc / 空闲 Ctrl-C）时若仍有排队消息，终端还原后会在 stderr 提示被丢弃的条数。
 一轮正常结束（end_turn / stop 等）不再打印 `[done: …]` 行，只有异常停止（max_tokens /
 length / error 等）才显示警告。工具输出里的 ANSI 颜色序列（如 git diff 的红绿）会按
@@ -405,6 +406,7 @@ tiny-agent --config examples/web-search.json --task "搜一下 Anthropic 最近�
   "task": "headless 模式要执行的任务（可被 --task 覆盖）",
   "workdir": "工具操作的工作目录，默认当前目录",
   "restrict_to_workdir": false,
+  "inject_environment": true,
   "tools": ["shell", "read_file", "write_file", "edit_file", "list_dir", "load_image"],
   "mcp_servers": [],
   "reasoning_effort": "可选，思考程度字符串原样透传（none/low/medium/high/xhigh/max），不校验",
@@ -422,6 +424,17 @@ tiny-agent --config examples/web-search.json --task "搜一下 Anthropic 最近�
 ```
 
 API key 从 `api_key_env` 指定的环境变量读取，不写进配置文件。
+
+`inject_environment`（默认 `true`）：构造 agent 时在 system prompt **最前面**插入一段运行环境事实：
+
+```
+# Environment
+- OS: macos
+- Shell: sh -c
+- Working directory: /abs/path
+```
+
+让模型知道自己跑在哪个平台、据此下发兼容命令（如得知是 `cmd /C` 而非 bash，就不会写 `$((...))` 这种在 cmd 下**静默失效、还 exit 0**、看着像成功实则是哑火的语法）。**只注入 OS / Shell / 工作目录三项事实，不写死语法示例**——事实来自运行时（`std::env::consts::OS`）与配置，跨平台自动正确；Shell 取 `shell` 工具真实调用的形式（unix `sh -c`、windows `cmd /C`）；工作目录取已解析的 `workdir`。注入点在 `Agent::new` 单点（主 agent 与 `task` 子 agent 都覆盖——子 agent 也跑 shell，同样需要平台事实），调用方自定义的 `system_prompt` 完整保留在事实段之后。设 `false` 关闭。批量任务片段可覆盖（软字段，与 `reasoning_effort` 同类）。
 
 `limits.stream_idle_secs`（默认 30）：流式响应两个 chunk 之间最长允许的静默秒数，超过即判定连接半开并中断。普通对话模型 chunk 间隔在亚秒级，30s 绰绰有余；**深度推理模型**（DeepSeek-R1、o 系列等）首 token 前可能静默数分钟，需要调大（如 180）才不会被误杀——`limits.timeout_secs` 仍是**模型请求层面**的软上限（约束每轮 chat 请求与轮次边界；shell/MCP/子 agent 各有各自独立超时，不受此值硬截止），不会因此无限挂起。
 
@@ -513,11 +526,17 @@ TinyAgent 的定位是**可审计、可无人值守的 agent 执行单元**—�
   "tool_calls": [
     { "name": "write_file", "input": {...}, "output": "wrote 42 bytes", "is_error": false }
   ],
+  "plan": [
+    { "subject": "跑测试", "status": "completed" },
+    { "subject": "修失败用例", "status": "in_progress" },
+    { "subject": "提交", "status": "pending" }
+  ],
   "error": null
 }
 ```
 
 - `tool_calls[].output` 是工具返回的完整内容（`is_error` 标记是否为错误结果）
+- `plan`（可选）：agent 通过 `todo` 工具记录的任务计划与每步状态（末次调用的全量列表）。**仅当 agent 用过 `todo` 才出现**，否则该键不存在——不用 `todo` 的结果文件与启用前逐字节相同。`tool_calls[]` 里 `task`（子 agent）条目另带一个可选 `meta` 字段（`turns`/`tools`/`tokens`/`stop_reason` 的紧凑 trace），同理仅在子 agent 调用时出现
 - `attempts` 是实际执行的 agent 运行次数（`>1` 表示发生了瞬态重试，见下文「单跑瞬态重试」）
 - `input_tokens` / `output_tokens` 是本次运行累计的 token 用量；`cache_creation_input_tokens` /
   `cache_read_input_tokens` 是 prompt 缓存写/读累计（Anthropic 两者都报，OpenAI 只报读）。`input_tokens`
@@ -541,7 +560,7 @@ Linux/macOS 经 SIGINT、Windows 经 `SetConsoleCtrlHandler`，行为一致。
 照常合并写出 `--report` 后 exit 130；再次 `Ctrl-C` 立即 exit 130。TUI 模式下 `Ctrl-C` 是普通按键，按上面的按键表处理。
 
 `--json` 模式额外在每个事件吐一行 NDJSON（`type`: `turn` / `text` / `thinking` / `tool_call` /
-`tool_result` / `usage` / `compressed` / `warning` / `subagent` / `done`，重试时另吐 `retry`），可在结果文件落盘前实时跟进进度。
+`tool_result` / `usage` / `compressed` / `warning` / `subagent` / `todo` / `done`，重试时另吐 `retry`），可在结果文件落盘前实时跟进进度。
 
 ## 内置工具
 
@@ -554,6 +573,7 @@ Linux/macOS 经 SIGINT、Windows 经 `SetConsoleCtrlHandler`，行为一致。
 | `list_dir` | 列目录，最多 500 条 |
 | `load_image` | 加载本地图片让模型"看到"（需视觉模型） |
 | `task` | 把一块工作委派给一个**子 agent**（独立上下文 + 独立 turn 预算），只把子 agent 的最终摘要作为结果返回，保持主上下文清爽。详见下节 |
+| `todo` | 记录/更新任务计划（全量替换语义，每次发完整列表），最终计划落进 result.json 的 `plan` 字段。模型可见的是可读 checklist，审计真相是结构化 input |
 
 ## 子 agent（`task` 工具）
 
@@ -563,6 +583,7 @@ Linux/macOS 经 SIGINT、Windows 经 `SetConsoleCtrlHandler`，行为一致。
 - **同 turn 多调用并行**：主 agent 在**一个** assistant turn 里发出多个 `task` 调用时，它们会**并行**跑（每个一个线程，借线程池 scope），各自的事件经 mpsc 漏斗实时转发进主 run 的事件流——所以多个子 agent 协同工作时，输出是交错流式出现的。结果仍按原始块序拼回（N:N 配对不变）。叶子工具（`shell`/`read_file`/…）保持顺序执行，只有 `task` 并行，避免在文件/进程上引入新的竞态。
 - **事件可见**：子 agent 的流式过程（文本增量 / tool 调用 / tool 结果）**实时转发**进主 run 的事件流，每条都裹上 `name` 身份——headless 的 `--json` 输出形如 `{"type":"subagent","name":..,"event":<子事件>}`，TUI 里子 agent 的输出也带 `[name]` 前缀。并行多个子 agent 时，靠 `name` 区分交错的事件。
 - **成本诚实计入**：每个子 agent 的 token 用量折进主 run 的累计，并照常发 `usage` 事件 / 写进 `result.json`（并行的几个各自计入）。
+- **审计 trace（`meta`）**：`result.json` 里每个 `task` 条目另带一个 `meta` 字段——子 agent 的轮数、用过哪些工具（按名计数）、token 小计、stop_reason 的紧凑记录。**不进模型可见的 tool result**（主上下文只收摘要，保持清爽），仅供审计并行工作。失败子 agent 也带 `meta`（`stop_reason: "error"`），看得出"跑到哪一步倒了"。
 - **继承**：子 agent 复用主 agent 的 provider / model / 工作目录 / `restrict_to_workdir` / 取消标志（Ctrl-C 会连带中断在跑的子 agent）。工具白名单继承父配置。
 
 **边界（刻意收紧）**：
@@ -573,6 +594,23 @@ Linux/macOS 经 SIGINT、Windows 经 `SetConsoleCtrlHandler`，行为一致。
 
 ```json
 "tools": ["shell", "read_file", "write_file", "edit_file", "list_dir"]
+```
+
+## 任务计划（`todo` 工具）
+
+`todo` 让 agent 把任务计划结构化地记下来、随进度更新，最终落进 `result.json` 的 `plan` 字段——把"agent **打算**做什么、做到哪一步"和"agent **做了**什么"（`tool_calls`）一起写进同一份账单。
+
+- **全量替换语义**：每次调用发**完整新列表**（不是增量），状态三选一——`pending` / `in_progress` / `completed`。模型可见的是一份可读 checklist（`☐`/`▶`/`✓` 前缀）作为 tool result；**审计真相是结构化的 input**，两者职责分离。
+- **`plan` 字段的来源**：run 结束时，取 tool-call 日志里**最后一条非 error 的 `todo` 调用的 input** 作为最终计划。这个日志独立于对话历史（上下文压缩只重写 `messages`、不碰工具调用日志），所以**计划状态不怕被压缩吃掉**——这是它能稳定落进 `result.json` 的关键。模型没用过 `todo` 时，结果文件**不含 `plan` 键**（与启用前逐字节相同）。
+- **实时进度**：每次 `todo` 调用经 `--json` 吐一条 `{"type":"todo","todos":[...]}`（headless 终端另在 stderr 打一行 `[plan] done/total`），管道可据此渲染实时进度。
+- **默认启用，子 agent 不继承**：与 `task` 同在默认白名单；评测 / CI 想锁定行为在 `tools` 里去掉即可。子 agent 是聚焦短任务，`todo` 被白名单滤掉（规划是父 agent 的职责），其计划也不会进父的 `result.json.plan`。
+
+```json
+{ "todos": [
+  { "subject": "复现失败", "status": "completed" },
+  { "subject": "定位根因", "status": "in_progress" },
+  { "subject": "写回归测试", "status": "pending" }
+] }
 ```
 
 ## Skill（技能）
@@ -720,7 +758,8 @@ src/
 │   ├── file.rs  (483) #   read_file / write_file / edit_file / list_dir
 │   ├── image.rs  (79) #   load_image 工具
 │   ├── mcp.rs   (261) #   MCP 工具包装（sanitize_name + wire_name 分发）
-│   └── subagent.rs(415) # task 子 agent 工具（独立上下文 + turn 封顶；不可递归；事件转发 + usage 折算）
+│   ├── subagent.rs(571) # task 子 agent 工具（独立上下文 + turn 封顶；不可递归；事件转发 + usage 折算 + 审计 meta trace）
+│   └── todo.rs  (286) # todo 工具（任务计划，全量替换；plan 从 records 派生落 result.json）
 ├── mcp.rs      (802)   # MCP 客户端（stdio / Streamable HTTP / 旧版 SSE）
 ├── session.rs   (125)  # 会话持久化
 ├── batch.rs     (644)  # 批量任务 + --retries/--failed + 报告合并

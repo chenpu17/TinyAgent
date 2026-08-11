@@ -1,4 +1,4 @@
-use crate::agent::{Agent, AgentEvent, RunCost, RunOutcome};
+use crate::agent::{extract_plan, Agent, AgentEvent, RunCost, RunOutcome};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::io::Write;
@@ -223,6 +223,12 @@ fn event_json(ev: &AgentEvent) -> Value {
             json!({"type": "compressed", "dropped": *dropped, "kept": *kept, "trigger": how})
         }
         AgentEvent::Warning(w) => json!({"type": "warning", "message": w.clone()}),
+        AgentEvent::TodoUpdate { todos } => {
+            // Live plan-progress for `--json` pipelines. `todos` is the agent's
+            // full current plan (full-replacement each `todo` call), serialized
+            // as-is so a consumer can render its own checklist.
+            json!({"type": "todo", "todos": todos})
+        }
         AgentEvent::SubAgent { name, event } => {
             json!({
                 "type": "subagent",
@@ -310,15 +316,22 @@ pub fn write_result(
                 .tool_calls
                 .iter()
                 .map(|c| {
-                    json!({
+                    let mut entry = json!({
                         "name": c.name.clone(),
                         "input": c.input.clone(),
                         "output": c.output.clone(),
                         "is_error": c.is_error,
-                    })
+                    });
+                    // `meta` is sparse (only the `task` sub-agent sets it), so
+                    // add the key only when present — leaf tools stay
+                    // byte-identical to before the field existed.
+                    if let Some(m) = &c.meta {
+                        entry["meta"] = m.clone();
+                    }
+                    entry
                 })
                 .collect();
-            json!({
+            let mut result = json!({
                 "success": o.stop_reason == "end_turn",
                 "stop_reason": o.stop_reason.clone(),
                 "turns": o.turns,
@@ -331,7 +344,13 @@ pub fn write_result(
                 "summary": o.final_text.clone(),
                 "tool_calls": tool_calls,
                 "error": error_val,
-            })
+            });
+            // `plan` only when the agent actually used `todo`; omitted otherwise
+            // so a result.json with no plan is byte-identical to pre-feature.
+            if let Some(plan) = extract_plan(&o.tool_calls) {
+                result["plan"] = json!(plan);
+            }
+            result
         }
         None => {
             // No final outcome, but the failed attempts still burned tokens and
@@ -342,15 +361,19 @@ pub fn write_result(
                 .tool_calls
                 .iter()
                 .map(|c| {
-                    json!({
+                    let mut entry = json!({
                         "name": c.name.clone(),
                         "input": c.input.clone(),
                         "output": c.output.clone(),
                         "is_error": c.is_error,
-                    })
+                    });
+                    if let Some(m) = &c.meta {
+                        entry["meta"] = m.clone();
+                    }
+                    entry
                 })
                 .collect();
-            json!({
+            let mut result = json!({
                 "success": false,
                 "stop_reason": none_stop_reason,
                 "turns": acc.turns,
@@ -363,7 +386,13 @@ pub fn write_result(
                 "summary": "",
                 "tool_calls": tool_calls,
                 "error": error_val,
-            })
+            });
+            // Even on failure, a partial plan (the agent's progress before it
+            // died) is valuable audit info — derive it the same way.
+            if let Some(plan) = extract_plan(&acc.tool_calls) {
+                result["plan"] = json!(plan);
+            }
+            result
         }
     };
     let bytes = serde_json::to_string_pretty(&result)?;
@@ -506,6 +535,13 @@ impl<Out: Write, Err: Write> HumanRenderer<Out, Err> {
                 content,
             } => {
                 let tag = if *is_error { "[tool ✗]" } else { "[tool ✓]" };
+                // A streamed sub-agent TextDelta can leave stdout mid-line (no
+                // trailing newline); ensure the tool-result row starts fresh so
+                // it never sticks to the child's last line. No-op when already
+                // at a line start (the common TextDelta→ToolCall→ToolResult path).
+                if !self.at_line_start {
+                    let _ = writeln!(self.out);
+                }
                 let _ = writeln!(self.out, "{tag} {name}: {}", crate::agent::preview(content));
                 self.at_line_start = true;
                 self.current_sub_name = None;
@@ -556,6 +592,20 @@ impl<Out: Write, Err: Write> HumanRenderer<Out, Err> {
                     String::new()
                 };
                 let _ = writeln!(self.err, "[tokens: {input_tokens}↑ {output_tokens}↓{cache}]");
+            }
+            AgentEvent::TodoUpdate { todos } => {
+                // Plan progress → stderr only (stdout carries the transcript /
+                // the --output summary). One compact line per update so a human
+                // tailing the run sees the plan evolve; the authoritative final
+                // plan is in result.json's `plan` field.
+                let line = if todos.is_empty() {
+                    "[plan] cleared".to_string()
+                } else {
+                    let total = todos.len();
+                    let done = todos.iter().filter(|t| t.status == "completed").count();
+                    format!("[plan] {done}/{total} done")
+                };
+                let _ = writeln!(self.err, "{line}");
             }
             AgentEvent::SubAgent { name, event } => {
                 // Render the child's event prefixed with its identity, so a human
@@ -622,7 +672,7 @@ impl<Out: Write, Err: Write> HumanRenderer<Out, Err> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{CompressTrigger, RunOutcome, ToolCallRecord};
+    use crate::agent::{CompressTrigger, RunOutcome, TodoItem, ToolCallRecord};
     use serde_json::json;
 
     #[test]
@@ -680,6 +730,7 @@ mod tests {
                 input: json!({"path": "a.txt"}),
                 output: "hello world".into(),
                 is_error: false,
+                meta: None,
             }],
             input_tokens: 100,
             output_tokens: 5,
@@ -710,6 +761,136 @@ mod tests {
     }
 
     #[test]
+    fn write_result_emits_plan_when_todo_used_and_omits_otherwise() {
+        // The `plan` key is conditional: present (derived from the last `todo`
+        // call) when the agent tracked a plan, absent otherwise — so a result
+        // with no plan is byte-identical to pre-feature for consumers that
+        // don't know the field.
+        let dir = std::env::temp_dir().join(format!("ta-plan-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Outcome WITH a todo call → `plan` present.
+        let with_plan = RunOutcome {
+            final_text: "done".into(),
+            turns: 1,
+            stop_reason: "end_turn".into(),
+            tool_calls: vec![
+                ToolCallRecord {
+                    name: "todo".into(),
+                    input: json!({"todos":[
+                        {"subject":"a","status":"completed"},
+                        {"subject":"b","status":"in_progress"}
+                    ]}),
+                    output: "☐ ...".into(),
+                    is_error: false,
+                    meta: None,
+                },
+                ToolCallRecord {
+                    name: "shell".into(),
+                    input: json!({"command":"ls"}),
+                    output: "x".into(),
+                    is_error: false,
+                    meta: None,
+                },
+            ],
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            elapsed: std::time::Duration::from_secs_f64(1.0),
+        };
+        let path = dir.join("plan.json");
+        write_result(&path, Some(&with_plan), None, 1, "error", None).unwrap();
+        let parsed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let obj = parsed.as_object().expect("result is a JSON object");
+        assert!(obj.contains_key("plan"), "plan key present when todo used");
+        assert_eq!(parsed["plan"][0]["status"], "completed");
+        assert_eq!(parsed["plan"][1]["subject"], "b");
+
+        // Outcome with NO todo call → `plan` key absent (not null).
+        let without_plan = RunOutcome {
+            final_text: "done".into(),
+            turns: 1,
+            stop_reason: "end_turn".into(),
+            tool_calls: vec![ToolCallRecord {
+                name: "shell".into(),
+                input: json!({"command":"ls"}),
+                output: "x".into(),
+                is_error: false,
+                meta: None,
+            }],
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            elapsed: std::time::Duration::from_secs_f64(1.0),
+        };
+        let np = dir.join("noplan.json");
+        write_result(&np, Some(&without_plan), None, 1, "error", None).unwrap();
+        let nparsed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&np).unwrap()).unwrap();
+        assert!(
+            !nparsed.as_object().unwrap().contains_key("plan"),
+            "plan key absent when no todo used"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_result_emits_tool_meta_only_when_present() {
+        // `meta` is sparse (only `task` sets it): a tool_call with meta surfaces
+        // it, one without stays byte-identical (no null meta key).
+        let dir = std::env::temp_dir().join(format!("ta-meta-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let o = RunOutcome {
+            final_text: "done".into(),
+            turns: 1,
+            stop_reason: "end_turn".into(),
+            tool_calls: vec![
+                ToolCallRecord {
+                    name: "task".into(),
+                    input: json!({"name":"scout","prompt":"x"}),
+                    output: "summary".into(),
+                    is_error: false,
+                    meta: Some(json!({"turns":2,"tools":{"shell":1},"tokens":{"in":50,"out":5},"stop_reason":"end_turn"})),
+                },
+                ToolCallRecord {
+                    name: "shell".into(),
+                    input: json!({"command":"ls"}),
+                    output: "x".into(),
+                    is_error: false,
+                    meta: None,
+                },
+            ],
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            elapsed: std::time::Duration::from_secs_f64(1.0),
+        };
+        let path = dir.join("meta.json");
+        write_result(&path, Some(&o), None, 1, "error", None).unwrap();
+        let parsed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // The task entry carries its trace meta.
+        assert_eq!(parsed["tool_calls"][0]["name"], "task");
+        assert_eq!(parsed["tool_calls"][0]["meta"]["turns"], 2);
+        assert_eq!(parsed["tool_calls"][0]["meta"]["tools"]["shell"], 1);
+        // The shell entry has NO meta key (sparse — not null).
+        let shell_obj = parsed["tool_calls"][1]
+            .as_object()
+            .expect("shell entry is an object");
+        assert!(
+            !shell_obj.contains_key("meta"),
+            "leaf tool has no meta key: {:?}",
+            shell_obj
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn write_result_failure_path_keeps_accumulated_cost() {
         // P2: a run that fails after burning tokens must still report them. The
         // final-failure paths (retries exhausted, cancel during backoff) call
@@ -731,6 +912,7 @@ mod tests {
                 input: json!({"command": "ls"}),
                 output: "a.txt".into(),
                 is_error: false,
+                meta: None,
             }],
             turns: 3,
             elapsed: std::time::Duration::from_secs(12),
@@ -864,6 +1046,19 @@ mod tests {
         let v = event_json(&AgentEvent::Warning("careful".into()));
         assert_eq!(v["type"], "warning");
         assert_eq!(v["message"], "careful");
+        // TodoUpdate → {"type":"todo","todos":[{subject,status},...]} — the
+        // full plan rides on every update (full-replacement semantics), so a
+        // consumer can render the checklist from any single event.
+        let v = event_json(&AgentEvent::TodoUpdate {
+            todos: vec![
+                TodoItem { subject: "a".into(), status: "completed".into() },
+                TodoItem { subject: "b".into(), status: "in_progress".into() },
+            ],
+        });
+        assert_eq!(v["type"], "todo");
+        assert_eq!(v["todos"][0]["subject"], "a");
+        assert_eq!(v["todos"][0]["status"], "completed");
+        assert_eq!(v["todos"][1]["status"], "in_progress");
         // Done → {"type":"done","stop_reason":..}
         let v = event_json(&AgentEvent::Done {
             stop_reason: "end_turn".into(),
@@ -996,6 +1191,33 @@ mod tests {
         assert!(out_s.contains("[done: end_turn]"));
         // Chrome must not leak into the transcript.
         assert!(!out_s.contains("[tokens:") && !out_s.contains("[warn]"));
+    }
+
+    #[test]
+    fn renderer_starts_tool_result_on_a_fresh_line_after_subagent_text() {
+        // Regression: a sub-agent TextDelta with no trailing newline left stdout
+        // mid-line; the parent's ToolResult then stuck to it ("...result[tool ✓]
+        // task:"). The ToolResult arm must break to a new line when not
+        // at_line_start (mirrors the warn arm).
+        let mut r: HumanRenderer<Vec<u8>, Vec<u8>> = HumanRenderer::new(Vec::new(), Vec::new());
+        r.render(&AgentEvent::SubAgent {
+            name: "scout".into(),
+            event: Box::new(AgentEvent::TextDelta("partial-result".into())),
+        });
+        r.render(&AgentEvent::ToolResult {
+            name: "task".into(),
+            is_error: false,
+            content: "done".into(),
+        });
+        let out_s = String::from_utf8_lossy(&r.out).into_owned();
+        assert!(
+            out_s.contains("partial-result\n[tool ✓] task:"),
+            "tool result must start on a fresh line, got: {out_s}"
+        );
+        assert!(
+            !out_s.contains("partial-result[tool ✓]"),
+            "sub-agent text must not stick to the tool-result row, got: {out_s}"
+        );
     }
 
     #[test]

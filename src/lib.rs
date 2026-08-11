@@ -36,7 +36,10 @@ pub mod skills;
 pub mod tools;
 
 // ── Facade re-exports (the library's public face) ──────────────────────────
-pub use agent::{Agent, AgentEvent, CompressTrigger, RunCost, RunError, RunOutcome, ToolCallRecord};
+pub use agent::{
+    Agent, AgentEvent, CompressTrigger, RunCost, RunError, RunOutcome, TodoItem, ToolCallRecord,
+    extract_plan,
+};
 pub use config::{Config, Limits};
 pub use provider::{Block, ChatRequest, ChatResponse, Message, Provider, Role, SimpleChatResponse, ToolDef, Usage};
 pub use tools::{CallbackTool, Tool, ToolCtx, ToolOutput};

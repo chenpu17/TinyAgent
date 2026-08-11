@@ -27,7 +27,7 @@
 //!   is mid-responding to); skipping it is safe because the batch gate ensures
 //!   the flag is false at spawn, so any `true` seen mid-run is a real cancel.
 
-use crate::agent::{Agent, AgentEvent, RunOutcome};
+use crate::agent::{Agent, AgentEvent, RunOutcome, ToolCallRecord};
 use crate::config::Config;
 use crate::provider::{self, Block, Message, Usage};
 use crate::tools::{self, Tool, ToolCtx, ToolOutput};
@@ -143,7 +143,12 @@ impl Tool for SubAgent {
         let child_tool_names: Vec<String> = child_cfg
             .tools
             .iter()
-            .filter(|t| t.as_str() != "task")
+            // Drop `task` (a sub-agent cannot spawn its own sub-agent — no depth
+            // bookkeeping) and `todo` (the child is a focused short task; plan
+            // tracking is the PARENT's job, and a child's `todo` calls would
+            // never reach the parent's `result.json.plan` anyway — they'd just
+            // burn tokens). Both are filtered by name.
+            .filter(|t| !matches!(t.as_str(), "task" | "todo"))
             .cloned()
             .collect();
         let mut child_tools = tools::build(&child_tool_names, &child_cfg, &self.client, &self.api_key, &self.mcp_tools)?;
@@ -201,6 +206,12 @@ fn run_subagent(
             if re.usage.total() > 0 {
                 out.usage = Some(re.usage);
             }
+            // Audit trace even on failure: "how far did the child get" is the
+            // first question when a parallel `task` fails, and it lives only in
+            // NDJSON otherwise. stop_reason is "error" here (the child's own
+            // stop_reason was never set — it returned Err), so the trace makes
+            // that explicit rather than echoing the parent-facing failure text.
+            out.meta = Some(trace_meta(re.turns, &re.tool_calls, &re.usage, "error"));
             out
         }
     }
@@ -211,6 +222,12 @@ fn run_subagent(
 /// note when it ended short of `end_turn` (max_turns / timeout / cancelled),
 /// tagged with the sub-agent's name so the parent can tell which one stopped.
 fn outcome_to_output(o: &RunOutcome, name: &str, max_output_chars: usize) -> ToolOutput {
+    let usage = Usage {
+        input_tokens: o.input_tokens,
+        output_tokens: o.output_tokens,
+        cache_creation_input_tokens: o.cache_creation_input_tokens,
+        cache_read_input_tokens: o.cache_read_input_tokens,
+    };
     let mut content = if o.stop_reason == "end_turn" {
         o.final_text.clone()
     } else {
@@ -221,6 +238,12 @@ fn outcome_to_output(o: &RunOutcome, name: &str, max_output_chars: usize) -> Too
     // inject a huge tool result into the parent's context, bloating it toward
     // the very compression the sub-agent was meant to avoid. Char-boundary safe.
     tools::truncate(&mut content, max_output_chars);
+    // Compact audit trace into `meta` (NOT content): keeps the parent's context
+    // clean (README: "only the final summary as the tool result") while making
+    // `result.json` self-contained for auditing parallel work — turns, which
+    // tools the child invoked and how often, a rough token cost, and the stop
+    // reason. Lands in `tool_calls[].meta` for the `task` entry only.
+    let meta = trace_meta(o.turns, &o.tool_calls, &usage, &o.stop_reason);
     ToolOutput {
         content,
         image: None,
@@ -228,13 +251,36 @@ fn outcome_to_output(o: &RunOutcome, name: &str, max_output_chars: usize) -> Too
         // so don't flag is_error — the prefix note above tells the parent what
         // happened. Only a provider Err (handled in run_subagent) is_error=true.
         is_error: false,
-        usage: Some(Usage {
-            input_tokens: o.input_tokens,
-            output_tokens: o.output_tokens,
-            cache_creation_input_tokens: o.cache_creation_input_tokens,
-            cache_read_input_tokens: o.cache_read_input_tokens,
-        }),
+        usage: Some(usage),
+        meta: Some(meta),
     }
+}
+
+/// Build the compact per-subagent audit trace attached as `ToolOutput::meta`.
+/// `tools` counts child tool calls by name (order-preserved map); `tokens.in`
+/// sums every input-facing axis (uncached input + cache write + cache read) so
+/// one number reflects how much the child read, while the exact cache split is
+/// already folded into the parent run's top-level totals.
+fn trace_meta(turns: u32, tool_calls: &[ToolCallRecord], usage: &Usage, stop_reason: &str) -> Value {
+    let mut tools = serde_json::Map::new();
+    for c in tool_calls {
+        if let Some(n) = tools.get_mut(&c.name) {
+            *n = json!(n.as_u64().unwrap_or(0) + 1);
+        } else {
+            tools.insert(c.name.clone(), json!(1u64));
+        }
+    }
+    json!({
+        "turns": turns,
+        "tools": tools,
+        "tokens": {
+            "in": usage.input_tokens
+                + usage.cache_creation_input_tokens
+                + usage.cache_read_input_tokens,
+            "out": usage.output_tokens,
+        },
+        "stop_reason": stop_reason,
+    })
 }
 
 #[cfg(test)]
@@ -261,6 +307,7 @@ mod tests {
             limits: crate::config::Limits::default(),
             mcp_servers: vec![],
             reasoning_effort: None,
+            inject_environment: false,
         };
         let (prov, _state) = MockProvider::new(turns);
         Agent::new(
@@ -364,6 +411,73 @@ mod tests {
     }
 
     #[test]
+    fn outcome_to_output_attaches_trace_meta_not_in_content() {
+        // The audit trace (turns / tool counts / token subtotal / stop reason)
+        // rides in `meta` — NOT `content` — so the parent's context stays clean
+        // (only the summary text reaches the model) while result.json is
+        // self-contained. Pins the B design: separation of model view vs audit.
+        let o = RunOutcome {
+            final_text: "summary".into(),
+            turns: 3,
+            stop_reason: "end_turn".into(),
+            tool_calls: vec![
+                ToolCallRecord {
+                    name: "shell".into(),
+                    input: json!({}),
+                    output: "ok".into(),
+                    is_error: false,
+                    meta: None,
+                },
+                ToolCallRecord {
+                    name: "read_file".into(),
+                    input: json!({}),
+                    output: "..".into(),
+                    is_error: false,
+                    meta: None,
+                },
+                ToolCallRecord {
+                    name: "shell".into(),
+                    input: json!({}),
+                    output: "ok2".into(),
+                    is_error: false,
+                    meta: None,
+                },
+            ],
+            input_tokens: 1000,
+            output_tokens: 40,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 50,
+            elapsed: std::time::Duration::from_secs_f64(3.0),
+        };
+        let out = outcome_to_output(&o, "scout", usize::MAX);
+        // content is the clean summary — no trace mixed in.
+        assert_eq!(out.content, "summary");
+        let meta = out.meta.expect("trace meta attached");
+        assert_eq!(meta["turns"], 3);
+        assert_eq!(meta["tools"]["shell"], 2, "shell counted twice: {meta}");
+        assert_eq!(meta["tools"]["read_file"], 1);
+        // tokens.in sums every input-facing axis (input + cache_read here).
+        assert_eq!(meta["tokens"]["in"], 1050);
+        assert_eq!(meta["tokens"]["out"], 40);
+        assert_eq!(meta["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn run_subagent_error_attaches_trace_meta() {
+        // Even a failed child has audit value — how far it got. The error path
+        // builds the same trace (stop_reason "error") from the RunError.
+        let mut agent = mock_agent(vec![
+            mock::resp_tool("t1", "noop", json!({}), mock::mk_usage(100, 5)),
+            mock::MockTurn::Err("provider blew up".into()),
+        ]);
+        let out = run_subagent(&mut agent, "scout", &mut |_| {}, usize::MAX);
+        assert!(out.is_error);
+        let meta = out.meta.expect("trace meta on failure too");
+        assert_eq!(meta["stop_reason"], "error");
+        assert!(meta["turns"].as_u64().unwrap_or(0) >= 1, "counted the turn that ran");
+    }
+
+    #[test]
     fn outcome_to_output_short_stop_notes_reason_not_error() {
         // max_turns / timeout / cancelled: surface the reason as a prefix (with
         // the sub-agent's name), but don't mark is_error — partial work may
@@ -453,6 +567,7 @@ mod tests {
             limits: crate::config::Limits::default(),
             mcp_servers: vec![],
             reasoning_effort: None,
+            inject_environment: false,
         }
     }
 }

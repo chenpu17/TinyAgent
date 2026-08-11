@@ -26,6 +26,9 @@ fn default_stream_idle() -> u64 {
 fn default_max_tokens() -> u32 {
     8192
 }
+fn default_inject_environment() -> bool {
+    true
+}
 fn default_tools() -> Vec<String> {
     vec![
         "shell".into(),
@@ -38,6 +41,11 @@ fn default_tools() -> Vec<String> {
         // or headless run can delegate sub-tasks without extra config; it is
         // non-recursive (a sub-agent's tool whitelist drops `task` itself).
         "task".into(),
+        // `todo` lets the agent track its plan in a structured, audit-friendly
+        // way: the final list lands in result.json's `plan` field. Enabled by
+        // default (matches `task`); eval/CI wanting to lock behavior removes it
+        // from `tools`. Not inherited by sub-agents (filtered in subagent.rs).
+        "todo".into(),
     ]
 }
 
@@ -204,6 +212,14 @@ pub struct Config {
     /// for batch/CI runs with untrusted task files.
     #[serde(default)]
     pub restrict_to_workdir: bool,
+    /// Prepend an `# Environment` block (OS / Shell / working directory) to the
+    /// front of the system prompt at agent construction, so the model knows its
+    /// runtime platform and emits compatible commands (e.g. it learns it is
+    /// under `cmd /C`, not bash, and stops writing `$((...))` that silently
+    /// no-ops and exits 0). Facts come from runtime/cfg — no syntax examples.
+    /// Default on; set false to disable. Soft field (batch-overridable).
+    #[serde(default = "default_inject_environment")]
+    pub inject_environment: bool,
     #[serde(default)]
     pub limits: Limits,
     /// External MCP tool servers (stdio transport).
@@ -292,6 +308,9 @@ impl Config {
         }
         if p.reasoning_effort.is_some() {
             self.reasoning_effort = p.reasoning_effort;
+        }
+        if let Some(v) = p.inject_environment {
+            self.inject_environment = v;
         }
         if let Some(l) = p.limits {
             // Batch task files are untrusted: a task may only TIGHTEN resource
@@ -402,6 +421,7 @@ pub struct PartialConfig {
     pub limits: Option<PartialLimits>,
     pub mcp_servers: Option<Vec<McpServerConfig>>,
     pub reasoning_effort: Option<String>,
+    pub inject_environment: Option<bool>,
 }
 
 impl PartialConfig {
@@ -464,7 +484,7 @@ mod tests {
         assert_eq!(cfg.provider, ProviderKind::Anthropic);
         assert_eq!(cfg.base_url(), "https://api.anthropic.com");
         assert_eq!(cfg.limits.max_turns, 30);
-        assert_eq!(cfg.tools, vec!["shell", "read_file", "write_file", "edit_file", "list_dir", "task"]);
+        assert_eq!(cfg.tools, vec!["shell", "read_file", "write_file", "edit_file", "list_dir", "task", "todo"]);
     }
 
     #[test]
@@ -535,6 +555,22 @@ mod tests {
         assert!(partial.forbidden_batch_override().is_none());
         cfg.apply(partial).unwrap();
         assert_eq!(cfg.reasoning_effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn partial_config_overlays_inject_environment_without_being_forbidden() {
+        // inject_environment is a soft field: a batch task fragment may override
+        // it (e.g. force the env block off for a locked eval), and it is NOT in
+        // forbidden_batch_override.
+        let mut cfg: Config =
+            serde_json::from_str(r#"{"provider":"anthropic","api_key_env":"K","model":"m"}"#)
+                .unwrap();
+        assert!(cfg.inject_environment, "defaults true");
+        let partial: PartialConfig =
+            serde_json::from_str(r#"{"inject_environment":false}"#).unwrap();
+        assert!(partial.forbidden_batch_override().is_none());
+        cfg.apply(partial).unwrap();
+        assert!(!cfg.inject_environment, "overlaid to false");
     }
 
     #[test]

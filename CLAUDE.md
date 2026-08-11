@@ -91,6 +91,25 @@ cargo clippy -p tiny-agent-node
   **不可递归**：子 agent 的工具白名单滤掉 `task` 本身（无深度计数）。**在默认白名单**（`config::default_tools`
   含 `task`）——headless 评测任务也会默认能 spawn 子 agent；评测若要锁定行为/成本，在 config 的 `tools`
   里显式去掉 `task`。
+- **任务计划（`todo` 工具，`tools/todo.rs`）+ 审计 `meta` 通道**：`todo` 是无状态工具（`&self`，与 shell 同），
+  **全量替换语义**（每次发完整计划，TodoWrite 式）。两条关键设计：① **`plan` 从 tool-call 日志派生，不经压缩**——
+  `agent::extract_plan` 取 `records`（`Vec<ToolCallRecord>`，独立于 `self.messages`）里最后一条非 error 的 `todo` 调用的
+  `input`，在 `harness::write_result` 里落进 `result.json` 的 `plan` 字段。压缩只重写 `messages`、不碰 `records`，故计划
+  状态不怕被摘要吃掉。**不加 Agent/ToolCtx/Session 字段、零状态机**——records 已流穿重试/失败/批量全路径（`RunCost.tool_calls`
+  自动带 plan）。`AgentEvent::TodoUpdate{todos}` 经 `run_with_emit` 的 `emit` 流式转发（`--json` 吐 `{"type":"todo",...}`）。
+  ② **审计 `meta` 侧信道**：`ToolOutput` 加 `meta: Option<Value>`、`ToolCallRecord` 同步加 `meta`——**不进模型可见的 `content`**
+  （保主上下文清爽），只进 `result.json`。`task` 子 agent 的 `outcome_to_output`/错误路径用它挂紧凑 trace（`turns`/`tools` 按名
+  计数/`tokens`/`stop_reason`）。`write_result` 用 `if let Some(m)=&c.meta { entry["meta"]=m.clone() }` 后插，**稀疏**（只有
+  task 条目出 `meta` 键，叶子工具无）；`plan` 同款条件后插（没用 todo 时无 `plan` 键，与启用前逐字节相同）。**默认白名单含 `todo`**；
+  **子 agent 不继承**（`subagent.rs` 白名单 filter 把 `"task"` 和 `"todo"` 一并滤掉——子 agent 是聚焦短任务，规划归父）。
+  `Slot::Ran(Box<ToolOutput>)` 装箱（ToolOutput 加 meta 后跨 `large_enum_variant` 阈值）。`todo` 模块 `pub(crate)`（测试按路径取 `Todo`）。
+  改 `ToolOutput`/`ToolCallRecord` 字段的人：**两个绑定（`bindings/{python,node}/src/lib.rs`）构造 `ToolOutput` 的地方要补 `meta: None`**，
+  核心构造点还有 `tools/{image,mcp,subagent}.rs` + `agent_tests.rs`。
+  **TUI 配合（状态行 plan 段，破冻结的唯一例外）**：TUI 主循环持 `plan: Vec<TodoItem>` 局部状态，`TodoUpdate` arm 直接 `plan = todos.clone()`
+  （全量替换，不 push sys_info 行——完整 checklist 已在 `todo` 工具结果行可见）。每帧把 `plan done/total`（全完成绿/进行中黄）作为
+  `build_status_line` 的 `plan: Option<(&str, Style)>` 段渲染。`build_status_line` 的可选段按**存活优先级**贪心添加：ctx > plan > stats
+  （窄屏先省 stats、再 plan、ctx 最后），用一个 `Vec<(String,Style)>` + 累积 `prefix_w` 的通用循环取代旧的 if/else-if；**plan=None 时行为与
+  启用前逐字节相同**（既有 `build_status_line_*` 测试全过）。TUI 的"冻结只修 bug"政策对此**破例一次**（产品决定）；其余 TUI 改动仍守冻结。
 - **Skill（技能，`skills.rs` + `tools/skill.rs`）**：对齐 **agentskills.io 开放标准**（不是 Claude Code 私有扩展——
   `disable-model-invocation`/`context:fork`/`$ARGUMENTS`/`!cmd` 注入/嵌套惰性发现等依赖 CC 特有会话/权限/子代理模型，
   不实现）。启动时（`lib.rs::assemble`）扫描全局 `~/.config/tinyagent/skills/`（`skills::default_global_skills_dir`
@@ -116,6 +135,17 @@ cargo clippy -p tiny-agent-node
   字面量名匹配，不支持 glob/`Tool(spec)`。`assemble` 为注入简介 **clone cfg**（改 `cfg2.system_prompt`）并返回
   `(tool_list, ctx, cfg)` 三元组（带 `#[allow(clippy::type_complexity)]`）——`Agent::new` 从该 clone 读 system_prompt；改
   `assemble` 签名的人注意两个调用点（`build_agent_with` / `build_agent_with_provider`）都要拿返回的 cfg 传给 `Agent::new`。
+- **运行环境事实注入 system prompt**（`agent.rs::system_with_env` + `Agent::new` 单点）：构造 agent 时在
+  system prompt 最前面插一段 `# Environment`（OS / Shell / 工作目录），让模型知道自己跑在哪个平台、据此下发兼容命令
+  （否则默认 bash 语法在 Windows `cmd /C` 下静默失效还 exit 0，如 `echo $((555+666))` 原样回显）。**只给事实不给语法示例**：
+  OS 用 `std::env::consts::OS`、Shell 用 `shell` 工具真实调用形式（unix `sh -c` / windows `cmd /C`，查 `tools/shell.rs`）、
+  cwd 用已解析的 `ctx.workdir`。注入点在 `Agent::new` 的 `system` 赋值——**唯一收敛点**：主 agent 与 `task` 子 agent 都过
+  这一行（子 agent 先在 `subagent.rs` 覆盖 system_prompt 为 `SUBAGENT_SYSTEM_PROMPT` 再调 `Agent::new`，故子 agent 也覆盖；
+  改 `assemble` 注入会漏子 agent）。`system_with_env(base, os, shell, workdir)` 是 `pub(crate)` 纯函数且 os/shell **作参数**
+  （不硬编码），以便 off-platform 单测 windows+cmd / unix+sh 两条路径。`Config.inject_environment`（默认 true，软字段，仿
+  `reasoning_effort`，**不**在 `forbidden_batch_override`）开关。顺序：`assemble` 已把 skill 简介拼在 base 之后，这里再前插
+  env → 最终 `env + base + skills`。测试 config（`cfg_with` / `mock_agent` / `fake_cfg` / `minimal_config`）显式设
+  `inject_environment: false` 保 system prompt hermetic（MockProvider 不捕获 `req.system`，注入本身零行为漂移）。
 - **`retry.rs`** 是 batch `--retries` 与单跑瞬态重试共用的退避模块：指数 1/2/4/8/16/32s 封顶 + ±25%
   jitter（防并发 worker lockstep 踩踏同一个过载 provider）。只重试 transient（`stop_reason == "error"`）。
   **重试诚实成本**：`agent.run()` 失败返回 `RunError`（带 `usage` + `tool_calls`——失败轮已烧的 token / 已跑的

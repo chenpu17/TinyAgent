@@ -4,6 +4,7 @@ pub mod mcp;
 mod shell;
 mod skill;
 mod subagent;
+pub(crate) mod todo;
 
 pub use image::load_block;
 pub use skill::{ListSkill, ReadSkill};
@@ -39,6 +40,13 @@ pub struct ToolOutput {
     /// child run's usage so sub-agent cost is counted honestly in the parent's
     /// totals (and surfaces via AgentEvent::Usage / result.json).
     pub usage: Option<Usage>,
+    /// Structured audit metadata for the result file, NOT shown to the model —
+    /// the model only sees `content`. Currently used by the `task` sub-agent to
+    /// attach a compact trace (turns / tools used / token subtotal / stop
+    /// reason) so `result.json` is self-contained for auditing parallel work
+    /// without polluting the parent's context. None for every leaf tool. Lands
+    /// in `ToolCallRecord.meta` → `result.json` `tool_calls[].meta`.
+    pub meta: Option<Value>,
 }
 
 impl ToolOutput {
@@ -48,6 +56,7 @@ impl ToolOutput {
             image: None,
             is_error: false,
             usage: None,
+            meta: None,
         }
     }
 
@@ -57,6 +66,7 @@ impl ToolOutput {
             image: None,
             is_error: true,
             usage: None,
+            meta: None,
         }
     }
 }
@@ -170,6 +180,7 @@ pub fn build(
             "edit_file" => Box::new(file::EditFile),
             "list_dir" => Box::new(file::ListDir),
             "load_image" => Box::new(image::LoadImage),
+            "todo" => Box::new(todo::Todo),
             // The sub-agent clones the SHARED MCP tools into each child
             // (Arc-sharing the connections) instead of re-spawning every MCP
             // server per task call — see SubAgent::run_with_emit.

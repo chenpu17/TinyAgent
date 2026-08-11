@@ -49,6 +49,12 @@ pub enum AgentEvent {
     ThinkingDelta(String),
     ToolCall { name: String, input: Value },
     ToolResult { name: String, is_error: bool, content: String },
+    /// The agent updated its self-tracked task plan via the `todo` tool (full
+    /// replacement each call). Emitted by the `todo` tool itself, so `--json`
+    /// pipelines can render live progress; serializes as `{"TodoUpdate":
+    /// {"todos":[...]}}`. The final plan is also derived into `result.json`'s
+    /// `plan` field at run end.
+    TodoUpdate { todos: Vec<TodoItem> },
     /// Token usage reported by the provider for the latest chat request.
     /// Best-effort: emitted only when the provider actually reported usage
     /// (e.g. the stream wasn't cut off before the usage frame). The cache_*
@@ -90,6 +96,68 @@ pub struct ToolCallRecord {
     /// just the model's summary of it.
     pub output: String,
     pub is_error: bool,
+    /// Structured audit metadata the tool attached (not shown to the model).
+    /// Only the `task` sub-agent sets this today (a compact child-run trace).
+    /// Serialized as `tool_calls[].meta` in `result.json` (key omitted when
+    /// None, so leaf tools stay byte-identical to before).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
+}
+
+/// One row of the agent's self-tracked task plan, written via the `todo` tool.
+/// The `todo` tool uses full-replacement semantics (each call sends the entire
+/// plan), so the authoritative final plan is simply the input of the last
+/// non-error `todo` call in the run's `tool_calls` log — see `extract_plan`.
+/// That log is independent of conversation compression (compression rewrites
+/// `messages`, never the `records` accumulator), so the derived plan survives
+/// even when the `todo` tool_results in history are folded into the summary.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct TodoItem {
+    pub subject: String,
+    /// `"pending"` | `"in_progress"` | `"completed"` — stored as a string (not
+    /// an enum) so the field round-trips to JSON as-is and stays tolerant of
+    /// whatever the model sent (validation lives in the tool, not here).
+    pub status: String,
+}
+
+/// Derive the run's final task plan from its tool-call log: the input of the
+/// **last** `todo` call that did not error. Returns `None` when the model never
+/// used `todo` (or only ever errored), in which case `result.json` omits the
+/// `plan` field entirely. A free function rather than an `Agent` field because
+/// the `records` log already carries everything and already flows untouched
+/// through retry / failure / batch — no state machine, no compression hazard.
+pub fn extract_plan(records: &[ToolCallRecord]) -> Option<Vec<TodoItem>> {
+    let last = records
+        .iter()
+        .rev()
+        .find(|r| r.name == "todo" && !r.is_error)?;
+    parse_todos(&last.input)
+}
+
+/// Parse a `todo` tool input (`{"todos": [{subject, status}, …]}`) into typed
+/// items. Defensive: any malformation (missing array, bad object shape, wrong
+/// status value) yields `None` so a garbled plan never poisons `result.json`.
+/// The `todo` tool validates the same way before running, so a record that
+/// reaches here as non-error is already well-formed — this is the belt to that
+/// suspenders (e.g. a hand-constructed record in tests).
+fn parse_todos(input: &Value) -> Option<Vec<TodoItem>> {
+    let arr = input.get("todos")?.as_array()?;
+    let mut out = Vec::with_capacity(arr.len());
+    for v in arr {
+        let subject = v.get("subject")?.as_str()?.trim();
+        if subject.is_empty() {
+            return None;
+        }
+        let status = v.get("status")?.as_str()?;
+        if !matches!(status, "pending" | "in_progress" | "completed") {
+            return None;
+        }
+        out.push(TodoItem {
+            subject: subject.to_string(),
+            status: status.to_string(),
+        });
+    }
+    Some(out)
 }
 
 #[derive(serde::Serialize)]
@@ -234,6 +302,25 @@ pub struct Agent {
     tool_schema_chars: usize,
 }
 
+/// Build the system prompt with a leading `# Environment` block (OS / Shell /
+/// working directory). `os` and `shell` are parameters — not hardcoded — so
+/// the cross-platform shape is unit-testable without actually running on each
+/// target. When `base` is `None` (or empty) the env block stands alone.
+pub(crate) fn system_with_env(
+    base: Option<&str>,
+    os: &str,
+    shell: &str,
+    workdir: &str,
+) -> Option<String> {
+    let env = format!(
+        "# Environment\n- OS: {os}\n- Shell: {shell}\n- Working directory: {workdir}"
+    );
+    Some(match base {
+        Some(b) if !b.is_empty() => format!("{env}\n\n{b}"),
+        _ => env,
+    })
+}
+
 impl Agent {
     pub fn new(
         cfg: &Config,
@@ -247,12 +334,30 @@ impl Agent {
             .iter()
             .map(|t| t.name.len() + t.description.len() + t.schema.to_string().len())
             .sum();
+        // Prepend runtime environment facts (OS / Shell / cwd) to the system
+        // prompt so the model emits platform-correct commands (e.g. it learns
+        // it's under `cmd /C`, not bash, and stops writing `$((...))` that
+        // silently no-ops and exits 0). Done here — the single construction
+        // chokepoint — so BOTH the main agent and every `task` sub-agent (which
+        // overwrites system_prompt then calls Agent::new) get it. `os`/`shell`
+        // are args to the pure helper so the cross-platform shape is testable
+        // off-platform; read `ctx.workdir` before it is moved below.
+        let system = if cfg.inject_environment {
+            system_with_env(
+                cfg.system_prompt.as_deref(),
+                std::env::consts::OS,
+                if cfg!(unix) { "sh -c" } else { "cmd /C" },
+                &ctx.workdir.display().to_string(),
+            )
+        } else {
+            cfg.system_prompt.clone()
+        };
         Self {
             provider,
             tools,
             tool_defs,
             messages: initial,
-            system: cfg.system_prompt.clone(),
+            system,
             model: cfg.model.clone(),
             max_tokens: cfg.max_tokens,
             reasoning_effort: cfg.reasoning_effort.clone(),
@@ -758,10 +863,14 @@ impl Agent {
             // Per-slot outcome. `Cancelled` keeps N:N pairing (a result block
             // for every tool_use) without billing usage or recording a call —
             // matching the pre-parallel behavior. `Ran` is a real ToolOutput
-            // (leaf run inline, or `task` run in the parallel batch).
+            // (leaf run inline, or `task` run in the parallel batch). Boxed
+            // because `ToolOutput` carries an `Option<Value>` (audit `meta`) and
+            // crossed the `large_enum_variant` threshold — an alloc per tool
+            // call is negligible and keeps `Slot` (one per tool_use, in a Vec)
+            // small.
             enum Slot {
                 Cancelled,
-                Ran(ToolOutput),
+                Ran(Box<ToolOutput>),
             }
             let mut slots: Vec<Slot> = (0..tool_uses.len()).map(|_| Slot::Cancelled).collect();
             // Ordinals of `task` calls deferred to the parallel batch.
@@ -791,7 +900,7 @@ impl Agent {
                         let mut fwd = |ev: AgentEvent| events(ev);
                         run_tool(&self.tools, &self.tool_defs, name, input, &self.ctx, &mut fwd)
                     };
-                    slots[i] = Slot::Ran(output);
+                    slots[i] = Slot::Ran(Box::new(output));
                 }
             }
 
@@ -849,7 +958,7 @@ impl Agent {
                         let output = h
                             .join()
                             .unwrap_or_else(|_| ToolOutput::error("task worker panicked"));
-                        slots[task_slots[pos]] = Slot::Ran(output);
+                        slots[task_slots[pos]] = Slot::Ran(Box::new(output));
                     }
                 });
             }
@@ -876,6 +985,7 @@ impl Agent {
                             input: input.clone(),
                             output: output.content.clone(),
                             is_error: output.is_error,
+                            meta: output.meta.clone(),
                         });
                         events(AgentEvent::ToolResult {
                             name: name.clone(),

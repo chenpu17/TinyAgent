@@ -101,6 +101,7 @@ impl Tool for McpTool {
             image,
             is_error: result["isError"].as_bool().unwrap_or(false),
             usage: None,
+            meta: None,
         })
     }
 

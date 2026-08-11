@@ -832,6 +832,12 @@ fn ui_loop(
     // the response just appended to the history. Drives the status bar's
     // `ctx` segment.
     let mut ctx_tokens: u64 = 0;
+    // The agent's current task plan, tracked via the `todo` tool. Shown live in
+    // the status bar (a `plan done/total` segment) so progress is visible
+    // without scrolling — the full checklist also lives in the most recent
+    // `todo` tool-result row in the transcript. Updated on each TodoUpdate
+    // (full-replacement semantics: each call sends the entire plan).
+    let mut plan: Vec<crate::agent::TodoItem> = Vec::new();
     // Per-row markdown render cache (M6). Only the in-flight streaming row is
     // ever re-rendered in the live viewport, so this stays small; committed
     // rows are rendered once at commit time.
@@ -1014,6 +1020,16 @@ fn ui_loop(
                             + cache_creation_input_tokens
                             + cache_read_input_tokens
                             + output_tokens;
+                    }
+                    AgentEvent::TodoUpdate { todos } => {
+                        // Update the live plan state — the status bar renders a
+                        // `plan done/total` segment from it each frame (see
+                        // build_status_line). No transcript row: the full
+                        // checklist is already visible in the `todo` tool-result
+                        // row, and a per-update sys_info line would just clutter
+                        // the scrollback. Full-replacement semantics: each call
+                        // carries the entire plan, so a plain assign is correct.
+                        plan = todos.clone();
                     }
                     AgentEvent::SubAgent { name, event } => {
                         // Render the child's event tagged with its name so the
@@ -1281,11 +1297,27 @@ fn ui_loop(
                     fmt_tokens(out_tokens),
                 );
                 let ctx = fmt_ctx(ctx_tokens, cfg.limits.max_context_tokens);
+                // Plan segment: " · plan done/total", green when every step is
+                // completed, yellow while work remains. None when the agent
+                // hasn't used `todo` (segment absent, not a null).
+                let plan_seg = if plan.is_empty() {
+                    None
+                } else {
+                    let total = plan.len();
+                    let done = plan.iter().filter(|t| t.status == "completed").count();
+                    let style = if done == total {
+                        Style::default().fg(AGENT_FG)
+                    } else {
+                        Style::default().fg(TOOL_CALL_FG)
+                    };
+                    Some((format!(" · plan {done}/{total}"), style))
+                };
                 let status = build_status_line(
                     &cfg.model,
                     &state,
                     busy,
                     ctx.as_ref().map(|(t, s)| (t.as_str(), *s)),
+                    plan_seg.as_ref().map(|(t, s)| (t.as_str(), *s)),
                     &stats,
                     &cwd_path,
                     status_rect.width as usize,
@@ -2056,6 +2088,7 @@ fn build_status_line(
     state: &str,
     busy: bool,
     ctx: Option<(&str, Style)>,
+    plan: Option<(&str, Style)>,
     stats: &str,
     path: &str,
     width: usize,
@@ -2074,19 +2107,29 @@ fn build_status_line(
         Span::styled(state_seg, state_style),
     ];
     let used = spans.iter().map(|s| s.content.width()).sum::<usize>();
-    let ctx_seg = ctx.map(|(t, _)| format!(" · {t}"));
-    let ctx_w = ctx_seg.as_ref().map_or(0, |s| s.width());
-    let push_ctx = |spans: &mut Vec<Span<'static>>| {
-        if let (Some(seg), Some((_, style))) = (&ctx_seg, ctx) {
-            spans.push(Span::styled(seg.clone(), style));
+    // Optional segments in SURVIVAL order (highest priority first): ctx, plan,
+    // stats. Each is added only if it AND every higher-priority segment fit, so
+    // narrowing drops right-to-left — stats first, then plan, then ctx (ctx
+    // survives longest, matching the documented "ctx 保留到最后"). `plan` is
+    // None unless the agent used `todo`, so a no-plan run is byte-identical to
+    // before the segment existed.
+    let mut opt: Vec<(String, Style)> = Vec::new();
+    if let Some((t, s)) = ctx {
+        opt.push((format!(" · {t}"), s));
+    }
+    if let Some((t, s)) = plan {
+        opt.push((t.to_string(), s));
+    }
+    opt.push((stats.to_string(), Style::default().fg(DIM_FG)));
+    let mut prefix_w = 0usize;
+    for (text, style) in &opt {
+        prefix_w += text.width();
+        if used + prefix_w <= width {
+            spans.push(Span::styled(text.clone(), *style));
+        } else {
+            // Lower-priority segments won't fit either — stop.
+            break;
         }
-    };
-    if used + ctx_w + stats.width() <= width {
-        push_ctx(&mut spans);
-        spans.push(Span::styled(stats.to_string(), Style::default().fg(DIM_FG)));
-    } else if used + ctx_w <= width {
-        // Stats are gone but the context fill still fits on its own.
-        push_ctx(&mut spans);
     }
     // Right-aligned cwd path in the room the left side left over.
     let left_w = spans.iter().map(|s| s.content.width()).sum::<usize>();
@@ -3686,24 +3729,24 @@ mod tests {
     fn build_status_line_reduces_detail_on_narrow_terminals() {
         let stats = " · 5 in · 6 out";
         // Wide: full token detail appears as a dim third span.
-        let wide = build_status_line("glm", "idle", false, None, stats, "", 200);
+        let wide = build_status_line("glm", "idle", false, None, None, stats, "", 200);
         assert_eq!(wide.spans.len(), 3);
         assert_eq!(wide.spans[2].content.as_ref(), stats);
         assert_eq!(wide.spans[2].style.fg, Some(DIM_FG));
         // Medium: stats no longer fit, so the bar drops to badge+state only.
         let medium_width = " glm ".width() + "  idle".width();
-        let medium = build_status_line("glm", "idle", false, None, stats, "", medium_width);
+        let medium = build_status_line("glm", "idle", false, None, None, stats, "", medium_width);
         assert_eq!(medium.spans.len(), 2);
         // Narrow: model and live state remain, everything else disappears.
-        let narrow = build_status_line("glm", "idle", false, None, stats, "", 12);
+        let narrow = build_status_line("glm", "idle", false, None, None, stats, "", 12);
         assert_eq!(narrow.spans.len(), 2);
         // Busy state pops AGENT_FG bold — the one busy color, matching the
         // input chrome; idle is dim and carries no clock.
-        let busy = build_status_line("glm", "running", true, None, stats, "", 200);
+        let busy = build_status_line("glm", "running", true, None, None, stats, "", 200);
         let st = busy.spans[1].style;
         assert_eq!(st.fg, Some(AGENT_FG));
         assert!(st.add_modifier.contains(Modifier::BOLD));
-        let idle = build_status_line("glm", "idle", false, None, stats, "", 200);
+        let idle = build_status_line("glm", "idle", false, None, None, stats, "", 200);
         assert_eq!(idle.spans[1].style.fg, Some(DIM_FG));
         // Model badge keeps its black-on-cyan look.
         assert_eq!(wide.spans[0].style.bg, Some(Color::Cyan));
@@ -3714,7 +3757,7 @@ mod tests {
         let stats = " · 5 in · 6 out";
         let ctx = Some(("ctx 21% (54.7k/256k)", Style::default().fg(DIM_FG)));
         // Wide: ctx sits between the state and the stats, keeping its style.
-        let wide = build_status_line("glm", "idle", false, ctx, stats, "", 200);
+        let wide = build_status_line("glm", "idle", false, ctx, None, stats, "", 200);
         assert_eq!(wide.spans.len(), 4);
         assert_eq!(wide.spans[2].content.as_ref(), " · ctx 21% (54.7k/256k)");
         assert_eq!(wide.spans[2].style.fg, Some(DIM_FG));
@@ -3722,9 +3765,36 @@ mod tests {
         // Narrower: stats drop out but ctx stays — it's the most decision-relevant
         // number, so it outlives the stats and is the last segment standing.
         let ctx_only_width = " glm ".width() + "  idle".width() + " · ctx 21% (54.7k/256k)".width();
-        let minimal = build_status_line("glm", "idle", false, ctx, stats, "", ctx_only_width);
+        let minimal = build_status_line("glm", "idle", false, ctx, None, stats, "", ctx_only_width);
         assert_eq!(minimal.spans.len(), 3);
         assert_eq!(minimal.spans[2].content.as_ref(), " · ctx 21% (54.7k/256k)");
+    }
+
+    #[test]
+    fn build_status_line_plan_segment_drops_after_stats_before_ctx() {
+        // The plan segment sits between ctx and stats; narrowing drops stats
+        // first, then plan, then ctx (ctx survives longest). plan=None ⇒ the
+        // segment is absent and behavior matches pre-plan exactly.
+        let stats = " · 5 in · 6 out";
+        let ctx = Some(("ctx 21%", Style::default().fg(DIM_FG)));
+        let plan = Some((" · plan 2/5", Style::default().fg(TOOL_CALL_FG)));
+        // Wide: all four optional segments present, plan between ctx and stats.
+        let wide = build_status_line("glm", "idle", false, ctx, plan, stats, "", 200);
+        assert_eq!(wide.spans.len(), 5);
+        assert_eq!(wide.spans[2].content.as_ref(), " · ctx 21%");
+        assert_eq!(wide.spans[3].content.as_ref(), " · plan 2/5");
+        assert_eq!(wide.spans[3].style.fg, Some(TOOL_CALL_FG));
+        assert_eq!(wide.spans[4].content.as_ref(), stats);
+        // Tight: stats drop, ctx+plan remain (plan outlives stats).
+        let no_stats_w = " glm ".width() + "  idle".width() + " · ctx 21%".width() + " · plan 2/5".width();
+        let mid = build_status_line("glm", "idle", false, ctx, plan, stats, "", no_stats_w);
+        assert_eq!(mid.spans.len(), 4);
+        assert_eq!(mid.spans[3].content.as_ref(), " · plan 2/5");
+        // Tighter: plan drops too, ctx alone survives (ctx outlives plan).
+        let ctx_only_w = " glm ".width() + "  idle".width() + " · ctx 21%".width();
+        let tight = build_status_line("glm", "idle", false, ctx, plan, stats, "", ctx_only_w);
+        assert_eq!(tight.spans.len(), 3);
+        assert_eq!(tight.spans[2].content.as_ref(), " · ctx 21%");
     }
 
     #[test]
@@ -3752,12 +3822,12 @@ mod tests {
         let stats = " · 5 in · 6 out";
         // Left side uses 5 + 6 + 13 = 24 columns of the 40: the path
         // right-aligns into the remaining 16.
-        let line = build_status_line("glm", "idle", false, None, stats, "/tmp/proj", 40);
+        let line = build_status_line("glm", "idle", false, None, None, stats, "/tmp/proj", 40);
         let last = line.spans.last().expect("a path span");
         assert!(last.content.ends_with("/tmp/proj"));
         assert_eq!(line.width(), 40, "left + padded path fills the bar");
         // Narrow terminal: stats still fit but leave no room for the path.
-        let line = build_status_line("glm", "idle", false, None, stats, "/tmp/proj", 26);
+        let line = build_status_line("glm", "idle", false, None, None, stats, "/tmp/proj", 26);
         assert_eq!(line.spans.len(), 3, "no path span: {:?}", line.spans);
     }
 
@@ -4327,11 +4397,11 @@ mod tests {
         let used = " glm ".width() + format!("  {state}").width() + stats.width();
         let exact = used;
         // At the exact fit, the full stats are the third span.
-        let full = build_status_line("glm", state, false, None, stats, "", exact);
+        let full = build_status_line("glm", state, false, None, None, stats, "", exact);
         assert_eq!(full.spans[2].content.as_ref(), stats);
         // One column short: stats no longer fit and there's no ctx to fall back
         // to, so the bar is just badge+state.
-        let dropped = build_status_line("glm", state, false, None, stats, "", exact - 1);
+        let dropped = build_status_line("glm", state, false, None, None, stats, "", exact - 1);
         assert_eq!(dropped.spans.len(), 2);
     }
 

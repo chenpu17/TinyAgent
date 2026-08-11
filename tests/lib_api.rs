@@ -14,7 +14,8 @@ fn minimal_config() -> Config {
         "provider": "openai",
         "api_key_env": "NONE",
         "model": "mock-model",
-        "tools": []
+        "tools": [],
+        "inject_environment": false
     }))
     .expect("minimal config")
 }
