@@ -1965,6 +1965,39 @@
     }
 
     #[test]
+    fn stream_error_stop_reason_maps_to_run_error_with_usage() {
+        // Honest cost (CLAUDE.md "重试诚实成本"): when a provider returns
+        // stop_reason "stream_error" (Anthropic mid-stream error event / read
+        // failure), the agent must (1) fold the partial usage into self.usage
+        // so RunError.usage bills it, and (2) return Err so harness/batch retry
+        // the transient failure. Previously this path bailed inside the
+        // provider, dropping usage Anthropic had already billed.
+        let cfg = cfg_with(5, 0, 0);
+        let (prov, _) = MockProvider::new(vec![MockTurn::Ok(ChatResponse {
+            blocks: vec![
+                Block::Text("partial reply".into()),
+                Block::Text("[stream error] overloaded".into()),
+            ],
+            stop_reason: "stream_error".into(),
+            usage: mock::mk_usage(1500, 7),
+        })]);
+        let mut agent =
+            Agent::new(&cfg, Box::new(prov), vec![], vec![user_text("hi")], test_ctx());
+        let err = match agent.run(&mut |_| {}) {
+            Err(e) => e,
+            Ok(_) => panic!("stream_error must map to a retryable Err"),
+        };
+        // The error message is extracted from the [stream error] Text block.
+        assert!(format!("{err:#}").contains("overloaded"), "got: {err:#}");
+        // The partial usage (input 1500 + output 7) flowed into RunError.usage.
+        assert_eq!(
+            (err.usage.input_tokens, err.usage.output_tokens),
+            (1500, 7),
+            "stream_error partial usage must be billed in RunError"
+        );
+    }
+
+    #[test]
     fn single_run_retries_transient_then_succeeds() {
         // harness::run_with_retries retries on agent.run() Err: two transient
         // 503s then a clean turn → success, exit 0, attempts==3 in result.json.

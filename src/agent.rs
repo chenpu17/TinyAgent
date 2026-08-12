@@ -744,6 +744,34 @@ impl Agent {
                 self.fold_usage(events, &u);
             }
 
+            // A provider mid-stream error (Anthropic error event / read failure)
+            // returns stop_reason "stream_error" carrying the message in a Text
+            // block + the usage accumulated before the failure. fold_usage above
+            // already billed it; now surface the error so harness/batch retry
+            // (transient) and result.json reports it — but the partial cost is
+            // honestly accounted in self.usage / RunError.usage (CLAUDE.md
+            // "重试诚实成本"). Earlier this path bailed inside the provider,
+            // dropping the usage Anthropic had already billed.
+            if resp.stop_reason == "stream_error" {
+                let msg = resp
+                    .blocks
+                    .iter()
+                    .rev()
+                    .find_map(|b| match b {
+                        Block::Text(t) if t.starts_with("[stream error] ") => {
+                            Some(t["[stream error] ".len()..].to_string())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "stream error".to_string());
+                return Err(self.run_error(
+                    anyhow::Error::msg(msg),
+                    &records,
+                    turns,
+                    start.elapsed(),
+                ));
+            }
+
             stop_reason = resp.stop_reason.clone();
             let has_tool_use = resp
                 .blocks

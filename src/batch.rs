@@ -257,6 +257,7 @@ pub fn run(
 /// environment problem (missing api_key_env, MCP server won't start) — neither
 /// is retried; any other value is the model's real stop reason (end_turn /
 /// max_turns / …) and is not retried either.
+#[allow(clippy::too_many_arguments)] // base/name/partial/results_dir/client/attempt_no/acc/cancel — batch per-attempt wiring
 fn run_one_attempt(
     base: &Config,
     name: &str,
@@ -271,6 +272,17 @@ fn run_one_attempt(
     // attempt's outcome on success so result.json bills every attempt
     // honestly (P2-3); extended on a transient error for the next try.
     acc: &mut RunCost,
+    // Process-level Ctrl-C flag. Used ONLY to arm shutdown-aware teardown on
+    // the agent — a second Ctrl-C calls process::exit(130), which skips Drop,
+    // so without arming the MCP shutdown-reaper here a stuck MCP call (blocked
+    // in the 120s CALL_TIMEOUT) would orphan the server child. Deliberately
+    // does NOT call set_cancel: the batch worker gate checks this flag before
+    // dispatching tasks (CLAUDE.md "批量 Ctrl-C 是 worker gate"), and passing
+    // it to set_cancel would race with agent::run()'s entry-point
+    // store(false) reset across parallel workers. shutdown is never reset, so
+    // it is safe to share (mirrors main.rs single-run, which arms shutdown on
+    // the same flag — only the cancel side is batch-specific).
+    cancel: &Arc<std::sync::atomic::AtomicBool>,
 ) -> TaskReport {
     let start = std::time::Instant::now();
     // `usage` is the token cost to bill this report. bad_task / setup_error burn
@@ -328,6 +340,10 @@ fn run_one_attempt(
         Ok(a) => a,
         Err(e) => return bad("setup_error", format!("agent setup failed: {e:#}"), &zero, 0),
     };
+    // Arm MCP shutdown-reaper on the Ctrl-C flag: a second Ctrl-C exits the
+    // process (process::exit skips Drop), so without this a task stuck in an
+    // MCP call would orphan the server child. See the cancel param doc above.
+    agent.set_shutdown(cancel.clone());
 
     let outcome = agent.run(&mut |_| {}); // quiet: no per-event printing
 
@@ -416,7 +432,7 @@ fn run_one(
     // attempt, so each failed attempt's tokens/tools can only be recovered via
     // the RunError it returns — accumulate here and fold into the final result.
     let mut acc = RunCost::default();
-    let mut report = run_one_attempt(base, name, &partial, results_dir, client, 1, &mut acc);
+    let mut report = run_one_attempt(base, name, &partial, results_dir, client, 1, &mut acc, cancel);
     let mut attempt = 0;
     while report.stop_reason == "error" && attempt < retries {
         let backoff = backoff(attempt);
@@ -450,7 +466,7 @@ fn run_one(
             break;
         }
         attempt += 1;
-        report = run_one_attempt(base, name, &partial, results_dir, client, attempt + 1, &mut acc);
+        report = run_one_attempt(base, name, &partial, results_dir, client, attempt + 1, &mut acc, cancel);
     }
     // run_one_attempt stamps per-attempt elapsed; overwrite with the total
     // across attempts + backoffs so report.json reflects real wall cost.

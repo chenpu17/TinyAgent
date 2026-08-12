@@ -271,9 +271,21 @@ impl Anthropic {
                 }
                 // A mid-stream read failure must NOT be treated as a clean
                 // end-of-stream — that would assemble a partial response and
-                // report it as success. Bail so the request fails and retries.
+                // report it as success. Return with stop_reason "stream_error"
+                // (carrying the message as a Text block + any usage accumulated
+                // so far, e.g. input/cache tokens from message_start) so the
+                // agent bills the partial cost honestly and maps this to an Err
+                // that triggers retry — bailing here would drop the usage that
+                // Anthropic already billed for this turn.
                 Err(StreamAbort::StreamError(msg)) => {
-                    bail!("Anthropic stream read error: {msg}");
+                    blocks.push(Block::Text(format!(
+                        "[stream error] Anthropic stream read error: {msg}"
+                    )));
+                    return Ok(ChatResponse {
+                        blocks,
+                        stop_reason: "stream_error".into(),
+                        usage: Some(usage),
+                    });
                 }
             };
             let ev: Value = match serde_json::from_str(&data) {
@@ -381,10 +393,24 @@ impl Anthropic {
                     }
                 }
                 "error" => {
-                    bail!(
-                        "Anthropic stream error: {}",
-                        ev["error"]["message"].as_str().unwrap_or("(no message)")
-                    );
+                    // Return with stop_reason "stream_error" carrying the
+                    // message + any usage already accumulated (message_start's
+                    // input/cache tokens are billed by Anthropic even when the
+                    // stream errors mid-generation). Bailing here would drop
+                    // that usage, violating the honest-cost contract (CLAUDE.md
+                    // "重试诚实成本"). The agent maps "stream_error" to an Err
+                    // that triggers retry while billing the partial cost.
+                    let msg = ev["error"]["message"]
+                        .as_str()
+                        .unwrap_or("(no message)");
+                    blocks.push(Block::Text(format!(
+                        "[stream error] Anthropic stream error: {msg}"
+                    )));
+                    return Ok(ChatResponse {
+                        blocks,
+                        stop_reason: "stream_error".into(),
+                        usage: Some(usage),
+                    });
                 }
                 _ => {}
             }
@@ -491,6 +517,38 @@ mod tests {
     }
 
     #[test]
+    fn stream_error_event_returns_usage_not_bail() {
+        // A mid-stream error event (overloaded / content_filter mid-generation)
+        // arrives AFTER message_start already billed input + cache tokens.
+        // The honest-cost contract (CLAUDE.md "重试诚实成本") requires that
+        // usage to flow back so retry/billing accounts for it — previously the
+        // error event bailed, dropping the already-billed usage on the floor.
+        // Now it returns stop_reason "stream_error" carrying the usage + a
+        // Text block with the message; the agent maps that to a retryable Err.
+        let raw = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1500,\"cache_read_input_tokens\":800}}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+        );
+        let resp = parse(raw.as_bytes());
+        assert_eq!(resp.stop_reason, "stream_error");
+        // input + cache tokens from message_start survived the error path.
+        assert_eq!(
+            resp.usage.map(|u| (u.input_tokens, u.cache_read_input_tokens)),
+            Some((1500, 800))
+        );
+        // The error message is carried in a Text block (prefixed so the agent
+        // can extract it when constructing the retryable Err).
+        let msg = resp.blocks.iter().find_map(|b| match b {
+            Block::Text(t) if t.starts_with("[stream error] ") => Some(t.as_str()),
+            _ => None,
+        });
+        assert!(msg.is_some(), "missing [stream error] block: {:?}", resp.blocks);
+        assert!(msg.unwrap().contains("Overloaded"));
+    }
+
+    #[test]
     fn stream_usage_reads_cache_fields() {
         // When prompt caching engaged, message_start.usage carries
         // cache_creation_input_tokens / cache_read_input_tokens. parse_loop must
@@ -546,9 +604,18 @@ mod tests {
     }
 
     #[test]
-    fn stream_error_event_bails() {
+    fn stream_error_event_returns_stream_error_stop_reason() {
+        // Previously this bailed (dropping usage). Now it returns Ok with
+        // stop_reason "stream_error" so the agent can bill partial usage and
+        // map to a retryable Err. See stream_error_event_returns_usage_not_bail
+        // for the full usage-carrying assertion.
         let raw = "data: {\"type\":\"error\",\"error\":{\"message\":\"overloaded\"}}\n\n";
-        assert!(Anthropic::parse_stream(raw.as_bytes(), &mut |_| {}).is_err());
+        let resp = parse(raw.as_bytes());
+        assert_eq!(resp.stop_reason, "stream_error");
+        assert!(resp
+            .blocks
+            .iter()
+            .any(|b| matches!(b, Block::Text(t) if t.contains("overloaded"))));
     }
 
     #[test]
