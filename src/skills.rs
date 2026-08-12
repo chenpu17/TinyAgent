@@ -211,6 +211,13 @@ struct ParsedFrontmatter {
 /// missing/empty. Expects the conventional `key: value` shape (no space before
 /// the colon).
 fn parse_frontmatter(content: &str) -> Option<ParsedFrontmatter> {
+    // Strip a UTF-8 BOM if present: Windows editors (VS Code default, PowerShell
+    // `>` redirection) commonly emit one, and U+FEFF is NOT whitespace
+    // (char::is_whitespace returns false for it), so trim() below wouldn't
+    // remove it — the first line would read `\u{feff}---` and fail the `== "---"`
+    // check, silently skipping the whole skill with a misleading "missing
+    // frontmatter" warning.
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
     let mut lines = content.lines();
     let first = lines.next()?;
     if first.trim() != "---" {
@@ -381,6 +388,19 @@ mod tests {
         let f = fm("---\nname: \"deploy\"\ndescription: 'ship it'\n---\n");
         assert_eq!(f.name, "deploy");
         assert_eq!(f.description, "ship it");
+    }
+
+    #[test]
+    fn frontmatter_strips_utf8_bom() {
+        // Windows editors (VS Code default, PowerShell redirection) commonly
+        // save SKILL.md with a UTF-8 BOM (U+FEFF). U+FEFF is NOT whitespace, so
+        // the first line becomes "\u{feff}---" and the frontmatter check fails
+        // — silently skipping the skill with a misleading "missing frontmatter"
+        // warning. parse_frontmatter must strip the BOM before checking.
+        let bom = "\u{feff}";
+        let f = fm(&format!("{bom}---\nname: deploy\ndescription: ship\n---\nbody"));
+        assert_eq!(f.name, "deploy");
+        assert_eq!(f.description, "ship");
     }
 
     #[test]

@@ -129,11 +129,14 @@ impl Tool for WriteFile {
             .as_str()
             .context("write_file: missing \"content\"")?;
         let full = resolve(ctx, path)?;
-        if let Some(parent) = full.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("cannot create {}", parent.display()))?;
-        }
-        std::fs::write(&full, content)
+        // Atomic write (temp + fsync + rename), matching edit_file: a crash or
+        // SIGKILL mid-write_file must not leave a truncated target file. The
+        // previous std::fs::write overwrote in place, so a half-written file
+        // survived the interruption — and once compression reclaims the
+        // write_file's content from history, the model can't redo the write
+        // from an in-context copy either. atomic_write also creates the parent
+        // dir, so the explicit create_dir_all above is dropped.
+        crate::harness::atomic_write(&full, content.as_bytes())
             .with_context(|| format!("cannot write {}", full.display()))?;
         // Echo the path as given (usually relative) — less confusing than
         // the canonicalized absolute form.
