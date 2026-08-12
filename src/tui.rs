@@ -1219,6 +1219,7 @@ fn ui_loop(
                     Style::default().fg(USER_FG).add_modifier(Modifier::BOLD),
                 );
                 let body = input.text();
+                let lines_view = input.lines_view();
                 let (crow, ccol) = input.cursor_pos();
                 // The input box height is capped, so a long paste can exceed
                 // it. Scroll the box to follow the caret and place the caret
@@ -1251,15 +1252,35 @@ fn ui_loop(
                 // Ghost placeholder on an empty input box. The caret math below
                 // is unaffected: an empty buffer's caret sits at the prompt end,
                 // in front of the placeholder text.
-                let input_spans = if body.is_empty() {
-                    vec![
+                // Build one Line per logical line so a multiline buffer renders
+                // across rows (a single Line carrying embedded `\n` collapses:
+                // ratatui's grapheme iterator filters control chars including
+                // `\n`, so the caret row math below would land on an empty row).
+                // The prompt spans only the first line; subsequent lines start
+                // at the left border so caret `lead` (computed below as
+                // prompt width only when crow==0) stays correct.
+                let input_lines: Vec<Line> = if body.is_empty() {
+                    vec![Line::from(vec![
                         Span::styled(prompt.clone(), prompt_style),
                         Span::styled(INPUT_PLACEHOLDER, Style::default().fg(DIM_FG)),
-                    ]
+                    ])]
                 } else {
-                    vec![Span::styled(prompt.clone(), prompt_style), Span::raw(body)]
+                    lines_view
+                        .iter()
+                        .enumerate()
+                        .map(|(i, ln)| {
+                            if i == 0 {
+                                Line::from(vec![
+                                    Span::styled(prompt.clone(), prompt_style),
+                                    Span::raw(ln.clone()),
+                                ])
+                            } else {
+                                Line::from(vec![Span::raw(ln.clone())])
+                            }
+                        })
+                        .collect()
                 };
-                let input_widget = Paragraph::new(Line::from(input_spans))
+                let input_widget = Paragraph::new(input_lines)
                     .block(
                         WBlock::default()
                             .borders(Borders::ALL)
@@ -1783,8 +1804,9 @@ fn build_history_lines(
                 // M6: reuse the cached render unless this row's text
                 // grew since last frame (streaming). Prior rows and
                 // scroll redraws hit the cache; only the in-flight row
-                // (or a first render) re-parses markdown.
-                let mut rendered = md_cache.get_or_render(idx, t, markdown_width, |txt| {
+                // (or a first render) re-parses markdown. The cache is keyed by
+                // (text, width), not row index — see MdCache docs for why.
+                let mut rendered = md_cache.get_or_render(t, markdown_width, |txt| {
                     render_markdown(txt, markdown_width)
                         .iter()
                         .map(line_to_owned)
@@ -2947,11 +2969,15 @@ fn line_to_owned(line: &Line) -> Line<'static> {
 /// every assistant message on EVERY frame — including each streamed TextDelta
 /// and each scroll tick — which re-parses the whole conversation's markdown via
 /// `tui_markdown::from_str` each time. That's O(history) per event and gets
-/// slow for long chats. This memoizes the parse keyed by row index, text length,
-/// and terminal width. A streaming delta re-renders only the in-flight row;
-/// scrolling hits the cache; resizing rebuilds width-sensitive Markdown.
+/// slow for long chats. This memoizes the parse keyed by (text, width) — content
+/// addressing, NOT row index. Keying by row index was unsafe across frames:
+/// `build_history_lines` is called with different slices (the commit window vs a
+/// single in-flight row via `from_ref`), so the same relative index pointed at
+/// different rows across calls, and the stale check only compared (text length,
+/// width) — two different messages of equal byte length would alias and the
+/// wrong cached render would be committed into the terminal scrollback.
 struct MdCache {
-    entries: std::collections::HashMap<usize, (usize, usize, Vec<Line<'static>>)>,
+    entries: std::collections::HashMap<(String, usize), Vec<Line<'static>>>,
 }
 
 impl MdCache {
@@ -2963,12 +2989,11 @@ impl MdCache {
     fn clear(&mut self) {
         self.entries.clear();
     }
-    /// Cached rendered lines for row `idx`, recomputing via `render` on a miss
-    /// (absent, text changed, or terminal width changed). The returned slice's
-    /// borrow ends at the next `&mut self` call.
+    /// Cached rendered lines for `text` at `width`, recomputing via `render` on
+    /// a miss. Keyed by (text, width) so equal-length different messages never
+    /// alias. The returned slice's borrow ends at the next `&mut self` call.
     fn get_or_render(
         &mut self,
-        idx: usize,
         text: &str,
         width: usize,
         render: impl FnOnce(&str) -> Vec<Line<'static>>,
@@ -2976,15 +3001,9 @@ impl MdCache {
         // Width participates because Markdown rules and code blocks bake the
         // available measure into their rendered lines. A terminal resize must
         // not reuse the old geometry.
-        let stale = self
-            .entries
-            .get(&idx)
-            .is_none_or(|(len, cached_width, _)| *len != text.len() || *cached_width != width);
-        if stale {
-            self.entries
-                .insert(idx, (text.len(), width, render(text)));
-        }
-        &self.entries[&idx].2
+        self.entries
+            .entry((text.to_string(), width))
+            .or_insert_with(|| render(text))
     }
 }
 
@@ -3185,6 +3204,14 @@ impl InputBuffer {
     /// Snapshot for rendering.
     fn text(&self) -> String {
         self.lines.join("\n")
+    }
+
+    /// Read-only view of the logical lines, for rendering each as a separate
+    /// `Line` (a single `Line` carrying embedded `\n` collapses to one visual
+    /// row — ratatui's grapheme iterator filters control chars including `\n`,
+    /// so a multiline buffer must be split into multiple `Line`s to render).
+    fn lines_view(&self) -> &[String] {
+        &self.lines
     }
 
     /// (row, DISPLAY width of the text before the caret on that line). Display
@@ -4861,23 +4888,21 @@ mod tests {
 
     #[test]
     fn md_cache_recomputes_when_text_or_width_changes() {
-        // M6: the draw closure re-renders every assistant row each frame. The
-        // cache must reuse a row's render across frames (scrolling, other rows
-        // streaming) and only recompute when that row's text or width changes. We prove
-        // reuse by changing the renderer between calls: a cache hit ignores the
-        // new renderer (returns the old content), a miss uses it.
+        // M6: the cache is keyed by (text, width). A cache hit ignores the new
+        // renderer (returns the old content); a miss uses it. We prove reuse by
+        // swapping renderers between calls.
         let mut c = MdCache::new();
         let upper = |t: &str| vec![Line::from(t.to_string())];
         let lower = |t: &str| vec![Line::from(t.to_string())];
 
         // Miss → upper renderer used.
-        let r = c.get_or_render(0, "hi", 40, upper);
+        let r = c.get_or_render("hi", 40, upper);
         assert_eq!(r[0].spans.first().unwrap().content.as_ref(), "hi");
 
-        // Hit (same idx+text): the lower renderer is IGNORED — still "hi", not
-        // "hi" via lower (here identical, so swap to a distinguishing renderer).
+        // Hit (same text+width): the lower renderer is IGNORED — still "hi".
+        // Swap to a distinguishing renderer to prove the cached value is returned.
         let distinguishing = |t: &str| vec![Line::from(t.to_string() + "!")];
-        let r = c.get_or_render(0, "hi", 40, distinguishing);
+        let r = c.get_or_render("hi", 40, distinguishing);
         assert_eq!(
             r[0].spans.first().unwrap().content.as_ref(),
             "hi",
@@ -4885,27 +4910,51 @@ mod tests {
         );
 
         // Text grew (streaming): miss → distinguishing renderer now applied.
-        let r = c.get_or_render(0, "hi there", 40, distinguishing);
+        let r = c.get_or_render("hi there", 40, distinguishing);
         assert_eq!(r[0].spans.first().unwrap().content.as_ref(), "hi there!");
 
         // Same text at a different terminal width is also a miss.
-        let r = c.get_or_render(0, "hi there", 24, lower);
+        let r = c.get_or_render("hi there", 24, lower);
         assert_eq!(r[0].spans.first().unwrap().content.as_ref(), "hi there");
 
-        // A different row is independent (its own miss).
-        let r = c.get_or_render(7, "hi", 40, upper);
+        // The first text is still cached at width 40 (independent of width 24).
+        let r = c.get_or_render("hi", 40, distinguishing);
         assert_eq!(r[0].spans.first().unwrap().content.as_ref(), "hi");
-        // Row 0 untouched by row 7's render.
-        let r = c.get_or_render(0, "hi there", 24, distinguishing);
-        assert_eq!(r[0].spans.first().unwrap().content.as_ref(), "hi there");
 
         // clear() drops entries → next access is a miss.
         c.clear();
-        let r = c.get_or_render(0, "hi there", 24, lower);
+        let r = c.get_or_render("hi there", 24, lower);
         assert_eq!(
             r[0].spans.first().unwrap().content.as_ref(),
             "hi there",
             "clear must force a re-render with the new renderer"
+        );
+    }
+
+    #[test]
+    fn md_cache_keys_by_text_not_index() {
+        // Regression: the cache was previously keyed by row index, but
+        // build_history_lines is called with different slices across frames
+        // (commit window vs a single in-flight row via `from_ref`), so the
+        // same relative index pointed at different rows. The stale check only
+        // compared (text byte-length, width) — two different messages of equal
+        // byte length would alias and the wrong cached render would be
+        // committed into the terminal scrollback. Keying by (text, width)
+        // makes equal-length different messages independent.
+        let mut c = MdCache::new();
+        let renderer = |t: &str| vec![Line::from(t.to_string())];
+        // Two different 4-byte messages ("AAAA" and "BBBB").
+        let r1 = c.get_or_render("AAAA", 80, renderer);
+        assert_eq!(r1[0].spans.first().unwrap().content.as_ref(), "AAAA");
+        // Same width, same byte length, DIFFERENT content → must NOT alias.
+        let r2 = c.get_or_render("BBBB", 80, renderer);
+        assert_eq!(r2[0].spans.first().unwrap().content.as_ref(), "BBBB");
+        // The first entry is untouched by the second render.
+        let r1_again = c.get_or_render("AAAA", 80, renderer);
+        assert_eq!(
+            r1_again[0].spans.first().unwrap().content.as_ref(),
+            "AAAA",
+            "equal-length different messages must not alias in the cache"
         );
     }
 
