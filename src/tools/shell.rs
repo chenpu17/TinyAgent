@@ -115,11 +115,11 @@ impl Tool for Shell {
 
         let Some(status) = status else {
             let mut out = format!("$ {cmd}\n");
-            out.push_str(&String::from_utf8_lossy(&stdout));
+            out.push_str(&decode_output(&stdout));
             // Keep stderr on the killed path too: the diagnostics a command
             // printed before hanging are exactly what's needed to see WHY it
             // timed out — dropping them makes timeouts undebuggable.
-            let stderr = String::from_utf8_lossy(&stderr);
+            let stderr = decode_output(&stderr);
             if !stderr.trim().is_empty() {
                 if !out.ends_with('\n') {
                     out.push('\n');
@@ -141,8 +141,8 @@ impl Tool for Shell {
 
         let mut out = String::new();
         out.push_str(&format!("$ {cmd}\n"));
-        out.push_str(&String::from_utf8_lossy(&stdout));
-        let stderr = String::from_utf8_lossy(&stderr);
+        out.push_str(&decode_output(&stdout));
+        let stderr = decode_output(&stderr);
         if !stderr.trim().is_empty() {
             if !out.ends_with('\n') {
                 out.push('\n');
@@ -181,6 +181,47 @@ fn read_capped<R: Read>(r: &mut R, cap: usize) -> Vec<u8> {
     buf
 }
 
+/// Decode captured command output to a string. Modern tools emit UTF-8, but on
+/// Windows cmd.exe (and many legacy programs) emit text in the system OEM code
+/// page — GBK/936 on Chinese Windows, Shift_JIS/932 on Japanese, etc. Decoding
+/// those bytes as UTF-8 turns every multi-byte sequence into U+FFFD (the
+/// "'python3' 不是内部或外部命令" error becomes mojibake). Try strict UTF-8
+/// first; on Windows fall back to the OEM code page so localized messages come
+/// through intact. Unix tools are UTF-8, so the fallback is Windows-only.
+fn decode_output(bytes: &[u8]) -> String {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_string();
+    }
+    #[cfg(windows)]
+    if let Some(s) = decode_oem(bytes) {
+        return s;
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+#[cfg(windows)]
+fn decode_oem(bytes: &[u8]) -> Option<String> {
+    let cp = unsafe { windows_sys::Win32::Globalization::GetOEMCP() };
+    oem_encoding_for(cp).map(|enc| enc.decode(bytes).0.into_owned())
+}
+
+/// Map a Windows code page number to an encoding_rs encoding. Only the OEM
+/// pages that carry multi-byte text need mapping: their output fails UTF-8
+/// decode above, while ASCII OEM pages (437/850) are valid UTF-8 and never
+/// reach here. Separated from `decode_oem` so the mapping is testable without
+/// the FFI call (and without depending on the host machine's locale).
+#[cfg(windows)]
+fn oem_encoding_for(cp: u32) -> Option<&'static encoding_rs::Encoding> {
+    Some(match cp {
+        936 => encoding_rs::GBK,
+        932 => encoding_rs::SHIFT_JIS,
+        949 => encoding_rs::EUC_KR,
+        950 => encoding_rs::BIG5,
+        874 => encoding_rs::WINDOWS_874,
+        _ => return None,
+    })
+}
+
 /// Kill the child's entire process group. `process_group(0)` at spawn made
 /// the child a group leader, so its pid IS the group id and `-pid` targets
 /// every descendant — plain `child.kill()` only signals the direct child and
@@ -206,6 +247,21 @@ fn kill_process_group(child: &mut std::process::Child) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn oem_decode_turns_gbk_cmd_error_into_chinese() {
+        // cmd.exe on Chinese Windows (OEM CP 936/GBK) emits its "'x' 不是内部
+        // 或外部命令" error in GBK. UTF-8 decode of those bytes fails; the OEM
+        // fallback must produce readable Chinese, not U+FFFD soup. Tests the
+        // mapping + decode directly so it doesn't depend on the host's locale.
+        let enc = oem_encoding_for(936).expect("CP936 maps to GBK");
+        assert_eq!(enc.name(), "GBK");
+        // Real bytes for "不是内部" in GBK — not valid UTF-8, so the fallback fires.
+        let gbk = [0xb2u8, 0xbb, 0xca, 0xc7, 0xc4, 0xda, 0xb2, 0xbf];
+        let s = enc.decode(&gbk).0;
+        assert!(s.contains("不是内部"), "GBK should decode to Chinese, got: {s:?}");
+    }
     #[cfg(unix)]
     use std::sync::atomic::AtomicBool;
     #[cfg(unix)]

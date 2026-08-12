@@ -223,7 +223,9 @@ fn dedup_check(names: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{dedup_check, sanitize_name};
+    use super::{build, dedup_check, sanitize_name, McpServerConfig};
+    use crate::tools::{Tool as _, ToolCtx};
+    use serde_json::json;
 
     #[test]
     fn sanitize_keeps_clean_identifiers_unchanged() {
@@ -272,5 +274,61 @@ mod tests {
         let r = dedup_check(&["mcp_a_b".into(), "mcp_a_b".into()]);
         assert!(r.is_err());
         assert!(format!("{}", r.unwrap_err()).contains("collision"));
+    }
+
+    /// 真实 MCP 端到端：起一个 keyless 的 filesystem server，枚举它的工具，
+    /// 并实际执行一次 search_files。覆盖「连接 → 握手 → 枚举 → 执行」全链路，
+    /// 即 TinyWorker 建 agent 时走的同一条 mcp::build 路径。
+    /// `#[ignore]`：需要 npx + 网络，不进常规 CI；`cargo test filesystem_mcp -- --ignored --nocapture`。
+    #[test]
+    #[ignore]
+    fn filesystem_mcp_connects_enumerates_and_searches() {
+        let dir = std::env::temp_dir().join("ta-mcp-e2e");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("alpha.txt"), "a").unwrap();
+        std::fs::write(dir.join("beta.md"), "b").unwrap();
+        let server = McpServerConfig {
+            name: "fs".into(),
+            command: Some("npx".into()),
+            args: vec![
+                "-y".into(),
+                "@modelcontextprotocol/server-filesystem".into(),
+                dir.display().to_string(),
+            ],
+            url: None,
+            transport: None,
+            headers: Default::default(),
+            env: Default::default(),
+        };
+        let tools = build(&[server]).expect("MCP server 应连接并枚举出工具");
+        let names: Vec<String> = tools.iter().map(|t| t.def().name.clone()).collect();
+        eprintln!("fs MCP 暴露的工具：{names:?}");
+        assert!(
+            names.iter().any(|n| n.contains("search") || n.contains("list_directory")),
+            "应含 search/list 工具，得到 {names:?}"
+        );
+        // 实际执行一次工具调用。list_directory 语义确定（直接列目录内容），
+        // 用它断言「执行」链路通；search_files 也调一次看输出（其 pattern 匹配
+        // 语义随 server 版本而异，不强断言）。
+        let ctx = ToolCtx {
+            workdir: dir.clone(),
+            max_output_chars: 4000,
+            restrict_to_workdir: false,
+            cancel: None,
+        };
+        let list = tools.iter().find(|t| t.def().name.contains("list_directory")).expect("有 list 工具");
+        let out = list
+            .run(&json!({ "path": dir.display().to_string() }), &ctx)
+            .expect("list_directory 应执行成功");
+        eprintln!("list_directory 结果：{}", out.content);
+        assert!(out.content.contains("alpha.txt"), "应列出 alpha.txt，得到：{}", out.content);
+        assert!(out.content.contains("beta.md"), "应列出 beta.md，得到：{}", out.content);
+        if let Some(search) = tools.iter().find(|t| t.def().name.contains("search")) {
+            let s = search
+                .run(&json!({ "path": dir.display().to_string(), "pattern": "alpha" }), &ctx)
+                .expect("search_files 应执行成功");
+            eprintln!("search_files(alpha) 结果：{}", s.content);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

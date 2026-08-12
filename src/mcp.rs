@@ -293,13 +293,22 @@ impl StdioTransport {
                 .spawn()
         };
         #[cfg(not(unix))]
-        let child = Command::new(cmd)
-            .args(&cfg.args)
-            .envs(&cfg.env)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn();
+        let child = {
+            // Windows: npm 装出来的 bin 多是 .cmd 垫片（npx、各 MCP server），
+            // CreateProcess 不会按 PATHEXT 解析 .cmd，直接 Command::new("npx")
+            // 会 "program not found"。经 cmd /C 走 .cmd 解析（同 shell 工具的做法）。
+            // kill 仍是 best-effort：非 unix 无 process group，Drop 只杀直接子进程
+            // cmd.exe（Windows 既有行为，不变；整树回收需 Job Object，另案）。
+            Command::new("cmd")
+                .arg("/C")
+                .arg(cmd)
+                .args(&cfg.args)
+                .envs(&cfg.env)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+        };
         let mut child =
             child.with_context(|| format!("cannot start MCP server '{}': {}", cfg.name, cmd))?;
 
