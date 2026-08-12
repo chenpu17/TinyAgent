@@ -1266,11 +1266,20 @@ impl Agent {
         let old_summary = compress::extract_running_summary(&self.messages);
         let lines = compress::window_lines(&self.messages, cut);
         let transcript_size: usize = lines.iter().map(|l| l.len()).sum();
+        // The summary request's max_tokens must stay within the configured
+        // turn budget: strict gateways (some OpenAI-compatible deployments)
+        // reject a per-request max_tokens above the model/account cap with a
+        // 400, which would fail the summary call, set compress_failed, and
+        // silently disable compression for the whole run. summary_budget
+        // clamps to [1024, 4096], but an eval config can set max_tokens < 1024
+        // — clamp the budget down to it (with a 256 floor so a summary isn't
+        // cut to nothing). 256 is the smallest useful summary length.
+        let cap = self.max_tokens.max(256);
 
         if transcript_size <= compress::SUMMARY_CHUNK_CHARS {
             // Common case: one summary call with a proportional budget.
             let transcript = lines.concat();
-            let budget = compress::summary_budget(transcript_size);
+            let budget = compress::summary_budget(transcript_size).min(cap);
             self.summary_call(
                 &compress::summary_prompt(&transcript, old_summary.as_deref()),
                 budget,
@@ -1286,7 +1295,7 @@ impl Agent {
             if chunks.len() == 1 {
                 return self.summary_call(
                     &compress::summary_prompt(&chunks[0], old_summary.as_deref()),
-                    compress::summary_budget(chunks[0].len()),
+                    compress::summary_budget(chunks[0].len()).min(cap),
                     deadline,
                     1,
                 );
@@ -1297,7 +1306,7 @@ impl Agent {
             for chunk in &chunks {
                 let (s, u) = self.summary_call(
                     &compress::summary_prompt(chunk, None),
-                    compress::SUMMARY_CHUNK_BUDGET,
+                    compress::SUMMARY_CHUNK_BUDGET.min(cap),
                     deadline,
                     n_calls,
                 )?;
@@ -1312,7 +1321,7 @@ impl Agent {
             for (i, s) in chunk_summaries.iter().enumerate() {
                 combined.push_str(&format!("\n[segment {}]\n{s}\n", i + 1));
             }
-            let budget = compress::summary_budget(combined.len());
+            let budget = compress::summary_budget(combined.len()).min(cap);
             let (final_summary, u) = self.summary_call(
                 &compress::summary_prompt(&combined, old_summary.as_deref()),
                 budget,

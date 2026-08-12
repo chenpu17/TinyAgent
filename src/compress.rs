@@ -143,9 +143,19 @@ pub(crate) fn fold_summary(messages: &[Message], cut: usize, summary: &str) -> V
     // so a pathological cut (find_safe_cut guarantees cut>=3, but don't rely on
     // an invariant upstream to avoid a usize underflow here) can't underflow.
     let mut compressed = Vec::with_capacity(messages.len().saturating_sub(cut) + 1);
-    let mut head = messages[0].clone();
-    head.content
-        .retain(|b| !matches!(b, Block::Text(t) if t.starts_with(SUMMARY_MARKER)));
+    // The head MUST be a user message so the folded history keeps a valid
+    // user→assistant→… cadence (Anthropic rejects an assistant-led exchange).
+    // Normally messages[0] is the opening user turn, but a resumed/edited
+    // session can start with an assistant message — fold the summary into a
+    // fresh empty user head then, rather than grafting it onto an assistant.
+    let mut head = if messages[0].role == Role::User {
+        let mut h = messages[0].clone();
+        h.content
+            .retain(|b| !matches!(b, Block::Text(t) if t.starts_with(SUMMARY_MARKER)));
+        h
+    } else {
+        Message::user(Vec::new())
+    };
     head.content
         .push(Block::Text(format!("{SUMMARY_MARKER}\n{summary}")));
     compressed.push(head);
@@ -165,7 +175,16 @@ pub(crate) fn find_safe_cut(messages: &[Message], keep_recent: usize) -> Option<
     if n <= keep_recent + 2 {
         return None;
     }
-    let mut cut = n - keep_recent; // always >= 3 by the guard above
+    // Scan from the tail's nominal start upward for an assistant boundary.
+    // When keep_recent is 0 the nominal start is `n` (empty tail), which made
+    // the loop body unreachable and silently disabled compression for that
+    // config — clamp to n-1 so a single-message tail (the boundary message
+    // itself) is still discoverable. The guard above guarantees n >= 3 when
+    // keep_recent is 0, so n-1 >= 2 (head keeps >= messages[0..2]).
+    let mut cut = n - keep_recent;
+    if cut >= n {
+        cut = n - 1;
+    }
     while cut < n {
         if messages[cut].role == Role::Assistant {
             return Some(cut);

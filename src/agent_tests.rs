@@ -88,6 +88,32 @@
     }
 
     #[test]
+    fn safe_cut_works_with_keep_recent_zero() {
+        // keep_recent=0 means "the tail may be empty", but fold_summary still
+        // needs at least one tail message — so the scan must clamp the nominal
+        // start (n) down to n-1 and still find an assistant boundary. Without
+        // the fix, cut==n made the loop body unreachable and compression was
+        // silently disabled for keep_recent=0 configs.
+        // [user, asst, user, asst] — n=4, guard (4 <= 0+2) passes.
+        let msgs = vec![
+            user_text("task"),
+            Message::assistant(vec![Block::Text("r1".into())]),
+            user_text("more"),
+            Message::assistant(vec![Block::Text("r2".into())]),
+        ];
+        // clamp → cut=3 → messages[3]=assistant → Some(3); tail = [asst] (1 msg).
+        assert_eq!(find_safe_cut(&msgs, 0), Some(3));
+        // If the last message isn't an assistant, no boundary → None.
+        let msgs2 = vec![
+            user_text("task"),
+            Message::assistant(vec![Block::Text("r1".into())]),
+            user_text("more"),
+            user_text("again"),
+        ];
+        assert_eq!(find_safe_cut(&msgs2, 0), None);
+    }
+
+    #[test]
     fn safe_cut_needs_middle_content() {
         // Candidate lands at index 1 (assistant) → nothing to summarize → None
         let msgs = vec![
@@ -126,6 +152,29 @@
         // tail untouched
         assert_eq!(out[1].role, Role::Assistant);
         assert_eq!(out[2].role, Role::User);
+    }
+
+    #[test]
+    fn fold_summary_uses_fresh_user_head_when_first_message_is_assistant() {
+        // A resumed/edited session can start with an assistant message. The
+        // summary must NOT be grafted onto that assistant head (it would break
+        // user→assistant cadence and Anthropic rejects assistant-led exchanges
+        // after the fold). Instead a fresh empty user head carries the summary.
+        let msgs = vec![
+            Message::assistant(vec![Block::Text("stray opening".into())]),
+            user_text("real turn"),
+            Message::assistant(vec![Block::Text("reply".into())]),
+        ];
+        let out = fold_summary(&msgs, 2, "the summary");
+        // head + 1 tail message (messages[2..])
+        assert_eq!(out.len(), 2);
+        // Head is a USER message (fresh), not the assistant that was messages[0].
+        assert_eq!(out[0].role, Role::User);
+        // The fresh head carries ONLY the summary block (no stray opening text).
+        assert_eq!(out[0].content.len(), 1);
+        assert!(matches!(&out[0].content[0], Block::Text(t) if t.contains("the summary")));
+        // Tail preserved as-is.
+        assert_eq!(out[1].role, Role::Assistant);
     }
 
     #[test]
