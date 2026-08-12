@@ -50,6 +50,13 @@ pub fn run(
     failed: bool,
     cancel: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<i32> {
+    // Reject --jobs 0 explicitly: the worker loop below uses jobs.max(1), so 0
+    // would otherwise silently run as a single worker with no warning, which
+    // is surprising for a user who passed 0 expecting "no parallelism" or an
+    // error. Surface it as a clear config error instead.
+    if jobs == 0 {
+        bail!("--jobs must be >= 1");
+    }
     // If --report points at a *.json inside the batch dir, a re-run would pick
     // up the prior report.json as a task fragment (it's a *.json sitting in
     // `dir`). Canonicalize lets us skip exactly that file when it already
@@ -174,7 +181,7 @@ pub fn run(
     // lock state, so this is a debug/CI-robustness + consistency measure, not a
     // release-abort guard — a panicking worker still loses the report in release.
     std::thread::scope(|s| {
-        for _ in 0..jobs.max(1) {
+        for _ in 0..jobs {
             s.spawn(|| loop {
                 let next = rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
                 let (name, partial) = match next {

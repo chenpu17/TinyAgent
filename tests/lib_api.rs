@@ -121,3 +121,76 @@ fn agent_event_is_serializable_for_ffi() {
     let s2 = serde_json::to_string(&sub).expect("serialize subagent");
     assert!(s2.contains("worker") && s2.contains("child"), "serialized: {s2}");
 }
+
+#[test]
+fn build_agent_with_provider_assembles_and_runs() {
+    // Cover the build_agent* facade (assemble: tool wiring + workdir + ToolCtx),
+    // which custom_callback_tool_runs_and_usage_is_honest bypasses by calling
+    // Agent::new directly. Using build_agent_with_provider injects a mock
+    // provider and asserts the assembled agent runs end-to-end with an extra
+    // custom tool appended.
+    use tiny_agent::provider::new_client;
+    let cfg = minimal_config();
+    let client = new_client(0);
+    let (provider, _state) =
+        MockProvider::new(vec![resp_text("ok from facade", mk_usage(3, 2))]);
+    let mut agent = tiny_agent::build_agent_with_provider(
+        &cfg,
+        Box::new(provider),
+        Vec::new(),
+        &client,
+        Vec::new(),
+        "",
+    )
+    .expect("build_agent_with_provider assembles");
+    let mut texts = String::new();
+    let outcome = agent
+        .run(&mut |ev| {
+            if let AgentEvent::TextDelta(t) = ev {
+                texts.push_str(&t);
+            }
+        })
+        .expect("facade-assembled agent runs");
+    assert_eq!(outcome.stop_reason, "end_turn");
+    assert!(texts.contains("ok from facade"), "ran via facade: {texts}");
+    assert_eq!(outcome.input_tokens, 3);
+}
+
+#[test]
+fn run_error_serializes_structured_cost() {
+    // The bindings serialize RunError to surface a failed run's burned tokens /
+    // tool calls / turns to the host (CLAUDE.md "重试诚实成本"). A manual
+    // Serialize impl carries usage/tool_calls/turns/elapsed and renders source
+    // (anyhow::Error, not auto-Serializable) as its Display string under `error`.
+    // Drive a real failing run (provider Err) so the RunError is authentic.
+    use tiny_agent::provider::mock;
+    let cfg = minimal_config();
+    let (provider, _) = MockProvider::new(vec![
+        // turn 1 bills some usage then…
+        resp_text("partial", mk_usage(100, 10)),
+    ]);
+    // Re-script to fail: a provider Err surfaces as RunError carrying the
+    // accumulated cost. Use a one-turn script that errors immediately.
+    let (provider, _) = MockProvider::new(vec![mock::MockTurn::Err("boom: 503".into())]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(provider),
+        vec![],
+        vec![tiny_agent::Message::user(vec![tiny_agent::Block::Text("go".into())])],
+        ToolCtx {
+            workdir: std::env::current_dir().unwrap(),
+            max_output_chars: 4000,
+            restrict_to_workdir: false,
+            cancel: None,
+        },
+    );
+    let re = match agent.run(&mut |_| {}) {
+        Err(e) => e,
+        Ok(_) => panic!("expected a provider error"),
+    };
+    let v = serde_json::to_value(&re).expect("serialize RunError");
+    assert_eq!(v["error"], "boom: 503", "source renders as its Display string");
+    assert!(v["usage"].is_object(), "usage serializes");
+    assert!(v["turns"].is_number(), "turns serializes as a number");
+    assert!(v["elapsed"].is_object(), "Duration serializes (serde json)");
+}

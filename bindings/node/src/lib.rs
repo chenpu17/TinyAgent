@@ -77,6 +77,14 @@ impl ToNapiValue for Outcome {
 // No tokio, no core change — reuses the lib's `CallbackTool` (same path the
 // Python binding takes).
 
+/// Backstop timeout for a JS callback round-trip (tool / custom-provider): if
+/// the host function hasn't resolved within this many seconds, the agent worker
+/// gives up so it can't hang forever (the JS main thread must stay free during
+/// run() for the TSFN callback to dispatch — a stuck callback otherwise deadlocks
+/// the worker). CLAUDE.md documents this as a deliberate backstop, not a knob;
+/// the value is centralized here so the timeout and its error message agree.
+const JS_CALLBACK_TIMEOUT_SECS: u64 = 120;
+
 /// Monotonic id tagging each in-flight tool call so `resolveTool` can find the
 /// waiting channel. `i64` (not u64) because napi only reads JS numbers as i64.
 static NEXT_TOOL_ID: AtomicI64 = AtomicI64::new(1);
@@ -150,7 +158,7 @@ fn build_extra_tools(env: Env, tools: Option<Vec<Object>>) -> Result<Vec<Box<dyn
             // thread is free (the run() caller awaits it), so the wrapped run
             // resolves the channel promptly; the timeout is a backstop against
             // a user tool that never returns.
-            match rx.recv_timeout(Duration::from_secs(120)) {
+            match rx.recv_timeout(Duration::from_secs(JS_CALLBACK_TIMEOUT_SECS)) {
                 Ok(r) => Ok(ta::ToolOutput {
                     content: r.content,
                     is_error: r.is_error,
@@ -161,7 +169,7 @@ fn build_extra_tools(env: Env, tools: Option<Vec<Object>>) -> Result<Vec<Box<dyn
                 Err(_) => {
                     pending_tools().lock().unwrap().remove(&id);
                     Err(anyhow::anyhow!(
-                        "tool \"{name}\": JS callback did not resolve within 120s"
+                        "tool \"{name}\": JS callback did not resolve within {JS_CALLBACK_TIMEOUT_SECS}s"
                     ))
                 }
             }
@@ -272,8 +280,12 @@ impl ta::Provider for NodeProvider {
         // resolves promptly; the timeout is a backstop against a provider that
         // never returns.
         let resp = rx
-            .recv_timeout(Duration::from_secs(120))
-            .map_err(|_| err("provider: JS callback did not resolve within 120s"))?;
+            .recv_timeout(Duration::from_secs(JS_CALLBACK_TIMEOUT_SECS))
+            .map_err(|_| {
+                err(format!(
+                    "provider: JS callback did not resolve within {JS_CALLBACK_TIMEOUT_SECS}s"
+                ))
+            })?;
         // The wrapper signals a thrown user provider via a `{__error}` marker so
         // the run fails honestly (mirroring the Python binding, where a raised
         // exception fails the turn) instead of producing a silent empty turn.
@@ -333,7 +345,19 @@ impl Task for RunTask {
                     }
                 }
             })
-            .map_err(err)?;
+            .map_err(|e: ta::RunError| {
+                // Surface the structured cost a failed run burned, not just the
+                // Display message — the binding previously dropped usage /
+                // tool_calls / turns / elapsed, contradicting the core library's
+                // "honest cost" design (CLAUDE.md "重试诚实成本"). Serialize
+                // RunError (manual Serialize impl) to a JSON string so JS callers
+                // can JSON.parse(err.message) to read e.g. .usage.input_tokens;
+                // the `error` field carries the human-readable message.
+                match serde_json::to_string(&e) {
+                    Ok(json) => Error::from_reason(json),
+                    Err(_) => err(&e),
+                }
+            })?;
 
         serde_json::to_value(&outcome).map_err(err)
     }
@@ -564,7 +588,19 @@ impl Task for ChatRunTask {
                     }
                 }
             })
-            .map_err(err)?;
+            .map_err(|e: ta::RunError| {
+                // Surface the structured cost a failed run burned, not just the
+                // Display message — the binding previously dropped usage /
+                // tool_calls / turns / elapsed, contradicting the core library's
+                // "honest cost" design (CLAUDE.md "重试诚实成本"). Serialize
+                // RunError (manual Serialize impl) to a JSON string so JS callers
+                // can JSON.parse(err.message) to read e.g. .usage.input_tokens;
+                // the `error` field carries the human-readable message.
+                match serde_json::to_string(&e) {
+                    Ok(json) => Error::from_reason(json),
+                    Err(_) => err(&e),
+                }
+            })?;
 
         serde_json::to_value(&outcome).map_err(err)
     }

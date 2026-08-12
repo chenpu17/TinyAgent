@@ -123,7 +123,20 @@ fn run_agent(
             let bound = pythonize(py, &o)?;
             Ok(bound.unbind())
         }
-        Err(e) => Err(to_pyerr(e)),
+        Err(e) => {
+            // Surface the structured cost (usage / tool_calls / turns / elapsed)
+            // a failed run burned, not just the Display message — the bindings
+            // previously dropped these, contradicting the core library's
+            // "honest cost" design (CLAUDE.md "重试诚实成本"). Serialize
+            // RunError (manual Serialize impl) to a JSON string and carry it as
+            // the RuntimeError message so callers can `json.loads(e.args[0])`
+            // to read e.g. .usage.input_tokens; the `error` field carries the
+            // human-readable message (mirrors the Node binding).
+            match serde_json::to_string(&e) {
+                Ok(json) => Err(PyRuntimeError::new_err(json)),
+                Err(_) => Err(to_pyerr(&e)),
+            }
+        }
     }
 }
 

@@ -217,6 +217,26 @@ impl std::error::Error for RunError {
     }
 }
 
+/// Serialize the structured cost fields (usage / tool_calls / turns / elapsed)
+/// so the Python / TypeScript bindings can hand a failed run's honest cost back
+/// to the host — previously the bindings only took `Display` (the source
+/// message), dropping the tokens/tools/turns that CLAUDE.md's "重试诚实成本"
+/// design gathered them for. `source` (anyhow::Error) serializes as its Display
+/// string since anyhow has no Serialize impl; Display/Debug above are unchanged
+/// so core call-site `{e}` formatting is byte-identical.
+impl serde::Serialize for RunError {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut s = ser.serialize_struct("RunError", 5)?;
+        s.serialize_field("error", &self.source.to_string())?;
+        s.serialize_field("usage", &self.usage)?;
+        s.serialize_field("tool_calls", &self.tool_calls)?;
+        s.serialize_field("turns", &self.turns)?;
+        s.serialize_field("elapsed", &self.elapsed)?;
+        s.end()
+    }
+}
+
 /// Accumulated partial run cost (tokens + tool calls) from failed attempts,
 /// folded into a successful outcome so `result.json` bills every attempt
 /// honestly (P2-3). Shared between single-run `run_with_retries` and batch
