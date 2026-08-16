@@ -7,7 +7,7 @@
 
 ```sh
 cargo build --features tui                 # 默认只编 headless；TUI 要带 feature
-cargo test --features tui                  # 单测（含 TUI 输入/渲染逻辑）
+cargo test --features tui,mock             # 单测（含 TUI 输入/渲染逻辑 + lib_api 集成测试）
 cargo clippy --features tui --all-targets  # lint TUI 版
 cargo clippy --all-targets                # lint headless 版（两个 feature 配置都要过）
 ```

@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # 三平台 × 双 clippy 配置 + 测试。CLAUDE.md 约定两个 clippy 都要过：
+    # TUI 代码在 #[cfg(feature = "tui")] 后，默认构建看不到它。
+    # tests/lib_api.rs 门在 `mock` feature 上（provider::mock 是
+    # cfg(any(test, feature="mock"))——integration test 编译时 lib 不带
+    # cfg(test)），所以测试命令必须带 mock 才真正跑到它。
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # 两个 clippy 都带 -D warnings：本地现状零警告，门禁就该硬。
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --features tui --all-targets -- -D warnings
+      - run: cargo test
+      - run: cargo test --features tui,mock
+
+  python-binding:
+    # 绑定测试只在 ubuntu 跑：绑定层从未在 Windows 验证过（三次 Windows
+    # 修复全是核心代码），先不做 continue-on-error 的虚假信心，等手动
+    # 在 Windows 跑绿一轮再扩矩阵。
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # maturin develop 需要 virtualenv；conftest.py 从 __file__ 反解仓库根，
+      # 以 sys.executable 起 examples/mock_openai.py，离线自洽。
+      - run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          pip install maturin pytest
+          cd bindings/python
+          maturin develop
+          python -m pytest tests/ -q
+      - run: cargo clippy -p tiny-agent-py --all-targets -- -D warnings
+
+  node-binding:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: |
+          cd bindings/node
+          npm ci
+          npm run build:debug
+          npm test
+      - run: cargo clippy -p tiny-agent-node --all-targets -- -D warnings
+
+  musl:
+    # 移植性冒烟：musl 静态构建是"嵌入式低配 Linux"定位的核心交付物，
+    # 每次 push 确认它编得过。
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: rustup target add x86_64-unknown-linux-musl
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --target x86_64-unknown-linux-musl

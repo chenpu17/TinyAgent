@@ -720,7 +720,7 @@ tool whitelist`。真正的"按轮临时预批准"需要每轮权限/激活层�
 ## 开发
 
 ```sh
-cargo test --features tui         # 单元测试（含 TUI 输入/渲染逻辑）
+cargo test --features tui,mock   # 单元测试（含 TUI 输入/渲染逻辑 + lib_api 集成测试）
 cargo clippy --features tui --all-targets   # lint（TUI 版）
 cargo clippy --all-targets                 # lint（headless 版）
 
