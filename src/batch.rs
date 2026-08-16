@@ -30,6 +30,18 @@ struct TaskReport {
     cache_creation_input_tokens: u64,
     #[serde(default)]
     cache_read_input_tokens: u64,
+    // Attribution (P3): WHICH model ran this task and WHEN it started. `model`
+    // because a task fragment may override it — a mixed-model batch is exactly
+    // when per-task attribution matters. `started_at` because parallel workers
+    // make elapsed_secs ≠ wall-clock (queue wait + backoff are invisible
+    // otherwise). Both `#[serde(default)]` so pre-field reports still parse for
+    // `--failed` (same guard as the token fields above). No `provider`: it's a
+    // forbidden_batch_override field, so one batch is single-provider — written
+    // once at the top level of report.json instead.
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    started_at: String,
 }
 
 /// Run every `*.json` task fragment in `dir` against the base config,
@@ -206,6 +218,10 @@ pub fn run(
                         output_tokens: 0,
                         cache_creation_input_tokens: 0,
                         cache_read_input_tokens: 0,
+                        // Never started: no model ran it, no start time. Empty
+                        // string = "not applicable", written verbatim.
+                        model: String::new(),
+                        started_at: String::new(),
                     }
                 } else {
                     run_one(base, &name, partial, &results_dir, &client, retries, &cancel)
@@ -241,7 +257,7 @@ pub fn run(
         None => reports,
     };
     let succeeded = final_reports.iter().filter(|r| r.success).count();
-    write_report(report_path, &final_reports)?;
+    write_report(report_path, &final_reports, base.provider.as_str())?;
     eprintln!(
         "batch done: {}/{} succeeded, report → {}",
         succeeded,
@@ -314,6 +330,10 @@ fn run_one_attempt(
             output_tokens: usage.output_tokens,
             cache_creation_input_tokens: usage.cache_creation_input_tokens,
             cache_read_input_tokens: usage.cache_read_input_tokens,
+            // bad_task / setup_error fail before apply/build; attribute to the
+            // BASE model (a bad fragment's model never ran) and the task start.
+            model: base.model.clone(),
+            started_at: started_at.to_string(),
         };
     let zero = crate::provider::Usage::default();
 
@@ -401,6 +421,8 @@ fn run_one_attempt(
                 output_tokens: o.output_tokens,
                 cache_creation_input_tokens: o.cache_creation_input_tokens,
                 cache_read_input_tokens: o.cache_read_input_tokens,
+                model: meta.model.clone(),
+                started_at: meta.started_at.clone(),
             }
         }
         Err(re) => {
@@ -492,6 +514,13 @@ fn run_one(
                 output_tokens: acc.usage.output_tokens,
                 cache_creation_input_tokens: acc.usage.cache_creation_input_tokens,
                 cache_read_input_tokens: acc.usage.cache_read_input_tokens,
+                // Attribution lost across the attempt boundary: run_one doesn't
+                // know the applied model (a fragment may override it). The
+                // last attempt's results/<name>.json (written by
+                // run_one_attempt with full attribution) is the authoritative
+                // record; the report entry just carries what's recoverable.
+                model: String::new(),
+                started_at: started_at.clone(),
             };
             break;
         }
@@ -551,7 +580,7 @@ struct ReportFile {
     tasks: Vec<TaskReport>,
 }
 
-fn write_report(path: &Path, reports: &[TaskReport]) -> Result<()> {
+fn write_report(path: &Path, reports: &[TaskReport], provider: &str) -> Result<()> {
     let tasks: Vec<_> = reports
         .iter()
         .map(|r| {
@@ -559,6 +588,8 @@ fn write_report(path: &Path, reports: &[TaskReport]) -> Result<()> {
                 "name": r.name,
                 "success": r.success,
                 "stop_reason": r.stop_reason,
+                "model": r.model,
+                "started_at": r.started_at,
                 "turns": r.turns,
                 "elapsed_secs": r.elapsed_secs,
                 "input_tokens": r.input_tokens,
@@ -588,6 +619,9 @@ fn write_report(path: &Path, reports: &[TaskReport]) -> Result<()> {
         "total": reports.len(),
         "succeeded": succeeded,
         "failed": reports.len() - succeeded,
+        // One provider per batch (forbidden_batch_override) — attribute the
+        // whole report once instead of per task.
+        "provider": provider,
         "totals": {
             "input_tokens": ti,
             "output_tokens": to,
@@ -626,7 +660,7 @@ mod tests {
         // failed, plus a failed task with an empty name — the latter can't be
         // matched to a file, so it must be dropped from the re-run list.
         let reports = vec![tr("a", true), tr("b", false), tr("c", false), tr("", false)];
-        write_report(&path, &reports).unwrap();
+        write_report(&path, &reports, "openai").unwrap();
 
         let names = failed_names_from_report(&path).unwrap();
         // Only the failed tasks with names; the empty-name one is dropped.
@@ -670,6 +704,8 @@ mod tests {
             output_tokens: 0,
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
+            model: "test-model".into(),
+            started_at: "2026-08-15T07:41:02Z".into(),
         }
     }
 
@@ -692,7 +728,7 @@ mod tests {
             tr_tok("a", true, 100, 10, 5, 20),
             tr_tok("b", false, 200, 30, 15, 80),
         ];
-        write_report(&path, &reports).unwrap();
+        write_report(&path, &reports, "openai").unwrap();
 
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -710,6 +746,35 @@ mod tests {
         // Per-task totals in tasks[] are unchanged.
         assert_eq!(v["tasks"][0]["input_tokens"].as_u64().unwrap(), 100);
         assert_eq!(v["tasks"][1]["input_tokens"].as_u64().unwrap(), 200);
+        // Attribution: top-level provider + per-task model/started_at.
+        assert_eq!(v["provider"], "openai");
+        assert_eq!(v["tasks"][0]["model"], "test-model");
+        assert!(v["tasks"][0]["started_at"].as_str().unwrap().ends_with('Z'));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn prior_report_without_attribution_fields_still_parses() {
+        // serde(default) guard: a report written before model/started_at
+        // existed must still load for --failed (same contract as the token
+        // fields when they were added).
+        let dir = std::env::temp_dir().join(format!("ta-batch-old-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("report.json");
+        std::fs::write(
+            &path,
+            r#"{"total":1,"succeeded":1,"failed":0,
+                "tasks":[{"name":"a","success":true,"stop_reason":"end_turn",
+                "turns":1,"elapsed_secs":1.0,"error":null,
+                "input_tokens":10,"output_tokens":5}]}"#,
+        )
+        .unwrap();
+        let prior = read_prior_tasks(&path).unwrap();
+        assert_eq!(prior.len(), 1);
+        assert!(prior[0].success);
+        assert_eq!(prior[0].model, "", "missing model defaults to empty");
+        assert_eq!(prior[0].started_at, "", "missing started_at defaults to empty");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -719,7 +784,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ta-batch-empty-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("report.json");
-        write_report(&path, &[]).unwrap();
+        write_report(&path, &[], "openai").unwrap();
 
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -768,7 +833,7 @@ mod tests {
         // Write a report, then read it back: field names must line up so the
         // merge base is faithful (a mismatch would silently drop entries).
         let wrote = vec![tr("alpha", false), tr("beta", true)];
-        write_report(&path, &wrote).unwrap();
+        write_report(&path, &wrote, "openai").unwrap();
         let read = read_prior_tasks(&path).unwrap();
         assert_eq!(read.len(), 2);
         assert_eq!(read[0].name, "alpha");

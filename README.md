@@ -211,7 +211,7 @@ tiny-agent --config examples/chat.json --tui
 ```
 
 - 每个任务独立跑完整 agent 流程，结果写 `results/<task>.json`（与 `--output` 同格式）
-- `--jobs N` 控制并发（默认 1）；`--report` 写汇总：`{total, succeeded, failed, totals, averages, tasks[]}`（`totals`/`averages` 为 4 个 token 轴的总和与 per-task 均值）
+- `--jobs N` 控制并发（默认 1）；`--report` 写汇总：`{total, succeeded, failed, provider, totals, averages, tasks[]}`（`totals`/`averages` 为 4 个 token 轴的总和与 per-task 均值；`tasks[]` 每条带 `model` / `started_at` 归因——任务片段可覆盖 `model`，同批混模型时靠它区分）
 - ⚠ `--jobs > 1` 时所有任务**共用同一个 workdir**（base 配置的，任务片段不能覆盖）——并发写同名文件的任务会互相覆盖、污染结果。需要隔离的写文件任务用 `--jobs 1`，或让各任务写不同路径；任务只读 / 纯推理则无此问题，可放心并发
 - exit code：全部成功 → 0，否则 1，可直接做 CI 门禁
 
