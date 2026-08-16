@@ -767,6 +767,18 @@ release 下 panic 不触发 `Drop`——调试 destructors（如 TUI 终端还�
 `src/agent.rs` 的 `#[cfg(test)]` 模块覆盖 cancel 复位、tool_use/tool_result N:N 配对（含中途取消的
 合成 `[cancelled by user]`）、上下文压缩、usage 累计等不变量。**改 `agent.rs` 核心路径请配套补 loop 测试。**
 
+## 发布流程
+
+版本号同步在 **5 处**（改一处漏一处会造成绑定包与核心版本漂移）：根 `Cargo.toml`、
+`bindings/{python,node}/Cargo.toml`、`bindings/python/pyproject.toml`、`bindings/node/package.json`。
+
+1. 五处版本号同步 bump；
+2. `CHANGELOG.md` 补 `[新版本]` 段（从 `[Unreleased]` 挪入，附日期）；
+3. 提交后打 tag：`git tag vX.Y.Z`；
+4. `git push --tags` —— tag 推上 GitHub 后自动触发 release workflow
+   （`.github/workflows/release.yml`：musl x86_64 静态二进制 + sha256 上传 GitHub Releases，
+   附自动生成的 release notes）。gitee 侧 `git push origin --tags` 同步标签。
+
 ## 代码结构
 
 ```

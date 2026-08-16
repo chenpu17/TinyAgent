@@ -37,6 +37,9 @@ cargo clippy -p tiny-agent-node
   报 fatal。**所有** git 命令前置 `-c core.precomposeunicode=false`：
   `git -c core.precomposeunicode=false status` / `commit` / `log` ……
 - message 里有双引号会破坏 `-m "..."` 的 shell 引号——改用 `git commit -F <文件>` 写多行 message。
+- **发布（tag）**：版本号同步 5 处（根 `Cargo.toml`、`bindings/{python,node}/Cargo.toml`、
+  `pyproject.toml`、`package.json`）+ `CHANGELOG.md` 补段，然后 `git tag vX.Y.Z` 推双远端
+  （gitee origin + github）。tag 推 GitHub 触发 `release.yml`（musl 产物）。流程详见 README 发布节。
 
 ## 架构要点
 
