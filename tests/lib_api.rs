@@ -184,6 +184,7 @@ fn run_error_serializes_structured_cost() {
             max_output_chars: 4000,
             restrict_to_workdir: false,
             cancel: None,
+            shell_timeout_secs: 120,
         },
     );
     let re = match agent.run(&mut |_| {}) {

@@ -48,6 +48,12 @@
 
 - 第三方审计问题全量修正（含回归守卫）：reaper 误杀 / 失败路径丢成本 / 退出-重试-取消
   健壮性 / OOM 边界 / 审计字段一致性等。
+- TUI 多行输入框塌缩 + MdCache 按 (text, width) 寻址，防 scrollback 渲染污染。
+- 压缩边界：`keep_recent=0` 失效 / `fold_summary` role / summary `max_tokens` 封顶。
+- Windows：`cmd` 输出按 OEM 代码页解码（中文不再乱码）、MCP stdio 走 `cmd /C`。
+- `write_file` 原子化（临时文件 + rename，防半截文件）；skill frontmatter 剥 UTF-8 BOM。
+- batch 补 `set_shutdown`（二次 Ctrl-C 后 MCP 子进程不再成孤儿）；Anthropic 流内 error
+  透出已计 usage；`--jobs 0` 直接报错而非静默串行；绑定层透出 `RunError` 结构化成本。
 
 ## [0.2.0] — 2026-08-04
 
