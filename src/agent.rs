@@ -284,6 +284,13 @@ impl RunCost {
 
 pub struct Agent {
     provider: Box<dyn Provider>,
+    /// The protocol family declared by the config ("anthropic" / "openai") —
+    /// NOT derived from the boxed `provider` above. When a caller injects a
+    /// custom provider (bindings' provider= callback) this still records what
+    /// protocol the CONFIG declared, which is what result.json attributes the
+    /// bill to. Kept as a plain string (via `ProviderKind::as_str`) so it
+    /// serializes/reports without carrying the enum around.
+    provider_label: String,
     tools: Vec<Box<dyn Tool>>,
     tool_defs: Vec<ToolDef>,
     messages: Vec<Message>,
@@ -374,6 +381,7 @@ impl Agent {
         };
         Self {
             provider,
+            provider_label: cfg.provider.as_str().to_string(),
             tools,
             tool_defs,
             messages: initial,
@@ -410,6 +418,14 @@ impl Agent {
     /// The model name this agent sends with each request (from the config).
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    /// The protocol family declared by the config ("anthropic" / "openai") —
+    /// what result.json attributes the bill to. With a custom injected
+    /// provider (bindings' provider= callback) this is still the config's
+    /// declared kind; see the field doc for why.
+    pub fn provider(&self) -> &str {
+        &self.provider_label
     }
 
     /// The limits (max_turns / timeout / token budget / …) in effect.

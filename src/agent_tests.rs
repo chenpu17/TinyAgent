@@ -2303,6 +2303,12 @@
         let parsed: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
         assert_eq!(parsed["success"], true);
+        // Attribution stamp: the bill names the model/provider that ran it
+        // (cfg_with → model "m", provider openai) plus schema version.
+        assert_eq!(parsed["model"], "m");
+        assert_eq!(parsed["provider"], "openai");
+        assert_eq!(parsed["schema_version"], 1);
+        assert!(parsed["started_at"].as_str().unwrap().ends_with('Z'));
         assert!(parsed["summary"].as_str().unwrap().contains("42"));
         assert_eq!(parsed["tool_calls"].as_array().unwrap().len(), 1);
         assert_eq!(parsed["tool_calls"][0]["name"], "echo");

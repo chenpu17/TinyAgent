@@ -516,10 +516,15 @@ TinyAgent 的定位是**可审计、可无人值守的 agent 执行单元**—�
 
 ```json
 {
+  "schema_version": 1,
   "success": true,
   "stop_reason": "end_turn",
+  "model": "deepseek-chat",
+  "provider": "openai",
   "turns": 2,
   "attempts": 3,
+  "started_at": "2026-08-15T07:41:02Z",
+  "finished_at": "2026-08-15T07:41:09Z",
   "elapsed_secs": 3.1,
   "input_tokens": 1234,
   "output_tokens": 567,
@@ -539,6 +544,11 @@ TinyAgent 的定位是**可审计、可无人值守的 agent 执行单元**—�
 ```
 
 - `tool_calls[].output` 是工具返回的完整内容（`is_error` 标记是否为错误结果）
+- **归因字段（`schema_version` / `model` / `provider` / `started_at` / `finished_at`）每次都写**——
+  一份无法归因到模型 / 协议 / 时间的账单不可审计（`--model` 做 A/B 对照后两份结果必须能区分）。
+  与 `plan`/`meta` 的稀疏后插不同，这五个键是**纯增量**（新键，旧键不动），按 key 取值的消费方不受影响。
+  `model`/`provider` 来自实际运行的配置（批量任务片段覆盖了 `model` 就记覆盖后的值）；`provider` 记
+  配置声明的协议族（anthropic / openai），绑定层注入自定义 provider 回调时仍是配置声明值。
 - `plan`（可选）：agent 通过 `todo` 工具记录的任务计划与每步状态（末次调用的全量列表）。**仅当 agent 用过 `todo` 才出现**，否则该键不存在——不用 `todo` 的结果文件与启用前逐字节相同。`tool_calls[]` 里 `task`（子 agent）条目另带一个可选 `meta` 字段（`turns`/`tools`/`tokens`/`stop_reason` 的紧凑 trace），同理仅在子 agent 调用时出现
 - `attempts` 是实际执行的 agent 运行次数（`>1` 表示发生了瞬态重试，见下文「单跑瞬态重试」）
 - `input_tokens` / `output_tokens` 是本次运行累计的 token 用量；`cache_creation_input_tokens` /

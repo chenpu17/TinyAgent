@@ -4,6 +4,65 @@ use serde_json::{json, Value};
 use std::io::Write;
 use std::path::Path;
 
+/// Attribution metadata stamped into `result.json` (and, in part, the batch
+/// report): which model / provider protocol produced the bill, and when the
+/// run started. `finished_at` is taken inside `write_result`, so this struct
+/// carries only the pre-run facts.
+pub struct ResultMeta {
+    pub model: String,
+    pub provider: String,
+    /// RFC 3339 UTC timestamp of the run's start, e.g. "2026-08-15T07:41:02Z".
+    pub started_at: String,
+}
+
+impl ResultMeta {
+    /// Build from the live agent — the single-run headless path derives it
+    /// here so the 17 test call sites of `run_with_retries` need no changes.
+    pub fn from_agent(agent: &Agent) -> Self {
+        Self {
+            model: agent.model().to_string(),
+            provider: agent.provider().to_string(),
+            started_at: now_rfc3339(),
+        }
+    }
+}
+
+/// Current wall clock as an RFC 3339 UTC timestamp (second precision).
+pub(crate) fn now_rfc3339() -> String {
+    rfc3339_utc(std::time::SystemTime::now())
+}
+
+/// Format a `SystemTime` as `YYYY-MM-DDTHH:MM:SSZ`. Hand-rolled (no chrono /
+/// time / jiff dependency — house style: hand-written XDG lookup, hand-written
+/// YAML frontmatter, kernel32 FFI): the classic days-from-civil inversion
+/// (Hinnant) — exact for the full u64 second count, pure, and unit-testable
+/// against known literals including leap days and year boundaries.
+fn rfc3339_utc(t: std::time::SystemTime) -> String {
+    let secs = match t.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        // Before the epoch (system clock skew): clamp to 0 rather than panic —
+        // a timestamp is audit metadata, not worth failing a run over.
+        Err(_) => 0,
+    };
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (h, m, s) = (rem / 3600, rem / 60 % 60, rem % 60);
+    // Civil-from-days (Howard Hinnant's algorithm): shifts the epoch to the
+    // March-based civil calendar so leap days land at the end of the year,
+    // making the month/day math branch-free.
+    let z = days + 719_468; // days since 0000-03-01
+    let era = z.div_euclid(146_097); // 400-year Gregorian cycle
+    let doe = z.rem_euclid(146_097); // day of era [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // year of era
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
+    let mp = (5 * doy + 2) / 153; // month of the March-based year [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // day of month [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = if month <= 2 { y + 1 } else { y };
+    format!("{year:04}-{month:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
 /// Run the agent to completion in headless mode:
 /// - `json = false`: stream human-readable events to stdout/stderr.
 /// - `json = true`:  stream one JSON object per event (NDJSON) to stdout.
@@ -143,7 +202,16 @@ pub(crate) fn run_with_retries(
         } else {
             "error"
         };
-        write_result(path, outcome.as_ref(), error.as_deref(), attempt, none_sr, Some(&acc))?;
+        let meta = ResultMeta::from_agent(agent);
+        write_result(
+            path,
+            outcome.as_ref(),
+            error.as_deref(),
+            attempt,
+            none_sr,
+            Some(&acc),
+            &meta,
+        )?;
         if !json {
             eprintln!("result written to {}", path.display());
         }
@@ -302,6 +370,8 @@ pub fn write_result(
     // outcome is Some, its totals already include any folded-in cost, so this
     // is ignored. None ⇒ all-zero / empty (e.g. a setup error before any turn).
     none_acc: Option<&RunCost>,
+    // Attribution: model / provider / started_at (finished_at is taken here).
+    meta: &ResultMeta,
 ) -> Result<()> {
     // json! takes values by ownership, so the &RunOutcome fields are cloned
     // here; Option<&str> is turned into a JSON null/string explicitly (Value
@@ -310,6 +380,12 @@ pub fn write_result(
         Some(s) => json!(s),
         None => serde_json::Value::Null,
     };
+    // Attribution fields appear on EVERY result (not opt-in like `plan`/`meta`):
+    // a bill you can't attribute to a model/provider/time isn't auditable.
+    // Deliberate break from the byte-identical-to-before convention — pure
+    // additive keys, consumers indexing by key are unaffected. `preserve_order`
+    // is on, so insertion order below is the output order.
+    let finished_at = now_rfc3339();
     let result = match outcome {
         Some(o) => {
             let tool_calls: Vec<_> = o
@@ -332,10 +408,15 @@ pub fn write_result(
                 })
                 .collect();
             let mut result = json!({
+                "schema_version": 1,
                 "success": o.stop_reason == "end_turn",
                 "stop_reason": o.stop_reason.clone(),
+                "model": meta.model.clone(),
+                "provider": meta.provider.clone(),
                 "turns": o.turns,
                 "attempts": attempts,
+                "started_at": meta.started_at.clone(),
+                "finished_at": finished_at,
                 "elapsed_secs": o.elapsed.as_secs_f64(),
                 "input_tokens": o.input_tokens,
                 "output_tokens": o.output_tokens,
@@ -374,10 +455,15 @@ pub fn write_result(
                 })
                 .collect();
             let mut result = json!({
+                "schema_version": 1,
                 "success": false,
                 "stop_reason": none_stop_reason,
+                "model": meta.model.clone(),
+                "provider": meta.provider.clone(),
                 "turns": acc.turns,
                 "attempts": attempts,
+                "started_at": meta.started_at.clone(),
+                "finished_at": finished_at,
                 "elapsed_secs": acc.elapsed.as_secs_f64(),
                 "input_tokens": acc.usage.input_tokens,
                 "output_tokens": acc.usage.output_tokens,
@@ -671,6 +757,15 @@ impl<Out: Write, Err: Write> HumanRenderer<Out, Err> {
 
 #[cfg(test)]
 mod tests {
+    /// Shared attribution meta for write_result tests.
+    fn meta() -> ResultMeta {
+        ResultMeta {
+            model: "test-model".into(),
+            provider: "openai".into(),
+            started_at: "2026-08-15T07:41:02Z".into(),
+        }
+    }
+
     use super::*;
     use crate::agent::{CompressTrigger, RunOutcome, TodoItem, ToolCallRecord};
     use serde_json::json;
@@ -740,7 +835,7 @@ mod tests {
         };
         // Success path: tool output + token totals + summary all present.
         let path = dir.join("out.json");
-        write_result(&path, Some(&o), None, 1, "error", None).unwrap();
+        write_result(&path, Some(&o), None, 1, "error", None, &meta()).unwrap();
         let s = std::fs::read_to_string(&path).unwrap();
         assert!(s.contains("\"output\"") && s.contains("hello world"), "tool output missing");
         assert!(
@@ -752,12 +847,72 @@ mod tests {
         // Failure path: agent.run returned Err — still write a result artifact
         // (this is the gap the old `?`-skips-write_result had).
         let epath = dir.join("err.json");
-        write_result(&epath, None, Some("provider 503"), 1, "error", None).unwrap();
+        write_result(&epath, None, Some("provider 503"), 1, "error", None, &meta()).unwrap();
         let es = std::fs::read_to_string(&epath).unwrap();
         assert!(es.contains("\"success\": false"));
         assert!(es.contains("provider 503"));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_result_stamps_attribution_on_success_and_failure() {
+        // The five attribution keys are NOT opt-in (unlike `plan`/`meta`): a
+        // bill you can't attribute to a model/provider/time isn't auditable.
+        // Both branches must carry them. (`line!()` keeps the temp dir unique
+        // against the OTHER tests sharing this prefix pattern.)
+        let dir = std::env::temp_dir().join(format!("ta-attrib-{}-{}", line!(), std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let keys = |s: &str| {
+            for k in [
+                "\"schema_version\": 1",
+                "\"model\": \"test-model\"",
+                "\"provider\": \"openai\"",
+                "\"started_at\": \"2026-08-15T07:41:02Z\"",
+                "\"finished_at\": \"",
+            ] {
+                assert!(s.contains(k), "missing {k} in: {s}");
+            }
+        };
+
+        let o = RunOutcome {
+            final_text: "done".into(),
+            turns: 1,
+            stop_reason: "end_turn".into(),
+            tool_calls: vec![],
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            elapsed: std::time::Duration::from_secs_f64(0.1),
+        };
+        let path = dir.join("ok.json");
+        write_result(&path, Some(&o), None, 1, "error", None, &meta()).unwrap();
+        keys(&std::fs::read_to_string(&path).unwrap());
+
+        let epath = dir.join("fail.json");
+        write_result(&epath, None, Some("boom"), 1, "error", None, &meta()).unwrap();
+        keys(&std::fs::read_to_string(&epath).unwrap());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rfc3339_utc_formats_known_instants() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let at = |secs: u64| rfc3339_utc(UNIX_EPOCH + Duration::from_secs(secs));
+        assert_eq!(at(0), "1970-01-01T00:00:00Z");
+        // 2026-08-15T00:00:00Z (verified independently).
+        assert_eq!(at(1_786_752_000), "2026-08-15T00:00:00Z");
+        // Leap day 2024-02-29T12:00:00Z.
+        assert_eq!(at(1_709_208_000), "2024-02-29T12:00:00Z");
+        // Year boundary: the last second of 2023.
+        assert_eq!(at(1_704_067_199), "2023-12-31T23:59:59Z");
+        // First second of a leap year: 2024-01-01T00:00:00Z.
+        assert_eq!(at(1_704_067_200), "2024-01-01T00:00:00Z");
+        // Day rollover mid-run: 23:59:59 → next day 00:00:00.
+        assert_eq!(at(86_399), "1970-01-01T23:59:59Z");
+        assert_eq!(at(86_400), "1970-01-02T00:00:00Z");
     }
 
     #[test]
@@ -800,7 +955,7 @@ mod tests {
             elapsed: std::time::Duration::from_secs_f64(1.0),
         };
         let path = dir.join("plan.json");
-        write_result(&path, Some(&with_plan), None, 1, "error", None).unwrap();
+        write_result(&path, Some(&with_plan), None, 1, "error", None, &meta()).unwrap();
         let parsed: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let obj = parsed.as_object().expect("result is a JSON object");
@@ -827,7 +982,7 @@ mod tests {
             elapsed: std::time::Duration::from_secs_f64(1.0),
         };
         let np = dir.join("noplan.json");
-        write_result(&np, Some(&without_plan), None, 1, "error", None).unwrap();
+        write_result(&np, Some(&without_plan), None, 1, "error", None, &meta()).unwrap();
         let nparsed: Value =
             serde_json::from_str(&std::fs::read_to_string(&np).unwrap()).unwrap();
         assert!(
@@ -871,7 +1026,7 @@ mod tests {
             elapsed: std::time::Duration::from_secs_f64(1.0),
         };
         let path = dir.join("meta.json");
-        write_result(&path, Some(&o), None, 1, "error", None).unwrap();
+        write_result(&path, Some(&o), None, 1, "error", None, &meta()).unwrap();
         let parsed: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         // The task entry carries its trace meta.
@@ -918,7 +1073,7 @@ mod tests {
             elapsed: std::time::Duration::from_secs(12),
         };
         let path = dir.join("fail.json");
-        write_result(&path, None, Some("provider 503"), 2, "error", Some(&acc)).unwrap();
+        write_result(&path, None, Some("provider 503"), 2, "error", Some(&acc), &meta()).unwrap();
         let parsed: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         // Failure semantics.
@@ -944,7 +1099,7 @@ mod tests {
         // No accumulated cost (e.g. a setup error before any turn) ⇒ zeros,
         // never missing keys (schema stays stable for CI consumers).
         let zpath = dir.join("zero.json");
-        write_result(&zpath, None, Some("setup failed"), 1, "error", None).unwrap();
+        write_result(&zpath, None, Some("setup failed"), 1, "error", None, &meta()).unwrap();
         let zparsed: Value =
             serde_json::from_str(&std::fs::read_to_string(&zpath).unwrap()).unwrap();
         assert_eq!(zparsed["input_tokens"], 0);
@@ -1125,7 +1280,7 @@ mod tests {
             elapsed: std::time::Duration::from_secs(2),
         };
         let path = dir.join("cache.json");
-        write_result(&path, Some(&o), None, 3, "error", None).unwrap();
+        write_result(&path, Some(&o), None, 3, "error", None, &meta()).unwrap();
         // Parse back and assert by field name — a typo in the cache_* names
         // would silently drop cache cost from downstream accounting, and
         // substring checks couple to pretty-print spacing.

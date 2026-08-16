@@ -140,6 +140,15 @@ impl ProviderKind {
             ProviderKind::Openai => "https://api.openai.com",
         }
     }
+
+    /// Stable lowercase label matching the serde rename ("anthropic" /
+    /// "openai") — used for attribution fields in result.json / report.json.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProviderKind::Anthropic => "anthropic",
+            ProviderKind::Openai => "openai",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

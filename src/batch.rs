@@ -264,7 +264,10 @@ pub fn run(
 /// environment problem (missing api_key_env, MCP server won't start) — neither
 /// is retried; any other value is the model's real stop reason (end_turn /
 /// max_turns / …) and is not retried either.
-#[allow(clippy::too_many_arguments)] // base/name/partial/results_dir/client/attempt_no/acc/cancel — batch per-attempt wiring
+// 9 params — already a cluster of (base, name, partial, results_dir, client)
+// plus the accumulator, retry-stable attribution stamp and the shutdown flag;
+// bundling into a context struct just moves the same data one indirection away.
+#[allow(clippy::too_many_arguments)]
 fn run_one_attempt(
     base: &Config,
     name: &str,
@@ -290,6 +293,9 @@ fn run_one_attempt(
     // it is safe to share (mirrors main.rs single-run, which arms shutdown on
     // the same flag — only the cancel side is batch-specific).
     cancel: &Arc<std::sync::atomic::AtomicBool>,
+    // RFC 3339 start-of-TASK timestamp (not per-attempt): retries of one task
+    // share the task's start, so the bill attributes to when work began.
+    started_at: &str,
 ) -> TaskReport {
     let start = std::time::Instant::now();
     // `usage` is the token cost to bill this report. bad_task / setup_error burn
@@ -351,6 +357,13 @@ fn run_one_attempt(
     // process (process::exit skips Drop), so without this a task stuck in an
     // MCP call would orphan the server child. See the cancel param doc above.
     agent.set_shutdown(cancel.clone());
+    // Attribution for this task's result.json: AFTER apply, so a task fragment
+    // overriding `model` is attributed to the model it actually ran.
+    let meta = harness::ResultMeta {
+        model: agent.model().to_string(),
+        provider: agent.provider().to_string(),
+        started_at: started_at.to_string(),
+    };
 
     let outcome = agent.run(&mut |_| {}); // quiet: no per-event printing
 
@@ -364,9 +377,15 @@ fn run_one_attempt(
             // for the full tool_calls/summary. Surface it so report.json does
             // not claim success while the result file is missing.
             let mut error = None;
-            if let Err(e) =
-                harness::write_result(&results_dir.join(format!("{name}.json")), Some(&o), None, attempt_no, "error", None)
-            {
+            if let Err(e) = harness::write_result(
+                &results_dir.join(format!("{name}.json")),
+                Some(&o),
+                None,
+                attempt_no,
+                "error",
+                None,
+                &meta,
+            ) {
                 eprintln!("[warn] {name}: failed to write result file: {e:#}");
                 error = Some(format!("result file not written: {e:#}"));
             }
@@ -408,6 +427,7 @@ fn run_one_attempt(
                 // shared reborrow to &RunCost) — not `&acc` (a needless double
                 // borrow). The later `&acc.usage` still borrows fine.
                 Some(acc),
+                &meta,
             ) {
                 eprintln!("[warn] {name}: failed to write result file: {e:#}");
             }
@@ -439,7 +459,10 @@ fn run_one(
     // attempt, so each failed attempt's tokens/tools can only be recovered via
     // the RunError it returns — accumulate here and fold into the final result.
     let mut acc = RunCost::default();
-    let mut report = run_one_attempt(base, name, &partial, results_dir, client, 1, &mut acc, cancel);
+    // Task-level start (shared by every attempt) for the attribution stamp.
+    let started_at = crate::harness::now_rfc3339();
+    let mut report =
+        run_one_attempt(base, name, &partial, results_dir, client, 1, &mut acc, cancel, &started_at);
     let mut attempt = 0;
     while report.stop_reason == "error" && attempt < retries {
         let backoff = backoff(attempt);
@@ -473,7 +496,8 @@ fn run_one(
             break;
         }
         attempt += 1;
-        report = run_one_attempt(base, name, &partial, results_dir, client, attempt + 1, &mut acc, cancel);
+        report =
+            run_one_attempt(base, name, &partial, results_dir, client, attempt + 1, &mut acc, cancel, &started_at);
     }
     // run_one_attempt stamps per-attempt elapsed; overwrite with the total
     // across attempts + backoffs so report.json reflects real wall cost.
