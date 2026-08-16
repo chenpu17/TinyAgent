@@ -190,8 +190,8 @@ tiny-agent --config examples/chat.json --resume --task "暗号是什么？" --se
 # 一次性运行不落盘会话（CI / 临时跑不想污染 cwd）
 tiny-agent --config examples/harness.json --task "跑测试" --session none --output result.json
 
-# 批量任务模式：跑目录下所有任务片段，2 个并发，输出汇总报告
-tiny-agent --config examples/harness.json --batch examples/tasks --jobs 2 --report report.json
+# 批量任务模式：跑目录下所有任务片段，2 个并发，每任务私有 workdir 拷贝，输出汇总报告
+tiny-agent --config examples/harness.json --batch examples/tasks --jobs 2 --isolate copy --report report.json
 # 只重跑上一轮 report.json 里失败的任务（结果合并回完整报告），并对 transient 失败重试 2 次
 tiny-agent --config examples/harness.json --batch examples/tasks --failed --retries 2 --report report.json
 
@@ -212,8 +212,24 @@ tiny-agent --config examples/chat.json --tui
 
 - 每个任务独立跑完整 agent 流程，结果写 `results/<task>.json`（与 `--output` 同格式）
 - `--jobs N` 控制并发（默认 1）；`--report` 写汇总：`{total, succeeded, failed, provider, totals, averages, tasks[]}`（`totals`/`averages` 为 4 个 token 轴的总和与 per-task 均值；`tasks[]` 每条带 `model` / `started_at` 归因——任务片段可覆盖 `model`，同批混模型时靠它区分）
-- ⚠ `--jobs > 1` 时所有任务**共用同一个 workdir**（base 配置的，任务片段不能覆盖）——并发写同名文件的任务会互相覆盖、污染结果。需要隔离的写文件任务用 `--jobs 1`，或让各任务写不同路径；任务只读 / 纯推理则无此问题，可放心并发
+- ⚠ **`--isolate` 之前的默认语义**：`--jobs > 1` 时所有任务**共用同一个 workdir**（base 配置的，任务片段不能覆盖）——并发写同名文件的任务会互相覆盖、污染结果。两条出路：
+  - `--jobs 1`（串行，或任务只读 / 纯推理可放心并发）
+  - `--isolate <mode>` 给每个任务一份私有 workdir（见下）
 - exit code：全部成功 → 0，否则 1，可直接做 CI 门禁
+
+### `--isolate`：任务级 workdir 隔离
+
+| mode | 做法 | 适用 |
+|---|---|---|
+| `none`（默认） | 不隔离，所有 worker 共用 base workdir | 只读任务 / `--jobs 1` |
+| `copy` | 每任务把 workdir **拷贝**到临时目录，跑完删除。排除 `target`/`node_modules`/`.git`/`results`（体积大头 + 防把上轮结果当输入） | 通用；大仓库较慢 |
+| `git` | 每任务 `git worktree add --detach` 一份检出，跑完 `worktree remove --force` | 仓库内任务零拷贝；**要求 workdir 是 git 仓库根**（子目录报 `setup_error`，不重试） |
+
+- **per-task、跨 attempt 复用**：一个任务的重试看得到自己前次 attempt 的落盘副作用（与共享 workdir 语义一致）
+- **产物随目录丢弃**：隔离模式下任务写的文件不留在 workdir——评测语义下审计面就是 `result.json`（`tool_calls` 全量）与 `report.json`；需要产物落盘就别用隔离
+- 与 `"restrict_to_workdir": true` 天然协同（隔离目录即沙箱根）——不可信批量任务的推荐组合：容器内运行 + `--isolate copy` + restrict
+- 隔离 setup 失败（git 缺失 / 非 repo / 临时目录不可写）按 `setup_error` 报告（确定性，不重试）
+- git 模式孤儿 worktree：极端情况（进程被 SIGKILL）下 `git worktree prune` 在源仓库回收
 
 任务片段**只能覆盖** `task` / `system_prompt` / `model` / `max_tokens` / `limits`。安全相关字段
 （`provider` / `base_url` / `api_key_env` / `workdir` / `tools` / `restrict_to_workdir` /

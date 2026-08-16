@@ -245,6 +245,14 @@ cargo clippy -p tiny-agent-node
 - **批量 `--retries` 只重试 transient**（`stop_reason == "error"`），指数退避 1..32s 封顶；
   `bad_task`/`max_turns` 等确定性失败不重试。`--failed` 重跑失败子集后**合并**进完整报告
   （未重跑的历史成功项原样保留）。
+- **batch workdir 隔离（`--isolate none|copy|git`，`batch::IsolateMode`）**：`none` 默认共享
+  workdir（jobs>1 打 ⚠）；`copy` 每任务拷贝（排除 `target`/`node_modules`/`.git`/`results`）；
+  `git` 每任务 `worktree add --detach`（要求 workdir 是 repo 根，canonicalize 比较——macOS
+  `/tmp`→`/private/tmp` symlink 会让字符串比较误拒；否则 `setup_error` 不重试）。**per-task、
+  跨 attempt 复用**（重试看得到前次落盘，与共享语义一致）；`IsolationGuard` Drop 清理（copy
+  remove_dir_all；git `worktree remove --force` 失败回退 remove_dir_all，孤儿用 `git worktree
+  prune` 回收——release `panic=abort` 下 Drop 不保证）。产物随目录丢弃是**评测语义**（审计面是
+  result.json/report.json）。jobs>1 ⚠ 只在 isolate==None 时打。
 - **批量 Ctrl-C 是 worker gate，不中断在跑任务**：`batch::run` 的 worker 在**起任务前**检查共享
   cancel 标志，命中则标 `cancelled` 跳过；在跑的任务照常跑完（"收敛"）。**没有**把 cancel 标志传给
   agent 中断流式——因为多 worker 共享一个 flag 会和 `agent::run()` 入口的 `store(false)` 复位竞争

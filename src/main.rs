@@ -100,6 +100,13 @@ struct Cli {
     /// Batch mode: re-run only tasks that failed in the prior report (at --report)
     #[arg(long)]
     failed: bool,
+
+    /// Batch mode: per-task workdir isolation. none (default) = all workers
+    /// share the base workdir; copy = each task gets a throwaway copy (excludes
+    /// target/node_modules/.git/results); git = each task gets a
+    /// `git worktree` (workdir must be the repo root).
+    #[arg(long, default_value = "none")]
+    isolate: String,
 }
 
 fn main() -> Result<()> {
@@ -156,7 +163,20 @@ fn main() -> Result<()> {
         // hard and the merged report was never written.
         let cancel = Arc::new(AtomicBool::new(false));
         signal::install_sigint_cancel(cancel.clone());
-        let code = batch::run(&cfg, dir, cli.jobs, &cli.report, cli.retries, cli.failed, cancel)?;
+        let isolate: batch::IsolateMode = cli
+            .isolate
+            .parse()
+            .map_err(|e: String| anyhow::anyhow!("{e}"))?;
+        let code = batch::run(
+            &cfg,
+            dir,
+            cli.jobs,
+            &cli.report,
+            cli.retries,
+            cli.failed,
+            isolate,
+            cancel,
+        )?;
         std::process::exit(code);
     }
 
@@ -173,6 +193,9 @@ fn main() -> Result<()> {
     }
     if cli.report.as_path() != std::path::Path::new("report.json") {
         bail!("--report only applies to --batch mode");
+    }
+    if cli.isolate != "none" {
+        bail!("--isolate only applies to --batch mode");
     }
 
     // ── Single-run mode (headless or TUI) ─────────────────────────────

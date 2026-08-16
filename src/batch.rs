@@ -9,6 +9,236 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc, Mutex};
 
+/// Per-task workdir isolation for `--batch` (the `--isolate` flag).
+///
+/// `none` (default) keeps today's semantics: all workers share base.workdir.
+/// `copy` gives each task a throwaway copy of the workdir; `git` gives each
+/// task a `git worktree` of the repo — see `prepare_isolation`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IsolateMode {
+    #[default]
+    None,
+    /// Copy the workdir per task (excludes `target`/`node_modules`/`.git`/
+    /// `results`). Simple and universal; slow/big for large trees.
+    Copy,
+    /// `git worktree add --detach` per task. Near-zero copy for repos, but
+    /// requires workdir to BE the git repo root (checked up front).
+    Git,
+}
+
+impl std::str::FromStr for IsolateMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "none" => Ok(IsolateMode::None),
+            "copy" => Ok(IsolateMode::Copy),
+            "git" => Ok(IsolateMode::Git),
+            _ => Err(format!(
+                "invalid --isolate value {s:?} (expected none | copy | git)"
+            )),
+        }
+    }
+}
+
+/// Directory names skipped by `--isolate copy`. The first three are the size
+/// heavyweights (build caches / vendored deps / repo metadata); `results`
+/// prevents copying the PREVIOUS batch round's outputs into this task's
+/// sandbox. `.tinyagent/` is deliberately NOT excluded — project skills are
+/// part of the task's environment.
+const COPY_EXCLUDE: [&str; 4] = ["target", "node_modules", ".git", "results"];
+
+/// Prepare a task's isolated workdir. Returns `Ok(None)` for `IsolateMode::None`
+/// (no isolation, nothing to clean). The returned guard removes the directory
+/// on Drop — including panic unwinds in debug builds. Under release
+/// `panic = "abort"` a crashed batch can orphan a temp dir (or a worktree;
+/// `git worktree prune` in the source repo recovers those) — accepted.
+fn prepare_isolation(
+    mode: IsolateMode,
+    base: &Config,
+    task_name: &str,
+) -> Result<Option<IsolationGuard>> {
+    if mode == IsolateMode::None {
+        return Ok(None);
+    }
+    let src = match &base.workdir {
+        Some(w) => w.clone(),
+        None => std::env::current_dir().context("cannot determine current directory")?,
+    };
+    let tmp = {
+        // Same pid + counter trick as harness::atomic_write: unique between
+        // concurrent workers and unpredictable against symlink pre-placement.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let safe: String = task_name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect();
+        std::env::temp_dir().join(format!("ta-batch-{safe}-{}-{n}", std::process::id()))
+    };
+    match mode {
+        IsolateMode::Copy => {
+            std::fs::create_dir_all(&tmp)
+                .with_context(|| format!("cannot create isolation dir {}", tmp.display()))?;
+            copy_dir_filtered(&src, &tmp)?;
+            Ok(Some(IsolationGuard {
+                mode,
+                dir: tmp,
+                src_repo: None,
+            }))
+        }
+        IsolateMode::Git => {
+            // The workdir must BE the repo root: `worktree add` checks out the
+            // whole repo, so a subdirectory workdir would present a different
+            // file set than the task expects — reject rather than silently
+            // misplace the task.
+            let out = std::process::Command::new("git")
+                .args(["-C", &src.display().to_string(), "rev-parse", "--show-toplevel"])
+                .output()
+                .context("cannot run git (is it on PATH?) for --isolate git")?;
+            if !out.status.success() {
+                bail!(
+                    "--isolate git: workdir {} is not a git repository",
+                    src.display()
+                );
+            }
+            let toplevel = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            // Compare canonical paths: on macOS temp dirs live under /private
+            // while the workdir spelling may be the /var symlink view — a
+            // string compare would reject a perfectly good repo root.
+            let canon = |p: &str| {
+                std::fs::canonicalize(p)
+                    .map(|c| c.display().to_string())
+                    .unwrap_or_else(|_| p.to_string())
+            };
+            if canon(&toplevel) != canon(&src.display().to_string()) {
+                bail!(
+                    "--isolate git: workdir {} is a subdirectory of the repo ({toplevel}); \
+                     point workdir at the repo root or use --isolate copy",
+                    src.display()
+                );
+            }
+            let out = std::process::Command::new("git")
+                .args([
+                    "-C",
+                    &toplevel,
+                    "worktree",
+                    "add",
+                    "--detach",
+                    &tmp.display().to_string(),
+                ])
+                .output()
+                .context("git worktree add failed to spawn")?;
+            if !out.status.success() {
+                bail!(
+                    "git worktree add failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            Ok(Some(IsolationGuard {
+                mode,
+                dir: tmp,
+                src_repo: Some(PathBuf::from(toplevel)),
+            }))
+        }
+        IsolateMode::None => unreachable!("handled above"),
+    }
+}
+
+/// RAII cleanup for one task's isolated workdir: removes it on Drop (copy:
+/// remove_dir_all; git: `worktree remove --force`, falling back to
+/// remove_dir_all if git is unavailable/unwilling). Drop keeps debug-build
+/// panics from leaking the sandbox.
+struct IsolationGuard {
+    mode: IsolateMode,
+    dir: PathBuf,
+    /// Repo the git worktree was carved from (git mode only).
+    src_repo: Option<PathBuf>,
+}
+
+impl Drop for IsolationGuard {
+    fn drop(&mut self) {
+        match self.mode {
+            IsolateMode::Copy => {
+                if let Err(e) = std::fs::remove_dir_all(&self.dir) {
+                    eprintln!("[warn] isolation cleanup failed ({}): {e}", self.dir.display());
+                }
+            }
+            IsolateMode::Git => {
+                let removed = self.src_repo.as_deref().is_some_and(|repo| {
+                    std::process::Command::new("git")
+                        .args([
+                            "-C",
+                            &repo.display().to_string(),
+                            "worktree",
+                            "remove",
+                            "--force",
+                            &self.dir.display().to_string(),
+                        ])
+                        .output()
+                        .is_ok_and(|o| o.status.success())
+                });
+                if !removed {
+                    // git missing / index lock / anything: still don't leave the
+                    // checkout behind. The worktree's admin metadata is under
+                    // <repo>/.git/worktrees; removing the dir without git leaves
+                    // a stale entry `git worktree prune` will reap.
+                    if let Err(e) = std::fs::remove_dir_all(&self.dir) {
+                        eprintln!(
+                            "[warn] worktree cleanup failed ({}): {e}; run `git worktree prune` in the repo",
+                            self.dir.display()
+                        );
+                    }
+                }
+            }
+            IsolateMode::None => {}
+        }
+    }
+}
+
+/// Recursively copy `src` into `dst`, skipping top-level entries named in
+/// `COPY_EXCLUDE`. Symlinks are reproduced as symlinks (preserves workspace
+/// tooling layouts); unreadable entries are errors, not skips — a task that
+/// silently misses an input file fails confusingly later.
+fn copy_dir_filtered(src: &Path, dst: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(src)
+        .with_context(|| format!("cannot read {}", src.display()))?
+    {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if COPY_EXCLUDE.contains(&name.as_ref()) {
+            continue;
+        }
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
+            let target = std::fs::read_link(&from)?;
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&target, &to)
+                .with_context(|| format!("cannot symlink {} → {}", to.display(), target.display()))?;
+            #[cfg(not(unix))]
+            {
+                // No symlink privilege on Windows by default: fall back to
+                // copying the target (directory or file) in place.
+                if target.is_dir() {
+                    std::fs::create_dir_all(&to)?;
+                    copy_dir_filtered(&from, &to)?;
+                } else {
+                    std::fs::copy(&from, &to)?;
+                }
+            }
+        } else if ft.is_dir() {
+            std::fs::create_dir_all(&to)?;
+            copy_dir_filtered(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+
 #[derive(Debug, Clone, Deserialize)]
 struct TaskReport {
     name: String,
@@ -48,11 +278,13 @@ struct TaskReport {
 /// with a fixed pool of worker threads.
 /// - `retries`: extra attempts per task on transient failures only.
 /// - `failed`: re-run only tasks that failed in the prior report at `report_path`.
+/// - `isolate`: per-task workdir isolation (`--isolate none|copy|git`).
 /// - `cancel`: shared flag flipped by SIGINT (headless). Once set, workers stop
 ///   dispatching new tasks — in-flight tasks finish on their own, not-yet-started
 ///   ones are marked `cancelled` so the report still accounts for every task.
 ///
 /// Returns process exit code (130 if cancelled, else 0/1 by success).
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     base: &Config,
     dir: &Path,
@@ -60,6 +292,7 @@ pub fn run(
     report_path: &Path,
     retries: usize,
     failed: bool,
+    isolate: IsolateMode,
     cancel: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<i32> {
     // Reject --jobs 0 explicitly: the worker loop below uses jobs.max(1), so 0
@@ -165,10 +398,10 @@ pub fn run(
     // Concurrent workers all share base.workdir (task fragments can't override
     // it), so jobs>1 with write-file tasks can corrupt each other's results.
     // Surface this at startup so it's an informed choice, not a silent trap.
-    // (Per-task workdir isolation would need a copy per task — impractical for
-    // large repos — so the contract is: shared by default, user opts into jobs=1
-    // when tasks write overlapping paths.)
-    if jobs > 1 {
+    // `--isolate` is the actual fix: each task gets a private workdir (copy or
+    // git worktree), removed when the task ends — the warning only fires when
+    // the user opted INTO concurrency but NOT into isolation.
+    if jobs > 1 && isolate == IsolateMode::None {
         let wd = base
             .workdir
             .as_deref()
@@ -176,8 +409,8 @@ pub fn run(
             .unwrap_or_else(|| "<current dir>".to_string());
         eprintln!(
             "note: --jobs {jobs} shares one workdir ({wd}); tasks writing the same \
-             files can corrupt each other — use --jobs 1 if tasks write overlapping \
-             paths."
+             files can corrupt each other — use --jobs 1, or --isolate copy|git for \
+             per-task workdirs."
         );
     }
 
@@ -224,7 +457,7 @@ pub fn run(
                         started_at: String::new(),
                     }
                 } else {
-                    run_one(base, &name, partial, &results_dir, &client, retries, &cancel)
+                    run_one(base, &name, partial, &results_dir, &client, retries, isolate, &cancel)
                 };
                 eprintln!(
                     "[{}] {} ({} turns, {:.1}s{})",
@@ -467,6 +700,7 @@ fn run_one_attempt(
 /// the task cancelled instead of running another full attempt: the worker's
 /// per-task gate only stops the NEXT task, so without this the cancel is
 /// swallowed until the in-flight retry loop finishes.
+#[allow(clippy::too_many_arguments)]
 fn run_one(
     base: &Config,
     name: &str,
@@ -474,9 +708,46 @@ fn run_one(
     results_dir: &Path,
     client: &reqwest::blocking::Client,
     retries: usize,
+    isolate: IsolateMode,
     cancel: &Arc<std::sync::atomic::AtomicBool>,
 ) -> TaskReport {
     let start = std::time::Instant::now();
+    // Per-task workdir isolation: prepared ONCE per task (not per attempt) so
+    // a retry sees its predecessor's on-disk side effects — matching today's
+    // shared-workdir semantics, where attempt 2 runs in the same tree attempt 1
+    // mutated. The guard's Drop cleans up when run_one returns.
+    let _guard = match prepare_isolation(isolate, base, name) {
+        Ok(g) => g,
+        Err(e) => {
+            // Isolation setup failures are DETERMINISTIC (not a repo, unwritable
+            // temp, missing git): report setup_error, no retry, no partial cost.
+            return TaskReport {
+                name: name.into(),
+                success: false,
+                stop_reason: "setup_error".into(),
+                turns: 0,
+                elapsed_secs: start.elapsed().as_secs_f64(),
+                error: Some(format!("isolation setup failed: {e:#}")),
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                model: base.model.clone(),
+                started_at: crate::harness::now_rfc3339(),
+            };
+        }
+    };
+    // With isolation active, tasks run in the sandbox copy — everything
+    // downstream (run_one_attempt's clone + apply + agent) sees only that.
+    let task_base = match _guard {
+        Some(ref g) => {
+            let mut b = base.clone();
+            b.workdir = Some(g.dir.clone());
+            b
+        }
+        None => base.clone(),
+    };
+    let base = &task_base;
     // Honest-cost accumulator across attempts (P2-3): a fresh agent is built per
     // attempt, so each failed attempt's tokens/tools can only be recovered via
     // the RunError it returns — accumulate here and fold into the final result.
@@ -862,7 +1133,7 @@ mod tests {
         let report = dir.join("report.json");
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(true)); // pre-cancelled
 
-        let code = run(&base, &dir, 2, &report, 0, false, cancel).unwrap();
+        let code = run(&base, &dir, 2, &report, 0, false, IsolateMode::None, cancel).unwrap();
         assert_eq!(code, 130);
 
         // Report accounts for both tasks; both cancelled, none actually run.
@@ -898,7 +1169,7 @@ mod tests {
         .unwrap();
         let report = dir.join("report.json");
         let start = std::time::Instant::now();
-        let code = run(&base, &dir, 1, &report, 3, false, Default::default()).unwrap();
+        let code = run(&base, &dir, 1, &report, 3, false, IsolateMode::None, Default::default()).unwrap();
         assert_eq!(code, 1);
         assert!(
             start.elapsed() < std::time::Duration::from_secs(2),
@@ -950,7 +1221,7 @@ mod tests {
             flag.store(true, Ordering::Relaxed);
         });
 
-        let code = run(&base, &dir, 1, &report, 2, false, cancel).unwrap();
+        let code = run(&base, &dir, 1, &report, 2, false, IsolateMode::None, cancel).unwrap();
         assert_eq!(code, 130, "cancel during backoff → exit 130");
 
         // The task is marked cancelled (not re-attempted to success/error), with
@@ -1078,7 +1349,7 @@ mod tests {
         .unwrap();
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(true)); // gate everything
 
-        let code = run(&base, &dir, 1, &report, 0, false, cancel).unwrap();
+        let code = run(&base, &dir, 1, &report, 0, false, IsolateMode::None, cancel).unwrap();
         assert_eq!(code, 130);
 
         let tasks = read_prior_tasks(&report).unwrap();
@@ -1123,7 +1394,7 @@ mod tests {
         .unwrap();
         let report = dir.join("report.json");
 
-        let code = run(&base, &dir, 2, &report, 0, false, Default::default()).unwrap();
+        let code = run(&base, &dir, 2, &report, 0, false, IsolateMode::None, Default::default()).unwrap();
         assert_eq!(code, 0, "both tasks should succeed against the mock");
 
         let s = spans.lock().unwrap();
@@ -1140,5 +1411,303 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Loopback mock that scripts a real tool-use loop: first response tells
+    /// the model to `write_file` (path/body fixed per server), second response
+    /// is a plain end_turn. Same thread-per-connection shape as slow_ok_mock.
+    /// Per-task state is keyed by hashing the FIRST user message out of the
+    /// request body (each task's opening message is unique), so two concurrent
+    /// tasks' turns never interleave their counters.
+    fn write_file_mock(path: &str, body: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let path = path.to_string();
+        let body = body.to_string();
+        let seen: Arc<Mutex<std::collections::HashMap<u64, usize>>> =
+            Arc::new(Mutex::new(std::collections::HashMap::new()));
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(s) = stream else { continue };
+                let (path, body, seen) = (path.clone(), body.clone(), seen.clone());
+                std::thread::spawn(move || {
+                    let mut s = s;
+                    let req = read_http_body(&s);
+                    // Key = hash of the first user message content ("do a"/"do b").
+                    // Content arrives as an OpenAI-style block array
+                    // [{"type":"text","text":"do a"}], not a bare string.
+                    let key: u64 = {
+                        let v: serde_json::Value = serde_json::from_str(&req).unwrap_or_default();
+                        let first_user_text = v["messages"].as_array().and_then(|msgs| {
+                            msgs.iter().find(|m| m["role"] == "user").and_then(|m| {
+                                m["content"].as_str().map(String::from).or_else(|| {
+                                    m["content"].as_array().and_then(|blocks| {
+                                        blocks
+                                            .iter()
+                                            .find(|b| b["type"] == "text")
+                                            .and_then(|b| b["text"].as_str())
+                                            .map(String::from)
+                                    })
+                                })
+                            })
+                        });
+                        match first_user_text {
+                            Some(t) => t.bytes().fold(0xcbf29ce484222325, |a, b| {
+                                (a ^ b as u64).wrapping_mul(0x100000001b3)
+                            }),
+                            None => 0,
+                        }
+                    };
+                    let turn = {
+                        let mut g = seen.lock().unwrap();
+                        let n = g.entry(key).or_insert(0);
+                        *n += 1;
+                        *n
+                    };
+                    let payload = if turn == 1 {
+                        // Build the SSE payload with serde_json (string
+                        // surgery here is a nest of JSON-in-JSON escapes; a
+                        // hand-built template got the closing quotes wrong).
+                        let args = json!({"path": path, "content": body})
+                            .to_string();
+                        let line1 = json!({
+                            "choices": [{"index": 0, "delta": {"role": "assistant",
+                                "tool_calls": [{"index": 0, "id": "c1", "type": "function",
+                                    "function": {"name": "write_file", "arguments": args}}]}}]
+                        })
+                        .to_string();
+                        let line2 = json!({
+                            "choices": [{"index": 0, "finish_reason": "tool_calls", "delta": {}}]
+                        })
+                        .to_string();
+                        format!("data: {line1}\n\ndata: {line2}\n\ndata: [DONE]\n\n")
+                    } else {
+                        let line1 = json!({
+                            "choices": [{"index": 0, "delta": {"role": "assistant", "content": "done"}}]
+                        })
+                        .to_string();
+                        let line2 = json!({
+                            "choices": [{"index": 0, "finish_reason": "stop", "delta": {}}]
+                        })
+                        .to_string();
+                        format!("data: {line1}\n\ndata: {line2}\n\ndata: [DONE]\n\n")
+                    };
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        payload.len(),
+                    );
+                    let _ = s.write_all(head.as_bytes());
+                    let _ = s.write_all(payload.as_bytes());
+                    let _ = s.flush();
+                });
+            }
+        });
+        url
+    }
+
+    #[test]
+    fn isolate_mode_parses() {
+        use std::str::FromStr;
+        assert_eq!(IsolateMode::from_str("none").unwrap(), IsolateMode::None);
+        assert_eq!(IsolateMode::from_str("copy").unwrap(), IsolateMode::Copy);
+        assert_eq!(IsolateMode::from_str("git").unwrap(), IsolateMode::Git);
+        assert_eq!(IsolateMode::from_str("COPY").unwrap(), IsolateMode::Copy);
+        let err = IsolateMode::from_str("banana").unwrap_err();
+        assert!(err.contains("none | copy | git"), "got: {err}");
+    }
+
+    #[test]
+    fn isolate_copy_gives_each_task_a_private_workdir() {
+        // THE isolation contract: two tasks write the SAME file concurrently;
+        // without isolation they corrupt each other (or one silently wins),
+        // with --isolate copy both succeed and the SOURCE workdir is untouched.
+        // Also proves the temp dirs are cleaned up (no ta-batch-* litter).
+        let url = write_file_mock("out.txt", "task wrote\n");
+        let root = std::env::temp_dir().join(format!("ta-batch-iso-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let workdir = root.join("src");
+        std::fs::create_dir_all(&workdir).unwrap();
+        std::fs::write(workdir.join("seed.txt"), "seed").unwrap();
+        let dir = root.join("tasks");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.json"), r#"{"task":"do a"}"#).unwrap();
+        std::fs::write(dir.join("b.json"), r#"{"task":"do b"}"#).unwrap();
+
+        std::env::set_var("TA_BATCH_ISO_KEY", "dummy");
+        let base: Config = serde_json::from_str(&format!(
+            r#"{{"provider":"openai","api_key_env":"TA_BATCH_ISO_KEY","model":"m","base_url":"{}","workdir":"{}","tools":["write_file"]}}"#,
+            url,
+            workdir.display()
+        ))
+        .unwrap();
+        let report = dir.join("report.json");
+
+        let code = run(&base, &dir, 2, &report, 0, false, IsolateMode::Copy, Default::default())
+            .unwrap();
+        assert_eq!(code, 0, "both isolated tasks succeed writing the same file");
+
+        // The source workdir keeps its seed and gains nothing: task outputs
+        // lived and died in the sandboxes.
+        assert!(workdir.join("seed.txt").exists());
+        assert!(
+            !workdir.join("out.txt").exists(),
+            "isolated write must not leak into the source workdir"
+        );
+        // Sandbox cleanup: no ta-batch-* temp dirs left behind.
+        let leftover = std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("ta-batch-a-{}", std::process::id()))
+            })
+            .count();
+        assert_eq!(leftover, 0, "isolation temp dirs must be cleaned up");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn isolate_copy_excludes_heavy_directories() {
+        // The exclusion list is load-bearing: copying the previous round's
+        // results/ or a multi-GB target/ would be both slow and wrong (stale
+        // outputs presented as task inputs).
+        let root = std::env::temp_dir().join(format!("ta-batch-exc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let src = root.join("src");
+        for d in ["target", "node_modules", ".git", "results"] {
+            std::fs::create_dir_all(src.join(d)).unwrap();
+            std::fs::write(src.join(d).join("heavy.bin"), "x").unwrap();
+        }
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("keep.txt"), "x").unwrap();
+        std::fs::write(src.join("sub").join("inner.txt"), "x").unwrap();
+
+        let base: Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"K","model":"m","workdir":"SRC"}"#,
+        )
+        .unwrap();
+        let base = {
+            let mut b = base;
+            b.workdir = Some(src.clone());
+            b
+        };
+        let guard = prepare_isolation(IsolateMode::Copy, &base, "exc").unwrap().unwrap();
+        let iso = guard.dir.clone();
+        for d in ["target", "node_modules", ".git", "results"] {
+            assert!(!iso.join(d).exists(), "{d} must be excluded from the copy");
+        }
+        assert!(iso.join("keep.txt").exists());
+        assert!(iso.join("sub").join("inner.txt").exists(), "nested files copied");
+        drop(guard);
+        assert!(!iso.exists(), "guard Drop removes the sandbox");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn isolate_git_rejects_non_repo_workdir_as_setup_error() {
+        // git mode requires workdir to BE a repo root; anything else is a
+        // deterministic setup_error (no retry — elapsed stays sub-second).
+        let root = std::env::temp_dir().join(format!("ta-batch-gitbad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let workdir = root.join("plain");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let dir = root.join("tasks");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("t.json"), r#"{"task":"x"}"#).unwrap();
+
+        let base: Config = serde_json::from_str(&format!(
+            r#"{{"provider":"openai","api_key_env":"K","model":"m","workdir":"{}"}}"#,
+            workdir.display()
+        ))
+        .unwrap();
+        let report = dir.join("report.json");
+
+        let start = std::time::Instant::now();
+        let code = run(&base, &dir, 1, &report, 3, false, IsolateMode::Git, Default::default())
+            .unwrap();
+        assert_eq!(code, 1);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "setup_error must not be retried"
+        );
+        let tasks = read_prior_tasks(&report).unwrap();
+        assert_eq!(tasks[0].stop_reason, "setup_error");
+        assert!(
+            tasks[0].error.as_deref().unwrap_or("").contains("isolation setup failed"),
+            "got: {:?}",
+            tasks[0].error
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn isolate_git_gives_each_task_a_worktree_and_keeps_repo_clean() {
+        // A real git repo: tasks write into their worktree sandboxes; the base
+        // repo stays pristine (`git status --porcelain` empty) and no worktree
+        // admin entries linger afterwards.
+        let url = write_file_mock("out.txt", "task wrote\n");
+        let root = std::env::temp_dir().join(format!("ta-batch-gitiso-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .expect("git on PATH")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        std::fs::write(repo.join("seed.txt"), "seed").unwrap();
+        assert!(git(&["add", "."]).status.success());
+        assert!(git(&["commit", "-qm", "init"]).status.success());
+
+        let dir = root.join("tasks");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.json"), r#"{"task":"do a"}"#).unwrap();
+        std::fs::write(dir.join("b.json"), r#"{"task":"do b"}"#).unwrap();
+
+        std::env::set_var("TA_BATCH_GITISO_KEY", "dummy");
+        let base: Config = serde_json::from_str(&format!(
+            r#"{{"provider":"openai","api_key_env":"TA_BATCH_GITISO_KEY","model":"m","base_url":"{}","workdir":"{}","tools":["write_file"]}}"#,
+            url,
+            repo.display()
+        ))
+        .unwrap();
+        let report = dir.join("report.json");
+
+        let code = run(&base, &dir, 2, &report, 0, false, IsolateMode::Git, Default::default())
+            .unwrap();
+        assert_eq!(code, 0, "both worktree tasks succeed");
+
+        // Base repo pristine: no tracked changes, no untracked out.txt.
+        let status = git(&["status", "--porcelain"]);
+        assert_eq!(
+            String::from_utf8_lossy(&status.stdout).trim(),
+            "",
+            "base repo must be untouched: {}",
+            String::from_utf8_lossy(&status.stdout)
+        );
+        assert!(!repo.join("out.txt").exists(), "writes stayed in the worktrees");
+        // Worktree admin cleaned: `git worktree list` shows only the main one.
+        let list = git(&["worktree", "list"]);
+        let out = String::from_utf8_lossy(&list.stdout);
+        assert_eq!(
+            out.lines().count(),
+            1,
+            "no lingering worktrees after cleanup: {out}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }
