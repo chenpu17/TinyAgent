@@ -252,6 +252,8 @@ mod tests {
             max_output_chars: 1000,
             restrict_to_workdir: false,
             cancel: None,
+
+            shell_timeout_secs: 120,
         }
     }
 

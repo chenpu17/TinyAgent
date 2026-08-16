@@ -251,6 +251,7 @@
             max_output_chars: 1000,
             restrict_to_workdir: false,
             cancel: None,
+            shell_timeout_secs: 120,
         }
     }
 
@@ -2493,6 +2494,7 @@
             max_output_chars: 10_000,
             restrict_to_workdir: true,
             cancel: None,
+            shell_timeout_secs: 120,
         };
         (ctx, canon)
     }

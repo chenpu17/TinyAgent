@@ -23,6 +23,9 @@ fn default_keep_recent() -> usize {
 fn default_stream_idle() -> u64 {
     30
 }
+fn default_shell_timeout() -> u64 {
+    120
+}
 fn default_max_tokens() -> u32 {
     8192
 }
@@ -95,6 +98,16 @@ pub struct Limits {
     /// (`timeout_secs`) remains the hard backstop regardless.
     #[serde(default = "default_stream_idle")]
     pub stream_idle_secs: u64,
+    /// Max wall-clock time for a single `shell` tool command before it is
+    /// killed and reported as an error. `0` (default is 120) = no per-command
+    /// limit — the run-level `timeout_secs` and interactive cancel still apply.
+    /// Unlike the other limits fields this is a COST/latency knob, not a safety
+    /// boundary: eval tasks routinely need builds/installs longer than 120s,
+    /// and a task that wants to burn time can do it with ten thousand fast
+    /// commands anyway. So a batch task fragment may override it in BOTH
+    /// directions (see `apply` — the only limits field with no clamp).
+    #[serde(default = "default_shell_timeout")]
+    pub shell_timeout_secs: u64,
 }
 
 impl Default for Limits {
@@ -108,6 +121,7 @@ impl Default for Limits {
             max_context_tokens: 0,
             max_total_tokens: 0,
             stream_idle_secs: default_stream_idle(),
+            shell_timeout_secs: default_shell_timeout(),
         }
     }
 }
@@ -396,6 +410,15 @@ impl Config {
                     };
                 }
             }
+            // shell_timeout_secs: the ONLY limits field a task may override in
+            // BOTH directions, no clamp. It is a cost/latency knob (eval tasks
+            // legitimately need builds longer than the 120s default), not a
+            // safety boundary — a task burning time can do it with many fast
+            // commands regardless. The run-level `timeout_secs` (one-way
+            // tighten above) and `max_total_tokens` remain the real backstops.
+            if let Some(v) = l.shell_timeout_secs {
+                self.limits.shell_timeout_secs = v;
+            }
         }
         if let Some(v) = p.mcp_servers {
             self.mcp_servers = v;
@@ -467,6 +490,7 @@ pub struct PartialLimits {
     pub max_context_tokens: Option<u64>,
     pub max_total_tokens: Option<u64>,
     pub stream_idle_secs: Option<u64>,
+    pub shell_timeout_secs: Option<u64>,
 }
 
 #[cfg(test)]
@@ -836,5 +860,57 @@ mod tests {
             cfg.limits.stream_idle_secs, 60,
             "a longer idle window must not loosen (mask a stall)"
         );
+    }
+
+    #[test]
+    fn shell_timeout_defaults_to_120_and_overridable() {
+        let cfg: Config =
+            serde_json::from_str(r#"{"provider":"anthropic","api_key_env":"K","model":"m"}"#).unwrap();
+        assert_eq!(cfg.limits.shell_timeout_secs, 120, "default per-command timeout is 120s");
+
+        let cfg: Config = serde_json::from_str(
+            r#"{"provider":"anthropic","api_key_env":"K","model":"m",
+               "limits":{"shell_timeout_secs":0}}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.limits.shell_timeout_secs, 0, "0 = no per-command limit");
+    }
+
+    #[test]
+    fn batch_overlay_shell_timeout_is_bidirectional() {
+        // shell_timeout_secs is a cost knob, not a safety boundary: a task
+        // fragment may RAISE it (eval builds legitimately run longer than the
+        // 120s default) or lower it — the run-level timeout_secs and
+        // max_total_tokens remain the real backstops. This is the ONLY limits
+        // field applied without a clamp.
+        let mut cfg: Config = serde_json::from_str(
+            r#"{"provider":"anthropic","api_key_env":"K","model":"m",
+               "limits":{"shell_timeout_secs":120}}"#,
+        )
+        .unwrap();
+        let partial: PartialConfig =
+            serde_json::from_str(r#"{"task":"x","limits":{"shell_timeout_secs":600}}"#).unwrap();
+        cfg.apply(partial).unwrap();
+        assert_eq!(cfg.limits.shell_timeout_secs, 600, "raising is allowed");
+
+        let mut cfg: Config = serde_json::from_str(
+            r#"{"provider":"anthropic","api_key_env":"K","model":"m",
+               "limits":{"shell_timeout_secs":120}}"#,
+        )
+        .unwrap();
+        let partial: PartialConfig =
+            serde_json::from_str(r#"{"task":"x","limits":{"shell_timeout_secs":30}}"#).unwrap();
+        cfg.apply(partial).unwrap();
+        assert_eq!(cfg.limits.shell_timeout_secs, 30, "tightening is allowed");
+
+        let mut cfg: Config = serde_json::from_str(
+            r#"{"provider":"anthropic","api_key_env":"K","model":"m",
+               "limits":{"shell_timeout_secs":120}}"#,
+        )
+        .unwrap();
+        let partial: PartialConfig =
+            serde_json::from_str(r#"{"task":"x","limits":{"shell_timeout_secs":0}}"#).unwrap();
+        cfg.apply(partial).unwrap();
+        assert_eq!(cfg.limits.shell_timeout_secs, 0, "0 (no limit) is allowed too");
     }
 }

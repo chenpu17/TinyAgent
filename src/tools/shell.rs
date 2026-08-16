@@ -6,9 +6,6 @@ use std::io::Read;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-/// Max wall-clock time for a single shell command.
-const CMD_TIMEOUT: Duration = Duration::from_secs(120);
-
 pub struct Shell;
 
 impl Tool for Shell {
@@ -81,7 +78,10 @@ impl Tool for Shell {
 
         // Poll the child so a timeout or cancel can kill it (wait_with_output
         // would consume the handle and leak the process on timeout).
-        let deadline = Instant::now() + CMD_TIMEOUT;
+        // `0` = no per-command limit: cancel still applies (poll below), and
+        // the run-level timeout_secs remains the backstop.
+        let deadline = (ctx.shell_timeout_secs > 0)
+            .then(|| Instant::now() + Duration::from_secs(ctx.shell_timeout_secs));
         let mut cancelled = false;
         let status = loop {
             // Honor an interactive cancel (Ctrl-C in the TUI) between polls,
@@ -96,7 +96,7 @@ impl Tool for Shell {
             }
             match child.try_wait() {
                 Ok(Some(s)) => break Some(s),
-                Ok(None) if Instant::now() >= deadline => {
+                Ok(None) if deadline.is_some_and(|d| Instant::now() >= d) => {
                     kill_process_group(&mut child);
                     let _ = child.wait();
                     break None;
@@ -133,7 +133,7 @@ impl Tool for Shell {
             } else {
                 out.push_str(&format!(
                     "\n[command timed out after {}s and was killed]",
-                    CMD_TIMEOUT.as_secs()
+                    ctx.shell_timeout_secs
                 ));
             }
             return Ok(ToolOutput::error(out));
@@ -229,7 +229,7 @@ fn oem_encoding_for(cp: u32) -> Option<&'static encoding_rs::Encoding> {
 /// ESRCH (already reaped) is harmless, so the return is ignored. No process
 /// groups off unix — kill the direct child so a timeout/cancel actually stops
 /// the command (a bare no-op left child.wait() blocking until the command
-/// finished on its own, voiding the 120s timeout and Ctrl-C). Mirrors
+/// finished on its own, voiding the configured timeout and Ctrl-C). Mirrors
 /// StdioTransport::drop's non-unix branch.
 #[cfg(unix)]
 fn kill_process_group(child: &mut std::process::Child) {
@@ -274,14 +274,15 @@ mod tests {
     fn cancel_flag_kills_a_running_command_promptly() {
         // Cancel pre-set: the poll loop must notice it on the first iteration
         // and kill the whole process group, returning within ~1s instead of
-        // waiting out the full CMD_TIMEOUT (120s). The output reports the
-        // cancellation distinctly from a timeout.
+        // waiting out the full shell timeout (120s by default). The output
+        // reports the cancellation distinctly from a timeout.
         let cancel = Arc::new(AtomicBool::new(true));
         let ctx = ToolCtx {
             workdir: std::env::temp_dir(),
             max_output_chars: 1000,
             restrict_to_workdir: false,
             cancel: Some(cancel),
+            shell_timeout_secs: 120,
         };
         let start = Instant::now();
         let out = Shell.run(&json!({"command": "sleep 30"}), &ctx).unwrap();
@@ -310,6 +311,7 @@ mod tests {
             max_output_chars: 1000,
             restrict_to_workdir: false,
             cancel: None,
+            shell_timeout_secs: 120,
         };
         let out = Shell
             .run(&json!({"command": "printf '中%.0s' $(seq 1 5000)"}), &ctx)
@@ -327,6 +329,7 @@ mod tests {
             max_output_chars,
             restrict_to_workdir: false,
             cancel: None,
+            shell_timeout_secs: 120,
         }
     }
 
@@ -395,5 +398,50 @@ mod tests {
             )
             .unwrap();
         assert!(out.content.contains("[truncated"), "got: {}", out.content);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_timeout_kills_a_long_command_promptly() {
+        // shell_timeout_secs is a real knob: 1s must kill `sleep 30` within a
+        // poll interval, report an error, and name the configured timeout.
+        let ctx = ToolCtx {
+            workdir: std::env::temp_dir(),
+            max_output_chars: 1000,
+            restrict_to_workdir: false,
+            cancel: None,
+            shell_timeout_secs: 1,
+        };
+        let start = Instant::now();
+        let out = Shell.run(&json!({"command": "sleep 30"}), &ctx).unwrap();
+        let elapsed = start.elapsed();
+        assert!(out.is_error);
+        assert!(
+            out.content.contains("[command timed out after 1s and was killed]"),
+            "got: {}",
+            out.content
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "1s timeout should kill within a poll interval, took {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zero_timeout_runs_long_commands_to_completion() {
+        // 0 = no per-command limit: a 2s command finishes normally instead of
+        // being cut by the default 120s (which wouldn't fire here) — and more
+        // importantly the Option<Instant> deadline must not treat 0 as "now".
+        let ctx = ToolCtx {
+            workdir: std::env::temp_dir(),
+            max_output_chars: 1000,
+            restrict_to_workdir: false,
+            cancel: None,
+            shell_timeout_secs: 0,
+        };
+        let out = Shell.run(&json!({"command": "sleep 2 && echo done"}), &ctx).unwrap();
+        assert!(!out.is_error, "got: {}", out.content);
+        assert!(out.content.contains("done"));
     }
 }

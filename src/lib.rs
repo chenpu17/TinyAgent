@@ -185,6 +185,7 @@ fn assemble(
         max_output_chars: cfg.limits.max_output_chars,
         restrict_to_workdir: cfg.restrict_to_workdir,
         cancel: None,
+        shell_timeout_secs: cfg.limits.shell_timeout_secs,
     };
     Ok((tool_list, ctx, cfg))
 }

@@ -418,7 +418,8 @@ tiny-agent --config examples/web-search.json --task "搜一下 Anthropic 最近�
     "keep_recent_messages": 8,
     "max_context_tokens": 0,
     "max_total_tokens": 0,
-    "stream_idle_secs": 30
+    "stream_idle_secs": 30,
+    "shell_timeout_secs": 120
   }
 }
 ```
@@ -437,6 +438,8 @@ API key 从 `api_key_env` 指定的环境变量读取，不写进配置文件。
 让模型知道自己跑在哪个平台、据此下发兼容命令（如得知是 `cmd /C` 而非 bash，就不会写 `$((...))` 这种在 cmd 下**静默失效、还 exit 0**、看着像成功实则是哑火的语法）。**只注入 OS / Shell / 工作目录三项事实，不写死语法示例**——事实来自运行时（`std::env::consts::OS`）与配置，跨平台自动正确；Shell 取 `shell` 工具真实调用的形式（unix `sh -c`、windows `cmd /C`）；工作目录取已解析的 `workdir`。注入点在 `Agent::new` 单点（主 agent 与 `task` 子 agent 都覆盖——子 agent 也跑 shell，同样需要平台事实），调用方自定义的 `system_prompt` 完整保留在事实段之后。设 `false` 关闭。批量任务片段可覆盖（软字段，与 `reasoning_effort` 同类）。
 
 `limits.stream_idle_secs`（默认 30）：流式响应两个 chunk 之间最长允许的静默秒数，超过即判定连接半开并中断。普通对话模型 chunk 间隔在亚秒级，30s 绰绰有余；**深度推理模型**（DeepSeek-R1、o 系列等）首 token 前可能静默数分钟，需要调大（如 180）才不会被误杀——`limits.timeout_secs` 仍是**模型请求层面**的软上限（约束每轮 chat 请求与轮次边界；shell/MCP/子 agent 各有各自独立超时，不受此值硬截止），不会因此无限挂起。
+
+`limits.shell_timeout_secs`（默认 120）：单条 `shell` 命令的墙钟上限，超时杀掉整个进程组并在结果里记 `[command timed out after Ns and was killed]`。评测任务里的构建 / 安装（`cargo build`、`npm install`、训练脚本）常常超过 120s——任务会被砍死写进账单成 error，看似模型不行实则 harness 不行；这类任务调大它（或设 `0` = 单命令不限时，交互取消与 run 级 `timeout_secs` 兜底仍生效）。注意它是**成本旋钮而非安全边界**：这也是 limits 里**唯一允许批量任务片段双向覆盖**的字段（放宽/收紧都行）——想烧时间的任务用一万条快命令同样能烧，真正的闸门是 `timeout_secs`（单向收紧）与 `max_total_tokens`。
 
 > **`timeout_secs: 0`（不设超时）时的单请求兜底**：即便关掉整轮超时，单次 chat 请求仍有一个 **10 分钟**的总时长上限（`STREAM_BACKSTOP`）。这是**泄漏兜底**而非功能限制——流式读取线程阻塞在 reqwest 的 `read()` 里、无法观测取消标志，若没有任何单请求上限，一条半开连接会让该线程及其 TCP 连接一直挂到进程退出。该上限只约束**单次请求**，从不约束**整轮 run**（一轮由多次请求组成），所以「不设超时」仍意味着 run 可以无限长，只是不会无限卡在单次请求上。设了 `timeout_secs > 0` 时此兜底不生效，单请求上限改由剩余预算推导。
 
@@ -566,7 +569,7 @@ Linux/macOS 经 SIGINT、Windows 经 `SetConsoleCtrlHandler`，行为一致。
 
 | 工具 | 说明 |
 |---|---|
-| `shell` | 在工作目录执行命令（sh -c / cmd /C），120s 超时后 kill，输出有界读取并按 `max_output_chars` 截断 |
+| `shell` | 在工作目录执行命令（sh -c / cmd /C），超时后 kill（默认 120s，`limits.shell_timeout_secs` 可调、0=不限），输出有界读取并按 `max_output_chars` 截断 |
 | `read_file` | 读文本文件，带行号，支持 offset/limit；流式读取，超大文件不会整段进内存 |
 | `write_file` | 全量重写文件，自动创建父目录 |
 | `edit_file` | 精确替换：`old_string`→`new_string`，默认要求唯一匹配（`replace_all` 全替换）；匹配 0 或 >1 时报错引导补上下文，复用 `restrict_to_workdir` 沙箱 |

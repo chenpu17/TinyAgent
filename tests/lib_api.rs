@@ -59,6 +59,8 @@ fn custom_callback_tool_runs_and_usage_is_honest() {
         max_output_chars: cfg.limits.max_output_chars,
         restrict_to_workdir: false,
         cancel: None,
+
+        shell_timeout_secs: 120,
     };
     let mut agent = Agent::new(&cfg, provider, vec![Box::new(echo)], Vec::new(), ctx);
 

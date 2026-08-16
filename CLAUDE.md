@@ -239,6 +239,9 @@ cargo clippy -p tiny-agent-node
 - **批量任务片段只能覆盖** `task`/`system_prompt`/`model`/`max_tokens`/`limits`；安全字段
   （`provider`/`base_url`/`api_key_env`/`workdir`/`tools`/`restrict_to_workdir`/`mcp_servers`）
   禁止覆盖（`config::forbidden_batch_override`），覆盖即 `bad_task` 失败、不执行。
+  limits 内各字段单向收紧（clamp），**唯一例外是 `shell_timeout_secs` 双向可覆盖、不 clamp**
+  ——它是成本/延迟旋钮不是安全边界（评测构建常超默认 120s；想烧时间的任务用一万条快命令
+  同样能烧），真兜底是 run 级 `timeout_secs` + `max_total_tokens`。
 - **批量 `--retries` 只重试 transient**（`stop_reason == "error"`），指数退避 1..32s 封顶；
   `bad_task`/`max_turns` 等确定性失败不重试。`--failed` 重跑失败子集后**合并**进完整报告
   （未重跑的历史成功项原样保留）。

@@ -28,6 +28,10 @@ pub struct ToolCtx {
     /// both headless (`main` installs the SIGINT flag and `set_cancel`s it)
     /// and the TUI (Ctrl-C during a run); None only in tests.
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Max wall-clock seconds for one `shell` command (`limits.shell_timeout_secs`).
+    /// `0` = no per-command limit — the cancel flag above still applies, and
+    /// the run-level `timeout_secs` remains the backstop.
+    pub shell_timeout_secs: u64,
 }
 
 #[derive(Debug)]
@@ -311,6 +315,7 @@ mod tests {
             max_output_chars: 1000,
             restrict_to_workdir: true,
             cancel: None,
+            shell_timeout_secs: 120,
         };
         let err = resolve(&ctx, "../outside.txt").unwrap_err();
         assert!(
@@ -327,6 +332,7 @@ mod tests {
             max_output_chars: 1000,
             restrict_to_workdir: true,
             cancel: None,
+            shell_timeout_secs: 120,
         };
         // write_file targets not-yet-existing files; resolve (via confine) must
         // allow a path whose deeper components don't exist yet (it canonicalizes
@@ -344,6 +350,7 @@ mod tests {
             max_output_chars: 1000,
             restrict_to_workdir: false,
             cancel: None,
+            shell_timeout_secs: 120,
         };
         // With restrict off, resolve just joins — no escape check, no error.
         let resolved = resolve(&ctx, "../outside.txt").unwrap();
@@ -358,6 +365,7 @@ mod tests {
             max_output_chars: 1000,
             restrict_to_workdir: true,
             cancel: None,
+            shell_timeout_secs: 120,
         };
         // The workdir's own parent exists and is, by definition, not under it.
         let outside = dir.parent().unwrap();

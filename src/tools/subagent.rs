@@ -160,6 +160,7 @@ impl Tool for SubAgent {
             max_output_chars: ctx.max_output_chars,
             restrict_to_workdir: ctx.restrict_to_workdir,
             cancel: ctx.cancel.clone(),
+            shell_timeout_secs: ctx.shell_timeout_secs,
         };
         let initial = vec![Message::user(vec![Block::Text(prompt.to_string())])];
         let mut child = Agent::new(&child_cfg, provider, child_tools, initial, child_ctx);
@@ -320,6 +321,7 @@ mod tests {
                 max_output_chars: 1000,
                 restrict_to_workdir: false,
                 cancel: None,
+                shell_timeout_secs: 120,
             },
         )
     }
@@ -538,6 +540,7 @@ mod tests {
             max_output_chars: 1000,
             restrict_to_workdir: false,
             cancel: None,
+            shell_timeout_secs: 120,
         };
         let mut emit = |_: AgentEvent| {};
         // No name at all → rejected on name.
