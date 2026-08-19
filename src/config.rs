@@ -52,7 +52,7 @@ fn default_tools() -> Vec<String> {
     ]
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Limits {
     #[serde(default = "default_max_turns")]
@@ -105,7 +105,7 @@ pub struct Limits {
     /// boundary: eval tasks routinely need builds/installs longer than 120s,
     /// and a task that wants to burn time can do it with ten thousand fast
     /// commands anyway. So a batch task fragment may override it in BOTH
-    /// directions (see `apply` — the only limits field with no clamp).
+    /// directions (see `Clamp::Replace` — the only limits field with no clamp).
     #[serde(default = "default_shell_timeout")]
     pub shell_timeout_secs: u64,
 }
@@ -122,6 +122,62 @@ impl Default for Limits {
             max_total_tokens: 0,
             stream_idle_secs: default_stream_idle(),
             shell_timeout_secs: default_shell_timeout(),
+        }
+    }
+}
+
+/// How a batch task fragment may override one `Limits` field relative to the
+/// trusted base config. Batch task files are untrusted: the only legal
+/// direction is TIGHTENING (never loosen a resource limit — otherwise a task
+/// could set timeout_secs=0 (no limit) and max_turns=u32::MAX and pin a
+/// worker forever), so every limits field maps to exactly one of three
+/// shapes. [`Self::merge`] is the single authoritative implementation — the
+/// per-field hand-written branches `Config::apply` used to carry (including
+/// four fossilized copies of the 0-sentinel if-chain) now live here.
+enum Clamp {
+    /// Smaller is tighter and 0 is either the tightest value or nonsensical
+    /// (clamped at the use site, e.g. stream idle ≥1s in the provider): plain
+    /// `min`. A fragment can only lower the base value.
+    /// (max_turns / max_output_chars / keep_recent_messages / stream_idle_secs)
+    Tighten,
+    /// 0 means "no limit" — the LOOSEST value, opposite of [`Self::Tighten`]
+    /// fields. Canonical explanation, written ONCE here (it previously
+    /// fossilized as four hand-copied if-chains with long comments): a naive
+    /// `min` both lets a task's 0 loosen/disable the base cap, and — when the
+    /// base is 0 — collapses any finite tightening back to 0 (`v.min(0)==0`),
+    /// silently dropping e.g. a 30s tightening and leaving the worker
+    /// unbounded. So: a task's 0 is ignored (no-op sentinel); a 0 (unlimited)
+    /// base adopts any finite task value (any finite value tightens);
+    /// otherwise `min`.
+    /// (timeout_secs / compress_threshold_chars / max_context_tokens /
+    /// max_total_tokens)
+    TightenOrInit,
+    /// Cost/latency knob, not a safety boundary: overridden in BOTH
+    /// directions, no clamp. A task that wants to burn time can do it with
+    /// ten thousand fast commands anyway; the run-level `timeout_secs` and
+    /// `max_total_tokens` remain the real backstops. (shell_timeout_secs only)
+    Replace,
+}
+
+impl Clamp {
+    /// Apply a task fragment (`patch`) over the trusted `base` under this
+    /// policy. `None` keeps the base untouched. Generic over any ordered
+    /// integer type whose `Default` is the 0 sentinel, so call sites keep
+    /// their own field types with no widening/narrowing casts.
+    fn merge<T: Ord + Default>(self, base: T, patch: Option<T>) -> T {
+        let Some(v) = patch else { return base };
+        match self {
+            Clamp::Tighten => v.min(base),
+            Clamp::TightenOrInit => {
+                if v == T::default() {
+                    base
+                } else if base == T::default() {
+                    v
+                } else {
+                    v.min(base)
+                }
+            }
+            Clamp::Replace => v,
         }
     }
 }
@@ -259,6 +315,18 @@ pub struct Config {
     pub reasoning_effort: Option<String>,
 }
 
+/// Canonicalize + validate a workdir (must exist and be a directory). Shared
+/// by `Config::load` and `Config::apply` (previously two hand-copied copies).
+fn resolve_workdir(dir: PathBuf) -> Result<PathBuf> {
+    let dir = dir
+        .canonicalize()
+        .with_context(|| format!("workdir does not exist: {}", dir.display()))?;
+    if !dir.is_dir() {
+        bail!("workdir is not a directory: {}", dir.display());
+    }
+    Ok(dir)
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
@@ -268,15 +336,7 @@ impl Config {
         for s in &cfg.mcp_servers {
             s.validate()?;
         }
-        if let Some(dir) = &cfg.workdir {
-            let dir = dir
-                .canonicalize()
-                .with_context(|| format!("workdir does not exist: {}", dir.display()))?;
-            if !dir.is_dir() {
-                bail!("workdir is not a directory: {}", dir.display());
-            }
-            cfg.workdir = Some(dir);
-        }
+        cfg.workdir = cfg.workdir.take().map(resolve_workdir).transpose()?;
         Ok(cfg)
     }
 
@@ -292,144 +352,100 @@ impl Config {
     }
 
     /// Overlay a partial task config (batch mode): any `Some` field wins.
+    ///
+    /// The `PartialConfig` is destructured WITHOUT `..` at the top: adding a
+    /// field to it without classifying it here (soft overlay) AND in
+    /// `forbidden_batch_override` (hard/soft) is a compile error — closing
+    /// the historical "field added, wiring forgotten, override silently
+    /// dropped" hole (and its security-flavored sibling: a hard field
+    /// forgotten from the forbidden list) at the type level, not by
+    /// discipline. Never reintroduce `..` in these destructures.
     pub fn apply(&mut self, p: PartialConfig) -> Result<()> {
-        if let Some(v) = p.provider {
+        let PartialConfig {
+            provider,
+            base_url,
+            api_key_env,
+            model,
+            max_tokens,
+            system_prompt,
+            task,
+            workdir,
+            tools,
+            restrict_to_workdir,
+            limits,
+            mcp_servers,
+            reasoning_effort,
+            inject_environment,
+        } = p;
+        if let Some(v) = provider {
             self.provider = v;
         }
-        if p.base_url.is_some() {
-            self.base_url = p.base_url;
+        if base_url.is_some() {
+            self.base_url = base_url;
         }
-        if let Some(v) = p.api_key_env {
+        if let Some(v) = api_key_env {
             self.api_key_env = v;
         }
-        if let Some(v) = p.model {
+        if let Some(v) = model {
             self.model = v;
         }
-        if let Some(v) = p.max_tokens {
+        if let Some(v) = max_tokens {
             self.max_tokens = v;
         }
-        if p.system_prompt.is_some() {
-            self.system_prompt = p.system_prompt;
+        if system_prompt.is_some() {
+            self.system_prompt = system_prompt;
         }
-        if p.task.is_some() {
-            self.task = p.task;
+        if task.is_some() {
+            self.task = task;
         }
-        if let Some(dir) = p.workdir {
-            let dir = dir
-                .canonicalize()
-                .with_context(|| format!("workdir does not exist: {}", dir.display()))?;
-            if !dir.is_dir() {
-                bail!("workdir is not a directory: {}", dir.display());
-            }
-            self.workdir = Some(dir);
+        if let Some(dir) = workdir {
+            self.workdir = Some(resolve_workdir(dir)?);
         }
-        if let Some(v) = p.tools {
+        if let Some(v) = tools {
             self.tools = v;
         }
-        if let Some(v) = p.restrict_to_workdir {
+        if let Some(v) = restrict_to_workdir {
             self.restrict_to_workdir = v;
         }
-        if p.reasoning_effort.is_some() {
-            self.reasoning_effort = p.reasoning_effort;
+        if reasoning_effort.is_some() {
+            self.reasoning_effort = reasoning_effort;
         }
-        if let Some(v) = p.inject_environment {
+        if let Some(v) = inject_environment {
             self.inject_environment = v;
         }
-        if let Some(l) = p.limits {
-            // Batch task files are untrusted: a task may only TIGHTEN resource
-            // limits (shorter timeout / fewer turns / smaller output), never
-            // loosen them — otherwise it could set timeout_secs=0 (no limit)
-            // and max_turns=u32::MAX and pin a worker forever. 0 means "no
-            // limit" so it is treated as a loosening and ignored.
-            if let Some(v) = l.max_turns {
-                self.limits.max_turns = v.min(self.limits.max_turns);
-            }
-            if let Some(v) = l.timeout_secs {
-                if v != 0 {
-                    // timeout_secs==0 uniquely means "no limit" (the LOOSEST
-                    // value), so v.min(0)==0 would silently drop a task's
-                    // tightening to e.g. 30s — the opposite of every other
-                    // field where 0 is the tightest. When the base is 0, take v
-                    // directly (any finite v tightens); otherwise min so a task
-                    // can only tighten, never loosen.
-                    self.limits.timeout_secs = if self.limits.timeout_secs == 0 {
-                        v
-                    } else {
-                        v.min(self.limits.timeout_secs)
-                    };
-                }
-            }
-            if let Some(v) = l.max_output_chars {
-                self.limits.max_output_chars = v.min(self.limits.max_output_chars);
-            }
-            // compress_threshold_chars is 0-sentineled like timeout_secs and
-            // max_context_tokens: 0 means "no preflight compression" (the
-            // LOOSEST value), so a task setting 0 is a loosening and is
-            // ignored; a finite v can only tighten — enable compaction from a
-            // disabled (0) base, or lower the threshold against an enabled one
-            // (compacts sooner). Without this, a task could set 0 →
-            // min(base,0)==0 → silently disable the base's preflight
-            // compaction, the opposite of every other field's tighten direction.
-            if let Some(v) = l.compress_threshold_chars {
-                if v != 0 {
-                    self.limits.compress_threshold_chars = if self.limits.compress_threshold_chars == 0 {
-                        v
-                    } else {
-                        v.min(self.limits.compress_threshold_chars)
-                    };
-                }
-            }
-            if let Some(v) = l.keep_recent_messages {
-                self.limits.keep_recent_messages = v.min(self.limits.keep_recent_messages);
-            }
-            // stream_idle_secs: shorter = tighter (a stalled stream fails
-            // sooner). Plain min like max_output_chars/keep_recent_messages;
-            // 0 is nonsensical (instant timeout) so it is clamped to ≥1 at use
-            // in the provider rather than special-cased here. A task can only
-            // shorten the idle window, never lengthen it to mask a hang (the
-            // reqwest total `timeout_secs` is the hard backstop regardless).
-            if let Some(v) = l.stream_idle_secs {
-                self.limits.stream_idle_secs = v.min(self.limits.stream_idle_secs);
-            }
-            // max_context_tokens is 0-sentineled like timeout_secs: 0 means
-            // "no preflight token compaction" (the LOOSEST), so a task setting 0
-            // is a loosening and is ignored; a finite v can only tighten (adopt
-            // from a 0/disabled base, or min against a finite base → compacts
-            // earlier). Batch tasks may trigger compression sooner, never later.
-            if let Some(v) = l.max_context_tokens {
-                if v != 0 {
-                    self.limits.max_context_tokens = if self.limits.max_context_tokens == 0 {
-                        v
-                    } else {
-                        v.min(self.limits.max_context_tokens)
-                    };
-                }
-            }
-            // max_total_tokens is 0-sentineled like max_context_tokens: 0
-            // means "no budget cap" (the LOOSEST), so a task setting 0 is a
-            // loosening and is ignored; a finite v can only tighten — adopt
-            // from a 0/disabled base, or min against a finite base (stops
-            // sooner). A task can never raise or remove the base's cap.
-            if let Some(v) = l.max_total_tokens {
-                if v != 0 {
-                    self.limits.max_total_tokens = if self.limits.max_total_tokens == 0 {
-                        v
-                    } else {
-                        v.min(self.limits.max_total_tokens)
-                    };
-                }
-            }
-            // shell_timeout_secs: the ONLY limits field a task may override in
-            // BOTH directions, no clamp. It is a cost/latency knob (eval tasks
-            // legitimately need builds longer than the 120s default), not a
-            // safety boundary — a task burning time can do it with many fast
-            // commands regardless. The run-level `timeout_secs` (one-way
-            // tighten above) and `max_total_tokens` remain the real backstops.
-            if let Some(v) = l.shell_timeout_secs {
-                self.limits.shell_timeout_secs = v;
-            }
+        if let Some(l) = limits {
+            // Same exhaustive-destructure discipline as above: a new
+            // PartialLimits field that is not classified here is a compile
+            // error, not a silently dropped override. Each field's declared
+            // `Clamp` policy is the single source of what a batch task
+            // fragment may do to it (batch task files are untrusted).
+            let PartialLimits {
+                max_turns,
+                timeout_secs,
+                max_output_chars,
+                compress_threshold_chars,
+                keep_recent_messages,
+                max_context_tokens,
+                max_total_tokens,
+                stream_idle_secs,
+                shell_timeout_secs,
+            } = l;
+            let li = &mut self.limits;
+            li.max_turns = Clamp::Tighten.merge(li.max_turns, max_turns);
+            li.timeout_secs = Clamp::TightenOrInit.merge(li.timeout_secs, timeout_secs);
+            li.max_output_chars = Clamp::Tighten.merge(li.max_output_chars, max_output_chars);
+            li.compress_threshold_chars =
+                Clamp::TightenOrInit.merge(li.compress_threshold_chars, compress_threshold_chars);
+            li.keep_recent_messages =
+                Clamp::Tighten.merge(li.keep_recent_messages, keep_recent_messages);
+            li.max_context_tokens =
+                Clamp::TightenOrInit.merge(li.max_context_tokens, max_context_tokens);
+            li.max_total_tokens = Clamp::TightenOrInit.merge(li.max_total_tokens, max_total_tokens);
+            li.stream_idle_secs = Clamp::Tighten.merge(li.stream_idle_secs, stream_idle_secs);
+            // The only Replace: cost/latency knob, not a safety boundary.
+            li.shell_timeout_secs = Clamp::Replace.merge(li.shell_timeout_secs, shell_timeout_secs);
         }
-        if let Some(v) = p.mcp_servers {
+        if let Some(v) = mcp_servers {
             self.mcp_servers = v;
         }
         Ok(())
@@ -459,29 +475,51 @@ pub struct PartialConfig {
 impl PartialConfig {
     /// First security-relevant field this fragment tries to set, if any.
     /// Batch task files are untrusted: they may only override soft fields
-    /// (task / system_prompt / model / max_tokens / limits). Everything else
-    /// (endpoints, credentials, tool whitelist, sandbox, MCP servers) must
-    /// come from the trusted base config and must not be weakened per task.
+    /// (task / system_prompt / model / max_tokens / reasoning_effort /
+    /// inject_environment / limits). Everything else (endpoints, credentials,
+    /// working directory, tool whitelist, sandbox, MCP servers) must come
+    /// from the trusted base config and must not be weakened per task.
+    ///
+    /// The destructure below lists EVERY field exactly once — soft ones as
+    /// `field: _` (explicitly allowed), hard ones bound and checked in
+    /// reporting order. Adding a field without picking a side is a compile
+    /// error; never reintroduce `..` here.
     pub fn forbidden_batch_override(&self) -> Option<&'static str> {
-        if self.provider.is_some() {
+        let PartialConfig {
+            provider,
+            base_url,
+            api_key_env,
+            model: _,
+            max_tokens: _,
+            system_prompt: _,
+            task: _,
+            workdir,
+            tools,
+            restrict_to_workdir,
+            limits: _,
+            mcp_servers,
+            reasoning_effort: _,
+            inject_environment: _,
+        } = self;
+        if provider.is_some() {
             return Some("provider");
         }
-        if self.base_url.is_some() {
+        if base_url.is_some() {
             return Some("base_url");
         }
-        if self.api_key_env.is_some() {
+        if api_key_env.is_some() {
             return Some("api_key_env");
         }
-        if self.workdir.is_some() {
+        if workdir.is_some() {
             return Some("workdir");
         }
-        if self.tools.is_some() {
+        if tools.is_some() {
             return Some("tools");
         }
-        if self.restrict_to_workdir.is_some() {
+        if restrict_to_workdir.is_some() {
             return Some("restrict_to_workdir");
         }
-        if self.mcp_servers.is_some() {
+        if mcp_servers.is_some() {
             return Some("mcp_servers");
         }
         None
@@ -921,5 +959,71 @@ mod tests {
             serde_json::from_str(r#"{"task":"x","limits":{"shell_timeout_secs":0}}"#).unwrap();
         cfg.apply(partial).unwrap();
         assert_eq!(cfg.limits.shell_timeout_secs, 0, "0 (no limit) is allowed too");
+    }
+
+    #[test]
+    fn clamp_merge_matrix() {
+        // The three policies are the SPEC of what a batch fragment may do to a
+        // limits field; every branch asserted, including the (0, 0) corner.
+        // Tighten: plain min; None keeps the base.
+        assert_eq!(Clamp::Tighten.merge(10u64, Some(100)), 10);
+        assert_eq!(Clamp::Tighten.merge(10u64, Some(3)), 3);
+        assert_eq!(Clamp::Tighten.merge(10u64, None), 10);
+        // TightenOrInit: patch 0 ignored (loosening sentinel); a 0 (unlimited)
+        // base adopts any finite value; two finite values take min; None keeps.
+        assert_eq!(Clamp::TightenOrInit.merge(60u64, Some(0)), 60);
+        assert_eq!(Clamp::TightenOrInit.merge(0u64, Some(30)), 30);
+        assert_eq!(Clamp::TightenOrInit.merge(0u64, Some(0)), 0);
+        assert_eq!(Clamp::TightenOrInit.merge(60u64, Some(30)), 30);
+        assert_eq!(Clamp::TightenOrInit.merge(60u64, Some(120)), 60);
+        assert_eq!(Clamp::TightenOrInit.merge(60u64, None), 60);
+        // Replace: both directions allowed; None keeps the base.
+        assert_eq!(Clamp::Replace.merge(120u64, Some(600)), 600);
+        assert_eq!(Clamp::Replace.merge(120u64, Some(30)), 30);
+        assert_eq!(Clamp::Replace.merge(120u64, Some(0)), 0);
+        assert_eq!(Clamp::Replace.merge(120u64, None), 120);
+    }
+
+    #[test]
+    fn limits_empty_json_equals_default() {
+        // serde-default canary: `Limits` must keep parsing `{}` into exactly
+        // `Limits::default()`. This is what killed the macro-based config
+        // redesign (its generated struct lost the per-field serde defaults and
+        // broke parse_minimal_config); pinned here against regression.
+        let parsed: Limits = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed, Limits::default());
+    }
+
+    #[test]
+    fn apply_overlays_every_partial_limits_field() {
+        // Anti-silence sentinel: EVERY PartialLimits field set to a
+        // distinguishing (tightening) value must observably land after apply.
+        // Catches a field added to the struct but never wired into apply() —
+        // e.g. if someone reintroduces `..` in the exhaustive destructure.
+        let mut cfg: Config = serde_json::from_str(
+            r#"{"provider":"anthropic","api_key_env":"K","model":"m","limits":{
+                "max_turns":100,"timeout_secs":1000,"max_output_chars":100000,
+                "compress_threshold_chars":1000000,"keep_recent_messages":100,
+                "max_context_tokens":1000000,"max_total_tokens":1000000,
+                "stream_idle_secs":1000,"shell_timeout_secs":10000}}"#,
+        )
+        .unwrap();
+        let partial: PartialConfig = serde_json::from_str(
+            r#"{"limits":{"max_turns":2,"timeout_secs":3,"max_output_chars":4,
+                "compress_threshold_chars":5,"keep_recent_messages":6,
+                "max_context_tokens":7,"max_total_tokens":8,
+                "stream_idle_secs":9,"shell_timeout_secs":10}}"#,
+        )
+        .unwrap();
+        cfg.apply(partial).unwrap();
+        assert_eq!(cfg.limits.max_turns, 2, "Tighten field must land");
+        assert_eq!(cfg.limits.timeout_secs, 3, "TightenOrInit field must land");
+        assert_eq!(cfg.limits.max_output_chars, 4, "Tighten field must land");
+        assert_eq!(cfg.limits.compress_threshold_chars, 5, "TightenOrInit field must land");
+        assert_eq!(cfg.limits.keep_recent_messages, 6, "Tighten field must land");
+        assert_eq!(cfg.limits.max_context_tokens, 7, "TightenOrInit field must land");
+        assert_eq!(cfg.limits.max_total_tokens, 8, "TightenOrInit field must land");
+        assert_eq!(cfg.limits.stream_idle_secs, 9, "Tighten field must land");
+        assert_eq!(cfg.limits.shell_timeout_secs, 10, "Replace field must land");
     }
 }
