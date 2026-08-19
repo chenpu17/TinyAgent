@@ -316,6 +316,8 @@ mod tests {
             restrict_to_workdir: false,
             cancel: None,
             shell_timeout_secs: 120,
+            hooks: None,
+            subagent: None,
         };
         let list = tools.iter().find(|t| t.def().name.contains("list_directory")).expect("有 list 工具");
         let out = list

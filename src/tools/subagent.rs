@@ -162,15 +162,8 @@ impl Tool for SubAgent {
         child_tools.extend(self.mcp_tools.iter().cloned().map(|t| Box::new(t) as Box<dyn Tool>));
 
         let provider = provider::build(&child_cfg, &self.api_key, self.client.clone());
-        let child_ctx = ToolCtx {
-            workdir: ctx.workdir.clone(),
-            max_output_chars: ctx.max_output_chars,
-            restrict_to_workdir: ctx.restrict_to_workdir,
-            cancel: ctx.cancel.clone(),
-            shell_timeout_secs: ctx.shell_timeout_secs,
-        };
         let initial = vec![Message::user(vec![Block::Text(prompt.to_string())])];
-        let mut child = Agent::new(&child_cfg, provider, child_tools, initial, child_ctx);
+        let mut child = Agent::new(&child_cfg, provider, child_tools, initial, child_ctx(ctx, name));
         if let Some(flag) = ctx.cancel.clone() {
             child.set_cancel(flag);
         }
@@ -193,6 +186,26 @@ fn child_tools(
     let mut out = tools::build(&cfg.tools, cfg, client, api_key, mcp_tools)?;
     out.retain(|t| t.available_to_subagent());
     Ok(out)
+}
+
+/// The sub-agent's execution context: inherits the parent's sandbox / output
+/// limit / cancel flag / shell timeout, and additionally (commit 4)
+/// - INHERITS the hooks layer by Arc clone — a tool denied at the top level
+///   stays denied inside a sub-agent (no bypass), and the child's own
+///   `before_tool`/`after_tool`/`on_chat_request` flow through the same
+///   layer (on the child's worker thread — see `Hooks` doc, "Concurrency");
+/// - TAGS the sub-agent identity (`subagent`) so a hooks impl can tell a
+///   sub-agent's calls from top-level ones.
+fn child_ctx(ctx: &ToolCtx, name: &str) -> ToolCtx {
+    ToolCtx {
+        workdir: ctx.workdir.clone(),
+        max_output_chars: ctx.max_output_chars,
+        restrict_to_workdir: ctx.restrict_to_workdir,
+        cancel: ctx.cancel.clone(),
+        shell_timeout_secs: ctx.shell_timeout_secs,
+        hooks: ctx.hooks.clone(),
+        subagent: Some(name.to_string()),
+    }
 }
 
 /// Drive a constructed child agent to completion and map its outcome to a tool
@@ -346,6 +359,8 @@ mod tests {
                 restrict_to_workdir: false,
                 cancel: None,
                 shell_timeout_secs: 120,
+                hooks: None,
+                subagent: None,
             },
         )
     }
@@ -565,6 +580,8 @@ mod tests {
             restrict_to_workdir: false,
             cancel: None,
             shell_timeout_secs: 120,
+            hooks: None,
+            subagent: None,
         };
         let mut emit = |_: AgentEvent| {};
         // No name at all → rejected on name.
@@ -596,6 +613,42 @@ mod tests {
         let built = child_tools(&cfg, &reqwest::blocking::Client::new(), "k", &[]).unwrap();
         let names: Vec<String> = built.iter().map(|t| t.def().name).collect();
         assert_eq!(names, vec!["shell".to_string(), "read_file".to_string()]);
+    }
+
+    /// Trivial Hooks impl (all default methods) for the ctx-inheritance assert.
+    struct NoopHooks;
+    impl crate::hooks::Hooks for NoopHooks {}
+
+    #[test]
+    fn child_ctx_inherits_hooks_and_tags_subagent_name() {
+        // The child's ctx Arc-CLONES the parent's hooks layer (denied at the
+        // top level stays denied inside the sub-agent — no bypass), and tags
+        // the child with its sub-agent name so hooks can tell its calls apart.
+        // Sandbox / limit fields carry over unchanged.
+        let hooks: std::sync::Arc<dyn crate::hooks::Hooks> =
+            std::sync::Arc::new(NoopHooks);
+        let parent = ToolCtx {
+            workdir: std::env::temp_dir(),
+            max_output_chars: 1234,
+            restrict_to_workdir: true,
+            cancel: None,
+            shell_timeout_secs: 77,
+            hooks: Some(hooks.clone()),
+            subagent: None,
+        };
+        let child = child_ctx(&parent, "scout");
+        assert!(
+            std::sync::Arc::ptr_eq(
+                parent.hooks.as_ref().unwrap(),
+                child.hooks.as_ref().unwrap()
+            ),
+            "child must SHARE the parent's hooks layer (no bypass)"
+        );
+        assert_eq!(child.subagent.as_deref(), Some("scout"));
+        assert_eq!(child.workdir, parent.workdir);
+        assert_eq!(child.max_output_chars, 1234);
+        assert!(child.restrict_to_workdir);
+        assert_eq!(child.shell_timeout_secs, 77);
     }
 
     fn fake_cfg() -> Config {

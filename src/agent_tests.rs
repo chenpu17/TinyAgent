@@ -1,7 +1,8 @@
     use super::*;
     use crate::compress::*;
+    use crate::hooks::{Hooks, ToolDecision};
     use crate::provider::mock::{self, MockProvider, MockTurn};
-    use crate::provider::ChatResponse;
+    use crate::provider::{ChatRequest, ChatResponse};
     use crate::tools::ToolOutput;
     use serde_json::json;
 
@@ -252,6 +253,8 @@
             restrict_to_workdir: false,
             cancel: None,
             shell_timeout_secs: 120,
+            hooks: None,
+            subagent: None,
         }
     }
 
@@ -880,6 +883,406 @@
             agent.trailing_tool_result_contents(),
             vec!["ok".to_string(), "[cancelled by user]".to_string()]
         );
+    }
+
+    // ── Hooks interception layer (commit 4) ─────────────────────────────────
+
+    /// A recording [`Hooks`] impl for the interception-layer tests. Logs every
+    /// callback in call order — tagging what the contract promises: the ctx's
+    /// sub-agent identity in `before_tool`, the executed output in
+    /// `after_tool`, the model in `on_chat_request` — and can be pre-seeded
+    /// with a per-tool `before_tool` decision (absent → Allow). Mutex-guarded
+    /// like any real implementation must be — hooks may be called from several
+    /// worker threads at once (sibling sub-agents).
+    struct CaptureHooks {
+        calls: std::sync::Mutex<Vec<String>>,
+        decisions: std::sync::Mutex<std::collections::HashMap<String, ToolDecision>>,
+    }
+    impl CaptureHooks {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                decisions: std::sync::Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+        fn deny(tool: &str, reason: &str) -> Self {
+            let h = Self::new();
+            h.decisions
+                .lock()
+                .unwrap()
+                .insert(tool.to_string(), ToolDecision::Deny(reason.to_string()));
+            h
+        }
+        fn modify(tool: &str, replacement: Value) -> Self {
+            let h = Self::new();
+            h.decisions
+                .lock()
+                .unwrap()
+                .insert(tool.to_string(), ToolDecision::Modify(replacement));
+            h
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+    impl Hooks for CaptureHooks {
+        fn before_tool(&self, tool: &str, input: &Value, ctx: &ToolCtx) -> ToolDecision {
+            let tag = ctx.subagent.as_deref().unwrap_or("-");
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("before:{tool}:{input}:{tag}"));
+            match self.decisions.lock().unwrap().get(tool) {
+                Some(d) => d.clone(),
+                None => ToolDecision::Allow,
+            }
+        }
+        fn after_tool(&self, tool: &str, _input: &Value, output: &ToolOutput, executed: bool) {
+            self.calls.lock().unwrap().push(format!(
+                "after:{tool}:{executed}:{err}:{content}",
+                err = output.is_error,
+                content = output.content
+            ));
+        }
+        fn on_chat_request(&self, req: &ChatRequest) {
+            self.calls.lock().unwrap().push(format!("chat:{}", req.model));
+        }
+    }
+
+    /// Echoes the EXECUTED input back as the output — a Modify test can then
+    /// tell from the record which input actually ran (vs. the original the
+    /// audit keeps).
+    struct InputEchoTool {
+        name: &'static str,
+    }
+    impl Tool for InputEchoTool {
+        fn def(&self) -> ToolDef {
+            ToolDef {
+                name: self.name.into(),
+                description: "echoes the executed input".into(),
+                schema: json!({"type": "object"}),
+            }
+        }
+        fn run(&self, input: &Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+            Ok(ToolOutput::text(input.to_string()))
+        }
+    }
+
+    #[test]
+    fn hooks_deny_leaf_records_error_result_and_continues() {
+        // A denied Sequential call: never executed, yet RECORDED (is_error, the
+        // denial text as output), its tool_result keeps N:N pairing, and the
+        // run continues to the next turn. after_tool fires at decision time
+        // with executed=false. Deny lands as Slot::Ran — Slot::Cancelled stays
+        // reserved for cancel.
+        let cfg = cfg_with(5, 0, 0);
+        let (prov, _) = MockProvider::new(vec![
+            mock::resp_tool("t1", "danger", json!({"cmd": "rm -rf /"}), mock::mk_usage(5, 5)),
+            mock::resp_text("final", None),
+        ]);
+        let ran = Arc::new(AtomicBool::new(false));
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![Box::new(EchoTool::tracking("danger", ran.clone()))],
+            vec![user_text("go")],
+            test_ctx(),
+        );
+        let hooks = Arc::new(CaptureHooks::deny("danger", "forbidden in this deployment"));
+        agent.set_hooks(hooks.clone());
+        let mut events = Vec::new();
+        let o = agent.run(&mut |e| events.push(e)).unwrap();
+
+        assert!(!ran.load(Ordering::Relaxed), "a denied tool must never execute");
+        assert_eq!(o.tool_calls.len(), 1);
+        assert!(o.tool_calls[0].is_error);
+        assert_eq!(o.tool_calls[0].output, "forbidden in this deployment");
+        // The denial text is what the model sees; it then produced the final turn.
+        assert_eq!(o.final_text, "final");
+        // The ToolResult event reports the error.
+        let errs: Vec<bool> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ToolResult { is_error, .. } => Some(*is_error),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(errs, vec![true]);
+        // Exact hook sequence: chat(turn1) → before → after(denied) → chat(turn2).
+        let expected: Vec<String> = [
+            "chat:m",
+            r#"before:danger:{"cmd":"rm -rf /"}:-"#,
+            "after:danger:false:true:forbidden in this deployment",
+            "chat:m",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(hooks.calls(), expected);
+    }
+
+    #[test]
+    fn hooks_modify_leaf_executes_replacement_but_audit_keeps_original() {
+        // Modify: the tool RUNS with the replacement input; the audit trail
+        // (recorded input + announced ToolCall event) keeps the model's
+        // original — the log answers "what did the model ask for".
+        let cfg = cfg_with(5, 0, 0);
+        let original = json!({"path": "/etc/passwd"});
+        let (prov, _) = MockProvider::new(vec![
+            mock::resp_tool("t1", "echo", original.clone(), mock::mk_usage(1, 1)),
+            mock::resp_text("final", None),
+        ]);
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![Box::new(InputEchoTool { name: "echo" })],
+            vec![user_text("go")],
+            test_ctx(),
+        );
+        let hooks = Arc::new(CaptureHooks::modify("echo", json!({"path": "safe.txt"})));
+        agent.set_hooks(hooks.clone());
+        let mut events = Vec::new();
+        let o = agent.run(&mut |e| events.push(e)).unwrap();
+
+        // Executed input was the replacement...
+        assert_eq!(o.tool_calls[0].output, r#"{"path":"safe.txt"}"#);
+        assert!(!o.tool_calls[0].is_error);
+        // ...but the audit keeps the original.
+        assert_eq!(o.tool_calls[0].input, original);
+        let announced: Vec<Value> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ToolCall { name, input } if name == "echo" => Some(input.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(announced, vec![original]);
+    }
+
+    #[test]
+    fn hooks_allow_is_equivalent_to_no_hooks() {
+        // An all-Allow layer must be observably a no-op: same outcome fields,
+        // same event stream as no layer at all (elapsed aside). Guards against
+        // accidental drift from merely wiring the hook call sites.
+        let script = || {
+            vec![
+                mock::resp_tool("t1", "echo", json!({"v": 1}), mock::mk_usage(7, 3)),
+                mock::resp_text("done", mock::mk_usage(2, 1)),
+            ]
+        };
+        let build = |hooks: Option<Arc<CaptureHooks>>| {
+            let cfg = cfg_with(5, 0, 0);
+            let (prov, _) = MockProvider::new(script());
+            let mut agent = Agent::new(
+                &cfg,
+                Box::new(prov),
+                vec![Box::new(InputEchoTool { name: "echo" })],
+                vec![user_text("go")],
+                test_ctx(),
+            );
+            if let Some(h) = hooks {
+                agent.set_hooks(h);
+            }
+            agent
+        };
+        let mut evs_plain = Vec::new();
+        let o_plain = build(None).run(&mut |e| evs_plain.push(e)).unwrap();
+        let mut evs_hooked = Vec::new();
+        let o_hooked = build(Some(Arc::new(CaptureHooks::new())))
+            .run(&mut |e| evs_hooked.push(e))
+            .unwrap();
+
+        assert_eq!(o_hooked.final_text, o_plain.final_text);
+        assert_eq!(o_hooked.turns, o_plain.turns);
+        assert_eq!(o_hooked.stop_reason, o_plain.stop_reason);
+        assert_eq!(
+            format!("{:?}", o_hooked.tool_calls),
+            format!("{:?}", o_plain.tool_calls)
+        );
+        assert_eq!(o_hooked.input_tokens, o_plain.input_tokens);
+        assert_eq!(o_hooked.output_tokens, o_plain.output_tokens);
+        assert_eq!(
+            o_hooked.cache_creation_input_tokens,
+            o_plain.cache_creation_input_tokens
+        );
+        assert_eq!(
+            o_hooked.cache_read_input_tokens,
+            o_plain.cache_read_input_tokens
+        );
+        assert_eq!(format!("{evs_hooked:?}"), format!("{evs_plain:?}"));
+    }
+
+    #[test]
+    fn hooks_deny_task_call_never_spawns_and_bills_nothing() {
+        // A denied Parallel call: the batch gate refuses it BEFORE any worker
+        // spawns — no SubAgent events, no billed usage — yet it's recorded
+        // is_error (honest audit) and the run continues.
+        let cfg = cfg_with(5, 0, 0);
+        let (prov, _) = MockProvider::new(vec![
+            mock::resp_tool("t1", "task", json!({"label": "a"}), mock::mk_usage(5, 5)),
+            mock::resp_text("final", None),
+        ]);
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![Box::new(TaskTool)],
+            vec![user_text("go")],
+            test_ctx(),
+        );
+        let hooks = Arc::new(CaptureHooks::deny("task", "no sub-agents in this deployment"));
+        agent.set_hooks(hooks.clone());
+        let mut events = Vec::new();
+        let o = agent.run(&mut |e| events.push(e)).unwrap();
+
+        assert!(
+            events.iter().all(|e| !matches!(e, AgentEvent::SubAgent { .. })),
+            "a denied task must never spawn a sub-agent"
+        );
+        assert_eq!(o.tool_calls.len(), 1);
+        assert!(o.tool_calls[0].is_error);
+        // Only turn-1 usage billed — the denied task's 100/10 never ran.
+        assert_eq!(o.input_tokens, 5);
+        assert_eq!(o.output_tokens, 5);
+    }
+
+    #[test]
+    fn hooks_modify_task_input_reaches_the_worker() {
+        // Modify on a Parallel call: the spawned worker EXECUTES the
+        // replacement input, while the audit trail keeps the original.
+        let cfg = cfg_with(5, 0, 0);
+        let (prov, _) = MockProvider::new(vec![
+            mock::resp_tool("t1", "task", json!({"label": "a"}), mock::mk_usage(5, 5)),
+            mock::resp_text("final", None),
+        ]);
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![Box::new(TaskTool)],
+            vec![user_text("go")],
+            test_ctx(),
+        );
+        let hooks = Arc::new(CaptureHooks::modify("task", json!({"label": "b"})));
+        agent.set_hooks(hooks.clone());
+        let mut events = Vec::new();
+        let o = agent.run(&mut |e| events.push(e)).unwrap();
+
+        // The worker saw the replacement (TaskTool derives output + embedded
+        // event tag from the executed input).
+        assert_eq!(o.tool_calls[0].output, "out-b");
+        let tags: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::SubAgent { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tags, vec!["b".to_string()]);
+        // Audit keeps the original.
+        assert_eq!(o.tool_calls[0].input, json!({"label": "a"}));
+    }
+
+    #[test]
+    fn hooks_see_subagent_tag_when_gating_inside_a_subagent_ctx() {
+        // A child agent (ctx.subagent = Some) gates its own leaf tools through
+        // the inherited layer, and before_tool sees the sub-agent identity via
+        // ctx. (A full child-agent e2e is impossible offline — the child
+        // builds its own provider internally — so this simulates the child
+        // side: an agent whose ctx is tagged exactly like child_ctx() tags it.)
+        let cfg = cfg_with(5, 0, 0);
+        let (prov, _) = MockProvider::new(vec![
+            mock::resp_tool("t1", "leaf", json!({}), mock::mk_usage(1, 1)),
+            mock::resp_text("final", None),
+        ]);
+        let mut ctx = test_ctx();
+        ctx.subagent = Some("scout".into());
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![Box::new(EchoTool::new("leaf"))],
+            vec![user_text("go")],
+            ctx,
+        );
+        let hooks = Arc::new(CaptureHooks::deny("leaf", "children don't shell out"));
+        agent.set_hooks(hooks.clone());
+        agent.run(&mut |_| {}).unwrap();
+        let calls = hooks.calls();
+        assert!(
+            calls.contains(&"before:leaf:{}:scout".to_string()),
+            "before_tool must see the sub-agent tag: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn hooks_on_chat_request_fires_once_per_main_turn() {
+        // Three main turns (tool, tool, text) → exactly three on_chat_request
+        // observations, one per outgoing request. Compression is disabled
+        // (threshold 0) so no summary call can sneak in — and if one ever ran,
+        // it must NOT be surfaced (main-turns-only hook).
+        let cfg = cfg_with(5, 0, 0);
+        let (prov, _) = MockProvider::new(vec![
+            mock::resp_tool("t1", "echo", json!({}), mock::mk_usage(1, 1)),
+            mock::resp_tool("t2", "echo", json!({}), mock::mk_usage(1, 1)),
+            mock::resp_text("done", mock::mk_usage(1, 1)),
+        ]);
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![Box::new(InputEchoTool { name: "echo" })],
+            vec![user_text("go")],
+            test_ctx(),
+        );
+        let hooks = Arc::new(CaptureHooks::new());
+        agent.set_hooks(hooks.clone());
+        agent.run(&mut |_| {}).unwrap();
+        let calls = hooks.calls();
+        let chats: Vec<&str> = calls.iter().filter_map(|c| c.strip_prefix("chat:")).collect();
+        assert_eq!(chats.len(), 3, "one on_chat_request per main turn: {calls:?}");
+    }
+
+    #[test]
+    fn hooks_parallel_batch_gates_all_calls_in_block_order() {
+        // Three Parallel calls in one turn: before_tool fires for each, in
+        // block order, before execution; after_tool fires for each after the
+        // batch joins, again in block order (join order == spawn order). One
+        // chat observation frames each turn.
+        let cfg = cfg_with(5, 0, 0);
+        let (prov, _) = MockProvider::new(vec![
+            MockTurn::Ok(ChatResponse {
+                blocks: vec![
+                    Block::ToolUse { id: "a".into(), name: "task".into(), input: json!({"label": "a"}) },
+                    Block::ToolUse { id: "b".into(), name: "task".into(), input: json!({"label": "b"}) },
+                    Block::ToolUse { id: "c".into(), name: "task".into(), input: json!({"label": "c"}) },
+                ],
+                stop_reason: "tool_use".into(),
+                usage: None,
+            }),
+            mock::resp_text("final", None),
+        ]);
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![Box::new(TaskTool)],
+            vec![user_text("go")],
+            test_ctx(),
+        );
+        let hooks = Arc::new(CaptureHooks::new());
+        agent.set_hooks(hooks.clone());
+        let o = agent.run(&mut |_| {}).unwrap();
+        assert_eq!(o.tool_calls.len(), 3);
+        let expected: Vec<String> = [
+            "chat:m",
+            r#"before:task:{"label":"a"}:-"#,
+            r#"before:task:{"label":"b"}:-"#,
+            r#"before:task:{"label":"c"}:-"#,
+            "after:task:true:false:out-a",
+            "after:task:true:false:out-b",
+            "after:task:true:false:out-c",
+            "chat:m",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(hooks.calls(), expected);
     }
 
     #[test]
@@ -2671,6 +3074,8 @@
             restrict_to_workdir: true,
             cancel: None,
             shell_timeout_secs: 120,
+            hooks: None,
+            subagent: None,
         };
         (ctx, canon)
     }

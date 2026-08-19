@@ -32,6 +32,15 @@ pub struct ToolCtx {
     /// `0` = no per-command limit — the cancel flag above still applies, and
     /// the run-level `timeout_secs` remains the backstop.
     pub shell_timeout_secs: u64,
+    /// Third-party interception layer ([`crate::hooks::Hooks`]), installed via
+    /// `Agent::set_hooks` (assembly leaves it None). Shared by Arc with `task`
+    /// sub-agents — the child's ctx clones it, so a tool denied at the top
+    /// level stays denied when reached through a sub-agent (no bypass).
+    pub hooks: Option<std::sync::Arc<dyn crate::hooks::Hooks>>,
+    /// When this ctx belongs to a `task` sub-agent, its name (the same
+    /// identity that tags its forwarded events) — lets hooks tell top-level
+    /// calls from sub-agent calls. None on the main agent.
+    pub subagent: Option<String>,
 }
 
 #[derive(Debug)]
@@ -366,6 +375,8 @@ mod tests {
             restrict_to_workdir: true,
             cancel: None,
             shell_timeout_secs: 120,
+            hooks: None,
+            subagent: None,
         };
         let err = resolve(&ctx, "../outside.txt").unwrap_err();
         assert!(
@@ -383,6 +394,8 @@ mod tests {
             restrict_to_workdir: true,
             cancel: None,
             shell_timeout_secs: 120,
+            hooks: None,
+            subagent: None,
         };
         // write_file targets not-yet-existing files; resolve (via confine) must
         // allow a path whose deeper components don't exist yet (it canonicalizes
@@ -401,6 +414,8 @@ mod tests {
             restrict_to_workdir: false,
             cancel: None,
             shell_timeout_secs: 120,
+            hooks: None,
+            subagent: None,
         };
         // With restrict off, resolve just joins — no escape check, no error.
         let resolved = resolve(&ctx, "../outside.txt").unwrap();
@@ -416,6 +431,8 @@ mod tests {
             restrict_to_workdir: true,
             cancel: None,
             shell_timeout_secs: 120,
+            hooks: None,
+            subagent: None,
         };
         // The workdir's own parent exists and is, by definition, not under it.
         let outside = dir.parent().unwrap();

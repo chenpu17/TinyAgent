@@ -7,6 +7,18 @@
 
 ### Added
 
+- **Hooks 拦截层（P1）**：第三方不改核心即可观察与把关 agent 行为。新增
+  `hooks` 模块：`trait Hooks: Send + Sync`（三默认方法——`before_tool` 返回
+  `ToolDecision::Allow | Deny(String) | Modify(Value)`；`after_tool` 事后审计；
+  `on_chat_request` 只读观察主 turn 请求）+ `Agent::set_hooks` 后置安装
+  （仿 `set_cancel` 模式；装配默认 None，二进制与绑定行为零变化）。`task`
+  子 agent 经 `ToolCtx::hooks` Arc 继承同一层（顶层拒绝 = 子 agent 内也拒绝，
+  无绕过）；`ToolCtx::subagent` 标注子 agent 身份供区分。语义要点：Deny 产出
+  `is_error` 结果照常入记录与 N:N 配对（**不**占用 `Cancelled` 槽——那是取消
+  专用）；Modify 只改**执行**输入，审计链（tool-call 日志 / `ToolCall` 事件）
+  保留模型原始输入；顶层闸门在父线程 spawn 前**串行**把关（审批决策互不竞争），
+  子 agent 自身的闸门跑在各自 worker 线程上（兄弟真并发，实现方须自行线程安全）；
+  压缩摘要请求刻意不透出；`--resume` 重建的 agent 需重新 `set_hooks`。
 - **工具能力标记**：`Tool` trait 新增两个默认方法——`concurrency()`
   （`ToolConcurrency::Sequential | Parallel`，决定同 turn 多个调用是否并入并行批）
   与 `available_to_subagent()`（决定是否被 `task` 子 agent 继承）。核心 loop 的并行
@@ -17,6 +29,10 @@
 
 ### Changed (Breaking)
 
+- **`ToolCtx` 新增两个公共字段**：`hooks: Option<Arc<dyn Hooks>>` 与
+  `subagent: Option<String>`。外部**构造** `ToolCtx` 字面量的代码需补
+  `hooks: None, subagent: None`（本仓库内 29 处构造点已同步）；只接收
+  `&ToolCtx` 的工具实现不受影响。
 - **`AgentEvent` / `Block` / `ChatEvent` 加 `#[non_exhaustive]`**：三个消费侧枚举
   （第三方 `match` 的对象）后续新增变体不再需要版本承诺，外部 `match` **必须保留
   通配臂**，否则升级时编译错误。迁移一行：补 `_ => {}`。serde 序列化/反序列化不受

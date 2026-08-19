@@ -28,6 +28,7 @@ pub mod batch;
 pub mod compress;
 pub mod config;
 pub mod harness;
+pub mod hooks;
 pub mod mcp;
 pub mod provider;
 pub mod retry;
@@ -41,6 +42,7 @@ pub use agent::{
     extract_plan,
 };
 pub use config::{Config, Limits};
+pub use hooks::{Hooks, ToolDecision};
 pub use provider::{Block, ChatRequest, ChatResponse, Message, Provider, Role, SimpleChatResponse, ToolDef, Usage};
 pub use tools::{CallbackTool, Tool, ToolConcurrency, ToolCtx, ToolOutput};
 
@@ -186,6 +188,8 @@ fn assemble(
         restrict_to_workdir: cfg.restrict_to_workdir,
         cancel: None,
         shell_timeout_secs: cfg.limits.shell_timeout_secs,
+        hooks: None,
+        subagent: None,
     };
     Ok((tool_list, ctx, cfg))
 }

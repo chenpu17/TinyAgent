@@ -332,6 +332,8 @@ mod tests {
             cancel: None,
 
             shell_timeout_secs: 120,
+            hooks: None,
+            subagent: None,
         }
     }
 
@@ -389,6 +391,8 @@ mod tests {
             restrict_to_workdir: true,
             cancel: None,
             shell_timeout_secs: 120,
+            hooks: None,
+            subagent: None,
         }
     }
 

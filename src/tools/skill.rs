@@ -254,6 +254,8 @@ mod tests {
             cancel: None,
 
             shell_timeout_secs: 120,
+            hooks: None,
+            subagent: None,
         }
     }
 

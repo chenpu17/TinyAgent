@@ -283,6 +283,8 @@ mod tests {
             restrict_to_workdir: false,
             cancel: Some(cancel),
             shell_timeout_secs: 120,
+            hooks: None,
+            subagent: None,
         };
         let start = Instant::now();
         let out = Shell.run(&json!({"command": "sleep 30"}), &ctx).unwrap();
@@ -312,6 +314,8 @@ mod tests {
             restrict_to_workdir: false,
             cancel: None,
             shell_timeout_secs: 120,
+            hooks: None,
+            subagent: None,
         };
         let out = Shell
             .run(&json!({"command": "printf '中%.0s' $(seq 1 5000)"}), &ctx)
@@ -330,6 +334,8 @@ mod tests {
             restrict_to_workdir: false,
             cancel: None,
             shell_timeout_secs: 120,
+            hooks: None,
+            subagent: None,
         }
     }
 
@@ -411,6 +417,8 @@ mod tests {
             restrict_to_workdir: false,
             cancel: None,
             shell_timeout_secs: 1,
+            hooks: None,
+            subagent: None,
         };
         let start = Instant::now();
         let out = Shell.run(&json!({"command": "sleep 30"}), &ctx).unwrap();
@@ -439,6 +447,8 @@ mod tests {
             restrict_to_workdir: false,
             cancel: None,
             shell_timeout_secs: 0,
+            hooks: None,
+            subagent: None,
         };
         let out = Shell.run(&json!({"command": "sleep 2 && echo done"}), &ctx).unwrap();
         assert!(!out.is_error, "got: {}", out.content);

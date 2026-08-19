@@ -1,5 +1,6 @@
 use crate::config::{Config, Limits};
 use crate::compress;
+use crate::hooks::ToolDecision;
 use crate::provider::{Block, ChatEvent, ChatRequest, Message, Provider, Role, ToolDef, Usage};
 use crate::tools::{Tool, ToolConcurrency, ToolCtx, ToolOutput};
 use anyhow::Result;
@@ -471,6 +472,18 @@ impl Agent {
         self.shutdown = Some(flag);
     }
 
+    /// Install the third-party interception layer ([`crate::hooks::Hooks`]).
+    /// Post-construction setter (same pattern as `set_cancel`): assembly leaves
+    /// `ToolCtx::hooks` None, so the binary and bindings behave exactly as
+    /// before until a library user opts in. `task` sub-agents inherit the layer
+    /// automatically (their ctx clones this Arc — see `tools::subagent::child_ctx`),
+    /// so a policy installed here gates the WHOLE run, children included.
+    /// An agent rebuilt from `--resume` needs `set_hooks` again — the layer
+    /// lives on the instance, not in the session file.
+    pub fn set_hooks(&mut self, hooks: Arc<dyn crate::hooks::Hooks>) {
+        self.ctx.hooks = Some(hooks);
+    }
+
     pub(crate) fn cancelled(&self) -> bool {
         self.cancel
             .as_ref()
@@ -484,6 +497,29 @@ impl Agent {
         self.cancel
             .clone()
             .unwrap_or_else(|| Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Hooks gate for one pending tool call: the installed layer's decision, or
+    /// `Allow` when no layer is set (the default — zero overhead beyond one
+    /// Option check). Callers hold the ORIGINAL input for audit; only execution
+    /// may see a `Modify` replacement. Gates run where they're called: on this
+    /// (parent) thread for the top-level turn — serial by construction, before
+    /// any parallel worker spawns — and on a worker thread inside a sub-agent
+    /// (see the `Hooks` doc, "Concurrency").
+    fn gate_tool(&self, name: &str, input: &Value) -> ToolDecision {
+        match &self.ctx.hooks {
+            Some(h) => h.before_tool(name, input, &self.ctx),
+            None => ToolDecision::Allow,
+        }
+    }
+
+    /// Hooks after-notification for a finished tool call. `input` is always the
+    /// ORIGINAL (never a `Modify` replacement); `executed` is false only for a
+    /// denied call (which still gets its error output reported).
+    fn notify_after(&self, name: &str, input: &Value, output: &ToolOutput, executed: bool) {
+        if let Some(h) = &self.ctx.hooks {
+            h.after_tool(name, input, output, executed);
+        }
     }
 
     /// Fold one request's usage into the run totals and emit the per-request
@@ -743,6 +779,12 @@ impl Agent {
                         cache: true,
                         reasoning_effort: self.reasoning_effort.as_deref(),
                     };
+                    // Hooks observation point — MAIN-turn requests only (the
+                    // compression summary call deliberately not surfaced; see
+                    // the Hooks doc, "Scope"). Read-only by signature.
+                    if let Some(h) = &self.ctx.hooks {
+                        h.on_chat_request(&req);
+                    }
                     self.provider.chat(&req, &mut |e| match e {
                         ChatEvent::TextDelta(t) => events(AgentEvent::TextDelta(t)),
                         ChatEvent::ThinkingDelta(t) => events(AgentEvent::ThinkingDelta(t)),
@@ -978,11 +1020,39 @@ impl Agent {
                         name: name.clone(),
                         input: input.clone(),
                     });
-                    let output = {
-                        let mut fwd = |ev: AgentEvent| events(ev);
-                        run_tool(&self.tools, &self.tool_defs, name, input, &self.ctx, &mut fwd)
-                    };
-                    slots[i] = Slot::Ran(Box::new(output));
+                    // Hooks gate (serial, on this thread). Deny → an error
+                    // result that is STILL recorded (N:N pairing + honest audit
+                    // log) — never Slot::Cancelled, which stays reserved for
+                    // cancel. Allow/Modify proceed below.
+                    match self.gate_tool(name, input) {
+                        ToolDecision::Deny(reason) => {
+                            let output = ToolOutput::error(reason);
+                            self.notify_after(name, input, &output, false);
+                            slots[i] = Slot::Ran(Box::new(output));
+                        }
+                        decision => {
+                            // Allow → original input; Modify → replacement
+                            // clone. The audit trail (records, ToolCall events)
+                            // keeps the ORIGINAL in both cases.
+                            let effective: &Value = match &decision {
+                                ToolDecision::Modify(v) => v,
+                                _ => input,
+                            };
+                            let output = {
+                                let mut fwd = |ev: AgentEvent| events(ev);
+                                run_tool(
+                                    &self.tools,
+                                    &self.tool_defs,
+                                    name,
+                                    effective,
+                                    &self.ctx,
+                                    &mut fwd,
+                                )
+                            };
+                            self.notify_after(name, input, &output, true);
+                            slots[i] = Slot::Ran(Box::new(output));
+                        }
+                    }
                 }
             }
 
@@ -1000,6 +1070,9 @@ impl Agent {
             // marks the batch cancelled and skips it); in-flight workers
             // self-terminate via the shared cancel flag they inherit,
             // returning partial/cancelled results rather than synthesised ones.
+            // Hooks: after the announce, each call passes `before_tool` —
+            // serially, on this thread, before ANY worker spawns (approval
+            // decisions never race); denied calls never spawn.
             if !parallel_slots.is_empty() && !batch_cancelled && !self.cancelled() {
                 // Announce the parallel calls in block order NOW that the batch
                 // is committed to run — emitting them in the inline pass (before
@@ -1011,19 +1084,45 @@ impl Agent {
                         input: tool_uses[i].2.clone(),
                     });
                 }
+                // Hooks gate — SERIAL on this (parent) thread, before any
+                // worker spawns, in parallel-block order (see the Hooks doc,
+                // "Call order & concurrency"). Denied calls get their error
+                // slot + after-notification at decision time and spawn no
+                // worker; Allow/Modify land in `runnable` (Modify carrying the
+                // replacement — the audit trail keeps the original input from
+                // `tool_uses`).
+                let mut runnable: Vec<(usize, String, Value)> =
+                    Vec::with_capacity(parallel_slots.len());
+                for &i in &parallel_slots {
+                    let name = &tool_uses[i].1;
+                    let input = &tool_uses[i].2;
+                    match self.gate_tool(name, input) {
+                        ToolDecision::Deny(reason) => {
+                            let output = ToolOutput::error(reason);
+                            self.notify_after(name, input, &output, false);
+                            slots[i] = Slot::Ran(Box::new(output));
+                        }
+                        ToolDecision::Allow => {
+                            runnable.push((i, name.clone(), input.clone()));
+                        }
+                        ToolDecision::Modify(v) => {
+                            runnable.push((i, name.clone(), v));
+                        }
+                    }
+                }
                 let (tx, rx) = std::sync::mpsc::channel::<AgentEvent>();
                 let tools = &self.tools;
                 let defs = &self.tool_defs;
                 let ctx = &self.ctx;
                 std::thread::scope(|s| {
-                    // Spawn every parallel worker BEFORE joining any, so they
+                    // Spawn every runnable worker BEFORE joining any, so they
                     // run concurrently. Each owns its input/name + a sender
                     // clone, and only ever touches `tx` (never `events`).
                     let mut handles: Vec<std::thread::ScopedJoinHandle<ToolOutput>> =
-                        Vec::with_capacity(parallel_slots.len());
-                    for &i in &parallel_slots {
-                        let name = tool_uses[i].1.clone();
-                        let input = tool_uses[i].2.clone();
+                        Vec::with_capacity(runnable.len());
+                    for (_, name, input) in &runnable {
+                        let name = name.clone();
+                        let input = input.clone();
                         let tx = tx.clone();
                         handles.push(s.spawn(move || {
                             let mut emit = |ev: AgentEvent| {
@@ -1038,12 +1137,16 @@ impl Agent {
                     while let Ok(ev) = rx.recv() {
                         events(ev);
                     }
-                    // Join in spawn order and place each result at its ordinal.
+                    // Join in spawn order (= parallel block order): notify
+                    // hooks with the ORIGINAL input (from tool_uses, never the
+                    // Modify replacement), then place each result at its ordinal.
                     for (pos, h) in handles.into_iter().enumerate() {
                         let output = h
                             .join()
                             .unwrap_or_else(|_| ToolOutput::error("parallel tool worker panicked"));
-                        slots[parallel_slots[pos]] = Slot::Ran(Box::new(output));
+                        let (i, _, _) = runnable[pos];
+                        self.notify_after(&tool_uses[i].1, &tool_uses[i].2, &output, true);
+                        slots[i] = Slot::Ran(Box::new(output));
                     }
                 });
             }
