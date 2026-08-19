@@ -42,7 +42,7 @@ pub use agent::{
 };
 pub use config::{Config, Limits};
 pub use provider::{Block, ChatRequest, ChatResponse, Message, Provider, Role, SimpleChatResponse, ToolDef, Usage};
-pub use tools::{CallbackTool, Tool, ToolCtx, ToolOutput};
+pub use tools::{CallbackTool, Tool, ToolConcurrency, ToolCtx, ToolOutput};
 
 /// Wire together provider + tools (the config's built-in whitelist + any MCP
 /// servers) + [`Agent`], returning a ready-to-run agent.

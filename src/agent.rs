@@ -1,7 +1,7 @@
 use crate::config::{Config, Limits};
 use crate::compress;
 use crate::provider::{Block, ChatEvent, ChatRequest, Message, Provider, Role, ToolDef, Usage};
-use crate::tools::{Tool, ToolCtx, ToolOutput};
+use crate::tools::{Tool, ToolConcurrency, ToolCtx, ToolOutput};
 use anyhow::Result;
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -927,34 +927,43 @@ impl Agent {
             // Per-slot outcome. `Cancelled` keeps N:N pairing (a result block
             // for every tool_use) without billing usage or recording a call —
             // matching the pre-parallel behavior. `Ran` is a real ToolOutput
-            // (leaf run inline, or `task` run in the parallel batch). Boxed
-            // because `ToolOutput` carries an `Option<Value>` (audit `meta`) and
-            // crossed the `large_enum_variant` threshold — an alloc per tool
-            // call is negligible and keeps `Slot` (one per tool_use, in a Vec)
-            // small.
+            // (a Sequential tool run inline, or a Parallel one run in the
+            // batch below). Boxed because `ToolOutput` carries an
+            // `Option<Value>` (audit `meta`) and crossed the
+            // `large_enum_variant` threshold — an alloc per tool call is
+            // negligible and keeps `Slot` (one per tool_use, in a Vec) small.
             enum Slot {
                 Cancelled,
                 Ran(Box<ToolOutput>),
             }
             let mut slots: Vec<Slot> = (0..tool_uses.len()).map(|_| Slot::Cancelled).collect();
-            // Ordinals of `task` calls deferred to the parallel batch.
-            let mut task_slots: Vec<usize> = Vec::new();
+            // Ordinals of Parallel-capable calls deferred to the parallel batch.
+            let mut parallel_slots: Vec<usize> = Vec::new();
             let mut batch_cancelled = false;
 
-            // Inline leaf pass: run non-`task` tools one at a time (sequential —
-            // avoids new races on shell/file), announce each LEAF call in block
-            // order, and short-circuit on cancel (later slots stay Cancelled).
-            // `task` calls are NOT announced here — their ToolCall is emitted in
-            // the batch block below, AFTER the cancel gate, so a task gated off
-            // by a later leaf tripping cancel never dangles a ToolCall without a
+            // Inline leaf pass: run Sequential tools one at a time (avoids new
+            // races on shell/file), announce each LEAF call in block order, and
+            // short-circuit on cancel (later slots stay Cancelled). Routing is
+            // by CAPABILITY — a tool whose `concurrency()` reports Parallel is
+            // deferred to the batch below, whatever its name. Parallel calls
+            // are NOT announced here — their ToolCall is emitted in the batch
+            // block below, AFTER the cancel gate, so a call gated off by a
+            // later leaf tripping cancel never dangles a ToolCall without a
             // matching ToolResult on the UI.
             for (i, (_id, name, input)) in tool_uses.iter().enumerate() {
                 if batch_cancelled || self.cancelled() {
                     batch_cancelled = true;
                     continue; // leaves the default Slot::Cancelled
                 }
-                if name.as_str() == "task" {
-                    task_slots.push(i); // ToolCall announced + run in the batch below
+                // Unknown names land here too (find_tool → None): run_tool
+                // synthesizes the "unknown tool" error result, exactly as
+                // before the capability split.
+                let parallel = match find_tool(&self.tool_defs, name) {
+                    Some(ti) => self.tools[ti].concurrency() == ToolConcurrency::Parallel,
+                    None => false,
+                };
+                if parallel {
+                    parallel_slots.push(i); // ToolCall announced + run in the batch below
                 } else {
                     events(AgentEvent::ToolCall {
                         name: name.clone(),
@@ -968,23 +977,26 @@ impl Agent {
                 }
             }
 
-            // Parallel `task` batch: each `task` call runs on its own scoped
-            // thread (borrowing the read-only tool list + ctx, both Sync), and
-            // forwards its child events through an mpsc funnel the parent drains
-            // live — so concurrent sub-agents interleave on screen, tagged by
-            // name. Leaf tools stay sequential (above); only `task` is fanned
-            // out — it's the one worth parallelizing, and the only non-leaf
-            // `run_with_emit` impl. Cancel: gate before spawning (a cancel that
-            // hit during the inline pass, or one already set, marks the batch
-            // cancelled and skips it); in-flight children self-terminate via the
-            // shared cancel flag they inherit, returning partial/cancelled
-            // results rather than synthesised ones.
-            if !task_slots.is_empty() && !batch_cancelled && !self.cancelled() {
-                // Announce the task calls in block order NOW that the batch is
-                // committed to run — emitting them in the inline pass (before the
-                // gate) would leave a ToolCall with no matching ToolResult if a
-                // later leaf tripped cancel and gated this batch off.
-                for &i in &task_slots {
+            // Parallel batch: every call whose tool reported
+            // ToolConcurrency::Parallel runs on its own scoped thread
+            // (borrowing the read-only tool list + ctx, both Sync), forwarding
+            // its events through an mpsc funnel the parent drains live — so
+            // concurrent sub-agents interleave on screen, tagged by name.
+            // Sequential tools stay inline (above); routing is by the
+            // capability marker, NOT by name, so a third-party tool opting
+            // into Parallel gets the same fan-out the built-in `task` does.
+            // Its implementor has signed up for reentrancy + cancel polling
+            // (see ToolConcurrency::Parallel). Cancel: gate before spawning (a
+            // cancel that hit during the inline pass, or one already set,
+            // marks the batch cancelled and skips it); in-flight workers
+            // self-terminate via the shared cancel flag they inherit,
+            // returning partial/cancelled results rather than synthesised ones.
+            if !parallel_slots.is_empty() && !batch_cancelled && !self.cancelled() {
+                // Announce the parallel calls in block order NOW that the batch
+                // is committed to run — emitting them in the inline pass (before
+                // the gate) would leave a ToolCall with no matching ToolResult
+                // if a later leaf tripped cancel and gated this batch off.
+                for &i in &parallel_slots {
                     events(AgentEvent::ToolCall {
                         name: tool_uses[i].1.clone(),
                         input: tool_uses[i].2.clone(),
@@ -995,12 +1007,12 @@ impl Agent {
                 let defs = &self.tool_defs;
                 let ctx = &self.ctx;
                 std::thread::scope(|s| {
-                    // Spawn every task worker BEFORE joining any, so they run
-                    // concurrently. Each owns its input/name + a sender clone,
-                    // and only ever touches `tx` (never `events`).
+                    // Spawn every parallel worker BEFORE joining any, so they
+                    // run concurrently. Each owns its input/name + a sender
+                    // clone, and only ever touches `tx` (never `events`).
                     let mut handles: Vec<std::thread::ScopedJoinHandle<ToolOutput>> =
-                        Vec::with_capacity(task_slots.len());
-                    for &i in &task_slots {
+                        Vec::with_capacity(parallel_slots.len());
+                    for &i in &parallel_slots {
                         let name = tool_uses[i].1.clone();
                         let input = tool_uses[i].2.clone();
                         let tx = tx.clone();
@@ -1021,8 +1033,8 @@ impl Agent {
                     for (pos, h) in handles.into_iter().enumerate() {
                         let output = h
                             .join()
-                            .unwrap_or_else(|_| ToolOutput::error("task worker panicked"));
-                        slots[task_slots[pos]] = Slot::Ran(Box::new(output));
+                            .unwrap_or_else(|_| ToolOutput::error("parallel tool worker panicked"));
+                        slots[parallel_slots[pos]] = Slot::Ran(Box::new(output));
                     }
                 });
             }
@@ -1088,15 +1100,21 @@ impl Agent {
     }
 }
 
-/// Look up a tool by name and run it through `run_with_emit` (so the `task`
-/// sub-agent can stream its child events into `emit`). A missing tool or a tool
-/// Err becomes a `ToolOutput::error` rather than aborting the run — the result
-/// is still paired N:N with the tool_use that triggered it. Shared by the
-/// sequential leaf pass and the parallel `task` batch.
-///
-/// Lookup goes through `defs` (the cached ToolDefs, built in the same order as
-/// `tools`): matching on `tool.def().name` would deep-clone every probed
-/// tool's name/description/schema on EVERY call.
+/// Locate a tool by name in the cached `defs`, returning its index into the
+/// parallel `tools` vec. Shared by the inline leaf pass (capability routing
+/// needs the live tool to read `concurrency()`) and [`run_tool`] — one linear
+/// lookup, not two. Matching on `tool.def().name` instead would deep-clone
+/// every probed tool's name/description/schema on EVERY call.
+fn find_tool(defs: &[ToolDef], name: &str) -> Option<usize> {
+    defs.iter().position(|d| d.name == name)
+}
+
+/// Look up a tool by name ([`find_tool`]) and run it through `run_with_emit`
+/// (so tools with progress to stream — the `task` sub-agent — can emit into
+/// the parent run). A missing tool or a tool Err becomes a `ToolOutput::error`
+/// rather than aborting the run — the result is still paired N:N with the
+/// tool_use that triggered it. Shared by the sequential leaf pass and the
+/// parallel batch.
 fn run_tool(
     tools: &[Box<dyn Tool>],
     defs: &[ToolDef],
@@ -1105,7 +1123,7 @@ fn run_tool(
     ctx: &ToolCtx,
     emit: &mut dyn FnMut(AgentEvent),
 ) -> ToolOutput {
-    match defs.iter().position(|d| d.name == name) {
+    match find_tool(defs, name) {
         Some(i) => match tools[i].run_with_emit(input, ctx, emit) {
             Ok(o) => o,
             Err(e) => ToolOutput::error(format!("{e:#}")),

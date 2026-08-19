@@ -12,9 +12,9 @@
 //!   single `task` call just blocks its turn until the child finishes. No
 //!   workdir isolation — children share the parent's workdir (concurrent
 //!   sub-agents are expected not to write the same file).
-//! - **No recursion.** The child's tool list is the parent's whitelist with
-//!   `task` itself removed, so a sub-agent cannot spawn its own sub-agent. This
-//!   sidesteps depth bookkeeping entirely.
+//! - **No recursion.** The child's tool list is the parent's whitelist retained
+//!   by `Tool::available_to_subagent` — `task` opts out, so a sub-agent cannot
+//!   spawn its own sub-agent. This sidesteps depth bookkeeping entirely.
 //! - **Event forwarding.** The child's events stream into the parent's sink,
 //!   each wrapped as `AgentEvent::SubAgent { name, .. }` so a harness/UI can
 //!   show each sub-agent's progress and tell parallel ones apart.
@@ -30,7 +30,7 @@
 use crate::agent::{Agent, AgentEvent, RunOutcome, ToolCallRecord};
 use crate::config::Config;
 use crate::provider::{self, Block, Message, Usage};
-use crate::tools::{self, Tool, ToolCtx, ToolOutput};
+use crate::tools::{self, Tool, ToolConcurrency, ToolCtx, ToolOutput};
 use anyhow::Result;
 use serde_json::{json, Value};
 
@@ -104,6 +104,21 @@ impl Tool for SubAgent {
         }
     }
 
+    fn concurrency(&self) -> ToolConcurrency {
+        // Each `task` call is an independent child agent (own history, own
+        // turn budget) with no shared mutable state — so multiple calls in one
+        // turn may fan out on scoped threads. This marker is what routes the
+        // call into the parallel batch — nothing in the loop matches the name
+        // "task" anymore.
+        ToolConcurrency::Parallel
+    }
+
+    fn available_to_subagent(&self) -> bool {
+        // No recursion: a sub-agent cannot spawn its own sub-agent (sidesteps
+        // depth bookkeeping entirely).
+        false
+    }
+
     fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         // The agent loop always calls `run_with_emit` (so child events stream
         // into the parent). This `run` exists only to satisfy the trait; it
@@ -133,25 +148,17 @@ impl Tool for SubAgent {
         child_cfg.system_prompt = Some(SUBAGENT_SYSTEM_PROMPT.into());
         child_cfg.limits.max_turns = child_cfg.limits.max_turns.min(SUBAGENT_MAX_TURNS);
 
-        // Child tools: parent's whitelist minus `task` → no recursion. MCP
+        // Child tools: the parent's whitelist built full, then RETAINED by
+        // capability (`available_to_subagent`) rather than filtered by name —
+        // `task` and `todo` opt out via the trait (no recursion; plan tracking
+        // is the parent's job), and a third-party tool can do the same. MCP
         // servers are inherited (a sub-agent may need the same external tools)
         // by CLONING the parent's shared MCP tools — each clone Arc-shares the
         // underlying connection, so this does NOT re-spawn the MCP servers
         // (the old path called tools::mcp::build, running McpClient::start for
         // every server on every task call — a parallel task batch would spawn
         // N×(#servers) subprocesses).
-        let child_tool_names: Vec<String> = child_cfg
-            .tools
-            .iter()
-            // Drop `task` (a sub-agent cannot spawn its own sub-agent — no depth
-            // bookkeeping) and `todo` (the child is a focused short task; plan
-            // tracking is the PARENT's job, and a child's `todo` calls would
-            // never reach the parent's `result.json.plan` anyway — they'd just
-            // burn tokens). Both are filtered by name.
-            .filter(|t| !matches!(t.as_str(), "task" | "todo"))
-            .cloned()
-            .collect();
-        let mut child_tools = tools::build(&child_tool_names, &child_cfg, &self.client, &self.api_key, &self.mcp_tools)?;
+        let mut child_tools = child_tools(&child_cfg, &self.client, &self.api_key, &self.mcp_tools)?;
         child_tools.extend(self.mcp_tools.iter().cloned().map(|t| Box::new(t) as Box<dyn Tool>));
 
         let provider = provider::build(&child_cfg, &self.api_key, self.client.clone());
@@ -169,6 +176,23 @@ impl Tool for SubAgent {
         }
         Ok(run_subagent(&mut child, name, emit, ctx.max_output_chars))
     }
+}
+
+/// The sub-agent's whitelist tools: build the config's FULL tool list, then
+/// retain only the tools whose [`Tool::available_to_subagent`] says true.
+/// Capability-based, not name-based — `task` (no recursion) and `todo` (the
+/// parent owns the plan) opt out via the trait, and so can any third-party
+/// tool. The caller appends the shared MCP tools separately (they're injected
+/// at assembly, never part of the whitelist).
+fn child_tools(
+    cfg: &Config,
+    client: &reqwest::blocking::Client,
+    api_key: &str,
+    mcp_tools: &[crate::tools::mcp::McpTool],
+) -> Result<Vec<Box<dyn Tool>>> {
+    let mut out = tools::build(&cfg.tools, cfg, client, api_key, mcp_tools)?;
+    out.retain(|t| t.available_to_subagent());
+    Ok(out)
 }
 
 /// Drive a constructed child agent to completion and map its outcome to a tool
@@ -553,6 +577,25 @@ mod tests {
             .run_with_emit(&json!({"name": "x", "prompt": "   "}), &ctx, &mut emit)
             .unwrap_err();
         assert!(format!("{err:#}").contains("prompt"), "empty prompt: {err:#}");
+    }
+
+    #[test]
+    fn child_tools_retains_by_capability_not_name() {
+        // The sub-agent's tool list is the config whitelist built FULL, then
+        // retained by available_to_subagent() — `task` and `todo` (both opting
+        // out via the trait) are gone while leaf tools stay, in whitelist
+        // order. No name literal drives the filter: a third-party tool opting
+        // out is dropped the same way.
+        let mut cfg = fake_cfg();
+        cfg.tools = vec![
+            "shell".into(),
+            "todo".into(),
+            "task".into(),
+            "read_file".into(),
+        ];
+        let built = child_tools(&cfg, &reqwest::blocking::Client::new(), "k", &[]).unwrap();
+        let names: Vec<String> = built.iter().map(|t| t.def().name).collect();
+        assert_eq!(names, vec!["shell".to_string(), "read_file".to_string()]);
     }
 
     fn fake_cfg() -> Config {

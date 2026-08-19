@@ -93,6 +93,14 @@ impl Tool for Todo {
         emit(AgentEvent::TodoUpdate { todos });
         Ok(out)
     }
+
+    fn available_to_subagent(&self) -> bool {
+        // Plan tracking is the PARENT's job: a sub-agent is a focused short
+        // task, and a child's `todo` calls would never reach the parent's
+        // result.json `plan` field anyway (extract_plan reads the PARENT's
+        // tool-call log) — they'd just burn tokens.
+        false
+    }
 }
 
 impl Todo {

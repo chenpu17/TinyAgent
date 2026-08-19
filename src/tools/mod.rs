@@ -75,6 +75,35 @@ impl ToolOutput {
     }
 }
 
+/// Whether the agent loop may execute several calls of one tool CONCURRENTLY.
+///
+/// When an assistant turn contains multiple tool_use blocks, the loop splits
+/// them by this marker: `Sequential` calls run one at a time in block order
+/// (the default — safe for file/shell tools whose side effects would race),
+/// while every `Parallel` call is deferred and fanned out on its own scoped
+/// thread (the parallel batch in `agent::run_impl`). Routing is by this
+/// marker, NOT by tool name — a third-party tool opting into `Parallel` gets
+/// the same fan-out the built-in `task` tool does.
+///
+/// `#[non_exhaustive]`: variants may be added later; external `match`es must
+/// keep a wildcard arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ToolConcurrency {
+    /// Calls run one at a time, in block order. The default: correct for any
+    /// tool whose per-call side effects could race (files, shells, ...).
+    Sequential,
+    /// Multiple calls in the same turn may run concurrently, each on its own
+    /// thread. An implementation opting in TAKES ON two obligations:
+    /// - reentrancy — `run`/`run_with_emit` may be executing simultaneously on
+    ///   several threads (all on the same `&self`), so no unsynchronized
+    ///   shared mutation;
+    /// - cancel responsiveness — poll `ctx.cancel` between waits (like
+    ///   `shell` does) so Ctrl-C stops an in-flight call instead of waiting
+    ///   it out.
+    Parallel,
+}
+
 pub trait Tool: Send + Sync {
     fn def(&self) -> ToolDef;
     fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput>;
@@ -110,6 +139,27 @@ pub trait Tool: Send + Sync {
     /// frontend sets ONLY on session end. The per-turn `cancel` flag is wired
     /// separately via `ToolCtx` and never reaches this method.
     fn set_shutdown(&mut self, _shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>) {}
+
+    /// Concurrency class for multiple calls of THIS tool in one turn (see
+    /// [`ToolConcurrency`]). Default `Sequential` (the safe side); only tools
+    /// built for concurrent execution override it (the `task` sub-agent — each
+    /// call is an independent child agent). The loop reads this through the
+    /// boxed trait object, so it is a method — an associated const would not
+    /// be object-safe on `dyn Tool`.
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Sequential
+    }
+
+    /// Whether a `task` sub-agent may carry this tool in its own tool list.
+    /// Default true. Overridden false where inheritance is wrong: `task`
+    /// itself (no recursion) and `todo` (plan tracking belongs to the parent;
+    /// a child's calls would never reach the parent's `result.json.plan`
+    /// anyway). The sub-agent's list is built full, then retained by this
+    /// marker — NOT filtered by name — so a third-party tool can exclude
+    /// itself the same way.
+    fn available_to_subagent(&self) -> bool {
+        true
+    }
 }
 
 /// A tool backed by a closure — the zero-boilerplate way to add a custom tool,

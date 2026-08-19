@@ -380,12 +380,13 @@
         }
     }
 
-    /// A stand-in for the real `task` sub-agent tool, named "task" so the loop's
-    /// partition routes it to the PARALLEL batch (the whole point of commit 2).
-    /// It reads `input["label"]` to make each call's output distinguishable, emits
-    /// a name-tagged SubAgent event (so we can assert it ran), and bills usage
-    /// (so we can assert parallel cost folds into the run totals). Concurrency is
-    /// structural — we assert functional correctness, NOT timing (which would flake).
+    /// A stand-in for the real `task` sub-agent tool. It reports
+    /// `ToolConcurrency::Parallel` — THAT marker, not its name, is what routes
+    /// it to the parallel batch. It reads `input["label"]` to make each call's
+    /// output distinguishable, emits a name-tagged SubAgent event (so we can
+    /// assert it ran), and bills usage (so we can assert parallel cost folds
+    /// into the run totals). Concurrency is structural — we assert functional
+    /// correctness, NOT timing (which would flake).
     struct TaskTool;
     impl Tool for TaskTool {
         fn def(&self) -> ToolDef {
@@ -394,6 +395,9 @@
                 description: "test stand-in for the task sub-agent tool".into(),
                 schema: json!({"type": "object", "properties": {"label": {"type": "string"}}}),
             }
+        }
+        fn concurrency(&self) -> ToolConcurrency {
+            ToolConcurrency::Parallel
         }
         fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
             self.run_with_emit(input, ctx, &mut |_| {})
@@ -426,17 +430,37 @@
 
     /// Like `TaskTool` but each call sleeps, so a timing assertion can tell real
     /// parallelism (thread::scope fan-out) from a serialization regression: two
-    /// calls overlap → ~1× the sleep; serialized → ~2×. Named "task" so the loop
-    /// routes it to the parallel batch. Used by the ONE timing-aware test in the
-    /// suite — every other concurrency test asserts function only (see TaskTool).
-    struct SlowTaskTool;
-    impl Tool for SlowTaskTool {
+    /// calls overlap → ~1× the sleep; serialized → ~2×. Name, sleep length, and
+    /// concurrency class are configurable so the same stub doubles as the
+    /// built-in `task` shape (`SlowTool::task`) and as an arbitrary third-party
+    /// tool under either class (`SlowTool::custom`). Used only by the
+    /// timing-aware tests — every other concurrency test asserts function only
+    /// (see TaskTool).
+    struct SlowTool {
+        name: &'static str,
+        ms: u64,
+        concurrency: ToolConcurrency,
+    }
+    impl SlowTool {
+        /// The built-in `task` shape: named "task", 500ms, Parallel.
+        fn task() -> Self {
+            Self { name: "task", ms: 500, concurrency: ToolConcurrency::Parallel }
+        }
+        /// A third-party tool shape: arbitrary name, sleep, and class.
+        fn custom(name: &'static str, ms: u64, concurrency: ToolConcurrency) -> Self {
+            Self { name, ms, concurrency }
+        }
+    }
+    impl Tool for SlowTool {
         fn def(&self) -> ToolDef {
             ToolDef {
-                name: "task".into(),
+                name: self.name.into(),
                 description: "test stand-in that sleeps, to assert real parallelism".into(),
                 schema: json!({"type": "object", "properties": {"label": {"type": "string"}}}),
             }
+        }
+        fn concurrency(&self) -> ToolConcurrency {
+            self.concurrency
         }
         fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
             self.run_with_emit(input, ctx, &mut |_| {})
@@ -448,7 +472,7 @@
             _emit: &mut dyn FnMut(AgentEvent),
         ) -> Result<ToolOutput> {
             let label = input["label"].as_str().unwrap_or("?").to_string();
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            std::thread::sleep(std::time::Duration::from_millis(self.ms));
             Ok(ToolOutput::text(format!("slow-{label}")))
         }
     }
@@ -610,7 +634,7 @@
 
     #[test]
     fn parallel_task_calls_actually_overlap_in_wall_clock() {
-        // The ONLY timing assertion in the suite. Two `task` calls each sleep
+        // One of the suite's few timing assertions. Two `task` calls each sleep
         // 500ms; real parallelism (thread::scope fan-out) finishes in ~1×
         // (≈500ms + overhead), a serialization regression (a coarse lock around
         // run_tool, or the scope replaced by a sequential loop) in ~2×
@@ -641,7 +665,7 @@
         let mut agent = Agent::new(
             &cfg,
             Box::new(prov),
-            vec![Box::new(SlowTaskTool)],
+            vec![Box::new(SlowTool::task())],
             vec![user_text("go")],
             test_ctx(),
         );
@@ -654,6 +678,152 @@
             "two 500ms task calls took {elapsed:?} — expected parallel (~500ms); \
              a serialization regression would take ~1000ms"
         );
+    }
+
+    #[test]
+    fn third_party_parallel_tool_overlaps_by_capability_not_name() {
+        // Batch routing keys off Tool::concurrency(), NOT the name "task": a
+        // custom-named tool opting into Parallel gets the identical fan-out.
+        // Two 500ms calls of a tool named "worker" must overlap (~1×); a
+        // regression that routes by name (or serializes the batch) takes ~2×.
+        // The mirror of parallel_task_calls_actually_overlap_in_wall_clock for
+        // the capability split — together they pin both halves of the routing.
+        let cfg = cfg_with(5, 0, 0);
+        let (prov, _) = MockProvider::new(vec![
+            MockTurn::Ok(ChatResponse {
+                blocks: vec![
+                    Block::ToolUse {
+                        id: "a".into(),
+                        name: "worker".into(),
+                        input: json!({"label": "a"}),
+                    },
+                    Block::ToolUse {
+                        id: "b".into(),
+                        name: "worker".into(),
+                        input: json!({"label": "b"}),
+                    },
+                ],
+                stop_reason: "tool_use".into(),
+                usage: None,
+            }),
+            mock::resp_text("final", None),
+        ]);
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![Box::new(SlowTool::custom("worker", 500, ToolConcurrency::Parallel))],
+            vec![user_text("go")],
+            test_ctx(),
+        );
+        let start = std::time::Instant::now();
+        let o = agent.run(&mut |_| {}).unwrap();
+        let elapsed = start.elapsed();
+        // Results still pair N:N in block order, despite the custom name.
+        assert_eq!(o.tool_calls.len(), 2);
+        assert_eq!(o.tool_calls[0].output, "slow-a");
+        assert_eq!(o.tool_calls[1].output, "slow-b");
+        assert!(
+            elapsed < std::time::Duration::from_millis(900),
+            "two 500ms parallel-capable calls took {elapsed:?} — a name-based \
+             router would run them inline (~1000ms)"
+        );
+    }
+
+    #[test]
+    fn sequential_tool_calls_stay_inline_and_serialized() {
+        // The other half of the capability split: a tool reporting Sequential
+        // (the default class) must NOT be deferred to the parallel batch even
+        // with multiple calls in one turn — over-fan-out would race leaf tools
+        // on shell/file. Two 400ms calls run inline back-to-back (~2×), and
+        // results still pair N:N in block order.
+        let cfg = cfg_with(5, 0, 0);
+        let (prov, _) = MockProvider::new(vec![
+            MockTurn::Ok(ChatResponse {
+                blocks: vec![
+                    Block::ToolUse {
+                        id: "a".into(),
+                        name: "slowseq".into(),
+                        input: json!({"label": "a"}),
+                    },
+                    Block::ToolUse {
+                        id: "b".into(),
+                        name: "slowseq".into(),
+                        input: json!({"label": "b"}),
+                    },
+                ],
+                stop_reason: "tool_use".into(),
+                usage: None,
+            }),
+            mock::resp_text("final", None),
+        ]);
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![Box::new(SlowTool::custom("slowseq", 400, ToolConcurrency::Sequential))],
+            vec![user_text("go")],
+            test_ctx(),
+        );
+        let start = std::time::Instant::now();
+        let o = agent.run(&mut |_| {}).unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(o.tool_calls.len(), 2);
+        assert_eq!(o.tool_calls[0].output, "slow-a");
+        assert_eq!(o.tool_calls[1].output, "slow-b");
+        // Serialized ≥800ms in theory; 700ms leaves jitter margin while staying
+        // far above the ~400ms a (wrong) parallel batch would take.
+        assert!(
+            elapsed >= std::time::Duration::from_millis(700),
+            "two 400ms sequential calls took {elapsed:?} — expected inline \
+             serialization (~800ms), not the parallel batch (~400ms)"
+        );
+    }
+
+    #[test]
+    fn mixed_turn_assembles_results_in_block_order() {
+        // One turn mixing the two classes — [Sequential, Parallel, Sequential]:
+        // the leaves run inline first (block order), the Parallel call fans out
+        // after, yet the assembled results/records must land in ORIGINAL block
+        // order, the middle one between the two leaves.
+        let cfg = cfg_with(5, 0, 0);
+        let (prov, _) = MockProvider::new(vec![
+            MockTurn::Ok(ChatResponse {
+                blocks: vec![
+                    Block::ToolUse { id: "e1".into(), name: "first".into(), input: json!({}) },
+                    Block::ToolUse {
+                        id: "p".into(),
+                        name: "task".into(),
+                        input: json!({"label": "m"}),
+                    },
+                    Block::ToolUse { id: "e2".into(), name: "second".into(), input: json!({}) },
+                ],
+                stop_reason: "tool_use".into(),
+                usage: None,
+            }),
+            mock::resp_text("final", None),
+        ]);
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![
+                Box::new(EchoTool::new("first")),
+                Box::new(TaskTool),
+                Box::new(EchoTool::new("second")),
+            ],
+            vec![user_text("go")],
+            test_ctx(),
+        );
+        let o = agent.run(&mut |_| {}).unwrap();
+        assert_eq!(o.tool_calls.len(), 3);
+        assert_eq!(o.tool_calls[0].name, "first");
+        assert_eq!(o.tool_calls[0].output, "ok");
+        assert_eq!(o.tool_calls[1].name, "task");
+        assert_eq!(o.tool_calls[1].output, "out-m");
+        assert_eq!(o.tool_calls[2].name, "second");
+        assert_eq!(o.tool_calls[2].output, "ok");
+        // records and the history tool_result message are assembled by the same
+        // block-order loop over the slots, so ordered records pin the assembly
+        // (N:N history pairing itself is pinned by the cancel test above, which
+        // stops right at the tool_result message).
     }
 
     #[test]
