@@ -13,7 +13,7 @@
 - **批量任务**：`--batch <dir>` 并发跑一组任务片段，`--retries` 对 transient 失败指数退避重试，`--failed` 只重跑上一轮失败的任务并合并进完整报告
 - **TUI（可选 feature）**：ratatui 对话界面——内联/流式渲染（对话进终端原生 scrollback，原生选择/滚动/搜索开箱即用）、多行输入、输入历史、斜杠命令、token 状态条；默认不编译，保持 headless 版极小
 - **同步实现**（无 tokio），`reqwest::blocking` + rustls，核心 agent loop 集中在 `agent.rs`
-- **库 API**：核心逻辑同时编译为 `tiny_agent` 库（bin + lib 同包双 target），第三方 Rust 程序可直接 `tiny_agent = "..."` 驱动 agent loop、注册自定义工具（`CallbackTool`）、读回诚实 token 账单；Python（PyO3）/ TypeScript（napi-rs）绑定构建其上。`mock` feature 放出脚本化 provider 供离线 dry-run
+- **库 API**：核心逻辑同时编译为 `tiny_agent` 库（bin + lib 同包双 target），第三方 Rust 程序可直接 `tiny_agent = "..."` 驱动 agent loop、注册自定义工具（`CallbackTool`）、读回诚实 token 账单；Python（PyO3）/ TypeScript（napi-rs）绑定构建其上。`mock` feature 放出脚本化 provider 供离线 dry-run。**扩展面**：Hooks 拦截层（`set_hooks`：审批/拒绝/改写工具调用、审计、观察请求，子 agent 自动继承）+ 工具能力标记（`concurrency()` 声明并行、`available_to_subagent()` 声明子 agent 继承），均无需改核心
 
 ## 构建
 
@@ -68,6 +68,31 @@ let tool = CallbackTool::new(
 ```
 
 自定义 provider 同理：实现 `Provider` trait（或用 `build_agent_with_provider` 复用 config 的工具/MCP 装配、只换 provider）。非流式 provider 可返回 `SimpleChatResponse`（`{text, stop_reason?, usage?}`），经 `ChatResponse::from_simple` 合成单条 delta——Python/Node 绑定的自定义 provider 走的就是这条路。
+
+**Hooks 拦截层**（不改核心，观察并把关 agent 行为）：实现 `Hooks` trait（三个方法全有默认实现，只覆盖需要的），用 `Agent::set_hooks` 挂上。`before_tool` 可放行 / 拒绝（理由成为模型看到的错误结果）/ 改写执行输入；`after_tool` 事后审计；`on_chat_request` 只读观察每个主 turn 请求。`task` 子 agent 自动继承同一层——顶层拒绝在子 agent 内同样生效：
+
+```rust,no_run
+use tiny_agent::{Hooks, ToolDecision};
+use std::sync::Arc;
+
+struct Policy;
+impl Hooks for Policy {
+    fn before_tool(&self, tool: &str, _input: &serde_json::Value, _ctx: &tiny_agent::ToolCtx) -> ToolDecision {
+        if tool == "shell" {
+            ToolDecision::Deny("本部署禁用 shell".into())
+        } else {
+            ToolDecision::Allow
+        }
+    }
+}
+
+let mut agent = tiny_agent::build_agent(&cfg, Vec::new(), &client)?;
+agent.set_hooks(Arc::new(Policy));
+```
+
+注意：钩子可能被多个 worker 线程并发调用（并行 `task` 的子 agent 各跑各的），实现要自带同步（`Mutex` / 原子量）；`--resume` 重建的 agent 需要重新 `set_hooks`。完整语义（调用次序、Modify 的审计分裂等）见 [`src/hooks.rs`](src/hooks.rs) 的 trait 文档。
+
+**工具能力标记**：自定义 `Tool` 还可用两个默认方法向 loop 声明能力——`concurrency()` 返回 `ToolConcurrency::Parallel` 即获得与内置 `task` 同款的同 turn 多调用并行执行（承诺可重入 + 轮询 `ctx.cancel`）；`available_to_subagent()` 返回 `false` 即退出子 agent 继承。路由按能力、不按名字，第三方工具与内置工具一视同仁。
 
 run 结束后从 [`RunOutcome`](src/agent.rs)（或 `Agent::usage()` / `messages()` / `model()` getter）读回诚实的 token 账单与历史。`AgentEvent` 派生了 `Serialize`，绑定层可直接序列化成宿主语言的 dict / object。
 
@@ -383,6 +408,45 @@ stdio server 可注入环境变量（`env`，叠加在宿主环境之上、同�
 
 不支持的边角：Streamable HTTP 的 GET 流（server-initiated 消息）。`examples/mcp_echo.py`（stdio）与 `examples/mcp_http_echo.py`（/mcp + /sse 双端点）是零依赖测试服务器，也是协议参考实现。内置工具白名单（`tools`）与 MCP 工具互不影响。
 
+### 第一个 TinyAgent MCP 工具
+
+想给 agent 加一个自定义能力，MCP 是「不改核心、不编译」的路子——任何语言的进程只要会说 stdio 上的 JSON-RPC 2.0，就是一个工具服务器。最小例子（Python，零依赖；完整文件见 `examples/mcp_echo.py`）：
+
+```python
+import json, sys
+
+TOOLS = [{"name": "echo", "description": "Echo back the given text.",
+          "inputSchema": {"type": "object",
+                          "properties": {"text": {"type": "string"}}, "required": ["text"]}}]
+
+def reply(msg_id, result):
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": msg_id, "result": result}) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    msg = json.loads(line)
+    method, msg_id = msg.get("method"), msg.get("id")
+    if method == "initialize":
+        reply(msg_id, {"protocolVersion": "2025-03-26", "capabilities": {"tools": {}},
+                       "serverInfo": {"name": "mcp-echo", "version": "0.1.0"}})
+    elif method == "tools/list":
+        reply(msg_id, {"tools": TOOLS})
+    elif method == "tools/call":
+        args = msg.get("params", {}).get("arguments", {})
+        reply(msg_id, {"content": [{"type": "text", "text": f"echo: {args.get('text', '')}"}],
+                       "isError": False})
+```
+
+存成 `my_server.py`，config 里声明即接入——工具以 `mcp_echo_echo` 注册给模型：
+
+```json
+"mcp_servers": [
+  {"name": "echo", "command": "python3", "args": ["my_server.py"]}
+]
+```
+
+三条协议要点：`initialize` 必须回 `protocolVersion` + `serverInfo`；`tools/list` 回工具名/描述/inputSchema；`tools/call` 回 `content` 数组（`type: "text"`）+ `isError`。没有 `id` 的行是通知，忽略即可。需要凭据就加 `env` 注入（见上）。
+
 ### 联网搜索 / 抓取（Web Search MCP）
 
 给 agent 加联网能力，最省事的是挂一个搜索类 MCP server——核心不改，config 里声明即可。**推荐 DuckDuckGo MCP（`duckduckgo-mcp-server`）**：免费、无需 API key，中英文搜索质量都不错，注册两个工具：
@@ -520,8 +584,8 @@ Anthropic 原生 provider 默认开启 prompt caching：每个请求自动在 **
 TinyAgent 的定位是**可审计、可无人值守的 agent 执行单元**——一个跑完一定留下完整、诚实、机器可读账单的一次性进程。下面这些方向与该定位冲突，明确不做（把力气挡在护城河上）：
 
 - **不做 `--serve` / HTTP 服务模式**：长驻、多租户、鉴权是另一个产品，与"一次性执行单元"直接冲突。要集成的用户用 `--json`（NDJSON 流）+ exit code 包一层即可。
-- **不自建沙箱 / 命令过滤**：半吊子过滤只制造虚假安全感。隔离的官方答案是**在容器或受限用户下运行**（见上文安全说明）。
-- **不做插件系统**：工具是编译期的内置 + MCP，不引入运行时加载。
+- **不自建沙箱 / 命令过滤**：半吊子过滤只制造虚假安全感。隔离的官方答案是**在容器或受限用户下运行**（见上文安全说明）。（库 API 的 Hooks 拦截层是给嵌入方接自己的审批/策略系统用的编译期扩展点，不是内置安全边界——威胁模型见 `src/hooks.rs`。）
+- **不做插件系统**：工具是编译期的内置 + MCP，不引入运行时加载。（Hooks 与工具能力标记同理：编译期 trait 扩展，不加载动态代码。）
 - **TUI 冻结在当前完成度**：它是 dogfooding / 演示工具，对标全职迭代的 Claude Code / Codex，追平是负 ROI；之后只修 bug，不加新功能。
 
 ### 特性试金石

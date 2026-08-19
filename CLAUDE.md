@@ -88,12 +88,28 @@ cargo clippy -p tiny-agent-node
 - **子 agent（`task` 工具，`tools/subagent.rs`）**：主 agent 把聚焦子任务交给一个全新子 agent
   （独立历史 + 独立 turn 预算，`SUBAGENT_MAX_TURNS=25` 封顶），只把最终摘要作 tool 结果返回。
   **同 turn 多个 `task` 调用并行**：`agent.rs` 的工具执行分两遍——叶子工具（shell/read_file/…）
-  顺序跑，`task` 调用收集后用 `std::thread::scope` fan-out（每个一个 scoped thread），结果按原块序
-  拼回（tool_use/tool_result 仍 N:N）。子 agent 的 token 用量经 `ToolOutput::usage` 折进主 run 累计
-  （失败也照计已完成轮次）。事件实时转发，裹成 `AgentEvent::SubAgent{name}` 区分并行的几个。
-  **不可递归**：子 agent 的工具白名单滤掉 `task` 本身（无深度计数）。**在默认白名单**（`config::default_tools`
+  顺序跑，并行能力调用收集后用 `std::thread::scope` fan-out（每个一个 scoped thread），结果按原块序
+  拼回（tool_use/tool_result 仍 N:N）。**路由按能力标记、不按名字**：分流依据是
+  `Tool::concurrency() == ToolConcurrency::Parallel`（`SubAgent` 覆写为 Parallel），loop 里没有任何
+  `"task"` 字面量分流——第三方工具声明 Parallel 即获同款 fan-out（义务见「容易踩的坑」）。子 agent 的
+  token 用量经 `ToolOutput::usage` 折进主 run 累计（失败也照计已完成轮次）。事件实时转发，裹成
+  `AgentEvent::SubAgent{name}` 区分并行的几个。
+  **不可递归**：子 agent 的工具白名单是**全量构建后按 `Tool::available_to_subagent()` retain**
+  （`child_tools()`，同样不按名字滤）——`task`（防递归）与 `todo`（计划归父）在 trait 里覆写 false，
+  第三方工具可自主退出。**在默认白名单**（`config::default_tools`
   含 `task`）——headless 评测任务也会默认能 spawn 子 agent；评测若要锁定行为/成本，在 config 的 `tools`
   里显式去掉 `task`。
+- **Hooks 拦截层（`hooks.rs`，P1，第三方扩展面）**：`trait Hooks: Send + Sync` 三默认方法
+  （`before_tool` → `ToolDecision::{Allow, Deny(String), Modify(Value)}`；`after_tool` 事后审计；
+  `on_chat_request` 只读观察主 turn 请求），`Agent::set_hooks` 后置安装（仿 `set_cancel` 模式）。
+  装配（`lib.rs::assemble`）留 `ToolCtx::hooks = None`——二进制与绑定**零行为变化**，只有库用户
+  显式安装才生效。**子 agent 经 `child_ctx()` Arc-clone 继承同一层**（顶层拒绝 = 子 agent 内也拒绝，
+  无绕过）；`ToolCtx::subagent` 以名字标注子 agent 身份供钩子区分。**关键语义**：Deny 产出
+  `is_error` 结果照常入记录/配对，**不占 `Slot::Cancelled`**（那是取消专用——被拒调用要进审计账，
+  被取消的不进）；Modify 只换**执行**输入，审计链（records/`ToolCall` 事件）永远保留模型原始输入；
+  顶层闸门在父线程 spawn 前**串行**把关，子 agent 自身闸门跑在各自 worker 线程（兄弟真并发，实现方
+  须自行线程安全——`Send + Sync` 只保证传对象内存安全）；压缩摘要请求**不**透出；`--resume` 重建的
+  agent 需重挂（层活在实例上、不进 session 文件）。本期绑定不透出 hooks（backlog P3）。
 - **任务计划（`todo` 工具，`tools/todo.rs`）+ 审计 `meta` 通道**：`todo` 是无状态工具（`&self`，与 shell 同），
   **全量替换语义**（每次发完整计划，TodoWrite 式）。两条关键设计：① **`plan` 从 tool-call 日志派生，不经压缩**——
   `agent::extract_plan` 取 `records`（`Vec<ToolCallRecord>`，独立于 `self.messages`）里最后一条非 error 的 `todo` 调用的
@@ -242,9 +258,18 @@ cargo clippy -p tiny-agent-node
 - **批量任务片段只能覆盖** `task`/`system_prompt`/`model`/`max_tokens`/`limits`；安全字段
   （`provider`/`base_url`/`api_key_env`/`workdir`/`tools`/`restrict_to_workdir`/`mcp_servers`）
   禁止覆盖（`config::forbidden_batch_override`），覆盖即 `bad_task` 失败、不执行。
-  limits 内各字段单向收紧（clamp），**唯一例外是 `shell_timeout_secs` 双向可覆盖、不 clamp**
-  ——它是成本/延迟旋钮不是安全边界（评测构建常超默认 120s；想烧时间的任务用一万条快命令
-  同样能烧），真兜底是 run 级 `timeout_secs` + `max_total_tokens`。
+  limits 内各字段的覆盖策略由 `config::Clamp` 三变体逐字段声明（`merge` 是唯一权威实现）：
+  `Tighten`（小即紧，plain min）、`TightenOrInit`（0=无上限是**最松**值——片段的 0 忽略、
+  base 为 0 时采纳任何有限值、否则 min；canonical 解释只写在 Clamp 文档一处）、`Replace`
+  （**唯一例外 `shell_timeout_secs`**，双向可覆盖不 clamp——成本/延迟旋钮不是安全边界，
+  评测构建常超默认 120s；想烧时间的任务用一万条快命令同样能烧，真兜底是 run 级
+  `timeout_secs` + `max_total_tokens`）。
+- **新增 `Limits` 字段的接入流程（别加回 `..` 解构）**：`Limits` + `PartialLimits` 各加字段
+  （后者 `Option<T>` + `#[serde(default)]`）→ 在 `Config::apply` 的 limits 分支里给它选一档
+  `Clamp` 并补一行 `merge`。**`let PartialLimits { ... } = l;` 是穷尽解构、没有 `..`**——
+  新字段不分类就是编译错误，这是刻意设计（旧版手写 if-chain 曾把 0-哨兵逻辑化石复制四份、
+  悄悄丢过覆盖），禁止为"省事"加回 `..`。同理 `Config::apply` 顶层的 `PartialConfig`
+  解构也是穷尽的。
 - **批量 `--retries` 只重试 transient**（`stop_reason == "error"`），指数退避 1..32s 封顶；
   `bad_task`/`max_turns` 等确定性失败不重试。`--failed` 重跑失败子集后**合并**进完整报告
   （未重跑的历史成功项原样保留）。
@@ -291,7 +316,28 @@ cargo clippy -p tiny-agent-node
   `#[cfg(test)] #[path = "agent_tests.rs"] mod tests;` 引入，靠 `use super::*` 仍可达 agent 私有项；
   压缩纯函数的测试靠 `use crate::compress::*`）。用 `provider/mock.rs` 的脚本化 Provider 覆盖不变量：
   cancel 复位、tool_use/tool_result N:N 配对（含中途取消时合成的 `[cancelled by user]` 进 history
-  但不进 `tool_calls`）、压缩、usage 累计。动了 loop 逻辑先补/查这些测试，别只靠 mock server 跑一遍就提交。
+  但不进 `tool_calls`）、压缩、usage 累计、hooks 闸门（Deny 记录不占 Cancelled / Modify 审计留原始
+  输入 / Allow 与无 hooks 逐字段等价，`CaptureHooks` 记录精确调用序列）。动了 loop 逻辑先补/查这些
+  测试，别只靠 mock server 跑一遍就提交。
+- **Hooks 三条易错语义**（完整合同在 `hooks.rs` trait 文档，改实现前必读）：① **调用次序**——
+  同 turn 内先顺序块逐个过叶子闸门，再按并行块序过批次闸门（混合 turn 里**不是**全局块序）；
+  `after_tool` 镜像之（叶子即时、批次 join 后、被拒调用在决策时刻）。② **`--resume` 不带走 hooks**——
+  层活在 agent 实例上、不进 session 文件，重建后要重挂；文档与绑定透出（P3）时别暗示持久。
+  ③ **Modify 的审计分裂是有意的**——执行用替换输入，`ToolCallRecord.input` / `ToolCall` 事件保留
+  模型原始输入（日志答"模型要什么"、输出答"实际发生了什么"）；`todo` 被 Modify 时 `result.json.plan`
+  仍从记录的原始输入派生。另：Deny 落 `Slot::Ran(error)` **不是** `Slot::Cancelled`（被拒要进记录
+  与账单审计，取消不进）；顶层闸门串行（父线程 spawn 前），子 agent 自身闸门在 worker 线程真并发。
+- **`ToolConcurrency::Parallel` 是承诺不是路由提示**：工具覆写 `concurrency()` 即向 loop 保证
+  ① **可重入**——`run`/`run_with_emit` 可能同时在多个 scoped 线程上跑（同一个 `&self`），共享可变
+  状态必须自带同步；② **取消响应**——等待间隙轮询 `ctx.cancel`（参考 `shell`），否则 Ctrl-C 只能
+  等满本次执行。谎报 Parallel 的工具不会编译报错、只会在生产里数据竞争——核心不校验，靠这条约定。
+  同理 `available_to_subagent()` 返回 false 是退出子 agent 继承的唯一方式（没有名字黑名单）。
+- **`#[non_exhaustive]` 卫生标准**（Commit 3 定死）：只给**消费侧**枚举（第三方 `match` 的：
+  `AgentEvent`/`Block`/`ChatEvent`/`ToolConcurrency`）加；`Role`（封闭轴）、`CompressTrigger`
+  （tui.rs 有穷尽 match）与一切**生产侧**枚举（第三方构造、核心消费，如 `ToolDecision`）明确不加。
+  crate 内该属性不生效——lib 内部穷尽 match 照旧，新增变体仍会编译期点名所有内部消费点
+  （这是想要的提醒）；唯一外部消费点是 bin crate 的 `tui.rs` 主事件 match 那行 `_ => {}`
+  （编译适配，渲染不变）。新枚举拿不准归哪侧时问一句：第三方会对它 `match` 还是构造它？
 
 ## 离线 / 视觉验证
 
