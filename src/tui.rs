@@ -1101,6 +1101,11 @@ fn ui_loop(
                             _ => {} // TurnStart/Compressed/Usage/SubAgent: noisy or folded
                         }
                     }
+                    // non_exhaustive forward-compat: AgentEvent may grow new
+                    // variants (0.x SemVer window); they render nothing here
+                    // until given a dedicated arm. Compile-adaptation only —
+                    // no behavior change for the variants above.
+                    _ => {}
                 },
                 UiMsg::Error(e) => {
                     rows.push(Row::sys_error(format!("[error] {e}")));

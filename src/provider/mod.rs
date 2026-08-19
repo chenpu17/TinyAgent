@@ -21,8 +21,14 @@ use std::time::{Duration, Instant};
 
 /// One block of message content. Mirrors Anthropic's content-block model;
 /// the OpenAI provider maps these onto its own wire format.
+///
+/// `#[non_exhaustive]`: new content block types may be added; external
+/// `match`es must keep a wildcard arm (serde (de)serialization is unaffected —
+/// it goes by tag, not by exhaustive matching). See `AgentEvent`'s doc for the
+/// consumer-side-only hygiene rule.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Block {
     Text(String),
     /// base64-encoded image (media_type e.g. "image/png").
@@ -79,6 +85,11 @@ pub struct ToolDef {
 }
 
 /// Incremental events emitted while streaming a response.
+///
+/// `#[non_exhaustive]`: new stream event kinds may be added; external
+/// `match`es must keep a wildcard arm. See `AgentEvent`'s doc for the
+/// consumer-side-only hygiene rule.
+#[non_exhaustive]
 pub enum ChatEvent {
     TextDelta(String),
     /// Reasoning/thinking increment from a reasoning model (OpenAI-style

@@ -5,6 +5,26 @@
 
 ## [Unreleased]
 
+### Added
+
+- **工具能力标记**：`Tool` trait 新增两个默认方法——`concurrency()`
+  （`ToolConcurrency::Sequential | Parallel`，决定同 turn 多个调用是否并入并行批）
+  与 `available_to_subagent()`（决定是否被 `task` 子 agent 继承）。核心 loop 的并行
+  分批与子 agent 白名单自此**按能力路由、不再按 `"task"` / `"todo"` 名字硬编码**；
+  第三方工具可自主声明并行类别或退出子 agent 继承，无需改核心。内置覆盖点仅
+  `SubAgent`（Parallel + 不可继承）与 `Todo`（不可继承）。`ToolConcurrency` 自
+  门面 re-export。
+
+### Changed (Breaking)
+
+- **`AgentEvent` / `Block` / `ChatEvent` 加 `#[non_exhaustive]`**：三个消费侧枚举
+  （第三方 `match` 的对象）后续新增变体不再需要版本承诺，外部 `match` **必须保留
+  通配臂**，否则升级时编译错误。迁移一行：补 `_ => {}`。serde 序列化/反序列化不受
+  影响（按 tag 走，非穷尽匹配）。**卫生标准**：只给消费侧枚举加；`Role`
+  （user/assistant 封闭轴）与 `CompressTrigger` 明确不加，生产侧枚举（第三方构造、
+  核心消费）今后也一律不加。配套改动：`src/tui.rs` 主事件 match 增一行 `_ => {}`
+  （编译适配，对现存变体渲染逐字节不变）。
+
 ## [0.3.0] — 2026-08-16
 
 ### Added

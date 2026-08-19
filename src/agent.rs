@@ -39,7 +39,16 @@ pub enum CompressTrigger {
 /// `Serialize` is derived so the Python / TypeScript bindings can hand each event
 /// to host code as a native dict / object (via `pythonize` / napi serde interop)
 /// without a separate DTO. The recursive `SubAgent` variant serializes fine.
+///
+/// `#[non_exhaustive]`: variants will keep being added as the agent grows;
+/// external `match`es must keep a wildcard arm (add one `_ => {}` when
+/// upgrading). Inside this crate the attribute is inert — exhaustive matches
+/// stay enforced, and a new variant still pings every in-crate consumer at
+/// compile time. Hygiene note: only CONSUMER-side enums (third parties match
+/// on them) get this attribute; producer-side enums (third parties construct,
+/// the core consumes) deliberately do not.
 #[derive(Debug, serde::Serialize)]
+#[non_exhaustive]
 pub enum AgentEvent {
     TurnStart(u32),
     TextDelta(String),
