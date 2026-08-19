@@ -1214,9 +1214,11 @@ impl Agent {
 
 /// Locate a tool by name in the cached `defs`, returning its index into the
 /// parallel `tools` vec. Shared by the inline leaf pass (capability routing
-/// needs the live tool to read `concurrency()`) and [`run_tool`] — one linear
-/// lookup, not two. Matching on `tool.def().name` instead would deep-clone
-/// every probed tool's name/description/schema on EVERY call.
+/// needs the live tool to read `concurrency()`) and [`run_tool`] — one shared
+/// routine instead of two divergent lookups. (A Sequential call is thus looked
+/// up twice per invocation — once to route, once to dispatch; the tool count is
+/// tiny, so this stays negligible.) Matching on `tool.def().name` instead would
+/// deep-clone every probed tool's name/description/schema on EVERY call.
 fn find_tool(defs: &[ToolDef], name: &str) -> Option<usize> {
     defs.iter().position(|d| d.name == name)
 }

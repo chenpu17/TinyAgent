@@ -1240,6 +1240,53 @@
     }
 
     #[test]
+    fn hooks_on_chat_request_skips_the_compression_summary_call() {
+        // Companion to the per-turn test above, covering the case it can't:
+        // compression ENABLED. The run makes TWO provider calls — the internal
+        // summary request plus the main turn — but on_chat_request must fire
+        // only for the MAIN one (summary_call is deliberately not hooked; see
+        // Hooks doc, "Scope"). Without this test a future hook wired into
+        // summary_call would pass the whole suite (every other hooks test runs
+        // with compression disabled). Setup mirrors
+        // compress_folds_history_and_emits_event so compression provably runs.
+        let mut cfg = cfg_with(5, 0, 30);
+        cfg.limits.keep_recent_messages = 2;
+        let long = "x".repeat(40);
+        let initial = vec![
+            user_text(&long),
+            Message::assistant(vec![Block::Text("a1".into())]),
+            user_text("u1"),
+            Message::assistant(vec![Block::Text("a2".into())]),
+            user_text("u2"),
+        ];
+        let (prov, state) = MockProvider::new(vec![
+            mock::resp_text("SUMMARY", None), // summarize_prefix call (NOT hooked)
+            mock::resp_text("final answer", None), // the only main turn
+        ]);
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+        let hooks = Arc::new(CaptureHooks::new());
+        agent.set_hooks(hooks.clone());
+        let mut events = Vec::new();
+        agent.run(&mut |e| events.push(e)).unwrap();
+        // Compression really ran (summary call happened)...
+        assert_eq!(state.calls(), 2, "summary + main = two provider calls");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Compressed { .. })),
+            "compression must actually fire for this test to mean anything"
+        );
+        // ...but hooks saw exactly ONE chat request — the main turn's.
+        let calls = hooks.calls();
+        let chats: Vec<&str> = calls.iter().filter_map(|c| c.strip_prefix("chat:")).collect();
+        assert_eq!(
+            chats.len(),
+            1,
+            "summary_call must not surface to on_chat_request: {calls:?}"
+        );
+    }
+
+    #[test]
     fn hooks_parallel_batch_gates_all_calls_in_block_order() {
         // Three Parallel calls in one turn: before_tool fires for each, in
         // block order, before execution; after_tool fires for each after the

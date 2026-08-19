@@ -575,8 +575,8 @@ fn run_one_attempt(
         return bad(
             "bad_task",
             format!(
-                "task file must not override '{field}' (only task/system_prompt/model/max_tokens/limits \
-                 are overridable in batch mode)"
+                "task file must not override '{field}' (only task/system_prompt/model/max_tokens/\
+                 limits/reasoning_effort/inject_environment are overridable in batch mode)"
             ),
             &zero,
             0,

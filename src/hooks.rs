@@ -84,6 +84,10 @@ pub enum ToolDecision {
 /// - Unknown tool names still pass the gate; `after_tool` then reports
 ///   `executed = true` for the attempted run whose result is the "unknown
 ///   tool" error (executed = "reached the run attempt", not "tool exists").
+///   Same for a Parallel worker that PANICKED: the loop synthesizes an error
+///   output for it and reports `executed = true` — a third flavour of
+///   "attempted but failed" alongside tool Err results (only a `before_tool`
+///   Deny reports `executed = false`).
 /// - `Modify` on a `todo` call changes only what EXECUTES; the `plan` field
 ///   in `result.json` is derived from the recorded (original) input — the
 ///   plan reflects what the model wanted to send. A denied `todo` is recorded
