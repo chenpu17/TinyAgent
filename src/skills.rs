@@ -12,7 +12,7 @@
 //!    skill's `name`+`description` into the system prompt — enough for the model
 //!    to know when a skill is relevant, cheap to carry permanently.
 //! 2. The model pulls a skill's full `SKILL.md` into context on demand via the
-//!    [`crate::tools::skill::ReadSkill`] tool — arriving as a tool_result in
+//!    [`crate::tools::ReadSkill`] tool — arriving as a tool_result in
 //!    history (compressible), not a permanent system addition.
 //! 3. Sidecar files are read the same way, with a `file` argument.
 //!

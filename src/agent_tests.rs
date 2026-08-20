@@ -1333,6 +1333,63 @@
     }
 
     #[test]
+    fn hooks_mixed_turn_gates_leaves_first_then_batch_in_block_order() {
+        // A MIXED turn pins the documented non-global gate order: every
+        // Sequential call passes its gate DURING the inline pass
+        // (gate-then-run, so its after fires before any parallel gate is even
+        // consulted), then the batch's gates run serially in parallel-block
+        // order before any worker spawns, and the afters fire after the join.
+        // With block order [task(a), echo, task(b)] the echo gate+after land
+        // BEFORE both task gates — global-block-order gating (the inline pass
+        // consulting parallel calls too) would reorder them and fail this.
+        // (The pure paths are pinned by the deny/modify + parallel-batch
+        // tests; this covers the mix the doc warns about. Records still
+        // assemble in BLOCK order — pinned by
+        // mixed_turn_assembles_results_in_block_order — the GATE order is
+        // deliberately different.)
+        let cfg = cfg_with(5, 0, 0);
+        let (prov, _) = MockProvider::new(vec![
+            MockTurn::Ok(ChatResponse {
+                blocks: vec![
+                    Block::ToolUse { id: "a".into(), name: "task".into(), input: json!({"label": "a"}) },
+                    Block::ToolUse { id: "e".into(), name: "echo".into(), input: json!({}) },
+                    Block::ToolUse { id: "b".into(), name: "task".into(), input: json!({"label": "b"}) },
+                ],
+                stop_reason: "tool_use".into(),
+                usage: None,
+            }),
+            mock::resp_text("final", None),
+        ]);
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![Box::new(TaskTool), Box::new(EchoTool::new("echo"))],
+            vec![user_text("go")],
+            test_ctx(),
+        );
+        let hooks = Arc::new(CaptureHooks::new());
+        agent.set_hooks(hooks.clone());
+        let o = agent.run(&mut |_| {}).unwrap();
+        // Records assemble in block order regardless of gate order.
+        let names: Vec<&str> = o.tool_calls.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["task", "echo", "task"]);
+        let expected: Vec<String> = [
+            "chat:m",
+            "before:echo:{}:-",
+            "after:echo:true:false:ok",
+            r#"before:task:{"label":"a"}:-"#,
+            r#"before:task:{"label":"b"}:-"#,
+            "after:task:true:false:out-a",
+            "after:task:true:false:out-b",
+            "chat:m",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(hooks.calls(), expected);
+    }
+
+    #[test]
     fn run_resets_stale_cancel_so_first_turn_is_not_cancelled() {
         // A cancel left set from a previous run must be cleared at entry —
         // cancel is level-triggered and never auto-clears elsewhere, so

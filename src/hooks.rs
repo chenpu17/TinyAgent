@@ -80,6 +80,13 @@ pub enum ToolDecision {
 /// housekeeping call, and rewriting it would need summary-consistency
 /// semantics this layer doesn't define).
 ///
+/// **Threat model.** This layer is a compile-time extension point for the
+/// embedder's own approval / policy system — NOT a built-in security
+/// boundary. It gates the calls the MODEL makes; it cannot protect against
+/// a malicious tool implementation (tools and hooks are compile-time trusted
+/// code, running in-process with the same privileges). For actual isolation,
+/// run the agent in a container or under a restricted user.
+///
 /// **Edges.**
 /// - Unknown tool names still pass the gate; `after_tool` then reports
 ///   `executed = true` for the attempted run whose result is the "unknown
@@ -88,6 +95,15 @@ pub enum ToolDecision {
 ///   output for it and reports `executed = true` — a third flavour of
 ///   "attempted but failed" alongside tool Err results (only a `before_tool`
 ///   Deny reports `executed = false`).
+/// - A panicking HOOKS method is not caught anywhere: on the parent thread
+///   (top-level gate / after-notify / chat observation) it unwinds through
+///   `Agent::run` and may leave the already-saved session with an unpaired
+///   tool_use — the same consequence as a Sequential tool's `run`
+///   panicking (hooks are a new panic SOURCE at existing call sites, not a
+///   new panic CLASS). Inside a sub-agent it stays on that worker thread and
+///   the parent batch's join absorbs it as the "parallel tool worker
+///   panicked" error output. Return `Deny` on bad input rather than
+///   panicking.
 /// - `Modify` on a `todo` call changes only what EXECUTES; the `plan` field
 ///   in `result.json` is derived from the recorded (original) input — the
 ///   plan reflects what the model wanted to send. A denied `todo` is recorded
