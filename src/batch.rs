@@ -22,7 +22,9 @@ pub enum IsolateMode {
     /// `results`). Simple and universal; slow/big for large trees.
     Copy,
     /// `git worktree add --detach` per task. Near-zero copy for repos, but
-    /// requires workdir to BE the git repo root (checked up front).
+    /// requires workdir to BE the git repo root (checked up front). Checks
+    /// out HEAD: uncommitted/untracked files do NOT enter the worktree —
+    /// commit them first or use Copy.
     Git,
 }
 
@@ -360,6 +362,15 @@ pub fn run(
     {
         let p = e?.path();
         if p.extension().and_then(|s| s.to_str()) == Some("json") {
+            // A DIRECTORY named *.json (a task payload dir, an accidentally
+            // nested report dir, …) must not kill the whole batch — the old
+            // path fed it to read_to_string, whose "Is a directory" error
+            // aborted the run before ANY task started. Skip with a warning;
+            // genuinely bad task JSON is still fail-fast below.
+            if p.is_dir() {
+                eprintln!("[warn] skipping {}: is a directory", p.display());
+                continue;
+            }
             if matches!(&report_canon, Some(rc) if p.canonicalize().ok().as_ref() == Some(rc)) {
                 continue;
             }
@@ -735,7 +746,13 @@ fn run_one_attempt(
             }
             // Bill the accumulated cost (this attempt + any prior retries) so a
             // failed task reports honest token totals in report.json, not zero.
-            bad("error", msg, &acc.usage, acc.turns)
+            let mut r = bad("error", msg, &acc.usage, acc.turns);
+            // Attribute to the model that actually RAN — `bad` stamps the BASE
+            // model, which is only correct for bad_task / setup_error (they
+            // fail before apply). This run happened after `cfg.apply`, so a
+            // fragment's model override must own the bill even on failure.
+            r.model = meta.model.clone();
+            r
         }
     }
 }
@@ -1409,6 +1426,72 @@ mod tests {
             "report.json inside the batch dir must be skipped, not scanned as a task"
         );
         assert_eq!(tasks[0].name, "task-a");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn batch_skips_json_named_directories() {
+        // C4: a DIRECTORY named *.json inside the batch dir must be skipped
+        // with a warning — feeding it to read_to_string errors "Is a
+        // directory" and the old `?` aborted the whole batch before ANY task
+        // ran. Cancel-gate the run (no provider needed) and assert exactly
+        // the real task was scanned.
+        let dir = std::env::temp_dir().join(format!("ta-batch-dirjson-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("decoy.json")).unwrap();
+        std::fs::write(dir.join("decoy.json").join("payload.txt"), "x").unwrap();
+        std::fs::write(dir.join("task-a.json"), r#"{"task":"do a"}"#).unwrap();
+
+        let base: Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"MOCK_API_KEY","model":"m"}"#,
+        )
+        .unwrap();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(true)); // gate everything
+
+        let report = dir.join("report.json");
+        let code = run(&base, &dir, 1, &report, 0, false, IsolateMode::None, cancel).unwrap();
+        assert_eq!(
+            code, 130,
+            "cancel-gated batch: a *.json DIRECTORY must not abort the scan"
+        );
+
+        let tasks = read_prior_tasks(&report).unwrap();
+        assert_eq!(tasks.len(), 1, "only the real task file is scanned");
+        assert_eq!(tasks[0].name, "task-a");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn failed_task_attributes_to_fragment_model() {
+        // C2: a task fragment overriding `model` must own report.json's
+        // attribution even when the run FAILS — the error path used to stamp
+        // the BASE model, mis-attributing the bill. Point the provider at a
+        // closed port (immediate connection refused → transient Err).
+        let dir = std::env::temp_dir().join(format!("ta-batch-modelattr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("t.json"), r#"{"task":"x","model":"override-m"}"#).unwrap();
+
+        std::env::set_var("TA_BATCH_MODELATTR_KEY", "dummy");
+        let base: Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"TA_BATCH_MODELATTR_KEY","model":"base-m","base_url":"http://127.0.0.1:9"}"#,
+        )
+        .unwrap();
+        let report = dir.join("report.json");
+
+        let code = run(&base, &dir, 1, &report, 0, false, IsolateMode::None, Default::default())
+            .unwrap();
+        assert_eq!(code, 1, "connection refused → task fails, batch exit 1");
+
+        let tasks = read_prior_tasks(&report).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(
+            tasks[0].model, "override-m",
+            "failed run bills the model that actually ran"
+        );
+        assert_eq!(tasks[0].stop_reason, "error");
 
         std::fs::remove_dir_all(&dir).ok();
     }

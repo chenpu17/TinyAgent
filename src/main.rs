@@ -104,7 +104,9 @@ struct Cli {
     /// Batch mode: per-task workdir isolation. none (default) = all workers
     /// share the base workdir; copy = each task gets a throwaway copy (excludes
     /// target/node_modules/.git/results); git = each task gets a
-    /// `git worktree` (workdir must be the repo root).
+    /// `git worktree` (workdir must be the repo root). git mode checks out
+    /// HEAD: uncommitted/untracked files do NOT enter the isolate — commit
+    /// them first or use copy.
     #[arg(long, default_value = "none")]
     isolate: String,
 }
@@ -156,6 +158,17 @@ fn main() -> Result<()> {
         if cli.output.is_some() {
             bail!("--batch and --output are mutually exclusive (per-task results go to the batch results dir)");
         }
+        if cli_task.is_some() {
+            // --task sets the single run's initial message; in batch mode every
+            // task fragment carries its own task, and silently grafting --task
+            // onto the base config would change ALL of them.
+            bail!("--batch and --task are mutually exclusive (each task fragment defines its own task)");
+        }
+        if cli.session.as_path() != std::path::Path::new(".tinyagent-session.json") {
+            // Batch tasks are independent fresh runs — session persistence has
+            // nothing to resume, and per-task session files are not a thing.
+            bail!("--batch and --session are mutually exclusive (batch tasks are independent fresh runs)");
+        }
         // Wire Ctrl-C into batch the same way single-run headless does: first
         // SIGINT flips a shared flag the worker pool gates on (in-flight tasks
         // finish, no new ones start, the report still merges) → exit 130; a
@@ -191,7 +204,7 @@ fn main() -> Result<()> {
     if cli.jobs != 1 {
         bail!("--jobs only applies to --batch mode");
     }
-    if cli.report.as_path() != std::path::Path::new("report.json") {
+    if !is_default_report(&cli.report) {
         bail!("--report only applies to --batch mode");
     }
     if cli.isolate != "none" {
@@ -367,6 +380,21 @@ fn main() -> Result<()> {
     }
 }
 
+/// True when the `--report` value is the DEFAULT "report.json" — possibly via
+/// an explicit-but-equivalent spelling. `Path::eq` compares components, so
+/// `./report.json` != `report.json`; without this normalization a user
+/// passing the explicit default spelling in single-run mode was bailed as if
+/// they had chosen a custom report path. A parent beyond ""/"." IS custom.
+fn is_default_report(p: &std::path::Path) -> bool {
+    if p.file_name().and_then(|s| s.to_str()) != Some("report.json") {
+        return false;
+    }
+    matches!(
+        p.parent().and_then(|q| q.to_str()),
+        None | Some("") | Some(".")
+    )
+}
+
 /// Resolve the `--session` value into the persistence target, if any. The
 /// literal `none` is the opt-out sentinel — no session file is read or written,
 /// so a one-shot headless run doesn't litter the cwd. Anything else is treated
@@ -511,9 +539,24 @@ fn missing_config_error(default: Option<&Path>) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        choose_config_path, default_config_path_in, default_tui_mode, session_target, TuiDefault,
+        choose_config_path, default_config_path_in, default_tui_mode, is_default_report,
+        session_target, TuiDefault,
     };
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn is_default_report_accepts_equivalent_spellings() {
+        // C5: `Path::eq` compares components, so "./report.json" !=
+        // "report.json" — the old literal compare bailed single-run users who
+        // spelled the default explicitly. Equivalent spellings are no-ops;
+        // anything with a real parent/name is custom.
+        for p in ["report.json", "./report.json", ".//report.json"] {
+            assert!(is_default_report(Path::new(p)), "{p:?} is the default");
+        }
+        for p in ["out/report.json", "report.json.bak", "other.json", "sub/./report.json"] {
+            assert!(!is_default_report(Path::new(p)), "{p:?} is custom");
+        }
+    }
 
     #[test]
     fn session_target_none_disables_persistence() {

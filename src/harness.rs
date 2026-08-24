@@ -111,6 +111,10 @@ pub(crate) fn run_with_retries(
     // their side effects are in the history and on disk — so the final
     // result.json must fold these in for an honest total (P2-3).
     let mut acc = RunCost::default();
+    // Stamp the run's start BEFORE the first attempt: retries must attribute
+    // the whole run from its true beginning, not re-stamp at write time when
+    // the backoff sleeps already consumed seconds-to-minutes.
+    let started = now_rfc3339();
     let (code, outcome, error) = loop {
         let result = agent.run(&mut |ev| {
             if json {
@@ -202,8 +206,13 @@ pub(crate) fn run_with_retries(
         } else {
             "error"
         };
-        let meta = ResultMeta::from_agent(agent);
-        write_result(
+        let mut meta = ResultMeta::from_agent(agent);
+        meta.started_at = started;
+        // A failed artifact write must not swallow the run's exit code: 130 /
+        // 125 / 124 say what actually happened, and degrading them to 1 would
+        // lie about a cancelled / timed-out run to CI. Warn-and-continue,
+        // matching batch's write-failure policy.
+        if let Err(e) = write_result(
             path,
             outcome.as_ref(),
             error.as_deref(),
@@ -211,8 +220,9 @@ pub(crate) fn run_with_retries(
             none_sr,
             Some(&acc),
             &meta,
-        )?;
-        if !json {
+        ) {
+            eprintln!("[warn] failed to write {}: {e:#}", path.display());
+        } else if !json {
             eprintln!("result written to {}", path.display());
         }
     }
@@ -514,8 +524,12 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     }
     // Write + fsync the temp file before renaming, so a crash after rename
     // never exposes a zero-length file. (result.json / report.json are read
-    // by CI and must not corrupt on power loss.)
-    {
+    // by CI and must not corrupt on power loss.) A failure anywhere inside
+    // this block removes the temp file first — the rename branch below
+    // already did, but a create/write/sync failure used to leave the stray
+    // .tmp behind (visible to anything globbing the directory, e.g. the next
+    // batch round's task scan).
+    let written = (|| -> Result<()> {
         let mut f = std::fs::File::create(&tmp)
             .with_context(|| format!("cannot create {}", tmp.display()))?;
         // Preserve the existing target's permissions — above all the executable
@@ -529,6 +543,11 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
             .with_context(|| format!("cannot write {}", tmp.display()))?;
         f.sync_all()
             .with_context(|| format!("cannot sync {}", tmp.display()))?;
+        Ok(())
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp); // don't litter on failure

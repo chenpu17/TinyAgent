@@ -2874,6 +2874,71 @@
     }
 
     #[test]
+    fn single_run_started_at_reflects_first_attempt_not_write_time() {
+        // C1: result.json's started_at must stamp the run's true beginning —
+        // including the retry backoff. Pre-fix it was taken at write time, so
+        // a retried run's backoff waits were erased (started_at == finished_at
+        // at second precision). Real sleeps here (backoff 1s + 2s ≥ 2.25s
+        // even with full negative jitter) make the second-resolution
+        // timestamps differ deterministically.
+        let cfg = cfg_with(5, 0, 0);
+        let (prov, _state) = MockProvider::new(vec![
+            MockTurn::Err("503 transient".into()),
+            MockTurn::Err("503 transient".into()),
+            mock::resp_text("recovered", None),
+        ]);
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], vec![user_text("go")], test_ctx());
+        let dir = std::env::temp_dir().join(format!("ta-retry-start-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let out = dir.join("r.json");
+        let code = crate::harness::run_with_retries(&mut agent, Some(&out), false, 2, |d| {
+            std::thread::sleep(d)
+        })
+        .unwrap();
+        assert_eq!(code, 0);
+        let s = std::fs::read_to_string(&out).unwrap();
+        let field = |k: &str| {
+            s.split(&format!("\"{k}\": \""))
+                .nth(1)
+                .unwrap_or_else(|| panic!("no {k} in: {s}"))
+                .split('"')
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        let (started, finished) = (field("started_at"), field("finished_at"));
+        assert!(
+            started < finished,
+            "started_at must precede finished_at across retried runs: {started} vs {finished}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn single_run_write_failure_keeps_exit_code() {
+        // C3: a failed result.json write must not swallow the run's exit code
+        // — the old `?` degraded any non-write failure to exit 1, lying to CI
+        // about what happened (e.g. a cancelled run stopped being 130). A
+        // read-only output dir forces the write failure.
+        let cfg = cfg_with(5, 0, 0);
+        let (prov, _) = MockProvider::new(vec![MockTurn::Err("503 one".into())]);
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], vec![user_text("go")], test_ctx());
+        let dir = std::env::temp_dir().join(format!("ta-retry-ro-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let out = dir.join("r.json");
+        let r = crate::harness::run_with_retries(&mut agent, Some(&out), false, 0, |_| {});
+        // Restore FIRST so cleanup always runs, even if the assert fails.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let code = r.expect("write failure must not turn into Err");
+        assert_eq!(code, 1, "the run's own exit code is preserved");
+        assert!(!out.exists(), "nothing was written");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn single_run_folds_failed_attempt_cost_into_final_totals() {
         // P2-3 (honest cost): a retried run's result.json must bill EVERY
         // attempt, not just the last. Attempt 1 bills 100/10 streamed tokens

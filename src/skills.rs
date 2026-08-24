@@ -147,11 +147,14 @@ pub fn scan(dirs: &[PathBuf]) -> (SkillIndex, Vec<String>) {
                 ));
                 continue;
             }
-            if fm.description.len() > 1024 {
+            // Count CHARS, not bytes: the standard caps description length at
+            // 1024 characters, and a CJK description triples in UTF-8 — a
+            // byte count wrongly skipped perfectly legal skills.
+            if fm.description.chars().count() > 1024 {
                 warnings.push(format!(
                     "skill dir {} description exceeds 1024 chars ({}, standard max), skipped",
                     sub.display(),
-                    fm.description.len()
+                    fm.description.chars().count()
                 ));
                 continue;
             }
@@ -557,6 +560,29 @@ mod tests {
         assert_eq!(warns.len(), 1, "{warns:?}");
         assert!(warns[0].contains("exceeds 1024"), "{warns:?}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn scan_counts_description_in_chars_not_bytes() {
+        // C13: the 1024 cap is in CHARACTERS (agentskills.io). A CJK
+        // description triples in UTF-8 — 600 汉字 = 1800 bytes < 1024 chars,
+        // and the old byte count wrongly skipped it as oversized.
+        let dir = tmpd("cjkdesc");
+        let desc = "汉".repeat(600); // 600 chars, 1800 UTF-8 bytes
+        assert_eq!(desc.len(), 1800);
+        write_skill(&dir, "cjk", &format!("---\nname: cjk\ndescription: {desc}\n---\n"));
+        let (idx, warns) = scan(std::slice::from_ref(&dir));
+        assert!(warns.is_empty(), "{warns:?}");
+        assert_eq!(idx.entries().len(), 1);
+        // …while a true char overrun (1025 chars of 汉字) is still rejected.
+        let dir2 = tmpd("cjkdesc2");
+        let over = "汉".repeat(1025);
+        write_skill(&dir2, "cjk2", &format!("---\nname: cjk2\ndescription: {over}\n---\n"));
+        let (idx2, warns2) = scan(std::slice::from_ref(&dir2));
+        assert!(idx2.is_empty());
+        assert_eq!(warns2.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir2).ok();
     }
 
     #[test]
