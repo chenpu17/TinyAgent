@@ -241,6 +241,18 @@ impl Provider for OpenAi {
         // RECORD it so the next turn's body is already fixed. At most three
         // turns of the loop (three distinct fields); when no known fix applies
         // the 400 bails with the text.
+        //
+        // RECORD-ON-SUCCESS: fixes are persisted only after the adjusted body
+        // gets a 2xx (or the call fails transiently and records nothing). A
+        // fix is proof "the gateway rejects the FIELD", and only a subsequent
+        // success is that proof. Recording at apply time let a VALUE error
+        // poison the table: a 400 saying `max_tokens must be <= 100` matches
+        // the rename rule, the retry fails on `max_completion_tokens` with
+        // text no rule matches → bail — but the rename was already learned,
+        // so every later turn proactively sends a body the gateway rejects
+        // for the same value reason (and the 400s it triggers are of the
+        // unfixable kind).
+        let mut applied: Vec<BodyFix> = Vec::new();
         for _ in 0..3 {
             if resp.status() != reqwest::StatusCode::BAD_REQUEST {
                 break;
@@ -249,10 +261,7 @@ impl Provider for OpenAi {
             match Self::diagnose_400(&text, &body) {
                 Some(fix) => {
                     Self::apply_fix(&mut body, fix);
-                    {
-                        let mut learned = self.fixes.lock().unwrap();
-                        learned.record(fix);
-                    }
+                    applied.push(fix);
                     resp = self
                         .post(&body, req.per_request_timeout)
                         .context("retry after adjusting request for 400 failed")?;
@@ -265,6 +274,14 @@ impl Provider for OpenAi {
             let status = resp.status();
             let text = resp.text().unwrap_or_default();
             bail!("OpenAI-compatible API error {status}: {text}");
+        }
+        // The gateway accepted the (possibly adjusted) body — now the applied
+        // fixes are proven to be about field acceptance, persist them.
+        if !applied.is_empty() {
+            let mut learned = self.fixes.lock().unwrap();
+            for fix in applied {
+                learned.record(fix);
+            }
         }
 
         let mut sse = CancellableSse::new(resp, req.cancel.clone(), self.idle);
@@ -1092,6 +1109,123 @@ mod tests {
         assert!(
             received[2].get("max_tokens").is_none(),
             "turn 2 body should NOT carry the old max_tokens key"
+        );
+    }
+
+    /// A gateway that rejects the max_tokens VALUE (not the field name): both
+    /// `max_tokens` and `max_completion_tokens` 400 with "must be ≤ 100". The
+    /// rename fix fires on the first 400 (its text contains "max_tokens") but
+    /// cannot succeed; the retry's 400 names `max_completion_tokens`, which no
+    /// rule matches → bail. Under record-at-apply-time this failure STILL
+    /// poisoned the learned-fix table, so every later turn proactively sent
+    /// the renamed field. Record-on-success must learn nothing here.
+    fn value_error_400_mock() -> (String, Arc<Mutex<Vec<Value>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let bodies: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let bodies_c = bodies.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = match stream {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let body = read_http_body(&stream);
+                if let Ok(v) = serde_json::from_str::<Value>(&body) {
+                    bodies_c.lock().unwrap().push(v);
+                }
+                // Order matters: check the RENAMED key first. "Invalid
+                // max_completion_tokens: …" names the new field only, so the
+                // retried request's 400 matches no diagnose_400 rule. BOTH
+                // keys are value errors — the 400 fires either way.
+                let (status, ct, payload): (&str, &str, &str) =
+                    if body.contains("\"max_completion_tokens\"") {
+                        (
+                            "400 Bad Request",
+                            "application/json",
+                            r#"{"error":{"message":"Invalid max_completion_tokens: must be less than or equal to 100","type":"invalid_request_error"}}"#,
+                        )
+                    } else if body.contains("\"max_tokens\"") {
+                        (
+                            "400 Bad Request",
+                            "application/json",
+                            r#"{"error":{"message":"Invalid max_tokens: must be less than or equal to 100","type":"invalid_request_error"}}"#,
+                        )
+                    } else {
+                        // Unreachable in this test (every request carries one
+                        // of the two keys) — kept so a body-shape surprise
+                        // still yields a parseable success instead of hanging.
+                        (
+                            "200 OK",
+                            "text/event-stream",
+                            concat!(
+                                "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"}}]}\n\n",
+                                "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n",
+                                "data: [DONE]\n\n",
+                            ),
+                        )
+                    };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: {ct}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    payload.len(),
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(payload.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (url, bodies)
+    }
+
+    #[test]
+    fn value_error_400_does_not_poison_the_learned_fix() {
+        let (url, bodies) = value_error_400_mock();
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("reqwest client");
+        let provider = OpenAi::new(
+            client,
+            url,
+            "k",
+            std::time::Duration::from_secs(30),
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        fn mk_req<'a>(m: &'a [Message], cancel: &Arc<AtomicBool>) -> ChatRequest<'a> {
+            ChatRequest {
+                system: None,
+                messages: m,
+                tools: &[],
+                model: "m",
+                max_tokens: 100,
+                per_request_timeout: Some(std::time::Duration::from_secs(10)),
+                cancel: cancel.clone(),
+                cache: true,
+                reasoning_effort: None,
+            }
+        }
+
+        // Turn 1: 400 on max_tokens (value error) → rename fires → retry 400s
+        // on max_completion_tokens → no rule → honest Err.
+        let m1 = vec![Message::user(vec![Block::Text("turn one".into())])];
+        let r1 = provider.chat(&mk_req(&m1, &cancel), &mut |_| {});
+        assert!(r1.is_err(), "unfixable value 400 must fail the turn");
+
+        // Turn 2: nothing was learned — the first request must STILL carry the
+        // original `max_tokens` field (pre-fix it was proactively renamed).
+        let m2 = vec![Message::user(vec![Block::Text("turn two".into())])];
+        let _ = provider.chat(&mk_req(&m2, &cancel), &mut |_| {});
+        let received = bodies.lock().unwrap().clone();
+        // Turn 1: 400 + retry-400; turn 2: 400 + retry-400 (it fails the same
+        // way — the point is it fails with the ORIGINAL body, not a poisoned
+        // one).
+        assert_eq!(received.len(), 4, "saw {} requests", received.len());
+        assert!(received[0].get("max_tokens").is_some());
+        assert!(received[1].get("max_completion_tokens").is_some());
+        assert!(
+            received[2].get("max_tokens").is_some(),
+            "turn 2 must start from the un-poisoned body (no proactive rename)"
         );
     }
 }
