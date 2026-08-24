@@ -1,3 +1,4 @@
+use super::file::MAX_LIST_ENTRIES;
 use super::{confined_to, truncate, Tool, ToolCtx, ToolOutput};
 use crate::provider::ToolDef;
 use crate::skills::SkillIndex;
@@ -190,13 +191,23 @@ impl Tool for ListSkill {
 /// Recursively list files under `root` as paths relative to `root`, up to
 /// `max_depth` levels deep. Hidden entries (leading `.`) are skipped. Uses
 /// `file_type` (which does NOT follow symlinks) to decide whether to descend,
-/// so a symlinked directory is reported as an entry but not walked.
+/// so a symlinked directory is reported as an entry but not walked. Each
+/// directory enumerates at most [`MAX_LIST_ENTRIES`] entries (matching
+/// list_dir): a runaway generated dir can't balloon the listing past the
+/// truncation budget — instead the directory gets an explicit truncation
+/// marker so the model KNOWS the listing is partial.
 fn walk_skill(root: &Path, cur: &Path, depth: usize, max_depth: usize, out: &mut Vec<String>) {
     let rd = match std::fs::read_dir(cur) {
         Ok(r) => r,
         Err(_) => return,
     };
+    let mut seen = 0usize;
     for e in rd.flatten() {
+        seen += 1;
+        if seen > MAX_LIST_ENTRIES {
+            out.push("... [directory listing truncated]".into());
+            break;
+        }
         if e.file_name().to_string_lossy().starts_with('.') {
             continue; // skip hidden
         }
@@ -217,11 +228,13 @@ fn walk_skill(root: &Path, cur: &Path, depth: usize, max_depth: usize, out: &mut
 }
 
 /// A safe relative path inside the skill directory: non-empty, no backslash,
-/// not absolute (no leading `/`), and no empty/`.`/`..` component. Allows `/`
-/// as a subdirectory separator (e.g. `scripts/foo.sh`). This is the syntactic
-/// first layer of confinement; `confined_to` is the canonicalize-based second.
+/// no `:` (Windows drive prefix / NTFS alternate data stream — and legal
+/// skill resource names never carry one), not absolute (no leading `/`), and
+/// no empty/`.`/`..` component. Allows `/` as a subdirectory separator
+/// (e.g. `scripts/foo.sh`). This is the syntactic first layer of confinement;
+/// `confined_to` is the canonicalize-based second.
 fn safe_relative_path(s: &str) -> bool {
-    if s.is_empty() || s.starts_with('/') || s.contains('\\') {
+    if s.is_empty() || s.starts_with('/') || s.contains('\\') || s.contains(':') {
         return false;
     }
     for comp in s.split('/') {
@@ -285,6 +298,11 @@ mod tests {
         assert!(!safe_relative_path("a/."));
         assert!(!safe_relative_path("."));
         assert!(!safe_relative_path(".."));
+        // `:` is rejected unconditionally: Windows drive prefix, NTFS
+        // alternate data stream. Legal skill resource names never carry one.
+        assert!(!safe_relative_path("C:foo"));
+        assert!(!safe_relative_path("C:/foo"));
+        assert!(!safe_relative_path("file:stream"));
     }
 
     #[test]
@@ -442,6 +460,31 @@ mod tests {
             .unwrap();
         assert!(out.is_error, "{}", out.content);
         assert!(out.content.contains("unknown skill"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn list_skill_truncates_runaway_directories() {
+        // C12: a per-directory cap (500, matching list_dir) with an explicit
+        // marker — a generated directory with thousands of entries must not
+        // balloon the listing past the output budget silently; the model has
+        // to KNOW the listing is partial.
+        let dir = std::env::temp_dir().join(format!("ta-rs-cap-{}", std::process::id()));
+        let index = index_in(&dir, &["gen"]);
+        let sub = dir.join("gen").join("out");
+        fs::create_dir_all(&sub).unwrap();
+        for i in 0..600 {
+            fs::write(sub.join(format!("f{i:03}.txt")), "x").unwrap();
+        }
+        let out = ListSkill::new(index)
+            .run(&json!({"skill": "gen"}), &ctx(&dir))
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(
+            out.content.contains("[directory listing truncated]"),
+            "marker missing: {}…",
+            &out.content[..out.content.len().min(200)]
+        );
         fs::remove_dir_all(&dir).ok();
     }
 

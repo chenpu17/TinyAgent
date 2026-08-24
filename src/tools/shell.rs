@@ -97,24 +97,32 @@ impl Tool for Shell {
             .then(|| Instant::now() + Duration::from_secs(ctx.shell_timeout_secs));
         let mut cancelled = false;
         let status = loop {
-            // Honor an interactive cancel (Ctrl-C in the TUI) between polls,
-            // killing the whole process group the same way a timeout does.
-            if let Some(c) = &ctx.cancel {
-                if c.load(std::sync::atomic::Ordering::Relaxed) {
-                    cancelled = true;
-                    kill_process_group(&mut child);
-                    let _ = child.wait();
-                    break None;
-                }
-            }
+            // Check exit FIRST (C10): a command that finished within the same
+            // 50ms poll slice as a cancel must report its REAL exit code and
+            // output — the cancel aimed at a command that already exited
+            // would otherwise mislabel a successful run as cancelled. Only a
+            // still-running child is cancellable.
             match child.try_wait() {
                 Ok(Some(s)) => break Some(s),
-                Ok(None) if deadline.is_some_and(|d| Instant::now() >= d) => {
-                    kill_process_group(&mut child);
-                    let _ = child.wait();
-                    break None;
+                Ok(None) => {
+                    // Honor an interactive cancel (Ctrl-C in the TUI) between
+                    // polls, killing the whole process group the same way a
+                    // timeout does.
+                    if let Some(c) = &ctx.cancel {
+                        if c.load(std::sync::atomic::Ordering::Relaxed) {
+                            cancelled = true;
+                            kill_process_group(&mut child);
+                            let _ = child.wait();
+                            break None;
+                        }
+                    }
+                    if deadline.is_some_and(|d| Instant::now() >= d) {
+                        kill_process_group(&mut child);
+                        let _ = child.wait();
+                        break None;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
                 }
-                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
                 Err(e) => {
                     kill_process_group(&mut child);
                     let _ = child.wait();
@@ -126,7 +134,11 @@ impl Tool for Shell {
         // Collect the readers, reclaiming leftover background processes that
         // hold the pipes open past the child's exit (collect_output): the
         // pre-fix unconditional join could block FOREVER on this path.
-        let c = collect_output(&rx, &mut child, ctx);
+        // `killed` = the poll loop already killed the process group (timeout
+        // / cancel); collect_output must not killpg AGAIN on an already-reaped
+        // pid (pid reuse could hit an unrelated new process group).
+        let killed = status.is_none();
+        let c = collect_output(&rx, &mut child, ctx, killed);
         // Join only completed readers — a leaked one is still blocked in
         // read(); dropping its handle detaches it (it exits at process exit).
         if !c.leaked {
@@ -286,16 +298,25 @@ struct Collected {
 ///    joining (two threads stay blocked in `read()` until process exit)
 ///    rather than hang the turn. Their bytes are lost.
 ///
-/// Theoretical, accepted: on the normal-exit path the child is already
-/// reaped when the group kill runs, so its pid could in principle have been
-/// reused as a new process-group id. Cycling the whole pid space (macOS ~99k,
-/// Linux ~4M) inside a 2s grace is not a real scenario; the timeout path
-/// kills before reaping and has no such window. (Windows Job Objects would
-/// close the phase-3 gap there; backlog.)
+/// Theoretical, accepted: the ONE remaining killpg-after-reap is the
+/// normal-exit reclaim (phase 2 on a self-exited child) — by then its pid
+/// could in principle have been reused as a new process-group id, but cycling
+/// the whole pid space (macOS ~99k, Linux ~4M) inside a 2s grace is not a
+/// real scenario. The timeout/cancel path passes `already_killed`, so its
+/// phase 2 never killpg's the already-reaped child at all (the earlier claim
+/// that this path "has no such window" was wrong — the poll loop reaps via
+/// `child.wait()` right after killing). (Windows Job Objects would close the
+/// phase-3 gap there; backlog.)
 fn collect_output(
     rx: &std::sync::mpsc::Receiver<ReaderDone>,
     child: &mut std::process::Child,
     ctx: &ToolCtx,
+    // True when the poll loop already killed the process group and reaped
+    // the child (timeout / cancel). Phase 2 then skips its own killpg —
+    // killing a REAPED pid could hit an unrelated process group that the OS
+    // handed the reused pid — and only waits out another grace for the EOF
+    // the first kill already forced.
+    already_killed: bool,
 ) -> Collected {
     // Phase 1: bounded wait for natural EOF. On the killed path (timeout /
     // cancel) the poll loop's killpg already forced EOF, so this returns
@@ -316,11 +337,15 @@ fn collect_output(
     });
 
     // Phase 2: the pipe is still open — someone in the child's group is
-    // holding a write end. Kill the group to force EOF.
+    // holding a write end. On a normal exit, kill the group to force EOF;
+    // when the poll loop already killed (child reaped), skip the second
+    // killpg (pid-reuse window) and only wait out another grace.
     let mut reclaimed = false;
     if out.is_none() || err.is_none() {
-        kill_process_group(child);
-        reclaimed = true;
+        if !already_killed {
+            kill_process_group(child);
+            reclaimed = true;
+        }
         let (o, e) = wait_readers(rx, Instant::now() + PIPE_GRACE, || false);
         out = out.or(o);
         err = err.or(e);

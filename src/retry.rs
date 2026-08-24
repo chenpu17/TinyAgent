@@ -66,19 +66,42 @@ fn backoff_with(attempt: usize, jitter: f64) -> Duration {
 }
 
 /// Dependency-free jitter source in 0.0..1.0. The low nanos of the time since
-/// the first backoff call are unpredictable enough to decorrelate retries —
-/// this is not a security context, just anti-lockstep spread.
+/// the first backoff call, XOR-mixed with a per-call counter, spread
+/// concurrent retries apart (see the C9 note inside).
 fn jitter_seed() -> f64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::OnceLock;
     static T0: OnceLock<Instant> = OnceLock::new();
+    static CALLS: AtomicU64 = AtomicU64::new(0);
     let t0 = *T0.get_or_init(Instant::now);
-    let nanos = t0.elapsed().subsec_nanos();
-    (nanos % 1_000_000) as f64 / 1_000_000.0
+    let call = CALLS.fetch_add(1, Ordering::Relaxed);
+    let nanos = t0.elapsed().subsec_nanos() as u64;
+    // C9: subsec_nanos is quantized by the OS scheduler (often 1-4ms ticks),
+    // so concurrent workers failing together on the same overload event can
+    // read near-identical nanos and re-converge on one jitter value — exactly
+    // the lockstep jitter exists to break. XOR-mixing the call counter
+    // (Knuth multiplicative hash, wrapping_mul for the low bits) spreads
+    // them. Not a security context, just anti-lockstep spread.
+    let mixed = nanos ^ call.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    (mixed % 1_000_000) as f64 / 1_000_000.0
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jitter_seed_varies_across_rapid_calls() {
+        // C9: scheduler-quantized subsec_nanos made back-to-back calls
+        // (concurrent workers failing on the same overload event) read
+        // identical seeds — the exact lockstep jitter exists to break. The
+        // call-counter mix must vary them.
+        let seeds: Vec<f64> = (0..8).map(|_| jitter_seed()).collect();
+        assert!(
+            seeds.iter().any(|s| (s - seeds[0]).abs() > f64::EPSILON),
+            "8 rapid jitter_seed calls produced identical values: {seeds:?}"
+        );
+    }
 
     #[test]
     fn backoff_grows_then_caps() {

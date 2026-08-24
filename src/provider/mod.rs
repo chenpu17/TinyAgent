@@ -304,23 +304,50 @@ impl<R: Read> SseReader<R> {
         }
     }
 
-    /// Returns the next `data:` payload, or `Ok(None)` at clean end of stream.
-    /// A read error surfaces as `Err` (NOT `Ok(None)`) so a mid-stream failure
-    /// — connection reset, truncated body — isn't indistinguishable from a
-    /// clean EOF (which would make the caller assemble a truncated "successful"
-    /// response). The `SseSource` impl maps this to `StreamAbort::StreamError`.
+    /// Returns the next complete event's `data` payload — multiple `data:`
+    /// lines joined with `\n` (per the SSE spec), dispatched on the blank
+    /// event boundary — or `Ok(None)` at clean end of stream. A read error
+    /// surfaces as `Err` (NOT `Ok(None)`) so a mid-stream failure —
+    /// connection reset, truncated body — isn't indistinguishable from a
+    /// clean EOF (which would make the caller assemble a truncated
+    /// "successful" response). The `SseSource` impl maps this to
+    /// `StreamAbort::StreamError`.
     pub fn next_data(&mut self) -> std::io::Result<Option<String>> {
         let mut line = String::new();
+        // C20: the old reader returned on the FIRST `data:` line, so a
+        // gateway legally splitting one JSON payload across several `data:`
+        // lines delivered truncated, unparseable fragments. Accumulate per
+        // spec: consecutive data lines join with \n, the event dispatches on
+        // the blank line, and EOF flushes a pending buffer (a stream ending
+        // right after `data: x` with no trailing blank line still yields x).
+        let mut data_lines: Vec<String> = Vec::new();
         loop {
             line.clear();
             match self.reader.read_line(&mut line) {
-                Ok(0) => return Ok(None),
+                Ok(0) => {
+                    if data_lines.is_empty() {
+                        return Ok(None);
+                    }
+                    return Ok(Some(data_lines.join("\n")));
+                }
                 Ok(_) => {
                     let trimmed = line.trim_end_matches(['\r', '\n']);
                     if let Some(data) = trimmed.strip_prefix("data:") {
-                        return Ok(Some(data.trim_start().to_string()));
+                        // Spec: strip at most ONE leading space (the optional
+                        // separator after the colon), not all whitespace —
+                        // the payload owns any further indentation.
+                        let payload = data.strip_prefix(' ').unwrap_or(data);
+                        data_lines.push(payload.to_string());
+                    } else if trimmed.is_empty() {
+                        // Blank line = event boundary. Only a non-empty
+                        // buffer dispatches (the blank line AFTER a
+                        // dispatched event — the usual `\n\n` — is a no-op).
+                        if !data_lines.is_empty() {
+                            return Ok(Some(data_lines.join("\n")));
+                        }
                     }
-                    // skip event:, id:, comments and blank lines
+                    // event:, id:, comment (`: …`) and unknown fields are
+                    // ignored.
                 }
                 Err(e) => return Err(e),
             }
@@ -459,12 +486,52 @@ mod tests {
 
     #[test]
     fn sse_reader_skips_non_data_lines() {
-        let raw = b"event: message_start\ndata: {\"a\":1}\n\ndata:{\"b\":2}\n: keep-alive\ndata: [DONE]\n";
+        // Non-data lines (event:, comments, blanks) never contribute payload;
+        // each event here is blank-line-terminated. A comment BETWEEN two
+        // data lines does not split them — that case is covered by
+        // sse_reader_joins_multiline_data_per_spec.
+        let raw = b"event: message_start\ndata: {\"a\":1}\n\ndata:{\"b\":2}\n: keep-alive\n\ndata: [DONE]\n\n";
         let mut r = SseReader::new(&raw[..]);
         assert_eq!(r.next_data().unwrap().as_deref(), Some("{\"a\":1}"));
         assert_eq!(r.next_data().unwrap().as_deref(), Some("{\"b\":2}"));
         assert_eq!(r.next_data().unwrap().as_deref(), Some("[DONE]"));
         assert_eq!(r.next_data().unwrap(), None); // clean EOF
+    }
+
+    #[test]
+    fn sse_reader_joins_multiline_data_per_spec() {
+        // C20: consecutive `data:` lines form ONE event, joined with \n per
+        // the SSE spec — a gateway legally splitting a JSON payload across
+        // lines used to deliver a truncated fragment (the old reader returned
+        // on the first data: line).
+        let raw = b"data: {\"a\":\ndata: 1}\n\ndata: [DONE]\n\n";
+        let mut r = SseReader::new(&raw[..]);
+        assert_eq!(r.next_data().unwrap().as_deref(), Some("{\"a\":\n1}"));
+        assert_eq!(r.next_data().unwrap().as_deref(), Some("[DONE]"));
+        assert_eq!(r.next_data().unwrap(), None);
+    }
+
+    #[test]
+    fn sse_reader_flushes_pending_event_at_eof() {
+        // A stream ending right after a data: line (no trailing blank) still
+        // yields the buffered event at EOF.
+        let raw = b"data: tail";
+        let mut r = SseReader::new(&raw[..]);
+        assert_eq!(r.next_data().unwrap().as_deref(), Some("tail"));
+        assert_eq!(r.next_data().unwrap(), None);
+    }
+
+    #[test]
+    fn sse_reader_strips_at_most_one_leading_space() {
+        // Spec: exactly one optional space after the colon is the separator;
+        // the payload owns any further indentation (a tab is payload, not
+        // separator — the old trim_start() ate it).
+        let raw = b"data:no-space\ndata:  two\ndata:\t tab\n\n";
+        let mut r = SseReader::new(&raw[..]);
+        assert_eq!(
+            r.next_data().unwrap().as_deref(),
+            Some("no-space\n two\n\t tab")
+        );
     }
 
     #[test]

@@ -4,7 +4,10 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::io::Read;
 
-const MAX_LIST_ENTRIES: usize = 500;
+/// Per-directory entry cap for listings (list_dir and list_skill) — a
+/// runaway generated directory must not balloon the listing past the output
+/// budget; instead the listing gets an explicit truncation marker.
+pub(crate) const MAX_LIST_ENTRIES: usize = 500;
 /// edit_file reads the whole file into memory (replace semantics), unlike
 /// read_file which streams. Refuse a file beyond this cap rather than OOM on
 /// a multi-GB file (e.g. a log in the workdir). Module-level so a test can
@@ -50,7 +53,7 @@ impl Tool for ReadFile {
         // read". 4× the char cap + slack mirrors the shell tool's byte budget:
         // ample for the output window, and no single line can exceed it.
         let max_bytes = (ctx.max_output_chars.saturating_mul(4)).saturating_add(1024) as u64;
-        let reader = reader.take(max_bytes);
+        let mut reader = reader.take(max_bytes);
 
         let offset = input["offset"].as_u64().unwrap_or(1).max(1) as usize;
         let limit = input["limit"].as_u64().map(|n| n as usize);
@@ -58,7 +61,29 @@ impl Tool for ReadFile {
         use std::io::BufRead;
         let mut out = String::new();
         let mut lines_seen = 0usize;
-        for (i, line) in reader.lines().enumerate() {
+        // Does the byte cap actually bite? Computed once: the manual line
+        // loop below uses it to deliver the valid prefix of a fragment the
+        // cap split mid-multi-byte-char (BufRead::lines() turned that into a
+        // hard "invalid UTF-8" error for ANY CJK file larger than the cap).
+        let byte_capped = std::fs::metadata(&full).map(|m| m.len() > max_bytes).unwrap_or(false);
+        // C14: the output budget is tracked in CHARS (matching
+        // max_output_chars and truncate()). `out.len()` is bytes, so CJK
+        // content hit the budget at ~⅓ of the configured chars and truncated
+        // early. `formatted` includes the line number + tab prefix, all
+        // single-byte-ish overhead — counting the whole formatted line keeps
+        // the accounting simple and the cap conservative.
+        let mut chars_out = 0usize;
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf) {
+                Ok(0) => break, // clean EOF
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(e).with_context(|| format!("cannot read {}", full.display()))
+                }
+            }
+            let i = lines_seen; // 0-based line index, as the old enumerate() gave
             lines_seen += 1;
             if i < offset - 1 {
                 continue;
@@ -69,30 +94,53 @@ impl Tool for ReadFile {
                     break;
                 }
             }
-            let line = line.with_context(|| format!("cannot read {}", full.display()))?;
+            let mut line = match std::str::from_utf8(&buf) {
+                Ok(s) => s.trim_end_matches(['\r', '\n']).to_string(),
+                // The cap split a multi-byte char: deliver the valid prefix
+                // (valid_up_to is a char boundary by definition) instead of
+                // failing the read.
+                Err(e) if byte_capped => String::from_utf8_lossy(&buf[..e.valid_up_to()])
+                    .trim_end_matches(['\r', '\n'])
+                    .to_string(),
+                // Strict UTF-8 for a genuinely invalid file under the cap is
+                // a real error — not silent lossy replacement.
+                Err(_) => {
+                    return Err(anyhow::anyhow!(
+                        "cannot read {}: file is not valid UTF-8",
+                        full.display()
+                    ))
+                }
+            };
             // Cap a pathological single line BEFORE formatting+pushing: a
             // multi-MB line would otherwise be allocated into `out` in full
             // (far past max_output_chars) only for the truncation below to
-            // throw it away. Cheap byte-length gate; char-boundary-safe cap.
-            let remaining = ctx.max_output_chars.saturating_sub(out.len());
-            if line.len() > remaining {
-                let mut capped = line;
-                truncate(&mut capped, remaining);
-                out.push_str(&format!("{:>6}\t{}\n", i + 1, capped));
-            } else {
-                out.push_str(&format!("{:>6}\t{}\n", i + 1, line));
+            // throw it away. Char-based gate; truncate() is char-boundary-safe.
+            let remaining = ctx.max_output_chars.saturating_sub(chars_out);
+            if line.chars().count() > remaining {
+                truncate(&mut line, remaining);
             }
-            if out.len() >= ctx.max_output_chars {
+            let formatted = format!("{:>6}\t{}\n", i + 1, line);
+            chars_out += formatted.chars().count();
+            out.push_str(&formatted);
+            if chars_out >= ctx.max_output_chars {
                 truncate(&mut out, ctx.max_output_chars);
                 break;
             }
         }
+        // C15: `lines_seen` only counts what the byte-capped reader yielded —
+        // for a file truncated by that cap it UNDERREPORTS the total, and the
+        // "file has N lines" note lied about the file. Say "lines read"
+        // instead when the cap bit.
         if out.is_empty() {
             // Distinguish a truly empty file from an offset past EOF. The
             // latter used to read as "[empty file]", which misleads the
             // model into thinking the file has no content.
             if lines_seen == 0 {
                 out.push_str("[empty file]");
+            } else if byte_capped {
+                out.push_str(&format!(
+                    "... [offset {offset} beyond the {lines_seen} lines read (file was truncated)]\n"
+                ));
             } else {
                 out.push_str(&format!(
                     "... [offset {offset} beyond EOF; file has {lines_seen} lines]\n"
@@ -379,6 +427,26 @@ mod tests {
             out.content.len() < 2000,
             "a pathological line must be capped, got {} bytes",
             out.content.len()
+        );
+        assert!(out.content.contains("truncated"), "got: {}", out.content);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_file_char_budget_counts_chars_not_bytes() {
+        // C14: the output budget is in CHARS. CJK content (3 bytes/char) used
+        // to hit the byte-based budget at ~⅓ of the configured chars —
+        // 5000 汉字 with max 1000 must deliver ~1000 chars, not ~333.
+        let dir = std::env::temp_dir().join(format!("ta-cjk-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("cjk.txt"), "中".repeat(5000)).unwrap();
+        let out = ReadFile
+            .run(&json!({"path": "cjk.txt"}), &ctx_in(&dir))
+            .unwrap();
+        let zh = out.content.chars().filter(|c| *c == '中').count();
+        assert!(
+            zh >= 950,
+            "expected ~1000 chars of content under a 1000-char budget, got {zh}"
         );
         assert!(out.content.contains("truncated"), "got: {}", out.content);
         fs::remove_dir_all(&dir).ok();

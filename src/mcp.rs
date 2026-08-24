@@ -100,22 +100,22 @@ impl McpClient {
                 McpTransport::Http => Self::handshake(HttpTransport::new(url, cfg)?),
                 McpTransport::Sse => Self::handshake(SseTransport::connect(url, cfg)?),
                 McpTransport::Auto => {
-                    if probe_http(url, cfg)? {
-                        // Probe says Streamable HTTP, but a 200 from a legacy
-                        // SSE server can still fool it; fall back to SSE if
-                        // the HTTP handshake then fails.
-                        match Self::handshake(HttpTransport::new(url, cfg)?) {
-                            ok @ Ok(_) => ok,
-                            Err(e) => {
-                                eprintln!(
-                                    "[warn] MCP '{}': Streamable HTTP handshake failed ({e:#}); falling back to legacy SSE",
-                                    cfg.name
-                                );
-                                Self::handshake(SseTransport::connect(url, cfg)?)
-                            }
+                    // Try Streamable HTTP via a FULL handshake — a legacy SSE
+                    // server 404/405s (or streams nothing usable for) the
+                    // POST initialize, failing fast; that failure IS the
+                    // probe. No separate probe request, so a strict
+                    // Streamable server sees exactly ONE initialize (the old
+                    // probe sent a second one). Fall back to legacy SSE on
+                    // any HTTP handshake failure.
+                    match Self::handshake(HttpTransport::new(url, cfg)?) {
+                        ok @ Ok(_) => ok,
+                        Err(e) => {
+                            eprintln!(
+                                "[warn] MCP '{}': Streamable HTTP handshake failed ({e:#}); falling back to legacy SSE",
+                                cfg.name
+                            );
+                            Self::handshake(SseTransport::connect(url, cfg)?)
                         }
-                    } else {
-                        Self::handshake(SseTransport::connect(url, cfg)?)
                     }
                 }
             },
@@ -600,29 +600,6 @@ impl Transport for HttpTransport {
         self.post(&notify_frame(method, params))?;
         Ok(())
     }
-}
-
-/// Auto-detect: a Streamable HTTP server answers POST /initialize with 2xx;
-/// legacy SSE servers typically 404/405 on POST to the SSE endpoint.
-fn probe_http(url: &str, cfg: &McpServerConfig) -> Result<bool> {
-    let client = http_client(CONNECT_TIMEOUT);
-    let mut req = client
-        .post(url)
-        .header("content-type", "application/json")
-        .header("accept", "application/json, text/event-stream")
-        .header("MCP-Protocol-Version", PROTOCOL_VERSION);
-    for (k, v) in &cfg.headers {
-        req = req.header(k, v);
-    }
-    let resp = req
-        .json(&frame(0, "initialize", json!({
-            "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": {},
-            "clientInfo": {"name": "tiny-agent", "version": env!("CARGO_PKG_VERSION")}
-        })))
-        .send()
-        .with_context(|| format!("cannot reach MCP server '{}'", cfg.name))?;
-    Ok(resp.status().is_success())
 }
 
 // ─── legacy HTTP+SSE ────────────────────────────────────────────────
