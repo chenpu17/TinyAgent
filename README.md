@@ -248,7 +248,7 @@ tiny-agent --config examples/chat.json --tui
 |---|---|---|
 | `none`（默认） | 不隔离，所有 worker 共用 base workdir | 只读任务 / `--jobs 1` |
 | `copy` | 每任务把 workdir **拷贝**到临时目录，跑完删除。排除 `target`/`node_modules`/`.git`/`results`（体积大头 + 防把上轮结果当输入） | 通用；大仓库较慢 |
-| `git` | 每任务 `git worktree add --detach` 一份检出，跑完 `worktree remove --force` | 仓库内任务零拷贝；**要求 workdir 是 git 仓库根**（子目录报 `setup_error`，不重试） |
+| `git` | 每任务 `git worktree add --detach` 一份检出，跑完 `worktree remove --force` | 仓库内任务零拷贝；**要求 workdir 是 git 仓库根**（子目录报 `setup_error`，不重试）。**检出的是 HEAD**——未提交 / 未跟踪文件不进隔离副本，要带上它们先 commit 或改用 `copy` |
 
 - **per-task、跨 attempt 复用**：一个任务的重试看得到自己前次 attempt 的落盘副作用（与共享 workdir 语义一致）
 - **产物随目录丢弃**：隔离模式下任务写的文件不留在 workdir——评测语义下审计面就是 `result.json`（`tool_calls` 全量）与 `report.json`；需要产物落盘就别用隔离
@@ -268,6 +268,7 @@ tiny-agent --config examples/chat.json --tui
 | stop_reason | 含义 | 是否重试 |
 |---|---|---|
 | `error` | provider/网络错误（transient） | ✅ |
+| `context_overflow` | 上下文溢出且强制压缩未能救回（确定性） | ❌ |
 | `bad_task` | 任务片段非法（禁用字段 / 缺 task / JSON 错） | ❌ |
 | `max_turns_reached` / `max_tokens` | 模型跑满上限 | ❌ |
 | `budget_exceeded` | 累计 token 触顶 `limits.max_total_tokens` | ❌ |
@@ -524,6 +525,9 @@ API key 从 `api_key_env` 指定的环境变量读取，不写进配置文件。
 > **`timeout_secs: 0`（不设超时）时的单请求兜底**：即便关掉整轮超时，单次 chat 请求仍有一个 **10 分钟**的总时长上限（`STREAM_BACKSTOP`）。这是**泄漏兜底**而非功能限制——流式读取线程阻塞在 reqwest 的 `read()` 里、无法观测取消标志，若没有任何单请求上限，一条半开连接会让该线程及其 TCP 连接一直挂到进程退出。该上限只约束**单次请求**，从不约束**整轮 run**（一轮由多次请求组成），所以「不设超时」仍意味着 run 可以无限长，只是不会无限卡在单次请求上。设了 `timeout_secs > 0` 时此兜底不生效，单请求上限改由剩余预算推导。
 
 `limits.max_total_tokens`（默认 `0` = 不限）：整个 run 的 token 预算上限（input + output + cache 写 + cache 读，跨所有轮次 / 子 agent / 压缩调用累计）。累计超过即以 `stop_reason: "budget_exceeded"`（exit 125）停下，不再开新一轮——语义同 `timeout_secs` 的**轮次边界**停：把总额顶破上限的那一轮照常跑完（工具执行、assistant 消息入历史），上限只阻止**下一轮**开始，故 transcript 与 tool_use/tool_result 配对不受影响。评测 / CI 场景用来给"跑飞钱包"装闸门：usage 累计本就含子 agent、压缩、失败轮（诚实成本，失败也计费），这个闸门只是在地基上加一道关。批量任务片段可设此项**只收紧**（更小值）；`0` 意为"无上限"（最松），任务片段设 0 会被忽略。
+**预算是"事后熔断"不是"预先分片"**：闸门只在主 loop 的 turn 边界读累计值——N 个并行 `task` 子 agent 各自最多跑
+25 turns、其用量要等 join 后才折进累计，顶破上限的那批子 agent 照样跑完。评测要严格控成本，要么给预算留足余量，
+要么在 config 的 `tools` 里去掉 `task`。
 
 `reasoning_effort`（可选字符串，默认不设）：思考程度，**按字符串原样透传给 provider，不做枚举校验**——各家档位碎片化且随模型代际变动，TinyAgent 不维护映射表，由 provider/server 拒绝未知值。取值参考：OpenAI `none`/`low`/`medium`/`high`/`xhigh`/`max`（随模型代际扩张）、Anthropic `low`/`medium`/`high`/`max`（Claude 4.6+ adaptive thinking；Opus 4.7 起旧 `budget_tokens` 已移除）、DeepSeek `low`/`high`/`xhigh`/`max`、GLM 仅开关（`enabled`/`disabled`）。映射：OpenAI 系直接发 `reasoning_effort` 字段（老网关不认会 400，`body_fix_for_400` 自动 drop 重试，与 `max_tokens`/`stream_options` 同款）；Anthropic 发 `thinking: {"type": "adaptive"}` + `output_config: {"effort": "..."}`（effort 在**独立顶层 `output_config` 对象**里，不在 thinking 内、也不是裸顶层字段——裸顶层会被静默忽略，这是该 API 最常见的坑），`"none"` 发 `{"type": "disabled"}`。
 
@@ -650,7 +654,9 @@ headless 模式下 `Ctrl-C` 走**优雅取消**：首次 Ctrl-C 在流式 chunk 
 `result.json`（`stop_reason = cancelled`）后 exit 130；再次 `Ctrl-C` 立即 exit 130（不等本轮结束）。
 Linux/macOS 经 SIGINT、Windows 经 `SetConsoleCtrlHandler`，行为一致。
 **批量模式**（`--batch`）同样生效：首次 SIGINT 后在跑的任务跑完、不再起新任务（未起的标记 `cancelled`），
-照常合并写出 `--report` 后 exit 130；再次 `Ctrl-C` 立即 exit 130。TUI 模式下 `Ctrl-C` 是普通按键，按上面的按键表处理。
+照常合并写出 `--report` 后 exit 130；再次 `Ctrl-C` 立即 exit 130。一个例外：在跑任务的 **MCP server
+会被立即关闭**（防第二次 Ctrl-C 硬退时子进程成孤儿）——依赖 MCP 工具的在跑任务可能因此提前失败。
+TUI 模式下 `Ctrl-C` 是普通按键，按上面的按键表处理。
 
 `--json` 模式额外在每个事件吐一行 NDJSON（`type`: `turn` / `text` / `thinking` / `tool_call` /
 `tool_result` / `usage` / `compressed` / `warning` / `subagent` / `todo` / `done`，重试时另吐 `retry`），可在结果文件落盘前实时跟进进度。

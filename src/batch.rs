@@ -329,8 +329,11 @@ struct TaskReport {
 /// - `failed`: re-run only tasks that failed in the prior report at `report_path`.
 /// - `isolate`: per-task workdir isolation (`--isolate none|copy|git`).
 /// - `cancel`: shared flag flipped by SIGINT (headless). Once set, workers stop
-///   dispatching new tasks — in-flight tasks finish on their own, not-yet-started
+///   dispatching new tasks — in-flight tasks finish on their own (EXCEPT their
+///   MCP servers: the shutdown-reaper armed on every agent kills those
+///   immediately, the documented 0.3.0 anti-orphan trade-off), not-yet-started
 ///   ones are marked `cancelled` so the report still accounts for every task.
+///   A second Ctrl-C force-exits 130.
 ///
 /// Returns process exit code (130 if cancelled, else 0/1 by success).
 #[allow(clippy::too_many_arguments)]
@@ -483,6 +486,13 @@ pub fn run(
     // panic="abort" a worker panic aborts the process immediately regardless of
     // lock state, so this is a debug/CI-robustness + consistency measure, not a
     // release-abort guard — a panicking worker still loses the report in release.
+    // Ctrl-C 契约（A5，一次性警告，首个命中 cancel 的 worker 打印）：
+    // 未启动的任务跳过并标 cancelled；在跑的任务自身跑完——但它们的
+    // MCP server 会被立即杀掉（每个 agent 都用 set_shutdown 挂了同一
+    // 个 reaper，防第二次 Ctrl-C 的 _exit(130) 留下孤儿子进程；这是
+    // 0.3.0 MCP 孤儿修复的既定取舍，见 run_one_attempt 的 cancel 参数
+    // 文档）。
+    let warned = std::sync::atomic::AtomicBool::new(false);
     std::thread::scope(|s| {
         for _ in 0..jobs {
             s.spawn(|| loop {
@@ -492,6 +502,14 @@ pub fn run(
                     Err(_) => return, // channel drained
                 };
                 let report = if cancel.load(Ordering::Relaxed) {
+                    if !warned.swap(true, Ordering::Relaxed) {
+                        eprintln!(
+                            "[warn] Ctrl-C: not-yet-started tasks are skipped and marked \
+                             cancelled; in-flight tasks finish on their own — except their \
+                             MCP servers, which are shut down immediately; press Ctrl-C \
+                             again to force-exit (130)"
+                        );
+                    }
                     // Ctrl-C was hit: stop dispatching new tasks. Mark this one
                     // cancelled (not run) so the report still accounts for every
                     // task. In-flight tasks in other workers finish on their own
@@ -599,6 +617,12 @@ fn run_one_attempt(
     // store(false) reset across parallel workers. shutdown is never reset, so
     // it is safe to share (mirrors main.rs single-run, which arms shutdown on
     // the same flag — only the cancel side is batch-specific).
+    // CONTRACT (A5): arming on this flag means the FIRST Ctrl-C — which only
+    // stops task DISPATCH — also fires the reaper for every in-flight agent's
+    // MCP servers (immediate teardown, unlike the "finish on their own" the
+    // run() doc promises for the agents themselves). Accepted trade-off from
+    // the 0.3.0 MCP-orphan fix: without it, a second Ctrl-C's _exit(130)
+    // leaks the servers. The one-shot gate warning tells the user both halves.
     cancel: &Arc<std::sync::atomic::AtomicBool>,
     // RFC 3339 start-of-TASK timestamp (not per-attempt): retries of one task
     // share the task's start, so the bill attributes to when work began.

@@ -98,7 +98,9 @@ cargo clippy -p tiny-agent-node
   （`child_tools()`，同样不按名字滤）——`task`（防递归）与 `todo`（计划归父）在 trait 里覆写 false，
   第三方工具可自主退出。**在默认白名单**（`config::default_tools`
   含 `task`）——headless 评测任务也会默认能 spawn 子 agent；评测若要锁定行为/成本，在 config 的 `tools`
-  里显式去掉 `task`。
+  里显式去掉 `task`。**预算稀释（B1，既定语义）**：`max_total_tokens` 闸门只在父 turn 边界读累计值，
+  N 个并行子 agent 各自最多 25 turns、用量 join 后才折进累计——预算是"事后熔断"不是"预先分片"，
+  严格控成本要留余量或去掉 `task`（README limits 节同款表述）。
 - **Hooks 拦截层（`hooks.rs`，P1，第三方扩展面）**：`trait Hooks: Send + Sync` 三默认方法
   （`before_tool` → `ToolDecision::{Allow, Deny(String), Modify(Value)}`；`after_tool` 事后审计；
   `on_chat_request` 只读观察主 turn 请求），`Agent::set_hooks` 后置安装（仿 `set_cancel` 模式）。
@@ -299,7 +301,10 @@ cargo clippy -p tiny-agent-node
   prune` 回收——release `panic=abort` 下 Drop 不保证）。产物随目录丢弃是**评测语义**（审计面是
   result.json/report.json）。jobs>1 ⚠ 只在 isolate==None 时打。
 - **批量 Ctrl-C 是 worker gate，不中断在跑任务**：`batch::run` 的 worker 在**起任务前**检查共享
-  cancel 标志，命中则标 `cancelled` 跳过；在跑的任务照常跑完（"收敛"）。**没有**把 cancel 标志传给
+  cancel 标志，命中则标 `cancelled` 跳过（首个命中的 worker 打一次性契约警告）；在跑的任务照常跑完
+  （"收敛"）。**例外（A5，既定取舍）**：每个 agent 都用 `set_shutdown` 挂了同一个 flag 的 reaper——首次
+  Ctrl-C 也会**立即杀掉在跑任务的 MCP server**（防二次 Ctrl-C 硬退留孤儿子进程，0.3.0 修复的另一半）；
+  依赖 MCP 的在跑任务可能因此提前失败。**没有**把 cancel 标志传给
   agent 中断流式——因为多 worker 共享一个 flag 会和 `agent::run()` 入口的 `store(false)` 复位竞争
   （一个 worker 起新 run 会清掉另一个在跑的取消信号）。要立刻退出按第二次 Ctrl-C（`_exit(130)`）。
 - **子 agent 用 `run_as_subagent`，入口不复位 cancel 标志**：子 agent 继承父的 cancel Arc，但不像
