@@ -2989,6 +2989,14 @@
             1,
             "deterministic overflow must not enter the retry ladder"
         );
+        // B4 vocabulary alignment: the single-run result.json must say
+        // "context_overflow" (like batch's report), not the generic "error" —
+        // CI keys off this value to tell a too-long task from a flaky provider.
+        let written: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&out).expect("result.json written"),
+        )
+        .unwrap();
+        assert_eq!(written["stop_reason"], "context_overflow");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

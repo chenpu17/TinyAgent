@@ -638,7 +638,8 @@ TinyAgent 的定位是**可审计、可无人值守的 agent 执行单元**—�
 - `input_tokens` / `output_tokens` 是本次运行累计的 token 用量；`cache_creation_input_tokens` /
   `cache_read_input_tokens` 是 prompt 缓存写/读累计（Anthropic 两者都报，OpenAI 只报读）。`input_tokens`
   只含未缓存部分，真实计费输入需加上缓存写 1.25× / 读 0.1×（见上文 Prompt caching）
-- agent.run 返回 `Err`（如 provider 503）时仍会写结果文件：`{"success": false, "stop_reason": "error", "error": "..."}`
+- agent.run 返回 `Err`（如 provider 503）时仍会写结果文件：`{"success": false, "stop_reason": "error", "error": "..."}`；
+  不可救的上下文溢出（强制压缩未能救回）记 `stop_reason: "context_overflow"`（不进瞬态重试，exit code 仍为 1），与 batch report 同口径
 
 进程 exit code：
 

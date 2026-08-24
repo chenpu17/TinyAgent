@@ -79,6 +79,14 @@ cargo clippy -p tiny-agent-node
   （`estimate_tokens`/`find_safe_cut`/`fold_summary`/`window_lines`/`chunk_lines`/`SUMMARY_*` 等）抽到
   `compress.rs`（单向被 agent 依赖；`window_lines` 反向调 `crate::agent::preview`，不构成环）。`AgentEvent`
   透传给 harness（headless 打印/NDJSON）或 TUI。上下文压缩的摘要请求自身 usage 也计入累计（诚实成本）。
+  **`find_safe_cut` 空尾语义**：keep_recent=0 时 cut==n（空尾）是**合法**切点——真实 loop 每个请求点
+  历史必 user 结尾，若钳到 n-1 扫边界必落空、该配置下压缩被静默禁用（A2 修复）；`fold_summary` 对空尾
+  产出单条 user 头。守卫是 `saturating_add(2)`（usize::MAX 级 keep_recent 不 panic/回绕）。
+  **数值写端一律 saturating**：usage 累计 / RunCost / merge_usage / trace_meta / batch 汇总的 `+=`
+  全部是 `saturating_add`（读端 `Usage::total()` 本就饱和）——新增累加点照做，谎报 u64::MAX 不 panic
+  （debug）也不回绕躲预算闸门（release）。
+  **溢出确定性**：溢出逃逸失败后的溢出错误经 `RunError::is_context_overflow()` 判定为确定性——单跑
+  `run_with_retries` 与 batch（stop_reason `context_overflow`，run_one 只重试 `"error"`）都不再进退避。
 - **token 预算闸门**（`limits.max_total_tokens`，0=不限）：run loop 每轮开头用累计 usage 的
   `Usage::total()`（input+output+cache 写+读）比对预算，超则以 `stop_reason: "budget_exceeded"`
   （exit 125）停。turn 边界语义同 `timeout_secs`——顶破上限的那轮照常跑完（工具执行、assistant 入历史），
@@ -319,6 +327,10 @@ cargo clippy -p tiny-agent-node
   （vLLM 等旧网关，之后 usage 走 `None` 降级，`parse_loop` 已容忍）；提到 `reasoning_effort` 时丢弃该字段
   重试一次（老网关不认）。三条 fix 各管一个独立字段，可连续修三次满足同时拒全部三个字段的网关。未知 400 直接 bail。
   改请求体字段的人要知道这条重试路径，别在 fix 后又引入新 400。
+  **fix 落账是 record-on-success**（A3）：本轮累积 applied 清单、仅当调整后的请求最终 2xx 才
+  `learned.record`——值错误 400（"max_tokens must be ≤ N"）文案也含 max_tokens 会触发改名，但重试
+  必再失败，apply 即记会让此后每轮主动发改名后的字段、反复触发不可修复的 400。改这段别把落账挪回
+  apply 时刻。
 - **`--session none` 是关闭持久化的字面量哨兵**（不是文件名）——真要叫 `none` 的文件没法用，
   但它语义清晰、够用。改 `session_target` 判定前先想清楚。
 - **MCP 工具名只消毒展示名，wire 名不动**（`tools::mcp::sanitize_name`）：对外名 `mcp_<server>_<tool>`

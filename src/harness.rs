@@ -115,6 +115,10 @@ pub(crate) fn run_with_retries(
     // the whole run from its true beginning, not re-stamp at write time when
     // the backoff sleeps already consumed seconds-to-minutes.
     let started = now_rfc3339();
+    // B4: set when the run died on an unfixable context overflow — the
+    // terminal NDJSON event and result.json then say "context_overflow"
+    // (matching batch's report vocabulary) instead of the generic "error".
+    let mut failed_overflow = false;
     let (code, outcome, error) = loop {
         let result = agent.run(&mut |ev| {
             if json {
@@ -139,6 +143,7 @@ pub(crate) fn run_with_retries(
                 // backoff ladder, which would only burn 1+2+4…s per attempt
                 // to fail identically.
                 if re.is_context_overflow() {
+                    failed_overflow = true;
                     break (EXIT_ERROR, None, Some(format!("{re:#}")));
                 }
                 if attempt <= retries {
@@ -190,6 +195,8 @@ pub(crate) fn run_with_retries(
         if let Some(err) = &error {
             let stop_reason = if code == EXIT_CANCELLED {
                 "cancelled"
+            } else if failed_overflow {
+                "context_overflow"
             } else {
                 "error"
             };
@@ -206,11 +213,15 @@ pub(crate) fn run_with_retries(
     // non-zero exit. Batch (run_one) already did this; single-run now matches.
     if let Some(path) = output_path {
         // When there's no outcome, record WHY: a cancel (exit 130) is
-        // "cancelled", anything else is "error". Otherwise result.json would
-        // claim "error" for a user-initiated cancel, disagreeing with the exit
-        // code and the NDJSON terminal event (both already say "cancelled").
+        // "cancelled", an unfixable context overflow is "context_overflow"
+        // (matching batch's report vocabulary), anything else is "error".
+        // Otherwise result.json would claim "error" for a user-initiated
+        // cancel, disagreeing with the exit code and the NDJSON terminal
+        // event (both already say "cancelled").
         let none_sr = if code == EXIT_CANCELLED {
             "cancelled"
+        } else if failed_overflow {
+            "context_overflow"
         } else {
             "error"
         };

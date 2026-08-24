@@ -7,6 +7,14 @@
 
 ### Fixed
 
+- **第三方审查（第二轮）全量修正**（每项带回归测试）：
+  - **Anthropic 流解析**：识别 `message_stop` 事件主动结束（持连接不关流的网关不再等 30s idle 超时、真实 stop_reason 不被中止覆盖）；`content_block_start` 内联非空 `input` 作 seed（不合规网关内联参数不再丢失）；`tool_result` 序列化避免空 text 块 400（带图空文只发 `[image]`，两者皆空省略 `content` 字段）。
+  - **压缩 `keep_recent=0` 空尾合法化**：真实 loop 每个请求点历史必 user 结尾，旧的钳制让该配置下压缩被静默禁用（preflight 不折叠、溢出逃逸判不可压缩直接失败）。现 `cut==n` 合法——除保留头外全部折进摘要；守卫改 `saturating_add`（usize::MAX 不再 debug panic）。
+  - **OpenAI learned-fix 改 record-on-success**：400 自适应修复仅在调整后的请求最终拿到 2xx 才落账，值错误（"max_tokens must be ≤ N"）不再毒化修复表（旧逻辑 apply 即记，此后每轮主动发改名后的字段反复触发不可修复的 400）。
+  - **batch `--isolate copy` 排除清单只作用于 workdir 根**：嵌套同名目录（`sub/results/`）是任务输入，不再被静默漏拷；Windows symlink 相对目标按链接父目录解析（不再随进程 CWD 漂移）；`worktree add` 锁竞争（index.lock/config.lock）有界重试 ≤3 次。
+  - **数值写端全部饱和化**：usage 累计 / RunCost / 压缩摘要成本 / 子 agent trace / batch 汇总的 `+=` 改 `saturating_add`——u64::MAX 级谎报在 debug 下 panic、release 下回绕成小数躲过预算闸门。`read_skill` 磁盘读取加字节上限（对齐 read_file 公式）；`CancellableSse` 线程 spawn 失败改瞬态错误不再 panic。
+  - **harness/batch 归因与退出码**：单跑 `result.json` 的 `started_at` 在 attempt 循环前盖章（重试退避不再从时间线上消失）；写结果失败不再吞退出码（130/125/124 保持原值）；batch 扫描跳过 `*.json` 名字的目录（不再让 "Is a directory" 炸掉整批）；失败任务的 report `model` 归因到片段覆盖后的模型；单跑模式 `--report ./report.json` 显式默认拼写不再误拒；batch 分支显式拒 `--task` / 非默认 `--session`。
+  - **杂项硬化**：retry 抖动混入调用计数（调度器量化的纳秒让并发失败重新聚成同一节拍）；shell 轮询先 `try_wait` 再查 cancel（同窗口退出的命令拿真实 exit code）；超时/取消路径不再对已 reap 的 pid 二次 killpg（pid 复用窗口）；`list_skill` 每目录 500 条上限 + 截断标记；`read_file` 输出预算按**字符**计（CJK 不再提前 ⅓ 截断），字节上限切开多字节字符时交付合法前缀而非硬报 invalid UTF-8，行数提示在截断时不再谎报总数；MCP `Auto` 传输删独立探测（先完整 HTTP 握手、失败回退 SSE，strict server 只见一次 initialize）；SSE 解析对齐规范（多行 `data:` 以 `\n` 拼接、空行分发、EOF 冲刷、至多剥一个前导空格）；`read_skill` 路径拒 `:`；skill description 上限按字符计（CJK 不再被字节误杀）。
 - **shell 工具正常退出路径的管道孤儿挂死**：命令留下的后台进程继承工具的输出管道
   （`server & curl …`，或 `cd d && server >/dev/null 2>&1 & curl …` 这类 `&` 后台化整个
   AND-list 的形态——为其 fork 的子 shell 自己持有管道，内层重定向管不到），直接子进程
@@ -16,6 +24,20 @@
   进程组强制 EOF 并在输出标注「已回收遗留的后台进程」→ kill 仍无法释放管道
   （`setsid` 逃逸 / Windows）时放弃等待、标注后返回，不再挂死。正确保留后台进程的
   方式是重定向其输出（`cmd >log 2>&1 &`）——不持管道即不触发回收、跨调用存活。
+
+### Changed
+
+- **不可救的上下文溢出归类为确定性失败**（新 `stop_reason` 值 `context_overflow`）：溢出逃逸
+  （强制压缩 + 重试一次）失败后不再按瞬态错误走 1+2+4…s 退避——单跑直接终止，且 `result.json`
+  与 NDJSON 终态事件同记 `context_overflow`；batch 不重试、report 同口径，CI 可区分溢出与瞬态
+  错误。`RunError::is_context_overflow()` 公开判定。
+- **batch Ctrl-C 契约显式化**：首次 Ctrl-C 后在跑任务自身跑完，但其 **MCP server 会被立即关闭**
+  （防二次 Ctrl-C 硬退留孤儿，0.3.0 修复的既定取舍）——首个命中 cancel 的 worker 打一次性警告
+  说明两侧语义。
+- **子 agent 预算稀释语义写进文档**：`max_total_tokens` 闸门只在父 turn 边界读累计值，并行子
+  agent 用量 join 后才折入——预算是"事后熔断"不是"预先分片"，控成本留余量或去掉 `task` 工具。
+- **`--isolate git` 检出 HEAD 语义写进 help**：未提交 / 未跟踪文件不进隔离副本，要带上先 commit
+  或用 `--isolate copy`。
 
 ### Added
 
