@@ -166,15 +166,10 @@ fn run_error_serializes_structured_cost() {
     // tool calls / turns to the host (CLAUDE.md "重试诚实成本"). A manual
     // Serialize impl carries usage/tool_calls/turns/elapsed and renders source
     // (anyhow::Error, not auto-Serializable) as its Display string under `error`.
-    // Drive a real failing run (provider Err) so the RunError is authentic.
+    // Drive a real failing run (provider Err) so the RunError is authentic:
+    // a one-turn script that errors immediately.
     use tiny_agent::provider::mock;
     let cfg = minimal_config();
-    let (provider, _) = MockProvider::new(vec![
-        // turn 1 bills some usage then…
-        resp_text("partial", mk_usage(100, 10)),
-    ]);
-    // Re-script to fail: a provider Err surfaces as RunError carrying the
-    // accumulated cost. Use a one-turn script that errors immediately.
     let (provider, _) = MockProvider::new(vec![mock::MockTurn::Err("boom: 503".into())]);
     let mut agent = Agent::new(
         &cfg,

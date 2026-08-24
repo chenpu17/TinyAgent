@@ -336,10 +336,16 @@ pub(crate) fn merge_usage(a: Option<Usage>, b: Option<Usage>) -> Option<Usage> {
         (None, None) => None,
         (Some(x), None) | (None, Some(x)) => Some(x),
         (Some(mut x), Some(y)) => {
-            x.input_tokens += y.input_tokens;
-            x.output_tokens += y.output_tokens;
-            x.cache_creation_input_tokens += y.cache_creation_input_tokens;
-            x.cache_read_input_tokens += y.cache_read_input_tokens;
+            // Saturating: a lying provider report must not panic (debug) /
+            // wrap to a small total (release) the summary-cost accumulator.
+            x.input_tokens = x.input_tokens.saturating_add(y.input_tokens);
+            x.output_tokens = x.output_tokens.saturating_add(y.output_tokens);
+            x.cache_creation_input_tokens = x
+                .cache_creation_input_tokens
+                .saturating_add(y.cache_creation_input_tokens);
+            x.cache_read_input_tokens = x
+                .cache_read_input_tokens
+                .saturating_add(y.cache_read_input_tokens);
             Some(x)
         }
     }

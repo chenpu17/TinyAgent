@@ -1840,6 +1840,29 @@
     }
 
     #[test]
+    fn usage_accumulation_saturates_instead_of_wrapping() {
+        // B2: a lying provider reporting u64::MAX input tokens must SATURATE
+        // the accumulator — a wrapping `+=` folds MAX twice into MAX-1
+        // (quietly dodging any budget gate read on the total), and a debug
+        // build panics outright on the second add.
+        let cfg = cfg_with(5, 0, 0);
+        let (prov, _) = MockProvider::new(vec![
+            mock::resp_tool("a", "echo", json!({}), mock::mk_usage(u64::MAX, 1)),
+            mock::resp_text("done", mock::mk_usage(u64::MAX, 1)),
+        ]);
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![Box::new(EchoTool::new("echo"))],
+            vec![user_text("go")],
+            test_ctx(),
+        );
+        let o = agent.run(&mut |_| {}).unwrap();
+        assert_eq!(o.input_tokens, u64::MAX, "two MAX folds saturate at MAX");
+        assert_eq!(o.output_tokens, 2);
+    }
+
+    #[test]
     fn cache_usage_propagates_to_run_outcome_and_event() {
         // Prompt-cache tokens billed by the provider (Anthropic cache writes/
         // reads) must flow through to the RunOutcome totals AND the per-turn

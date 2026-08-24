@@ -926,10 +926,12 @@ fn write_report(path: &Path, reports: &[TaskReport], provider: &str) -> Result<(
     // included because it still reflects tokens moved over the wire.
     let (mut ti, mut to, mut tcc, mut tcr) = (0u64, 0u64, 0u64, 0u64);
     for r in reports {
-        ti += r.input_tokens;
-        to += r.output_tokens;
-        tcc += r.cache_creation_input_tokens;
-        tcr += r.cache_read_input_tokens;
+        // Saturating: matches the core usage folds — absurd per-task numbers
+        // must not wrap the batch bill to a small total.
+        ti = ti.saturating_add(r.input_tokens);
+        to = to.saturating_add(r.output_tokens);
+        tcc = tcc.saturating_add(r.cache_creation_input_tokens);
+        tcr = tcr.saturating_add(r.cache_read_input_tokens);
     }
     // per-task average; 0 when there are no tasks (avoids div-by-zero).
     let avg = |t: u64| if reports.is_empty() { 0.0 } else { t as f64 / reports.len() as f64 };

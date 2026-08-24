@@ -284,7 +284,7 @@ impl Provider for OpenAi {
             }
         }
 
-        let mut sse = CancellableSse::new(resp, req.cancel.clone(), self.idle);
+        let mut sse = CancellableSse::new(resp, req.cancel.clone(), self.idle)?;
         Self::parse_loop(&mut sse, on_event)
     }
 }

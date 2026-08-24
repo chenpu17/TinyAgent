@@ -3,6 +3,7 @@ use crate::provider::ToolDef;
 use crate::skills::SkillIndex;
 use anyhow::Context;
 use serde_json::{json, Value};
+use std::io::Read;
 use std::path::Path;
 
 /// Load a skill's full `SKILL.md` (or a bundled resource file from a
@@ -99,8 +100,18 @@ impl Tool for ReadSkill {
                 )));
             }
         };
-        let mut content = std::fs::read_to_string(&resolved)
+        // Bound the BYTES read from disk (same formula as read_file: 4× the
+        // char cap + slack) — `read_to_string` would pull a huge SKILL.md
+        // (or a runaway references/ file) fully into memory before the char
+        // truncation below could throw it away. Strict UTF-8 semantics kept:
+        // invalid content is an error, not silent lossy replacement.
+        let max_bytes = (ctx.max_output_chars.saturating_mul(4)).saturating_add(1024) as u64;
+        let mut bytes = Vec::new();
+        std::fs::File::open(&resolved)
+            .and_then(|f| f.take(max_bytes).read_to_end(&mut bytes))
             .with_context(|| format!("read_skill: cannot read {}", resolved.display()))?;
+        let mut content = String::from_utf8(bytes)
+            .with_context(|| format!("read_skill: {} is not valid UTF-8", resolved.display()))?;
         truncate(&mut content, ctx.max_output_chars);
         Ok(ToolOutput::text(content))
     }
@@ -376,6 +387,29 @@ mod tests {
         c.max_output_chars = 500;
         let out = ReadSkill::new(index).run(&json!({"skill": "big"}), &c).unwrap();
         assert!(out.content.len() < 2000, "got {} bytes", out.content.len());
+        assert!(out.content.contains("truncated"), "{}", out.content);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_skill_byte_cap_bounds_huge_files() {
+        // B3: the DISK read is bounded (4×max_output_chars + 1024 bytes), not
+        // just the post-read char truncation — a multi-MB SKILL.md comes back
+        // truncated and is never pulled whole into memory. Single line is the
+        // worst case for unbounded reads.
+        let dir = std::env::temp_dir().join(format!("ta-rs-bytecap-{}", std::process::id()));
+        let sub = dir.join("big");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(
+            sub.join("SKILL.md"),
+            format!("---\nname: big\ndescription: d\n---\n{}", "y".repeat(3_000_000)),
+        )
+        .unwrap();
+        let (index, _) = crate::skills::scan(std::slice::from_ref(&dir));
+        let mut c = ctx(&dir);
+        c.max_output_chars = 400;
+        let out = ReadSkill::new(index).run(&json!({"skill": "big"}), &c).unwrap();
+        assert!(out.content.len() < 1600, "got {} bytes", out.content.len());
         assert!(out.content.contains("truncated"), "{}", out.content);
         fs::remove_dir_all(&dir).ok();
     }

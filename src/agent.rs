@@ -267,28 +267,38 @@ impl RunCost {
     /// it ran (whose side effects already landed in the history / on disk).
     /// `&RunError` (not by value) so the caller can still format the error.
     pub(crate) fn add_failed(&mut self, re: &RunError) {
-        self.usage.input_tokens += re.usage.input_tokens;
-        self.usage.output_tokens += re.usage.output_tokens;
-        self.usage.cache_creation_input_tokens += re.usage.cache_creation_input_tokens;
-        self.usage.cache_read_input_tokens += re.usage.cache_read_input_tokens;
+        // Saturating on every numeric fold: a provider reporting absurd
+        // totals must not panic (debug) / wrap (release) the accumulator.
+        self.usage.input_tokens = self.usage.input_tokens.saturating_add(re.usage.input_tokens);
+        self.usage.output_tokens = self.usage.output_tokens.saturating_add(re.usage.output_tokens);
+        self.usage.cache_creation_input_tokens = self
+            .usage
+            .cache_creation_input_tokens
+            .saturating_add(re.usage.cache_creation_input_tokens);
+        self.usage.cache_read_input_tokens =
+            self.usage.cache_read_input_tokens.saturating_add(re.usage.cache_read_input_tokens);
         self.tool_calls.extend(re.tool_calls.iter().cloned());
-        self.turns += re.turns;
-        self.elapsed += re.elapsed;
+        self.turns = self.turns.saturating_add(re.turns);
+        self.elapsed = self.elapsed.saturating_add(re.elapsed);
     }
 
     /// Fold this accumulated cost into a successful outcome so its reported
     /// totals cover EVERY attempt. Tool calls from earlier (failed) attempts
     /// come first — they happened first chronologically.
     pub(crate) fn fold_into(&mut self, o: &mut RunOutcome) {
-        o.input_tokens += self.usage.input_tokens;
-        o.output_tokens += self.usage.output_tokens;
-        o.cache_creation_input_tokens += self.usage.cache_creation_input_tokens;
-        o.cache_read_input_tokens += self.usage.cache_read_input_tokens;
+        // Saturating — see add_failed.
+        o.input_tokens = o.input_tokens.saturating_add(self.usage.input_tokens);
+        o.output_tokens = o.output_tokens.saturating_add(self.usage.output_tokens);
+        o.cache_creation_input_tokens = o
+            .cache_creation_input_tokens
+            .saturating_add(self.usage.cache_creation_input_tokens);
+        o.cache_read_input_tokens =
+            o.cache_read_input_tokens.saturating_add(self.usage.cache_read_input_tokens);
         // Earlier attempts first, then this attempt's tool calls.
         self.tool_calls.append(&mut o.tool_calls);
         o.tool_calls = std::mem::take(&mut self.tool_calls);
-        o.turns += self.turns;
-        o.elapsed += self.elapsed;
+        o.turns = o.turns.saturating_add(self.turns);
+        o.elapsed = o.elapsed.saturating_add(self.elapsed);
     }
 }
 
@@ -528,10 +538,19 @@ impl Agent {
     /// to each duplicate it, and the Some(Some) vs Some(None) semantics had to
     /// be re-explained at every copy.
     fn fold_usage(&mut self, events: &mut dyn FnMut(AgentEvent), u: &Usage) {
-        self.usage.input_tokens += u.input_tokens;
-        self.usage.output_tokens += u.output_tokens;
-        self.usage.cache_creation_input_tokens += u.cache_creation_input_tokens;
-        self.usage.cache_read_input_tokens += u.cache_read_input_tokens;
+        // Saturating — the read side (Usage::total) already saturates; a
+        // lying/huge provider report must not panic (debug) or wrap to a
+        // small total (release) here, silently hiding the budget breach.
+        self.usage.input_tokens = self.usage.input_tokens.saturating_add(u.input_tokens);
+        self.usage.output_tokens = self.usage.output_tokens.saturating_add(u.output_tokens);
+        self.usage.cache_creation_input_tokens = self
+            .usage
+            .cache_creation_input_tokens
+            .saturating_add(u.cache_creation_input_tokens);
+        self.usage.cache_read_input_tokens = self
+            .usage
+            .cache_read_input_tokens
+            .saturating_add(u.cache_read_input_tokens);
         events(AgentEvent::Usage {
             input_tokens: u.input_tokens,
             output_tokens: u.output_tokens,

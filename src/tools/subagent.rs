@@ -312,9 +312,12 @@ fn trace_meta(turns: u32, tool_calls: &[ToolCallRecord], usage: &Usage, stop_rea
         "turns": turns,
         "tools": tools,
         "tokens": {
-            "in": usage.input_tokens
-                + usage.cache_creation_input_tokens
-                + usage.cache_read_input_tokens,
+            // Saturating: matches the core usage folds — a lying provider
+            // report must not overflow the trace arithmetic.
+            "in": usage
+                .input_tokens
+                .saturating_add(usage.cache_creation_input_tokens)
+                .saturating_add(usage.cache_read_input_tokens),
             "out": usage.output_tokens,
         },
         "stop_reason": stop_reason,

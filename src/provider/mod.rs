@@ -10,7 +10,7 @@ pub use anthropic::Anthropic;
 pub use openai::OpenAi;
 
 use crate::config::{Config, ProviderKind};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Read};
@@ -389,11 +389,15 @@ pub(crate) struct CancellableSse {
 }
 
 impl CancellableSse {
+    /// Spawn the reader thread. Fails (rather than panics) when the OS can't
+    /// spawn a thread — thread-resource exhaustion is a per-request failure,
+    /// handled by the caller like any transient request error (retry / cancel
+    /// path), not a process-killing panic.
     pub(crate) fn new<R: Read + Send + 'static>(
         reader: R,
         cancel: Arc<AtomicBool>,
         idle: Duration,
-    ) -> Self {
+    ) -> std::result::Result<Self, anyhow::Error> {
         // The channel carries Result: Ok(payload) for data, Err(message) when
         // the underlying read failed. An IO error is sent before the worker
         // drops the sender, so the receiver distinguishes a failed read from a
@@ -421,8 +425,8 @@ impl CancellableSse {
                 // tx drops here → receiver sees Disconnected (end of stream)
                 // unless it already saw the Err above.
             })
-            .expect("spawn sse-reader thread");
-        Self { rx, cancel, idle }
+            .context("spawn sse-reader thread")?;
+        Ok(Self { rx, cancel, idle })
     }
 }
 
@@ -509,7 +513,7 @@ mod tests {
             }
         }
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut s = CancellableSse::new(ErroringRead, cancel, Duration::from_secs(30));
+        let mut s = CancellableSse::new(ErroringRead, cancel, Duration::from_secs(30)).unwrap();
         match s.next_payload() {
             Err(StreamAbort::StreamError(msg)) => assert!(msg.contains("reset"), "{msg}"),
             other => panic!("expected StreamError, got {other:?}"),
@@ -520,7 +524,7 @@ mod tests {
     fn cancellable_sse_reads_payloads_then_eof() {
         let raw = b"data: {\"a\":1}\n\ndata: {\"b\":2}\n\n";
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut s = CancellableSse::new(&raw[..], cancel, Duration::from_secs(30));
+        let mut s = CancellableSse::new(&raw[..], cancel, Duration::from_secs(30)).unwrap();
         assert_eq!(s.next_payload().unwrap().as_deref(), Some("{\"a\":1}"));
         assert_eq!(s.next_payload().unwrap().as_deref(), Some("{\"b\":2}"));
         assert!(s.next_payload().unwrap().is_none()); // reader hit EOF
@@ -539,7 +543,7 @@ mod tests {
             }
         }
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut s = CancellableSse::new(Stall, cancel.clone(), Duration::from_secs(30));
+        let mut s = CancellableSse::new(Stall, cancel.clone(), Duration::from_secs(30)).unwrap();
         let c = cancel;
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(300));
