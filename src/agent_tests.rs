@@ -90,11 +90,13 @@
 
     #[test]
     fn safe_cut_works_with_keep_recent_zero() {
-        // keep_recent=0 means "the tail may be empty", but fold_summary still
-        // needs at least one tail message — so the scan must clamp the nominal
-        // start (n) down to n-1 and still find an assistant boundary. Without
-        // the fix, cut==n made the loop body unreachable and compression was
-        // silently disabled for keep_recent=0 configs.
+        // keep_recent=0 means "the tail may be empty": cut==n is a legal cut —
+        // fold_summary builds head + messages[n..], i.e. everything except the
+        // retained head folds into the summary. Both shapes must compress:
+        // assistant-final (any gateway that ended on an assistant message) and
+        // user-final (the real loop's shape at every request point) — the old
+        // clamp-to-n-1 fallback made the boundary scan miss on user-final and
+        // silently DISABLED compression for keep_recent=0 configs.
         // [user, asst, user, asst] — n=4, guard (4 <= 0+2) passes.
         let msgs = vec![
             user_text("task"),
@@ -102,16 +104,41 @@
             user_text("more"),
             Message::assistant(vec![Block::Text("r2".into())]),
         ];
-        // clamp → cut=3 → messages[3]=assistant → Some(3); tail = [asst] (1 msg).
-        assert_eq!(find_safe_cut(&msgs, 0), Some(3));
-        // If the last message isn't an assistant, no boundary → None.
+        assert_eq!(find_safe_cut(&msgs, 0), Some(4));
+        // user-final — the shape the real loop guarantees at request points.
         let msgs2 = vec![
             user_text("task"),
             Message::assistant(vec![Block::Text("r1".into())]),
             user_text("more"),
             user_text("again"),
         ];
-        assert_eq!(find_safe_cut(&msgs2, 0), None);
+        assert_eq!(find_safe_cut(&msgs2, 0), Some(4));
+    }
+
+    #[test]
+    fn safe_cut_saturates_on_pathological_keep_recent() {
+        // keep_recent=usize::MAX must disable compression, not wrap: a plain
+        // `keep_recent + 2` panics in debug (and in release the guard passes
+        // for large n, making `n - keep_recent` underflow into a giant cut).
+        let msgs = vec![user_text("a"), user_text("b"), user_text("c")];
+        assert_eq!(find_safe_cut(&msgs, usize::MAX), None);
+    }
+
+    #[test]
+    fn fold_summary_empty_tail_is_legal() {
+        // cut == messages.len() (keep_recent=0): the compressed history is
+        // exactly one user message — the retained head carrying the summary.
+        let msgs = vec![
+            user_text("task"),
+            Message::assistant(vec![Block::Text("r1".into())]),
+            user_text("more"),
+            user_text("again"),
+        ];
+        let out = fold_summary(&msgs, msgs.len(), "the summary");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].role, Role::User);
+        assert_eq!(out[0].content.len(), 2); // task + summary
+        assert!(matches!(&out[0].content[1], Block::Text(t) if t.contains("the summary")));
     }
 
     #[test]
@@ -1887,6 +1914,80 @@
         // The main (2nd) request saw the folded history: 3 messages.
         let cap = state.captured();
         assert_eq!(cap[1].message_count, 3);
+    }
+
+    #[test]
+    fn compress_with_keep_recent_zero_folds_everything() {
+        // Loop-level companion to safe_cut_works_with_keep_recent_zero: with
+        // keep_recent=0 the real-loop (user-final) history must still compress.
+        // cut==n → the folded history is exactly the summary head, and the run
+        // completes. Pre-fix this config silently never compressed (the cut
+        // scan missed on user-final histories).
+        let mut cfg = cfg_with(5, 0, 30);
+        cfg.limits.keep_recent_messages = 0;
+        let long = "x".repeat(40);
+        let initial = vec![
+            user_text(&long),
+            Message::assistant(vec![Block::Text("a1".into())]),
+            user_text("u1"),
+            Message::assistant(vec![Block::Text("a2".into())]),
+            user_text("u2"), // user-final: the real loop's request-point shape
+        ];
+        let (prov, state) = MockProvider::new(vec![
+            mock::resp_text("SUMMARY", None),      // summarize_prefix call
+            mock::resp_text("final answer", None), // main call on folded history
+        ]);
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+        let mut events = Vec::new();
+        let o = agent.run(&mut |e| events.push(e)).unwrap();
+        assert_eq!(o.stop_reason, "end_turn");
+        assert_eq!(state.calls(), 2);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::Compressed { dropped: 4, kept: 1, trigger: CompressTrigger::Preflight }
+            )),
+            "empty-tail cut: drop the 4 non-head messages, keep exactly the summary head"
+        );
+        // The main (2nd) request saw the folded history: just the head.
+        let cap = state.captured();
+        assert_eq!(cap[1].message_count, 1);
+    }
+
+    #[test]
+    fn overflow_recovery_with_keep_recent_zero() {
+        // The overflow-escape path checks find_safe_cut(...).is_some() before
+        // force-compressing; with keep_recent=0 and a user-final history that
+        // check used to fail → unrecoverable overflow RunError. Now the empty
+        // tail is a legal cut, the forced compression folds everything, and
+        // the retried request succeeds.
+        let mut cfg = cfg_with(5, 0, 0); // threshold 0: no preflight, only overflow
+        cfg.limits.keep_recent_messages = 0;
+        let initial = vec![
+            user_text("task"),
+            Message::assistant(vec![Block::Text("a1".into())]),
+            user_text("u1"),
+            user_text("u2"),
+        ];
+        let (prov, state) = MockProvider::new(vec![
+            MockTurn::Err("mock: maximum context length exceeded".into()),
+            mock::resp_text("SUMMARY", None),      // forced compression call
+            mock::resp_text("final answer", None), // retried main call
+        ]);
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+        let mut events = Vec::new();
+        let o = agent.run(&mut |e| events.push(e)).unwrap();
+        assert_eq!(o.stop_reason, "end_turn");
+        assert_eq!(state.calls(), 3);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Compressed { trigger: CompressTrigger::Overflow, .. })),
+            "overflow should trigger a forced compression"
+        );
+        // The retried main request saw the folded 1-message history.
+        let cap = state.captured();
+        assert_eq!(cap[2].message_count, 1);
     }
 
     #[test]

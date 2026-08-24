@@ -167,23 +167,26 @@ pub(crate) fn fold_summary(messages: &[Message], cut: usize, summary: &str) -> V
 /// boundary: its tool_use blocks (if any) are answered by the tool_result
 /// that immediately follows it inside the kept tail. Cutting before a
 /// tool_result-bearing user message would orphan those results, so those
-/// are skipped. Must leave at least one middle message worth summarizing,
-/// i.e. n must exceed keep_recent by at least 3 (the kept tail, the
-/// assistant boundary to cut at, and one message before it to summarize).
+/// are skipped. Must leave at least one message worth summarizing beyond
+/// the retained head, i.e. n must exceed keep_recent by at least 2.
 pub(crate) fn find_safe_cut(messages: &[Message], keep_recent: usize) -> Option<usize> {
     let n = messages.len();
-    if n <= keep_recent + 2 {
+    // Saturating guard: a pathological keep_recent (usize::MAX) must disable
+    // compression, not wrap the subtraction below (release: giant cut that
+    // panics on slice; debug: add overflow panic right here).
+    if n <= keep_recent.saturating_add(2) {
         return None;
     }
     // Scan from the tail's nominal start upward for an assistant boundary.
-    // When keep_recent is 0 the nominal start is `n` (empty tail), which made
-    // the loop body unreachable and silently disabled compression for that
-    // config — clamp to n-1 so a single-message tail (the boundary message
-    // itself) is still discoverable. The guard above guarantees n >= 3 when
-    // keep_recent is 0, so n-1 >= 2 (head keeps >= messages[0..2]).
     let mut cut = n - keep_recent;
     if cut >= n {
-        cut = n - 1;
+        // keep_recent == 0: the nominal tail start is n — an EMPTY tail,
+        // which is a legal cut. fold_summary builds head + messages[n..],
+        // i.e. everything except the retained head folds into the summary.
+        // The real loop's history is always user-final at request points, so
+        // the old clamp-to-n-1 fallback made the boundary scan miss and
+        // silently DISABLED compression for keep_recent=0 configs.
+        return Some(n);
     }
     while cut < n {
         if messages[cut].role == Role::Assistant {
@@ -255,7 +258,12 @@ pub(crate) fn window_lines(messages: &[Message], cut: usize) -> Vec<String> {
 /// window → 1024. Replaces the old fixed 2048, which crushed a 100k-char
 /// prefix at ~12:1 and dropped coding-relevant detail.
 pub(crate) fn summary_budget(size: usize) -> u32 {
-    ((size / 16) as u32).clamp(1024, 4096)
+    // try_from, not `as`: `as` truncates (usize→u32), so a transcript over
+    // 16 GiB would wrap to a small budget. Unreachable in practice —
+    // defensive, same spirit as the saturating usage adds.
+    u32::try_from(size / 16)
+        .unwrap_or(u32::MAX)
+        .clamp(1024, 4096)
 }
 
 /// Build the user message for a summary call. With an `old_summary` we ask the
