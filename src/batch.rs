@@ -117,22 +117,40 @@ fn prepare_isolation(
                     src.display()
                 );
             }
-            let out = std::process::Command::new("git")
-                .args([
-                    "-C",
-                    &toplevel,
-                    "worktree",
-                    "add",
-                    "--detach",
-                    &tmp.display().to_string(),
-                ])
-                .output()
-                .context("git worktree add failed to spawn")?;
-            if !out.status.success() {
-                bail!(
-                    "git worktree add failed: {}",
-                    String::from_utf8_lossy(&out.stderr)
-                );
+            // Lock contention (index.lock / config.lock held by a concurrent
+            // git process on this repo) is the one TRANSIENT failure mode of
+            // `worktree add` — and setup_error in batch is otherwise
+            // deterministic (not retried by the attempt loop). Bound the
+            // retry to lock failures only: a non-lock failure (bad repo,
+            // unwritable temp, …) fails fast as before.
+            let mut last_err = String::new();
+            let mut added = false;
+            for attempt in 0..3u32 {
+                let out = std::process::Command::new("git")
+                    .args([
+                        "-C",
+                        &toplevel,
+                        "worktree",
+                        "add",
+                        "--detach",
+                        &tmp.display().to_string(),
+                    ])
+                    .output()
+                    .context("git worktree add failed to spawn")?;
+                if out.status.success() {
+                    added = true;
+                    break;
+                }
+                last_err = String::from_utf8_lossy(&out.stderr).to_string();
+                if !last_err.contains("lock") {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(
+                    200 * u64::from(attempt + 1),
+                ));
+            }
+            if !added {
+                bail!("git worktree add failed: {last_err}");
             }
             Ok(Some(IsolationGuard {
                 mode,
@@ -195,10 +213,13 @@ impl Drop for IsolationGuard {
     }
 }
 
-/// Recursively copy `src` into `dst`, skipping top-level entries named in
-/// `COPY_EXCLUDE`. Symlinks are reproduced as symlinks (preserves workspace
-/// tooling layouts); unreadable entries are errors, not skips — a task that
-/// silently misses an input file fails confusingly later.
+/// Recursively copy `src` into `dst`, skipping TOP-LEVEL entries named in
+/// `COPY_EXCLUDE`. The exclusion list means "the previous batch run's
+/// artifacts / VCS / build caches at the workdir ROOT" — a nested directory
+/// that happens to share a name (`sub/results/`) is task input and must be
+/// copied. Symlinks are reproduced as symlinks (preserves workspace tooling
+/// layouts); unreadable entries are errors, not skips — a task that silently
+/// misses an input file fails confusingly later.
 fn copy_dir_filtered(src: &Path, dst: &Path) -> Result<()> {
     for entry in std::fs::read_dir(src)
         .with_context(|| format!("cannot read {}", src.display()))?
@@ -209,31 +230,57 @@ fn copy_dir_filtered(src: &Path, dst: &Path) -> Result<()> {
         if COPY_EXCLUDE.contains(&name.as_ref()) {
             continue;
         }
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        let ft = entry.file_type()?;
-        if ft.is_symlink() {
-            let target = std::fs::read_link(&from)?;
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(&target, &to)
-                .with_context(|| format!("cannot symlink {} → {}", to.display(), target.display()))?;
-            #[cfg(not(unix))]
-            {
-                // No symlink privilege on Windows by default: fall back to
-                // copying the target (directory or file) in place.
-                if target.is_dir() {
-                    std::fs::create_dir_all(&to)?;
-                    copy_dir_filtered(&from, &to)?;
-                } else {
-                    std::fs::copy(&from, &to)?;
+        copy_entry(&entry.path(), &dst.join(entry.file_name()))?;
+    }
+    Ok(())
+}
+
+/// Copy one entry (file / dir / symlink) — no exclusion filter: exclusions
+/// apply only at the workdir root (see `copy_dir_filtered`).
+fn copy_entry(from: &Path, to: &Path) -> Result<()> {
+    let ft = std::fs::symlink_metadata(from)
+        .with_context(|| format!("cannot stat {}", from.display()))?
+        .file_type();
+    if ft.is_symlink() {
+        let target = std::fs::read_link(from)?;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, to)
+            .with_context(|| format!("cannot symlink {} → {}", to.display(), target.display()))?;
+        #[cfg(not(unix))]
+        {
+            // No symlink privilege on Windows by default: fall back to
+            // copying the target (directory or file) in place. A RELATIVE
+            // target must resolve against the LINK'S PARENT, not the process
+            // CWD — `is_dir()` resolves relative paths against CWD, so the
+            // old spelling copied the wrong thing (or nothing) depending on
+            // where the process happens to run.
+            let resolved = if target.is_absolute() {
+                target.clone()
+            } else {
+                from.parent().unwrap_or(Path::new(".")).join(&target)
+            };
+            if resolved.is_dir() {
+                std::fs::create_dir_all(to)?;
+                for entry in std::fs::read_dir(&resolved)
+                    .with_context(|| format!("cannot read {}", resolved.display()))?
+                {
+                    let entry = entry?;
+                    copy_entry(&entry.path(), &to.join(entry.file_name()))?;
                 }
+            } else {
+                std::fs::copy(from, to)?;
             }
-        } else if ft.is_dir() {
-            std::fs::create_dir_all(&to)?;
-            copy_dir_filtered(&from, &to)?;
-        } else {
-            std::fs::copy(&from, &to)?;
         }
+    } else if ft.is_dir() {
+        std::fs::create_dir_all(to)?;
+        for entry in std::fs::read_dir(from)
+            .with_context(|| format!("cannot read {}", from.display()))?
+        {
+            let entry = entry?;
+            copy_entry(&entry.path(), &to.join(entry.file_name()))?;
+        }
+    } else {
+        std::fs::copy(from, to)?;
     }
     Ok(())
 }
@@ -1572,7 +1619,9 @@ mod tests {
     fn isolate_copy_excludes_heavy_directories() {
         // The exclusion list is load-bearing: copying the previous round's
         // results/ or a multi-GB target/ would be both slow and wrong (stale
-        // outputs presented as task inputs).
+        // outputs presented as task inputs). It applies ONLY at the workdir
+        // root — a nested directory sharing a name (`sub/results/`) is task
+        // input and must be copied.
         let root = std::env::temp_dir().join(format!("ta-batch-exc-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let src = root.join("src");
@@ -1583,6 +1632,9 @@ mod tests {
         std::fs::create_dir_all(src.join("sub")).unwrap();
         std::fs::write(src.join("keep.txt"), "x").unwrap();
         std::fs::write(src.join("sub").join("inner.txt"), "x").unwrap();
+        // A nested `results` directory is task input, not last round's output.
+        std::fs::create_dir_all(src.join("sub").join("results")).unwrap();
+        std::fs::write(src.join("sub").join("results").join("deep.csv"), "x").unwrap();
 
         let base: Config = serde_json::from_str(
             r#"{"provider":"openai","api_key_env":"K","model":"m","workdir":"SRC"}"#,
@@ -1600,6 +1652,10 @@ mod tests {
         }
         assert!(iso.join("keep.txt").exists());
         assert!(iso.join("sub").join("inner.txt").exists(), "nested files copied");
+        assert!(
+            iso.join("sub").join("results").join("deep.csv").exists(),
+            "nested results/ is task input — must be copied (root-level filter only)"
+        );
         drop(guard);
         assert!(!iso.exists(), "guard Drop removes the sandbox");
 
