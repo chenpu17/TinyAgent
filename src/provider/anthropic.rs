@@ -49,20 +49,35 @@ impl Anthropic {
                     image,
                     is_error,
                 } => {
+                    // Anthropic rejects EMPTY text blocks with 400, so the text
+                    // part is only emitted when non-empty: an image-bearing
+                    // result with empty text sends just [image]; a result with
+                    // neither text nor image omits `content` entirely (the API
+                    // allows a content-less tool_result) instead of `"text":""`.
                     let body = match image.as_deref() {
-                        Some(Block::Image { media_type, data }) => json!([
-                            {"type": "image",
-                             "source": {"type": "base64", "media_type": media_type, "data": data}},
-                            {"type": "text", "text": content}
-                        ]),
+                        Some(Block::Image { media_type, data }) => {
+                            let img = json!({
+                                "type": "image",
+                                "source": {"type": "base64", "media_type": media_type, "data": data}
+                            });
+                            if content.is_empty() {
+                                json!([img])
+                            } else {
+                                json!([img, {"type": "text", "text": content}])
+                            }
+                        }
+                        _ if content.is_empty() => serde_json::Value::Null,
                         _ => json!(content),
                     };
-                    json!({
+                    let mut v = json!({
                         "type": "tool_result",
                         "tool_use_id": tool_use_id,
-                        "content": body,
                         "is_error": is_error
-                    })
+                    });
+                    if !body.is_null() {
+                        v["content"] = body;
+                    }
+                    v
                 }
             })
             .collect();
@@ -319,7 +334,18 @@ impl Anthropic {
                         "tool_use" => Pending::ToolUse {
                             id: cb["id"].as_str().unwrap_or_default().to_string(),
                             name: cb["name"].as_str().unwrap_or_default().to_string(),
-                            json: String::new(),
+                            // The official API always sends `"input": {}` here
+                            // and streams the real arguments via later
+                            // input_json_delta events; a non-conforming gateway
+                            // may inline the full object in content_block_start
+                            // instead. Seed the buffer with it iff it's a
+                            // NON-EMPTY object — official streams (empty
+                            // object) are byte-for-byte unaffected.
+                            json: cb["input"]
+                                .as_object()
+                                .filter(|o| !o.is_empty())
+                                .map(|o| Value::Object(o.clone()).to_string())
+                                .unwrap_or_default(),
                         },
                         // Extended-thinking blocks. `thinking` streams its text
                         // via later thinking_delta events (surfaced as
@@ -412,6 +438,18 @@ impl Anthropic {
                         usage: Some(usage),
                     });
                 }
+                // The official API closes the body right after message_stop,
+                // so the loop could previously rely on EOF alone to end. A
+                // gateway that HOLDS the connection open (LiteLLM-style
+                // proxies, enterprise relays) never EOFs: the loop sat until
+                // the 30s idle timeout, and that abort ("stream_idle")
+                // overrode the real stop_reason — an entire tool_use turn was
+                // then killed by the agent's aborted-branch block stripping.
+                // Breaking here mirrors the OpenAI parser's explicit
+                // `data: [DONE]` termination; the pending flush and the
+                // stop_reason priority chain below are shared with the EOF
+                // path, so nothing else changes.
+                "message_stop" => break,
                 _ => {}
             }
         }
@@ -674,6 +712,131 @@ mod tests {
             Block::ToolUse { input, .. } => assert!(input.get("_raw").is_some()),
             other => panic!("expected tool_use, got {other:?}"),
         }
+    }
+
+    /// A reader that hands out one batch of bytes, then FAILS every read —
+    /// simulating a gateway that holds the connection open after message_stop
+    /// and later breaks, with no clean EOF in between. The sync test source
+    /// has no idle-timeout notion; the error stands in for "the loop kept
+    /// reading past message_stop", which is exactly what the fix removes.
+    struct HoldThenErr {
+        data: Vec<u8>,
+        pos: usize,
+    }
+    impl std::io::Read for HoldThenErr {
+        fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos >= self.data.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "gateway broke",
+                ));
+            }
+            let n = (self.data.len() - self.pos).min(b.len());
+            b[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn message_stop_ends_the_stream_without_eof() {
+        // A1: a tool_use turn whose stream ends with message_stop while the
+        // server keeps the body open. Pre-fix the loop read on → the error
+        // surfaced as stop_reason "stream_error"; post-fix it breaks at
+        // message_stop and returns the REAL stop_reason with blocks intact
+        // (the agent's aborted branch would otherwise strip the tool_use and
+        // fail the whole run).
+        let raw = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"shell\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"ls\\\"}\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let resp = Anthropic::parse_stream(
+            HoldThenErr {
+                data: raw.as_bytes().to_vec(),
+                pos: 0,
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(resp.stop_reason, "tool_use");
+        match &resp.blocks[0] {
+            Block::ToolUse { id, input, .. } => {
+                assert_eq!(id, "t1");
+                assert_eq!(input["command"], "ls");
+            }
+            other => panic!("expected tool_use, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn content_block_start_with_inline_input_is_seeded() {
+        // B5: a gateway may inline the tool arguments in content_block_start
+        // (the official API always sends {} and streams via input_json_delta).
+        // With no deltas following, the seeded object must become the input —
+        // previously it was dropped entirely (empty json → {}).
+        let raw = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t2\",\"name\":\"shell\",\"input\":{\"command\":\"pwd\"}}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let resp = parse(raw.as_bytes());
+        assert_eq!(resp.stop_reason, "tool_use");
+        match &resp.blocks[0] {
+            Block::ToolUse { id, input, .. } => {
+                assert_eq!(id, "t2");
+                assert_eq!(input["command"], "pwd");
+            }
+            other => panic!("expected tool_use, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_result_serialization_avoids_empty_text_blocks() {
+        // B6: Anthropic rejects empty text blocks with 400. An image-bearing
+        // result with empty text must emit only the image block; a result with
+        // neither text nor image must OMIT `content` (legal per the API)
+        // instead of sending `"text": ""`.
+        let mk = |content: &str, image: Option<Block>| {
+            Message::user(vec![Block::ToolResult {
+                tool_use_id: "t1".into(),
+                content: content.into(),
+                image: image.map(Box::new),
+                is_error: false,
+            }])
+        };
+        let img = || Block::Image {
+            media_type: "image/png".into(),
+            data: "AAAA".into(),
+        };
+
+        // image + empty text → [image] only
+        let v = Anthropic::message_json(&mk("", Some(img())));
+        let blocks = v["content"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1, "got: {blocks:?}");
+        assert_eq!(blocks[0]["type"], "image");
+
+        // no image + empty text → content key omitted entirely
+        let v = Anthropic::message_json(&mk("", None));
+        assert!(
+            v["content"][0].get("content").is_none(),
+            "content must be omitted, got: {}",
+            v["content"][0]
+        );
+
+        // image + text → [image, text] (unchanged shape)
+        let v = Anthropic::message_json(&mk("ok", Some(img())));
+        let blocks = v["content"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[1]["type"], "text");
+        assert_eq!(blocks[1]["text"], "ok");
+
+        // text only → bare string (unchanged shape)
+        let v = Anthropic::message_json(&mk("plain", None));
+        assert_eq!(v["content"][0]["content"], "plain");
     }
 
     /// A representative agent-turn request: system prompt + two tools + two
