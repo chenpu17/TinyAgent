@@ -722,6 +722,19 @@ fn run_one_attempt(
             // bills them, and so a final success isn't undercosted.
             acc.add_failed(&re);
             let msg = format!("{re:#}");
+            // B4: an unfixable context overflow is deterministic — label it
+            // distinctly so run_one's retry gate (stop_reason == "error")
+            // skips the backoff ladder, and CI can tell context overflows
+            // apart from transient errors. Known corner, accepted: when a
+            // TRANSIENT summary failure (compress_failed) stacks on top of a
+            // real overflow, a retry might have saved the run — we label it
+            // deterministic anyway rather than pay N×(1+2+4…s) of backoff
+            // on every genuine overflow.
+            let stop = if re.is_context_overflow() {
+                "context_overflow"
+            } else {
+                "error"
+            };
             // Write a per-task result file for the failure too — audit parity
             // with single-run (which always produces a result artifact). The
             // accumulated tokens + tool_calls land here via write_result's None
@@ -735,7 +748,7 @@ fn run_one_attempt(
                 None,
                 Some(&msg),
                 attempt_no,
-                "error",
+                stop,
                 // `acc` is a &mut param here, so pass it directly (an implicit
                 // shared reborrow to &RunCost) — not `&acc` (a needless double
                 // borrow). The later `&acc.usage` still borrows fine.
@@ -746,7 +759,7 @@ fn run_one_attempt(
             }
             // Bill the accumulated cost (this attempt + any prior retries) so a
             // failed task reports honest token totals in report.json, not zero.
-            let mut r = bad("error", msg, &acc.usage, acc.turns);
+            let mut r = bad(stop, msg, &acc.usage, acc.turns);
             // Attribute to the model that actually RAN — `bad` stamps the BASE
             // model, which is only correct for bad_task / setup_error (they
             // fail before apply). This run happened after `cfg.apply`, so a
@@ -1492,6 +1505,71 @@ mod tests {
             "failed run bills the model that actually ran"
         );
         assert_eq!(tasks[0].stop_reason, "error");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Loopback mock that rejects EVERY request with a 400 context-overflow
+    /// body (the deterministic too-long rejection).
+    fn overflow_400_mock() -> (String, Arc<Mutex<usize>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let count_c = count.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = match stream {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let _body = read_http_body(&stream);
+                *count_c.lock().unwrap() += 1;
+                let payload = r#"{"error":{"message":"This model's maximum context length is 4096 tokens. However, your messages resulted in 9000 tokens. Please reduce the length of the messages.","type":"invalid_request_error"}}"#;
+                let head = format!(
+                    "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    payload.len(),
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(payload.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (url, count)
+    }
+
+    #[test]
+    fn overflow_failure_is_not_retried_in_batch() {
+        // B4: a context-overflow 400 is deterministic (compression already
+        // failed to save it — 1-message history has no safe cut). --retries 3
+        // must NOT run the backoff ladder: exactly one provider request,
+        // stop_reason "context_overflow" (distinct from transient "error"),
+        // and the whole task finishes in well under the first backoff second.
+        let (url, count) = overflow_400_mock();
+        let dir = std::env::temp_dir().join(format!("ta-batch-ovf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("t.json"), r#"{"task":"x"}"#).unwrap();
+        std::env::set_var("TA_BATCH_OVF_KEY", "dummy");
+        let base: Config = serde_json::from_str(&format!(
+            r#"{{"provider":"openai","api_key_env":"TA_BATCH_OVF_KEY","model":"m","base_url":"{}"}}"#,
+            url
+        ))
+        .unwrap();
+        let report = dir.join("report.json");
+
+        let start = std::time::Instant::now();
+        let code =
+            run(&base, &dir, 1, &report, 3, false, IsolateMode::None, Default::default()).unwrap();
+        assert_eq!(code, 1);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "no backoff ladder; took {:?}",
+            start.elapsed()
+        );
+        assert_eq!(*count.lock().unwrap(), 1, "exactly one request — no retries");
+        let tasks = read_prior_tasks(&report).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].stop_reason, "context_overflow");
 
         std::fs::remove_dir_all(&dir).ok();
     }

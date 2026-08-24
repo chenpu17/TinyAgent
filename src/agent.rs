@@ -227,6 +227,18 @@ impl std::error::Error for RunError {
     }
 }
 
+impl RunError {
+    /// True when the run died on a provider "request too long for the context
+    /// window" rejection that the overflow escape already failed to fix (or
+    /// couldn't attempt). DETERMINISTIC: a retry re-sends an at-best
+    /// equally-long request and fails identically — `run_with_retries` and
+    /// batch use this to skip the retry ladder and to label the failure
+    /// `context_overflow` (distinct from transient `error`).
+    pub fn is_context_overflow(&self) -> bool {
+        crate::compress::is_context_overflow(&self.source)
+    }
+}
+
 /// Serialize the structured cost fields (usage / tool_calls / turns / elapsed)
 /// so the Python / TypeScript bindings can hand a failed run's honest cost back
 /// to the host — previously the bindings only took `Display` (the source

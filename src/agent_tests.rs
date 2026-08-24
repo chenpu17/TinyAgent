@@ -2939,6 +2939,60 @@
     }
 
     #[test]
+    fn unfixable_overflow_run_error_is_deterministic() {
+        // B4: an overflow the escape hatch can't fix (history uncompressible —
+        // keep_recent too large for a safe cut) surfaces as a RunError whose
+        // is_context_overflow() is true; harness/batch use that to skip the
+        // transient retry ladder. A plain transient error is NOT overflow.
+        let mut cfg = cfg_with(5, 0, 0);
+        cfg.limits.keep_recent_messages = 100; // n <= keep+2 → no safe cut
+        let (prov, _) = MockProvider::new(vec![MockTurn::Err(
+            "mock: maximum context length is 8192 tokens, got 9000".into(),
+        )]);
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], vec![user_text("go")], test_ctx());
+        let re = match agent.run(&mut |_| {}) {
+            Err(e) => e,
+            Ok(o) => panic!("expected Err, got Ok({})", o.stop_reason),
+        };
+        assert!(re.is_context_overflow(), "source: {re:#}");
+
+        let (prov2, _) = MockProvider::new(vec![MockTurn::Err("503 transient".into())]);
+        let mut agent2 =
+            Agent::new(&cfg, Box::new(prov2), vec![], vec![user_text("go")], test_ctx());
+        let re2 = match agent2.run(&mut |_| {}) {
+            Err(e) => e,
+            Ok(o) => panic!("expected Err, got Ok({})", o.stop_reason),
+        };
+        assert!(!re2.is_context_overflow());
+    }
+
+    #[test]
+    fn single_run_does_not_retry_unfixable_overflow() {
+        // B4 companion: the retry ladder must not fire on deterministic
+        // overflow — retries=3 with a single scripted Err still makes exactly
+        // ONE provider call (a retry would consume the script and surface
+        // "turns exhausted" on later attempts, inflating calls()).
+        let mut cfg = cfg_with(5, 0, 0);
+        cfg.limits.keep_recent_messages = 100;
+        let (prov, state) = MockProvider::new(vec![MockTurn::Err(
+            "mock: maximum context length exceeded".into(),
+        )]);
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], vec![user_text("go")], test_ctx());
+        let dir = std::env::temp_dir().join(format!("ta-retry-ovf-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let out = dir.join("r.json");
+        let code =
+            crate::harness::run_with_retries(&mut agent, Some(&out), false, 3, |_| {}).unwrap();
+        assert_eq!(code, 1);
+        assert_eq!(
+            state.calls(),
+            1,
+            "deterministic overflow must not enter the retry ladder"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn single_run_folds_failed_attempt_cost_into_final_totals() {
         // P2-3 (honest cost): a retried run's result.json must bill EVERY
         // attempt, not just the last. Attempt 1 bills 100/10 streamed tokens

@@ -133,6 +133,14 @@ pub(crate) fn run_with_retries(
             Err(re) => {
                 // Record what this failed attempt burned before retrying.
                 acc.add_failed(&re);
+                // B4: an unfixable context overflow is deterministic — the
+                // escape hatch already force-compressed (or couldn't) and a
+                // retry re-sends an at-best equally-long request. Skip the
+                // backoff ladder, which would only burn 1+2+4…s per attempt
+                // to fail identically.
+                if re.is_context_overflow() {
+                    break (EXIT_ERROR, None, Some(format!("{re:#}")));
+                }
                 if attempt <= retries {
                     let backoff = crate::retry::backoff(attempt - 1);
                     let msg = format!("{re:#}");
