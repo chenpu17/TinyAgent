@@ -35,6 +35,8 @@ impl Tool for Shell {
         // a single `sh -c make` execs make, but make spawns compilers; those
         // grandchildren share the child's group and would otherwise survive a
         // plain `child.kill()` and keep the build running in the background.
+        // The same group kill also reclaims background processes left holding
+        // the output pipes after a normal exit (collect_output below).
         let mut child = {
             #[cfg(unix)]
             {
@@ -73,8 +75,19 @@ impl Tool for Shell {
         let cap = ctx.max_output_chars.saturating_mul(4).saturating_add(1024);
         let mut out_pipe = child.stdout.take().expect("stdout piped");
         let mut err_pipe = child.stderr.take().expect("stderr piped");
-        let out_thread = std::thread::spawn(move || read_capped(&mut out_pipe, cap));
-        let err_thread = std::thread::spawn(move || read_capped(&mut err_pipe, cap));
+        // Each reader SENDS its bytes at EOF (instead of returning them) so
+        // the parent can wait with a deadline — an unconditional join here is
+        // the pre-fix bug: a leftover background process holding the pipe
+        // kept EOF from ever arriving and hung the turn forever (see
+        // collect_output).
+        let (tx, rx) = std::sync::mpsc::channel::<ReaderDone>();
+        let tx_err = tx.clone();
+        let out_thread = std::thread::spawn(move || {
+            let _ = tx.send(ReaderDone::Stdout(read_capped(&mut out_pipe, cap)));
+        });
+        let err_thread = std::thread::spawn(move || {
+            let _ = tx_err.send(ReaderDone::Stderr(read_capped(&mut err_pipe, cap)));
+        });
 
         // Poll the child so a timeout or cancel can kill it (wait_with_output
         // would consume the handle and leak the process on timeout).
@@ -110,8 +123,18 @@ impl Tool for Shell {
             }
         };
 
-        let stdout = out_thread.join().unwrap_or_default();
-        let stderr = err_thread.join().unwrap_or_default();
+        // Collect the readers, reclaiming leftover background processes that
+        // hold the pipes open past the child's exit (collect_output): the
+        // pre-fix unconditional join could block FOREVER on this path.
+        let c = collect_output(&rx, &mut child, ctx);
+        // Join only completed readers — a leaked one is still blocked in
+        // read(); dropping its handle detaches it (it exits at process exit).
+        if !c.leaked {
+            let _ = out_thread.join();
+            let _ = err_thread.join();
+        }
+        let stdout = c.stdout;
+        let stderr = c.stderr;
 
         let Some(status) = status else {
             let mut out = format!("$ {cmd}\n");
@@ -153,6 +176,28 @@ impl Tool for Shell {
         let code = status.code().unwrap_or(-1);
         out.push_str(&format!("\n[exit code: {code}]"));
         truncate(&mut out, ctx.max_output_chars);
+        // Post-exit notes, appended AFTER truncate so they can't be cut away.
+        // The command itself ran to completion (real exit code above); these
+        // are side notes about what its leftovers cost, so they never flip
+        // is_error — the exit code stays the single truth for that.
+        if c.reclaimed {
+            out.push_str(
+                "\n[reclaimed background processes that were still holding the output pipe; \
+                 to leave one running, redirect its output: cmd >log 2>&1 &]",
+            );
+        }
+        if c.leaked {
+            out.push_str(
+                "\n[stopped waiting for command output: leftover processes outside the \
+                 process group still hold the pipe; some output may be missing]",
+            );
+        }
+        // A cancel that landed while waiting for the leftover processes: the
+        // command's own result stands (exit code above is real), the marker
+        // records that the user pulled the plug on the stragglers.
+        if c.cancelled {
+            out.push_str("\n[command cancelled by user]");
+        }
 
         if code == 0 {
             Ok(ToolOutput::text(out))
@@ -179,6 +224,146 @@ fn read_capped<R: Read>(r: &mut R, cap: usize) -> Vec<u8> {
         }
     }
     buf
+}
+
+/// A reader thread's final message: which pipe it drained, and the bytes.
+/// One message per reader, sent at EOF — so waiting with a deadline is
+/// possible, but partial bytes are only available once EOF arrives.
+enum ReaderDone {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+}
+
+/// How long EOF may lag the direct child's exit before leftover background
+/// processes are reclaimed (see [`collect_output`]). A command that leaves
+/// nothing behind closes its write ends at exit, so normal commands never
+/// wait out this grace.
+const PIPE_GRACE: Duration = Duration::from_secs(2);
+
+/// Slice for the collection loop's `recv_timeout`: bounds how long a cancel
+/// can go unnoticed mid-grace (same cadence as the poll loop's 50ms).
+const COLLECT_POLL: Duration = Duration::from_millis(50);
+
+/// Output collected from the two reader threads after the poll loop, plus
+/// what had to happen to get it.
+struct Collected {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    /// Had to kill the process group to force pipe EOF — leftover background
+    /// processes held a write end past the grace.
+    reclaimed: bool,
+    /// Gave up waiting: readers abandoned mid-read, their bytes lost (a
+    /// process outside the group still holds the pipe).
+    leaked: bool,
+    /// ctx.cancel fired while collecting.
+    cancelled: bool,
+}
+
+/// Collect the reader threads' output once the poll loop is done, forcing EOF
+/// when the command left background processes holding the pipes.
+///
+/// EOF on a pipe needs EVERY write end closed, and a backgrounded process
+/// inherits the tool's stdout/stderr as its own fd1/2: `sleep 60 & echo hi`,
+/// or `cd dir && server >/dev/null 2>&1 & curl …` where `&` backgrounds the
+/// whole AND-list and the subshell forked for it — not the inner server,
+/// whose redirect only covers itself — holds the pipe for as long as it
+/// waits. The direct child's exit closes only ITS write ends, so after a
+/// normal exit the readers can block in `read()` forever, and an
+/// unconditional join (the pre-fix code) hung the whole turn with no rescue:
+/// the timeout/cancel checks live in the poll loop, which has already exited,
+/// and the run-level deadline only caps chat requests, not tool execution.
+///
+/// Collection is therefore phased:
+/// 1. wait up to [`PIPE_GRACE`] for natural EOF (a cancel aborts at the next
+///    slice, skipping straight to the reclaim);
+/// 2. pipe still open → [`kill_process_group`] to force EOF — the group
+///    SURVIVES the direct child's exit (reparenting to init doesn't change
+///    pgid), so the kill still reaches the stragglers. Same kill the timeout
+///    path uses, just triggered by pipe closure instead of time;
+/// 3. still open after a second grace — a process that escaped the group
+///    (`setsid`), or Windows where the non-unix "group kill" can only kill
+///    the already-exited direct child — abandon the readers: return without
+///    joining (two threads stay blocked in `read()` until process exit)
+///    rather than hang the turn. Their bytes are lost.
+///
+/// Theoretical, accepted: on the normal-exit path the child is already
+/// reaped when the group kill runs, so its pid could in principle have been
+/// reused as a new process-group id. Cycling the whole pid space (macOS ~99k,
+/// Linux ~4M) inside a 2s grace is not a real scenario; the timeout path
+/// kills before reaping and has no such window. (Windows Job Objects would
+/// close the phase-3 gap there; backlog.)
+fn collect_output(
+    rx: &std::sync::mpsc::Receiver<ReaderDone>,
+    child: &mut std::process::Child,
+    ctx: &ToolCtx,
+) -> Collected {
+    // Phase 1: bounded wait for natural EOF. On the killed path (timeout /
+    // cancel) the poll loop's killpg already forced EOF, so this returns
+    // immediately; on a normal exit it covers output still in flight plus
+    // short-lived background writers finishing up.
+    let mut cancelled = false;
+    let (mut out, mut err) = wait_readers(rx, Instant::now() + PIPE_GRACE, || {
+        if ctx
+            .cancel
+            .as_ref()
+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            cancelled = true;
+            true
+        } else {
+            false
+        }
+    });
+
+    // Phase 2: the pipe is still open — someone in the child's group is
+    // holding a write end. Kill the group to force EOF.
+    let mut reclaimed = false;
+    if out.is_none() || err.is_none() {
+        kill_process_group(child);
+        reclaimed = true;
+        let (o, e) = wait_readers(rx, Instant::now() + PIPE_GRACE, || false);
+        out = out.or(o);
+        err = err.or(e);
+    }
+
+    // Phase 3: even the kill didn't produce EOF. Abandon the readers instead
+    // of hanging; whatever they read is stuck in the held pipe.
+    let leaked = out.is_none() || err.is_none();
+    Collected {
+        stdout: out.unwrap_or_default(),
+        stderr: err.unwrap_or_default(),
+        reclaimed,
+        leaked,
+        cancelled,
+    }
+}
+
+/// Wait for the readers' EOF messages until `deadline`, waking on arrival (no
+/// added latency for normal commands) and slicing the blocking wait at
+/// [`COLLECT_POLL`] so `on_slice` — the cancel check — runs at least that
+/// often. `on_slice` returning true aborts the wait early.
+fn wait_readers(
+    rx: &std::sync::mpsc::Receiver<ReaderDone>,
+    deadline: Instant,
+    mut on_slice: impl FnMut() -> bool,
+) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    let (mut out, mut err) = (None, None);
+    while out.is_none() || err.is_none() {
+        let remain = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(remain.min(COLLECT_POLL)) {
+            Ok(ReaderDone::Stdout(b)) => out = Some(b),
+            Ok(ReaderDone::Stderr(b)) => err = Some(b),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if Instant::now() >= deadline || on_slice() {
+                    break;
+                }
+            }
+            // Both readers exited without reporting (a panicked reader): the
+            // bytes are gone; stop waiting instead of holding the deadline.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    (out, err)
 }
 
 /// Decode captured command output to a string. Modern tools emit UTF-8, but on
@@ -226,10 +411,17 @@ fn oem_encoding_for(cp: u32) -> Option<&'static encoding_rs::Encoding> {
 /// the child a group leader, so its pid IS the group id and `-pid` targets
 /// every descendant — plain `child.kill()` only signals the direct child and
 /// orphans grandchildren (a build tool's compilers, a test runner's workers).
-/// ESRCH (already reaped) is harmless, so the return is ignored. No process
-/// groups off unix — kill the direct child so a timeout/cancel actually stops
-/// the command (a bare no-op left child.wait() blocking until the command
-/// finished on its own, voiding the configured timeout and Ctrl-C). Mirrors
+/// The group SURVIVES the direct child's exit (reparenting to init doesn't
+/// change pgid), so this also works post-exit to reclaim background processes
+/// that kept the output pipes open (collect_output) — by then the child is
+/// already reaped and its pid theoretically reusable as a fresh pgid, but
+/// cycling the whole pid space inside the 2s grace is not a real scenario.
+/// ESRCH (nothing left in the group) is harmless, so the return is ignored.
+/// No process groups off unix — kill the direct child so a timeout/cancel
+/// actually stops the command (a bare no-op left child.wait() blocking until
+/// the command finished on its own, voiding the configured timeout and
+/// Ctrl-C). On the post-exit reclaim path that kill is a no-op (child already
+/// dead) and collection falls through to abandoning the readers. Mirrors
 /// StdioTransport::drop's non-unix branch.
 #[cfg(unix)]
 fn kill_process_group(child: &mut std::process::Child) {
@@ -260,7 +452,10 @@ mod tests {
         // Real bytes for "不是内部" in GBK — not valid UTF-8, so the fallback fires.
         let gbk = [0xb2u8, 0xbb, 0xca, 0xc7, 0xc4, 0xda, 0xb2, 0xbf];
         let s = enc.decode(&gbk).0;
-        assert!(s.contains("不是内部"), "GBK should decode to Chinese, got: {s:?}");
+        assert!(
+            s.contains("不是内部"),
+            "GBK should decode to Chinese, got: {s:?}"
+        );
     }
     #[cfg(unix)]
     use std::sync::atomic::AtomicBool;
@@ -342,7 +537,10 @@ mod tests {
     #[test]
     fn runs_command_and_reports_zero_exit() {
         let out = Shell
-            .run(&json!({"command": "echo hello"}), &ctx(std::env::temp_dir(), 1000))
+            .run(
+                &json!({"command": "echo hello"}),
+                &ctx(std::env::temp_dir(), 1000),
+            )
             .unwrap();
         assert!(!out.is_error, "echo should exit 0: {}", out.content);
         assert!(out.content.contains("hello"));
@@ -353,7 +551,10 @@ mod tests {
     #[test]
     fn nonzero_exit_is_flagged_error_with_code() {
         let out = Shell
-            .run(&json!({"command": "exit 7"}), &ctx(std::env::temp_dir(), 1000))
+            .run(
+                &json!({"command": "exit 7"}),
+                &ctx(std::env::temp_dir(), 1000),
+            )
             .unwrap();
         assert!(out.is_error);
         assert!(out.content.contains("[exit code: 7]"));
@@ -363,7 +564,10 @@ mod tests {
     #[test]
     fn stderr_is_captured_under_a_section_header() {
         let out = Shell
-            .run(&json!({"command": "echo oops >&2"}), &ctx(std::env::temp_dir(), 1000))
+            .run(
+                &json!({"command": "echo oops >&2"}),
+                &ctx(std::env::temp_dir(), 1000),
+            )
             .unwrap();
         assert!(
             out.content.contains("[stderr]"),
@@ -425,7 +629,8 @@ mod tests {
         let elapsed = start.elapsed();
         assert!(out.is_error);
         assert!(
-            out.content.contains("[command timed out after 1s and was killed]"),
+            out.content
+                .contains("[command timed out after 1s and was killed]"),
             "got: {}",
             out.content
         );
@@ -450,8 +655,172 @@ mod tests {
             hooks: None,
             subagent: None,
         };
-        let out = Shell.run(&json!({"command": "sleep 2 && echo done"}), &ctx).unwrap();
+        let out = Shell
+            .run(&json!({"command": "sleep 2 && echo done"}), &ctx)
+            .unwrap();
         assert!(!out.is_error, "got: {}", out.content);
         assert!(out.content.contains("done"));
+    }
+
+    // ── Post-exit pipe reclamation (the orphan-hang fix) ─────────────────────
+    //
+    // Assertions match "\npayload" (payload at line start) rather than the
+    // bare word: the output's first line echoes the command itself, which
+    // contains every payload string.
+
+    #[cfg(unix)]
+    #[test]
+    fn background_process_holding_the_pipe_is_reclaimed() {
+        // `sleep 60 &` inherits the tool's pipes as fd1/2 and never closes
+        // them: the direct sh exits immediately, EOF never arrives, and the
+        // pre-fix unconditional join hung the turn FOREVER (no timeout /
+        // cancel check survived on that path). The grace must expire, the
+        // group must be reclaimed (the note says so), and the call must come
+        // back in ~grace — not 60s.
+        let start = Instant::now();
+        let out = Shell
+            .run(
+                &json!({"command": "sleep 60 & echo bg_here"}),
+                &ctx(std::env::temp_dir(), 5000),
+            )
+            .unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            !out.is_error,
+            "echo exits 0; the reclaim note must not flip error: {}",
+            out.content
+        );
+        assert!(out.content.contains("\nbg_here"), "got: {}", out.content);
+        assert!(out.content.contains("[exit code: 0]"));
+        assert!(
+            out.content.contains("[reclaimed"),
+            "reclaim note missing: {}",
+            out.content
+        );
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "grace (2s) + slack, took {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backgrounded_and_list_subshell_is_reclaimed() {
+        // The reporter's shape: `&` backgrounds the whole AND-list, and the
+        // subshell forked for it holds the pipes as fd1/2 — the inner command
+        // could redirect all it wants, the subshell itself still holds the
+        // write ends while it waits. Same reclaim as the simple case.
+        let start = Instant::now();
+        let out = Shell
+            .run(
+                &json!({"command": "sleep 60 && echo never & echo done_now"}),
+                &ctx(std::env::temp_dir(), 5000),
+            )
+            .unwrap();
+        assert!(out.content.contains("\ndone_now"), "got: {}", out.content);
+        assert!(
+            out.content.contains("[reclaimed"),
+            "reclaim note missing: {}",
+            out.content
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(6),
+            "took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn redirected_background_process_does_not_hold_the_pipe() {
+        // The documented escape hatch: a background process that redirects
+        // its own output never holds the tool's pipes, so the tool must NOT
+        // wait out the grace or fire the reclaim — this is how a model leaves
+        // something running across calls.
+        let start = Instant::now();
+        let out = Shell
+            .run(
+                &json!({"command": "sleep 60 >/dev/null 2>&1 & echo gone_now"}),
+                &ctx(std::env::temp_dir(), 5000),
+            )
+            .unwrap();
+        assert!(out.content.contains("\ngone_now"), "got: {}", out.content);
+        assert!(
+            !out.content.contains("[reclaimed"),
+            "a redirected bg process must not be reclaimed: {}",
+            out.content
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "EOF should arrive at child exit, not after the grace: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancel_during_grace_reclaims_immediately() {
+        // Ctrl-C while collection is inside the grace: the wait must abort at
+        // the next slice, kill the group, and return with the cancel marker —
+        // long before the 2s grace would have expired on its own.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        let ctx = ToolCtx {
+            cancel: Some(cancel),
+            ..ctx(std::env::temp_dir(), 5000)
+        };
+        let start = Instant::now();
+        let out = Shell
+            .run(&json!({"command": "sleep 60 & echo ccl_now"}), &ctx)
+            .unwrap();
+        assert!(out.content.contains("\nccl_now"), "got: {}", out.content);
+        assert!(
+            out.content.contains("[command cancelled by user]"),
+            "cancel marker missing: {}",
+            out.content
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "cancel at ~300ms must beat the 2s grace: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_escapee_abandons_readers_instead_of_hanging() {
+        // os.setsid moves the background process into its own session, so the
+        // reclaim kill can't force EOF. The collector must give up (abandon
+        // the blocked readers, report the loss) instead of hanging: both
+        // graces expire, so this returns after ~4s with the stopped-waiting
+        // note and WITHOUT the pipe's content (it is stuck behind the
+        // escapee). Depends on python3 (CI's unix images carry it for the
+        // bindings; there is no `setsid(1)` binary on macOS to do this in sh).
+        let start = Instant::now();
+        let out = Shell
+            .run(
+                &json!({"command": "python3 -c 'import os,time; os.setsid(); time.sleep(60)' & echo lost_now"}),
+                &ctx(std::env::temp_dir(), 5000),
+            )
+            .unwrap();
+        assert!(
+            out.content.contains("[stopped waiting"),
+            "abandon note missing: {}",
+            out.content
+        );
+        assert!(
+            !out.content.contains("\nlost_now"),
+            "stdout is stuck in the held pipe and must be reported lost: {}",
+            out.content
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(8),
+            "two graces (2s+2s) + spawn, took {:?}",
+            start.elapsed()
+        );
     }
 }

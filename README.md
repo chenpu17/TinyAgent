@@ -659,7 +659,7 @@ Linux/macOS 经 SIGINT、Windows 经 `SetConsoleCtrlHandler`，行为一致。
 
 | 工具 | 说明 |
 |---|---|
-| `shell` | 在工作目录执行命令（sh -c / cmd /C），超时后 kill（默认 120s，`limits.shell_timeout_secs` 可调、0=不限），输出有界读取并按 `max_output_chars` 截断 |
+| `shell` | 在工作目录执行命令（sh -c / cmd /C），超时后 kill 整个进程组（默认 120s，`limits.shell_timeout_secs` 可调、0=不限），输出有界读取并按 `max_output_chars` 截断；命令留下的、仍持有输出管道的后台进程在 2s 宽限后被回收并标注（想留后台进程运行请重定向其输出：`cmd >log 2>&1 &`，不持管道即不受影响） |
 | `read_file` | 读文本文件，带行号，支持 offset/limit；流式读取，超大文件不会整段进内存 |
 | `write_file` | 全量重写文件，自动创建父目录 |
 | `edit_file` | 精确替换：`old_string`→`new_string`，默认要求唯一匹配（`replace_all` 全替换）；匹配 0 或 >1 时报错引导补上下文，复用 `restrict_to_workdir` 沙箱 |

@@ -229,6 +229,23 @@ cargo clippy -p tiny-agent-node
     drop 时释放 libuv async handle 有时机问题（**工具/ provider 都有，预先存在**）——独立脚本 run 完不会
     自然退出；`node --test` 的 pending-promise 检查会因此误判文件 hang。force-exit 是 napi 绑定测试的
     标准做法，不掩盖功能 bug（测试仍验证正确性）。
+- **shell 正常退出后的管道孤儿回收**（`tools/shell.rs::collect_output`）：读管道线程的 EOF 要等
+  **所有**写端关闭；命令留下的后台进程继承工具管道（`sleep 60 & echo x`，或 `cd d && server
+  >/dev/null 2>&1 & curl …`——`&` 后台化整个 AND-list，为其 fork 的子 shell **自己**持有 fd1/2，
+  内层重定向管不到它），直接子进程退出后 EOF 永不到达 → 旧版在无条件 `join()` 上**永久挂死**
+  （超时/cancel 检查都在轮询循环里、break 后不可达；run 级 `timeout_secs` 只 cap chat 请求、
+  救不到工具执行；唯一逃生门是 headless 二次 Ctrl-C 硬退）。现修法：读线程 EOF 时经 mpsc 单通道
+  发 `(ReaderDone::Stdout/Stderr, 字节)`，收尾三段——①宽限 2s（`PIPE_GRACE`）等自然 EOF
+  （`recv_timeout` 50ms 切片查 cancel，取消立即进②；正常命令 EOF 即时到、零新增延迟）②
+  `kill_process_group` 强制 EOF：进程组**在组长退出后仍存活**（reparent 不改 pgid），与超时路径
+  同一把刀、只是触发时机不同（注意：此时子进程已 reap，pid 理论上可复用为新 pgid——2s 内跑完
+  整 pid 空间不可能，注释在案）③再等一个宽限仍无 EOF（`setsid` 逃逸 / Windows 的 kill 只能杀
+  已死的直接子进程）→ 放弃 join、标注后返回（泄漏 2 个读线程到进程退出，字节丢失；Windows 正解
+  Job Objects 在 backlog）。**留后台进程的正确姿势是重定向其输出**（`cmd >log 2>&1 &`）——
+  不持管道即不触发回收、跨调用存活，有单测钉住这条逃生门。回收/泄漏/取消标记只追加在**正常退出
+  路径**输出尾部（truncate 之后防被截掉）；None（超时/取消杀）路径输出与旧版逐字节一致；
+  `is_error` 仍按 exit code 判（回收是旁注、不谎报失败）；cancel 在宽限期命中时保留真实
+  exit code + 追加 cancelled 标记。
 - **`panic = "abort"`（`[profile.release]`）**：release 下 panic **不触发 `Drop`**。TUI 的终端还原
   (`TerminalGuard`)、MCP 子进程清理（`StdioTransport::drop`）都依赖 Drop——调试这些行为用
   **debug 构建**。`std::process::exit` 也跳过 Drop，headless 模式退出前显式 `drop(agent)`。
