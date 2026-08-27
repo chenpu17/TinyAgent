@@ -611,6 +611,12 @@ struct SseTransport {
     pending: Pending,
     /// Signals the reader thread to stop at its next loop iteration.
     shutdown: Arc<AtomicBool>,
+    /// The reader thread's handle, kept so Drop can at least JOIN an already
+    /// finished reader (reclaims it deterministically) and observe — never
+    /// block on — a stuck one. Held for observability/lifecycle, not for
+    /// interruption: a blocked reqwest read cannot be interrupted without an
+    /// async runtime (see Drop).
+    reader: Option<std::thread::JoinHandle<()>>,
 }
 
 impl SseTransport {
@@ -640,11 +646,14 @@ impl SseTransport {
         let (endpoint_tx, endpoint_rx) = mpsc::channel::<Option<String>>();
         let pending = pending_new();
         let shutdown = Arc::new(AtomicBool::new(false));
-        {
+        let reader = {
             let pending = pending.clone();
             let shutdown = shutdown.clone();
             let url = url.to_string();
-            std::thread::spawn(move || {
+            // Named for thread dumps: this thread can outlive the transport
+            // (see Drop) — a name is the difference between a diagnosable
+            // stray and an anonymous one.
+            let body = move || {
                 let Ok(resp) = req.send() else {
                     pending_fail_all(&pending, "");
                     return;
@@ -690,8 +699,16 @@ impl SseTransport {
                     }
                 }
                 pending_fail_all(&pending, "");
-            });
-        }
+            };
+            std::thread::Builder::new()
+                .name("mcp-sse-reader".into())
+                .spawn(body)
+                // Thread-creation failure is fatal here: without the reader
+                // no response can ever be dispatched, and every call would
+                // hang to CALL_TIMEOUT. Nothing to salvage — same policy as
+                // CancellableSse's spawn.
+                .expect("spawn mcp-sse-reader")
+        };
         let post_url = endpoint_rx
             .recv_timeout(CONNECT_TIMEOUT)
             .map_err(|e| {
@@ -699,9 +716,18 @@ impl SseTransport {
                 // tell the reader thread to stop. Its read() may still be
                 // blocked (reqwest::blocking can't be interrupted mid-read),
                 // but at least it won't keep dispatching into a dead table,
-                // and it will exit on the next event or stream close.
+                // and it will exit on the next event or stream close. If it
+                // IS stuck, say so — a connect-failure path that silently
+                // strands a thread + TCP connection is the one place the
+                // leak is not routine teardown (see Drop for why teardown
+                // itself stays silent).
                 shutdown.store(true, Ordering::Relaxed);
-                anyhow!("MCP SSE: no 'endpoint' event from {url}: {e}")
+                if !reader.is_finished() {
+                    eprintln!(
+                        "[warn] MCP SSE: reader thread detached (server at {url} never \
+                         sent an 'endpoint' event; the stuck GET exits at process exit)"
+                    );
+                }                anyhow!("MCP SSE: no 'endpoint' event from {url}: {e}")
             })?
             .ok_or_else(|| anyhow!("MCP SSE endpoint rejected (origin mismatch)"))?;
         Ok(Self {
@@ -710,6 +736,7 @@ impl SseTransport {
             headers: cfg.headers.clone(),
             pending,
             shutdown,
+            reader: Some(reader),
         })
     }
 
@@ -763,6 +790,14 @@ impl Drop for SseTransport {
         // async runtime or direct hyper use, which this binary avoids; in
         // batch mode prefer stdio MCP servers (which kill cleanly on drop).
         self.shutdown.store(true, Ordering::Relaxed);
+        // Join only an ALREADY finished reader (never block on a live one —
+        // a healthy idle server keeps its stream open, and blocking here
+        // would hang teardown on exactly the servers we're giving up on).
+        // Joining the finished case reclaims it deterministically instead of
+        // leaving it to the runtime's unjoined-thread reclamation.
+        if let Some(handle) = self.reader.take().filter(|h| h.is_finished()) {
+            let _ = handle.join();
+        }
     }
 }
 
