@@ -87,12 +87,16 @@ cargo clippy -p tiny-agent-node
   （debug）也不回绕躲预算闸门（release）。
   **溢出确定性**：溢出逃逸失败后的溢出错误经 `RunError::is_context_overflow()` 判定为确定性——单跑
   `run_with_retries` 与 batch（stop_reason `context_overflow`，run_one 只重试 `"error"`）都不再进退避。
-- **token 预算闸门**（`limits.max_total_tokens`，0=不限）：run loop 每轮开头用累计 usage 的
-  `Usage::total()`（input+output+cache 写+读）比对预算，超则以 `stop_reason: "budget_exceeded"`
-  （exit 125）停。turn 边界语义同 `timeout_secs`——顶破上限的那轮照常跑完（工具执行、assistant 入历史），
-  闸门只拒开下一轮，故 transcript 与 tool_use/tool_result 配对不破。batch task 片段只能收紧（更小值），
-  0 视为"无上限"被忽略。闸门复用已累计的 usage，不加新的记账；它和 `max_turns`/`timeout` 是 loop 的
-  三个 turn 边界停止条件。
+- **token 预算闸门（fleet 级）**（`limits.max_total_tokens`，0=不限）：`Agent::run` 入口安装 run 级
+  共享花费计数器（`ToolCtx::budget: Option<Arc<AtomicU64>>`，每次顶层 run 换新——与 usage 每 run
+  重置对齐；`run_as_subagent` 经 `child_ctx` 继承同一个），**父与每个在飞 `task` 子 agent 的闸门读的
+  都是它**——并行子 agent 集体触顶，不再各自烧满一份预算后 join 才被发现。写入端：**直接 chat 走
+  `bill_chat`**（`fetch_update` 饱和累加 + 本地 fold），覆盖轮次 chat 与压缩摘要两个账单；**工具账单
+  （子 agent `ToolOutput.usage` 折进父 totals）走普通 `fold_usage`、绝不进计数器**——子 agent 运行期
+  已自己记过直接花费，父再记一次会把有效预算砍半（有测试钉住）。闸门超限以 `stop_reason:
+  "budget_exceeded"`（exit 125）停；turn 边界语义同 `timeout_secs`——顶破上限的那轮照常跑完
+  （工具执行、assistant 入历史），闸门只拒开下一轮，配对不破。batch task 片段只能收紧（更小值），
+  0 视为"无上限"被忽略。它和 `max_turns`/`timeout` 是 loop 的三个 turn 边界停止条件。
 - **子 agent（`task` 工具，`tools/subagent.rs`）**：主 agent 把聚焦子任务交给一个全新子 agent
   （独立历史 + 独立 turn 预算，`SUBAGENT_MAX_TURNS=25` 封顶），只把最终摘要作 tool 结果返回。
   **同 turn 多个 `task` 调用并行**：`agent.rs` 的工具执行分两遍——叶子工具（shell/read_file/…）
@@ -106,9 +110,10 @@ cargo clippy -p tiny-agent-node
   （`child_tools()`，同样不按名字滤）——`task`（防递归）与 `todo`（计划归父）在 trait 里覆写 false，
   第三方工具可自主退出。**在默认白名单**（`config::default_tools`
   含 `task`）——headless 评测任务也会默认能 spawn 子 agent；评测若要锁定行为/成本，在 config 的 `tools`
-  里显式去掉 `task`。**预算稀释（B1，既定语义）**：`max_total_tokens` 闸门只在父 turn 边界读累计值，
-  N 个并行子 agent 各自最多 25 turns、用量 join 后才折进累计——预算是"事后熔断"不是"预先分片"，
-  严格控成本要留余量或去掉 `task`（README limits 节同款表述）。
+  里显式去掉 `task`。**预算与墙钟继承**：子 agent 的预算闸门读父安装的共享计数器（见「token 预算
+  闸门」条）；`timeout_secs` 经 `clamp_child_timeout` 收紧为父的**剩余时间**（`ToolCtx::deadline`，
+  只紧不松、地板 1s——0 会意外松成"不限"），不再克隆完整第二份超时。粒度仍是轮次边界：同轮已并行
+  启动的兄弟互不见对方本轮后续花费，严格控成本仍留余量或去掉 `task`（README limits 节同款表述）。
 - **Hooks 拦截层（`hooks.rs`，P1，第三方扩展面）**：`trait Hooks: Send + Sync` 三默认方法
   （`before_tool` → `ToolDecision::{Allow, Deny(String), Modify(Value)}`；`after_tool` 事后审计；
   `on_chat_request` 只读观察主 turn 请求），`Agent::set_hooks` 后置安装（仿 `set_cancel` 模式）。
@@ -133,7 +138,11 @@ cargo clippy -p tiny-agent-node
   **子 agent 不继承**（`subagent.rs` 白名单 filter 把 `"task"` 和 `"todo"` 一并滤掉——子 agent 是聚焦短任务，规划归父）。
   `Slot::Ran(Box<ToolOutput>)` 装箱（ToolOutput 加 meta 后跨 `large_enum_variant` 阈值）。`todo` 模块 `pub(crate)`（测试按路径取 `Todo`）。
   改 `ToolOutput`/`ToolCallRecord` 字段的人：**两个绑定（`bindings/{python,node}/src/lib.rs`）构造 `ToolOutput` 的地方要补 `meta: None`**，
-  核心构造点还有 `tools/{image,mcp,subagent}.rs` + `agent_tests.rs`。
+  核心构造点还有 `tools/{image,mcp,subagent}.rs` + `agent_tests.rs`。改 `ToolCtx` 字段同理：库内全部
+  字面量构造点（lib.rs assemble + 各工具/绑定测试）都要补字段——绑定层经 `build_agent_with` 走
+  assemble、**不构造 ToolCtx**，零改动。`timeout_secs` 是**软上限**（管 chat 请求 / 轮次边界 / 子
+  agent 剩余时间；工具各有独立上限、绑定 host 回调不可中断），README limits 节有完整边界表述——新增
+  不受它管的等待点时别把它当硬墙钟引用。
   **TUI 配合（状态行 plan 段，破冻结的唯一例外）**：TUI 主循环持 `plan: Vec<TodoItem>` 局部状态，`TodoUpdate` arm 直接 `plan = todos.clone()`
   （全量替换，不 push sys_info 行——完整 checklist 已在 `todo` 工具结果行可见）。每帧把 `plan done/total`（全完成绿/进行中黄）作为
   `build_status_line` 的 `plan: Option<(&str, Style)>` 段渲染。`build_status_line` 的可选段按**存活优先级**贪心添加：ctx > plan > stats
@@ -301,7 +310,10 @@ cargo clippy -p tiny-agent-node
   `bad_task`/`max_turns` 等确定性失败不重试。`--failed` 重跑失败子集后**合并**进完整报告
   （未重跑的历史成功项原样保留）。
 - **batch workdir 隔离（`--isolate none|copy|git`，`batch::IsolateMode`）**：`none` 默认共享
-  workdir（jobs>1 打 ⚠）；`copy` 每任务拷贝（排除 `target`/`node_modules`/`.git`/`results`）；
+  workdir（jobs>1 打 ⚠）；`copy` 每任务拷贝（排除 `target`/`node_modules`/`.git`/`results`），符号
+  链接**自包含策略**（`copy_entry`）：源树内相对链接复刻 / 绝对在内拷内容 / 出根（绝对或 `..` 逃逸）
+  跳过 + 告警——副本里不允许有通往原树的路（绝对链接指回原 workdir 会把并行任务重新耦合到共享
+  目录），包含判定复用 `tools::confined_to`，自引用解引链深度封顶 64；
   `git` 每任务 `worktree add --detach`（要求 workdir 是 repo 根，canonicalize 比较——macOS
   `/tmp`→`/private/tmp` symlink 会让字符串比较误拒；否则 `setup_error` 不重试）。**per-task、
   跨 attempt 复用**（重试看得到前次落盘，与共享语义一致）；`IsolationGuard` Drop 清理（copy
@@ -336,6 +348,9 @@ cargo clippy -p tiny-agent-node
 - **MCP 工具名只消毒展示名，wire 名不动**（`tools::mcp::sanitize_name`）：对外名 `mcp_<server>_<tool>`
   非 `[A-Za-z0-9_]` → `_` 并折叠，但 `wire_name` 保留服务器原始工具名，`tools/call` 用它分发。
   改消毒逻辑别误动 `wire_name`，否则分发会找不到工具。`dedup_check` 在消毒后撞名时启动报错。
+  **工具名全集校验在 `lib.rs::assemble` 末尾**（`validate_tool_names`）：最终列表（内置+MCP+skill 注入
+  +extra）统一查非空 / `[A-Za-z0-9_-]` / ≤64 / 唯一——自定义工具与内置同名此前被静默遮蔽（`find_tool`
+  首匹配）。改工具装配顺序/新增注入工具不影响该校验（在最后跑），但别在校验后再 push 工具。
 - **MCP stdio `env` 注入**（`McpServerConfig.env` + `StdioTransport::spawn` 的 `.envs(&cfg.env)`）：
   stdio 子进程的额外环境变量，叠加在宿主环境之上（同名以配置为准）。GUI 进程无 shell 环境靠它传凭据
   （`GITHUB_PERSONAL_ACCESS_TOKEN` / 连接串 / `XXX_API_KEY`）。`#[serde(default)]` 向后兼容；`validate()` 不拦

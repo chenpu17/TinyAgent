@@ -67,7 +67,7 @@ let tool = CallbackTool::new(
 );
 ```
 
-自定义 provider 同理：实现 `Provider` trait（或用 `build_agent_with_provider` 复用 config 的工具/MCP 装配、只换 provider）。非流式 provider 可返回 `SimpleChatResponse`（`{text, stop_reason?, usage?}`），经 `ChatResponse::from_simple` 合成单条 delta——Python/Node 绑定的自定义 provider 走的就是这条路。
+自定义 provider 同理：实现 `Provider` trait（或用 `build_agent_with_provider` 复用 config 的工具/MCP 装配、只换 provider）。非流式 provider 可返回 `SimpleChatResponse`（`{text, stop_reason?, usage?}`），经 `ChatResponse::from_simple` 合成单条 delta——Python/Node 绑定的自定义 provider 走的就是这条路。工具名在装配时统一校验（`build_agent_with` 路径）：全列表（内置 + MCP + skill 注入 + 自定义）必须**唯一**、仅 `[A-Za-z0-9_-]`、≤64 字符——同名冲突 / 非法字符在构建时即报错，不再静默遮蔽（分发按首匹配）或等到首个请求被 provider 400 拒绝。
 
 **Hooks 拦截层**（不改核心，观察并把关 agent 行为）：实现 `Hooks` trait（三个方法全有默认实现，只覆盖需要的），用 `Agent::set_hooks` 挂上。`before_tool` 可放行 / 拒绝（理由成为模型看到的错误结果）/ 改写执行输入；`after_tool` 事后审计；`on_chat_request` 只读观察每个主 turn 请求。`task` 子 agent 自动继承同一层——顶层拒绝在子 agent 内同样生效：
 
@@ -137,7 +137,7 @@ def echo_provider(request):
 a = tiny_agent.Agent("chat.json", provider=echo_provider)  # 无 api_key
 ```
 
-非流式 v1：返回整段文本，作为单条 delta 发出；不支持 tool_use（需要工具调用请用内置 provider + 自定义 `Tool`）。provider 抛异常会**诚实地 fail 该轮**。
+非流式 v1：返回整段文本，作为单条 delta 发出；不支持 tool_use（需要工具调用请用内置 provider + 自定义 `Tool`）。provider 抛异常会**诚实地 fail 该轮**。**取消 / 超时契约**：callable 在 GIL 内同步执行，`timeout_secs` 与取消**不会中断它**——agent 等它返回，可长时间运行的 provider 必须自行设限；预算与超时仍在轮次边界生效。
 
 **Node.js / TypeScript（`import { chat, Agent }`，napi-rs）**
 
@@ -178,7 +178,7 @@ const a = new Agent('chat.json', {
 await a.run();
 ```
 
-与自定义工具同款 TSFN round-trip（JS 调 `resolveProvider(id, result)` 唤醒 worker）。非流式 v1：返回整段文本，作为单条 delta 发出；不支持 tool_use（需要工具调用请用内置 provider + 自定义 `Tool`）。provider 抛异常会**诚实地 reject 该轮**。
+与自定义工具同款 TSFN round-trip（JS 调 `resolveProvider(id, result)` 唤醒 worker）。非流式 v1：返回整段文本，作为单条 delta 发出；不支持 tool_use（需要工具调用请用内置 provider + 自定义 `Tool`）。provider 抛异常会**诚实地 reject 该轮**。worker 等待回调的上限取 `min(本次请求剩余预算, 120s)`——run 设了 `timeout_secs` 时永不超出预算（预算仍在轮次边界生效；同步阻塞的 host 代码本身无法被中断）。
 
 ## 使用
 
@@ -252,7 +252,8 @@ tiny-agent --config examples/chat.json --tui
 
 - **per-task、跨 attempt 复用**：一个任务的重试看得到自己前次 attempt 的落盘副作用（与共享 workdir 语义一致）
 - **产物随目录丢弃**：隔离模式下任务写的文件不留在 workdir——评测语义下审计面就是 `result.json`（`tool_calls` 全量）与 `report.json`；需要产物落盘就别用隔离
-- 与 `"restrict_to_workdir": true` 天然协同（隔离目录即沙箱根）——不可信批量任务的推荐组合：容器内运行 + `--isolate copy` + restrict
+- 与 `"restrict_to_workdir": true` 天然协同（restrict 的沙箱根随隔离目录走）——不可信批量任务的推荐组合：容器内运行 + `--isolate copy` + restrict。**`--isolate` 是评测隔离不是安全沙箱**：`shell` 仍能访问文件系统可达的一切路径，不可信任务必须放进容器 / 受限用户
+- `copy` 的符号链接策略（副本里不允许有通往原树或外部的路）：解析后仍在源树内的**相对**链接原样复刻（`node_modules/.bin` 类工具布局继续可用，且天然 copy-local）；**绝对**链接在源树内则拷贝目标内容（原样复刻会指回原树、把并行任务重新耦合到共享目录）；解析后在源树**外**的链接（绝对或 `..` 逃逸）跳过并打 stderr 告警
 - 隔离 setup 失败（git 缺失 / 非 repo / 临时目录不可写）按 `setup_error` 报告（确定性，不重试）
 - git 模式孤儿 worktree：极端情况（进程被 SIGKILL）下 `git worktree prune` 在源仓库回收
 
@@ -404,7 +405,7 @@ stdio server 可注入环境变量（`env`，叠加在宿主环境之上、同�
 |---|---|
 | **stdio** | `command` + `args`，spawn 本地子进程（NDJSON / JSON-RPC 2.0） |
 | **http** | Streamable HTTP（2025-03-26 现行标准）：单端点 POST，支持 JSON / SSE 响应、Mcp-Session-Id |
-| **sse** | 旧版 HTTP+SSE（2024-11-05 已废弃协议）：GET 收事件流 + endpoint POST |
+| **sse** | 旧版 HTTP+SSE（2024-11-05 已废弃协议）：GET 收事件流 + endpoint POST。注意其长连接 GET 在服务器不关流时读取线程只能等进程退出回收——长驻批量作业优先 stdio / http |
 | **auto**（默认） | 先按 Streamable HTTP 探测，失败自动回落旧版 SSE |
 
 不支持的边角：Streamable HTTP 的 GET 流（server-initiated 消息）。`examples/mcp_echo.py`（stdio）与 `examples/mcp_http_echo.py`（/mcp + /sse 双端点）是零依赖测试服务器，也是协议参考实现。内置工具白名单（`tools`）与 MCP 工具互不影响。
@@ -518,16 +519,16 @@ API key 从 `api_key_env` 指定的环境变量读取，不写进配置文件。
 
 让模型知道自己跑在哪个平台、据此下发兼容命令（如得知是 `cmd /C` 而非 bash，就不会写 `$((...))` 这种在 cmd 下**静默失效、还 exit 0**、看着像成功实则是哑火的语法）。**只注入 OS / Shell / 工作目录三项事实，不写死语法示例**——事实来自运行时（`std::env::consts::OS`）与配置，跨平台自动正确；Shell 取 `shell` 工具真实调用的形式（unix `sh -c`、windows `cmd /C`）；工作目录取已解析的 `workdir`。注入点在 `Agent::new` 单点（主 agent 与 `task` 子 agent 都覆盖——子 agent 也跑 shell，同样需要平台事实），调用方自定义的 `system_prompt` 完整保留在事实段之后。设 `false` 关闭。批量任务片段可覆盖（软字段，与 `reasoning_effort` 同类）。
 
-`limits.stream_idle_secs`（默认 30）：流式响应两个 chunk 之间最长允许的静默秒数，超过即判定连接半开并中断。普通对话模型 chunk 间隔在亚秒级，30s 绰绰有余；**深度推理模型**（DeepSeek-R1、o 系列等）首 token 前可能静默数分钟，需要调大（如 180）才不会被误杀——`limits.timeout_secs` 仍是**模型请求层面**的软上限（约束每轮 chat 请求与轮次边界；shell/MCP/子 agent 各有各自独立超时，不受此值硬截止），不会因此无限挂起。
+`limits.stream_idle_secs`（默认 30）：流式响应两个 chunk 之间最长允许的静默秒数，超过即判定连接半开并中断。普通对话模型 chunk 间隔在亚秒级，30s 绰绰有余；**深度推理模型**（DeepSeek-R1、o 系列等）首 token 前可能静默数分钟，需要调大（如 180）才不会被误杀——`limits.timeout_secs` 仍是**模型请求层面**的软上限（约束每轮 chat 请求与轮次边界），不会因此无限挂起。
+
+`limits.timeout_secs`（默认 `0` = 不限）：整个 run 的墙钟**软上限**——约束每轮 chat 请求（单请求上限 = 剩余时间）与轮次边界（不再开新轮），`task` 子 agent 继承父的**剩余时间**（不会拿到完整第二份超时）。**不覆盖**的部分：工具执行各有独立上限（`shell_timeout_secs`、MCP 调用 120s），顶破上限那轮里已在跑的工具照常跑完（保 tool_use/tool_result 配对）；Python/Node 绑定的自定义 provider 回调是同步 host 调用，无法被强制中断（Node 侧等待上限已随剩余预算收紧，Python 侧靠 host 自律）。要硬墙钟请用外层 `timeout(1)` / 容器。
 
 `limits.shell_timeout_secs`（默认 120）：单条 `shell` 命令的墙钟上限，超时杀掉整个进程组并在结果里记 `[command timed out after Ns and was killed]`。评测任务里的构建 / 安装（`cargo build`、`npm install`、训练脚本）常常超过 120s——任务会被砍死写进账单成 error，看似模型不行实则 harness 不行；这类任务调大它（或设 `0` = 单命令不限时，交互取消与 run 级 `timeout_secs` 兜底仍生效）。注意它是**成本旋钮而非安全边界**：这也是 limits 里**唯一允许批量任务片段双向覆盖**的字段（放宽/收紧都行）——想烧时间的任务用一万条快命令同样能烧，真正的闸门是 `timeout_secs`（单向收紧）与 `max_total_tokens`。
 
 > **`timeout_secs: 0`（不设超时）时的单请求兜底**：即便关掉整轮超时，单次 chat 请求仍有一个 **10 分钟**的总时长上限（`STREAM_BACKSTOP`）。这是**泄漏兜底**而非功能限制——流式读取线程阻塞在 reqwest 的 `read()` 里、无法观测取消标志，若没有任何单请求上限，一条半开连接会让该线程及其 TCP 连接一直挂到进程退出。该上限只约束**单次请求**，从不约束**整轮 run**（一轮由多次请求组成），所以「不设超时」仍意味着 run 可以无限长，只是不会无限卡在单次请求上。设了 `timeout_secs > 0` 时此兜底不生效，单请求上限改由剩余预算推导。
 
 `limits.max_total_tokens`（默认 `0` = 不限）：整个 run 的 token 预算上限（input + output + cache 写 + cache 读，跨所有轮次 / 子 agent / 压缩调用累计）。累计超过即以 `stop_reason: "budget_exceeded"`（exit 125）停下，不再开新一轮——语义同 `timeout_secs` 的**轮次边界**停：把总额顶破上限的那一轮照常跑完（工具执行、assistant 消息入历史），上限只阻止**下一轮**开始，故 transcript 与 tool_use/tool_result 配对不受影响。评测 / CI 场景用来给"跑飞钱包"装闸门：usage 累计本就含子 agent、压缩、失败轮（诚实成本，失败也计费），这个闸门只是在地基上加一道关。批量任务片段可设此项**只收紧**（更小值）；`0` 意为"无上限"（最松），任务片段设 0 会被忽略。
-**预算是"事后熔断"不是"预先分片"**：闸门只在主 loop 的 turn 边界读累计值——N 个并行 `task` 子 agent 各自最多跑
-25 turns、其用量要等 join 后才折进累计，顶破上限的那批子 agent 照样跑完。评测要严格控成本，要么给预算留足余量，
-要么在 config 的 `tools` 里去掉 `task`。
+**预算在父与子 agent 之间共享执行**：闸门读的是 run 级共享花费计数器——父与每个在飞 `task` 子 agent 的直接 chat 花费（轮次 chat + 压缩摘要）实时累入同一计数器，父和每个子 agent 都在自己的轮次边界读它，并行子 agent **集体**触顶（不再是各烧满一份预算、join 后才发现）。粒度仍是**轮次边界**：同一轮里已并行启动的兄弟子 agent 互相看不到对方本轮的后续花费，顶破上限的那轮照常跑完；预算是"熔断"不是"预先分片"——严格控成本仍建议留余量或在 config 的 `tools` 里去掉 `task`。
 
 `reasoning_effort`（可选字符串，默认不设）：思考程度，**按字符串原样透传给 provider，不做枚举校验**——各家档位碎片化且随模型代际变动，TinyAgent 不维护映射表，由 provider/server 拒绝未知值。取值参考：OpenAI `none`/`low`/`medium`/`high`/`xhigh`/`max`（随模型代际扩张）、Anthropic `low`/`medium`/`high`/`max`（Claude 4.6+ adaptive thinking；Opus 4.7 起旧 `budget_tokens` 已移除）、DeepSeek `low`/`high`/`xhigh`/`max`、GLM 仅开关（`enabled`/`disabled`）。映射：OpenAI 系直接发 `reasoning_effort` 字段（老网关不认会 400，`body_fix_for_400` 自动 drop 重试，与 `max_tokens`/`stream_options` 同款）；Anthropic 发 `thinking: {"type": "adaptive"}` + `output_config: {"effort": "..."}`（effort 在**独立顶层 `output_config` 对象**里，不在 thinking 内、也不是裸顶层字段——裸顶层会被静默忽略，这是该 API 最常见的坑），`"none"` 发 `{"type": "disabled"}`。
 

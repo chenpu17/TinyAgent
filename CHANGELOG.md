@@ -7,6 +7,28 @@
 
 ### Fixed
 
+- **第三方审查（第三轮）确定性修正**（行为变化项均带回归测试）：
+  - **预算闸门升级为 fleet 级**：`max_total_tokens` 从"每 agent 各自熔断"（并行子 agent 最坏各烧满一份、
+    join 后才发现）升级为 run 级共享花费计数器——父与每个在飞 `task` 子 agent 的直接 chat 花费（轮次
+    chat + 压缩摘要）实时累入同一计数器，父与子 agent 的闸门统一读它，并行子 agent **集体**触顶。工具
+    账单折算（子 agent usage 入父 totals）刻意不进计数器——子 agent 已自己记过，双计会把有效预算砍半。
+    粒度仍为轮次边界（同轮已启动的兄弟互不见对方本轮后续花费）。
+  - **`task` 子 agent 继承父剩余墙钟**：`clamp_child_timeout` 把子 agent 的 `timeout_secs` 收紧为父的
+    剩余时间（只紧不松、地板 1s），不再克隆完整第二份超时（fleet 墙钟不再 ~2× 配置值）。`timeout_secs`
+    的软上限边界（管 chat 请求 / 轮次边界 / 子 agent，不管工具自身上限与绑定 host 回调）写进 README。
+  - **工具名装配期统一校验**：全列表（内置 + MCP + skill 注入 + 自定义）必须唯一、仅 `[A-Za-z0-9_-]`、
+    ≤64 字符，冲突 / 违规构建即错——此前自定义工具与内置同名被静默遮蔽（分发按首匹配），非法字符 / 超长
+    要等首个请求被 provider 400 拒。
+  - **`--isolate copy` 符号链接自包含**：源树内相对链接原样复刻（`node_modules/.bin` 类布局继续可用）、
+    绝对但在源树内则拷贝目标内容（原样复刻会指回原树、把并行任务重新耦合到共享目录）、解析后出根（绝对
+    或 `..` 逃逸）跳过 + stderr 告警——副本里不允许有通往原树或外部的路。
+  - **MCP 旧版 SSE reader 线程可观测**：reader 线程命名（`mcp-sse-reader`）+ Drop 只 join 已结束的
+    reader（绝不阻塞在活的上）+ 连接失败（endpoint 事件未到）时显式告警而非静默遗留线程与 TCP 连接。
+  - **TUI 退出 worker 超时脱离显式告警**：3s 内未退出的 worker 脱离时向 scrollback 打 stderr 提示
+    （无取消意识的第三方工具 / host 回调可能仍在后台跑），不再静默。
+  - **Node 自定义 provider 等待上限随请求剩余预算**：`min(per_request_timeout, 120s)`——run 设了
+    `timeout_secs` 后等待不再可能超出预算挂满 120s；超时文案秒数向上取整（~1s 不再显示 "0s"）。Python
+    侧回调契约入档（GIL 内同步、不受 timeout/cancel 强制中断，host 自行设限）。
 - **第三方审查（第二轮）全量修正**（每项带回归测试）：
   - **Anthropic 流解析**：识别 `message_stop` 事件主动结束（持连接不关流的网关不再等 30s idle 超时、真实 stop_reason 不被中止覆盖）；`content_block_start` 内联非空 `input` 作 seed（不合规网关内联参数不再丢失）；`tool_result` 序列化避免空 text 块 400（带图空文只发 `[image]`，两者皆空省略 `content` 字段）。
   - **压缩 `keep_recent=0` 空尾合法化**：真实 loop 每个请求点历史必 user 结尾，旧的钳制让该配置下压缩被静默禁用（preflight 不折叠、溢出逃逸判不可压缩直接失败）。现 `cut==n` 合法——除保留头外全部折进摘要；守卫改 `saturating_add`（usize::MAX 不再 debug panic）。
@@ -34,8 +56,6 @@
 - **batch Ctrl-C 契约显式化**：首次 Ctrl-C 后在跑任务自身跑完，但其 **MCP server 会被立即关闭**
   （防二次 Ctrl-C 硬退留孤儿，0.3.0 修复的既定取舍）——首个命中 cancel 的 worker 打一次性警告
   说明两侧语义。
-- **子 agent 预算稀释语义写进文档**：`max_total_tokens` 闸门只在父 turn 边界读累计值，并行子
-  agent 用量 join 后才折入——预算是"事后熔断"不是"预先分片"，控成本留余量或去掉 `task` 工具。
 - **`--isolate git` 检出 HEAD 语义写进 help**：未提交 / 未跟踪文件不进隔离副本，要带上先 commit
   或用 `--isolate copy`。
 
@@ -63,6 +83,10 @@
 
 ### Changed (Breaking)
 
+- **`ToolCtx` 再增两个公共字段**：`budget: Option<Arc<AtomicU64>>`（fleet 预算计数器的继承通道，
+  `Agent::run` 按 run 安装）与 `deadline: Option<Instant>`（父剩余墙钟，供 `task` 子 agent 收紧自身
+  超时）。外部**构造** `ToolCtx` 字面量的代码需补 `budget: None, deadline: None`（本仓库内全部构造点
+  已同步；绑定层经 `build_agent_with` 装配、零改动）。
 - **`ToolCtx` 新增两个公共字段**：`hooks: Option<Arc<dyn Hooks>>` 与
   `subagent: Option<String>`。外部**构造** `ToolCtx` 字面量的代码需补
   `hooks: None, subagent: None`（本仓库内 29 处构造点已同步）；只接收
