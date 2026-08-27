@@ -219,9 +219,10 @@ impl Drop for IsolationGuard {
 /// `COPY_EXCLUDE`. The exclusion list means "the previous batch run's
 /// artifacts / VCS / build caches at the workdir ROOT" — a nested directory
 /// that happens to share a name (`sub/results/`) is task input and must be
-/// copied. Symlinks are reproduced as symlinks (preserves workspace tooling
-/// layouts); unreadable entries are errors, not skips — a task that silently
-/// misses an input file fails confusingly later.
+/// copied. Relative in-tree symlinks are reproduced (preserves workspace
+/// tooling layouts); links resolving outside the source tree are skipped
+/// with a warning (see `copy_entry`). Unreadable entries are errors, not
+/// skips — a task that silently misses an input file fails confusingly later.
 fn copy_dir_filtered(src: &Path, dst: &Path) -> Result<()> {
     for entry in std::fs::read_dir(src)
         .with_context(|| format!("cannot read {}", src.display()))?
@@ -232,46 +233,95 @@ fn copy_dir_filtered(src: &Path, dst: &Path) -> Result<()> {
         if COPY_EXCLUDE.contains(&name.as_ref()) {
             continue;
         }
-        copy_entry(&entry.path(), &dst.join(entry.file_name()))?;
+        copy_entry(&entry.path(), &dst.join(entry.file_name()), src, 0)?;
     }
     Ok(())
 }
 
 /// Copy one entry (file / dir / symlink) — no exclusion filter: exclusions
 /// apply only at the workdir root (see `copy_dir_filtered`).
-fn copy_entry(from: &Path, to: &Path) -> Result<()> {
+///
+/// Symlink policy — the copy must not contain a road back to the original
+/// tree: a relative link that stays inside the source tree is RECREATED
+/// verbatim (the common tooling layout, `node_modules/.bin/*`, keeps working
+/// and stays copy-local); a link whose target resolves OUTSIDE the tree is
+/// SKIPPED with a warning (an absolute link back into the original workdir
+/// would re-couple isolated tasks — two workers racing through the same
+/// original path — and an external link reaches beyond the copy); an
+/// ABSOLUTE link resolving INSIDE the tree is dereferenced (its content
+/// copied) because recreated verbatim it would point at the ORIGINAL tree.
+/// `depth` caps pathological self-referential dereference chains.
+fn copy_entry(from: &Path, to: &Path, root: &Path, depth: usize) -> Result<()> {
+    if depth > 64 {
+        eprintln!(
+            "[warn] isolate copy: skipping {} (dereference chain deeper than 64)",
+            from.display()
+        );
+        return Ok(());
+    }
     let ft = std::fs::symlink_metadata(from)
         .with_context(|| format!("cannot stat {}", from.display()))?
         .file_type();
     if ft.is_symlink() {
         let target = std::fs::read_link(from)?;
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&target, to)
-            .with_context(|| format!("cannot symlink {} → {}", to.display(), target.display()))?;
-        #[cfg(not(unix))]
-        {
-            // No symlink privilege on Windows by default: fall back to
-            // copying the target (directory or file) in place. A RELATIVE
-            // target must resolve against the LINK'S PARENT, not the process
-            // CWD — `is_dir()` resolves relative paths against CWD, so the
-            // old spelling copied the wrong thing (or nothing) depending on
-            // where the process happens to run.
-            let resolved = if target.is_absolute() {
-                target.clone()
-            } else {
-                from.parent().unwrap_or(Path::new(".")).join(&target)
-            };
-            if resolved.is_dir() {
-                std::fs::create_dir_all(to)?;
-                for entry in std::fs::read_dir(&resolved)
-                    .with_context(|| format!("cannot read {}", resolved.display()))?
-                {
-                    let entry = entry?;
-                    copy_entry(&entry.path(), &to.join(entry.file_name()))?;
-                }
-            } else {
-                std::fs::copy(from, to)?;
+        // A RELATIVE target resolves against the LINK'S PARENT, not the
+        // process CWD.
+        let resolved = if target.is_absolute() {
+            target.clone()
+        } else {
+            from.parent().unwrap_or(Path::new(".")).join(&target)
+        };
+        // Containment on the resolved path. `confined_to` canonicalizes the
+        // nearest existing ancestor, so a dangling in-tree link still counts
+        // as contained. No symlink privilege on Windows by default: the
+        // dereference branch below doubles as the fallback for every
+        // contained link there.
+        if crate::tools::confined_to(root, &resolved, "isolate copy source").is_err() {
+            eprintln!(
+                "[warn] isolate copy: skipping symlink {} → {} (escapes the source workdir)",
+                from.display(),
+                target.display()
+            );
+            return Ok(());
+        }
+        if !resolved.exists() {
+            // Dangling but contained: recreate the shape (unix) or skip
+            // (Windows, which can't create the link) — copying the target is
+            // impossible, there is none.
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&target, to).with_context(|| {
+                    format!("cannot symlink {} → {}", to.display(), target.display())
+                })?;
             }
+            #[cfg(not(unix))]
+            eprintln!(
+                "[warn] isolate copy: skipping dangling symlink {} → {}",
+                from.display(),
+                target.display()
+            );
+            return Ok(());
+        }
+        #[cfg(unix)]
+        if target.is_relative() {
+            // Relative + contained: recreate verbatim; inside the copy it
+            // still points inside the copy.
+            std::os::unix::fs::symlink(&target, to).with_context(|| {
+                format!("cannot symlink {} → {}", to.display(), target.display())
+            })?;
+            return Ok(());
+        }
+        // Absolute + contained + existing: dereference-copy the target.
+        if resolved.is_dir() {
+            std::fs::create_dir_all(to)?;
+            for entry in std::fs::read_dir(&resolved)
+                .with_context(|| format!("cannot read {}", resolved.display()))?
+            {
+                let entry = entry?;
+                copy_entry(&entry.path(), &to.join(entry.file_name()), root, depth + 1)?;
+            }
+        } else {
+            std::fs::copy(&resolved, to)?;
         }
     } else if ft.is_dir() {
         std::fs::create_dir_all(to)?;
@@ -279,7 +329,7 @@ fn copy_entry(from: &Path, to: &Path) -> Result<()> {
             .with_context(|| format!("cannot read {}", from.display()))?
         {
             let entry = entry?;
-            copy_entry(&entry.path(), &to.join(entry.file_name()))?;
+            copy_entry(&entry.path(), &to.join(entry.file_name()), root, depth + 1)?;
         }
     } else {
         std::fs::copy(from, to)?;
@@ -1845,6 +1895,70 @@ mod tests {
         );
         drop(guard);
         assert!(!iso.exists(), "guard Drop removes the sandbox");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn isolate_copy_symlink_policy_keeps_the_copy_self_contained() {
+        // The copy must not contain a road back to the original tree (an
+        // absolute link into the source would re-couple parallel tasks) or
+        // out of it. Relative in-tree links are recreated (tooling layouts
+        // like node_modules/.bin keep working, copy-local); absolute links
+        // resolving inside the tree are dereferenced (content copied);
+        // anything resolving outside — and dangling links on Windows — is
+        // skipped with a warning instead of reproduced.
+        let root = std::env::temp_dir().join(format!("ta-batch-sym-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let src = root.join("src");
+        let outside = root.join("outside-cache");
+        std::fs::create_dir_all(src.join("real")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(src.join("real").join("data.txt"), "d").unwrap();
+        std::fs::write(outside.join("leak.txt"), "l").unwrap();
+        // 1. Relative in-tree: `data → ./real` — recreated verbatim.
+        std::os::unix::fs::symlink("real", src.join("data")).unwrap();
+        // 2. Absolute INSIDE the tree: dereferenced (content copied), because
+        // recreated verbatim it would point at the ORIGINAL tree.
+        std::os::unix::fs::symlink(src.join("real"), src.join("abs-in")).unwrap();
+        // 3. Escape: absolute link to a dir outside the source — skipped.
+        std::os::unix::fs::symlink(&outside, src.join("escape")).unwrap();
+        // 4. Relative escape (`../outside-cache`) — skipped.
+        std::os::unix::fs::symlink("../outside-cache", src.join("rel-escape")).unwrap();
+
+        let base: Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"K","model":"m","workdir":"SRC"}"#,
+        )
+        .unwrap();
+        let base = {
+            let mut b = base;
+            b.workdir = Some(src.clone());
+            b
+        };
+        let guard = prepare_isolation(IsolateMode::Copy, &base, "sym").unwrap().unwrap();
+        let iso = guard.dir.clone();
+        // 1 — recreated as a symlink, still relative.
+        assert!(
+            std::fs::symlink_metadata(iso.join("data"))
+                .expect("relative in-tree link copied")
+                .file_type()
+                .is_symlink(),
+            "relative in-tree links are recreated verbatim"
+        );
+        // 2 — a real directory (deref), not a link back at the original.
+        assert!(
+            !std::fs::symlink_metadata(iso.join("abs-in"))
+                .expect("absolute in-tree link dereferenced")
+                .file_type()
+                .is_symlink()
+                && iso.join("abs-in").join("data.txt").exists(),
+            "absolute in-tree links are content-copied"
+        );
+        // 3/4 — gone entirely: no road out of (or back into) the copy.
+        assert!(!iso.join("escape").exists(), "escaping symlink must be skipped");
+        assert!(!iso.join("rel-escape").exists(), "relative escape must be skipped");
+        drop(guard);
 
         std::fs::remove_dir_all(&root).ok();
     }
