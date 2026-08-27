@@ -746,7 +746,7 @@ pub fn run(
     // within the reaper's 100ms poll, so it too unblocks here. A genuinely
     // non-cancel-aware tool with no teardown just lets this time out — we then
     // detach as before, never hanging exit.
-    let _ = done_rx.recv_timeout(Duration::from_secs(3));
+    let worker_stuck = done_rx.recv_timeout(Duration::from_secs(3)).is_err();
     drop(worker); // detach if the worker is still stuck past the deadline
     // Restore the terminal BEFORE reporting discarded queued messages — a note
     // printed while raw mode is still active would be garbled. The guard's Drop
@@ -757,6 +757,17 @@ pub fn run(
     // Step past the inline viewport so the dropped-queue note (and the shell
     // prompt on return) doesn't overwrite the viewport's last frame.
     println!();
+    // A detached worker is a lifecycle fact the user must see, not silence:
+    // a third-party tool / host callback with no cancel awareness can still
+    // be running (writing files, holding connections) after the terminal is
+    // back. The MCP reaper + cancel-aware tools normally finish within the
+    // 3s join above; this fires only for the remainder.
+    if worker_stuck {
+        eprintln!(
+            "[tiny-agent] worker did not exit within 3s — detached; a non-cancel-aware \
+             tool may still be running in the background"
+        );
+    }
     if let Ok(dropped) = result {
         if dropped > 0 {
             eprintln!("[tiny-agent] {dropped} queued message(s) discarded on quit");
