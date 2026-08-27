@@ -231,6 +231,14 @@ fn py_to_simple(bound: &Bound<'_, PyAny>) -> anyhow::Result<ta::SimpleChatRespon
 /// returns the **whole** text at once (non-streaming v1); it is emitted as a
 /// single `TextDelta` via [`ta::ChatResponse::from_simple`], so the agent's
 /// event stream / display still sees the assistant message.
+///
+/// Cancellation/timeout contract (deliberate v1 limitation): the call is
+/// synchronous inside the GIL, so `limits.timeout_secs` and the cancel token
+/// do NOT interrupt it — the agent waits for the host function to return, for
+/// however long it takes. A host `chat` that can run long MUST bound itself
+/// (e.g. its own timeout around the work it does); a raised exception fails
+/// the turn honestly. The run budget still applies at the turn boundaries
+/// around the call.
 struct PyProvider {
     chat_fn: Py<PyAny>,
 }

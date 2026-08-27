@@ -30,7 +30,7 @@ function writeConfig(t, mockUrl, opts = {}) {
     workdir,
     limits: {
       max_turns: opts.maxTurns ?? 6,
-      timeout_secs: 30,
+      timeout_secs: opts.timeoutSecs ?? 30,
       max_output_chars: 20000,
       stream_idle_secs: opts.streamIdleSecs ?? 30,
     },
@@ -200,7 +200,11 @@ test('custom async JS tool, str-return shorthand', async (t) => {
 // A config for custom-provider tests: base_url is never hit (the provider
 // replaces the HTTP call entirely), so a dummy url suffices.
 function providerConfig(t, opts = {}) {
-  return writeConfig(t, 'http://unused-no-http-here', { tools: opts.tools ?? [], maxTurns: opts.maxTurns ?? 6 });
+  return writeConfig(t, 'http://unused-no-http-here', {
+    tools: opts.tools ?? [],
+    maxTurns: opts.maxTurns ?? 6,
+    timeoutSecs: opts.timeoutSecs,
+  });
 }
 
 test('custom provider returns text + honest usage', async (t) => {
@@ -405,4 +409,20 @@ test('custom provider passes through non-end-turn stop_reason', async (t) => {
   });
   assert.strictEqual(out.stop_reason, 'max_tokens');
   assert.strictEqual(out.final_text, 'cut off');
+});
+
+test('custom provider wait is bounded by the run budget, not just the 120s backstop', async (t) => {
+  // A provider that never resolves + timeout_secs=1: the request carries the
+  // run's remaining budget as its per-request timeout, and the worker's wait
+  // for the JS callback must honor it — run() rejects in ~1s instead of
+  // hanging until the 120s backstop.
+  const { cfgPath } = providerConfig(t, { timeoutSecs: 1 });
+  const a = new Agent(cfgPath, {
+    provider: () => new Promise(() => {}), // never settles
+  });
+  a.pushUser('hi');
+  const started = Date.now();
+  await assert.rejects(a.run(), /did not resolve within 1s/);
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed < 10_000, `failed fast (~1s), took ${elapsed}ms`);
 });

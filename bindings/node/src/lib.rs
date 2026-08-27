@@ -278,14 +278,21 @@ impl ta::Provider for NodeProvider {
         // Block the agent worker thread for the JS result. The JS main thread
         // is free (the run() caller awaits it), so the wrapped provider
         // resolves promptly; the timeout is a backstop against a provider that
-        // never returns.
-        let resp = rx
-            .recv_timeout(Duration::from_secs(JS_CALLBACK_TIMEOUT_SECS))
-            .map_err(|_| {
-                err(format!(
-                    "provider: JS callback did not resolve within {JS_CALLBACK_TIMEOUT_SECS}s"
-                ))
-            })?;
+        // never returns. When the run set a wall-clock budget, the request
+        // carries its REMAINDER as `per_request_timeout` (the built-in HTTP
+        // providers cap themselves the same way) — the wait never outlives
+        // the run budget; JS_CALLBACK_TIMEOUT_SECS stays the ceiling for
+        // unbudgeted runs.
+        let wait = req
+            .per_request_timeout
+            .filter(|d| *d < Duration::from_secs(JS_CALLBACK_TIMEOUT_SECS))
+            .unwrap_or(Duration::from_secs(JS_CALLBACK_TIMEOUT_SECS));
+        // Round UP for the message: the budget remainder is sub-second
+        // precision, and "within 0s" for a ~1s wait reads like a bug.
+        let wait_secs = wait.as_secs() + u64::from(wait.subsec_millis() > 0);
+        let resp = rx.recv_timeout(wait).map_err(|_| {
+            err(format!("provider: JS callback did not resolve within {wait_secs}s"))
+        })?;
         // The wrapper signals a thrown user provider via a `{__error}` marker so
         // the run fails honestly (mirroring the Python binding, where a raised
         // exception fails the turn) instead of producing a silent empty turn.
