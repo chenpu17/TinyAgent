@@ -282,6 +282,8 @@
             shell_timeout_secs: 120,
             hooks: None,
             subagent: None,
+            budget: None,
+            deadline: None,
         }
     }
 
@@ -1744,6 +1746,70 @@
         // The turn that crossed the cap still bills its usage honestly.
         assert_eq!(o.input_tokens, 80);
         assert_eq!(o.output_tokens, 30);
+    }
+
+    #[test]
+    fn run_installs_a_fleet_budget_counter_and_resets_it_per_run() {
+        // With max_total_tokens set, a top-level run publishes a shared spend
+        // counter to the tool ctx (the channel `task` children inherit), and
+        // every direct chat bills into it. A repeat run on the same Agent
+        // (TUI follow-up / harness retry) gets a FRESH counter — usage totals
+        // also reset per run, so the fleet budget is per-run, not lifetime.
+        let mut cfg = cfg_with(99, 0, 0);
+        cfg.limits.max_total_tokens = 1_000;
+        let (prov, _) = MockProvider::new(vec![
+            mock::resp_tool("a", "echo", json!({}), mock::mk_usage(30, 10)),
+            mock::resp_text("done", mock::mk_usage(20, 5)),
+        ]);
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![Box::new(EchoTool::new("echo"))],
+            vec![user_text("hi")],
+            test_ctx(),
+        );
+        agent.run(&mut |_| {}).unwrap();
+        let counter = agent.ctx.budget.clone().expect("counter installed by run");
+        assert_eq!(counter.load(Ordering::Relaxed), 65, "both chats billed: 40 + 25");
+        // Second run: fresh provider script, fresh spend — the counter must
+        // NOT still carry the previous run's 65.
+        let (prov2, _) = MockProvider::new(vec![mock::resp_text("again", mock::mk_usage(7, 3))]);
+        agent.provider = Box::new(prov2);
+        agent.run(&mut |_| {}).unwrap();
+        let counter2 = agent.ctx.budget.clone().expect("counter re-installed");
+        assert_eq!(counter2.load(Ordering::Relaxed), 10, "fresh counter per run");
+        assert!(!(
+            std::sync::Arc::ptr_eq(&counter, &counter2)
+        ), "a new run must replace, not reuse, the counter");
+    }
+
+    #[test]
+    fn tool_billed_usage_does_not_double_count_in_the_fleet_counter() {
+        // The tool-billed fold (a `task` child's ToolOutput.usage landing in
+        // the parent's totals) must stay OUT of the shared counter: the child
+        // already shared its direct chat spend while it ran, so adding the
+        // fold here too would double-count and halve the fleet's effective
+        // budget. Own totals (o.input_tokens) still include the billed usage.
+        let mut cfg = cfg_with(99, 0, 0);
+        cfg.limits.max_total_tokens = 1_000;
+        let (prov, _) = MockProvider::new(vec![
+            mock::resp_tool("a", "bill", json!({}), mock::mk_usage(40, 0)),
+            mock::resp_text("done", mock::mk_usage(10, 0)),
+        ]);
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![Box::new(BillTool)],
+            vec![user_text("hi")],
+            test_ctx(),
+        );
+        let o = agent.run(&mut |_| {}).unwrap();
+        // Accounting total = both chats (40+10) + the tool's billed 111.
+        assert_eq!(o.input_tokens, 161);
+        // Fleet counter = direct chats ONLY (40+10); BillTool's 111 is a
+        // child-spend stand-in that "already counted itself" elsewhere.
+        let counter = agent.ctx.budget.clone().expect("counter installed");
+        assert_eq!(counter.load(Ordering::Relaxed), 50);
     }
 
     #[test]
@@ -3431,6 +3497,8 @@
             shell_timeout_secs: 120,
             hooks: None,
             subagent: None,
+            budget: None,
+            deadline: None,
         };
         (ctx, canon)
     }

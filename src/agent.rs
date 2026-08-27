@@ -5,7 +5,7 @@ use crate::provider::{Block, ChatEvent, ChatRequest, Message, Provider, Role, To
 use crate::tools::{Tool, ToolConcurrency, ToolCtx, ToolOutput};
 use anyhow::Result;
 use serde_json::Value;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -571,6 +571,25 @@ impl Agent {
         });
     }
 
+    /// Bill one of THIS agent's own chat requests: share the spend into the
+    /// run-wide counter (`ToolCtx::budget` — see the gate in `run_impl`), then
+    /// fold into the local totals + emit. Used by the three direct-chat sites
+    /// (main turn chat, preflight + forced-compression summaries). NOT for
+    /// tool-billed usage: a `task` child already shared its own direct spend
+    /// while running, so the parent's accounting fold must stay counter-free
+    /// (a double add would halve the fleet's effective budget).
+    fn bill_chat(&mut self, events: &mut dyn FnMut(AgentEvent), u: &Usage) {
+        if let Some(c) = &self.ctx.budget {
+            // fetch_update (not fetch_add): saturating per the numeric-writer
+            // convention — a wrapping add could roll a huge lying counter back
+            // to a small value and dodge the budget gate.
+            let _ = c.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_add(u.total()))
+            });
+        }
+        self.fold_usage(events, u);
+    }
+
     /// Wrap a mid-run error with the partial cost burned so far (this run's
     /// accumulated `usage` + the `records` of tools already executed), so a
     /// retry loop can bill the failed attempt honestly. Called at every
@@ -712,6 +731,22 @@ impl Agent {
         // otherwise only enforced at turn boundaries.
         let deadline = (self.limits.timeout_secs > 0)
             .then(|| start + Duration::from_secs(self.limits.timeout_secs));
+        // Publish the deadline + a fleet-wide budget counter to the tool ctx
+        // so `task` children inherit both (child_ctx clones them): the shared
+        // counter makes N parallel sub-agents collectively bound by
+        // max_total_tokens (each child's gate reads the same spend the parent
+        // and its siblings write — the old gate saw only the parent's own
+        // totals at turn boundaries, so a parallel batch could burn N× the
+        // budget before the join-time fold), and the deadline lets a child
+        // clamp its timeout to the parent's REMAINING time. Only a top-level
+        // run installs a FRESH counter (usage totals also reset per run — TUI
+        // follow-ups, harness retries); run_as_subagent keeps the inherited
+        // one so parent + siblings + child all read/write the same numbers.
+        self.ctx.deadline = deadline;
+        if reset_cancel {
+            self.ctx.budget = (self.limits.max_total_tokens > 0)
+                .then(|| Arc::new(AtomicU64::new(0)));
+        }
         let mut turns = 0u32;
         let mut final_text = String::new();
         let mut records: Vec<ToolCallRecord> = Vec::new();
@@ -751,11 +786,22 @@ impl Agent {
             // tool_results are in history); this only prevents a fresh turn
             // from starting, so the transcript and N:N tool pairing stay
             // intact. 0 = no cap.
-            if self.limits.max_total_tokens > 0
-                && self.usage.total() >= self.limits.max_total_tokens
-            {
-                stop_reason = "budget_exceeded".into();
-                break;
+            if self.limits.max_total_tokens > 0 {
+                // Fleet spend: the shared counter when installed (this run's
+                // direct chat spend of the parent AND every live task child —
+                // children fetch_add as they go, so a parallel batch trips the
+                // cap collectively instead of each child independently burning
+                // a full budget while the parent waits at the join), else our
+                // own totals (hand-built ctx in tests / budget unset).
+                let spent = self
+                    .ctx
+                    .budget
+                    .as_ref()
+                    .map_or_else(|| self.usage.total(), |c| c.load(Ordering::Relaxed));
+                if spent >= self.limits.max_total_tokens {
+                    stop_reason = "budget_exceeded".into();
+                    break;
+                }
             }
             turns += 1;
             events(AgentEvent::TurnStart(turns));
@@ -769,7 +815,7 @@ impl Agent {
             // and must not emit a noise Usage{0,0} event into the NDJSON stream
             // / TUI status.
             if let Some(Some(u)) = self.compress(events, deadline, /*force*/ false) {
-                self.fold_usage(events, &u);
+                self.bill_chat(events, &u);
             }
 
             // Overflow recovery (OpenCode semantics): if the provider rejects
@@ -845,7 +891,7 @@ impl Agent {
                             if let Some(Some(u)) =
                                 self.compress(events, deadline, /*force*/ true)
                             {
-                                self.fold_usage(events, &u);
+                                self.bill_chat(events, &u);
                             }
                             // Only retry if compression actually shrank the
                             // history; otherwise there's nothing more we can do.
@@ -859,7 +905,7 @@ impl Agent {
                 }
             };
             if let Some(u) = resp.usage {
-                self.fold_usage(events, &u);
+                self.bill_chat(events, &u);
             }
 
             // A provider mid-stream error (Anthropic error event / read failure)
@@ -1196,6 +1242,11 @@ impl Agent {
                         is_error: true,
                     }),
                     Slot::Ran(output) => {
+                        // Plain fold_usage (NOT bill_chat): tool-billed usage
+                        // is a `task` child's spend, which the child already
+                        // shared into the fleet counter while it ran — adding
+                        // it here too would double-count and halve the
+                        // effective budget.
                         if let Some(u) = output.usage {
                             self.fold_usage(events, &u);
                         }

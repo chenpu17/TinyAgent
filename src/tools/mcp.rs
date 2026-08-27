@@ -318,6 +318,8 @@ mod tests {
             shell_timeout_secs: 120,
             hooks: None,
             subagent: None,
+            budget: None,
+            deadline: None,
         };
         let list = tools.iter().find(|t| t.def().name.contains("list_directory")).expect("有 list 工具");
         let out = list

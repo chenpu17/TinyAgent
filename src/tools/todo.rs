@@ -293,6 +293,8 @@ mod tests {
             shell_timeout_secs: 120,
             hooks: None,
             subagent: None,
+            budget: None,
+            deadline: None,
         }
     }
 }

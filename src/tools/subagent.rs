@@ -147,6 +147,12 @@ impl Tool for SubAgent {
         let mut child_cfg = self.cfg.clone();
         child_cfg.system_prompt = Some(SUBAGENT_SYSTEM_PROMPT.into());
         child_cfg.limits.max_turns = child_cfg.limits.max_turns.min(SUBAGENT_MAX_TURNS);
+        // Wall-clock inheritance: the child's budget is the parent's REMAINING
+        // time, never a fresh full copy — a `task` spawned one second before
+        // the parent deadline would otherwise get a whole second
+        // `timeout_secs` and the fleet could take ~2× the configured budget.
+        child_cfg.limits.timeout_secs =
+            clamp_child_timeout(child_cfg.limits.timeout_secs, ctx.deadline);
 
         // Child tools: the parent's whitelist built full, then RETAINED by
         // capability (`available_to_subagent`) rather than filtered by name —
@@ -205,6 +211,33 @@ fn child_ctx(ctx: &ToolCtx, name: &str) -> ToolCtx {
         shell_timeout_secs: ctx.shell_timeout_secs,
         hooks: ctx.hooks.clone(),
         subagent: Some(name.to_string()),
+        // Fleet-wide budget + parent deadline carry over (Arc-shared): the
+        // child's budget gate reads the SAME counter the parent and any
+        // parallel siblings write, and its timeout clamps to the parent's
+        // remaining wall-clock — see `SubAgent::run_with_emit`.
+        budget: ctx.budget.clone(),
+        deadline: ctx.deadline,
+    }
+}
+
+/// Clamp a `task` child's `timeout_secs` to the parent's remaining wall-clock
+/// (`ToolCtx::deadline`, published by the parent's run loop). Tighten-only
+/// (`min`): a child config that is already tighter stays tighter. The floor is
+/// 1s — `0` would mean "no timeout" (a LOOSENING) even though the deadline
+/// being set at all means the parent IS bounded, and a sub-second remainder
+/// cannot fit a chat anyway (the parent loop's own gate refuses the next turn
+/// at <1s). `None` (parent unbounded) leaves the child config untouched.
+fn clamp_child_timeout(child_timeout_secs: u64, deadline: Option<std::time::Instant>) -> u64 {
+    let Some(d) = deadline else {
+        return child_timeout_secs;
+    };
+    let remaining = d
+        .saturating_duration_since(std::time::Instant::now())
+        .as_secs()
+        .max(1);
+    match child_timeout_secs {
+        0 => remaining,
+        t => t.min(remaining),
     }
 }
 
@@ -334,6 +367,18 @@ mod tests {
     /// a no-cancel ToolCtx. Mirrors what SubAgent::run assembles, minus the
     /// real provider — so we can assert run_subagent's outcome mapping.
     fn mock_agent(turns: Vec<mock::MockTurn>) -> Agent {
+        mock_agent_ext(turns, 0, None)
+    }
+
+    /// [`mock_agent`] plus the two fleet-limit knobs a `task` child inherits
+    /// from the parent's run loop: the shared budget counter
+    /// (`max_total_tokens > 0` installs one in a real run) and the run
+    /// deadline — wired here through the ctx exactly as `child_ctx` does.
+    fn mock_agent_ext(
+        turns: Vec<mock::MockTurn>,
+        max_total_tokens: u64,
+        budget: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    ) -> Agent {
         let cfg = crate::config::Config {
             provider: crate::config::ProviderKind::Anthropic,
             base_url: None,
@@ -350,6 +395,8 @@ mod tests {
             reasoning_effort: None,
             inject_environment: false,
         };
+        let mut cfg = cfg;
+        cfg.limits.max_total_tokens = max_total_tokens;
         let (prov, _state) = MockProvider::new(turns);
         Agent::new(
             &cfg,
@@ -364,6 +411,8 @@ mod tests {
                 shell_timeout_secs: 120,
                 hooks: None,
                 subagent: None,
+                budget,
+                deadline: None,
             },
         )
     }
@@ -412,6 +461,65 @@ mod tests {
         let out = run_subagent(&mut agent, "scout", &mut |_| {}, usize::MAX);
         assert!(out.is_error);
         assert!(out.usage.is_none());
+    }
+
+    #[test]
+    fn child_budget_gate_reads_the_shared_fleet_counter() {
+        // Fleet budget: the parent already burned 100 of a 150 cap before
+        // spawning (the counter holds exactly what the parent's run loop
+        // publishes via ToolCtx). The child's FIRST turn fits (100 < 150) and
+        // bills another 100 → counter 200; its second turn must be REFUSED by
+        // the shared gate — under the old per-child gate (own usage only) it
+        // would have run on, each parallel child independently burning a
+        // whole budget before the parent's join-time fold.
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(100));
+        let mut agent = mock_agent_ext(
+            vec![
+                mock::resp_tool("t1", "noop", json!({}), mock::mk_usage(100, 0)),
+                mock::resp_text("unreached", mock::mk_usage(100, 0)),
+            ],
+            /* max_total_tokens */ 150,
+            Some(counter.clone()),
+        );
+        let out = run_subagent(&mut agent, "scout", &mut |_| {}, usize::MAX);
+        // Stopped after turn 1: the child's own bill is 100 (not 200), and the
+        // counter ends at parent(100) + child(100) = 200.
+        let u = out.usage.expect("turn 1 was billed");
+        assert_eq!(u.input_tokens, 100);
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            200,
+            "child direct spend lands in the shared counter"
+        );
+        assert!(
+            out.content.contains("budget_exceeded"),
+            "stop reason surfaced to the parent: {}",
+            out.content
+        );
+    }
+
+    #[test]
+    fn clamp_child_timeout_tightens_to_parent_remaining() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        // No parent deadline (parent unbounded) → child config untouched.
+        assert_eq!(clamp_child_timeout(10, None), 10);
+        assert_eq!(clamp_child_timeout(0, None), 0);
+        // Parent deadline far away → the child's own (tighter) value wins:
+        // tighten-only, never loosen.
+        assert_eq!(clamp_child_timeout(1, Some(now + Duration::from_secs(10))), 1);
+        // Parent nearly out of time → clamped to the remainder (the instant
+        // elapsed between capture and the call shaves the fraction, so accept
+        // 2..=3 for a 3s margin).
+        let clamped = clamp_child_timeout(10, Some(now + Duration::from_secs(3)));
+        assert!((2..=3).contains(&clamped), "clamped to ~3s, got {clamped}");
+        // Deadline already past → floored at 1s (0 would mean "no timeout",
+        // a loosening; and <1s cannot fit a chat).
+        assert_eq!(clamp_child_timeout(10, Some(now - Duration::from_secs(1))), 1);
+        // Child "unlimited" (0) under a bounded parent → the remaining time,
+        // not unlimited.
+        let unlimited = clamp_child_timeout(0, Some(now + Duration::from_secs(4)));
+        assert!((3..=4).contains(&unlimited), "~4s, got {unlimited}");
     }
 
     #[test]
@@ -585,6 +693,8 @@ mod tests {
             shell_timeout_secs: 120,
             hooks: None,
             subagent: None,
+            budget: None,
+            deadline: None,
         };
         let mut emit = |_: AgentEvent| {};
         // No name at all → rejected on name.
@@ -627,9 +737,13 @@ mod tests {
         // The child's ctx Arc-CLONES the parent's hooks layer (denied at the
         // top level stays denied inside the sub-agent — no bypass), and tags
         // the child with its sub-agent name so hooks can tell its calls apart.
-        // Sandbox / limit fields carry over unchanged.
+        // Sandbox / limit fields carry over unchanged — including the two
+        // fleet-limit channels: the budget counter is Arc-SHARED (the child's
+        // gate reads the same spend the parent and siblings write) and the
+        // run deadline passes through (the child clamps its timeout to it).
         let hooks: std::sync::Arc<dyn crate::hooks::Hooks> =
             std::sync::Arc::new(NoopHooks);
+        let deadline = std::time::Instant::now();
         let parent = ToolCtx {
             workdir: std::env::temp_dir(),
             max_output_chars: 1234,
@@ -638,6 +752,10 @@ mod tests {
             shell_timeout_secs: 77,
             hooks: Some(hooks.clone()),
             subagent: None,
+            budget: Some(std::sync::Arc::new(
+                std::sync::atomic::AtomicU64::new(42),
+            )),
+            deadline: Some(deadline),
         };
         let child = child_ctx(&parent, "scout");
         assert!(
@@ -647,6 +765,14 @@ mod tests {
             ),
             "child must SHARE the parent's hooks layer (no bypass)"
         );
+        assert!(
+            std::sync::Arc::ptr_eq(
+                parent.budget.as_ref().unwrap(),
+                child.budget.as_ref().unwrap()
+            ),
+            "child must SHARE the fleet budget counter (collective cap)"
+        );
+        assert_eq!(child.deadline, Some(deadline));
         assert_eq!(child.subagent.as_deref(), Some("scout"));
         assert_eq!(child.workdir, parent.workdir);
         assert_eq!(child.max_output_chars, 1234);

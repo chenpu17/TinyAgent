@@ -63,6 +63,8 @@ fn custom_callback_tool_runs_and_usage_is_honest() {
         shell_timeout_secs: 120,
         hooks: None,
         subagent: None,
+        budget: None,
+        deadline: None,
     };
     let mut agent = Agent::new(&cfg, provider, vec![Box::new(echo)], Vec::new(), ctx);
 
@@ -184,6 +186,8 @@ fn run_error_serializes_structured_cost() {
             shell_timeout_secs: 120,
             hooks: None,
             subagent: None,
+            budget: None,
+            deadline: None,
         },
     );
     let re = match agent.run(&mut |_| {}) {

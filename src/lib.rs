@@ -190,6 +190,8 @@ fn assemble(
         shell_timeout_secs: cfg.limits.shell_timeout_secs,
         hooks: None,
         subagent: None,
+        budget: None,
+        deadline: None,
     };
     Ok((tool_list, ctx, cfg))
 }

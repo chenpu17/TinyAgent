@@ -505,6 +505,8 @@ mod tests {
             shell_timeout_secs: 120,
             hooks: None,
             subagent: None,
+            budget: None,
+            deadline: None,
         };
         let start = Instant::now();
         let out = Shell.run(&json!({"command": "sleep 30"}), &ctx).unwrap();
@@ -536,6 +538,8 @@ mod tests {
             shell_timeout_secs: 120,
             hooks: None,
             subagent: None,
+            budget: None,
+            deadline: None,
         };
         let out = Shell
             .run(&json!({"command": "printf '中%.0s' $(seq 1 5000)"}), &ctx)
@@ -556,6 +560,8 @@ mod tests {
             shell_timeout_secs: 120,
             hooks: None,
             subagent: None,
+            budget: None,
+            deadline: None,
         }
     }
 
@@ -648,6 +654,8 @@ mod tests {
             shell_timeout_secs: 1,
             hooks: None,
             subagent: None,
+            budget: None,
+            deadline: None,
         };
         let start = Instant::now();
         let out = Shell.run(&json!({"command": "sleep 30"}), &ctx).unwrap();
@@ -679,6 +687,8 @@ mod tests {
             shell_timeout_secs: 0,
             hooks: None,
             subagent: None,
+            budget: None,
+            deadline: None,
         };
         let out = Shell
             .run(&json!({"command": "sleep 2 && echo done"}), &ctx)

@@ -41,6 +41,29 @@ pub struct ToolCtx {
     /// identity that tags its forwarded events) — lets hooks tell top-level
     /// calls from sub-agent calls. None on the main agent.
     pub subagent: Option<String>,
+    /// Run-wide token spend counter shared by the parent agent and EVERY
+    /// `task` sub-agent of the current run (`max_total_tokens > 0` only).
+    /// Each agent `fetch_add`s its OWN direct chat spend (turn chats +
+    /// compression summaries); the budget gates — parent and children alike —
+    /// read this SAME counter, so N parallel sub-agents collectively trip the
+    /// cap instead of each independently burning a full budget before the
+    /// parent's join-time fold (the old "事后熔断" hole). Installed per run by
+    /// `Agent::run` (fresh counter — usage totals also reset per run);
+    /// `run_as_subagent` keeps the inherited one. IMPORTANT for callers: when
+    /// the parent folds a sub-agent's `ToolOutput.usage` into its own totals
+    /// (accounting), it must NOT also add here — the child already counted
+    /// its direct spend (double-add would halve the effective budget).
+    pub budget: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// The run's wall-clock deadline (`limits.timeout_secs` from run start),
+    /// published so a `task` sub-agent can clamp its own timeout to the
+    /// parent's REMAINING time instead of a fresh full copy (a child spawned
+    /// near the deadline would otherwise run a whole second `timeout_secs`,
+    /// letting the fleet take ~2× the configured budget). SOFT limit: it
+    /// bounds chat requests and turn starts (and, via this field, sub-agent
+    /// turn starts) — tool execution is bounded by each tool's own limits
+    /// (`shell_timeout_secs`, the MCP call timeout), and host callbacks in
+    /// the language bindings cannot be interrupted at all.
+    pub deadline: Option<std::time::Instant>,
 }
 
 #[derive(Debug)]
@@ -377,6 +400,8 @@ mod tests {
             shell_timeout_secs: 120,
             hooks: None,
             subagent: None,
+            budget: None,
+            deadline: None,
         };
         let err = resolve(&ctx, "../outside.txt").unwrap_err();
         assert!(
@@ -396,6 +421,8 @@ mod tests {
             shell_timeout_secs: 120,
             hooks: None,
             subagent: None,
+            budget: None,
+            deadline: None,
         };
         // write_file targets not-yet-existing files; resolve (via confine) must
         // allow a path whose deeper components don't exist yet (it canonicalizes
@@ -416,6 +443,8 @@ mod tests {
             shell_timeout_secs: 120,
             hooks: None,
             subagent: None,
+            budget: None,
+            deadline: None,
         };
         // With restrict off, resolve just joins — no escape check, no error.
         let resolved = resolve(&ctx, "../outside.txt").unwrap();
@@ -433,6 +462,8 @@ mod tests {
             shell_timeout_secs: 120,
             hooks: None,
             subagent: None,
+            budget: None,
+            deadline: None,
         };
         // The workdir's own parent exists and is, by definition, not under it.
         let outside = dir.parent().unwrap();
