@@ -182,6 +182,15 @@ fn assemble(
         tool_list.push(Box::new(tools::ListSkill::new(index)) as Box<dyn tools::Tool>);
     }
 
+    // Startup contract: the FINAL list's names (built-in + MCP + skill + extra)
+    // must be valid + unique. Without this a custom tool named like a built-in
+    // was silently SHADOWED (dispatch resolves by first match) while the model
+    // saw duplicate definitions — providers reject those with a 400 mid-run —
+    // and an invalid charset/length only failed inside a provider request.
+    // Same spirit as `tools::mcp::dedup_check`, which covers MCP display names
+    // among themselves only.
+    validate_tool_names(&tool_list)?;
+
     let ctx = ToolCtx {
         workdir,
         max_output_chars: cfg.limits.max_output_chars,
@@ -194,6 +203,44 @@ fn assemble(
         deadline: None,
     };
     Ok((tool_list, ctx, cfg))
+}
+
+/// Validate the FINAL tool list's names before the agent is built: non-empty,
+/// `[A-Za-z0-9_-]` only, ≤64 chars (the Anthropic tool-name / OpenAI
+/// function-name wire limit), and unique across built-in + MCP + skill +
+/// extra tools. See the call site in [`assemble`] for the failure mode this
+/// replaces (silent shadowing at dispatch / provider 400 mid-run).
+fn validate_tool_names(tools: &[Box<dyn tools::Tool>]) -> anyhow::Result<()> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for t in tools {
+        let name = t.def().name;
+        if name.is_empty() {
+            anyhow::bail!("tool name must not be empty");
+        }
+        if let Some(bad) = name
+            .chars()
+            .find(|c| !c.is_ascii_alphanumeric() && *c != '_' && *c != '-')
+        {
+            anyhow::bail!(
+                "tool name '{name}' contains '{bad}': names may only use \
+                 [A-Za-z0-9_-] (the Anthropic/OpenAI tool-name character set)"
+            );
+        }
+        if name.chars().count() > 64 {
+            anyhow::bail!(
+                "tool name '{name}' exceeds the 64-char provider limit \
+                 (Anthropic tool name / OpenAI function name)"
+            );
+        }
+        if !seen.insert(name.clone()) {
+            anyhow::bail!(
+                "duplicate tool name '{name}': built-in, MCP, and custom tools \
+                 must be unique — the later definition would be silently shadowed \
+                 at dispatch (first match wins)"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Skill search dirs, global first + project last (so the project dir overrides

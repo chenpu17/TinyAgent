@@ -200,3 +200,90 @@ fn run_error_serializes_structured_cost() {
     assert!(v["turns"].is_number(), "turns serializes as a number");
     assert!(v["elapsed"].is_object(), "Duration serializes (serde json)");
 }
+
+/// A one-off custom tool with a caller-chosen name, for the name-validation
+/// tests below (the exact path a binding's callable takes into assemble).
+fn plain_tool(name: &str) -> CallbackTool {
+    CallbackTool::new(
+        ToolDef {
+            name: name.into(),
+            description: "validation probe".into(),
+            schema: json!({"type": "object", "properties": {}}),
+        },
+        |_input, _ctx| Ok(ToolOutput::text("ok")),
+    )
+}
+
+#[test]
+fn duplicate_tool_name_fails_at_build() {
+    // A custom tool named like a built-in used to be silently SHADOWED
+    // (dispatch resolves by first match) while the model saw two definitions
+    // of the same name — providers reject that with a 400 mid-run. Startup
+    // must fail instead, naming the collision.
+    let mut cfg = minimal_config();
+    cfg.tools = vec!["shell".into()];
+    let client = reqwest::blocking::Client::new();
+    let err = tiny_agent::build_agent_with(
+        &cfg,
+        vec![],
+        &client,
+        vec![Box::new(plain_tool("shell"))],
+        "k",
+    );
+    let err = match err {
+        Err(e) => e,
+        Ok(_) => panic!("built-in vs custom collision must fail at build"),
+    };
+    let msg = format!("{err:#}");
+    assert!(msg.contains("duplicate"), "{msg}");
+    assert!(msg.contains("shell"), "the colliding name is named: {msg}");
+    // Two custom tools colliding with each other hit the same check.
+    let err = tiny_agent::build_agent_with(
+        &cfg,
+        vec![],
+        &client,
+        vec![Box::new(plain_tool("dup")), Box::new(plain_tool("dup"))],
+        "k",
+    );
+    let err = match err {
+        Err(e) => e,
+        Ok(_) => panic!("custom vs custom collision must fail at build"),
+    };
+    assert!(format!("{err:#}").contains("duplicate"));
+}
+
+#[test]
+fn invalid_tool_name_fails_at_build() {
+    // Charset and length are the Anthropic tool-name / OpenAI function-name
+    // wire limits; violating them used to surface as a provider 400 on the
+    // first request instead of a build error.
+    let cfg = minimal_config();
+    let client = reqwest::blocking::Client::new();
+    for bad in ["my tool", "echo!", "工具", "a".repeat(65).as_str()] {
+        let err = tiny_agent::build_agent_with(
+            &cfg,
+            vec![],
+            &client,
+            vec![Box::new(plain_tool(bad))],
+            "k",
+        );
+        let err = match err {
+            Err(e) => e,
+            Ok(_) => panic!("'{bad}' must be rejected at build"),
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("tool name") || msg.contains("tool names"),
+            "message names the offending tool: {msg}"
+        );
+    }
+    // The boundary itself passes: exactly 64 chars of legal characters.
+    tiny_agent::build_agent_with(
+        &cfg,
+        vec![],
+        &client,
+        vec![Box::new(plain_tool(&"a".repeat(64)))],
+        "k",
+    )
+    .expect("64-char name is within the provider limit");
+}
