@@ -597,16 +597,31 @@ pub fn run(
                         started_at: String::new(),
                     }
                 } else {
-                    run_one(
-                        base,
-                        &name,
-                        partial,
-                        &results_dir,
-                        &client,
-                        retries,
-                        isolate,
-                        &cancel,
-                    )
+                    // P2-9: a panicking task (a bug in some exotic config
+                    // combo) must not unwind out of the worker and kill the
+                    // whole batch in debug builds — convert it to a
+                    // deterministic failure report so the remaining tasks and
+                    // the final report still land. NB: this only helps under
+                    // panic="unwind" (debug / test harnesses); the release
+                    // profile sets panic="abort", where a panic kills the
+                    // process before catch_unwind sees it — the fallback
+                    // report is then never written. Same trade-off as the
+                    // lock-poisoning tolerance above.
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run_one(
+                            base,
+                            &name,
+                            partial,
+                            &results_dir,
+                            &client,
+                            retries,
+                            isolate,
+                            &cancel,
+                        )
+                    })) {
+                        Ok(r) => r,
+                        Err(payload) => panic_report(&name, &payload),
+                    }
                 };
                 eprintln!(
                     "[{}] {} ({} turns, {:.1}s{})",
@@ -883,6 +898,33 @@ fn run_one_attempt(
 /// the task cancelled instead of running another full attempt: the worker's
 /// per-task gate only stops the NEXT task, so without this the cancel is
 /// swallowed until the in-flight retry loop finishes.
+/// Convert a panic payload caught around `run_one` into a deterministic
+/// failure report. `stop_reason: "panic"` deliberately differs from `"error"`
+/// so the retry gate (and any external tooling keying on stop_reason) treats
+/// it as non-transient. No tokens/turns are known — the panic aborted the
+/// task before accounting; elapsed time is lost with the unwinding stack.
+fn panic_report(name: &str, payload: &(dyn std::any::Any + Send)) -> TaskReport {
+    let msg = payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".into());
+    TaskReport {
+        name: name.into(),
+        success: false,
+        stop_reason: "panic".into(),
+        turns: 0,
+        elapsed_secs: 0.0,
+        error: Some(format!("worker panic: {msg}")),
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        model: String::new(),
+        started_at: crate::harness::now_rfc3339(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_one(
     base: &Config,
@@ -2209,5 +2251,27 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn panic_report_maps_payload_and_is_deterministic() {
+        // &str payload (panic!("literal"))
+        let r = panic_report("t1", &"boom");
+        assert!(!r.success);
+        assert_eq!(r.stop_reason, "panic");
+        assert_eq!(r.error.as_deref(), Some("worker panic: boom"));
+        assert_eq!(r.turns, 0);
+        assert_eq!(r.input_tokens, 0);
+        // String payload (panic!("{}", x))
+        let r = panic_report("t2", &String::from("value error"));
+        assert_eq!(r.error.as_deref(), Some("worker panic: value error"));
+        // Opaque payload (custom type) → generic fallback, not a panic-in-panic.
+        let opaque: Box<dyn std::any::Any + Send> = Box::new(7u32);
+        let r = panic_report("t3", opaque.as_ref());
+        assert_eq!(r.error.as_deref(), Some("worker panic: unknown panic"));
+        // "panic" is NOT the transient retry value — run_one only retries
+        // stop_reason == "error", so a panicked task stays failed in --failed
+        // reruns of the same (fixed) code.
+        assert_ne!(r.stop_reason, "error");
     }
 }
