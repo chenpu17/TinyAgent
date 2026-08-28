@@ -153,11 +153,7 @@ pub(crate) fn run_with_retries(
                         // Surface the retry to NDJSON consumers between attempts
                         // so they can follow progress, not just see a gap.
                         let v = retry_event_json(attempt, retries, backoff, &msg);
-                        println!(
-                            "{}",
-                            serde_json::to_string(&v).unwrap_or_else(|_| "{}".into())
-                        );
-                        let _ = std::io::stdout().flush();
+                        print_ndjson(&serde_json::to_string(&v).unwrap_or_else(|_| "{}".into()));
                     } else {
                         eprintln!("[transient] {msg}; retry {attempt}/{retries} in {backoff:?}");
                     }
@@ -199,11 +195,7 @@ pub(crate) fn run_with_retries(
                 "error"
             };
             let v = done_event_json(stop_reason, err);
-            println!(
-                "{}",
-                serde_json::to_string(&v).unwrap_or_else(|_| "{}".into())
-            );
-            let _ = std::io::stdout().flush();
+            print_ndjson(&serde_json::to_string(&v).unwrap_or_else(|_| "{}".into()));
         }
     }
     // Always produce a result artifact, even on failure: the previous `?` here
@@ -337,13 +329,21 @@ fn event_json(ev: &AgentEvent) -> Value {
     }
 }
 
+/// Print one NDJSON line to stdout, IGNORING write errors: Rust installs
+/// SIGPIPE=SIG_IGN, so a consumer closing the pipe (`--json … | head`) turns
+/// `println!` into a panic (exit 101) mid-run. The human renderer already
+/// treats I/O as best-effort for the same reason; the machine path must
+/// match — a vanished consumer doesn't invalidate the run (result.json is
+/// still written).
+fn print_ndjson(line: &str) {
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{line}");
+    let _ = out.flush();
+}
+
 fn emit_json(ev: &AgentEvent) {
     let v = event_json(ev);
-    println!(
-        "{}",
-        serde_json::to_string(&v).unwrap_or_else(|_| "{}".into())
-    );
-    let _ = std::io::stdout().flush();
+    print_ndjson(&serde_json::to_string(&v).unwrap_or_else(|_| "{}".into()));
 }
 
 /// NDJSON event emitted between attempts when a transient error is retried
@@ -512,78 +512,105 @@ pub fn write_result(
     atomic_write(path, bytes.as_bytes())
 }
 
+/// Monotonic per-process suffix for atomic_write temp names. Module-level
+/// (not inside the fn) so tests can predict the next allocation.
+static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `<target>.<pid>.<n>.tmp` sibling of `path` — same directory, so the final
+/// rename stays on one filesystem.
+fn tmp_name(path: &Path, n: u64) -> std::path::PathBuf {
+    match path.file_name() {
+        Some(name) => {
+            let mut base = name.to_os_string();
+            base.push(format!(".{}.{}.tmp", std::process::id(), n));
+            path.with_file_name(base)
+        }
+        None => path.with_extension("tmp"),
+    }
+}
+
 /// Atomically write bytes to `path`: write a temp file in the same
 /// directory, then rename. A crash mid-write never leaves a half-file —
 /// result.json and report.json are read by CI, so they must not corrupt.
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    // Unique temp name in the SAME directory as the target (atomic rename
-    // needs the same filesystem). The pid + counter suffix (a) avoids
-    // collisions between concurrent writes — e.g. batch workers sharing a
-    // workdir editing same-named files — and (b) makes the path unpredictable,
-    // so a pre-placed symlink at a fixed ".tmp" name can't redirect the write
-    // outside the workdir.
-    let tmp = {
-        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        match path.file_name() {
-            Some(name) => {
-                let mut base = name.to_os_string();
-                base.push(format!(".{}.{}.tmp", std::process::id(), n));
-                path.with_file_name(base)
-            }
-            None => path.with_extension("tmp"),
-        }
-    };
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
         }
     }
-    // Write + fsync the temp file before renaming, so a crash after rename
-    // never exposes a zero-length file. (result.json / report.json are read
-    // by CI and must not corrupt on power loss.) A failure anywhere inside
-    // this block removes the temp file first — the rename branch below
-    // already did, but a create/write/sync failure used to leave the stray
-    // .tmp behind (visible to anything globbing the directory, e.g. the next
-    // batch round's task scan).
-    let written = (|| -> Result<()> {
-        let mut f = std::fs::File::create(&tmp)
-            .with_context(|| format!("cannot create {}", tmp.display()))?;
-        // Preserve the existing target's permissions — above all the executable
-        // bit: File::create makes a fresh default-mode file, so without this an
-        // edit_file on a +x script silently strips -x. Best-effort no-op when
-        // the target doesn't exist yet (write_file creating a new file).
-        if let Ok(meta) = std::fs::metadata(path) {
-            let _ = f.set_permissions(meta.permissions());
+    // The pid + counter suffix avoids collisions between concurrent writers
+    // (batch workers sharing a workdir), but it is NOT unpredictable — a
+    // hostile workdir can pre-place a symlink at the exact predicted name —
+    // so the open is O_EXCL (`create_new`): it fails on ANY pre-existing
+    // path, symlinks included (O_EXCL never follows them), where plain
+    // `File::create` would write THROUGH the link and redirect the write
+    // outside the workdir (write_file / edit_file land here after their own
+    // target-path sandbox check, which can't see the temp sibling). On
+    // collision the counter advances and a fresh suffix is tried; a stale
+    // tmp from a pid-reused predecessor process is skipped the same way.
+    for _ in 0..8 {
+        let n = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = tmp_name(path, n);
+        let mut f = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e).with_context(|| format!("cannot create {}", tmp.display())),
+        };
+        // Write + fsync the temp file before renaming, so a crash after rename
+        // never exposes a zero-length file. (result.json / report.json are read
+        // by CI and must not corrupt on power loss.) A failure anywhere below
+        // removes the temp file first — the rename branch already did, but a
+        // write/sync failure used to leave the stray .tmp behind (visible to
+        // anything globbing the directory, e.g. the next batch round's task
+        // scan).
+        let written = (|| -> Result<()> {
+            // Preserve the existing target's permissions — above all the
+            // executable bit: a fresh default-mode file would silently strip
+            // -x from an edited script. Best-effort no-op when the target
+            // doesn't exist yet (write_file creating a new file).
+            if let Ok(meta) = std::fs::metadata(path) {
+                let _ = f.set_permissions(meta.permissions());
+            }
+            f.write_all(bytes)
+                .with_context(|| format!("cannot write {}", tmp.display()))?;
+            f.sync_all()
+                .with_context(|| format!("cannot sync {}", tmp.display()))?;
+            Ok(())
+        })();
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
         }
-        f.write_all(bytes)
-            .with_context(|| format!("cannot write {}", tmp.display()))?;
-        f.sync_all()
-            .with_context(|| format!("cannot sync {}", tmp.display()))?;
-        Ok(())
-    })();
-    if let Err(e) = written {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp); // don't litter on failure
-        return Err(e).with_context(|| format!("cannot save {}", path.display()));
-    }
-    // fsync the parent directory so the rename's directory-entry update
-    // survives a power loss. The file DATA is durable (sync_all above), but on
-    // ext4 (when auto_da_alloc doesn't fire) and xfs the rename itself can be
-    // lost without an explicit directory fsync — a crash could then expose the
-    // pre-rename state (old content, or no file). APFS/NTFS handle directory
-    // durability via their own transaction logs, so this is Unix-only and the
-    // error is ignored: best-effort hardening, and the rename already succeeded.
-    #[cfg(unix)]
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp); // don't litter on failure
+            return Err(e).with_context(|| format!("cannot save {}", path.display()));
         }
+        // fsync the parent directory so the rename's directory-entry update
+        // survives a power loss. The file DATA is durable (sync_all above), but
+        // on ext4 (when auto_da_alloc doesn't fire) and xfs the rename itself
+        // can be lost without an explicit directory fsync — a crash could then
+        // expose the pre-rename state (old content, or no file). APFS/NTFS
+        // handle directory durability via their own transaction logs, so this
+        // is Unix-only and the error is ignored: best-effort hardening, and
+        // the rename already succeeded.
+        #[cfg(unix)]
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+        return Ok(());
     }
-    Ok(())
+    // Every candidate name was already taken — either a stale-tmp pile-up or
+    // a hostile directory planted across the whole name window.
+    Err(anyhow::anyhow!(
+        "cannot create a temp file next to {} (all candidate names already exist)",
+        path.display()
+    ))
 }
 
 fn compact(v: &serde_json::Value) -> String {
@@ -862,6 +889,67 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "#!/bin/sh\necho new\n"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_skips_preplaced_symlink_at_predicted_tmp_name() {
+        // P1-1 regression: write_file/edit_file sandbox-check the TARGET path,
+        // but the temp sibling name is predictable (pid + counter). A
+        // pre-placed symlink at that exact name must NOT be written through —
+        // the O_EXCL (`create_new`) open fails on the existing link and the
+        // write retries on a fresh suffix instead of redirecting outside the
+        // workdir. With plain `File::create` the victim received the bytes.
+        let dir = std::env::temp_dir().join(format!("ta-atomic-link-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("out.json");
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, "precious").unwrap();
+        // Cover a few consecutive counter values: a parallel test in this
+        // process may bump TMP_COUNTER between our read and the write under
+        // test.
+        let n = TMP_COUNTER.load(std::sync::atomic::Ordering::Relaxed);
+        for k in n..n + 3 {
+            std::os::unix::fs::symlink(&victim, tmp_name(&target, k)).unwrap();
+        }
+        atomic_write(&target, b"{\"ok\":true}").unwrap();
+        // The write landed on the target…
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "{\"ok\":true}");
+        // …and never went THROUGH any planted link: the victim is untouched
+        // and the link itself still is one.
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
+        assert!(
+            std::fs::symlink_metadata(tmp_name(&target, n))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "planted symlink must not be replaced or followed"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn atomic_write_skips_stale_tmp_file_at_predicted_name() {
+        // The pid-reuse case: a crashed predecessor process with our pid can
+        // leave a stale `<target>.<pid>.<n>.tmp` behind. O_EXCL must skip it
+        // (write to a fresh suffix) rather than truncate-write a name someone
+        // else owns.
+        let dir = std::env::temp_dir().join(format!("ta-atomic-stale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("out.json");
+        let n = TMP_COUNTER.load(std::sync::atomic::Ordering::Relaxed);
+        let stale = tmp_name(&target, n);
+        std::fs::write(&stale, "stale junk from a pid-reused predecessor").unwrap();
+        atomic_write(&target, b"fresh").unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "fresh");
+        // The stale file is inert garbage — skipped, not written through.
+        assert!(
+            std::fs::read_to_string(&stale)
+                .unwrap()
+                .starts_with("stale junk"),
+            "stale tmp must not be truncated and reused"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
