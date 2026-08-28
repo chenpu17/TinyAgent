@@ -295,6 +295,51 @@ pub fn new_client(run_timeout_secs: u64) -> reqwest::blocking::Client {
     })
 }
 
+/// Hard cap on one SSE line read from a provider/gateway stream. Legitimate
+/// chunks are a few KiB (the largest shape is one big JSON event); a hostile
+/// or broken gateway streaming a line with NO newline used to make
+/// `read_line` grow the buffer without bound and OOM the reader thread.
+/// Same value/shape as mcp's MCP_LINE_MAX.
+const SSE_LINE_MAX: usize = 16 * 1024 * 1024;
+
+/// Read one line (with its `\n`) into `buf`, bounded by `max`. Returns bytes
+/// pushed (0 = clean EOF). Chunked `fill_buf`/`consume` — no per-byte reads —
+/// mirroring mcp's `read_capped_line`; the cap is a parameter so tests can
+/// exercise the bound without allocating 16 MiB.
+fn read_line_capped<R: BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max: usize,
+) -> std::io::Result<usize> {
+    loop {
+        let (consumed, done) = {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                // EOF. If a final unterminated line is buffered, hand it to
+                // the caller as a normal read (n > 0) — `read_line` semantics;
+                // the next call (buf cleared) returns a true 0/EOF.
+                return Ok(if buf.is_empty() { 0 } else { buf.len() });
+            }
+            let (take, found_nl) = match available.iter().position(|&c| c == b'\n') {
+                Some(i) => (&available[..=i], true),
+                None => (available, false),
+            };
+            if buf.len() + take.len() > max {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("SSE line exceeds {max}-byte limit (runaway gateway output?)"),
+                ));
+            }
+            buf.extend_from_slice(take);
+            (take.len(), found_nl)
+        };
+        reader.consume(consumed);
+        if done {
+            return Ok(consumed);
+        }
+    }
+}
+
 /// Iterate over the `data:` payloads of an SSE stream.
 /// Handles lines split across read boundaries and ignores comments/keep-alives.
 pub(crate) struct SseReader<R: Read> {
@@ -317,7 +362,7 @@ impl<R: Read> SseReader<R> {
     /// "successful" response). The `SseSource` impl maps this to
     /// `StreamAbort::StreamError`.
     pub fn next_data(&mut self) -> std::io::Result<Option<String>> {
-        let mut line = String::new();
+        let mut line: Vec<u8> = Vec::new();
         // C20: the old reader returned on the FIRST `data:` line, so a
         // gateway legally splitting one JSON payload across several `data:`
         // lines delivered truncated, unparseable fragments. Accumulate per
@@ -327,7 +372,9 @@ impl<R: Read> SseReader<R> {
         let mut data_lines: Vec<String> = Vec::new();
         loop {
             line.clear();
-            match self.reader.read_line(&mut line) {
+            // P2-13: bounded line read — `read_line` would grow without limit
+            // on a newline-less stream.
+            match read_line_capped(&mut self.reader, &mut line, SSE_LINE_MAX) {
                 Ok(0) => {
                     if data_lines.is_empty() {
                         return Ok(None);
@@ -335,7 +382,18 @@ impl<R: Read> SseReader<R> {
                     return Ok(Some(data_lines.join("\n")));
                 }
                 Ok(_) => {
-                    let trimmed = line.trim_end_matches(['\r', '\n']);
+                    let line = std::str::from_utf8(&line)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                    let mut trimmed = line.trim_end_matches(['\r', '\n']);
+                    // A UTF-8 BOM at the body head prefixes the first line
+                    // (`\u{feff}data: …`); U+FEFF is not whitespace so the
+                    // trims won't remove it and the `data:` prefix check
+                    // below would fail, silently dropping the first event.
+                    // Strip it wherever it appears — it's meaningless
+                    // mid-stream too.
+                    if let Some(rest) = trimmed.strip_prefix('\u{feff}') {
+                        trimmed = rest;
+                    }
                     if let Some(data) = trimmed.strip_prefix("data:") {
                         // Spec: strip at most ONE leading space (the optional
                         // separator after the colon), not all whitespace —
@@ -536,6 +594,44 @@ mod tests {
             r.next_data().unwrap().as_deref(),
             Some("no-space\n two\n\t tab")
         );
+    }
+
+    #[test]
+    fn sse_reader_strips_utf8_bom_before_first_data_line() {
+        // Some gateways emit a UTF-8 BOM at the body head. U+FEFF is not
+        // whitespace, so without an explicit strip the first line reads
+        // `\u{feff}data: …`, fails the prefix check, and the FIRST event is
+        // silently dropped.
+        let raw = "\u{feff}data: {\"first\":1}\n\ndata: [DONE]\n\n".as_bytes();
+        let mut r = SseReader::new(raw);
+        assert_eq!(r.next_data().unwrap().as_deref(), Some("{\"first\":1}"));
+        assert_eq!(r.next_data().unwrap().as_deref(), Some("[DONE]"));
+        assert_eq!(r.next_data().unwrap(), None);
+    }
+
+    #[test]
+    fn sse_reader_rejects_runaway_line() {
+        // P2-13: a line with no newline that grows past the cap must error
+        // rather than allocating without bound (OOM guard on the reader
+        // thread). Exercised on the shared helper with a tiny cap (next_data
+        // wires it up with the fixed SSE_LINE_MAX); the EOF-flush behavior of
+        // the unterminated-final-line case is pinned by the test above.
+        let cap = 16;
+        let runaway: Vec<u8> = vec![b'A'; cap + 8]; // no newline → one endless line
+        let mut r = std::io::BufReader::new(&runaway[..]);
+        let mut buf = Vec::new();
+        let err = read_line_capped(&mut r, &mut buf, cap).unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err}");
+        // Within-cap lines (newline included) read cleanly…
+        let ok = b"short line\n";
+        let mut r = std::io::BufReader::new(&ok[..]);
+        let mut buf = Vec::new();
+        let n = read_line_capped(&mut r, &mut buf, cap).unwrap();
+        assert_eq!(n, ok.len());
+        assert_eq!(&buf, ok);
+        // …and the next read is a clean EOF.
+        buf.clear();
+        assert_eq!(read_line_capped(&mut r, &mut buf, cap).unwrap(), 0);
     }
 
     #[test]
