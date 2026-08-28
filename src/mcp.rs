@@ -30,6 +30,19 @@ const MCP_LINE_MAX: usize = 16 * 1024 * 1024;
 /// a generous bound that still defeats runaway aggregation.
 const MCP_EVENT_MAX: usize = 4 * MCP_LINE_MAX;
 
+/// Cap on tools accepted from one server's `tools/list`. The tool list is
+/// model-visible context on EVERY request, and its size is the server's
+/// choice — a hostile/compromised server listing 10k tools used to bloat
+/// every request for the whole session.
+const MCP_MAX_TOOLS: usize = 256;
+/// Per-tool description cap (chars) — same 1024 the skill standard uses.
+const MCP_TOOL_DESC_MAX: usize = 1024;
+/// Per-tool inputSchema cap (serialized bytes).
+const MCP_SCHEMA_MAX: usize = 64 * 1024;
+/// Error-body read cap: a diagnostic string never needs more, and the body's
+/// size is the server's choice.
+const MCP_ERR_BODY_MAX: u64 = 16 * 1024;
+
 /// Read one line (including its trailing `\n`) into `buf` (bytes appended;
 /// caller clears `buf` between calls), bounded by `max_bytes`. Returns the
 /// number of bytes pushed, or 0 at clean EOF. Bails if a single line exceeds
@@ -143,15 +156,7 @@ impl McpClient {
         client.notify("notifications/initialized", json!({}))?;
 
         let tools = client.call("tools/list", json!({}))?;
-        let mut infos = Vec::new();
-        for t in tools["tools"].as_array().cloned().unwrap_or_default() {
-            infos.push(McpToolInfo {
-                name: t["name"].as_str().unwrap_or_default().to_string(),
-                description: t["description"].as_str().unwrap_or_default().to_string(),
-                input_schema: t["inputSchema"].clone(),
-            });
-        }
-        Ok((client, infos))
+        Ok((client, bound_tools(tools)))
     }
 
     /// Arm teardown on the underlying transport (stdio servers spawn a reaper
@@ -197,6 +202,48 @@ fn frame(id: u64, method: &str, params: Value) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
 }
 
+/// Bound a `tools/list` result into [`McpToolInfo`]s. The tool list is
+/// model-visible context on EVERY request and its size is the server's
+/// choice, so a hostile/compromised server gets to decide three things that
+/// must all be capped: the tool COUNT (MCP_MAX_TOOLS), each description
+/// (MCP_TOOL_DESC_MAX chars — same 1024 the skill standard uses), and each
+/// serialized inputSchema (MCP_SCHEMA_MAX bytes). Offenders are dropped with
+/// a stderr warning rather than kept — a garbage schema just moves the
+/// failure into every later request.
+fn bound_tools(tools: Value) -> Vec<McpToolInfo> {
+    let mut infos = Vec::new();
+    for t in tools["tools"].as_array().cloned().unwrap_or_default() {
+        if infos.len() >= MCP_MAX_TOOLS {
+            eprintln!(
+                "[warn] MCP server exposes more than {MCP_MAX_TOOLS} tools; ignoring the rest"
+            );
+            break;
+        }
+        let name = t["name"].as_str().unwrap_or_default().to_string();
+        let mut description = t["description"].as_str().unwrap_or_default().to_string();
+        if description.chars().count() > MCP_TOOL_DESC_MAX {
+            crate::tools::truncate(&mut description, MCP_TOOL_DESC_MAX);
+        }
+        let input_schema = t["inputSchema"].clone();
+        if serde_json::to_string(&input_schema)
+            .map(|s| s.len())
+            .unwrap_or(usize::MAX)
+            > MCP_SCHEMA_MAX
+        {
+            eprintln!(
+                "[warn] MCP tool '{name}' inputSchema exceeds {MCP_SCHEMA_MAX} bytes; ignoring the tool"
+            );
+            continue;
+        }
+        infos.push(McpToolInfo {
+            name,
+            description,
+            input_schema,
+        });
+    }
+    infos
+}
+
 fn notify_frame(method: &str, params: Value) -> Value {
     json!({"jsonrpc": "2.0", "method": method, "params": params})
 }
@@ -231,6 +278,13 @@ fn pending_new() -> Pending {
 }
 
 fn pending_dispatch(pending: &Pending, msg: Value) {
+    // Only RESPONSES dispatch: a server-initiated REQUEST (sampling,
+    // roots/list, …) also carries a numeric `id`, and matching one of our
+    // pending ids by accident would hand the caller the wrong message.
+    // A `method` key marks requests/notifications — never responses.
+    if msg.get("method").is_some() {
+        return;
+    }
     if let Some(id) = msg.get("id").and_then(|v| v.as_u64()) {
         if let Some(tx) = pending
             .lock()
@@ -543,6 +597,17 @@ struct HttpTransport {
     session_id: Option<String>,
 }
 
+/// Read at most `cap` bytes of a response body as lossy text. The SSE paths
+/// were always bounded (MCP_EVENT_MAX via `read_sse_event`); the plain-JSON
+/// and error-body paths used to slurp the whole server-chosen body
+/// (`resp.json()` buffers it all before parsing).
+fn capped_text(resp: &mut reqwest::blocking::Response, cap: u64) -> String {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    let _ = resp.take(cap).read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 impl HttpTransport {
     fn new(url: &str, cfg: &McpServerConfig) -> Result<Self> {
         Ok(Self {
@@ -566,10 +631,12 @@ impl HttpTransport {
         if let Some(sid) = &self.session_id {
             req = req.header("Mcp-Session-Id", sid);
         }
-        let resp = req.json(body).send().context("MCP HTTP POST failed")?;
+        let mut resp = req.json(body).send().context("MCP HTTP POST failed")?;
         if !resp.status().is_success() && resp.status() != 202 {
             let status = resp.status();
-            let text = resp.text().unwrap_or_default();
+            // P2-3: the error body's size is the server's choice and only
+            // feeds a diagnostic string — cap it.
+            let text = capped_text(&mut resp, MCP_ERR_BODY_MAX);
             bail!("MCP HTTP error {status}: {text}");
         }
         Ok(resp)
@@ -608,7 +675,15 @@ impl Transport for HttpTransport {
             }
             bail!("MCP HTTP stream closed before response to '{method}'")
         } else {
-            let msg: Value = resp.json().context("MCP HTTP: invalid JSON response")?;
+            // Plain-JSON response. P2-3: read capped, then parse — resp.json()
+            // buffers the entire body before parsing, and the body's size is
+            // the server's choice (MCP_EVENT_MAX already bounds the SSE
+            // variant of the same result; a body cut at the cap fails the
+            // parse, which is the right outcome for a >64MiB result).
+            let mut resp = resp;
+            let text = capped_text(&mut resp, MCP_EVENT_MAX as u64);
+            let msg: Value =
+                serde_json::from_str(&text).context("MCP HTTP: invalid JSON response")?;
             extract_result(msg, method)
         }
     }
@@ -765,10 +840,11 @@ impl SseTransport {
         for (k, v) in &self.headers {
             req = req.header(k, v);
         }
-        let resp = req.json(body).send().context("MCP SSE POST failed")?;
+        let mut resp = req.json(body).send().context("MCP SSE POST failed")?;
         if !resp.status().is_success() && resp.status() != 202 {
             let status = resp.status();
-            let text = resp.text().unwrap_or_default();
+            // P2-3: same error-body cap as the Streamable HTTP transport.
+            let text = capped_text(&mut resp, MCP_ERR_BODY_MAX);
             bail!("MCP SSE error {status}: {text}");
         }
         Ok(())
@@ -1093,5 +1169,80 @@ mod tests {
         assert!(resolve_endpoint("http://h/sse", "http://h:80/x").is_ok());
         // Cross-origin absolute URL is refused (SSRF guard).
         assert!(resolve_endpoint("http://h:3000/sse", "http://other/x").is_err());
+    }
+
+    #[test]
+    fn bound_tools_caps_count_description_and_schema() {
+        // P2-5: the tools/list result is server-chosen and lands in the
+        // model-visible tool list on every request. Count, per-tool
+        // description, and serialized schema must each be bounded.
+        let mut tools = Vec::new();
+        // A tool whose description is over the char cap → kept, truncated.
+        tools.push(json!({
+            "name": "chatty",
+            "description": "y".repeat(MCP_TOOL_DESC_MAX + 50),
+            "inputSchema": {"type": "object"},
+        }));
+        for i in 0..MCP_MAX_TOOLS + 5 {
+            tools.push(json!({
+                "name": format!("t{i}"),
+                "description": "d",
+                "inputSchema": {"type": "object"},
+            }));
+        }
+        // A tool whose schema serializes past the byte cap — appended past
+        // the count cap, so it is simply never reached in THIS list (the
+        // short list below exercises the drop in isolation).
+        tools.push(json!({
+            "name": "fat-schema",
+            "description": "d",
+            "inputSchema": {"type": "object", "props": "x".repeat(MCP_SCHEMA_MAX)},
+        }));
+        let infos = bound_tools(json!({"tools": tools}));
+        assert_eq!(infos.len(), MCP_MAX_TOOLS, "count capped");
+        // The first MCP_MAX_TOOLS entries by list order survive; the
+        // fat-schema tool appended past the cap is simply never reached.
+        let chatty = infos.iter().find(|i| i.name == "chatty").unwrap();
+        assert!(
+            chatty.description.contains("[truncated"),
+            "{}",
+            chatty.description
+        );
+        assert!(chatty.description.chars().count() <= MCP_TOOL_DESC_MAX + 40);
+
+        // With a short list the same rules apply in isolation: the fat schema
+        // tool is dropped even when the count is well under the cap.
+        let short = bound_tools(json!({"tools": [
+            {"name": "ok", "description": "d", "inputSchema": {"type": "object"}},
+            {"name": "fat", "description": "d", "inputSchema": {"type": "object", "props": "x".repeat(MCP_SCHEMA_MAX)}},
+        ]}));
+        let names: Vec<&str> = short.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["ok"]);
+    }
+
+    #[test]
+    fn pending_dispatch_ignores_server_initiated_requests() {
+        // A server-initiated REQUEST (sampling, roots/list, …) carries a
+        // numeric id just like a response — if its id happens to match a
+        // pending call, the old dispatch handed the caller the wrong message.
+        // Messages with a `method` key must never dispatch.
+        let pending = pending_new();
+        let (tx, rx) = mpsc::channel();
+        pending.lock().unwrap().insert(7, tx);
+        pending_dispatch(
+            &pending,
+            json!({"jsonrpc": "2.0", "id": 7, "method": "sampling/createTask", "params": {}}),
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a request must not satisfy a pending response slot"
+        );
+        // The slot survives for the real response.
+        pending_dispatch(
+            &pending,
+            json!({"jsonrpc": "2.0", "id": 7, "result": {"ok": true}}),
+        );
+        let got = rx.try_recv().expect("real response dispatches");
+        assert_eq!(got["result"]["ok"], json!(true));
     }
 }
