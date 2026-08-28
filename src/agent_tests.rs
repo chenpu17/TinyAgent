@@ -4517,3 +4517,161 @@ fn agent_constructs_and_runs_with_environment_injection_on() {
     let o = outcome.expect("run completes");
     assert_eq!(o.stop_reason, "end_turn");
 }
+
+#[test]
+fn normalize_tool_use_ids_mints_missing_and_renumbers_duplicates() {
+    // Pure-function form of the repair: empty ids (gateways that omit the
+    // field) get a minted one, duplicates get renumbered, and unique
+    // non-empty ids survive untouched.
+    let mut blocks = vec![
+        Block::Text("preamble".into()),
+        Block::ToolUse {
+            id: "".into(),
+            name: "shell".into(),
+            input: json!({}),
+        },
+        Block::ToolUse {
+            id: "dup".into(),
+            name: "shell".into(),
+            input: json!({}),
+        },
+        Block::ToolUse {
+            id: "dup".into(),
+            name: "shell".into(),
+            input: json!({}),
+        },
+        Block::ToolUse {
+            id: "real-1".into(),
+            name: "shell".into(),
+            input: json!({}),
+        },
+    ];
+    normalize_tool_use_ids(&mut blocks);
+    let ids: Vec<&str> = blocks
+        .iter()
+        .filter_map(|b| match b {
+            Block::ToolUse { id, .. } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids.len(), 4);
+    assert_eq!(ids[3], "real-1", "unique non-empty id is kept as-is");
+    assert!(
+        ids.iter().all(|i| !i.is_empty()),
+        "no empty id survives: {ids:?}"
+    );
+    let mut sorted = ids.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), 4, "all ids distinct after repair: {ids:?}");
+}
+
+#[test]
+fn loop_pairs_results_after_id_repair() {
+    // End-to-end: a gateway response with one empty id and two colliding
+    // ids used to produce ambiguous tool_use ↔ tool_result pairing (all
+    // three results "matched" the wrong use; Anthropic 400s). The loop
+    // repairs ids BEFORE the assistant message is persisted, so the next
+    // request must show a clean N:N bijection with no empty ids.
+    let cfg = cfg_with(5, 0, 0);
+    let echo = EchoTool::new("shell");
+    let (prov, state) = MockProvider::new(vec![
+        MockTurn::Ok(ChatResponse {
+            blocks: vec![
+                Block::ToolUse {
+                    id: "".into(),
+                    name: "shell".into(),
+                    input: json!({"command": "ls"}),
+                },
+                Block::ToolUse {
+                    id: "dup".into(),
+                    name: "shell".into(),
+                    input: json!({"command": "pwd"}),
+                },
+                Block::ToolUse {
+                    id: "dup".into(),
+                    name: "shell".into(),
+                    input: json!({"command": "true"}),
+                },
+            ],
+            stop_reason: "tool_use".into(),
+            usage: mock::mk_usage(10, 5),
+        }),
+        mock::resp_text("done", mock::mk_usage(3, 3)),
+    ]);
+    let initial = vec![user_text("run these")];
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(echo)],
+        initial,
+        test_ctx(),
+    );
+    let o = agent.run(&mut |_| {}).expect("run completes");
+    assert_eq!(o.stop_reason, "end_turn");
+    assert_eq!(o.tool_calls.len(), 3, "all three repaired calls executed");
+    // Second request: history must carry 3 distinct non-empty tool_use ids
+    // with exactly matching tool_results.
+    let cap = state.captured();
+    let second = &cap[1];
+    let mut uses = second.tool_use_ids.clone();
+    let mut results = second.tool_result_ids.clone();
+    assert!(uses.iter().all(|i| !i.is_empty()), "ids: {uses:?}");
+    uses.sort_unstable();
+    results.sort_unstable();
+    assert_eq!(uses, results, "N:N bijection after repair");
+    uses.dedup();
+    assert_eq!(uses.len(), 3, "all three ids distinct: {uses:?}");
+}
+
+#[test]
+fn run_tool_truncates_error_text_to_output_cap() {
+    // A tool Err becomes a model-visible ToolResult, so an arbitrarily long
+    // error string (e.g. from an MCP server) must be capped at
+    // max_output_chars like any other tool output — it used to bypass the
+    // cap entirely, letting a hostile/verbose server bloat every later
+    // request until the context overflowed.
+    struct ExplodeTool;
+    impl Tool for ExplodeTool {
+        fn def(&self) -> ToolDef {
+            ToolDef {
+                name: "explode".into(),
+                description: "always errors, verbosely".into(),
+                schema: json!({"type": "object", "properties": {}}),
+            }
+        }
+        fn run(&self, _input: &Value, _ctx: &ToolCtx) -> anyhow::Result<ToolOutput> {
+            anyhow::bail!("{}", "E".repeat(5000));
+        }
+    }
+    let tools: Vec<Box<dyn Tool>> = vec![Box::new(ExplodeTool)];
+    let defs: Vec<ToolDef> = tools.iter().map(|t| t.def()).collect();
+    let ctx = test_ctx(); // max_output_chars = 1000
+    let out = run_tool(&tools, &defs, "explode", &json!({}), &ctx, &mut |_| {});
+    assert!(out.is_error);
+    let n = out.content.chars().count();
+    assert!(
+        n <= 1000 + 40, // cap + the "[truncated…]" marker
+        "error text must be capped (got {n} chars)"
+    );
+    assert!(out.content.contains("[truncated"), "{}", out.content);
+}
+
+#[test]
+fn huge_timeout_secs_does_not_panic_on_clock_overflow() {
+    // Instant + Duration panics on platforms whose clock it overflows
+    // (macOS: u64 nanoseconds ≈ 584 years; u64::MAX seconds blows past it).
+    // A timeout that large is "no deadline" for practical purposes — the
+    // run must complete normally instead of panicking at run entry.
+    let cfg = cfg_with(3, u64::MAX, 0);
+    let (prov, state) = MockProvider::new(vec![mock::resp_text("ok", mock::mk_usage(2, 2))]);
+    let mut agent = Agent::new(&cfg, Box::new(prov), vec![], vec![], test_ctx());
+    let o = agent.run(&mut |_| {}).expect("run completes");
+    assert_eq!(o.stop_reason, "end_turn");
+    // The per-request streaming backstop stays armed even with no run
+    // deadline — the reader-thread leak guard must never go away.
+    assert!(
+        state.captured()[0].per_request_timeout.is_some(),
+        "STREAM_BACKSTOP must still cap the request"
+    );
+}

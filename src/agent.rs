@@ -780,9 +780,14 @@ impl Agent {
         }
         // Overall run deadline. Each chat is capped to the time left so a
         // single stuck request can't outlive the run budget — which is
-        // otherwise only enforced at turn boundaries.
+        // otherwise only enforced at turn boundaries. checked_add: a plain
+        // `start + Duration` panics on clock overflow (a timeout_secs near
+        // u64::MAX overflows Instant on some platforms); such a value is
+        // "no deadline" for all practical purposes, so None is the honest
+        // rendering, identical to timeout_secs == 0.
         let deadline = (self.limits.timeout_secs > 0)
-            .then(|| start + Duration::from_secs(self.limits.timeout_secs));
+            .then(|| start.checked_add(Duration::from_secs(self.limits.timeout_secs)))
+            .flatten();
         // Publish the deadline + a fleet-wide budget counter to the tool ctx
         // so `task` children inherit both (child_ctx clones them): the shared
         // counter makes N parallel sub-agents collectively bound by
@@ -877,7 +882,7 @@ impl Agent {
             // it lives in an inner block whose end releases that borrow before
             // the (mutable) compress call in the recovery arm.
             let mut overflow_recovered = false;
-            let resp = loop {
+            let mut resp = loop {
                 let r = {
                     // Safety net: fold any adjacent same-role messages (e.g. a
                     // resumed session that ends on two user messages, or a
@@ -1017,6 +1022,14 @@ impl Agent {
             if resp.blocks.is_empty() {
                 break;
             }
+            // Repair tool_use ids BEFORE the assistant message is persisted:
+            // a gateway may omit the id (empty — results then pair
+            // ambiguously) or repeat one (duplicate ids make the N:N
+            // tool_use ↔ tool_result mapping ambiguous; Anthropic rejects
+            // both with a 400). Normalizing here means history, the
+            // `tool_uses` tuples collected below, and the tool_results
+            // built from them all see one consistent id set.
+            normalize_tool_use_ids(&mut resp.blocks);
             self.messages.push(Message::assistant(resp.blocks.clone()));
             if let Some(w) = self.save_session() {
                 events(AgentEvent::Warning(w));
@@ -1374,7 +1387,15 @@ fn run_tool(
     match find_tool(defs, name) {
         Some(i) => match tools[i].run_with_emit(input, ctx, emit) {
             Ok(o) => o,
-            Err(e) => ToolOutput::error(format!("{e:#}")),
+            Err(e) => {
+                // An error message enters model-visible history, so it must
+                // be size-bounded like any other tool output: a tool (e.g.
+                // an MCP server) returning an arbitrarily long error string
+                // used to bypass max_output_chars entirely.
+                let mut msg = format!("{e:#}");
+                crate::tools::truncate(&mut msg, ctx.max_output_chars);
+                ToolOutput::error(msg)
+            }
         },
         None => ToolOutput::error(format!("unknown tool: {name}")),
     }
@@ -1410,6 +1431,34 @@ fn normalize_adjacent(messages: &mut Vec<Message>) {
         }
     }
     *messages = out;
+}
+
+/// Repair tool_use ids before an assistant message enters history: a
+/// gateway may omit the id (empty string — every result then "pairs"
+/// ambiguously) or repeat one (a duplicate id makes the N:N
+/// tool_use ↔ tool_result mapping ambiguous); strict APIs (Anthropic)
+/// reject both. Called before `messages.push`, so the saved history, the
+/// `tool_uses` tuples collected from the same blocks, and the
+/// tool_results built from those tuples all agree. Minted ids live in a
+/// `toolu_repair_…` namespace and are checked against everything seen so
+/// the repair itself can't introduce a collision.
+fn normalize_tool_use_ids(blocks: &mut [Block]) {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (i, b) in blocks.iter_mut().enumerate() {
+        let Block::ToolUse { id, .. } = b else {
+            continue;
+        };
+        if !id.is_empty() && seen.insert(id.clone()) {
+            continue; // unique and non-empty: keep the provider's id
+        }
+        let mut n = 0u32;
+        let mut fresh = format!("toolu_repair_{i}_{n}");
+        while !seen.insert(fresh.clone()) {
+            n += 1;
+            fresh = format!("toolu_repair_{i}_{n}");
+        }
+        *id = fresh;
+    }
 }
 
 /// Fold `blocks` into a trailing user message, or push a new one. Two adjacent

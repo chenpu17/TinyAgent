@@ -92,9 +92,14 @@ impl Tool for Shell {
         // Poll the child so a timeout or cancel can kill it (wait_with_output
         // would consume the handle and leak the process on timeout).
         // `0` = no per-command limit: cancel still applies (poll below), and
-        // the run-level timeout_secs remains the backstop.
+        // the run-level timeout_secs remains the backstop. checked_add: a
+        // huge shell_timeout_secs can overflow the clock on some platforms
+        // (a plain `Instant + Duration` panics there); such a value is
+        // "no limit" for all practical purposes, so None is the honest
+        // rendering, identical to 0.
         let deadline = (ctx.shell_timeout_secs > 0)
-            .then(|| Instant::now() + Duration::from_secs(ctx.shell_timeout_secs));
+            .then(|| Instant::now().checked_add(Duration::from_secs(ctx.shell_timeout_secs)))
+            .flatten();
         let mut cancelled = false;
         let status = loop {
             // Check exit FIRST (C10): a command that finished within the same
