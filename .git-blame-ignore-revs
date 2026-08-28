@@ -1,0 +1,6 @@
+# git blame 跳过纯机械 commit（`git blame --ignore-revs-file .git-blame-ignore-revs`，
+# 或 git config blame.ignoreRevsFile .git-blame-ignore-revs 一次配置永久生效）。
+# 每行一个完整 commit hash + # 注释。
+
+# style: 全量 rustfmt（305 处，纯格式零行为变化）
+756d2f7182d49ce0165206583caf487549f267d8

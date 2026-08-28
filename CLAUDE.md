@@ -10,10 +10,13 @@ cargo build --features tui                 # 默认只编 headless；TUI 要带 
 cargo test --features tui,mock             # 单测（含 TUI 输入/渲染逻辑 + lib_api 集成测试）
 cargo clippy --features tui --all-targets  # lint TUI 版
 cargo clippy --all-targets                # lint headless 版（两个 feature 配置都要过）
+cargo fmt --all                            # 格式化（CI 有 --check 门禁，改完代码必跑）
 ```
 
 每次改完**两个 clippy 都要跑**：TUI 代码在 `#[cfg(feature = "tui")]` 后，默认构建看不到，
-默认配置的 clippy 也看不到 TUI 代码——单跑一个会漏。
+默认配置的 clippy 也看不到 TUI 代码——单跑一个会漏。**`cargo fmt --all` 同理**（CI 的 fmt
+job 对全 workspace `--check`，含双绑定 crate；存量 305 处漂移已在一个纯格式 commit 清零，
+该 commit 记在 `.git-blame-ignore-revs`，`git blame` 配 ignoreRevsFile 后可跳过）。
 
 ### 语言绑定（workspace 成员 `bindings/python`、`bindings/node`）
 
@@ -39,7 +42,9 @@ cargo clippy -p tiny-agent-node
 - message 里有双引号会破坏 `-m "..."` 的 shell 引号——改用 `git commit -F <文件>` 写多行 message。
 - **发布（tag）**：版本号同步 5 处（根 `Cargo.toml`、`bindings/{python,node}/Cargo.toml`、
   `pyproject.toml`、`package.json`）+ `CHANGELOG.md` 补段，然后 `git tag vX.Y.Z` 推双远端
-  （gitee origin + github）。tag 推 GitHub 触发 `release.yml`（musl 产物）。流程详见 README 发布节。
+  （gitee origin + github）。tag 推 GitHub 触发 `release.yml`（musl 产物，tarball 附
+  README + LICENSE）。流程详见 README 发布节。许可证是 **MIT**（根 `LICENSE`，5 处元数据
+  已同步）——新增子模块/产物别忘带许可声明。
 
 ## 架构要点
 

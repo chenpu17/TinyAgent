@@ -10,6 +10,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  fmt:
+    # rustfmt 门禁：全 workspace（根 crate + 双绑定）--check 模式，零改动。
+    # 存量 305 处已在一个纯格式 commit 里清零（见 .git-blame-ignore-revs），
+    # 此后任何漂移在 CI 红灯、本地 `cargo fmt --all` 修。
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
   test:
     # 三平台 × 双 clippy 配置 + 测试。CLAUDE.md 约定两个 clippy 都要过：
     # TUI 代码在 #[cfg(feature = "tui")] 后，默认构建看不到它。
