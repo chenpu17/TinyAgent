@@ -273,7 +273,11 @@ tiny-agent --config examples/chat.json --tui
 | `bad_task` | 任务片段非法（禁用字段 / 缺 task / JSON 错） | ❌ |
 | `max_turns_reached` / `max_tokens` | 模型跑满上限 | ❌ |
 | `budget_exceeded` | 累计 token 触顶 `limits.max_total_tokens` | ❌ |
+| `panic` | 任务在 worker 里 panic，被兜成失败条目（见下） | ❌ |
 | `end_turn` | 正常完成 | ❌（已成功） |
+
+`panic` 仅 debug / CI 构建会出现（worker 用 `catch_unwind` 兜住、整批照常完
+成）；release 是 `panic="abort"`，进程当场退出、不落 report。
 
 `report.json` 的 `elapsed_secs` 含重试与退避的总耗时。
 
@@ -580,9 +584,35 @@ Anthropic 原生 provider 默认开启 prompt caching：每个请求自动在 **
   `write_file /etc/cron.d/x` 都会被执行。
 - **在 CI / 评测 pipeline 中批量运行不可信的第三方 task 时**，务必：
   1. 在容器或受限用户下运行 tiny-agent；
-  2. 配置 `"restrict_to_workdir": true`，文件工具将拒绝一切逃逸
-     `workdir` 的路径（`../` 与绝对路径，对新建文件同样生效）；
+  2. 配置 `"restrict_to_workdir": true`，文件工具将拒绝逃逸 `workdir`
+     的路径（`../` 与绝对路径，对新建文件同样生效）。注意它是 **best-effort
+     而非硬边界**：判定基于 canonicalize，检查与实际 I/O 之间存在 TOCTOU
+     窗口——防的是模型顺手 `../` 走错门，不是对抗并发改目录结构的恶意进程；
+     硬边界仍是容器；
   3. 必要时用 `"tools"` 白名单去掉 `shell`。
+
+### 信任边界（哪些输入是受信的）
+
+上面管的是**模型输出**这半张威胁面；另外半张是**加载的本地文件**。以下文件在
+TinyAgent 的威胁模型里视为**受信任输入**（等价于代码本身——来源不明就不要加载）：
+
+- **配置文件**：`base_url` 决定 API key 发往哪里（加载来路不明的 config 等于把
+  `api_key_env` 指向的凭据交给该 URL）；`tools` / `mcp_servers` 决定哪些工具可
+  用、哪些子进程被拉起。`--config` / 绑定的 config 路径请确认来源。
+- **session 文件**：`--resume` 把历史原样重放进模型上下文（含 tool_use /
+  tool_result 配对）——被篡改的 session 等同攻击者代笔的历史，模型照单全收。
+  session 需要跨机器流转时自行校验完整性。
+- **技能目录**（`~/.config/tinyagent/skills/` 与 `<workdir>/.tinyagent/skills/`）：
+  SKILL.md 简介常驻 system prompt、正文与资源可被读进历史——安装一个技能等于
+  安装一段 prompt（含可被模型照指示执行的脚本）。
+
+不在这张信任面里的**运行时不可信输入**（MCP server 响应、provider SSE 流、
+技能目录内容）有尺寸上限防御（tools/list 条数与 schema 上限、SSE 单行 16MiB、
+skill 扫描读取 64KiB 等）：不可信的 server / 目录最多拖慢，不能 OOM 进程。
+另注：OpenAI 400 自适应修复（learned fixes）只活在 provider 实例内存中——
+每次 run 重建、不落盘、跨进程不共享；同一网关的新 run 会重新学一遍（每类 400
+多一次试错往返），这是刻意的（落盘会带来跨 run 的毒化面，见 record-on-success
+语义）。
 
 ## Non-goals（明确不做）
 

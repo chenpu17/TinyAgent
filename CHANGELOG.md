@@ -7,6 +7,16 @@
 
 ### Fixed
 
+- **全面审计（第四轮，P1/P2/P3）修正**（每项带回归测试；P1-1/2/3 为最高优先级项）：
+  - **P1-1 atomic_write 防预置符号链接击穿**：临时文件名 `<target>.<pid>.<n>.tmp` 的 pid 与计数器均可预测，`write_file`/`edit_file` 只对目标路径做 workdir 沙盒检查、看不到临时兄弟名——攻击者（或恶意任务）在 workdir 预置同名符号链接指向 `/etc/cron.d/x`，"写进沙盒"实际写穿到任意路径。改 `create_new(true)`（O_EXCL）冲突即换名重试，符号链接永远打不开。同批：`--json` NDJSON 输出容忍下游断管（`| head` 不再 panic，改为静默放弃——stdout 已死时打印无意义）。
+  - **P1-2 Python 绑定双死锁消除**：`Agent` 存 `Mutex` 而 `run()` 释放 GIL 后又要锁——重入调用（自定义工具 / provider 回调里碰 agent 方法，如 `push_user`）GIL↔Mutex 互等死锁；两个线程各自 `push_user` 也互等。锁模型重构为单一 `with_agent` 入口（`allow_threads` 内拿锁），重入（run 期间的 agent 方法调用）从死锁改为明确的"agent is running"报错。
+  - **P1-3 Node 绑定 onEvent 异常不再致命**：TSFN 用 `ErrorStrategy::Fatal` 时回调抛异常 → `napi_fatal_exception` 整进程退出（host 侧一个日志回调的 bug 不该杀掉整个嵌入方进程）。wrapper 层 try/catch + 异步 `Promise.resolve().catch` 双保险，异常降级为 stderr 提示。同批：同步方法（`pushUser` 等）run 期间改 `try_lock` + 明确 busy 错误——阻塞等锁会冻结 JS 主循环，而 run 的 TSFN round-trip 依赖主循环转动（等锁 = 自死锁）；自定义工具等待上限感知 run 剩余预算（`min(deadline, 120s)`）。
+  - **P2 硬化合集**：agent 轮询 deadline 与 shell 超时的 `Instant + Duration` 加法改 `checked_add`（巨值配置在 debug 下加法溢出 panic）；不合规网关的空/重复 `tool_use` id 归一化重铸（保 N:N 配对不炸下一轮请求）；`run_tool` 错误文本过 `max_output_chars` 截断（错误轰炸不再撑爆上下文）；技能扫描读取 64KiB / 256 个 / 简介总量 16KiB 封顶 + 技能目录符号链接跳过（巨型或循环目录不再拖死启动、撑爆 system prompt）；MCP HTTP 错误响应体 16KiB / tools/list 256 条 / 描述 1KiB / schema 64KiB 封顶（恶意 server 不能再用巨型列表 OOM 或灌爆上下文）、MCP 事件 16MiB 与 SSE 单行 16MiB 封顶（`fill_buf` 分块读，无先整行 `read_line` 再检查的绕过窗口）、pending 分发跳过服务端主动请求（roots 采样请求不再被误当响应派发给挂起的调用）、SSE 首行剥 UTF-8 BOM（带 BOM 的网关首行 `data:` 匹配失败 → 整流被当垃圾）；**OpenAI 流中途错误改诚实成本形状**（读失败与 `{"error":…}` 事件两处不再 `bail!` 丢掉已上报的 usage，对齐 Anthropic 的 `[stream error]` 标记 + `stop_reason:"stream_error"` + 部分块保留——agent 侧照常计费并转可重试 Err）；batch worker `catch_unwind` 兜住任务 panic（debug/CI 下单个任务的 bug 不再 unwind 出 `thread::scope` 杀掉整批，转 `stop_reason:"panic"` 确定性失败条目；release `panic="abort"` 下进程当场死，此兜底不生效——注释在案）。
+  - **P3 快修**：shell 子进程 stdin 接 null（读 stdin 的命令立即 EOF 不再挂到超时）；`task` 子 agent 名按字符截到 64（事件标签不被模型的一句话刷屏）；`base_url` 归一去尾斜杠（`v1//chat/completions` 不再 404）；`--task ""` 显式拒绝（不再静默遮掉 config 的 task 空转）；压缩摘要 per-request 超时地板 1s（deadline 近耗尽时均分取整 ~0 = 瞬时超时）；`fold_summary` 空历史落 fresh-user-head 不再 index panic；Anthropic 无 usage 帧返回 `None` 而非 `Some(全零)`（"计了 0 token"与"用量未知"在账单里从此可区分）。
+
+### Security
+
+- CI 新增 `cargo-audit` job（RustSec 公告库扫依赖树，advisory 红灯）；README 安全说明补**信任边界**小节（config / session / 技能目录是受信本地输入，等价于代码——来源不明不要加载；运行时不可信输入走尺寸上限防御），`restrict_to_workdir` 表述从"拒绝一切逃逸"修正为 best-effort + TOCTOU 边界说明（硬边界仍是容器）。
 - **第三方审查（第三轮）确定性修正**（行为变化项均带回归测试）：
   - **预算闸门升级为 fleet 级**：`max_total_tokens` 从"每 agent 各自熔断"（并行子 agent 最坏各烧满一份、
     join 后才发现）升级为 run 级共享花费计数器——父与每个在飞 `task` 子 agent 的直接 chat 花费（轮次

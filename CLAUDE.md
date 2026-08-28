@@ -221,16 +221,23 @@ cargo clippy -p tiny-agent-node
 ## 容易踩的坑
 
 - **语言绑定的工具回调是跨线程 round-trip，不能简化成同步直调**：
-  - **Python**（`bindings/python`）：`Agent` 存进 `Mutex<Agent>`，`run()` 经 `py.allow_threads` **释放 GIL**
-    跑 loop；自定义工具的闭包在 agent 线程执行，用 `Python::with_gil` **短暂重获 GIL** 调回 Python。
-    `set_cancel(token)` **必须在 `run()` 之前**调（把共享 `Arc<AtomicBool>` 装进 agent）——run 期间持有
-    mutex，`run()` 入口不复位 cancel（与主 agent 一致）。改这条别在 run 持锁期间调会阻塞主线程的同步方法。
+  - **Python**（`bindings/python`）：`Agent` 存进 `Mutex<Agent>`，所有跨线程方法走单一
+    `with_agent` 入口（`py.allow_threads` 内拿锁——闭包与返回值须 `Send`）。`run()` 释放 GIL
+    跑 loop；自定义工具的闭包在 agent 线程执行，用 `Python::with_gil` **短暂重获 GIL** 调回
+    Python。`set_cancel(token)` **必须在 `run()` 之前**调（把共享 `Arc<AtomicBool>` 装进
+    agent）——run 期间持有 mutex，`run()` 入口不复位 cancel（与主 agent 一致）。
+    **重入即死锁**（P1-2 教训）：回调里再调 agent 方法会 GIL↔Mutex 互等——run 期间的
+    agent 方法调用经 `IN_RUN` thread-local 判定，报 "agent is running" 而非挂死；
+    两个线程各自调方法也要靠 with_agent 的锁排队，别绕过它直拿 mutex。
   - **Node**（`bindings/node`）：`run()` 是 `AsyncTask`（libuv worker 线程，**无 tokio**），事件经
     `ThreadsafeFunction` 回主线程。自定义 JS 工具是 **TSFN round-trip**：agent 线程把 `{id,args}` 经 TSFN
     派给 JS、阻塞 `mpsc` 等结果；JS（`wrapper.js` 把 `run(args)` 包成 `(err,req)` 形状）调完用户函数后调
     导出的 `resolveTool(id, result)`，经全局 `PENDING_TOOLS: i64→Sender` 注册表唤醒 worker（120s
     `recv_timeout` 兜底）。**JS 主线程在 `run()` 期间必须空闲**（调用方 `await`），否则 TSFN 回调排不进
-    主循环 → worker 永久阻塞 → 死锁。`resolveTool` / `PENDING_TOOLS` / `build_extra_tools` 三者是一套，
+    主循环 → worker 永久阻塞 → 死锁。**同步方法（pushUser 等）在 run 期间返回 busy 错误**（`try_lock`
+    而非阻塞等锁——等锁会冻结 JS 主循环，而 TSFN round-trip 靠它转动，等于自死锁）；**onEvent 回调抛
+    异常不致命**（wrapper try/catch + 异步 catch 双保险，降级 stderr——TSFN 的 Fatal 策略会让 host 的
+    一个日志 bug 杀掉整个进程）。`resolveTool` / `PENDING_TOOLS` / `build_extra_tools` 三者是一套，
     改其一要保住另两个。`env.create_threadsafe_function` 固定返回 `CalleeHandled`（JS 收 `(err,value)`），
     所以 wrapper 的 `run` 签名是 `(err, req)`——别改成单参。
 - **绑定层自定义 provider 回调**（`provider=` / `{ chat }`）：让 Python/JS 函数整个替换内置 HTTP
@@ -347,7 +354,24 @@ cargo clippy -p tiny-agent-node
   **fix 落账是 record-on-success**（A3）：本轮累积 applied 清单、仅当调整后的请求最终 2xx 才
   `learned.record`——值错误 400（"max_tokens must be ≤ N"）文案也含 max_tokens 会触发改名，但重试
   必再失败，apply 即记会让此后每轮主动发改名后的字段、反复触发不可修复的 400。改这段别把落账挪回
-  apply 时刻。
+  apply 时刻。**learned fixes 只活在 provider 实例内存**：每 run 重建、不落盘、跨进程/绑定不共享
+  （刻意——落盘引入跨 run 毒化面）；同一网关新 run 会重新学，每类 400 多一次试错往返。
+- **流中途错误的诚实成本形状（两 provider 对齐，改流解析必读）**：openai 与 anthropic 的
+  `parse_loop` 对读失败（`StreamError`）与 `{"error":…}` 事件都返回 `Ok` + 尾附一条
+  `[stream error] …` 标记文本块 + `stop_reason:"stream_error"` + **已上报的 usage**——
+  agent.rs 的 stream_error 提取路径据此把前缀转成可重试 `RunError` 并计费。新增流错误路径照这个
+  形状，**别 bail!**（会丢掉网关可能已发的 usage，破坏"失败也计费"契约）。Anthropic 另有
+  `saw_usage` 标记：流里完全没有 usage 帧时 usage 返回 `None` 而非 `Some(全零)`——下游按
+  Some/None 区分"计了 0"与"用量未知"，OpenAI 侧 usage 本就是 `Option` 天然满足。
+- **`harness::atomic_write` 的临时文件用 `create_new(true)`（O_EXCL）**：tmp 名
+  `<target>.<pid>.<counter>.tmp`，`AlreadyExists` 就换计数器重试。别"简化"回 `create(true)`
+  或可预测单名——写工具只对**目标**路径做沙盒检查、看不到临时兄弟名，预置符号链接同名文件会把
+  "写进沙盒"变成写穿到任意路径（P1-1 修的就是这个）。同理 `--json` NDJSON 输出走
+  `print_ndjson`（写失败静默放弃），别退回 `println!`（下游 `| head` 断管直接 panic）。
+- **batch `stop_reason` 词汇含 `panic`**（P2-9）：worker 用 `catch_unwind(AssertUnwindSafe)`
+  兜 `run_one`，payload 经 `panic_report` 转确定性失败条目（≠ `"error"`，不进瞬态重试）。
+  仅 debug/CI（unwind）生效——release `panic="abort"` 下进程当场死，兜不住（注释在案）。
+  新增 worker 内的代码别绕开 catch_unwind 直接调 run_one。
 - **`--session none` 是关闭持久化的字面量哨兵**（不是文件名）——真要叫 `none` 的文件没法用，
   但它语义清晰、够用。改 `session_target` 判定前先想清楚。
 - **MCP 工具名只消毒展示名，wire 名不动**（`tools::mcp::sanitize_name`）：对外名 `mcp_<server>_<tool>`
