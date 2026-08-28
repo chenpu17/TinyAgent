@@ -91,6 +91,25 @@ fn default_global_skills_dir_in(xdg: Option<&str>, home: Option<&str>) -> Option
     Some(base.join("tinyagent").join("skills"))
 }
 
+/// Cap on the bytes `scan` reads from one SKILL.md. Only the FRONTMATTER is
+/// needed at scan time (name + description + optional fields — a few KiB at
+/// most); the body is read later by `read_skill`, which has its own
+/// max_output_chars cap. A hostile/corrupt SKILL.md of arbitrary size used
+/// to be slurped whole into memory at every agent startup.
+const SCAN_READ_CAP: u64 = 64 * 1024;
+
+/// Cap on discovered skills. The level-1 intro is permanent system prompt;
+/// 256 entries × ≤1024-char descriptions would already be an unusable prompt
+/// — beyond this it's a misconfiguration or a hostile directory, and further
+/// entries are dropped with a warning instead of bloating every request for
+/// the whole session.
+const MAX_SKILLS: usize = 256;
+
+/// Hard cap on the rendered intro (chars). Same motivation as MAX_SKILLS,
+/// one level finer: even 256 legal entries can overrun the prompt, so the
+/// rendered list itself is bounded and says how much was omitted.
+const INTRO_MAX_CHARS: usize = 16_384;
+
 /// Scan the given dirs (pass global first, project last) and collect valid
 /// skills. Missing dirs are silently skipped — normal when no skills are
 /// installed. Malformed skills (no `SKILL.md`, missing frontmatter fields,
@@ -105,15 +124,23 @@ pub fn scan(dirs: &[PathBuf]) -> (SkillIndex, Vec<String>) {
             Err(_) => continue, // missing dir is normal — no skills installed there
         };
         for e in entries.flatten() {
-            let sub = e.path();
-            // A skill is a subdirectory containing SKILL.md; loose files are ignored.
-            if !sub.is_dir() {
-                continue;
+            // A skill directory must be a REAL directory: a symlinked entry
+            // would source SKILL.md (and, via read_skill, every sidecar file)
+            // from OUTSIDE the skills tree — e.g. an untrusted repo's
+            // `.tinyagent/skills/x -> /some/dir` — injecting attacker-chosen
+            // content into the SYSTEM PROMPT, a strictly more privileged
+            // channel than the history a repo file normally reaches.
+            // readdir's `file_type()` reports the link itself (no follow),
+            // unlike `path().is_dir()`.
+            match e.file_type() {
+                Ok(ft) if ft.is_dir() => {}
+                _ => continue,
             }
+            let sub = e.path();
             let skill_md = sub.join("SKILL.md");
-            let content = match std::fs::read_to_string(&skill_md) {
-                Ok(c) => c,
-                Err(_) => {
+            let content = match read_capped(&skill_md) {
+                Some(c) => c,
+                None => {
                     warnings.push(format!(
                         "skill dir {} has no readable SKILL.md, skipped",
                         sub.display()
@@ -176,9 +203,28 @@ pub fn scan(dirs: &[PathBuf]) -> (SkillIndex, Vec<String>) {
         }
     }
     // Deterministic order (independent of filesystem readdir order): sort by
-    // name so the system-prompt intro list is stable and predictable.
+    // name so the system-prompt intro list is stable and predictable — the
+    // MAX_SKILLS truncation below then keeps a deterministic subset.
     index.entries.sort_by(|a, b| a.name.cmp(&b.name));
+    if index.entries.len() > MAX_SKILLS {
+        warnings.push(format!(
+            "more than {MAX_SKILLS} skills discovered; keeping the first {MAX_SKILLS} by name"
+        ));
+        index.entries.truncate(MAX_SKILLS);
+    }
     (index, warnings)
+}
+
+/// Read at most [`SCAN_READ_CAP`] bytes, lossily decoded (the cap can split a
+/// multi-byte char at the boundary; the frontmatter parser is line-based and
+/// tolerant). Returns `None` when the file can't be opened at all — the same
+/// "skip + warn" contract the old `read_to_string` error path had.
+fn read_capped(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let f = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::new();
+    f.take(SCAN_READ_CAP).read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// Insert or replace by name — a later dir wins on a clash (project overrides
@@ -352,8 +398,26 @@ pub fn render_intro(prefix: Option<&str>, index: &SkillIndex) -> String {
          (参数 {\"skill\": ...}, 可选 \"file\" 默认 SKILL.md, 支持相对路径读 scripts/ 等子目录附属文件);\
          先用 list_skill 列出某技能目录下的全部文件以发现资源:\n",
     );
-    for e in index.entries() {
-        out.push_str(&format!("- {}: {}\n", e.name, e.description));
+    // Bound the rendered list: the intro is permanent system prompt and counts
+    // toward the compression estimate, so a bulk install (or a directory full
+    // of 1024-char descriptions) must not silently eat the context window.
+    // Stop before overflowing INTRO_MAX_CHARS and say how much was omitted.
+    let entries = index.entries();
+    let mut shown = 0usize;
+    for e in entries {
+        let line = format!("- {}: {}\n", e.name, e.description);
+        if out.chars().count() + line.chars().count() > INTRO_MAX_CHARS {
+            break;
+        }
+        out.push_str(&line);
+        shown += 1;
+    }
+    if shown < entries.len() {
+        out.push_str(&format!(
+            "- （另有 {} 个技能省略：简介总量达到 {} 字符上限）\n",
+            entries.len() - shown,
+            INTRO_MAX_CHARS
+        ));
     }
     out
 }
@@ -557,6 +621,129 @@ mod tests {
         let (idx, warns) = scan(&[PathBuf::from("/nonexistent/ta-skill-dir-xyz")]);
         assert!(idx.is_empty());
         assert!(warns.is_empty()); // missing dir is normal, not a warning
+    }
+
+    #[test]
+    fn scan_reads_only_the_head_of_skill_md() {
+        // P2-1: scan needs only the frontmatter, so the read is capped at
+        // SCAN_READ_CAP. Frontmatter placed PAST the cap must not be found
+        // (that's the proof the read stopped); frontmatter at the top of an
+        // equally huge file loads fine (the cap doesn't break normal skills).
+        let dir = tmpd("capread");
+        let sub = dir.join("far");
+        std::fs::create_dir_all(&sub).unwrap();
+        let pad = "x".repeat(SCAN_READ_CAP as usize + 1024);
+        std::fs::write(
+            sub.join("SKILL.md"),
+            format!("{pad}\n---\nname: far\ndescription: f\n---\n"),
+        )
+        .unwrap();
+        let (idx, warns) = scan(std::slice::from_ref(&dir));
+        assert!(idx.is_empty(), "frontmatter past the cap must not be found");
+        assert!(warns.iter().any(|w| w.contains("frontmatter")), "{warns:?}");
+
+        let dir2 = tmpd("capread2");
+        let sub2 = dir2.join("near");
+        std::fs::create_dir_all(&sub2).unwrap();
+        std::fs::write(
+            sub2.join("SKILL.md"),
+            format!("---\nname: near\ndescription: n\n---\n{pad}"),
+        )
+        .unwrap();
+        let (idx2, warns2) = scan(std::slice::from_ref(&dir2));
+        assert!(warns2.is_empty(), "{warns2:?}");
+        assert!(idx2.dir_of("near").is_some());
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir2).ok();
+    }
+
+    #[test]
+    fn scan_caps_total_skill_count() {
+        // P2-2: the level-1 intro is permanent system prompt; an unbounded
+        // directory of skills used to translate 1:1 into unbounded prompt
+        // growth. Keep the first MAX_SKILLS by name (deterministic post-sort)
+        // and say so in a warning.
+        let dir = tmpd("manyskills");
+        for i in 0..MAX_SKILLS + 10 {
+            write_skill(
+                &dir,
+                &format!("skill-{i:04}"),
+                &format!("---\nname: skill-{i:04}\ndescription: d{i}\n---\n"),
+            );
+        }
+        let (idx, warns) = scan(std::slice::from_ref(&dir));
+        assert_eq!(idx.entries().len(), MAX_SKILLS);
+        // First-by-name subset: the numerically largest names were dropped.
+        assert!(idx.dir_of("skill-0000").is_some());
+        assert!(idx
+            .dir_of(&format!("skill-{:04}", MAX_SKILLS + 9))
+            .is_none());
+        assert!(
+            warns.iter().any(|w| w.contains("keeping the first")),
+            "{warns:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_skips_symlinked_skill_dir() {
+        // A symlinked skill directory would source SKILL.md (and via
+        // read_skill every sidecar) from outside the skills tree — an
+        // untrusted repo could plant `.tinyagent/skills/x -> /etc/...` and
+        // inject chosen content into the SYSTEM PROMPT. readdir's file_type
+        // reports the link without following, so the entry is skipped.
+        let real = tmpd("symlink-real");
+        write_skill(
+            &real,
+            "outside",
+            "---\nname: outside\ndescription: o\n---\n",
+        );
+        let dir = tmpd("symlink-skills");
+        std::os::unix::fs::symlink(real.join("outside"), dir.join("outside")).unwrap();
+        let (idx, warns) = scan(std::slice::from_ref(&dir));
+        assert!(idx.is_empty(), "symlinked skill dir must be skipped");
+        // Silent skip (same as a loose file) — nothing is wrong with the
+        // tree; the entry simply isn't a real directory.
+        assert!(warns.is_empty(), "{warns:?}");
+        std::fs::remove_dir_all(&real).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn render_intro_caps_total_size() {
+        // P2-2: even legal entries (1024-char descriptions are in-spec) can
+        // overrun the prompt in bulk; the rendered list must stop at
+        // INTRO_MAX_CHARS and state how many entries were omitted.
+        let mut entries = Vec::new();
+        for i in 0..64 {
+            entries.push(SkillEntry {
+                name: format!("skill-{i:03}"),
+                description: "x".repeat(1024),
+                dir: PathBuf::from("/x"),
+                ..Default::default()
+            });
+        }
+        let idx = SkillIndex { entries };
+        let out = render_intro(None, &idx);
+        assert!(
+            out.chars().count() < INTRO_MAX_CHARS + 200,
+            "{} chars",
+            out.chars().count()
+        );
+        assert!(out.contains("省略"), "omission note expected: …");
+        // A small index renders every entry with no note.
+        let small = SkillIndex {
+            entries: vec![SkillEntry {
+                name: "a".into(),
+                description: "d".into(),
+                dir: PathBuf::from("/x"),
+                ..Default::default()
+            }],
+        };
+        let out2 = render_intro(None, &small);
+        assert!(out2.contains("- a: d"));
+        assert!(!out2.contains("省略"));
     }
 
     #[test]
