@@ -291,6 +291,12 @@ impl ta::Provider for NodeProvider {
         // precision, and "within 0s" for a ~1s wait reads like a bug.
         let wait_secs = wait.as_secs() + u64::from(wait.subsec_millis() > 0);
         let resp = rx.recv_timeout(wait).map_err(|_| {
+            // Reclaim the registry entry on timeout: resolveProvider is the
+            // only other remover and it never fires for an abandoned call —
+            // each timed-out request would strand one entry forever (and the
+            // budget-bounded wait makes timeouts routine, not exceptional).
+            // The tools registry does the same in its timeout arm.
+            pending_providers().lock().unwrap().remove(&id);
             err(format!("provider: JS callback did not resolve within {wait_secs}s"))
         })?;
         // The wrapper signals a thrown user provider via a `{__error}` marker so
