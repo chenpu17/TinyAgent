@@ -3,6 +3,7 @@ name = "tiny-agent-py"
 version = "0.3.0"
 edition = "2021"
 description = "Python bindings for TinyAgent (import tiny_agent)"
+license = "MIT"
 
 [lib]
 # The Python import name: `import tiny_agent`.

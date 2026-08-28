@@ -2,6 +2,7 @@
   "name": "tiny-agent",
   "version": "0.3.0",
   "description": "Node.js / TypeScript bindings for TinyAgent",
+  "license": "MIT",
   "main": "wrapper.js",
   "types": "wrapper.d.ts",
   "napi": {

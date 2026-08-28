@@ -3,6 +3,7 @@ name = "tiny-agent"
 version = "0.3.0"
 edition = "2021"
 description = "A minimal single-binary AI agent: one JSON config, two modes (headless / TUI)"
+license = "MIT"
 
 # Workspace so the language bindings (bindings/python, bindings/node) are
 # path-dependencies that evolve with the core library. The root package is a

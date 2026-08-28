@@ -3,6 +3,7 @@ name = "tiny-agent-node"
 version = "0.3.0"
 edition = "2021"
 description = "Node.js / TypeScript bindings for TinyAgent (import 'tiny-agent')"
+license = "MIT"
 
 [lib]
 crate-type = ["cdylib"]

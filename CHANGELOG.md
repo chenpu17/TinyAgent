@@ -61,6 +61,9 @@
 
 ### Added
 
+- **MIT LICENSE**：仓库此前无许可文件（发布产物默认保留所有权利，第三方无法合法
+  复用）。补根 `LICENSE`（MIT）并同步 5 处元数据（根 / 双绑定 `Cargo.toml`、
+  `pyproject.toml`、`package.json`）；release tarball 附带 LICENSE。
 - **Hooks 拦截层（P1）**：第三方不改核心即可观察与把关 agent 行为。新增
   `hooks` 模块：`trait Hooks: Send + Sync`（三默认方法——`before_tool` 返回
   `ToolDecision::Allow | Deny(String) | Modify(Value)`；`after_tool` 事后审计；
