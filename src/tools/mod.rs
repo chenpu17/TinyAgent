@@ -271,7 +271,10 @@ impl CallbackTool {
     where
         F: Fn(&Value, &ToolCtx) -> Result<ToolOutput> + Send + Sync + 'static,
     {
-        Self { def, func: Box::new(func) }
+        Self {
+            def,
+            func: Box::new(func),
+        }
     }
 }
 
@@ -325,11 +328,7 @@ pub fn build(
 /// Truncate to `max` chars on a char boundary, noting the omission.
 pub(crate) fn truncate(s: &mut String, max: usize) {
     if s.chars().count() > max {
-        let byte_idx = s
-            .char_indices()
-            .nth(max)
-            .map(|(i, _)| i)
-            .unwrap_or(s.len());
+        let byte_idx = s.char_indices().nth(max).map(|(i, _)| i).unwrap_or(s.len());
         s.truncate(byte_idx);
         s.push_str(&format!("\n... [truncated, limit {max} chars]"));
     }
@@ -390,9 +389,9 @@ pub(crate) fn confined_to(root: &Path, full: &Path, label: &str) -> Result<PathB
             Err(_) => match ancestor.file_name() {
                 Some(name) => {
                     rest.push(name.to_os_string());
-                    ancestor = ancestor
-                        .parent()
-                        .ok_or_else(|| anyhow::anyhow!("cannot resolve path: {}", full.display()))?;
+                    ancestor = ancestor.parent().ok_or_else(|| {
+                        anyhow::anyhow!("cannot resolve path: {}", full.display())
+                    })?;
                 }
                 None => bail!("cannot resolve path: {}", full.display()),
             },
@@ -405,7 +404,11 @@ pub(crate) fn confined_to(root: &Path, full: &Path, label: &str) -> Result<PathB
 /// canonicalized at config load, and `confined_to` canonicalizes it again
 /// (idempotent), so the prefix comparison is sound.
 fn confine(ctx: &ToolCtx, full: &Path) -> Result<PathBuf> {
-    confined_to(&ctx.workdir, full, "working directory (restrict_to_workdir)")
+    confined_to(
+        &ctx.workdir,
+        full,
+        "working directory (restrict_to_workdir)",
+    )
 }
 
 #[cfg(test)]

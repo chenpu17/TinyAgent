@@ -1,6 +1,9 @@
-use super::{Block, CancellableSse, ChatEvent, ChatRequest, ChatResponse, Message, Provider, Role, SseSource, StreamAbort, ToolDef, Usage};
 #[cfg(test)]
 use super::SseReader;
+use super::{
+    Block, CancellableSse, ChatEvent, ChatRequest, ChatResponse, Message, Provider, Role,
+    SseSource, StreamAbort, ToolDef, Usage,
+};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
@@ -102,7 +105,11 @@ impl Anthropic {
 /// Partially-assembled block while streaming.
 enum Pending {
     Text(String),
-    ToolUse { id: String, name: String, json: String },
+    ToolUse {
+        id: String,
+        name: String,
+        json: String,
+    },
     /// A `thinking` content block. Buffered only to coalesce its deltas into
     /// ThinkingDelta events; finalize drops it (thinking never enters history).
     Thinking(String),
@@ -326,8 +333,8 @@ impl Anthropic {
                     // leniently (its tool JSON may be half-delivered).
                     if let Some(p) = pending.take() {
                         if let Some(b) = finalize_pending_lenient(p) {
-                    blocks.push(b);
-                }
+                            blocks.push(b);
+                        }
                     }
                     let cb = &ev["content_block"];
                     pending = Some(match cb["type"].as_str().unwrap_or("") {
@@ -405,8 +412,8 @@ impl Anthropic {
                     // on a single model-level JSON slip was needlessly fatal.
                     if let Some(p) = pending.take() {
                         if let Some(b) = finalize_pending_lenient(p) {
-                    blocks.push(b);
-                }
+                            blocks.push(b);
+                        }
                     }
                 }
                 "message_delta" => {
@@ -426,9 +433,7 @@ impl Anthropic {
                     // that usage, violating the honest-cost contract (CLAUDE.md
                     // "重试诚实成本"). The agent maps "stream_error" to an Err
                     // that triggers retry while billing the partial cost.
-                    let msg = ev["error"]["message"]
-                        .as_str()
-                        .unwrap_or("(no message)");
+                    let msg = ev["error"]["message"].as_str().unwrap_or("(no message)");
                     blocks.push(Block::Text(format!(
                         "[stream error] Anthropic stream error: {msg}"
                     )));
@@ -460,8 +465,8 @@ impl Anthropic {
         // hard-failing on a parse error.
         if let Some(p) = pending.take() {
             if let Some(b) = finalize_pending_lenient(p) {
-                    blocks.push(b);
-                }
+                blocks.push(b);
+            }
         }
         // stop_reason priority: explicit abort (cancel/idle) > real
         // message_delta > stream_truncated. Without this an incomplete stream
@@ -473,7 +478,11 @@ impl Anthropic {
         } else {
             "stream_truncated".into()
         };
-        Ok(ChatResponse { blocks, stop_reason, usage: Some(usage) })
+        Ok(ChatResponse {
+            blocks,
+            stop_reason,
+            usage: Some(usage),
+        })
     }
 }
 
@@ -573,7 +582,8 @@ mod tests {
         assert_eq!(resp.stop_reason, "stream_error");
         // input + cache tokens from message_start survived the error path.
         assert_eq!(
-            resp.usage.map(|u| (u.input_tokens, u.cache_read_input_tokens)),
+            resp.usage
+                .map(|u| (u.input_tokens, u.cache_read_input_tokens)),
             Some((1500, 800))
         );
         // The error message is carried in a Text block (prefixed so the agent
@@ -582,7 +592,11 @@ mod tests {
             Block::Text(t) if t.starts_with("[stream error] ") => Some(t.as_str()),
             _ => None,
         });
-        assert!(msg.is_some(), "missing [stream error] block: {:?}", resp.blocks);
+        assert!(
+            msg.is_some(),
+            "missing [stream error] block: {:?}",
+            resp.blocks
+        );
         assert!(msg.unwrap().contains("Overloaded"));
     }
 
@@ -899,7 +913,10 @@ mod tests {
             !s.contains("cache_control"),
             "one-off request must not carry cache_control, body was:\n{s}"
         );
-        assert_eq!(body["system"], "you are a helpful agent", "bare string form");
+        assert_eq!(
+            body["system"], "you are a helpful agent",
+            "bare string form"
+        );
     }
 
     #[test]
@@ -923,4 +940,3 @@ mod tests {
         assert!(dflt.get("effort").is_none());
     }
 }
-

@@ -247,10 +247,16 @@ impl McpServerConfig {
     pub fn validate(&self) -> Result<()> {
         match (&self.command, &self.url) {
             (Some(_), Some(_)) => {
-                bail!("mcp server '{}': set either \"command\" or \"url\", not both", self.name)
+                bail!(
+                    "mcp server '{}': set either \"command\" or \"url\", not both",
+                    self.name
+                )
             }
             (None, None) => {
-                bail!("mcp server '{}': one of \"command\" or \"url\" is required", self.name)
+                bail!(
+                    "mcp server '{}': one of \"command\" or \"url\" is required",
+                    self.name
+                )
             }
             _ => {}
         }
@@ -563,10 +569,8 @@ mod tests {
         // the sandbox root and confinement checks derive from it), a
         // nonexistent one fails HERE with the config blamed, instead of
         // surfacing later at first tool use with a confusing error.
-        let mut cfg: Config = serde_json::from_str(
-            r#"{"provider":"openai","api_key_env":"K","model":"m"}"#,
-        )
-        .unwrap();
+        let mut cfg: Config =
+            serde_json::from_str(r#"{"provider":"openai","api_key_env":"K","model":"m"}"#).unwrap();
         let tmp = std::env::temp_dir(); // may itself sit behind a symlink (/tmp)
         cfg.workdir = Some(tmp.clone());
         cfg.validate_and_normalize().unwrap();
@@ -591,7 +595,18 @@ mod tests {
         assert_eq!(cfg.provider, ProviderKind::Anthropic);
         assert_eq!(cfg.base_url(), "https://api.anthropic.com");
         assert_eq!(cfg.limits.max_turns, 30);
-        assert_eq!(cfg.tools, vec!["shell", "read_file", "write_file", "edit_file", "list_dir", "task", "todo"]);
+        assert_eq!(
+            cfg.tools,
+            vec![
+                "shell",
+                "read_file",
+                "write_file",
+                "edit_file",
+                "list_dir",
+                "task",
+                "todo"
+            ]
+        );
     }
 
     #[test]
@@ -646,8 +661,14 @@ mod tests {
         }"#;
         let cfg: Config = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.reasoning_effort.as_deref(), Some("xhigh"));
-        assert_eq!(cfg.mcp_servers[0].env.get("FOO").map(String::as_str), Some("bar"));
-        assert_eq!(cfg.mcp_servers[0].env.get("BAZ").map(String::as_str), Some("qux"));
+        assert_eq!(
+            cfg.mcp_servers[0].env.get("FOO").map(String::as_str),
+            Some("bar")
+        );
+        assert_eq!(
+            cfg.mcp_servers[0].env.get("BAZ").map(String::as_str),
+            Some("qux")
+        );
     }
 
     #[test]
@@ -657,8 +678,7 @@ mod tests {
         let mut cfg: Config =
             serde_json::from_str(r#"{"provider":"anthropic","api_key_env":"K","model":"m"}"#)
                 .unwrap();
-        let partial: PartialConfig =
-            serde_json::from_str(r#"{"reasoning_effort":"low"}"#).unwrap();
+        let partial: PartialConfig = serde_json::from_str(r#"{"reasoning_effort":"low"}"#).unwrap();
         assert!(partial.forbidden_batch_override().is_none());
         cfg.apply(partial).unwrap();
         assert_eq!(cfg.reasoning_effort.as_deref(), Some("low"));
@@ -682,19 +702,15 @@ mod tests {
 
     #[test]
     fn mcp_server_validation() {
-        let both: McpServerConfig = serde_json::from_str(
-            r#"{"name":"x","command":"npx","url":"http://h/mcp"}"#,
-        )
-        .unwrap();
+        let both: McpServerConfig =
+            serde_json::from_str(r#"{"name":"x","command":"npx","url":"http://h/mcp"}"#).unwrap();
         assert!(both.validate().is_err());
 
         let neither: McpServerConfig = serde_json::from_str(r#"{"name":"x"}"#).unwrap();
         assert!(neither.validate().is_err());
 
-        let stdio_with_headers: McpServerConfig = serde_json::from_str(
-            r#"{"name":"x","command":"npx","headers":{"A":"b"}}"#,
-        )
-        .unwrap();
+        let stdio_with_headers: McpServerConfig =
+            serde_json::from_str(r#"{"name":"x","command":"npx","headers":{"A":"b"}}"#).unwrap();
         assert!(stdio_with_headers.validate().is_err());
 
         let http: McpServerConfig = serde_json::from_str(
@@ -785,7 +801,10 @@ mod tests {
         let partial: PartialConfig =
             serde_json::from_str(r#"{"task":"x","limits":{"timeout_secs":30}}"#).unwrap();
         cfg.apply(partial).unwrap();
-        assert_eq!(cfg.limits.timeout_secs, 30, "0-base must adopt the finite task value");
+        assert_eq!(
+            cfg.limits.timeout_secs, 30,
+            "0-base must adopt the finite task value"
+        );
 
         // From a finite base the task can still only tighten (min), never loosen.
         let mut cfg: Config = serde_json::from_str(
@@ -796,7 +815,10 @@ mod tests {
         let partial: PartialConfig =
             serde_json::from_str(r#"{"task":"x","limits":{"timeout_secs":120}}"#).unwrap();
         cfg.apply(partial).unwrap();
-        assert_eq!(cfg.limits.timeout_secs, 60, "a larger task timeout must not loosen the base");
+        assert_eq!(
+            cfg.limits.timeout_secs, 60,
+            "a larger task timeout must not loosen the base"
+        );
     }
 
     #[test]
@@ -813,18 +835,23 @@ mod tests {
         let partial: PartialConfig =
             serde_json::from_str(r#"{"task":"x","limits":{"max_context_tokens":0}}"#).unwrap();
         cfg.apply(partial).unwrap();
-        assert_eq!(cfg.limits.max_context_tokens, 200000, "0 sentinel must not disable");
+        assert_eq!(
+            cfg.limits.max_context_tokens, 200000,
+            "0 sentinel must not disable"
+        );
 
         // From a disabled base (0), a finite task value is adopted.
-        let mut cfg: Config = serde_json::from_str(
-            r#"{"provider":"anthropic","api_key_env":"K","model":"m"}"#,
-        )
-        .unwrap();
+        let mut cfg: Config =
+            serde_json::from_str(r#"{"provider":"anthropic","api_key_env":"K","model":"m"}"#)
+                .unwrap();
         assert_eq!(cfg.limits.max_context_tokens, 0);
         let partial: PartialConfig =
             serde_json::from_str(r#"{"task":"x","limits":{"max_context_tokens":8000}}"#).unwrap();
         cfg.apply(partial).unwrap();
-        assert_eq!(cfg.limits.max_context_tokens, 8000, "finite value adopted from 0 base");
+        assert_eq!(
+            cfg.limits.max_context_tokens, 8000,
+            "finite value adopted from 0 base"
+        );
 
         // From a finite base, a task can only tighten (min), never loosen.
         let mut cfg: Config = serde_json::from_str(
@@ -842,12 +869,13 @@ mod tests {
                "limits":{"max_context_tokens":100000}}"#,
         )
         .unwrap();
-        let partial: PartialConfig = serde_json::from_str(
-            r#"{"task":"x","limits":{"max_context_tokens":200000}}"#,
-        )
-        .unwrap();
+        let partial: PartialConfig =
+            serde_json::from_str(r#"{"task":"x","limits":{"max_context_tokens":200000}}"#).unwrap();
         cfg.apply(partial).unwrap();
-        assert_eq!(cfg.limits.max_context_tokens, 100000, "larger task value must not loosen");
+        assert_eq!(
+            cfg.limits.max_context_tokens, 100000,
+            "larger task value must not loosen"
+        );
     }
 
     #[test]
@@ -862,7 +890,8 @@ mod tests {
         )
         .unwrap();
         let partial: PartialConfig =
-            serde_json::from_str(r#"{"task":"x","limits":{"compress_threshold_chars":0}}"#).unwrap();
+            serde_json::from_str(r#"{"task":"x","limits":{"compress_threshold_chars":0}}"#)
+                .unwrap();
         cfg.apply(partial).unwrap();
         assert_eq!(
             cfg.limits.compress_threshold_chars, 100000,
@@ -877,7 +906,8 @@ mod tests {
         .unwrap();
         assert_eq!(cfg_disabled.limits.compress_threshold_chars, 0);
         let partial: PartialConfig =
-            serde_json::from_str(r#"{"task":"x","limits":{"compress_threshold_chars":50000}}"#).unwrap();
+            serde_json::from_str(r#"{"task":"x","limits":{"compress_threshold_chars":50000}}"#)
+                .unwrap();
         let mut cfg = cfg_disabled;
         cfg.apply(partial).unwrap();
         assert_eq!(
@@ -892,7 +922,8 @@ mod tests {
         )
         .unwrap();
         let partial: PartialConfig =
-            serde_json::from_str(r#"{"task":"x","limits":{"compress_threshold_chars":200000}}"#).unwrap();
+            serde_json::from_str(r#"{"task":"x","limits":{"compress_threshold_chars":200000}}"#)
+                .unwrap();
         cfg.apply(partial).unwrap();
         assert_eq!(
             cfg.limits.compress_threshold_chars, 100000,
@@ -905,7 +936,8 @@ mod tests {
         // Deep-reasoning models with long first-token latency need the SSE idle
         // gap raised above the 30s default; it must be a real config field.
         let cfg: Config =
-            serde_json::from_str(r#"{"provider":"anthropic","api_key_env":"K","model":"m"}"#).unwrap();
+            serde_json::from_str(r#"{"provider":"anthropic","api_key_env":"K","model":"m"}"#)
+                .unwrap();
         assert_eq!(cfg.limits.stream_idle_secs, 30, "default idle gap is 30s");
 
         let cfg: Config = serde_json::from_str(
@@ -929,7 +961,10 @@ mod tests {
         let partial: PartialConfig =
             serde_json::from_str(r#"{"task":"x","limits":{"stream_idle_secs":15}}"#).unwrap();
         cfg.apply(partial).unwrap();
-        assert_eq!(cfg.limits.stream_idle_secs, 15, "a shorter idle window tightens");
+        assert_eq!(
+            cfg.limits.stream_idle_secs, 15,
+            "a shorter idle window tightens"
+        );
 
         let mut cfg: Config = serde_json::from_str(
             r#"{"provider":"anthropic","api_key_env":"K","model":"m",
@@ -948,8 +983,12 @@ mod tests {
     #[test]
     fn shell_timeout_defaults_to_120_and_overridable() {
         let cfg: Config =
-            serde_json::from_str(r#"{"provider":"anthropic","api_key_env":"K","model":"m"}"#).unwrap();
-        assert_eq!(cfg.limits.shell_timeout_secs, 120, "default per-command timeout is 120s");
+            serde_json::from_str(r#"{"provider":"anthropic","api_key_env":"K","model":"m"}"#)
+                .unwrap();
+        assert_eq!(
+            cfg.limits.shell_timeout_secs, 120,
+            "default per-command timeout is 120s"
+        );
 
         let cfg: Config = serde_json::from_str(
             r#"{"provider":"anthropic","api_key_env":"K","model":"m",
@@ -994,7 +1033,10 @@ mod tests {
         let partial: PartialConfig =
             serde_json::from_str(r#"{"task":"x","limits":{"shell_timeout_secs":0}}"#).unwrap();
         cfg.apply(partial).unwrap();
-        assert_eq!(cfg.limits.shell_timeout_secs, 0, "0 (no limit) is allowed too");
+        assert_eq!(
+            cfg.limits.shell_timeout_secs, 0,
+            "0 (no limit) is allowed too"
+        );
     }
 
     #[test]
@@ -1055,10 +1097,22 @@ mod tests {
         assert_eq!(cfg.limits.max_turns, 2, "Tighten field must land");
         assert_eq!(cfg.limits.timeout_secs, 3, "TightenOrInit field must land");
         assert_eq!(cfg.limits.max_output_chars, 4, "Tighten field must land");
-        assert_eq!(cfg.limits.compress_threshold_chars, 5, "TightenOrInit field must land");
-        assert_eq!(cfg.limits.keep_recent_messages, 6, "Tighten field must land");
-        assert_eq!(cfg.limits.max_context_tokens, 7, "TightenOrInit field must land");
-        assert_eq!(cfg.limits.max_total_tokens, 8, "TightenOrInit field must land");
+        assert_eq!(
+            cfg.limits.compress_threshold_chars, 5,
+            "TightenOrInit field must land"
+        );
+        assert_eq!(
+            cfg.limits.keep_recent_messages, 6,
+            "Tighten field must land"
+        );
+        assert_eq!(
+            cfg.limits.max_context_tokens, 7,
+            "TightenOrInit field must land"
+        );
+        assert_eq!(
+            cfg.limits.max_total_tokens, 8,
+            "TightenOrInit field must land"
+        );
         assert_eq!(cfg.limits.stream_idle_secs, 9, "Tighten field must land");
         assert_eq!(cfg.limits.shell_timeout_secs, 10, "Replace field must land");
     }

@@ -1,5 +1,5 @@
-use crate::config::{Config, Limits};
 use crate::compress;
+use crate::config::{Config, Limits};
 use crate::hooks::ToolDecision;
 use crate::provider::{Block, ChatEvent, ChatRequest, Message, Provider, Role, ToolDef, Usage};
 use crate::tools::{Tool, ToolConcurrency, ToolCtx, ToolOutput};
@@ -57,14 +57,23 @@ pub enum AgentEvent {
     /// `{"ThinkingDelta": "..."}` so a downstream UI (TinyWorker) renders a
     /// collapsible "thinking" block. Not part of the reply text nor history.
     ThinkingDelta(String),
-    ToolCall { name: String, input: Value },
-    ToolResult { name: String, is_error: bool, content: String },
+    ToolCall {
+        name: String,
+        input: Value,
+    },
+    ToolResult {
+        name: String,
+        is_error: bool,
+        content: String,
+    },
     /// The agent updated its self-tracked task plan via the `todo` tool (full
     /// replacement each call). Emitted by the `todo` tool itself, so `--json`
     /// pipelines can render live progress; serializes as `{"TodoUpdate":
     /// {"todos":[...]}}`. The final plan is also derived into `result.json`'s
     /// `plan` field at run end.
-    TodoUpdate { todos: Vec<TodoItem> },
+    TodoUpdate {
+        todos: Vec<TodoItem>,
+    },
     /// Token usage reported by the provider for the latest chat request.
     /// Best-effort: emitted only when the provider actually reported usage
     /// (e.g. the stream wasn't cut off before the usage frame). The cache_*
@@ -93,8 +102,13 @@ pub enum AgentEvent {
     /// sub-agent's identity so a harness/UI can show concurrent sub-agent work
     /// and tell interleaved streams apart. The inner `event` is the child's own
     /// `AgentEvent` (TextDelta, ToolCall, …) — recurse to render it.
-    SubAgent { name: String, event: Box<AgentEvent> },
-    Done { stop_reason: String },
+    SubAgent {
+        name: String,
+        event: Box<AgentEvent>,
+    },
+    Done {
+        stop_reason: String,
+    },
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -281,14 +295,22 @@ impl RunCost {
     pub(crate) fn add_failed(&mut self, re: &RunError) {
         // Saturating on every numeric fold: a provider reporting absurd
         // totals must not panic (debug) / wrap (release) the accumulator.
-        self.usage.input_tokens = self.usage.input_tokens.saturating_add(re.usage.input_tokens);
-        self.usage.output_tokens = self.usage.output_tokens.saturating_add(re.usage.output_tokens);
+        self.usage.input_tokens = self
+            .usage
+            .input_tokens
+            .saturating_add(re.usage.input_tokens);
+        self.usage.output_tokens = self
+            .usage
+            .output_tokens
+            .saturating_add(re.usage.output_tokens);
         self.usage.cache_creation_input_tokens = self
             .usage
             .cache_creation_input_tokens
             .saturating_add(re.usage.cache_creation_input_tokens);
-        self.usage.cache_read_input_tokens =
-            self.usage.cache_read_input_tokens.saturating_add(re.usage.cache_read_input_tokens);
+        self.usage.cache_read_input_tokens = self
+            .usage
+            .cache_read_input_tokens
+            .saturating_add(re.usage.cache_read_input_tokens);
         self.tool_calls.extend(re.tool_calls.iter().cloned());
         self.turns = self.turns.saturating_add(re.turns);
         self.elapsed = self.elapsed.saturating_add(re.elapsed);
@@ -304,8 +326,9 @@ impl RunCost {
         o.cache_creation_input_tokens = o
             .cache_creation_input_tokens
             .saturating_add(self.usage.cache_creation_input_tokens);
-        o.cache_read_input_tokens =
-            o.cache_read_input_tokens.saturating_add(self.usage.cache_read_input_tokens);
+        o.cache_read_input_tokens = o
+            .cache_read_input_tokens
+            .saturating_add(self.usage.cache_read_input_tokens);
         // Earlier attempts first, then this attempt's tool calls.
         self.tool_calls.append(&mut o.tool_calls);
         o.tool_calls = std::mem::take(&mut self.tool_calls);
@@ -371,9 +394,8 @@ pub(crate) fn system_with_env(
     shell: &str,
     workdir: &str,
 ) -> Option<String> {
-    let env = format!(
-        "# Environment\n- OS: {os}\n- Shell: {shell}\n- Working directory: {workdir}"
-    );
+    let env =
+        format!("# Environment\n- OS: {os}\n- Shell: {shell}\n- Working directory: {workdir}");
     Some(match base {
         Some(b) if !b.is_empty() => format!("{env}\n\n{b}"),
         _ => env,
@@ -774,8 +796,8 @@ impl Agent {
         // one so parent + siblings + child all read/write the same numbers.
         self.ctx.deadline = deadline;
         if reset_cancel {
-            self.ctx.budget = (self.limits.max_total_tokens > 0)
-                .then(|| Arc::new(AtomicU64::new(0)));
+            self.ctx.budget =
+                (self.limits.max_total_tokens > 0).then(|| Arc::new(AtomicU64::new(0)));
         }
         let mut turns = 0u32;
         let mut final_text = String::new();
@@ -897,9 +919,9 @@ impl Agent {
                         ChatEvent::ThinkingDelta(t) => events(AgentEvent::ThinkingDelta(t)),
                     })
                 }; // req dropped here → &self.messages borrow released
-                // Baseline AFTER normalize_adjacent, so a same-role merge that
-                // shrank the history isn't mistaken for a successful compression
-                // fold — this gate means "did compression actually shrink it?".
+                   // Baseline AFTER normalize_adjacent, so a same-role merge that
+                   // shrank the history isn't mistaken for a successful compression
+                   // fold — this gate means "did compression actually shrink it?".
                 let before = self.messages.len();
                 match r {
                     Ok(resp) => break resp,
@@ -1239,8 +1261,8 @@ impl Agent {
                         }));
                     }
                     drop(tx); // workers hold the last clones; rx ends when they drop
-                    // Forward child events to the parent sink as they arrive
-                    // (interleaved across parallel sub-agents, told apart by name).
+                              // Forward child events to the parent sink as they arrive
+                              // (interleaved across parallel sub-agents, told apart by name).
                     while let Ok(ev) = rx.recv() {
                         events(ev);
                     }
@@ -1432,7 +1454,11 @@ impl Agent {
         // max_context_tokens when set, else the legacy char heuristic.
         if !force {
             let over = if self.limits.max_context_tokens > 0 {
-                let est = compress::estimate_tokens(&self.messages, self.system.as_deref(), self.tool_schema_chars);
+                let est = compress::estimate_tokens(
+                    &self.messages,
+                    self.system.as_deref(),
+                    self.tool_schema_chars,
+                );
                 // Trip at COMPACT_UTILIZATION_PCT of the window, reserving room
                 // for this turn's max_tokens output — so we compact BEFORE the
                 // provider would reject an over-long request, not after. Compute

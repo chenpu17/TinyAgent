@@ -25,7 +25,9 @@ impl Tool for ReadFile {
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "read_file".into(),
-            description: "Read a text file with line numbers (path relative to the working directory).".into(),
+            description:
+                "Read a text file with line numbers (path relative to the working directory)."
+                    .into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -39,7 +41,9 @@ impl Tool for ReadFile {
     }
 
     fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
-        let path = input["path"].as_str().context("read_file: missing \"path\"")?;
+        let path = input["path"]
+            .as_str()
+            .context("read_file: missing \"path\"")?;
         let full = resolve(ctx, path)?;
         // Stream line by line and stop once the output cap is hit, so a
         // huge file never gets pulled into memory whole.
@@ -65,7 +69,9 @@ impl Tool for ReadFile {
         // loop below uses it to deliver the valid prefix of a fragment the
         // cap split mid-multi-byte-char (BufRead::lines() turned that into a
         // hard "invalid UTF-8" error for ANY CJK file larger than the cap).
-        let byte_capped = std::fs::metadata(&full).map(|m| m.len() > max_bytes).unwrap_or(false);
+        let byte_capped = std::fs::metadata(&full)
+            .map(|m| m.len() > max_bytes)
+            .unwrap_or(false);
         // C14: the output budget is tracked in CHARS (matching
         // max_output_chars and truncate()). `out.len()` is bytes, so CJK
         // content hit the budget at ~⅓ of the configured chars and truncated
@@ -79,9 +85,7 @@ impl Tool for ReadFile {
             match reader.read_until(b'\n', &mut buf) {
                 Ok(0) => break, // clean EOF
                 Ok(_) => {}
-                Err(e) => {
-                    return Err(e).with_context(|| format!("cannot read {}", full.display()))
-                }
+                Err(e) => return Err(e).with_context(|| format!("cannot read {}", full.display())),
             }
             let i = lines_seen; // 0-based line index, as the old enumerate() gave
             lines_seen += 1;
@@ -172,7 +176,9 @@ impl Tool for WriteFile {
     }
 
     fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
-        let path = input["path"].as_str().context("write_file: missing \"path\"")?;
+        let path = input["path"]
+            .as_str()
+            .context("write_file: missing \"path\"")?;
         let content = input["content"]
             .as_str()
             .context("write_file: missing \"content\"")?;
@@ -221,7 +227,9 @@ impl Tool for EditFile {
     }
 
     fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
-        let path = input["path"].as_str().context("edit_file: missing \"path\"")?;
+        let path = input["path"]
+            .as_str()
+            .context("edit_file: missing \"path\"")?;
         let old_string = input["old_string"]
             .as_str()
             .context("edit_file: missing \"old_string\"")?;
@@ -320,7 +328,8 @@ impl Tool for ListDir {
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "list_dir".into(),
-            description: "List entries of a directory (path relative to the working directory).".into(),
+            description: "List entries of a directory (path relative to the working directory)."
+                .into(),
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -335,8 +344,8 @@ impl Tool for ListDir {
         let full = resolve(ctx, path)?;
         let mut entries: Vec<String> = Vec::new();
         let mut overflow = false;
-        for e in std::fs::read_dir(&full)
-            .with_context(|| format!("cannot list {}", full.display()))?
+        for e in
+            std::fs::read_dir(&full).with_context(|| format!("cannot list {}", full.display()))?
         {
             let e = e?;
             let suffix = if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
@@ -481,7 +490,10 @@ mod tests {
             .unwrap();
         assert!(!out.is_error, "{}", out.content);
         assert!(out.content.contains("1 replacement"), "{}", out.content);
-        assert_eq!(fs::read_to_string(dir.join("f.txt")).unwrap(), "alpha\nBETA\ngamma\n");
+        assert_eq!(
+            fs::read_to_string(dir.join("f.txt")).unwrap(),
+            "alpha\nBETA\ngamma\n"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -570,7 +582,10 @@ mod tests {
             &json!({"path": outside.to_string_lossy(), "old_string": "hello", "new_string": "bye"}),
             &ctx_restricted(&dir),
         );
-        assert!(res.is_err(), "escape must be rejected under restrict_to_workdir");
+        assert!(
+            res.is_err(),
+            "escape must be rejected under restrict_to_workdir"
+        );
         // The outside file is untouched.
         assert_eq!(fs::read_to_string(&outside).unwrap(), "hello");
         fs::remove_dir_all(&dir).ok();
@@ -647,7 +662,10 @@ mod tests {
             &json!({"path": "evil", "content": "hacked"}),
             &ctx_restricted(&dir),
         );
-        assert!(res.is_err(), "symlink escape must be rejected under restrict_to_workdir");
+        assert!(
+            res.is_err(),
+            "symlink escape must be rejected under restrict_to_workdir"
+        );
         assert_eq!(fs::read_to_string(&outside).unwrap(), "orig");
         fs::remove_dir_all(&dir).ok();
         let _ = fs::remove_file(&outside);

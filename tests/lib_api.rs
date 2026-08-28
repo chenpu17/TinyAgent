@@ -77,7 +77,9 @@ fn custom_callback_tool_runs_and_usage_is_honest() {
                 saw_toolcall = true;
                 assert_eq!(name, "echo");
             }
-            AgentEvent::ToolResult { is_error, content, .. } => {
+            AgentEvent::ToolResult {
+                is_error, content, ..
+            } => {
                 saw_toolresult = true;
                 assert!(!is_error, "tool result should not be an error");
                 assert!(content.contains("echo: hello"), "content was: {content}");
@@ -106,7 +108,10 @@ fn custom_callback_tool_runs_and_usage_is_honest() {
     assert_eq!(agent.usage().input_tokens, 18);
     assert_eq!(agent.usage().output_tokens, 8);
     assert_eq!(agent.model(), "mock-model");
-    assert!(!agent.messages().is_empty(), "history should hold the turns");
+    assert!(
+        !agent.messages().is_empty(),
+        "history should hold the turns"
+    );
 }
 
 #[test]
@@ -123,9 +128,15 @@ fn agent_event_is_serializable_for_ffi() {
 
     // The recursive SubAgent variant must serialize too.
     let inner = AgentEvent::TextDelta("child".into());
-    let sub = AgentEvent::SubAgent { name: "worker".into(), event: Box::new(inner) };
+    let sub = AgentEvent::SubAgent {
+        name: "worker".into(),
+        event: Box::new(inner),
+    };
     let s2 = serde_json::to_string(&sub).expect("serialize subagent");
-    assert!(s2.contains("worker") && s2.contains("child"), "serialized: {s2}");
+    assert!(
+        s2.contains("worker") && s2.contains("child"),
+        "serialized: {s2}"
+    );
 }
 
 #[test]
@@ -138,8 +149,7 @@ fn build_agent_with_provider_assembles_and_runs() {
     use tiny_agent::provider::new_client;
     let cfg = minimal_config();
     let client = new_client(0);
-    let (provider, _state) =
-        MockProvider::new(vec![resp_text("ok from facade", mk_usage(3, 2))]);
+    let (provider, _state) = MockProvider::new(vec![resp_text("ok from facade", mk_usage(3, 2))]);
     let mut agent = tiny_agent::build_agent_with_provider(
         &cfg,
         Box::new(provider),
@@ -177,7 +187,9 @@ fn run_error_serializes_structured_cost() {
         &cfg,
         Box::new(provider),
         vec![],
-        vec![tiny_agent::Message::user(vec![tiny_agent::Block::Text("go".into())])],
+        vec![tiny_agent::Message::user(vec![tiny_agent::Block::Text(
+            "go".into(),
+        )])],
         ToolCtx {
             workdir: std::env::current_dir().unwrap(),
             max_output_chars: 4000,
@@ -195,7 +207,10 @@ fn run_error_serializes_structured_cost() {
         Ok(_) => panic!("expected a provider error"),
     };
     let v = serde_json::to_value(&re).expect("serialize RunError");
-    assert_eq!(v["error"], "boom: 503", "source renders as its Display string");
+    assert_eq!(
+        v["error"], "boom: 503",
+        "source renders as its Display string"
+    );
     assert!(v["usage"].is_object(), "usage serializes");
     assert!(v["turns"].is_number(), "turns serializes as a number");
     assert!(v["elapsed"].is_object(), "Duration serializes (serde json)");
@@ -312,13 +327,7 @@ fn try_new_rejects_an_invalid_tool_set_as_an_error() {
     let (provider, _) = MockProvider::new(vec![]);
     let tools: Vec<Box<dyn tiny_agent::Tool>> =
         vec![Box::new(plain_tool("dup")), Box::new(plain_tool("dup"))];
-    let err = tiny_agent::Agent::try_new(
-        &cfg,
-        Box::new(provider),
-        tools,
-        Vec::new(),
-        plain_ctx(),
-    );
+    let err = tiny_agent::Agent::try_new(&cfg, Box::new(provider), tools, Vec::new(), plain_ctx());
     let err = match err {
         Err(e) => e,
         Ok(_) => panic!("duplicate names must fail try_new"),

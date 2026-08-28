@@ -142,13 +142,20 @@ fn build_extra_tools(env: Env, tools: Option<Vec<Object>>) -> Result<Vec<Box<dyn
         // resolveTool(req.id, result) — the closure below blocks until then.
         let tsfn = env.create_threadsafe_function(&run, 0, |ctx| Ok(vec![ctx.value]))?;
 
-        let def = ta::ToolDef { name: name.clone(), description, schema };
+        let def = ta::ToolDef {
+            name: name.clone(),
+            description,
+            schema,
+        };
         let tool = ta::CallbackTool::new(def, move |input: &Value, _ctx: &ta::ToolCtx| {
             let id = NEXT_TOOL_ID.fetch_add(1, Ordering::Relaxed);
             let (tx, rx) = mpsc::channel();
             pending_tools().lock().unwrap().insert(id, tx);
 
-            let req = ToolRequest { id, args: input.clone() };
+            let req = ToolRequest {
+                id,
+                args: input.clone(),
+            };
             if tsfn.call(Ok(req), ThreadsafeFunctionCallMode::NonBlocking) != Status::Ok {
                 pending_tools().lock().unwrap().remove(&id);
                 return Err(anyhow::anyhow!("tool \"{name}\": dispatch to JS failed"));
@@ -269,8 +276,15 @@ impl ta::Provider for NodeProvider {
         let (tx, rx) = mpsc::channel();
         pending_providers().lock().unwrap().insert(id, tx);
 
-        let call = ProviderCall { id, request: provider_request_value(req)? };
-        if self.tsfn.call(Ok(call), ThreadsafeFunctionCallMode::NonBlocking) != Status::Ok {
+        let call = ProviderCall {
+            id,
+            request: provider_request_value(req)?,
+        };
+        if self
+            .tsfn
+            .call(Ok(call), ThreadsafeFunctionCallMode::NonBlocking)
+            != Status::Ok
+        {
             pending_providers().lock().unwrap().remove(&id);
             return Err(err("provider: dispatch to JS failed").into());
         }
@@ -297,7 +311,9 @@ impl ta::Provider for NodeProvider {
             // budget-bounded wait makes timeouts routine, not exceptional).
             // The tools registry does the same in its timeout arm.
             pending_providers().lock().unwrap().remove(&id);
-            err(format!("provider: JS callback did not resolve within {wait_secs}s"))
+            err(format!(
+                "provider: JS callback did not resolve within {wait_secs}s"
+            ))
         })?;
         // The wrapper signals a thrown user provider via a `{__error}` marker so
         // the run fails honestly (mirroring the Python binding, where a raised
@@ -397,7 +413,9 @@ pub struct CancelToken {
 impl CancelToken {
     #[napi(constructor)]
     pub fn new() -> Self {
-        Self { flag: Arc::new(AtomicBool::new(false)) }
+        Self {
+            flag: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     /// Flip the flag; the running turn stops at the next boundary.
@@ -457,7 +475,9 @@ impl Agent {
             None => ta::build_agent_with(&cfg, Vec::new(), &client, extra, &api_key),
         }
         .map_err(err)?;
-        Ok(Self { inner: Arc::new(Mutex::new(agent)) })
+        Ok(Self {
+            inner: Arc::new(Mutex::new(agent)),
+        })
     }
 
     /// Append a user message (text) to the conversation, then (typically) call
@@ -513,7 +533,12 @@ impl Agent {
     /// The model name this agent sends with each request.
     #[napi]
     pub fn model(&self) -> Result<String> {
-        Ok(self.inner.lock().map_err(|_| err("agent mutex poisoned"))?.model().to_string())
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| err("agent mutex poisoned"))?
+            .model()
+            .to_string())
     }
 }
 
@@ -584,9 +609,7 @@ impl Task for ChatRunTask {
         let tools = std::mem::take(&mut self.tools);
         let provider = self.provider.take();
         let mut agent = match provider {
-            Some(p) => {
-                ta::build_agent_with_provider(&cfg, p, Vec::new(), &client, tools, &api_key)
-            }
+            Some(p) => ta::build_agent_with_provider(&cfg, p, Vec::new(), &client, tools, &api_key),
             None => ta::build_agent_with(&cfg, Vec::new(), &client, tools, &api_key),
         }
         .map_err(err)?;

@@ -16,11 +16,11 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use config::Config;
 use provider::{Block, Message, Role};
+#[cfg(feature = "tui")]
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-#[cfg(feature = "tui")]
-use std::io::IsTerminal;
 
 #[derive(Parser)]
 #[command(
@@ -245,7 +245,11 @@ fn main() -> Result<()> {
     // assumed already consumed — only an explicit --task sends a new one.
     // (cli.task was already merged into cfg.task above, so we check cli.task
     // directly to distinguish command-line from config.)
-    let task_to_send = if resumed { cli_task.clone() } else { cfg.task.clone() };
+    let task_to_send = if resumed {
+        cli_task.clone()
+    } else {
+        cfg.task.clone()
+    };
     if let Some(task) = task_to_send {
         let mut blocks = vec![Block::Text(task)];
         for img in &cli.image {
@@ -292,9 +296,9 @@ fn main() -> Result<()> {
         match default_tui_mode(last_is_user, has_initial, is_tty, tui_built) {
             TuiDefault::Headless => false,
             TuiDefault::Tui => true,
-            TuiDefault::ErrAssistantTail => bail!(
-                "session already ends with an assistant message; provide --task to continue"
-            ),
+            TuiDefault::ErrAssistantTail => {
+                bail!("session already ends with an assistant message; provide --task to continue")
+            }
             TuiDefault::ErrNoTask => {
                 #[cfg(feature = "tui")]
                 {
@@ -345,7 +349,11 @@ fn main() -> Result<()> {
             // initial task. This is for display only — the worker kicks
             // off the run based on the agent's last message role, so we
             // never double-send the task.
-            let initial_task = if resumed { cli_task.clone() } else { cfg.task.clone() };
+            let initial_task = if resumed {
+                cli_task.clone()
+            } else {
+                cfg.task.clone()
+            };
             tui::run(agent, &cfg, initial_task, auto_start)
         }
         #[cfg(not(feature = "tui"))]
@@ -553,7 +561,12 @@ mod tests {
         for p in ["report.json", "./report.json", ".//report.json"] {
             assert!(is_default_report(Path::new(p)), "{p:?} is the default");
         }
-        for p in ["out/report.json", "report.json.bak", "other.json", "sub/./report.json"] {
+        for p in [
+            "out/report.json",
+            "report.json.bak",
+            "other.json",
+            "sub/./report.json",
+        ] {
             assert!(!is_default_report(Path::new(p)), "{p:?} is custom");
         }
     }
@@ -609,15 +622,19 @@ mod tests {
     #[test]
     fn choose_empty_env_falls_through_to_default() {
         // An empty $TINYAGENT_CONFIG is treated as unset (never an empty path).
-        let p = choose_config_path(None, Some(String::new()), Some(PathBuf::from("/d.json")), true)
-            .unwrap();
+        let p = choose_config_path(
+            None,
+            Some(String::new()),
+            Some(PathBuf::from("/d.json")),
+            true,
+        )
+        .unwrap();
         assert_eq!(p, PathBuf::from("/d.json"));
     }
 
     #[test]
     fn choose_default_only_when_it_exists() {
-        let p =
-            choose_config_path(None, None, Some(PathBuf::from("/d.json")), true).unwrap();
+        let p = choose_config_path(None, None, Some(PathBuf::from("/d.json")), true).unwrap();
         assert_eq!(p, PathBuf::from("/d.json"));
     }
 
@@ -647,7 +664,11 @@ mod tests {
         // host-absolute path or the test hits the home-fallback branch on
         // Windows and the assertion can never hold. Build the expected path
         // with join() so the assertion is separator-agnostic.
-        let xdg = if cfg!(unix) { "/custom/xdg" } else { "C:/custom/xdg" };
+        let xdg = if cfg!(unix) {
+            "/custom/xdg"
+        } else {
+            "C:/custom/xdg"
+        };
         let p = default_config_path_in(Some(xdg), Some("/home/u")).unwrap();
         assert_eq!(p, PathBuf::from(xdg).join("tinyagent").join("config.json"));
     }
@@ -658,7 +679,11 @@ mod tests {
         // falls back to $HOME/.config.
         for xdg in ["relative/xdg", ""] {
             let p = default_config_path_in(Some(xdg), Some("/home/u")).unwrap();
-            assert_eq!(p, PathBuf::from("/home/u/.config/tinyagent/config.json"), "{xdg:?}");
+            assert_eq!(
+                p,
+                PathBuf::from("/home/u/.config/tinyagent/config.json"),
+                "{xdg:?}"
+            );
         }
     }
 
@@ -678,8 +703,14 @@ mod tests {
     fn tui_default_explicit_task_is_headless() {
         // An initial task (session ends with a user message) always runs
         // headless regardless of tty — the task is what was asked to run.
-        assert_eq!(default_tui_mode(true, true, true, true), TuiDefault::Headless);
-        assert_eq!(default_tui_mode(true, true, false, false), TuiDefault::Headless);
+        assert_eq!(
+            default_tui_mode(true, true, true, true),
+            TuiDefault::Headless
+        );
+        assert_eq!(
+            default_tui_mode(true, true, false, false),
+            TuiDefault::Headless
+        );
     }
 
     #[test]

@@ -73,7 +73,13 @@ fn prepare_isolation(
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let safe: String = task_name
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         std::env::temp_dir().join(format!("ta-batch-{safe}-{}-{n}", std::process::id()))
     };
@@ -94,7 +100,12 @@ fn prepare_isolation(
             // file set than the task expects — reject rather than silently
             // misplace the task.
             let out = std::process::Command::new("git")
-                .args(["-C", &src.display().to_string(), "rev-parse", "--show-toplevel"])
+                .args([
+                    "-C",
+                    &src.display().to_string(),
+                    "rev-parse",
+                    "--show-toplevel",
+                ])
                 .output()
                 .context("cannot run git (is it on PATH?) for --isolate git")?;
             if !out.status.success() {
@@ -180,7 +191,10 @@ impl Drop for IsolationGuard {
         match self.mode {
             IsolateMode::Copy => {
                 if let Err(e) = std::fs::remove_dir_all(&self.dir) {
-                    eprintln!("[warn] isolation cleanup failed ({}): {e}", self.dir.display());
+                    eprintln!(
+                        "[warn] isolation cleanup failed ({}): {e}",
+                        self.dir.display()
+                    );
                 }
             }
             IsolateMode::Git => {
@@ -224,9 +238,7 @@ impl Drop for IsolationGuard {
 /// with a warning (see `copy_entry`). Unreadable entries are errors, not
 /// skips — a task that silently misses an input file fails confusingly later.
 fn copy_dir_filtered(src: &Path, dst: &Path) -> Result<()> {
-    for entry in std::fs::read_dir(src)
-        .with_context(|| format!("cannot read {}", src.display()))?
-    {
+    for entry in std::fs::read_dir(src).with_context(|| format!("cannot read {}", src.display()))? {
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
@@ -325,8 +337,8 @@ fn copy_entry(from: &Path, to: &Path, root: &Path, depth: usize) -> Result<()> {
         }
     } else if ft.is_dir() {
         std::fs::create_dir_all(to)?;
-        for entry in std::fs::read_dir(from)
-            .with_context(|| format!("cannot read {}", from.display()))?
+        for entry in
+            std::fs::read_dir(from).with_context(|| format!("cannot read {}", from.display()))?
         {
             let entry = entry?;
             copy_entry(&entry.path(), &to.join(entry.file_name()), root, depth + 1)?;
@@ -336,7 +348,6 @@ fn copy_entry(from: &Path, to: &Path, root: &Path, depth: usize) -> Result<()> {
     }
     Ok(())
 }
-
 
 #[derive(Debug, Clone, Deserialize)]
 struct TaskReport {
@@ -475,7 +486,10 @@ pub fn run(
             kept_successes
         );
         if tasks.is_empty() {
-            bail!("no previously-failed tasks matched files in {}", dir.display());
+            bail!(
+                "no previously-failed tasks matched files in {}",
+                dir.display()
+            );
         }
         Some(prior_tasks)
     } else {
@@ -583,7 +597,16 @@ pub fn run(
                         started_at: String::new(),
                     }
                 } else {
-                    run_one(base, &name, partial, &results_dir, &client, retries, isolate, &cancel)
+                    run_one(
+                        base,
+                        &name,
+                        partial,
+                        &results_dir,
+                        &client,
+                        retries,
+                        isolate,
+                        &cancel,
+                    )
                 };
                 eprintln!(
                     "[{}] {} ({} turns, {:.1}s{})",
@@ -597,7 +620,10 @@ pub fn run(
                         .map(|e| format!(", {e}"))
                         .unwrap_or_default()
                 );
-                reports.lock().unwrap_or_else(|e| e.into_inner()).push(report);
+                reports
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(report);
             });
         }
         for t in tasks {
@@ -683,23 +709,22 @@ fn run_one_attempt(
     // nothing (zero, turns=0); the transient-error path bills the accumulated
     // cost across attempts (passed in from the caller after `acc.add_failed`),
     // including the turns those failed attempts actually completed.
-    let bad =
-        |stop: &str, msg: String, usage: &crate::provider::Usage, turns: u32| TaskReport {
-            name: name.into(),
-            success: false,
-            stop_reason: stop.into(),
-            turns,
-            elapsed_secs: start.elapsed().as_secs_f64(),
-            error: Some(msg),
-            input_tokens: usage.input_tokens,
-            output_tokens: usage.output_tokens,
-            cache_creation_input_tokens: usage.cache_creation_input_tokens,
-            cache_read_input_tokens: usage.cache_read_input_tokens,
-            // bad_task / setup_error fail before apply/build; attribute to the
-            // BASE model (a bad fragment's model never ran) and the task start.
-            model: base.model.clone(),
-            started_at: started_at.to_string(),
-        };
+    let bad = |stop: &str, msg: String, usage: &crate::provider::Usage, turns: u32| TaskReport {
+        name: name.into(),
+        success: false,
+        stop_reason: stop.into(),
+        turns,
+        elapsed_secs: start.elapsed().as_secs_f64(),
+        error: Some(msg),
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cache_creation_input_tokens: usage.cache_creation_input_tokens,
+        cache_read_input_tokens: usage.cache_read_input_tokens,
+        // bad_task / setup_error fail before apply/build; attribute to the
+        // BASE model (a bad fragment's model never ran) and the task start.
+        model: base.model.clone(),
+        started_at: started_at.to_string(),
+    };
     let zero = crate::provider::Usage::default();
 
     let mut cfg = base.clone();
@@ -736,7 +761,14 @@ fn run_one_attempt(
     ])];
     let mut agent = match crate::build_agent(&cfg, initial, client) {
         Ok(a) => a,
-        Err(e) => return bad("setup_error", format!("agent setup failed: {e:#}"), &zero, 0),
+        Err(e) => {
+            return bad(
+                "setup_error",
+                format!("agent setup failed: {e:#}"),
+                &zero,
+                0,
+            )
+        }
     };
     // Arm MCP shutdown-reaper on the Ctrl-C flag: a second Ctrl-C exits the
     // process (process::exit skips Drop), so without this a task stuck in an
@@ -905,8 +937,17 @@ fn run_one(
     let mut acc = RunCost::default();
     // Task-level start (shared by every attempt) for the attribution stamp.
     let started_at = crate::harness::now_rfc3339();
-    let mut report =
-        run_one_attempt(base, name, &partial, results_dir, client, 1, &mut acc, cancel, &started_at);
+    let mut report = run_one_attempt(
+        base,
+        name,
+        &partial,
+        results_dir,
+        client,
+        1,
+        &mut acc,
+        cancel,
+        &started_at,
+    );
     let mut attempt = 0;
     while report.stop_reason == "error" && attempt < retries {
         let backoff = backoff(attempt);
@@ -947,8 +988,17 @@ fn run_one(
             break;
         }
         attempt += 1;
-        report =
-            run_one_attempt(base, name, &partial, results_dir, client, attempt + 1, &mut acc, cancel, &started_at);
+        report = run_one_attempt(
+            base,
+            name,
+            &partial,
+            results_dir,
+            client,
+            attempt + 1,
+            &mut acc,
+            cancel,
+            &started_at,
+        );
     }
     // run_one_attempt stamps per-attempt elapsed; overwrite with the total
     // across attempts + backoffs so report.json reflects real wall cost.
@@ -1038,7 +1088,13 @@ fn write_report(path: &Path, reports: &[TaskReport], provider: &str) -> Result<(
         tcr = tcr.saturating_add(r.cache_read_input_tokens);
     }
     // per-task average; 0 when there are no tasks (avoids div-by-zero).
-    let avg = |t: u64| if reports.is_empty() { 0.0 } else { t as f64 / reports.len() as f64 };
+    let avg = |t: u64| {
+        if reports.is_empty() {
+            0.0
+        } else {
+            t as f64 / reports.len() as f64
+        }
+    };
     let report = json!({
         "total": reports.len(),
         "succeeded": succeeded,
@@ -1198,7 +1254,10 @@ mod tests {
         assert_eq!(prior.len(), 1);
         assert!(prior[0].success);
         assert_eq!(prior[0].model, "", "missing model defaults to empty");
-        assert_eq!(prior[0].started_at, "", "missing started_at defaults to empty");
+        assert_eq!(
+            prior[0].started_at, "",
+            "missing started_at defaults to empty"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1322,7 +1381,17 @@ mod tests {
         .unwrap();
         let report = dir.join("report.json");
         let start = std::time::Instant::now();
-        let code = run(&base, &dir, 1, &report, 3, false, IsolateMode::None, Default::default()).unwrap();
+        let code = run(
+            &base,
+            &dir,
+            1,
+            &report,
+            3,
+            false,
+            IsolateMode::None,
+            Default::default(),
+        )
+        .unwrap();
         assert_eq!(code, 1);
         assert!(
             start.elapsed() < std::time::Duration::from_secs(2),
@@ -1384,11 +1453,7 @@ mod tests {
         assert_eq!(tasks[0].stop_reason, "cancelled");
         assert!(!tasks[0].success);
         assert!(
-            tasks[0]
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("backoff"),
+            tasks[0].error.as_deref().unwrap_or("").contains("backoff"),
             "expected a backoff-cancel message, got {:?}",
             tasks[0].error
         );
@@ -1568,8 +1633,17 @@ mod tests {
         .unwrap();
         let report = dir.join("report.json");
 
-        let code = run(&base, &dir, 1, &report, 0, false, IsolateMode::None, Default::default())
-            .unwrap();
+        let code = run(
+            &base,
+            &dir,
+            1,
+            &report,
+            0,
+            false,
+            IsolateMode::None,
+            Default::default(),
+        )
+        .unwrap();
         assert_eq!(code, 1, "connection refused → task fails, batch exit 1");
 
         let tasks = read_prior_tasks(&report).unwrap();
@@ -1632,15 +1706,28 @@ mod tests {
         let report = dir.join("report.json");
 
         let start = std::time::Instant::now();
-        let code =
-            run(&base, &dir, 1, &report, 3, false, IsolateMode::None, Default::default()).unwrap();
+        let code = run(
+            &base,
+            &dir,
+            1,
+            &report,
+            3,
+            false,
+            IsolateMode::None,
+            Default::default(),
+        )
+        .unwrap();
         assert_eq!(code, 1);
         assert!(
             start.elapsed() < Duration::from_secs(2),
             "no backoff ladder; took {:?}",
             start.elapsed()
         );
-        assert_eq!(*count.lock().unwrap(), 1, "exactly one request — no retries");
+        assert_eq!(
+            *count.lock().unwrap(),
+            1,
+            "exactly one request — no retries"
+        );
         let tasks = read_prior_tasks(&report).unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].stop_reason, "context_overflow");
@@ -1678,7 +1765,17 @@ mod tests {
         .unwrap();
         let report = dir.join("report.json");
 
-        let code = run(&base, &dir, 2, &report, 0, false, IsolateMode::None, Default::default()).unwrap();
+        let code = run(
+            &base,
+            &dir,
+            2,
+            &report,
+            0,
+            false,
+            IsolateMode::None,
+            Default::default(),
+        )
+        .unwrap();
         assert_eq!(code, 0, "both tasks should succeed against the mock");
 
         let s = spans.lock().unwrap();
@@ -1752,8 +1849,7 @@ mod tests {
                         // Build the SSE payload with serde_json (string
                         // surgery here is a nest of JSON-in-JSON escapes; a
                         // hand-built template got the closing quotes wrong).
-                        let args = json!({"path": path, "content": body})
-                            .to_string();
+                        let args = json!({"path": path, "content": body}).to_string();
                         let line1 = json!({
                             "choices": [{"index": 0, "delta": {"role": "assistant",
                                 "tool_calls": [{"index": 0, "id": "c1", "type": "function",
@@ -1826,8 +1922,17 @@ mod tests {
         .unwrap();
         let report = dir.join("report.json");
 
-        let code = run(&base, &dir, 2, &report, 0, false, IsolateMode::Copy, Default::default())
-            .unwrap();
+        let code = run(
+            &base,
+            &dir,
+            2,
+            &report,
+            0,
+            false,
+            IsolateMode::Copy,
+            Default::default(),
+        )
+        .unwrap();
         assert_eq!(code, 0, "both isolated tasks succeed writing the same file");
 
         // The source workdir keeps its seed and gains nothing: task outputs
@@ -1882,13 +1987,18 @@ mod tests {
             b.workdir = Some(src.clone());
             b
         };
-        let guard = prepare_isolation(IsolateMode::Copy, &base, "exc").unwrap().unwrap();
+        let guard = prepare_isolation(IsolateMode::Copy, &base, "exc")
+            .unwrap()
+            .unwrap();
         let iso = guard.dir.clone();
         for d in ["target", "node_modules", ".git", "results"] {
             assert!(!iso.join(d).exists(), "{d} must be excluded from the copy");
         }
         assert!(iso.join("keep.txt").exists());
-        assert!(iso.join("sub").join("inner.txt").exists(), "nested files copied");
+        assert!(
+            iso.join("sub").join("inner.txt").exists(),
+            "nested files copied"
+        );
         assert!(
             iso.join("sub").join("results").join("deep.csv").exists(),
             "nested results/ is task input — must be copied (root-level filter only)"
@@ -1936,7 +2046,9 @@ mod tests {
             b.workdir = Some(src.clone());
             b
         };
-        let guard = prepare_isolation(IsolateMode::Copy, &base, "sym").unwrap().unwrap();
+        let guard = prepare_isolation(IsolateMode::Copy, &base, "sym")
+            .unwrap()
+            .unwrap();
         let iso = guard.dir.clone();
         // 1 — recreated as a symlink, still relative.
         assert!(
@@ -1956,8 +2068,14 @@ mod tests {
             "absolute in-tree links are content-copied"
         );
         // 3/4 — gone entirely: no road out of (or back into) the copy.
-        assert!(!iso.join("escape").exists(), "escaping symlink must be skipped");
-        assert!(!iso.join("rel-escape").exists(), "relative escape must be skipped");
+        assert!(
+            !iso.join("escape").exists(),
+            "escaping symlink must be skipped"
+        );
+        assert!(
+            !iso.join("rel-escape").exists(),
+            "relative escape must be skipped"
+        );
         drop(guard);
 
         std::fs::remove_dir_all(&root).ok();
@@ -1983,8 +2101,17 @@ mod tests {
         let report = dir.join("report.json");
 
         let start = std::time::Instant::now();
-        let code = run(&base, &dir, 1, &report, 3, false, IsolateMode::Git, Default::default())
-            .unwrap();
+        let code = run(
+            &base,
+            &dir,
+            1,
+            &report,
+            3,
+            false,
+            IsolateMode::Git,
+            Default::default(),
+        )
+        .unwrap();
         assert_eq!(code, 1);
         assert!(
             start.elapsed() < std::time::Duration::from_secs(2),
@@ -1993,7 +2120,11 @@ mod tests {
         let tasks = read_prior_tasks(&report).unwrap();
         assert_eq!(tasks[0].stop_reason, "setup_error");
         assert!(
-            tasks[0].error.as_deref().unwrap_or("").contains("isolation setup failed"),
+            tasks[0]
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("isolation setup failed"),
             "got: {:?}",
             tasks[0].error
         );
@@ -2043,8 +2174,17 @@ mod tests {
         .unwrap();
         let report = dir.join("report.json");
 
-        let code = run(&base, &dir, 2, &report, 0, false, IsolateMode::Git, Default::default())
-            .unwrap();
+        let code = run(
+            &base,
+            &dir,
+            2,
+            &report,
+            0,
+            false,
+            IsolateMode::Git,
+            Default::default(),
+        )
+        .unwrap();
         assert_eq!(code, 0, "both worktree tasks succeed");
 
         // Base repo pristine: no tracked changes, no untracked out.txt.
@@ -2055,7 +2195,10 @@ mod tests {
             "base repo must be untouched: {}",
             String::from_utf8_lossy(&status.stdout)
         );
-        assert!(!repo.join("out.txt").exists(), "writes stayed in the worktrees");
+        assert!(
+            !repo.join("out.txt").exists(),
+            "writes stayed in the worktrees"
+        );
         // Worktree admin cleaned: `git worktree list` shows only the main one.
         let list = git(&["worktree", "list"]);
         let out = String::from_utf8_lossy(&list.stdout);

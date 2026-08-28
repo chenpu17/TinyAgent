@@ -73,11 +73,11 @@ pub(crate) const OVERFLOW_PHRASES: &[&str] = &[
     "input length and max_tokens", // Anthropic "input length + max_tokens exceed context"
     "input too long",              // some OpenAI-compatible gateways
     "exceeds the context window",  // vLLM / Ollama / gateways
-    // NOTE: bare "token limit exceeded" is intentionally NOT here — some
-    // gateways use it for context overflow, but it ALSO appears in OUTPUT-token-
-    // limit errors, which compressing won't fix (the failure would repeat on the
-    // shorter history, wasting one force-compress + retry). It's matched with a
-    // guard in `is_context_overflow` instead.
+                                   // NOTE: bare "token limit exceeded" is intentionally NOT here — some
+                                   // gateways use it for context overflow, but it ALSO appears in OUTPUT-token-
+                                   // limit errors, which compressing won't fix (the failure would repeat on the
+                                   // shorter history, wasting one force-compress + retry). It's matched with a
+                                   // guard in `is_context_overflow` instead.
 ];
 
 /// Rough size estimate of a conversation (chars; images count cheaply).
@@ -111,7 +111,11 @@ pub(crate) fn total_chars(messages: &[Message]) -> usize {
 /// chars-per-token heuristic. Used ONLY for the preflight "should I compact
 /// before this request?" decision — never billed or reported; the provider's
 /// real usage is the source of truth for accounting.
-pub(crate) fn estimate_tokens(messages: &[Message], system: Option<&str>, tool_schema_chars: usize) -> usize {
+pub(crate) fn estimate_tokens(
+    messages: &[Message],
+    system: Option<&str>,
+    tool_schema_chars: usize,
+) -> usize {
     let chars = total_chars(messages) + system.map(|s| s.len()).unwrap_or(0) + tool_schema_chars;
     chars / CHARS_PER_TOKEN
 }
@@ -207,7 +211,11 @@ pub(crate) fn extract_running_summary(messages: &[Message]) -> Option<String> {
     head.content.iter().find_map(|b| match b {
         Block::Text(t) if t.starts_with(SUMMARY_MARKER) => {
             // Strip the marker line; keep the summary body.
-            Some(t[SUMMARY_MARKER.len()..].trim_start_matches('\n').to_string())
+            Some(
+                t[SUMMARY_MARKER.len()..]
+                    .trim_start_matches('\n')
+                    .to_string(),
+            )
         }
         _ => None,
     })
@@ -237,13 +245,20 @@ pub(crate) fn window_lines(messages: &[Message], cut: usize) -> Vec<String> {
                 Block::Text(t) => format!("[{role}] {t}\n"),
                 Block::Image { .. } => format!("[{role}] <image>\n"),
                 Block::ToolUse { name, input, .. } => {
-                    format!("[{role}] tool_call {name}: {}\n", crate::agent::preview(&input.to_string()))
+                    format!(
+                        "[{role}] tool_call {name}: {}\n",
+                        crate::agent::preview(&input.to_string())
+                    )
                 }
                 Block::ToolResult {
                     content, is_error, ..
                 } => {
                     let body = crate::agent::preview(content);
-                    let tag = if *is_error { "tool_error" } else { "tool_result" };
+                    let tag = if *is_error {
+                        "tool_error"
+                    } else {
+                        "tool_result"
+                    };
                     format!("[{role}] {tag}: {body}\n")
                 }
             };

@@ -32,7 +32,10 @@ use std::time::{Duration, Instant};
 pub enum Block {
     Text(String),
     /// base64-encoded image (media_type e.g. "image/png").
-    Image { media_type: String, data: String },
+    Image {
+        media_type: String,
+        data: String,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -184,7 +187,8 @@ impl SimpleChatResponse {
     /// the host language). Missing `stop_reason`/`usage` default per the struct's
     /// `#[serde(default)]` rules.
     pub fn from_value(v: &Value) -> Result<Self> {
-        serde_json::from_value(v.clone()).map_err(|e| anyhow::anyhow!("custom provider response: {e}"))
+        serde_json::from_value(v.clone())
+            .map_err(|e| anyhow::anyhow!("custom provider response: {e}"))
     }
 }
 
@@ -362,7 +366,7 @@ pub(crate) enum StreamAbort {
     /// Caller flipped the shared cancel flag (Esc/Ctrl-C in the TUI).
     Cancelled,
     /// No new chunk for `idle` (the configured `limits.stream_idle_secs`) — the
-/// connection is half-open
+    /// connection is half-open
     /// (server stopped sending without closing). Distinct from the reqwest
     /// total timeout, which is a backstop for the whole request.
     IdleTimeout,
@@ -545,7 +549,10 @@ mod tests {
         struct ErroringRead;
         impl std::io::Read for ErroringRead {
             fn read(&mut self, _b: &mut [u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "boom"))
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "boom",
+                ))
             }
         }
         // Raw reader: Err, not Ok(None).
@@ -557,7 +564,10 @@ mod tests {
         struct ErroringRead2;
         impl std::io::Read for ErroringRead2 {
             fn read(&mut self, _b: &mut [u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "cut"))
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "cut",
+                ))
             }
         }
         // Through the SseSource impl → StreamError (deterministic, no worker).
@@ -576,7 +586,10 @@ mod tests {
         struct ErroringRead;
         impl std::io::Read for ErroringRead {
             fn read(&mut self, _b: &mut [u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset"))
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "reset",
+                ))
             }
         }
         let cancel = Arc::new(AtomicBool::new(false));

@@ -84,8 +84,12 @@ impl Tool for ReadSkill {
         let dir = match self.index.dir_of(skill) {
             Some(d) => d,
             None => {
-                let known: Vec<&str> =
-                    self.index.entries().iter().map(|e| e.name.as_str()).collect();
+                let known: Vec<&str> = self
+                    .index
+                    .entries()
+                    .iter()
+                    .map(|e| e.name.as_str())
+                    .collect();
                 return Ok(ToolOutput::error(format!(
                     "read_skill: unknown skill {skill:?}; available: {}",
                     known.join(", ")
@@ -166,8 +170,12 @@ impl Tool for ListSkill {
         let dir = match self.index.dir_of(skill) {
             Some(d) => d,
             None => {
-                let known: Vec<&str> =
-                    self.index.entries().iter().map(|e| e.name.as_str()).collect();
+                let known: Vec<&str> = self
+                    .index
+                    .entries()
+                    .iter()
+                    .map(|e| e.name.as_str())
+                    .collect();
                 return Ok(ToolOutput::error(format!(
                     "list_skill: unknown skill {skill:?}; available: {}",
                     known.join(", ")
@@ -266,7 +274,10 @@ mod tests {
             .unwrap();
         }
         let (index, warnings) = crate::skills::scan(&[dir.to_path_buf()]);
-        assert!(warnings.is_empty(), "unexpected scan warnings: {warnings:?}");
+        assert!(
+            warnings.is_empty(),
+            "unexpected scan warnings: {warnings:?}"
+        );
         index
     }
 
@@ -325,7 +336,10 @@ mod tests {
         let index = index_in(&dir, &["deploy"]);
         fs::write(dir.join("deploy").join("reference.md"), "REFERENCE TEXT").unwrap();
         let out = ReadSkill::new(index)
-            .run(&json!({"skill": "deploy", "file": "reference.md"}), &ctx(&dir))
+            .run(
+                &json!({"skill": "deploy", "file": "reference.md"}),
+                &ctx(&dir),
+            )
             .unwrap();
         assert_eq!(out.content, "REFERENCE TEXT");
         fs::remove_dir_all(&dir).ok();
@@ -336,7 +350,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ta-rs-nested-{}", std::process::id()));
         let index = index_in(&dir, &["deploy"]);
         fs::create_dir_all(dir.join("deploy").join("scripts")).unwrap();
-        fs::write(dir.join("deploy").join("scripts").join("release.sh"), "RELEASE").unwrap();
+        fs::write(
+            dir.join("deploy").join("scripts").join("release.sh"),
+            "RELEASE",
+        )
+        .unwrap();
         fs::create_dir_all(dir.join("deploy").join("references")).unwrap();
         fs::write(
             dir.join("deploy").join("references").join("REFERENCE.md"),
@@ -345,12 +363,18 @@ mod tests {
         .unwrap();
         let tool = ReadSkill::new(index);
         let out = tool
-            .run(&json!({"skill": "deploy", "file": "scripts/release.sh"}), &ctx(&dir))
+            .run(
+                &json!({"skill": "deploy", "file": "scripts/release.sh"}),
+                &ctx(&dir),
+            )
             .unwrap();
         assert!(!out.is_error, "{}", out.content);
         assert_eq!(out.content, "RELEASE");
         let out = tool
-            .run(&json!({"skill": "deploy", "file": "references/REFERENCE.md"}), &ctx(&dir))
+            .run(
+                &json!({"skill": "deploy", "file": "references/REFERENCE.md"}),
+                &ctx(&dir),
+            )
             .unwrap();
         assert_eq!(out.content, "REF");
         fs::remove_dir_all(&dir).ok();
@@ -372,7 +396,11 @@ mod tests {
                 .run(&json!({"skill": "deploy", "file": bad}), &ctx(&dir))
                 .unwrap();
             assert!(out.is_error, "{bad:?} should be rejected: {}", out.content);
-            assert!(out.content.contains("unsafe file path"), "{bad:?}: {}", out.content);
+            assert!(
+                out.content.contains("unsafe file path"),
+                "{bad:?}: {}",
+                out.content
+            );
         }
         // The secret was never read.
         assert_eq!(fs::read_to_string(&secret).unwrap(), "TOPSECRET");
@@ -388,7 +416,11 @@ mod tests {
             .unwrap();
         assert!(out.is_error, "{}", out.content);
         assert!(out.content.contains("unknown skill"), "{}", out.content);
-        assert!(out.content.contains("alpha") && out.content.contains("beta"), "{}", out.content);
+        assert!(
+            out.content.contains("alpha") && out.content.contains("beta"),
+            "{}",
+            out.content
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -399,13 +431,18 @@ mod tests {
         fs::create_dir_all(&sub).unwrap();
         fs::write(
             sub.join("SKILL.md"),
-            format!("---\nname: big\ndescription: d\n---\n{}", "x".repeat(50_000)),
+            format!(
+                "---\nname: big\ndescription: d\n---\n{}",
+                "x".repeat(50_000)
+            ),
         )
         .unwrap();
         let (index, _) = crate::skills::scan(std::slice::from_ref(&dir));
         let mut c = ctx(&dir);
         c.max_output_chars = 500;
-        let out = ReadSkill::new(index).run(&json!({"skill": "big"}), &c).unwrap();
+        let out = ReadSkill::new(index)
+            .run(&json!({"skill": "big"}), &c)
+            .unwrap();
         assert!(out.content.len() < 2000, "got {} bytes", out.content.len());
         assert!(out.content.contains("truncated"), "{}", out.content);
         fs::remove_dir_all(&dir).ok();
@@ -422,13 +459,18 @@ mod tests {
         fs::create_dir_all(&sub).unwrap();
         fs::write(
             sub.join("SKILL.md"),
-            format!("---\nname: big\ndescription: d\n---\n{}", "y".repeat(3_000_000)),
+            format!(
+                "---\nname: big\ndescription: d\n---\n{}",
+                "y".repeat(3_000_000)
+            ),
         )
         .unwrap();
         let (index, _) = crate::skills::scan(std::slice::from_ref(&dir));
         let mut c = ctx(&dir);
         c.max_output_chars = 400;
-        let out = ReadSkill::new(index).run(&json!({"skill": "big"}), &c).unwrap();
+        let out = ReadSkill::new(index)
+            .run(&json!({"skill": "big"}), &c)
+            .unwrap();
         assert!(out.content.len() < 1600, "got {} bytes", out.content.len());
         assert!(out.content.contains("truncated"), "{}", out.content);
         fs::remove_dir_all(&dir).ok();
@@ -448,7 +490,11 @@ mod tests {
         assert!(out.content.contains("SKILL.md"), "{}", out.content);
         // walk_skill emits paths with the platform separator (\ on Windows).
         let sep = if cfg!(unix) { "/" } else { "\\" };
-        assert!(out.content.contains(&format!("scripts{sep}release.sh")), "{}", out.content);
+        assert!(
+            out.content.contains(&format!("scripts{sep}release.sh")),
+            "{}",
+            out.content
+        );
         assert!(out.content.contains("references.md"), "{}", out.content);
         fs::remove_dir_all(&dir).ok();
     }

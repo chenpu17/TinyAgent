@@ -1,6 +1,9 @@
-use super::{Block, CancellableSse, ChatEvent, ChatRequest, ChatResponse, Message, Provider, Role, SseSource, StreamAbort, ToolDef, Usage};
 #[cfg(test)]
 use super::SseReader;
+use super::{
+    Block, CancellableSse, ChatEvent, ChatRequest, ChatResponse, Message, Provider, Role,
+    SseSource, StreamAbort, ToolDef, Usage,
+};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
@@ -580,7 +583,11 @@ impl OpenAi {
                 other => other.into(),
             }
         };
-        Ok(ChatResponse { blocks, stop_reason, usage })
+        Ok(ChatResponse {
+            blocks,
+            stop_reason,
+            usage,
+        })
     }
 }
 
@@ -898,11 +905,7 @@ mod tests {
         // The trailing user message carries both images.
         let img_count = msgs[2]["content"]
             .as_array()
-            .map(|c| {
-                c.iter()
-                    .filter(|p| p["type"] == "image_url")
-                    .count()
-            })
+            .map(|c| c.iter().filter(|p| p["type"] == "image_url").count())
             .unwrap_or(0);
         assert_eq!(img_count, 2);
     }
@@ -1046,12 +1049,7 @@ mod tests {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("reqwest client");
-        let provider = OpenAi::new(
-            client,
-            url,
-            "k",
-            std::time::Duration::from_secs(30),
-        );
+        let provider = OpenAi::new(client, url, "k", std::time::Duration::from_secs(30));
         let cancel = Arc::new(AtomicBool::new(false));
 
         // Turn 1: 400 on `max_tokens` → diagnose_400 → rename to
@@ -1068,7 +1066,9 @@ mod tests {
             cache: true,
             reasoning_effort: None,
         };
-        let r1 = provider.chat(&req1, &mut |_| {}).expect("turn 1 recovers after fix");
+        let r1 = provider
+            .chat(&req1, &mut |_| {})
+            .expect("turn 1 recovers after fix");
         assert_eq!(r1.stop_reason, "end_turn");
 
         // Turn 2: body already carries `max_completion_tokens` (apply_learned
@@ -1138,24 +1138,25 @@ mod tests {
                 // max_completion_tokens: …" names the new field only, so the
                 // retried request's 400 matches no diagnose_400 rule. BOTH
                 // keys are value errors — the 400 fires either way.
-                let (status, ct, payload): (&str, &str, &str) =
-                    if body.contains("\"max_completion_tokens\"") {
-                        (
-                            "400 Bad Request",
-                            "application/json",
-                            r#"{"error":{"message":"Invalid max_completion_tokens: must be less than or equal to 100","type":"invalid_request_error"}}"#,
-                        )
-                    } else if body.contains("\"max_tokens\"") {
-                        (
-                            "400 Bad Request",
-                            "application/json",
-                            r#"{"error":{"message":"Invalid max_tokens: must be less than or equal to 100","type":"invalid_request_error"}}"#,
-                        )
-                    } else {
-                        // Unreachable in this test (every request carries one
-                        // of the two keys) — kept so a body-shape surprise
-                        // still yields a parseable success instead of hanging.
-                        (
+                let (status, ct, payload): (&str, &str, &str) = if body
+                    .contains("\"max_completion_tokens\"")
+                {
+                    (
+                        "400 Bad Request",
+                        "application/json",
+                        r#"{"error":{"message":"Invalid max_completion_tokens: must be less than or equal to 100","type":"invalid_request_error"}}"#,
+                    )
+                } else if body.contains("\"max_tokens\"") {
+                    (
+                        "400 Bad Request",
+                        "application/json",
+                        r#"{"error":{"message":"Invalid max_tokens: must be less than or equal to 100","type":"invalid_request_error"}}"#,
+                    )
+                } else {
+                    // Unreachable in this test (every request carries one
+                    // of the two keys) — kept so a body-shape surprise
+                    // still yields a parseable success instead of hanging.
+                    (
                             "200 OK",
                             "text/event-stream",
                             concat!(
@@ -1164,7 +1165,7 @@ mod tests {
                                 "data: [DONE]\n\n",
                             ),
                         )
-                    };
+                };
                 let head = format!(
                     "HTTP/1.1 {status}\r\ncontent-type: {ct}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                     payload.len(),
@@ -1185,12 +1186,7 @@ mod tests {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("reqwest client");
-        let provider = OpenAi::new(
-            client,
-            url,
-            "k",
-            std::time::Duration::from_secs(30),
-        );
+        let provider = OpenAi::new(client, url, "k", std::time::Duration::from_secs(30));
         let cancel = Arc::new(AtomicBool::new(false));
         fn mk_req<'a>(m: &'a [Message], cancel: &Arc<AtomicBool>) -> ChatRequest<'a> {
             ChatRequest {

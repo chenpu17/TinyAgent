@@ -37,14 +37,10 @@ impl Tool for McpTool {
         // Tolerate a poisoned lock: a panic while holding it leaves the client
         // state consistent (requests are serialized whole), and panicking here
         // would abort the process outright (release is panic="abort").
-        let result = self
-            .client
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .call(
-                "tools/call",
-                json!({"name": self.wire_name, "arguments": input}),
-            )?;
+        let result = self.client.lock().unwrap_or_else(|e| e.into_inner()).call(
+            "tools/call",
+            json!({"name": self.wire_name, "arguments": input}),
+        )?;
 
         let mut text = String::new();
         let mut image = None;
@@ -195,8 +191,16 @@ fn sanitize_name(server: &str, tool: &str) -> String {
     // clean to empty; substitute a stable placeholder so the name stays
     // well-formed. Two such tools then collide (caught by dedup_check) instead
     // of silently shadowing.
-    let server = if server.is_empty() { "server".to_string() } else { server };
-    let tool = if tool.is_empty() { "tool".to_string() } else { tool };
+    let server = if server.is_empty() {
+        "server".to_string()
+    } else {
+        server
+    };
+    let tool = if tool.is_empty() {
+        "tool".to_string()
+    } else {
+        tool
+    };
     let mut name = format!("mcp_{server}_{tool}");
     // Cap at 64 chars (Anthropic/OpenAI tool-name limit). The name is pure ASCII
     // (alnum/_), so byte truncation stays on a char boundary; truncate() is a
@@ -236,7 +240,10 @@ mod tests {
     #[test]
     fn sanitize_replaces_non_alnum_runs_with_single_underscore() {
         // spaces, dots, slashes, symbols all collapse to one '_' between runs.
-        assert_eq!(sanitize_name("my server", "do.thing"), "mcp_my_server_do_thing");
+        assert_eq!(
+            sanitize_name("my server", "do.thing"),
+            "mcp_my_server_do_thing"
+        );
         assert_eq!(sanitize_name("a...b", "c/d"), "mcp_a_b_c_d");
         assert_eq!(sanitize_name("---lead", "trail---"), "mcp_lead_trail");
     }
@@ -304,7 +311,9 @@ mod tests {
         let names: Vec<String> = tools.iter().map(|t| t.def().name.clone()).collect();
         eprintln!("fs MCP 暴露的工具：{names:?}");
         assert!(
-            names.iter().any(|n| n.contains("search") || n.contains("list_directory")),
+            names
+                .iter()
+                .any(|n| n.contains("search") || n.contains("list_directory")),
             "应含 search/list 工具，得到 {names:?}"
         );
         // 实际执行一次工具调用。list_directory 语义确定（直接列目录内容），
@@ -321,16 +330,30 @@ mod tests {
             budget: None,
             deadline: None,
         };
-        let list = tools.iter().find(|t| t.def().name.contains("list_directory")).expect("有 list 工具");
+        let list = tools
+            .iter()
+            .find(|t| t.def().name.contains("list_directory"))
+            .expect("有 list 工具");
         let out = list
             .run(&json!({ "path": dir.display().to_string() }), &ctx)
             .expect("list_directory 应执行成功");
         eprintln!("list_directory 结果：{}", out.content);
-        assert!(out.content.contains("alpha.txt"), "应列出 alpha.txt，得到：{}", out.content);
-        assert!(out.content.contains("beta.md"), "应列出 beta.md，得到：{}", out.content);
+        assert!(
+            out.content.contains("alpha.txt"),
+            "应列出 alpha.txt，得到：{}",
+            out.content
+        );
+        assert!(
+            out.content.contains("beta.md"),
+            "应列出 beta.md，得到：{}",
+            out.content
+        );
         if let Some(search) = tools.iter().find(|t| t.def().name.contains("search")) {
             let s = search
-                .run(&json!({ "path": dir.display().to_string(), "pattern": "alpha" }), &ctx)
+                .run(
+                    &json!({ "path": dir.display().to_string(), "pattern": "alpha" }),
+                    &ctx,
+                )
                 .expect("search_files 应执行成功");
             eprintln!("search_files(alpha) 结果：{}", s.content);
         }

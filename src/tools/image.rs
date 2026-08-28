@@ -66,7 +66,9 @@ impl Tool for LoadImage {
     }
 
     fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
-        let path = input["path"].as_str().context("load_image: missing \"path\"")?;
+        let path = input["path"]
+            .as_str()
+            .context("load_image: missing \"path\"")?;
         let full = resolve(ctx, path)?;
         let block = load_block(&full)?;
         Ok(ToolOutput {

@@ -89,13 +89,14 @@ fn build_extra_tools(
             let borrowed = t.bind(py).borrow();
             let def = borrowed.def.clone();
             let cb = borrowed.callback.clone();
-            let tool = ta::CallbackTool::new(def, move |input: &serde_json::Value, _ctx: &ta::ToolCtx| {
-                Python::with_gil(|py| -> anyhow::Result<ta::ToolOutput> {
-                    let args = pythonize(py, input).map_err(|e| anyhow::anyhow!("{e}"))?;
-                    let ret = cb.call1(py, (args,)).map_err(|e| anyhow::anyhow!("{e}"))?;
-                    python_ret_to_tooloutput(ret.bind(py))
-                })
-            });
+            let tool =
+                ta::CallbackTool::new(def, move |input: &serde_json::Value, _ctx: &ta::ToolCtx| {
+                    Python::with_gil(|py| -> anyhow::Result<ta::ToolOutput> {
+                        let args = pythonize(py, input).map_err(|e| anyhow::anyhow!("{e}"))?;
+                        let ret = cb.call1(py, (args,)).map_err(|e| anyhow::anyhow!("{e}"))?;
+                        python_ret_to_tooloutput(ret.bind(py))
+                    })
+                });
             out.push(Box::new(tool));
         }
     }
@@ -161,7 +162,9 @@ pub struct CancelToken {
 impl CancelToken {
     #[new]
     fn new() -> Self {
-        Self { flag: Arc::new(AtomicBool::new(false)) }
+        Self {
+            flag: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     /// Flip the flag; the running turn stops at the next boundary.
@@ -196,7 +199,11 @@ impl PyTool {
     ) -> PyResult<Self> {
         let schema: serde_json::Value = depythonize(schema).map_err(to_pyerr)?;
         Ok(Self {
-            def: ta::ToolDef { name, description, schema },
+            def: ta::ToolDef {
+                name,
+                description,
+                schema,
+            },
             callback,
         })
     }
@@ -222,7 +229,11 @@ struct ProviderRequest<'a> {
 /// the text) or a `dict` with `text` and optional `stop_reason` / `usage`.
 fn py_to_simple(bound: &Bound<'_, PyAny>) -> anyhow::Result<ta::SimpleChatResponse> {
     if let Ok(s) = bound.extract::<String>() {
-        return Ok(ta::SimpleChatResponse { text: s, stop_reason: None, usage: None });
+        return Ok(ta::SimpleChatResponse {
+            text: s,
+            stop_reason: None,
+            usage: None,
+        });
     }
     depythonize::<ta::SimpleChatResponse>(bound).map_err(|e| {
         anyhow::anyhow!("provider must return str or dict {{text, stop_reason?, usage?}}: {e}")
@@ -274,8 +285,6 @@ impl ta::Provider for PyProvider {
     }
 }
 
-
-
 /// A multi-turn agent. Construct from a config (path or dict), optionally with
 /// custom tools and an explicit API key; call `.run()` per turn.
 #[pyclass]
@@ -316,7 +325,9 @@ impl Agent {
             None => ta::build_agent_with(&cfg, Vec::new(), &client, extra, &api_key),
         }
         .map_err(to_pyerr)?;
-        Ok(Self { inner: Mutex::new(agent) })
+        Ok(Self {
+            inner: Mutex::new(agent),
+        })
     }
 
     /// Append a user message (text) to the conversation, then `.run()`.
@@ -347,19 +358,29 @@ impl Agent {
 
     /// Cumulative token usage of the current/latest run (4 axes).
     fn usage(&self, py: Python<'_>) -> PyResult<PyObject> {
-        let bound = pythonize(py, &self.inner.lock().expect("agent mutex poisoned").usage())?;
+        let bound = pythonize(
+            py,
+            &self.inner.lock().expect("agent mutex poisoned").usage(),
+        )?;
         Ok(bound.unbind())
     }
 
     /// Conversation history as a list of message dicts.
     fn messages(&self, py: Python<'_>) -> PyResult<PyObject> {
-        let bound = pythonize(py, self.inner.lock().expect("agent mutex poisoned").messages())?;
+        let bound = pythonize(
+            py,
+            self.inner.lock().expect("agent mutex poisoned").messages(),
+        )?;
         Ok(bound.unbind())
     }
 
     /// The model name this agent sends with each request.
     fn model(&self) -> String {
-        self.inner.lock().expect("agent mutex poisoned").model().to_string()
+        self.inner
+            .lock()
+            .expect("agent mutex poisoned")
+            .model()
+            .to_string()
     }
 }
 

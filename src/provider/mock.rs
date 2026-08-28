@@ -90,7 +90,12 @@ impl MockProvider {
             queue: Mutex::new(turns.into()),
             captured: Mutex::new(Vec::new()),
         });
-        (MockProvider { state: state.clone() }, state)
+        (
+            MockProvider {
+                state: state.clone(),
+            },
+            state,
+        )
     }
 }
 

@@ -38,12 +38,14 @@ pub mod tools;
 
 // ── Facade re-exports (the library's public face) ──────────────────────────
 pub use agent::{
-    Agent, AgentEvent, CompressTrigger, RunCost, RunError, RunOutcome, TodoItem, ToolCallRecord,
-    extract_plan,
+    extract_plan, Agent, AgentEvent, CompressTrigger, RunCost, RunError, RunOutcome, TodoItem,
+    ToolCallRecord,
 };
 pub use config::{Config, Limits};
 pub use hooks::{Hooks, ToolDecision};
-pub use provider::{Block, ChatRequest, ChatResponse, Message, Provider, Role, SimpleChatResponse, ToolDef, Usage};
+pub use provider::{
+    Block, ChatRequest, ChatResponse, Message, Provider, Role, SimpleChatResponse, ToolDef, Usage,
+};
 pub use tools::{CallbackTool, Tool, ToolConcurrency, ToolCtx, ToolOutput};
 
 /// Wire together provider + tools (the config's built-in whitelist + any MCP
@@ -141,7 +143,11 @@ fn assemble(
         Vec::new()
     };
     let mut tool_list = tools::build(&cfg.tools, cfg, client, api_key, &mcp_tools)?;
-    tool_list.extend(mcp_tools.into_iter().map(|t| Box::new(t) as Box<dyn tools::Tool>));
+    tool_list.extend(
+        mcp_tools
+            .into_iter()
+            .map(|t| Box::new(t) as Box<dyn tools::Tool>),
+    );
     tool_list.extend(extra_tools);
 
     // Skills (progressive disclosure, agentskills.io open standard): scan global

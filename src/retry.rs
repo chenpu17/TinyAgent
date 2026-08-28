@@ -126,7 +126,10 @@ mod tests {
             assert_eq!(backoff_with(attempt, 1.0).as_millis() as u64, base * 5 / 4);
             // The seeded entry point must land inside the same envelope.
             let d = backoff(attempt).as_millis() as u64;
-            assert!(d >= base * 3 / 4 && d <= base * 5 / 4, "attempt {attempt}: {d}ms");
+            assert!(
+                d >= base * 3 / 4 && d <= base * 5 / 4,
+                "attempt {attempt}: {d}ms"
+            );
         }
     }
 

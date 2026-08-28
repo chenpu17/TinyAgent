@@ -125,7 +125,10 @@ impl Todo {
                 .and_then(|s| s.as_str())
                 .ok_or_else(|| anyhow::anyhow!("todo: each item needs a string `subject`"))?;
             let subject = subject.trim();
-            ensure!(!subject.is_empty(), "todo: item `subject` must not be empty");
+            ensure!(
+                !subject.is_empty(),
+                "todo: item `subject` must not be empty"
+            );
             ensure!(
                 subject.chars().count() <= MAX_SUBJECT_CHARS,
                 "todo: item `subject` too long (limit {MAX_SUBJECT_CHARS} chars)"
@@ -215,7 +218,10 @@ mod tests {
             .unwrap();
         assert_eq!(first.len(), 3);
         let (_, second) = Todo
-            .exec(&json!({"todos": [item("only", "in_progress")]}), &test_ctx())
+            .exec(
+                &json!({"todos": [item("only", "in_progress")]}),
+                &test_ctx(),
+            )
             .unwrap();
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].subject, "only");
@@ -251,7 +257,9 @@ mod tests {
     #[test]
     fn rejects_missing_todos_array() {
         assert!(Todo.exec(&json!({}), &test_ctx()).is_err());
-        assert!(Todo.exec(&json!({"todos": "notarray"}), &test_ctx()).is_err());
+        assert!(Todo
+            .exec(&json!({"todos": "notarray"}), &test_ctx())
+            .is_err());
     }
 
     #[test]
@@ -259,9 +267,7 @@ mod tests {
         let many: Vec<Value> = (0..MAX_TODOS + 1)
             .map(|i| item(&format!("step{i}"), "pending"))
             .collect();
-        let err = Todo
-            .exec(&json!({"todos": many}), &test_ctx())
-            .unwrap_err();
+        let err = Todo.exec(&json!({"todos": many}), &test_ctx()).unwrap_err();
         assert!(format!("{err:#}").contains("too many"), "{err:#}");
     }
 

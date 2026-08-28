@@ -65,7 +65,10 @@ impl SkillIndex {
 
     /// Look up a skill's directory by name (linear scan — the index is small).
     pub fn dir_of(&self, name: &str) -> Option<&Path> {
-        self.entries.iter().find(|e| e.name == name).map(|e| e.dir.as_path())
+        self.entries
+            .iter()
+            .find(|e| e.name == name)
+            .map(|e| e.dir.as_path())
     }
 }
 
@@ -304,7 +307,8 @@ fn split_kv(s: &str) -> Option<(&str, &str)> {
 
 fn unquote(s: &str) -> String {
     let b = s.as_bytes();
-    if b.len() >= 2 && ((b[0] == b'"' && b[b.len() - 1] == b'"') || (b[0] == b'\'' && b[b.len() - 1] == b'\''))
+    if b.len() >= 2
+        && ((b[0] == b'"' && b[b.len() - 1] == b'"') || (b[0] == b'\'' && b[b.len() - 1] == b'\''))
     {
         s[1..s.len() - 1].to_string()
     } else {
@@ -401,7 +405,9 @@ mod tests {
         // — silently skipping the skill with a misleading "missing frontmatter"
         // warning. parse_frontmatter must strip the BOM before checking.
         let bom = "\u{feff}";
-        let f = fm(&format!("{bom}---\nname: deploy\ndescription: ship\n---\nbody"));
+        let f = fm(&format!(
+            "{bom}---\nname: deploy\ndescription: ship\n---\nbody"
+        ));
         assert_eq!(f.name, "deploy");
         assert_eq!(f.description, "ship");
     }
@@ -503,7 +509,11 @@ mod tests {
         // missing description
         write_skill(&dir, "nodesc", "---\nname: nodesc\n---\n");
         // illegal name
-        write_skill(&dir, "ignored", "---\nname: bad name\ndescription: x\n---\n");
+        write_skill(
+            &dir,
+            "ignored",
+            "---\nname: bad name\ndescription: x\n---\n",
+        );
         let (idx, warns) = scan(std::slice::from_ref(&dir));
         let names: Vec<&str> = idx.entries().iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["good"]); // only the valid one
@@ -515,9 +525,21 @@ mod tests {
     fn scan_project_overrides_global_on_clash() {
         let global = tmpd("g");
         let project = tmpd("p");
-        write_skill(&global, "shared", "---\nname: shared\ndescription: GLOBAL\n---\n");
-        write_skill(&project, "shared", "---\nname: shared\ndescription: PROJECT\n---\n");
-        write_skill(&global, "only-g", "---\nname: only-g\ndescription: g\n---\n");
+        write_skill(
+            &global,
+            "shared",
+            "---\nname: shared\ndescription: GLOBAL\n---\n",
+        );
+        write_skill(
+            &project,
+            "shared",
+            "---\nname: shared\ndescription: PROJECT\n---\n",
+        );
+        write_skill(
+            &global,
+            "only-g",
+            "---\nname: only-g\ndescription: g\n---\n",
+        );
         // global first, project last → project wins the clash, keeps first-seen order.
         let (idx, _) = scan(&[global.clone(), project.clone()]);
         let shared = idx.entries().iter().find(|e| e.name == "shared").unwrap();
@@ -546,7 +568,10 @@ mod tests {
         let (idx, warns) = scan(std::slice::from_ref(&dir));
         assert!(idx.is_empty(), "should be skipped");
         assert_eq!(warns.len(), 1, "{warns:?}");
-        assert!(warns[0].contains("must match the directory name"), "{warns:?}");
+        assert!(
+            warns[0].contains("must match the directory name"),
+            "{warns:?}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -554,7 +579,11 @@ mod tests {
     fn scan_rejects_oversized_description() {
         let dir = tmpd("bigdesc");
         let long = "x".repeat(1025);
-        write_skill(&dir, "big", &format!("---\nname: big\ndescription: {long}\n---\n"));
+        write_skill(
+            &dir,
+            "big",
+            &format!("---\nname: big\ndescription: {long}\n---\n"),
+        );
         let (idx, warns) = scan(std::slice::from_ref(&dir));
         assert!(idx.is_empty());
         assert_eq!(warns.len(), 1, "{warns:?}");
@@ -570,14 +599,22 @@ mod tests {
         let dir = tmpd("cjkdesc");
         let desc = "汉".repeat(600); // 600 chars, 1800 UTF-8 bytes
         assert_eq!(desc.len(), 1800);
-        write_skill(&dir, "cjk", &format!("---\nname: cjk\ndescription: {desc}\n---\n"));
+        write_skill(
+            &dir,
+            "cjk",
+            &format!("---\nname: cjk\ndescription: {desc}\n---\n"),
+        );
         let (idx, warns) = scan(std::slice::from_ref(&dir));
         assert!(warns.is_empty(), "{warns:?}");
         assert_eq!(idx.entries().len(), 1);
         // …while a true char overrun (1025 chars of 汉字) is still rejected.
         let dir2 = tmpd("cjkdesc2");
         let over = "汉".repeat(1025);
-        write_skill(&dir2, "cjk2", &format!("---\nname: cjk2\ndescription: {over}\n---\n"));
+        write_skill(
+            &dir2,
+            "cjk2",
+            &format!("---\nname: cjk2\ndescription: {over}\n---\n"),
+        );
         let (idx2, warns2) = scan(std::slice::from_ref(&dir2));
         assert!(idx2.is_empty());
         assert_eq!(warns2.len(), 1);
@@ -641,7 +678,11 @@ mod tests {
         // is_absolute() is platform-dependent (Windows needs a drive letter),
         // so pass a host-absolute XDG path or the "xdg wins" branch isn't taken
         // on Windows. Build the expected path with join() (separator-agnostic).
-        let xdg = if cfg!(unix) { "/custom/xdg" } else { "C:/custom/xdg" };
+        let xdg = if cfg!(unix) {
+            "/custom/xdg"
+        } else {
+            "C:/custom/xdg"
+        };
         assert_eq!(
             default_global_skills_dir_in(Some(xdg), None),
             Some(PathBuf::from(xdg).join("tinyagent").join("skills"))

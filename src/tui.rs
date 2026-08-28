@@ -15,8 +15,8 @@ use ratatui::widgets::{Block as WBlock, BorderType, Borders, Paragraph};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use std::io::stdout;
 use std::sync::mpsc;
-use unicode_width::UnicodeWidthStr;
 use std::time::{Duration, Instant};
+use unicode_width::UnicodeWidthStr;
 
 /// Braille spinner frames for the activity shown in the input border title.
 /// The frame is derived from the run's elapsed time (100ms per frame), not
@@ -108,7 +108,10 @@ impl Row {
     /// Convenience constructors so the many System-row sites name a level
     /// without repeating the struct literal.
     fn sys(text: impl Into<String>, level: SysLevel) -> Row {
-        Row::System { text: text.into(), level }
+        Row::System {
+            text: text.into(),
+            level,
+        }
     }
     fn sys_info(text: impl Into<String>) -> Row {
         Row::sys(text, SysLevel::Info)
@@ -155,7 +158,11 @@ fn classify(trimmed: &str) -> SlashCmd {
         Some((w, a)) => (w, a.trim()),
         None => (rest.trim(), ""),
     };
-    let arg = if raw_arg.is_empty() { None } else { Some(raw_arg.to_string()) };
+    let arg = if raw_arg.is_empty() {
+        None
+    } else {
+        Some(raw_arg.to_string())
+    };
     // Only /export takes an argument. After the classify refactor the other
     // commands silently dropped a trailing arg (`/model foo` ran /model with
     // "foo" ignored); reject them as unknown so the typo is surfaced. Unknown
@@ -212,7 +219,11 @@ fn slash_reply(cmd: &SlashCmd, cfg: &Config) -> String {
                     format!("/{} {}", c.name, c.arg_hint)
                 }
             };
-            let kw = SLASH_COMMANDS.iter().map(|c| lhs(c).len()).max().unwrap_or(0);
+            let kw = SLASH_COMMANDS
+                .iter()
+                .map(|c| lhs(c).len())
+                .max()
+                .unwrap_or(0);
             let mut s = "commands:".to_string();
             for c in &SLASH_COMMANDS {
                 s.push_str(&format!("\n  {:<kw$}  {}", lhs(c), c.desc));
@@ -239,14 +250,46 @@ struct SlashSpec {
 }
 
 const SLASH_COMMANDS: [SlashSpec; 8] = [
-    SlashSpec { name: "clear", arg_hint: "", desc: "clear the conversation history" },
-    SlashSpec { name: "export", arg_hint: "[path]", desc: "dump the transcript to a file (or clipboard)" },
-    SlashSpec { name: "model", arg_hint: "", desc: "model, provider, max_tokens, base URL" },
-    SlashSpec { name: "limits", arg_hint: "", desc: "turn and timeout limits" },
-    SlashSpec { name: "tools", arg_hint: "", desc: "enabled tool list" },
-    SlashSpec { name: "system", arg_hint: "", desc: "the active system prompt" },
-    SlashSpec { name: "help", arg_hint: "", desc: "list commands" },
-    SlashSpec { name: "quit", arg_hint: "", desc: "exit the TUI (alias: /exit)" },
+    SlashSpec {
+        name: "clear",
+        arg_hint: "",
+        desc: "clear the conversation history",
+    },
+    SlashSpec {
+        name: "export",
+        arg_hint: "[path]",
+        desc: "dump the transcript to a file (or clipboard)",
+    },
+    SlashSpec {
+        name: "model",
+        arg_hint: "",
+        desc: "model, provider, max_tokens, base URL",
+    },
+    SlashSpec {
+        name: "limits",
+        arg_hint: "",
+        desc: "turn and timeout limits",
+    },
+    SlashSpec {
+        name: "tools",
+        arg_hint: "",
+        desc: "enabled tool list",
+    },
+    SlashSpec {
+        name: "system",
+        arg_hint: "",
+        desc: "the active system prompt",
+    },
+    SlashSpec {
+        name: "help",
+        arg_hint: "",
+        desc: "list commands",
+    },
+    SlashSpec {
+        name: "quit",
+        arg_hint: "",
+        desc: "exit the TUI (alias: /exit)",
+    },
 ];
 
 /// Popup height cap; the match window scrolls to keep the selection visible.
@@ -466,7 +509,12 @@ fn render_transcript(rows: &[Row]) -> String {
             Row::ToolCall { name, input, .. } => {
                 out.push_str(&format!("→ {name}: {input}\n\n"));
             }
-            Row::ToolResult { name, content, is_error, .. } => {
+            Row::ToolResult {
+                name,
+                content,
+                is_error,
+                ..
+            } => {
                 let tag = if *is_error { "✗" } else { "✓" };
                 // Content may carry ANSI codes (kept for the TUI's colored
                 // render); the transcript wants the plain text.
@@ -513,16 +561,16 @@ fn copy_to_clipboard(text: &str) -> bool {
             .map(|s| s.write_all(text.as_bytes()).is_ok())
             .unwrap_or(false);
         drop(child.stdin.take()); // EOF so the tool flushes and exits
-        // Always reap. An earlier `fed && wait()` short-circuited the wait
-        // when the write failed (broken pipe after the tool exited early),
-        // and Rust's `Child::drop` does NOT reap on Unix — leaking a zombie
-        // until process exit. wait() runs unconditionally; its result still
-        // combines with `fed` so a failed write reports failure.
-        //
-        // Bound the wait at 3s: a clipboard tool that holds stdin open without
-        // exiting (e.g. xclip daemonizing in some modes) would otherwise hang
-        // the whole TUI. The thread owns the child and reaps it whenever it
-        // finally exits; on timeout we just stop blocking the UI.
+                                  // Always reap. An earlier `fed && wait()` short-circuited the wait
+                                  // when the write failed (broken pipe after the tool exited early),
+                                  // and Rust's `Child::drop` does NOT reap on Unix — leaking a zombie
+                                  // until process exit. wait() runs unconditionally; its result still
+                                  // combines with `fed` so a failed write reports failure.
+                                  //
+                                  // Bound the wait at 3s: a clipboard tool that holds stdin open without
+                                  // exiting (e.g. xclip daemonizing in some modes) would otherwise hang
+                                  // the whole TUI. The thread owns the child and reaps it whenever it
+                                  // finally exits; on timeout we just stop blocking the UI.
         let exited_ok = {
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
@@ -738,21 +786,21 @@ pub fn run(
     // shutdown is raised — a per-turn Esc never reaches here.
     shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
     drop(in_tx); // signal worker to exit
-    // Wait a bounded time for the worker to actually exit. A cancel-aware
-    // shell kills its process group within ~50ms, so joining here prevents the
-    // orphan-on-quit case where the process exits mid-tool and reparents a
-    // running shell to init. A wedged MCP call is now killed by the shutdown
-    // reaper armed above (child killed → stdout EOF → blocked request returns)
-    // within the reaper's 100ms poll, so it too unblocks here. A genuinely
-    // non-cancel-aware tool with no teardown just lets this time out — we then
-    // detach as before, never hanging exit.
+                 // Wait a bounded time for the worker to actually exit. A cancel-aware
+                 // shell kills its process group within ~50ms, so joining here prevents the
+                 // orphan-on-quit case where the process exits mid-tool and reparents a
+                 // running shell to init. A wedged MCP call is now killed by the shutdown
+                 // reaper armed above (child killed → stdout EOF → blocked request returns)
+                 // within the reaper's 100ms poll, so it too unblocks here. A genuinely
+                 // non-cancel-aware tool with no teardown just lets this time out — we then
+                 // detach as before, never hanging exit.
     let worker_stuck = done_rx.recv_timeout(Duration::from_secs(3)).is_err();
     drop(worker); // detach if the worker is still stuck past the deadline
-    // Restore the terminal BEFORE reporting discarded queued messages — a note
-    // printed while raw mode is still active would be garbled. The guard's Drop
-    // is idempotent, so a panic path below still ends clean. Inline mode leaves
-    // the committed scrollback intact: the conversation stays in the terminal's
-    // history like ordinary command output.
+                  // Restore the terminal BEFORE reporting discarded queued messages — a note
+                  // printed while raw mode is still active would be garbled. The guard's Drop
+                  // is idempotent, so a panic path below still ends clean. Inline mode leaves
+                  // the committed scrollback intact: the conversation stays in the terminal's
+                  // history like ordinary command output.
     drop(_guard);
     // Step past the inline viewport so the dropped-queue note (and the shell
     // prompt on return) doesn't overwrite the viewport's last frame.
@@ -1131,7 +1179,13 @@ fn ui_loop(
                     // away, keeping busy=true on success so no idle gap opens
                     // (a Ctrl-C in that gap would quit instead of cancelling).
                     let flush = flush_next_queued(&mut queued, &mut rows, &mut md_cache, in_tx);
-                    apply_flush(flush, &mut busy, &mut run_start, &mut activity, &mut thinking);
+                    apply_flush(
+                        flush,
+                        &mut busy,
+                        &mut run_start,
+                        &mut activity,
+                        &mut thinking,
+                    );
                 }
                 UiMsg::RunFinished => {
                     streaming = false;
@@ -1139,7 +1193,13 @@ fn ui_loop(
                     activity.clear();
                     // Flush the queue (same contract as the Error branch).
                     let flush = flush_next_queued(&mut queued, &mut rows, &mut md_cache, in_tx);
-                    apply_flush(flush, &mut busy, &mut run_start, &mut activity, &mut thinking);
+                    apply_flush(
+                        flush,
+                        &mut busy,
+                        &mut run_start,
+                        &mut activity,
+                        &mut thinking,
+                    );
                 }
             }
         }
@@ -1227,9 +1287,10 @@ fn ui_loop(
                 // busy. The border frame tracks the run: busy flips the whole
                 // frame to AGENT_FG so the bottom chrome reads as one busy
                 // unit, idle falls back to USER_FG.
-                let spinner_char = SPINNER
-                    [(run_start.map(|t| t.elapsed().as_millis() / 100).unwrap_or(0) as usize)
-                        % SPINNER.len()];
+                let spinner_char = SPINNER[(run_start
+                    .map(|t| t.elapsed().as_millis() / 100)
+                    .unwrap_or(0) as usize)
+                    % SPINNER.len()];
                 let (prompt, prompt_style) = (
                     "❯ ".to_string(),
                     Style::default().fg(USER_FG).add_modifier(Modifier::BOLD),
@@ -1442,8 +1503,7 @@ fn ui_loop(
                     }
                     // Alt/Shift+Enter inserts a newline (portable in raw mode;
                     // every terminal reports KeyModifiers::SHIFT truthfully).
-                    (KeyCode::Enter, KeyModifiers::ALT)
-                    | (KeyCode::Enter, KeyModifiers::SHIFT) => {
+                    (KeyCode::Enter, KeyModifiers::ALT) | (KeyCode::Enter, KeyModifiers::SHIFT) => {
                         input.newline();
                     }
                     // Enter sends (queues while busy). The input stays editable
@@ -1822,12 +1882,14 @@ fn build_history_lines(
                 // scroll redraws hit the cache; only the in-flight row
                 // (or a first render) re-parses markdown. The cache is keyed by
                 // (text, width), not row index — see MdCache docs for why.
-                let mut rendered = md_cache.get_or_render(t, markdown_width, |txt| {
-                    render_markdown(txt, markdown_width)
-                        .iter()
-                        .map(line_to_owned)
-                        .collect()
-                }).to_vec();
+                let mut rendered = md_cache
+                    .get_or_render(t, markdown_width, |txt| {
+                        render_markdown(txt, markdown_width)
+                            .iter()
+                            .map(line_to_owned)
+                            .collect()
+                    })
+                    .to_vec();
                 if rendered.is_empty() {
                     rendered.push(Line::default());
                 }
@@ -1842,10 +1904,8 @@ fn build_history_lines(
                 // Streaming cursor on the live assistant row.
                 if streaming && idx == rows.len() - 1 {
                     if let Some(last) = lines.last_mut() {
-                        last.spans.push(Span::styled(
-                            "▌".to_string(),
-                            Style::default().fg(AGENT_FG),
-                        ));
+                        last.spans
+                            .push(Span::styled("▌".to_string(), Style::default().fg(AGENT_FG)));
                     }
                 }
             }
@@ -1861,7 +1921,9 @@ fn build_history_lines(
                 let head = Line::from(vec![
                     Span::styled(
                         name_span.clone(),
-                        Style::default().fg(TOOL_CALL_FG).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(TOOL_CALL_FG)
+                            .add_modifier(Modifier::BOLD),
                     ),
                     if has_summary {
                         Span::styled(
@@ -1880,8 +1942,8 @@ fn build_history_lines(
                 // is meaningless); ansi_guided_lines is a pass-through here
                 // but keeps one uniform body path with ToolResult.
                 if *expanded {
-                    let body = serde_json::to_string_pretty(input)
-                        .unwrap_or_else(|_| input.to_string());
+                    let body =
+                        serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string());
                     let mut body = ansi_guided_lines(&body, Style::default().fg(DIM_FG));
                     indent_lines(&mut body, TOOL_INDENT);
                     lines.extend(body);
@@ -1908,7 +1970,10 @@ fn build_history_lines(
                 } else {
                     Style::default().fg(head_fg)
                 };
-                let dur = elapsed.as_deref().map(|e| format!(" · {e}")).unwrap_or_default();
+                let dur = elapsed
+                    .as_deref()
+                    .map(|e| format!(" · {e}"))
+                    .unwrap_or_default();
                 let name_span = format!("{marker}{tag} {name}{dur}");
                 let has_summary = !*expanded && !collapsed.is_empty();
                 let head = Line::from(vec![
@@ -1962,14 +2027,22 @@ fn build_history_lines(
                     Span::styled(it.next().unwrap_or("").to_string(), body_style),
                 ]));
                 for l in it {
-                    lines.push(Line::from(Span::styled(format!("{cont_pad}{l}"), body_style)));
+                    lines.push(Line::from(Span::styled(
+                        format!("{cont_pad}{l}"),
+                        body_style,
+                    )));
                 }
             }
         }
         // Turn boundary: a blank spacer separates this execution flow from the
         // next user message / queued ghost / system line.
         let next = rows.get(idx + 1);
-        if next.is_none() || matches!(next, Some(Row::User(_) | Row::Queued(_) | Row::System { .. })) {
+        if next.is_none()
+            || matches!(
+                next,
+                Some(Row::User(_) | Row::Queued(_) | Row::System { .. })
+            )
+        {
             lines.push(Line::default());
         }
     }
@@ -2028,9 +2101,9 @@ fn welcome_text(model: &str, n_tools: usize) -> String {
 /// call row exists (e.g. a resumed session whose calls predate the row list).
 fn tool_elapsed_for(rows: &[Row], name: &str) -> Option<String> {
     rows.iter().rev().find_map(|r| match r {
-        Row::ToolCall { name: n, started, .. } if n == name => {
-            Some(fmt_tool_elapsed(started.elapsed()))
-        }
+        Row::ToolCall {
+            name: n, started, ..
+        } if n == name => Some(fmt_tool_elapsed(started.elapsed())),
         _ => None,
     })
 }
@@ -2230,9 +2303,7 @@ fn wrap_history(lines: &[Line<'static>], width: usize) -> Vec<Line<'static>> {
 /// Render width for transcript text: the live viewport spans the terminal, so
 /// there is no horizontal inset, but prose is still capped at a readable max.
 fn content_width(term_w: u16) -> usize {
-    (term_w as usize)
-        .min(CONTENT_MAX_WIDTH as usize)
-        .max(1)
+    (term_w as usize).min(CONTENT_MAX_WIDTH as usize).max(1)
 }
 
 /// Render finalized rows to text and commit them into the terminal scrollback
@@ -2268,9 +2339,7 @@ fn commit_pending_end(rows: &[Row], committed: usize, stream_open: bool) -> usiz
         None => rows.len(),
     };
     // Hold back an in-flight trailing Assistant while its stream is open.
-    if stream_open
-        && pending_end > committed
-        && matches!(rows[pending_end - 1], Row::Assistant(_))
+    if stream_open && pending_end > committed && matches!(rows[pending_end - 1], Row::Assistant(_))
     {
         pending_end -= 1;
     }
@@ -2351,7 +2420,8 @@ fn render_zone_tail(f: &mut Frame, rect: Rect, lines: &[Line<'static>]) {
         // Fits: pad the top so the last line lands flush above the input box.
         let pad = (h - n) as u16;
         let body = if pad > 0 {
-            let [_, b] = Layout::vertical([Constraint::Length(pad), Constraint::Min(0)]).areas(rect);
+            let [_, b] =
+                Layout::vertical([Constraint::Length(pad), Constraint::Min(0)]).areas(rect);
             b
         } else {
             rect
@@ -2364,7 +2434,10 @@ fn render_zone_tail(f: &mut Frame, rect: Rect, lines: &[Line<'static>]) {
     // hidden count is what the tail CAN'T show.
     let hidden = n - (h - 1);
     let hint = Line::from(Span::styled(
-        format!("↑ +{hidden} line{} above", if hidden == 1 { "" } else { "s" }),
+        format!(
+            "↑ +{hidden} line{} above",
+            if hidden == 1 { "" } else { "s" }
+        ),
         Style::default().fg(DIM_FG).add_modifier(Modifier::ITALIC),
     ));
     let [hint_rect, tail_rect] =
@@ -2551,8 +2624,8 @@ fn wrap_line(src: &Line, width: usize) -> Vec<Line<'static>> {
     let mut rows: Vec<Line<'static>> = Vec::new();
     let mut row_start = 0usize; // cells index where the current row began
     let mut col = 0usize; // display width of [row_start, i)
-    // Index just past the most recent space — a valid break point as long as
-    // there's non-space content before it on this row.
+                          // Index just past the most recent space — a valid break point as long as
+                          // there's non-space content before it on this row.
     let mut last_space_after: Option<usize> = None;
 
     let mut i = 0usize;
@@ -2860,7 +2933,12 @@ fn ansi_guided_lines(text: &str, base_style: Style) -> Vec<Line<'static>> {
 fn ansi_plain(text: &str) -> String {
     ansi_to_lines(text)
         .iter()
-        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -3395,10 +3473,7 @@ mod tests {
 
     #[test]
     fn history_user_and_agent_use_inline_icons() {
-        let rows = vec![
-            Row::User("hello".into()),
-            Row::Assistant("world".into()),
-        ];
+        let rows = vec![Row::User("hello".into()), Row::Assistant("world".into())];
         let lines = history(&rows);
 
         // User: cyan-bold `❯ ` icon inline on the first body line — no
@@ -3407,7 +3482,10 @@ mod tests {
         let icon = lines[0].spans[0].style;
         assert_eq!(icon.fg, Some(USER_FG));
         assert!(icon.add_modifier.contains(Modifier::BOLD));
-        assert_eq!(lines[0].spans[1].style.fg, None, "user body must stay default fg");
+        assert_eq!(
+            lines[0].spans[1].style.fg, None,
+            "user body must stay default fg"
+        );
 
         // Assistant: green-bold `● ` icon the same way.
         assert_eq!(row_text(&lines[1]), "● world");
@@ -3548,7 +3626,10 @@ mod tests {
         assert_eq!(row_text(&lines[0]), "    · first");
         assert_eq!(row_text(&lines[1]), "      second");
         assert_eq!(row_text(&lines[2]), "      third");
-        assert!(!lines[1].spans[0].style.add_modifier.contains(Modifier::ITALIC));
+        assert!(!lines[1].spans[0]
+            .style
+            .add_modifier
+            .contains(Modifier::ITALIC));
         let lines = history(&[Row::sys_warn("w1\nw2")]);
         assert_eq!(row_text(&lines[0]), "· w1");
         assert_eq!(row_text(&lines[1]), "  w2");
@@ -3566,7 +3647,9 @@ mod tests {
         assert_eq!(row_text(&lines[1]), "● a");
         assert_eq!(row_text(&lines[2]), "");
         assert_eq!(row_text(&lines[3]), "❯ two");
-        assert!(lines.iter().all(|line| !row_text(line).contains(&"─".repeat(TEST_W))));
+        assert!(lines
+            .iter()
+            .all(|line| !row_text(line).contains(&"─".repeat(TEST_W))));
     }
 
     #[test]
@@ -3584,7 +3667,10 @@ mod tests {
             "no separator above the first User row"
         );
         // Welcome notice and user row are separated by whitespace, not a rule.
-        assert_eq!(row_text(&lines[0]), format!("    · {}", welcome_text("glm", 3)));
+        assert_eq!(
+            row_text(&lines[0]),
+            format!("    · {}", welcome_text("glm", 3))
+        );
         assert_eq!(row_text(&lines[2]), "❯ hi");
     }
 
@@ -3675,7 +3761,13 @@ mod tests {
     fn is_normal_stop_covers_both_provider_families() {
         // Anthropic: end_turn / tool_use / stop_sequence; OpenAI: stop /
         // tool_calls — none of these get a "[done: …]" row.
-        for normal in ["end_turn", "tool_use", "stop", "tool_calls", "stop_sequence"] {
+        for normal in [
+            "end_turn",
+            "tool_use",
+            "stop",
+            "tool_calls",
+            "stop_sequence",
+        ] {
             assert!(is_normal_stop(normal), "{normal} should be silent");
         }
         // Abnormal stops DO get a warn row.
@@ -3732,9 +3824,15 @@ mod tests {
         // Successes never auto-open, however short.
         assert!(!auto_expand_result(false, "one line"));
         // A short failure opens; the boundary is 20 lines inclusive.
-        let short = (1..=20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let short = (1..=20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(auto_expand_result(true, &short));
-        let long = (1..=21).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let long = (1..=21)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(!auto_expand_result(true, &long));
     }
 
@@ -3829,7 +3927,8 @@ mod tests {
         assert_eq!(wide.spans[3].style.fg, Some(TOOL_CALL_FG));
         assert_eq!(wide.spans[4].content.as_ref(), stats);
         // Tight: stats drop, ctx+plan remain (plan outlives stats).
-        let no_stats_w = " glm ".width() + "  idle".width() + " · ctx 21%".width() + " · plan 2/5".width();
+        let no_stats_w =
+            " glm ".width() + "  idle".width() + " · ctx 21%".width() + " · plan 2/5".width();
         let mid = build_status_line("glm", "idle", false, ctx, plan, stats, "", no_stats_w);
         assert_eq!(mid.spans.len(), 4);
         assert_eq!(mid.spans[3].content.as_ref(), " · plan 2/5");
@@ -3848,10 +3947,16 @@ mod tests {
         assert_eq!(seg.style.fg, Some(DIM_FG));
         // Under 12 columns left: no segment at all.
         assert!(right_path_seg("/tmp/proj", 11).is_none());
-        assert_eq!(right_path_seg("/tmp/proj", 12).map(|s| s.content.into_owned()).as_deref(), Some("   /tmp/proj"));
+        assert_eq!(
+            right_path_seg("/tmp/proj", 12)
+                .map(|s| s.content.into_owned())
+                .as_deref(),
+            Some("   /tmp/proj")
+        );
         // Too long for the budget: LEFT-truncated with a leading "…", the
         // project directory tail kept, still right-aligned.
-        let seg = right_path_seg("/Users/chenpu/workspace/claude-code/TinyAgent", 20).expect("truncated");
+        let seg =
+            right_path_seg("/Users/chenpu/workspace/claude-code/TinyAgent", 20).expect("truncated");
         assert_eq!(seg.content.as_ref(), "  …de-code/TinyAgent");
         assert_eq!(seg.content.width(), 20);
         // Even "…" + the basename exceeds the budget: nothing.
@@ -3906,14 +4011,21 @@ mod tests {
     fn slash_help_reply_is_a_multiline_list() {
         // Minimal config — the Help arm doesn't read it, but slash_reply's
         // signature needs one.
-        let cfg: Config = serde_json::from_str(
-            r#"{"provider":"anthropic","api_key_env":"K","model":"m"}"#,
-        )
-        .unwrap();
+        let cfg: Config =
+            serde_json::from_str(r#"{"provider":"anthropic","api_key_env":"K","model":"m"}"#)
+                .unwrap();
         let help = slash_reply(&SlashCmd::Help, &cfg);
-        assert!(help.lines().count() > 3, "help should be multiline: {help:?}");
-        for cmd in ["/clear", "/export", "/model", "/limits", "/tools", "/system", "/help"] {
-            assert!(help.lines().any(|l| l.contains(cmd)), "missing {cmd}: {help:?}");
+        assert!(
+            help.lines().count() > 3,
+            "help should be multiline: {help:?}"
+        );
+        for cmd in [
+            "/clear", "/export", "/model", "/limits", "/tools", "/system", "/help",
+        ] {
+            assert!(
+                help.lines().any(|l| l.contains(cmd)),
+                "missing {cmd}: {help:?}"
+            );
         }
         // Indented one-command-per-line layout.
         assert!(help.lines().any(|l| l.starts_with("  /export")));
@@ -4052,7 +4164,10 @@ mod tests {
             row_text(&lines[1]),
             "/export [path]  dump the transcript to a file (or clipboard)"
         );
-        assert_eq!(row_text(&lines[0]).trim_end(), "/clear  clear the conversation history");
+        assert_eq!(
+            row_text(&lines[0]).trim_end(),
+            "/clear  clear the conversation history"
+        );
         // The selected row (sel 0) is reversed and padded to the content
         // width; the others are neither.
         let content_w = lines.iter().map(|l| l.width()).max().unwrap();
@@ -4089,7 +4204,10 @@ mod tests {
                 "delta lost or merged into the interleaved tail row"
             );
             // The interleaved row kept its content.
-            assert!(matches!(&rows[1], Row::Queued(_) | Row::System { .. } | Row::ToolCall { .. }));
+            assert!(matches!(
+                &rows[1],
+                Row::Queued(_) | Row::System { .. } | Row::ToolCall { .. }
+            ));
         }
         // Normal case: tail IS the open Assistant bubble → merge.
         let mut rows = vec![Row::Assistant("a".into())];
@@ -4286,7 +4404,13 @@ mod tests {
         let out = flush_next_queued(&mut queued, &mut rows, &mut cache, &tx);
         assert_eq!(out, Flush::Undeliverable);
         assert!(rows.iter().any(|r| matches!(r, Row::User(t) if t == "q3")));
-        assert!(rows.iter().any(|r| matches!(r, Row::System { level: SysLevel::Error, .. })));
+        assert!(rows.iter().any(|r| matches!(
+            r,
+            Row::System {
+                level: SysLevel::Error,
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -4336,9 +4460,9 @@ mod tests {
         // following row are held back.
         let rows = vec![
             Row::User("u1".into()),      // 0 — committed
-            Row::Assistant("a1".into()),  // 1 — commits
-            Row::Queued("q".into()),      // 2 — cap here
-            Row::sys_warn("late warn"),   // 3 — held back
+            Row::Assistant("a1".into()), // 1 — commits
+            Row::Queued("q".into()),     // 2 — cap here
+            Row::sys_warn("late warn"),  // 3 — held back
         ];
         assert_eq!(commit_pending_end(&rows, 1, false), 2);
     }
@@ -4357,7 +4481,7 @@ mod tests {
         // streaming Assistant (last one), NOT the stale pre-ghost Assistant
         // that the commit watermark (capped at the first ghost) would point at.
         let rows = vec![
-            Row::User("u".into()),          // 0
+            Row::User("u".into()),           // 0
             Row::Assistant("turn 1".into()), // 1 — stale, pre-ghost
             Row::Queued("queued".into()),    // 2 — ghost
             Row::sys_warn("warn"),           // 3
@@ -4375,9 +4499,9 @@ mod tests {
         // User queues WHILE an Assistant streams: the ghost lands after it.
         // The streaming row is still the last Assistant.
         let rows = vec![
-            Row::User("u".into()),           // 0
+            Row::User("u".into()),              // 0
             Row::Assistant("streaming".into()), // 1
-            Row::Queued("next".into()),       // 2 — pushed during the stream
+            Row::Queued("next".into()),         // 2 — pushed during the stream
         ];
         assert_eq!(inflight_row_index(&rows, true), Some(1));
     }
@@ -4403,17 +4527,25 @@ mod tests {
         };
         let lines = history(&[call, result]);
         let texts: Vec<String> = lines.iter().map(row_text).collect();
-        assert!(texts.iter().any(|t| t.contains("\"cmd\": \"ls\"")), "pretty JSON: {texts:?}");
-        assert!(!texts.iter().any(|t| t.contains("summary")), "collapsed leaked: {texts:?}");
         assert!(
-            texts.iter().any(|t| t == "    │ line1")
-                && texts.iter().any(|t| t == "    │ line2")
+            texts.iter().any(|t| t.contains("\"cmd\": \"ls\"")),
+            "pretty JSON: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("summary")),
+            "collapsed leaked: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t == "    │ line1") && texts.iter().any(|t| t == "    │ line2")
         );
         // Every body line carries the role gutter followed by the guide span.
-        let guided = lines.iter().filter(|l| {
-            l.spans.get(1).is_some_and(|s| s.content.as_ref() == "│ ")
-        });
-        assert!(guided.count() >= 4, "expanded bodies must be guided: {texts:?}");
+        let guided = lines
+            .iter()
+            .filter(|l| l.spans.get(1).is_some_and(|s| s.content.as_ref() == "│ "));
+        assert!(
+            guided.count() >= 4,
+            "expanded bodies must be guided: {texts:?}"
+        );
     }
 
     #[test]
@@ -4422,7 +4554,10 @@ mod tests {
         // panic, leak the ``` line, or leave the tail without its border bar.
         let lines = render_markdown("intro\n\n```rust\nlet a = 1;\nlet b = 2;", 40);
         let texts: Vec<String> = lines.iter().map(row_text).collect();
-        assert!(!texts.iter().any(|t| t.contains("```")), "fence leaked: {texts:?}");
+        assert!(
+            !texts.iter().any(|t| t.contains("```")),
+            "fence leaked: {texts:?}"
+        );
         for l in lines.iter().filter(|l| row_text(l).starts_with("▎ let ")) {
             assert_eq!(l.spans[0].style.fg, Some(DIM_FG));
             assert!(
@@ -4464,7 +4599,11 @@ mod tests {
         // Header: a single bold span, markers stripped, just the title.
         let hdr = lines
             .iter()
-            .find(|l| l.spans.first().is_some_and(|s| s.style.add_modifier.contains(Modifier::BOLD)))
+            .find(|l| {
+                l.spans
+                    .first()
+                    .is_some_and(|s| s.style.add_modifier.contains(Modifier::BOLD))
+            })
             .expect("a bold header line");
         assert_eq!(hdr.spans.len(), 1);
         let ht = hdr.spans[0].content.as_ref();
@@ -4605,7 +4744,11 @@ mod tests {
         b.set_text("中\na"); // ["中"(3B), "a"(1B)]; cursor at end of "a": row1 col1
         b.move_up(); // -> row0; col 1 would be inside '中' (bytes 0..3)
         assert_eq!(b.row, 0);
-        assert!(b.col == 0 || b.col == 3, "col {} not a boundary of '中'", b.col);
+        assert!(
+            b.col == 0 || b.col == 3,
+            "col {} not a boundary of '中'",
+            b.col
+        );
         let _ = b.cursor_pos(); // slices lines[row][..col]; must not panic
 
         // Reverse direction: cursor after 'a' (col1) on a 1-byte line, moving
@@ -4617,7 +4760,11 @@ mod tests {
         b.end(); // row0 col1 (after 'a')
         b.move_down(); // -> row1; col 1 inside '中'
         assert_eq!(b.row, 1);
-        assert!(b.col == 0 || b.col == 3, "col {} not a boundary of '中'", b.col);
+        assert!(
+            b.col == 0 || b.col == 3,
+            "col {} not a boundary of '中'",
+            b.col
+        );
         let _ = b.cursor_pos(); // must not panic
     }
 
@@ -4652,27 +4799,39 @@ mod tests {
         assert_eq!(classify("/help"), SlashCmd::Help);
         assert_eq!(classify("/quit"), SlashCmd::Quit);
         assert_eq!(classify("/exit"), SlashCmd::Quit); // alias
-        // Case-sensitive: /Model is not /model.
+                                                       // Case-sensitive: /Model is not /model.
         assert_eq!(classify("/Model"), SlashCmd::Unknown("Model".into()));
         assert_eq!(classify("/foo"), SlashCmd::Unknown("foo".into()));
         // Bare "/" → unknown with empty name (not a message, not a command).
         assert_eq!(classify("/"), SlashCmd::Unknown(String::new()));
         // /export takes an optional path arg, split off + trimmed.
         assert_eq!(classify("/export"), SlashCmd::Export(None));
-        assert_eq!(classify("/export out.md"), SlashCmd::Export(Some("out.md".into())));
-        assert_eq!(classify("/export   a/b.txt  "), SlashCmd::Export(Some("a/b.txt".into())));
+        assert_eq!(
+            classify("/export out.md"),
+            SlashCmd::Export(Some("out.md".into()))
+        );
+        assert_eq!(
+            classify("/export   a/b.txt  "),
+            SlashCmd::Export(Some("a/b.txt".into()))
+        );
         // /export with only trailing spaces → no arg.
         assert_eq!(classify("/export "), SlashCmd::Export(None));
         // No-arg commands reject a trailing arg (only /export takes one):
         // `/model foo` is a typo, not a silently-ignored /model.
-        assert_eq!(classify("/model foo"), SlashCmd::Unknown("model foo".into()));
+        assert_eq!(
+            classify("/model foo"),
+            SlashCmd::Unknown("model foo".into())
+        );
         assert_eq!(classify("/clear x"), SlashCmd::Unknown("clear x".into()));
     }
 
     #[test]
     fn expand_tilde_resolves_home() {
         let home = std::ffi::OsStr::new("/Users/x");
-        assert_eq!(expand_tilde_with("~/notes.md", Some(home)), "/Users/x/notes.md");
+        assert_eq!(
+            expand_tilde_with("~/notes.md", Some(home)),
+            "/Users/x/notes.md"
+        );
         assert_eq!(expand_tilde_with("~", Some(home)), "/Users/x");
         // No leading tilde → passthrough unchanged.
         assert_eq!(expand_tilde_with("foo/bar", Some(home)), "foo/bar");
@@ -4726,7 +4885,10 @@ mod tests {
         assert!(!out.contains("Tiny\n\n"), "empty assistant must be skipped");
         assert!(out.contains("→ shell: null"), "tool call: {out:?}");
         assert!(out.contains("✓ shell: a.txt"), "tool result: {out:?}");
-        assert!(out.contains("✗ shell: boom"), "error result tagged: {out:?}");
+        assert!(
+            out.contains("✗ shell: boom"),
+            "error result tagged: {out:?}"
+        );
         assert!(out.contains("· [note]"), "system row: {out:?}");
     }
 
@@ -4899,7 +5061,11 @@ mod tests {
         assert_eq!(row, "pqrst ", "scrolled window: {row:?}");
         // The drawn cursor stays within the box's inner area.
         let pos = term.backend_mut().get_cursor_position().unwrap();
-        assert!(pos.x >= 1 && pos.x <= 6, "cursor x {} outside inner area", pos.x);
+        assert!(
+            pos.x >= 1 && pos.x <= 6,
+            "cursor x {} outside inner area",
+            pos.x
+        );
     }
 
     #[test]
@@ -4981,7 +5147,12 @@ mod tests {
         // (possibly borrowed) content into owned Strings.
         use ratatui::layout::Alignment;
         let src = Line::from(vec![
-            Span::styled("hello", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "hello",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" world"),
         ])
         .alignment(Alignment::Center);
@@ -5012,15 +5183,15 @@ mod tests {
         // (cyan bold header, bullet swap, inline-code span).
         let md = "## 标题\n\n- 项目 `代码` more\n";
         let borrowed: Vec<Line> = render_markdown(md, 40);
-        let owned: Vec<Line<'static>> =
-            render_markdown(md, 40).iter().map(line_to_owned).collect();
+        let owned: Vec<Line<'static>> = render_markdown(md, 40).iter().map(line_to_owned).collect();
 
         // Wide enough that the content isn't wrapped (we're comparing caches,
         // not wrapping). Render both into equal buffers and flatten cells.
         let area = Rect::new(0, 0, 40, 5);
         let cells_of = |lines: Vec<Line>| -> String {
             let mut term = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
-            term.draw(|f| f.render_widget(Paragraph::new(lines), area)).unwrap();
+            term.draw(|f| f.render_widget(Paragraph::new(lines), area))
+                .unwrap();
             let buf = term.backend().buffer();
             (0..area.height)
                 .map(|y| {
@@ -5042,7 +5213,10 @@ mod tests {
         // glyph rather than the contiguous "标题" substring.
         let rendered = cells_of(borrowed);
         assert!(rendered.contains("more"), "list text missing: {rendered:?}");
-        assert!(rendered.contains('标'), "CJK header glyph missing: {rendered:?}");
+        assert!(
+            rendered.contains('标'),
+            "CJK header glyph missing: {rendered:?}"
+        );
     }
 
     #[test]
@@ -5068,17 +5242,35 @@ mod tests {
         // Fits (1 line in a 3-row zone): bottom-aligned — the top two rows blank.
         let out = rows_of(vec![Line::from("only")], 3);
         assert_eq!(out.len(), 3);
-        assert!(out[0].trim().is_empty(), "top must be blank (bottom-align): {out:?}");
+        assert!(
+            out[0].trim().is_empty(),
+            "top must be blank (bottom-align): {out:?}"
+        );
         assert!(out[1].trim().is_empty(), "middle must be blank: {out:?}");
-        assert!(out[2].trim_start().starts_with("only"), "content on the bottom row: {out:?}");
+        assert!(
+            out[2].trim_start().starts_with("only"),
+            "content on the bottom row: {out:?}"
+        );
         // Overflow (5 lines in a 3-row zone): the hint takes one row, leaving 2
         // for the tail — so 3 of 5 lines are hidden. Row 0 = hint, rows 1-2 = tail.
         let many: Vec<Line<'static>> = (0..5u32).map(|i| Line::from(format!("line{i}"))).collect();
         let out = rows_of(many, 3);
-        assert!(out[0].contains('↑'), "overflow must show the truncation hint: {out:?}");
-        assert!(out[0].contains("+3"), "hint must name the hidden count (3): {out:?}");
-        assert!(out[1].trim_start().starts_with("line3"), "tail row 1 wrong: {out:?}");
-        assert!(out[2].trim_start().starts_with("line4"), "tail must end on the last line: {out:?}");
+        assert!(
+            out[0].contains('↑'),
+            "overflow must show the truncation hint: {out:?}"
+        );
+        assert!(
+            out[0].contains("+3"),
+            "hint must name the hidden count (3): {out:?}"
+        );
+        assert!(
+            out[1].trim_start().starts_with("line3"),
+            "tail row 1 wrong: {out:?}"
+        );
+        assert!(
+            out[2].trim_start().starts_with("line4"),
+            "tail must end on the last line: {out:?}"
+        );
     }
 
     #[test]

@@ -36,7 +36,11 @@ const MCP_EVENT_MAX: usize = 4 * MCP_LINE_MAX;
 /// `max_bytes`. Reads in `fill_buf` chunks (not byte-by-byte) and accumulates
 /// raw bytes, validating UTF-8 only at the call site — so a multi-byte char
 /// split across reads isn't misdecoded mid-accumulation.
-fn read_capped_line<R: BufRead>(reader: &mut R, buf: &mut Vec<u8>, max_bytes: usize) -> Result<usize> {
+fn read_capped_line<R: BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max_bytes: usize,
+) -> Result<usize> {
     loop {
         // fill_buf borrows `reader`; consume (also mut) can't run while that
         // borrow is live. Compute + copy under the borrow, then consume after.
@@ -228,7 +232,11 @@ fn pending_new() -> Pending {
 
 fn pending_dispatch(pending: &Pending, msg: Value) {
     if let Some(id) = msg.get("id").and_then(|v| v.as_u64()) {
-        if let Some(tx) = pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&id) {
+        if let Some(tx) = pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id)
+        {
             let _ = tx.send(msg);
         }
     }
@@ -243,7 +251,10 @@ fn pending_fail_all(pending: &Pending, detail: &str) {
     let message = if detail.trim().is_empty() {
         "MCP server closed the connection".to_string()
     } else {
-        format!("MCP server closed the connection; its stderr: {}", detail.trim())
+        format!(
+            "MCP server closed the connection; its stderr: {}",
+            detail.trim()
+        )
     };
     for (_, tx) in map.drain() {
         let _ = tx.send(json!({
@@ -351,7 +362,7 @@ impl StdioTransport {
                 loop {
                     buf.clear();
                     match read_capped_line(&mut reader, &mut buf, MCP_LINE_MAX) {
-                        Ok(0) => break,            // EOF
+                        Ok(0) => break, // EOF
                         Ok(_) => {
                             // Validate UTF-8 + parse here (the capped reader
                             // accumulates raw bytes); an unparseable line is
@@ -423,12 +434,16 @@ fn spawn_reaper(
 impl Transport for StdioTransport {
     fn request(&mut self, id: u64, method: &str, params: Value) -> Result<Value> {
         let (tx, rx) = mpsc::channel();
-        self.pending.lock().unwrap_or_else(|e| e.into_inner()).insert(id, tx);
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, tx);
         // Reclaim the pending slot on any failure (write error or timeout):
         // otherwise a flaky server that times out on every call leaks one
         // map entry per call and grows without bound over a long session.
         let res = (|| -> Result<Value> {
-            self.stdin.write_all(frame(id, method, params).to_string().as_bytes())?;
+            self.stdin
+                .write_all(frame(id, method, params).to_string().as_bytes())?;
             self.stdin.write_all(b"\n")?;
             self.stdin.flush()?;
             let msg = rx
@@ -437,7 +452,10 @@ impl Transport for StdioTransport {
             extract_result(msg, method)
         })();
         if res.is_err() {
-            self.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+            self.pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id);
         }
         res
     }
@@ -636,9 +654,7 @@ impl SseTransport {
                     .build()
                     .expect("reqwest client build")
             });
-        let mut req = client
-            .get(url)
-            .header("accept", "text/event-stream");
+        let mut req = client.get(url).header("accept", "text/event-stream");
         for (k, v) in &cfg.headers {
             req = req.header(k, v);
         }
@@ -727,7 +743,8 @@ impl SseTransport {
                         "[warn] MCP SSE: reader thread detached (server at {url} never \
                          sent an 'endpoint' event; the stuck GET exits at process exit)"
                     );
-                }                anyhow!("MCP SSE: no 'endpoint' event from {url}: {e}")
+                }
+                anyhow!("MCP SSE: no 'endpoint' event from {url}: {e}")
             })?
             .ok_or_else(|| anyhow!("MCP SSE endpoint rejected (origin mismatch)"))?;
         Ok(Self {
@@ -761,7 +778,10 @@ impl SseTransport {
 impl Transport for SseTransport {
     fn request(&mut self, id: u64, method: &str, params: Value) -> Result<Value> {
         let (tx, rx) = mpsc::channel();
-        self.pending.lock().unwrap_or_else(|e| e.into_inner()).insert(id, tx);
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, tx);
         let res = (|| -> Result<Value> {
             self.post(&frame(id, method, params))?;
             let msg = rx
@@ -770,7 +790,10 @@ impl Transport for SseTransport {
             extract_result(msg, method)
         })();
         if res.is_err() {
-            self.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+            self.pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id);
         }
         res
     }
@@ -807,7 +830,10 @@ impl Drop for SseTransport {
 /// total aggregated `data:` payload (each line is separately capped by
 /// `read_capped_line`); pluggable so a test can exercise the bound without
 /// allocating `MCP_EVENT_MAX` bytes.
-fn read_sse_event<R: BufRead>(reader: &mut R, event_max: usize) -> Result<Option<(String, String)>> {
+fn read_sse_event<R: BufRead>(
+    reader: &mut R,
+    event_max: usize,
+) -> Result<Option<(String, String)>> {
     let mut event = String::from("message");
     let mut data = String::new();
     let mut line: Vec<u8> = Vec::new();
@@ -817,9 +843,15 @@ fn read_sse_event<R: BufRead>(reader: &mut R, event_max: usize) -> Result<Option
         if n == 0 {
             // Flush a buffered event even if the stream ended without a
             // trailing blank line, or the last message is silently lost.
-            return Ok(if data.is_empty() { None } else { Some((event, data)) });
+            return Ok(if data.is_empty() {
+                None
+            } else {
+                Some((event, data))
+            });
         }
-        let Ok(s) = std::str::from_utf8(&line) else { continue };
+        let Ok(s) = std::str::from_utf8(&line) else {
+            continue;
+        };
         let t = s.trim_end_matches(['\r', '\n']);
         if t.is_empty() {
             if !data.is_empty() {
@@ -946,7 +978,7 @@ mod tests {
         });
         assert!(died, "reaper did not kill the child within ~2s of shutdown");
         let _ = child.wait(); // reap to avoid a zombie
-        // The reaper returned right after the kill; joining must not block.
+                              // The reaper returned right after the kill; joining must not block.
         let _ = reaper.join();
     }
 
@@ -986,10 +1018,14 @@ mod tests {
 
     #[test]
     fn sse_event_parsing() {
-        let raw = b"event: endpoint\ndata: /messages?session=abc\n\nevent: message\ndata: {\"id\":1}\n\n";
+        let raw =
+            b"event: endpoint\ndata: /messages?session=abc\n\nevent: message\ndata: {\"id\":1}\n\n";
         let mut r = BufReader::new(&raw[..]);
         let (e1, d1) = read_sse_event(&mut r, MCP_EVENT_MAX).unwrap().unwrap();
-        assert_eq!((e1.as_str(), d1.as_str()), ("endpoint", "/messages?session=abc"));
+        assert_eq!(
+            (e1.as_str(), d1.as_str()),
+            ("endpoint", "/messages?session=abc")
+        );
         let (e2, d2) = read_sse_event(&mut r, MCP_EVENT_MAX).unwrap().unwrap();
         assert_eq!((e2.as_str(), d2.as_str()), ("message", "{\"id\":1}"));
         assert!(read_sse_event(&mut r, MCP_EVENT_MAX).unwrap().is_none());

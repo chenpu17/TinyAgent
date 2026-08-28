@@ -170,11 +170,9 @@ pub(crate) fn run_with_retries(
                     // and would proceed — making the first Ctrl-C look like a
                     // no-op (only the second SIGINT force-exits) — so honor it
                     // here instead of falling through to the next attempt.
-                    if crate::retry::sleep_cancelable_with(
-                        backoff,
-                        &mut sleep,
-                        || agent.cancelled(),
-                    ) {
+                    if crate::retry::sleep_cancelable_with(backoff, &mut sleep, || {
+                        agent.cancelled()
+                    }) {
                         break (
                             EXIT_CANCELLED,
                             None,
@@ -658,7 +656,11 @@ impl<Out: Write, Err: Write> HumanRenderer<Out, Err> {
                 is_error,
                 content,
             } => {
-                let tag = if *is_error { "[tool ✗]" } else { "[tool ✓]" };
+                let tag = if *is_error {
+                    "[tool ✗]"
+                } else {
+                    "[tool ✓]"
+                };
                 // A streamed sub-agent TextDelta can leave stdout mid-line (no
                 // trailing newline); ensure the tool-result row starts fresh so
                 // it never sticks to the child's last line. No-op when already
@@ -715,7 +717,10 @@ impl<Out: Write, Err: Write> HumanRenderer<Out, Err> {
                 } else {
                     String::new()
                 };
-                let _ = writeln!(self.err, "[tokens: {input_tokens}↑ {output_tokens}↓{cache}]");
+                let _ = writeln!(
+                    self.err,
+                    "[tokens: {input_tokens}↑ {output_tokens}↓{cache}]"
+                );
             }
             AgentEvent::TodoUpdate { todos } => {
                 // Plan progress → stderr only (stdout carries the transcript /
@@ -772,8 +777,16 @@ impl<Out: Write, Err: Write> HumanRenderer<Out, Err> {
                         is_error,
                         content,
                     } => {
-                        let tag = if *is_error { "[tool ✗]" } else { "[tool ✓]" };
-                        let _ = writeln!(self.out, "[{name}] {tag} {tn}: {}", crate::agent::preview(content));
+                        let tag = if *is_error {
+                            "[tool ✗]"
+                        } else {
+                            "[tool ✓]"
+                        };
+                        let _ = writeln!(
+                            self.out,
+                            "[{name}] {tag} {tn}: {}",
+                            crate::agent::preview(content)
+                        );
                         self.at_line_start = true;
                         self.current_sub_name = None;
                     }
@@ -846,7 +859,10 @@ mod tests {
             mode & 0o111 != 0,
             "executable bit lost after atomic_write: mode {mode:o}"
         );
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "#!/bin/sh\necho new\n");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "#!/bin/sh\necho new\n"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -875,7 +891,10 @@ mod tests {
         let path = dir.join("out.json");
         write_result(&path, Some(&o), None, 1, "error", None, &meta()).unwrap();
         let s = std::fs::read_to_string(&path).unwrap();
-        assert!(s.contains("\"output\"") && s.contains("hello world"), "tool output missing");
+        assert!(
+            s.contains("\"output\"") && s.contains("hello world"),
+            "tool output missing"
+        );
         assert!(
             s.contains("\"input_tokens\"") && s.contains("\"output_tokens\""),
             "token totals missing"
@@ -885,7 +904,16 @@ mod tests {
         // Failure path: agent.run returned Err — still write a result artifact
         // (this is the gap the old `?`-skips-write_result had).
         let epath = dir.join("err.json");
-        write_result(&epath, None, Some("provider 503"), 1, "error", None, &meta()).unwrap();
+        write_result(
+            &epath,
+            None,
+            Some("provider 503"),
+            1,
+            "error",
+            None,
+            &meta(),
+        )
+        .unwrap();
         let es = std::fs::read_to_string(&epath).unwrap();
         assert!(es.contains("\"success\": false"));
         assert!(es.contains("provider 503"));
@@ -899,7 +927,8 @@ mod tests {
         // bill you can't attribute to a model/provider/time isn't auditable.
         // Both branches must carry them. (`line!()` keeps the temp dir unique
         // against the OTHER tests sharing this prefix pattern.)
-        let dir = std::env::temp_dir().join(format!("ta-attrib-{}-{}", line!(), std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("ta-attrib-{}-{}", line!(), std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let keys = |s: &str| {
             for k in [
@@ -994,8 +1023,7 @@ mod tests {
         };
         let path = dir.join("plan.json");
         write_result(&path, Some(&with_plan), None, 1, "error", None, &meta()).unwrap();
-        let parsed: Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let parsed: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let obj = parsed.as_object().expect("result is a JSON object");
         assert!(obj.contains_key("plan"), "plan key present when todo used");
         assert_eq!(parsed["plan"][0]["status"], "completed");
@@ -1021,8 +1049,7 @@ mod tests {
         };
         let np = dir.join("noplan.json");
         write_result(&np, Some(&without_plan), None, 1, "error", None, &meta()).unwrap();
-        let nparsed: Value =
-            serde_json::from_str(&std::fs::read_to_string(&np).unwrap()).unwrap();
+        let nparsed: Value = serde_json::from_str(&std::fs::read_to_string(&np).unwrap()).unwrap();
         assert!(
             !nparsed.as_object().unwrap().contains_key("plan"),
             "plan key absent when no todo used"
@@ -1047,7 +1074,9 @@ mod tests {
                     input: json!({"name":"scout","prompt":"x"}),
                     output: "summary".into(),
                     is_error: false,
-                    meta: Some(json!({"turns":2,"tools":{"shell":1},"tokens":{"in":50,"out":5},"stop_reason":"end_turn"})),
+                    meta: Some(
+                        json!({"turns":2,"tools":{"shell":1},"tokens":{"in":50,"out":5},"stop_reason":"end_turn"}),
+                    ),
                 },
                 ToolCallRecord {
                     name: "shell".into(),
@@ -1065,8 +1094,7 @@ mod tests {
         };
         let path = dir.join("meta.json");
         write_result(&path, Some(&o), None, 1, "error", None, &meta()).unwrap();
-        let parsed: Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let parsed: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         // The task entry carries its trace meta.
         assert_eq!(parsed["tool_calls"][0]["name"], "task");
         assert_eq!(parsed["tool_calls"][0]["meta"]["turns"], 2);
@@ -1111,9 +1139,17 @@ mod tests {
             elapsed: std::time::Duration::from_secs(12),
         };
         let path = dir.join("fail.json");
-        write_result(&path, None, Some("provider 503"), 2, "error", Some(&acc), &meta()).unwrap();
-        let parsed: Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        write_result(
+            &path,
+            None,
+            Some("provider 503"),
+            2,
+            "error",
+            Some(&acc),
+            &meta(),
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         // Failure semantics.
         assert_eq!(parsed["success"], false);
         assert_eq!(parsed["stop_reason"], "error");
@@ -1137,7 +1173,16 @@ mod tests {
         // No accumulated cost (e.g. a setup error before any turn) ⇒ zeros,
         // never missing keys (schema stays stable for CI consumers).
         let zpath = dir.join("zero.json");
-        write_result(&zpath, None, Some("setup failed"), 1, "error", None, &meta()).unwrap();
+        write_result(
+            &zpath,
+            None,
+            Some("setup failed"),
+            1,
+            "error",
+            None,
+            &meta(),
+        )
+        .unwrap();
         let zparsed: Value =
             serde_json::from_str(&std::fs::read_to_string(&zpath).unwrap()).unwrap();
         assert_eq!(zparsed["input_tokens"], 0);
@@ -1244,8 +1289,14 @@ mod tests {
         // consumer can render the checklist from any single event.
         let v = event_json(&AgentEvent::TodoUpdate {
             todos: vec![
-                TodoItem { subject: "a".into(), status: "completed".into() },
-                TodoItem { subject: "b".into(), status: "in_progress".into() },
+                TodoItem {
+                    subject: "a".into(),
+                    status: "completed".into(),
+                },
+                TodoItem {
+                    subject: "b".into(),
+                    status: "in_progress".into(),
+                },
             ],
         });
         assert_eq!(v["type"], "todo");
@@ -1290,8 +1341,7 @@ mod tests {
 
     #[test]
     fn atomic_write_creates_missing_parent_dirs() {
-        let base =
-            std::env::temp_dir().join(format!("ta-atomic-parent-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("ta-atomic-parent-{}", std::process::id()));
         std::fs::remove_dir_all(&base).ok();
         // Neither `a/b` nor `a` exists — atomic_write must mkdir -p them (the
         // create_dir_all branch the basic test skips by pre-making the dir).
@@ -1322,8 +1372,7 @@ mod tests {
         // Parse back and assert by field name — a typo in the cache_* names
         // would silently drop cache cost from downstream accounting, and
         // substring checks couple to pretty-print spacing.
-        let parsed: Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let parsed: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(parsed["cache_creation_input_tokens"], 800);
         assert_eq!(parsed["cache_read_input_tokens"], 200);
         assert_eq!(parsed["attempts"], 3);
@@ -1433,7 +1482,13 @@ mod tests {
             1,
             "tag should print once per contiguous run, not per chunk: {out_s}"
         );
-        assert!(out_s.contains("[scout] Hello"), "scout's chunks should join: {out_s}");
-        assert!(out_s.contains("[worker] x"), "second agent on its own tagged line: {out_s}");
+        assert!(
+            out_s.contains("[scout] Hello"),
+            "scout's chunks should join: {out_s}"
+        );
+        assert!(
+            out_s.contains("[worker] x"),
+            "second agent on its own tagged line: {out_s}"
+        );
     }
 }

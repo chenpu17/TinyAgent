@@ -164,12 +164,24 @@ impl Tool for SubAgent {
         // (the old path called tools::mcp::build, running McpClient::start for
         // every server on every task call — a parallel task batch would spawn
         // N×(#servers) subprocesses).
-        let mut child_tools = child_tools(&child_cfg, &self.client, &self.api_key, &self.mcp_tools)?;
-        child_tools.extend(self.mcp_tools.iter().cloned().map(|t| Box::new(t) as Box<dyn Tool>));
+        let mut child_tools =
+            child_tools(&child_cfg, &self.client, &self.api_key, &self.mcp_tools)?;
+        child_tools.extend(
+            self.mcp_tools
+                .iter()
+                .cloned()
+                .map(|t| Box::new(t) as Box<dyn Tool>),
+        );
 
         let provider = provider::build(&child_cfg, &self.api_key, self.client.clone());
         let initial = vec![Message::user(vec![Block::Text(prompt.to_string())])];
-        let mut child = Agent::new(&child_cfg, provider, child_tools, initial, child_ctx(ctx, name));
+        let mut child = Agent::new(
+            &child_cfg,
+            provider,
+            child_tools,
+            initial,
+            child_ctx(ctx, name),
+        );
         if let Some(flag) = ctx.cancel.clone() {
             child.set_cancel(flag);
         }
@@ -302,7 +314,10 @@ fn outcome_to_output(o: &RunOutcome, name: &str, max_output_chars: usize) -> Too
     let mut content = if o.stop_reason == "end_turn" {
         o.final_text.clone()
     } else {
-        format!("[subagent {name} ended: {}]\n{}", o.stop_reason, o.final_text)
+        format!(
+            "[subagent {name} ended: {}]\n{}",
+            o.stop_reason, o.final_text
+        )
     };
     // Cap the summary to the parent's output budget: a child that ignores the
     // "concise summary" instruction and dumps its whole transcript would
@@ -332,7 +347,12 @@ fn outcome_to_output(o: &RunOutcome, name: &str, max_output_chars: usize) -> Too
 /// sums every input-facing axis (uncached input + cache write + cache read) so
 /// one number reflects how much the child read, while the exact cache split is
 /// already folded into the parent run's top-level totals.
-fn trace_meta(turns: u32, tool_calls: &[ToolCallRecord], usage: &Usage, stop_reason: &str) -> Value {
+fn trace_meta(
+    turns: u32,
+    tool_calls: &[ToolCallRecord],
+    usage: &Usage,
+    stop_reason: &str,
+) -> Value {
     let mut tools = serde_json::Map::new();
     for c in tool_calls {
         if let Some(n) = tools.get_mut(&c.name) {
@@ -448,7 +468,9 @@ mod tests {
         let out = run_subagent(&mut agent, "scout", &mut |_| {}, usize::MAX);
         assert!(out.is_error);
         assert!(out.content.contains("provider blew up"));
-        let u = out.usage.expect("failed sub-agent still bills completed turns");
+        let u = out
+            .usage
+            .expect("failed sub-agent still bills completed turns");
         assert_eq!(u.input_tokens, 100);
         assert_eq!(u.output_tokens, 5);
     }
@@ -507,7 +529,10 @@ mod tests {
         assert_eq!(clamp_child_timeout(0, None), 0);
         // Parent deadline far away → the child's own (tighter) value wins:
         // tighten-only, never loosen.
-        assert_eq!(clamp_child_timeout(1, Some(now + Duration::from_secs(10))), 1);
+        assert_eq!(
+            clamp_child_timeout(1, Some(now + Duration::from_secs(10))),
+            1
+        );
         // Parent nearly out of time → clamped to the remainder (the instant
         // elapsed between capture and the call shaves the fraction, so accept
         // 2..=3 for a 3s margin).
@@ -515,7 +540,10 @@ mod tests {
         assert!((2..=3).contains(&clamped), "clamped to ~3s, got {clamped}");
         // Deadline already past → floored at 1s (0 would mean "no timeout",
         // a loosening; and <1s cannot fit a chat).
-        assert_eq!(clamp_child_timeout(10, Some(now - Duration::from_secs(1))), 1);
+        assert_eq!(
+            clamp_child_timeout(10, Some(now - Duration::from_secs(1))),
+            1
+        );
         // Child "unlimited" (0) under a bounded parent → the remaining time,
         // not unlimited.
         let unlimited = clamp_child_timeout(0, Some(now + Duration::from_secs(4)));
@@ -529,17 +557,28 @@ mod tests {
         // sub-agents interleave; the name disambiguates them).
         let mut agent = mock_agent(vec![mock::resp_text("hi", mock::mk_usage(1, 1))]);
         let mut seen: Vec<(String, String)> = Vec::new();
-        run_subagent(&mut agent, "worker-7", &mut |ev| {
-            if let AgentEvent::SubAgent { name, event } = ev {
-                match *event {
-                    AgentEvent::TextDelta(t) => seen.push((name.clone(), t)),
-                    AgentEvent::TurnStart(n) => seen.push((name.clone(), format!("turn{n}"))),
-                    _ => {}
+        run_subagent(
+            &mut agent,
+            "worker-7",
+            &mut |ev| {
+                if let AgentEvent::SubAgent { name, event } = ev {
+                    match *event {
+                        AgentEvent::TextDelta(t) => seen.push((name.clone(), t)),
+                        AgentEvent::TurnStart(n) => seen.push((name.clone(), format!("turn{n}"))),
+                        _ => {}
+                    }
                 }
-            }
-        }, usize::MAX);
-        assert!(seen.iter().all(|(n, _)| n == "worker-7"), "every event tagged: {seen:?}");
-        assert!(seen.iter().any(|(_, t)| t == "hi"), "child text forwarded: {seen:?}");
+            },
+            usize::MAX,
+        );
+        assert!(
+            seen.iter().all(|(n, _)| n == "worker-7"),
+            "every event tagged: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|(_, t)| t == "hi"),
+            "child text forwarded: {seen:?}"
+        );
     }
 
     #[test]
@@ -626,7 +665,10 @@ mod tests {
         assert!(out.is_error);
         let meta = out.meta.expect("trace meta on failure too");
         assert_eq!(meta["stop_reason"], "error");
-        assert!(meta["turns"].as_u64().unwrap_or(0) >= 1, "counted the turn that ran");
+        assert!(
+            meta["turns"].as_u64().unwrap_or(0) >= 1,
+            "counted the turn that ran"
+        );
     }
 
     #[test]
@@ -647,7 +689,9 @@ mod tests {
         };
         let out = outcome_to_output(&o, "scout", usize::MAX);
         assert!(!out.is_error, "short stop must not be is_error");
-        assert!(out.content.starts_with("[subagent scout ended: max_turns_reached]"));
+        assert!(out
+            .content
+            .starts_with("[subagent scout ended: max_turns_reached]"));
         assert!(out.content.contains("partial"));
     }
 
@@ -684,7 +728,12 @@ mod tests {
     fn subagent_tool_rejects_missing_or_empty_name_and_prompt() {
         // Validate before building anything: a missing/empty name or prompt is a
         // caller bug, not a sub-agent run to attempt.
-        let sa = SubAgent::new(fake_cfg(), reqwest::blocking::Client::new(), "k".into(), vec![]);
+        let sa = SubAgent::new(
+            fake_cfg(),
+            reqwest::blocking::Client::new(),
+            "k".into(),
+            vec![],
+        );
         let ctx = ToolCtx {
             workdir: std::env::temp_dir(),
             max_output_chars: 1000,
@@ -706,7 +755,10 @@ mod tests {
         let err = sa
             .run_with_emit(&json!({"name": "x", "prompt": "   "}), &ctx, &mut emit)
             .unwrap_err();
-        assert!(format!("{err:#}").contains("prompt"), "empty prompt: {err:#}");
+        assert!(
+            format!("{err:#}").contains("prompt"),
+            "empty prompt: {err:#}"
+        );
     }
 
     #[test]
@@ -741,8 +793,7 @@ mod tests {
         // fleet-limit channels: the budget counter is Arc-SHARED (the child's
         // gate reads the same spend the parent and siblings write) and the
         // run deadline passes through (the child clamps its timeout to it).
-        let hooks: std::sync::Arc<dyn crate::hooks::Hooks> =
-            std::sync::Arc::new(NoopHooks);
+        let hooks: std::sync::Arc<dyn crate::hooks::Hooks> = std::sync::Arc::new(NoopHooks);
         let deadline = std::time::Instant::now();
         let parent = ToolCtx {
             workdir: std::env::temp_dir(),
@@ -752,9 +803,7 @@ mod tests {
             shell_timeout_secs: 77,
             hooks: Some(hooks.clone()),
             subagent: None,
-            budget: Some(std::sync::Arc::new(
-                std::sync::atomic::AtomicU64::new(42),
-            )),
+            budget: Some(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(42))),
             deadline: Some(deadline),
         };
         let child = child_ctx(&parent, "scout");

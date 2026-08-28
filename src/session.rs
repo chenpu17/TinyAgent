@@ -17,7 +17,9 @@ pub fn load(path: &Path) -> Result<Option<(String, Vec<Message>)>> {
     let raw = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).with_context(|| format!("cannot read session: {}", path.display())),
+        Err(e) => {
+            return Err(e).with_context(|| format!("cannot read session: {}", path.display()))
+        }
     };
     let s: Session = match serde_json::from_str(&raw) {
         Ok(s) => s,
@@ -198,14 +200,20 @@ mod tests {
             .content
             .iter()
             .filter_map(|b| match b {
-                Block::ToolResult { tool_use_id, is_error, content, .. } => {
-                    Some((tool_use_id.clone(), *is_error, content.clone()))
-                }
+                Block::ToolResult {
+                    tool_use_id,
+                    is_error,
+                    content,
+                    ..
+                } => Some((tool_use_id.clone(), *is_error, content.clone())),
                 _ => None,
             })
             .collect();
         assert_eq!(results.len(), 2, "one result per dangling tool_use");
-        assert!(results.iter().all(|(_, e, _)| *e), "all interrupted results are errors");
+        assert!(
+            results.iter().all(|(_, e, _)| *e),
+            "all interrupted results are errors"
+        );
         assert!(results.iter().all(|(_, _, c)| c.contains("interrupted")));
         let ids: Vec<&str> = results.iter().map(|(id, _, _)| id.as_str()).collect();
         assert!(ids.contains(&"t1") && ids.contains(&"t2"));
