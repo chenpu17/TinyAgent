@@ -427,10 +427,23 @@ impl OpenAi {
                 }
                 // A mid-stream read failure (connection reset, truncated body)
                 // must NOT be treated as a clean end-of-stream — that would
-                // assemble a partial response and report it as success. Bail so
-                // the request fails and is retried as transient.
+                // assemble a partial response and report it as success.
+                // Mirror the Anthropic honest-cost path instead: partial
+                // blocks + a marker Text block + stop_reason "stream_error",
+                // carrying whatever usage already arrived — the agent bills
+                // the partial cost and maps this to a retryable Err. Bailing
+                // here dropped the usage (gateways that attach usage to the
+                // last choice chunk may have already sent it).
                 Err(StreamAbort::StreamError(msg)) => {
-                    bail!("OpenAI stream read error: {msg}");
+                    let mut blocks = Self::assemble_blocks(&text, &calls);
+                    blocks.push(Block::Text(format!(
+                        "[stream error] OpenAI stream read error: {msg}"
+                    )));
+                    return Ok(ChatResponse {
+                        blocks,
+                        stop_reason: "stream_error".into(),
+                        usage,
+                    });
                 }
             };
             if data == "[DONE]" {
@@ -445,12 +458,19 @@ impl OpenAi {
             // content_filter / overloaded error would masquerade as an empty
             // success — possibly with half-received tool args fed to _raw.
             // Some gateways serialize `"error": null` on success chunks; treat
-            // that as no error (filter out null).
+            // that as no error (filter out null). Same honest-cost shape as
+            // the read-failure arm above.
             if let Some(err) = ev.get("error").filter(|v| !v.is_null()) {
-                bail!(
-                    "OpenAI stream error: {}",
+                let mut blocks = Self::assemble_blocks(&text, &calls);
+                blocks.push(Block::Text(format!(
+                    "[stream error] OpenAI stream error: {}",
                     err["message"].as_str().unwrap_or("(no message)")
-                );
+                )));
+                return Ok(ChatResponse {
+                    blocks,
+                    stop_reason: "stream_error".into(),
+                    usage,
+                });
             }
             // Usage may ride on the final chunk whether or not it carries a
             // choice: standard OpenAI sends an empty-choices trailer, but some
@@ -550,22 +570,7 @@ impl OpenAi {
             }
         }
 
-        let mut blocks: Vec<Block> = Vec::new();
-        if !text.is_empty() {
-            blocks.push(Block::Text(text));
-        }
-        for (_, c) in calls {
-            let input = if c.arguments.trim().is_empty() {
-                json!({})
-            } else {
-                serde_json::from_str(&c.arguments).unwrap_or_else(|_| json!({"_raw": c.arguments}))
-            };
-            blocks.push(Block::ToolUse {
-                id: c.id,
-                name: c.name,
-                input,
-            });
-        }
+        let blocks = Self::assemble_blocks(&text, &calls);
 
         // Normalize to Anthropic-style stop reasons. An explicit abort
         // (cancel/idle) wins; otherwise a missing finish_reason means the
@@ -588,6 +593,33 @@ impl OpenAi {
             stop_reason,
             usage,
         })
+    }
+
+    /// Assemble the parsed blocks — streamed text (if any) then tool calls in
+    /// index order. Shared by parse_loop's tail and its mid-stream error arms,
+    /// so an honest-cost partial response carries the same block shape as a
+    /// normal finish.
+    fn assemble_blocks(
+        text: &str,
+        calls: &std::collections::BTreeMap<u64, PendingCall>,
+    ) -> Vec<Block> {
+        let mut blocks: Vec<Block> = Vec::new();
+        if !text.is_empty() {
+            blocks.push(Block::Text(text.to_string()));
+        }
+        for c in calls.values() {
+            let input = if c.arguments.trim().is_empty() {
+                json!({})
+            } else {
+                serde_json::from_str(&c.arguments).unwrap_or_else(|_| json!({"_raw": c.arguments}))
+            };
+            blocks.push(Block::ToolUse {
+                id: c.id.clone(),
+                name: c.name.clone(),
+                input,
+            });
+        }
+        blocks
     }
 }
 
@@ -777,6 +809,78 @@ mod tests {
         );
     }
 
+    /// Yields its prefix bytes, then fails with a connection-reset error
+    /// instead of a clean EOF — stands in for a mid-stream connection drop.
+    struct FailingAfter {
+        data: Vec<u8>,
+        pos: usize,
+    }
+    impl std::io::Read for FailingAfter {
+        fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos >= self.data.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "connection reset mid-stream",
+                ));
+            }
+            let n = std::cmp::min(b.len(), self.data.len() - self.pos);
+            b[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn stream_read_error_returns_partial_cost_honestly() {
+        // P2-10: a mid-stream read failure used to bail!, dropping the usage
+        // the gateway had already reported (Anthropic's shape already returns
+        // Ok with a "[stream error] " marker). Now both halves survive:
+        // partial text + carried usage + stop_reason "stream_error", which
+        // agent.rs extracts into a retryable Err that still bills the cost.
+        let raw = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial \"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"text\"}}]}\n\n",
+            // vLLM/DeepSeek shape: usage rides the last choice chunk (top-level
+            // field next to `choices`, not inside the choice object).
+            "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":120,\"completion_tokens\":7}}\n\n",
+        );
+        let reader = FailingAfter {
+            data: raw.as_bytes().to_vec(),
+            pos: 0,
+        };
+        let resp = OpenAi::parse_stream(reader, &mut |_| {}).unwrap();
+        assert_eq!(resp.stop_reason, "stream_error");
+        assert_eq!(
+            resp.usage.map(|u| (u.input_tokens, u.output_tokens)),
+            Some((120, 7))
+        );
+        assert!(matches!(&resp.blocks[0], Block::Text(t) if t == "partial text"));
+        assert!(
+            matches!(&resp.blocks[1], Block::Text(t) if t.starts_with("[stream error] OpenAI stream read error"))
+        );
+    }
+
+    #[test]
+    fn stream_error_event_returns_partial_cost_honestly() {
+        // Same honest-cost contract for the {"error": …} mid-stream event.
+        let raw = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"half a reply\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":42,\"completion_tokens\":3}}\n\n",
+            "data: {\"error\":{\"message\":\"server overloaded mid-generation\"}}\n\n",
+        );
+        let resp = OpenAi::parse_stream(raw.as_bytes(), &mut |_| {}).unwrap();
+        assert_eq!(resp.stop_reason, "stream_error");
+        assert_eq!(
+            resp.usage.map(|u| (u.input_tokens, u.output_tokens)),
+            Some((42, 3))
+        );
+        assert!(matches!(&resp.blocks[0], Block::Text(t) if t == "half a reply"));
+        assert!(matches!(
+            &resp.blocks[1],
+            Block::Text(t) if t == "[stream error] OpenAI stream error: server overloaded mid-generation"
+        ));
+    }
+
     #[test]
     fn stream_reasoning_content_surfaces_thinking_not_text() {
         // DeepSeek-R1 / GLM / o-series via gateways stream the thinking trace
@@ -861,14 +965,19 @@ mod tests {
     }
 
     #[test]
-    fn stream_error_event_bails() {
+    fn stream_error_event_stops_with_marker() {
         // A streaming error arrives with no `choices`; without the explicit
-        // check it would be skipped and surface as an empty success.
+        // check it would be skipped and surface as an empty success. Now it
+        // stops the parse with a marker block carrying the server's message
+        // (honest-cost shape, see stream_error_event_returns_partial_cost_
+        // honestly for the usage-carrying variant).
         let raw = "data: {\"error\":{\"message\":\"content filter\",\"type\":\"content_filter\"}}\n\ndata: [DONE]\n\n";
-        match OpenAi::parse_stream(raw.as_bytes(), &mut |_| {}) {
-            Err(e) => assert!(format!("{e:#}").contains("content filter")),
-            Ok(_) => panic!("expected stream error, got success"),
-        }
+        let resp = OpenAi::parse_stream(raw.as_bytes(), &mut |_| {}).unwrap();
+        assert_eq!(resp.stop_reason, "stream_error");
+        assert!(matches!(
+            &resp.blocks[0],
+            Block::Text(t) if t == "[stream error] OpenAI stream error: content filter"
+        ));
     }
 
     #[test]
