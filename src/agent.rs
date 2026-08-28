@@ -1712,7 +1712,12 @@ impl Agent {
                     let remaining = d
                         .saturating_duration_since(Instant::now())
                         .saturating_sub(compress::COMPRESS_RESERVE);
-                    remaining / (n_calls as u32)
+                    // Floor at 1s: with the deadline nearly exhausted the even
+                    // share rounds to ~0, and a zero Duration is an instant
+                    // timeout — the summary would fail before the request is
+                    // even sent. Same 1s-floor convention as
+                    // clamp_child_timeout.
+                    (remaining / (n_calls as u32)).max(Duration::from_secs(1))
                 }
                 // No run budget: the summary calls still get a per-request
                 // cap (the reader-thread leak backstop), evenly shared.

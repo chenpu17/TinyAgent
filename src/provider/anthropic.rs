@@ -278,6 +278,11 @@ impl Anthropic {
         let mut got_stop = false;
         let mut abort: Option<&'static str> = None;
         let mut usage = Usage::default();
+        // Distinguishes "gateway reported zero" from "gateway reported
+        // nothing": without a usage frame at all the response must carry
+        // usage=None, not Some(all-zeros) — downstream accounting keys on
+        // Some/None to tell "0 tokens" from "usage unknown".
+        let mut saw_usage = false;
 
         loop {
             let data = match src.next_payload() {
@@ -306,7 +311,7 @@ impl Anthropic {
                     return Ok(ChatResponse {
                         blocks,
                         stop_reason: "stream_error".into(),
-                        usage: Some(usage),
+                        usage: saw_usage.then_some(usage),
                     });
                 }
             };
@@ -317,6 +322,9 @@ impl Anthropic {
             match ev["type"].as_str().unwrap_or("") {
                 "message_start" => {
                     let u = &ev["message"]["usage"];
+                    if u.is_object() {
+                        saw_usage = true;
+                    }
                     if let Some(i) = u["input_tokens"].as_u64() {
                         usage.input_tokens = i;
                     }
@@ -423,6 +431,7 @@ impl Anthropic {
                     }
                     if let Some(o) = ev["usage"]["output_tokens"].as_u64() {
                         usage.output_tokens = o;
+                        saw_usage = true;
                     }
                 }
                 "error" => {
@@ -440,7 +449,7 @@ impl Anthropic {
                     return Ok(ChatResponse {
                         blocks,
                         stop_reason: "stream_error".into(),
-                        usage: Some(usage),
+                        usage: saw_usage.then_some(usage),
                     });
                 }
                 // The official API closes the body right after message_stop,
@@ -481,7 +490,7 @@ impl Anthropic {
         Ok(ChatResponse {
             blocks,
             stop_reason,
-            usage: Some(usage),
+            usage: saw_usage.then_some(usage),
         })
     }
 }
@@ -512,6 +521,23 @@ mod tests {
             resp.usage.map(|u| (u.input_tokens, u.output_tokens)),
             Some((12, 7))
         );
+    }
+
+    #[test]
+    fn stream_without_usage_frames_reports_none() {
+        // A gateway that never sends usage frames must surface usage=None,
+        // not Some(all-zeros) — downstream accounting keys on Some/None to
+        // tell "0 tokens billed" from "usage unknown" (honest-cost contract).
+        let raw = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+        );
+        let resp = parse(raw.as_bytes());
+        assert_eq!(resp.stop_reason, "end_turn");
+        assert!(matches!(&resp.blocks[0], Block::Text(t) if t == "hi"));
+        assert!(resp.usage.is_none());
     }
 
     #[test]
@@ -619,17 +645,20 @@ mod tests {
     }
 
     #[test]
-    fn stream_usage_defaults_when_missing() {
-        // No usage frames in the stream → Some(0,0), not None, because the
-        // Anthropic reader initializes usage to zero and always returns it.
-        // (Either side may legitimately be absent if the stream is cut short.)
+    fn partial_usage_one_sided_is_reported() {
+        // One-sided usage (message_start reported input, stream cut before
+        // message_delta's output): the input tokens were billed, so the
+        // response must carry Some((9, 0)) — the zero axis reads as
+        // "reported zero", distinct from usage=None ("no frame at all",
+        // see stream_without_usage_frames_reports_none).
         let raw = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":9}}}\n\n",
             "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"hi\"}}\n\n",
             "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
         );
         let resp = parse(raw.as_bytes());
-        let u = resp.usage.expect("anthropic always reports usage");
-        assert_eq!((u.input_tokens, u.output_tokens), (0, 0));
+        let u = resp.usage.expect("usage frame seen → Some");
+        assert_eq!((u.input_tokens, u.output_tokens), (9, 0));
     }
 
     #[test]

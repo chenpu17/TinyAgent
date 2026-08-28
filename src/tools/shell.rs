@@ -44,6 +44,10 @@ impl Tool for Shell {
                 Command::new("sh")
                     .args(["-c", cmd])
                     .current_dir(&ctx.workdir)
+                    // stdin null: a command that reads stdin would otherwise
+                    // inherit OUR stdin and hang forever on a prompt (or eat
+                    // the harness's piped input in batch mode).
+                    .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
                     .process_group(0)
@@ -54,6 +58,7 @@ impl Tool for Shell {
                 Command::new("cmd")
                     .args(["/C", cmd])
                     .current_dir(&ctx.workdir)
+                    .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
                     .spawn()
@@ -522,6 +527,32 @@ mod tests {
             elapsed < Duration::from_secs(3),
             "cancel should kill within a poll interval, took {elapsed:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdin_is_null_so_a_reading_command_gets_eof_not_a_hang() {
+        // `cat` reads stdin to EOF. With Stdio::null() it sees EOF instantly
+        // and exits 0; with an inherited stdin it would block the tool call
+        // until the shell timeout kills it (and, under a harness, could eat
+        // the harness's own piped input).
+        let ctx = ToolCtx {
+            workdir: std::env::temp_dir(),
+            max_output_chars: 1000,
+            restrict_to_workdir: false,
+            cancel: None,
+            shell_timeout_secs: 5,
+            hooks: None,
+            subagent: None,
+            budget: None,
+            deadline: None,
+        };
+        let out = Shell
+            .run(&json!({"command": "echo seeded; cat; echo done"}), &ctx)
+            .unwrap();
+        assert!(!out.is_error, "cat should EOF immediately: {}", out.content);
+        assert!(out.content.contains("seeded"));
+        assert!(out.content.contains("done"));
     }
 
     /// The byte cap on stdout is sized at 4 bytes/char so the char-based

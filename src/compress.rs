@@ -152,13 +152,16 @@ pub(crate) fn fold_summary(messages: &[Message], cut: usize, summary: &str) -> V
     // Normally messages[0] is the opening user turn, but a resumed/edited
     // session can start with an assistant message — fold the summary into a
     // fresh empty user head then, rather than grafting it onto an assistant.
-    let mut head = if messages[0].role == Role::User {
-        let mut h = messages[0].clone();
-        h.content
-            .retain(|b| !matches!(b, Block::Text(t) if t.starts_with(SUMMARY_MARKER)));
-        h
-    } else {
-        Message::user(Vec::new())
+    // `first()` (not `[0]`): this is pub(crate) and a caller handing in an
+    // empty slice must get the fresh-head fallback, not an index panic.
+    let mut head = match messages.first() {
+        Some(m) if m.role == Role::User => {
+            let mut h = m.clone();
+            h.content
+                .retain(|b| !matches!(b, Block::Text(t) if t.starts_with(SUMMARY_MARKER)));
+            h
+        }
+        _ => Message::user(Vec::new()),
     };
     head.content
         .push(Block::Text(format!("{SUMMARY_MARKER}\n{summary}")));

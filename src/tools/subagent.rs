@@ -132,10 +132,9 @@ impl Tool for SubAgent {
         ctx: &ToolCtx,
         emit: &mut dyn FnMut(AgentEvent),
     ) -> Result<ToolOutput> {
-        let name = input["name"]
-            .as_str()
-            .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| anyhow::anyhow!("task requires a non-empty `name`"))?;
+        // `description` is accepted but informational; `name` is the identity
+        // that tags this sub-agent's forwarded events.
+        let name = task_name(input)?;
         let prompt = input["prompt"]
             .as_str()
             .filter(|s| !s.trim().is_empty())
@@ -180,13 +179,24 @@ impl Tool for SubAgent {
             provider,
             child_tools,
             initial,
-            child_ctx(ctx, name),
+            child_ctx(ctx, &name),
         );
         if let Some(flag) = ctx.cancel.clone() {
             child.set_cancel(flag);
         }
-        Ok(run_subagent(&mut child, name, emit, ctx.max_output_chars))
+        Ok(run_subagent(&mut child, &name, emit, ctx.max_output_chars))
     }
+}
+
+/// Resolve the task identity: non-empty (after trim) and capped at 64
+/// CHARS — `name` tags every forwarded `SubAgent { name, .. }` event, so a
+/// model-supplied sentence as the name must not flood the event stream.
+fn task_name(input: &Value) -> Result<String> {
+    let raw = input["name"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("task requires a non-empty `name`"))?;
+    Ok(raw.chars().take(64).collect())
 }
 
 /// The sub-agent's whitelist tools: build the config's FULL tool list, then
@@ -435,6 +445,22 @@ mod tests {
                 deadline: None,
             },
         )
+    }
+
+    #[test]
+    fn task_name_rejects_empty_and_caps_at_64_chars() {
+        // Identity for event tagging: whitespace-only is rejected, longer
+        // names cap at 64 CHARS (not bytes — CJK stays whole characters).
+        assert!(task_name(&json!({"name": "  "})).is_err());
+        assert!(task_name(&json!({})).is_err());
+        assert_eq!(
+            task_name(&json!({"name": "x".repeat(200)})).unwrap(),
+            "x".repeat(64)
+        );
+        let cjk: String = "汉".repeat(100);
+        let capped = task_name(&json!({"name": cjk})).unwrap();
+        assert_eq!(capped.chars().count(), 64);
+        assert!(capped.chars().all(|c| c == '汉'));
     }
 
     #[test]

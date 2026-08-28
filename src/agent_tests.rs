@@ -142,6 +142,17 @@ fn fold_summary_empty_tail_is_legal() {
 }
 
 #[test]
+fn fold_summary_empty_messages_get_fresh_head_not_panic() {
+    // `first()` fallback (P3): fold_summary is pub(crate) — a caller handing
+    // in an empty slice must get the fresh empty-user-head branch, not an
+    // index panic on messages[0].
+    let out = fold_summary(&[], 0, "s");
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].role, Role::User);
+    assert!(matches!(&out[0].content[0], Block::Text(t) if t.contains("s")));
+}
+
+#[test]
 fn safe_cut_needs_middle_content() {
     // Candidate lands at index 1 (assistant) → nothing to summarize → None
     let msgs = vec![

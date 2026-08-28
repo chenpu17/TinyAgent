@@ -359,9 +359,14 @@ impl Config {
     }
 
     pub fn base_url(&self) -> String {
-        self.base_url
+        let base = self
+            .base_url
             .clone()
-            .unwrap_or_else(|| self.provider.default_base_url().to_string())
+            .unwrap_or_else(|| self.provider.default_base_url().to_string());
+        // Trim trailing slashes: providers join with `format!("{}/path")`,
+        // so a config ending in "/" would request `...v1//chat/completions`
+        // — some gateways 404 on the doubled slash.
+        base.trim_end_matches('/').to_string()
     }
 
     pub fn api_key(&self) -> Result<String> {
@@ -626,6 +631,21 @@ mod tests {
         assert_eq!(cfg.base_url(), "http://localhost:8000");
         assert_eq!(cfg.limits.max_output_chars, 1000);
         assert_eq!(cfg.tools, vec!["shell"]);
+    }
+
+    #[test]
+    fn base_url_trims_trailing_slashes() {
+        // Providers join with `format!("{}/path")`; a config ending in "/"
+        // would request `...v1//chat/completions` — some gateways 404 on the
+        // doubled slash. Multiple slashes collapse too (typo "v1//").
+        let json = r#"{
+            "provider": "openai",
+            "base_url": "http://localhost:8000/v1//",
+            "api_key_env": "OPENAI_API_KEY",
+            "model": "qwen3-4b"
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.base_url(), "http://localhost:8000/v1");
     }
 
     #[test]

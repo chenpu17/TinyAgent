@@ -117,6 +117,12 @@ fn main() -> Result<()> {
     let config_path = resolve_config_path(cli.config.clone())?;
     let mut cfg = Config::load(&config_path)?;
     if let Some(t) = cli.task {
+        // Reject an explicitly-empty --task "": an empty string would silently
+        // mask a task set in the config (Some("") wins the overlay below) and
+        // the agent would spin up with nothing to do.
+        if t.trim().is_empty() {
+            bail!("--task must not be empty");
+        }
         cfg.task = Some(t);
     }
     // CLI overrides for quick A/B runs without editing the config.
