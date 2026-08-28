@@ -6,6 +6,15 @@
 //! network-bound run; the event callback re-acquires the GIL per event via
 //! `Python::with_gil`.
 //!
+//! Lock model (`Agent` wraps the core agent in a `Mutex` because pyclasses
+//! methods take `&self`): every sync method acquires that lock with the GIL
+//! RELEASED (`with_agent` below), so a thread blocked on the lock never
+//! holds the GIL — holding both forms a GIL↔mutex deadlock against the run
+//! thread's `with_gil` event callbacks. Reentrant calls from those callbacks
+//! (same thread, whose run already holds the lock) are converted into an
+//! explanatory RuntimeError by a thread-local in-run flag instead of a
+//! silent `std::sync::Mutex` self-deadlock.
+//!
 //! `ta` is the Rust core library `tiny_agent` (package `tiny-agent`, aliased
 //! here because this crate's own lib name — the Python import — is *also*
 //! `tiny_agent`).
@@ -21,6 +30,7 @@
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pythonize::{depythonize, pythonize};
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -103,28 +113,28 @@ fn build_extra_tools(
     Ok(out)
 }
 
-/// Drive one `agent.run()` with the GIL released, forwarding each event to the
-/// optional Python callback, and return the outcome as a Python dict.
-fn run_agent(
-    agent: &mut ta::Agent,
-    on_event: Option<PyObject>,
-    py: Python<'_>,
-) -> PyResult<PyObject> {
-    let result = py.allow_threads(|| {
-        agent.run(&mut |ev: ta::AgentEvent| {
-            if let Some(cb) = on_event.as_ref() {
-                // Re-acquire the GIL only long enough to hand the event to the
-                // Python callback, then release it again for the network-bound
-                // run. Errors in the callback are swallowed: a buggy on_event
-                // must not poison the agent run.
-                Python::with_gil(|py| {
-                    if let Ok(py_ev) = pythonize(py, &ev) {
-                        let _ = cb.call1(py, (py_ev,));
-                    }
-                });
+/// Forward one event to the optional Python callback. Executed on the agent
+/// run thread while the GIL is released (the whole run sits inside
+/// `allow_threads`), so it re-acquires the GIL via `with_gil` just for the
+/// call. Errors in the callback are swallowed: a buggy on_event must not
+/// poison the agent run.
+fn emit_event(on_event: &Option<PyObject>, ev: ta::AgentEvent) {
+    if let Some(cb) = on_event.as_ref() {
+        Python::with_gil(|py| {
+            if let Ok(py_ev) = pythonize(py, &ev) {
+                let _ = cb.call1(py, (py_ev,));
             }
-        })
-    });
+        });
+    }
+}
+
+/// Convert a run result into the Python return: the serialized outcome, or a
+/// RuntimeError. Shared by `Agent::run` and the one-shot `chat()`.
+fn outcome_to_py<T, E>(result: Result<T, E>, py: Python<'_>) -> PyResult<PyObject>
+where
+    T: serde::Serialize,
+    E: serde::Serialize + std::fmt::Display,
+{
     match result {
         Ok(o) => {
             let bound = pythonize(py, &o)?;
@@ -144,6 +154,26 @@ fn run_agent(
                 Err(_) => Err(to_pyerr(&e)),
             }
         }
+    }
+}
+
+thread_local! {
+    /// Set while this thread is inside an `Agent::run` loop. Event and tool
+    /// callbacks execute on this same thread, and the run holds the agent
+    /// mutex for its whole duration — a callback calling a sync method
+    /// (`push_user`, `usage`, …) would re-lock the very mutex its own run
+    /// holds: a guaranteed self-deadlock on `std::sync::Mutex`. The flag
+    /// converts that into an immediate, explanatory RuntimeError.
+    static IN_RUN: Cell<bool> = const { Cell::new(false) };
+}
+
+/// RAII clear for [`IN_RUN`] — also on panic unwind, so the thread stays
+/// usable after a failed run.
+struct RunFlag;
+
+impl Drop for RunFlag {
+    fn drop(&mut self) {
+        IN_RUN.with(|c| c.set(false));
     }
 }
 
@@ -292,6 +322,38 @@ pub struct Agent {
     inner: Mutex<ta::Agent>,
 }
 
+impl Agent {
+    /// Run `f` on the inner agent with (a) the same-thread reentry guard and
+    /// (b) the GIL released while blocked on the lock.
+    ///
+    /// (b) is the deadlock fix: a thread waiting on the mutex while HOLDING
+    /// the GIL deadlocks against the running agent's `with_gil` event
+    /// callbacks (classic GIL↔mutex ABBA) — with the GIL released around the
+    /// wait, the run thread's callbacks proceed and this thread proceeds once
+    /// the run finishes. `MutexGuard` is `!Send` so it can't cross out of
+    /// `allow_threads`; the whole lock+work happens inside, which also forces
+    /// `f` to be Python-free (it runs GIL-less) — every caller only
+    /// reads/copies Rust data.
+    fn with_agent<T: Send>(
+        &self,
+        py: Python<'_>,
+        f: impl FnOnce(&mut ta::Agent) -> T + Send,
+    ) -> PyResult<T> {
+        if IN_RUN.with(Cell::get) {
+            return Err(PyRuntimeError::new_err(
+                "Agent is running on this thread: calling Agent methods from an \
+                 on_event/tool callback during run() would deadlock (the run \
+                 already holds the agent lock). Collect what you need in the \
+                 callback and call Agent methods after run() returns.",
+            ));
+        }
+        Ok(py.allow_threads(|| {
+            let mut guard = self.inner.lock().expect("agent mutex poisoned");
+            f(&mut guard)
+        }))
+    }
+}
+
 #[pymethods]
 impl Agent {
     #[new]
@@ -331,56 +393,61 @@ impl Agent {
     }
 
     /// Append a user message (text) to the conversation, then `.run()`.
-    fn push_user(&self, text: &str) {
-        self.inner
-            .lock()
-            .expect("agent mutex poisoned")
-            .push_user(vec![ta::Block::Text(text.into())]);
+    fn push_user(&self, text: &str, py: Python<'_>) -> PyResult<()> {
+        // The returned session-save warning is dropped (same as before the
+        // lock-model fix — the headless binary surfaces it, bindings don't).
+        self.with_agent(py, |a| {
+            a.push_user(vec![ta::Block::Text(text.into())]);
+        })
     }
 
     /// Arm a `CancelToken`; its flag interrupts the next turn boundary.
-    fn set_cancel(&self, token: &CancelToken) {
-        self.inner
-            .lock()
-            .expect("agent mutex poisoned")
-            .set_cancel(token.flag.clone());
+    fn set_cancel(&self, token: &CancelToken, py: Python<'_>) -> PyResult<()> {
+        self.with_agent(py, |a| a.set_cancel(token.flag.clone()))
     }
 
     /// Run one turn (until end_turn / max_turns / cancel / error). `on_event`
     /// is called for each `AgentEvent` (text deltas, tool calls, usage, …) with
     /// the event as a dict. Returns the `RunOutcome` as a dict
     /// (final_text, turns, stop_reason, tool_calls, *_tokens, elapsed_secs).
+    ///
+    /// The lock is acquired and the whole run happens with the GIL released;
+    /// callbacks re-acquire it per call (`emit_event` / tool closures). A
+    /// same-thread reentrant `run()` (from inside a callback) is a
+    /// RuntimeError, not a self-deadlock.
     #[pyo3(signature = (on_event=None))]
     fn run(&self, on_event: Option<PyObject>, py: Python<'_>) -> PyResult<PyObject> {
-        let mut agent = self.inner.lock().expect("agent mutex poisoned");
-        run_agent(&mut agent, on_event, py)
+        if IN_RUN.with(Cell::get) {
+            return Err(PyRuntimeError::new_err(
+                "Agent.run() cannot be called reentrantly from an on_event/tool callback",
+            ));
+        }
+        let result = py.allow_threads(|| {
+            let mut agent = self.inner.lock().expect("agent mutex poisoned");
+            IN_RUN.with(|c| c.set(true));
+            let _flag = RunFlag; // RAII clear, panic-safe
+            agent.run(&mut |ev| emit_event(&on_event, ev))
+        });
+        outcome_to_py(result, py)
     }
 
     /// Cumulative token usage of the current/latest run (4 axes).
     fn usage(&self, py: Python<'_>) -> PyResult<PyObject> {
-        let bound = pythonize(
-            py,
-            &self.inner.lock().expect("agent mutex poisoned").usage(),
-        )?;
+        let u = self.with_agent(py, |a| a.usage())?;
+        let bound = pythonize(py, &u)?;
         Ok(bound.unbind())
     }
 
     /// Conversation history as a list of message dicts.
     fn messages(&self, py: Python<'_>) -> PyResult<PyObject> {
-        let bound = pythonize(
-            py,
-            self.inner.lock().expect("agent mutex poisoned").messages(),
-        )?;
+        let msgs = self.with_agent(py, |a| a.messages().to_vec())?;
+        let bound = pythonize(py, &msgs)?;
         Ok(bound.unbind())
     }
 
     /// The model name this agent sends with each request.
-    fn model(&self) -> String {
-        self.inner
-            .lock()
-            .expect("agent mutex poisoned")
-            .model()
-            .to_string()
+    fn model(&self, py: Python<'_>) -> PyResult<String> {
+        self.with_agent(py, |a| a.model().to_string())
     }
 }
 
@@ -418,7 +485,10 @@ fn chat(
     }
     .map_err(to_pyerr)?;
     agent.push_user(vec![ta::Block::Text(message.into())]);
-    run_agent(&mut agent, on_event, py)
+    // Local agent (no shared mutex): the run itself still releases the GIL so
+    // other Python threads progress during the network-bound loop.
+    let result = py.allow_threads(|| agent.run(&mut |ev| emit_event(&on_event, ev)));
+    outcome_to_py(result, py)
 }
 
 // ── module ──────────────────────────────────────────────────────────────────

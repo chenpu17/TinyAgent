@@ -512,3 +512,65 @@ def test_inline_dict_config_validates_workdir():
     cfg = openai_config("http://unused", tools=[], workdir="/definitely/not/a/real/dir")
     with pytest.raises(RuntimeError, match="workdir"):
         tiny_agent.Agent(cfg, api_key=MOCK_KEY)
+
+
+# ── 14. lock model: no deadlock from callbacks or cross-thread callers ───────
+
+def test_sync_method_from_event_callback_raises_instead_of_deadlocking(tmp_path):
+    """P1-2 regression (same-thread reentry): the run holds the agent mutex on
+    the thread that executes on_event; a callback calling a sync method used to
+    re-lock that mutex and hang forever. It must now raise an explanatory
+    RuntimeError immediately. Run in a helper thread so a regression (deadlock)
+    fails on the join timeout instead of hanging the suite."""
+    def provider(request):
+        return {"text": "done", "stop_reason": "end_turn"}
+
+    cfg = openai_config("http://unused", tools=[], workdir=str(tmp_path))
+    agent = tiny_agent.Agent(cfg, provider=provider)
+    agent.push_user("hi")
+    outcome = {}
+
+    def on_event(ev):
+        try:
+            agent.push_user("called from callback")
+            outcome["err"] = None
+        except RuntimeError as e:
+            outcome["err"] = str(e)
+
+    t = threading.Thread(target=agent.run, kwargs={"on_event": on_event})
+    t.start()
+    t.join(timeout=30)
+    assert not t.is_alive(), "run() deadlocked: callback re-entered the agent lock"
+    assert outcome["err"] is not None, "push_user from on_event should have raised"
+    assert "deadlock" in outcome["err"] or "running" in outcome["err"], outcome["err"]
+    # After the run finishes, the same method works again (flag cleared).
+    agent.push_user("after run")
+    assert agent.usage()["input_tokens"] >= 0
+
+
+def test_usage_from_other_thread_during_run_does_not_deadlock(tmp_path):
+    """P1-2 regression (cross-thread ABBA): sync methods used to block on the
+    agent mutex while HOLDING the GIL, while the running agent's provider/event
+    callbacks waited on the GIL — mutual starvation. Now the lock is acquired
+    with the GIL released, so the run proceeds and the caller returns after
+    the run finishes."""
+    started = threading.Event()
+
+    def provider(request):
+        started.set()
+        time.sleep(1.0)  # hold the run open so the cross-thread call overlaps it
+        return {"text": "done", "stop_reason": "end_turn"}
+
+    cfg = openai_config("http://unused", tools=[], workdir=str(tmp_path))
+    agent = tiny_agent.Agent(cfg, provider=provider)
+    agent.push_user("hi")
+
+    t = threading.Thread(target=agent.run)
+    t.start()
+    assert started.wait(timeout=30), "provider never called"
+    # Overlaps the in-flight run; must block (GIL released) until the run
+    # finishes, then return — not deadlock holding the GIL.
+    usage = agent.usage()
+    assert usage["input_tokens"] >= 0
+    t.join(timeout=30)
+    assert not t.is_alive(), "run() deadlocked against a cross-thread sync call"
