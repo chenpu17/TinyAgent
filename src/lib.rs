@@ -56,8 +56,9 @@ pub use tools::{CallbackTool, Tool, ToolConcurrency, ToolCtx, ToolOutput};
 /// binary — so behavior is identical.
 ///
 /// For full control (custom [`Provider`] or a hand-built tool list), construct
-/// an [`Agent`] directly via [`Agent::new`], or use [`build_agent_with`] to add
-/// extra tools on top of the config's whitelist.
+/// an [`Agent`] directly via [`Agent::try_new`] (tool names are validated —
+/// duplicates / illegal names are an error, not a silent shadow), or use
+/// [`build_agent_with`] to add extra tools on top of the config's whitelist.
 pub fn build_agent(
     cfg: &Config,
     initial: Vec<Message>,
@@ -81,13 +82,13 @@ pub fn build_agent_with(
     api_key: &str,
 ) -> anyhow::Result<Agent> {
     let (tool_list, ctx, cfg) = assemble(cfg, client, extra_tools, api_key)?;
-    Ok(Agent::new(
+    Agent::try_new(
         &cfg,
         provider::build(&cfg, api_key, client.clone()),
         tool_list,
         initial,
         ctx,
-    ))
+    )
 }
 
 /// Like [`build_agent_with`], but the caller supplies the [`Provider`] directly
@@ -108,7 +109,7 @@ pub fn build_agent_with_provider(
     api_key: &str,
 ) -> anyhow::Result<Agent> {
     let (tool_list, ctx, cfg) = assemble(cfg, client, extra_tools, api_key)?;
-    Ok(Agent::new(&cfg, provider, tool_list, initial, ctx))
+    Agent::try_new(&cfg, provider, tool_list, initial, ctx)
 }
 
 /// Shared tool-list + [`ToolCtx`] assembly for the `build_agent*` helpers:
@@ -187,9 +188,9 @@ fn assemble(
     // was silently SHADOWED (dispatch resolves by first match) while the model
     // saw duplicate definitions — providers reject those with a 400 mid-run —
     // and an invalid charset/length only failed inside a provider request.
-    // Same spirit as `tools::mcp::dedup_check`, which covers MCP display names
-    // among themselves only.
-    validate_tool_names(&tool_list)?;
+    // Agent::try_new runs the same check, so direct construction is covered
+    // too; this call keeps the failure attributed to assembly.
+    tools::validate_tool_names(&tool_list)?;
 
     let ctx = ToolCtx {
         workdir,
@@ -203,44 +204,6 @@ fn assemble(
         deadline: None,
     };
     Ok((tool_list, ctx, cfg))
-}
-
-/// Validate the FINAL tool list's names before the agent is built: non-empty,
-/// `[A-Za-z0-9_-]` only, ≤64 chars (the Anthropic tool-name / OpenAI
-/// function-name wire limit), and unique across built-in + MCP + skill +
-/// extra tools. See the call site in [`assemble`] for the failure mode this
-/// replaces (silent shadowing at dispatch / provider 400 mid-run).
-fn validate_tool_names(tools: &[Box<dyn tools::Tool>]) -> anyhow::Result<()> {
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for t in tools {
-        let name = t.def().name;
-        if name.is_empty() {
-            anyhow::bail!("tool name must not be empty");
-        }
-        if let Some(bad) = name
-            .chars()
-            .find(|c| !c.is_ascii_alphanumeric() && *c != '_' && *c != '-')
-        {
-            anyhow::bail!(
-                "tool name '{name}' contains '{bad}': names may only use \
-                 [A-Za-z0-9_-] (the Anthropic/OpenAI tool-name character set)"
-            );
-        }
-        if name.chars().count() > 64 {
-            anyhow::bail!(
-                "tool name '{name}' exceeds the 64-char provider limit \
-                 (Anthropic tool name / OpenAI function name)"
-            );
-        }
-        if !seen.insert(name.clone()) {
-            anyhow::bail!(
-                "duplicate tool name '{name}': built-in, MCP, and custom tools \
-                 must be unique — the later definition would be silently shadowed \
-                 at dispatch (first match wins)"
-            );
-        }
-    }
-    Ok(())
 }
 
 /// Skill search dirs, global first + project last (so the project dir overrides

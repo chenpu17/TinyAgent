@@ -136,6 +136,46 @@ pub enum ToolConcurrency {
     Parallel,
 }
 
+/// Validate a tool list's names: non-empty, `[A-Za-z0-9_-]` only, ≤64 chars
+/// (the Anthropic tool-name / OpenAI function-name wire limit), and unique.
+/// Called from BOTH assembly ([`crate::assemble`], covering built-in + MCP +
+/// skill + extra tools) and [`crate::agent::Agent::try_new`] (covering direct
+/// construction — the README's "full control" path), so no entry point can
+/// build an agent whose dispatch silently shadows a duplicate or whose names
+/// only fail later as a provider 400.
+pub(crate) fn validate_tool_names(tools: &[Box<dyn Tool>]) -> Result<()> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for t in tools {
+        let name = t.def().name;
+        if name.is_empty() {
+            bail!("tool name must not be empty");
+        }
+        if let Some(bad) = name
+            .chars()
+            .find(|c| !c.is_ascii_alphanumeric() && *c != '_' && *c != '-')
+        {
+            bail!(
+                "tool name '{name}' contains '{bad}': names may only use \
+                 [A-Za-z0-9_-] (the Anthropic/OpenAI tool-name character set)"
+            );
+        }
+        if name.chars().count() > 64 {
+            bail!(
+                "tool name '{name}' exceeds the 64-char provider limit \
+                 (Anthropic tool name / OpenAI function name)"
+            );
+        }
+        if !seen.insert(name.clone()) {
+            bail!(
+                "duplicate tool name '{name}': built-in, MCP, and custom tools \
+                 must be unique — the later definition would be silently shadowed \
+                 at dispatch (first match wins)"
+            );
+        }
+    }
+    Ok(())
+}
+
 pub trait Tool: Send + Sync {
     fn def(&self) -> ToolDef;
     fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput>;

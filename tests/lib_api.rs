@@ -287,3 +287,69 @@ fn invalid_tool_name_fails_at_build() {
     )
     .expect("64-char name is within the provider limit");
 }
+
+fn plain_ctx() -> ToolCtx {
+    ToolCtx {
+        workdir: std::env::current_dir().unwrap(),
+        max_output_chars: 4000,
+        restrict_to_workdir: false,
+        cancel: None,
+        shell_timeout_secs: 120,
+        hooks: None,
+        subagent: None,
+        budget: None,
+        deadline: None,
+    }
+}
+
+#[test]
+fn try_new_rejects_an_invalid_tool_set_as_an_error() {
+    // Direct construction is the README's "full control" path; validation used
+    // to live only in assembly, so a hand-built list with duplicates (or
+    // illegal names) reintroduced silent shadowing / provider 400s. try_new
+    // surfaces the same validate_tool_names contract as the builders.
+    let cfg = minimal_config();
+    let (provider, _) = MockProvider::new(vec![]);
+    let tools: Vec<Box<dyn tiny_agent::Tool>> =
+        vec![Box::new(plain_tool("dup")), Box::new(plain_tool("dup"))];
+    let err = tiny_agent::Agent::try_new(
+        &cfg,
+        Box::new(provider),
+        tools,
+        Vec::new(),
+        plain_ctx(),
+    );
+    let err = match err {
+        Err(e) => e,
+        Ok(_) => panic!("duplicate names must fail try_new"),
+    };
+    assert!(format!("{err:#}").contains("duplicate"), "{err:#}");
+
+    let (provider, _) = MockProvider::new(vec![]);
+    let bad: Vec<Box<dyn tiny_agent::Tool>> = vec![Box::new(plain_tool("no good"))];
+    let err = tiny_agent::Agent::try_new(&cfg, Box::new(provider), bad, Vec::new(), plain_ctx());
+    let err = match err {
+        Err(e) => e,
+        Ok(_) => panic!("illegal name must fail try_new"),
+    };
+    assert!(format!("{err:#}").contains("tool name"), "{err:#}");
+
+    // A valid set constructs fine.
+    let (provider, _) = MockProvider::new(vec![]);
+    let ok: Vec<Box<dyn tiny_agent::Tool>> = vec![Box::new(plain_tool("fine"))];
+    tiny_agent::Agent::try_new(&cfg, Box::new(provider), ok, Vec::new(), plain_ctx())
+        .expect("valid tool set constructs");
+}
+
+#[test]
+#[should_panic(expected = "invalid tool set")]
+fn new_panics_on_an_invalid_tool_set() {
+    // Agent::new keeps its infallible signature (dozens of internal call
+    // sites); an invalid set is a construction-time programmer error, and the
+    // panic message points at try_new for the recoverable path.
+    let cfg = minimal_config();
+    let (provider, _) = MockProvider::new(vec![]);
+    let dup: Vec<Box<dyn tiny_agent::Tool>> =
+        vec![Box::new(plain_tool("dup")), Box::new(plain_tool("dup"))];
+    let _ = tiny_agent::Agent::new(&cfg, Box::new(provider), dup, Vec::new(), plain_ctx());
+}

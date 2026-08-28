@@ -381,6 +381,14 @@ pub(crate) fn system_with_env(
 }
 
 impl Agent {
+    /// Construct an [`Agent`], panicking on an invalid tool set (duplicate,
+    /// empty, illegal-charset, or over-length names).
+    ///
+    /// The panic is a construction-time programmer error, never a runtime
+    /// failure path — for a recoverable error (e.g. names come from user
+    /// input in a host-language binding), use [`Agent::try_new`]. The
+    /// `build_agent*` helpers already route through `try_new`, so this
+    /// contract only bites hand-built tool lists.
     pub fn new(
         cfg: &Config,
         provider: Box<dyn Provider>,
@@ -388,6 +396,28 @@ impl Agent {
         initial: Vec<Message>,
         ctx: ToolCtx,
     ) -> Self {
+        Self::try_new(cfg, provider, tools, initial, ctx).unwrap_or_else(|e| {
+            panic!(
+                "invalid tool set: {e:#}; construct via Agent::try_new to handle \
+                 this as a recoverable error"
+            )
+        })
+    }
+
+    /// [`Agent::new`] as a `Result`: same construction, but tool-name
+    /// validation failure is returned instead of panicking. Every entry point
+    /// funnels through here — `build_agent*` (after assembly adds built-in /
+    /// MCP / skill tools) and direct construction — so no path can build an
+    /// agent whose dispatch silently shadows a duplicate name or whose names
+    /// only fail later as a provider 400.
+    pub fn try_new(
+        cfg: &Config,
+        provider: Box<dyn Provider>,
+        tools: Vec<Box<dyn Tool>>,
+        initial: Vec<Message>,
+        ctx: ToolCtx,
+    ) -> Result<Self> {
+        crate::tools::validate_tool_names(&tools)?;
         let tool_defs: Vec<ToolDef> = tools.iter().map(|t| t.def()).collect();
         let tool_schema_chars = tool_defs
             .iter()
@@ -411,7 +441,7 @@ impl Agent {
         } else {
             cfg.system_prompt.clone()
         };
-        Self {
+        Ok(Self {
             provider,
             provider_label: cfg.provider.as_str().to_string(),
             tools,
@@ -429,7 +459,7 @@ impl Agent {
             compress_failed: false,
             usage: Usage::default(),
             tool_schema_chars,
-        }
+        })
     }
 
     // ── Read-only accessors (state for library users / bindings) ─────────────
