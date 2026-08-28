@@ -35,13 +35,19 @@ fn to_pyerr(e: impl std::fmt::Display) -> PyErr {
 }
 
 /// Build a [`ta::Config`] from either a filesystem path (`str`) or an inline
-/// `dict` (the same shape as a config JSON file).
+/// `dict` (the same shape as a config JSON file). Both paths go through
+/// `validate_and_normalize` — an inline dict used to skip workdir
+/// canonicalization/existence checks and eager MCP validation, silently
+/// diverging from the file path's semantics.
 fn load_config(obj: &Bound<'_, PyAny>) -> PyResult<ta::Config> {
-    if let Ok(path) = obj.extract::<String>() {
-        ta::Config::load(std::path::Path::new(&path)).map_err(to_pyerr)
+    let mut cfg = if let Ok(path) = obj.extract::<String>() {
+        ta::Config::load(std::path::Path::new(&path)).map_err(to_pyerr)?
     } else {
-        depythonize::<ta::Config>(obj).map_err(to_pyerr)
-    }
+        depythonize::<ta::Config>(obj).map_err(to_pyerr)?
+    };
+    // No-op for the file path (already normalized); the real work for dicts.
+    cfg.validate_and_normalize().map_err(to_pyerr)?;
+    Ok(cfg)
 }
 
 /// Shape a Python tool callback's return value accepts: a plain `str`, or a

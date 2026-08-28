@@ -333,11 +333,23 @@ impl Config {
             .with_context(|| format!("cannot read config file: {}", path.display()))?;
         let mut cfg: Config = serde_json::from_str(&raw)
             .with_context(|| format!("invalid config JSON: {}", path.display()))?;
-        for s in &cfg.mcp_servers {
+        cfg.validate_and_normalize()?;
+        Ok(cfg)
+    }
+
+    /// Post-deserialization normalization + validation, shared by EVERY config
+    /// entry point so they cannot drift: file load ([`Config::load`]) and the
+    /// Python binding's inline dict both route through here. Normalizes the
+    /// configured `workdir` (canonicalize + is-dir check — the sandbox root,
+    /// skill discovery, and result paths all derive from it) and validates MCP
+    /// server entries eagerly (a bad server fails at config time with the
+    /// config blamed, not at first connect with a confusing transport error).
+    pub fn validate_and_normalize(&mut self) -> Result<()> {
+        for s in &self.mcp_servers {
             s.validate()?;
         }
-        cfg.workdir = cfg.workdir.take().map(resolve_workdir).transpose()?;
-        Ok(cfg)
+        self.workdir = self.workdir.take().map(resolve_workdir).transpose()?;
+        Ok(())
     }
 
     pub fn base_url(&self) -> String {
@@ -543,6 +555,30 @@ pub struct PartialLimits {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_and_normalize_resolves_and_rejects_workdir() {
+        // The shared post-deserialization step (file load + the Python binding's
+        // inline dicts): a real workdir is canonicalized (symlinks resolved —
+        // the sandbox root and confinement checks derive from it), a
+        // nonexistent one fails HERE with the config blamed, instead of
+        // surfacing later at first tool use with a confusing error.
+        let mut cfg: Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"K","model":"m"}"#,
+        )
+        .unwrap();
+        let tmp = std::env::temp_dir(); // may itself sit behind a symlink (/tmp)
+        cfg.workdir = Some(tmp.clone());
+        cfg.validate_and_normalize().unwrap();
+        assert_eq!(
+            cfg.workdir.as_deref(),
+            Some(tmp.canonicalize().unwrap().as_path()),
+            "workdir is canonicalized"
+        );
+        cfg.workdir = Some(tmp.join("definitely-not-a-real-dir-for-config-tests"));
+        let err = cfg.validate_and_normalize().unwrap_err();
+        assert!(format!("{err:#}").contains("workdir"), "{err:#}");
+    }
 
     #[test]
     fn parse_minimal_config() {

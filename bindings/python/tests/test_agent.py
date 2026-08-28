@@ -502,3 +502,13 @@ def test_custom_provider_passes_through_non_end_turn_stop_reason(tmp_path):
     assert out["stop_reason"] == "max_tokens"
     assert out["final_text"] == "cut off"
 
+
+
+def test_inline_dict_config_validates_workdir():
+    # An inline dict used to skip Config::load's validate step: a nonexistent
+    # workdir silently fell back / diverged from the file path's semantics.
+    # Both construction paths now run validate_and_normalize, so a bogus
+    # workdir raises at construction (RuntimeError from the anyhow error).
+    cfg = openai_config("http://unused", tools=[], workdir="/definitely/not/a/real/dir")
+    with pytest.raises(RuntimeError, match="workdir"):
+        tiny_agent.Agent(cfg, api_key=MOCK_KEY)
