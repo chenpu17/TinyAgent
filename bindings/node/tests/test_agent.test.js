@@ -426,3 +426,85 @@ test('custom provider wait is bounded by the run budget, not just the 120s backs
   const elapsed = Date.now() - started;
   assert.ok(elapsed < 10_000, `failed fast (~1s), took ${elapsed}ms`);
 });
+
+// ── 12. robustness: throwing onEvent, busy sync methods, budget-bounded waits ─
+
+test('throwing onEvent does not kill the process; run still completes', async (t) => {
+  // P1-3 regression: the native event TSFNs use ErrorStrategy::Fatal, so an
+  // uncaught throw inside onEvent escalates to napi_fatal_exception — an
+  // UNCATCHABLE process exit (the whole test runner would die). The wrapper
+  // swallows the throw (Python-binding semantics); the run must complete.
+  const { cfgPath } = providerConfig(t);
+  const a = new Agent(cfgPath, {
+    provider: () => ({ text: 'done', stop_reason: 'end_turn' }),
+  });
+  a.pushUser('hi');
+  const out = await a.run((ev) => {
+    throw new Error('buggy onEvent: ' + JSON.stringify(ev));
+  });
+  assert.strictEqual(out.stop_reason, 'end_turn');
+
+  // Same guarantee for the one-shot chat() path (a rejected async callback).
+  const out2 = await chat(cfgPath, 'hi', {
+    provider: () => ({ text: 'ok', stop_reason: 'end_turn' }),
+    onEvent: async () => {
+      throw new Error('async throw');
+    },
+  });
+  assert.strictEqual(out2.stop_reason, 'end_turn');
+});
+
+test('sync methods busy-error while run() is in flight, work again after', async (t) => {
+  // P2-12 regression: a blocking lock on the JS main thread would freeze the
+  // event loop the run's own TSFN round-trips depend on (deadlock in all but
+  // name). The methods must fail fast with a busy error instead.
+  const { cfgPath } = providerConfig(t);
+  const a = new Agent(cfgPath, {
+    provider: async () => {
+      await new Promise((r) => setTimeout(r, 400));
+      return { text: 'done', stop_reason: 'end_turn' };
+    },
+  });
+  a.pushUser('hi');
+  const p = a.run(); // NOT awaited yet — it holds the agent lock in flight
+  await new Promise((r) => setTimeout(r, 100));
+  for (const busy of [() => a.pushUser('x'), () => a.usage(), () => a.messages(), () => a.model()]) {
+    assert.throws(busy, /active/, 'sync method must busy-error during run()');
+  }
+  const out = await p;
+  assert.strictEqual(out.stop_reason, 'end_turn');
+  // After the awaited run resolves, the methods work again.
+  assert.strictEqual(a.model(), 'mock-model');
+  assert.ok(Array.isArray(a.messages()));
+  assert.strictEqual(a.usage().input_tokens, 0); // provider reported no usage
+});
+
+test('never-resolving JS tool wait is bounded by the run budget, not 120s', async (t) => {
+  // P2-11 regression: the tool round-trip used to wait a fixed 120s backstop;
+  // with limits.timeout_secs set it must wait only the REMAINING budget (the
+  // same shape as the custom-provider wait), so a stuck tool fails the run in
+  // ~2s here instead of 120s. (The simple custom-provider shape can't emit
+  // tool calls, so the tool_use turn comes from the SSE mock.)
+  const mock = await ScriptedMock.start([
+    (_body, res) => respondSse(res, toolCallSse('c1', 'hang', {})),
+    (_body, res) => respondSse(res, textSse('late but bounded')),
+  ]);
+  t.after(() => mock.stop());
+  const { cfgPath } = writeConfig(t, mock.url, { tools: [], timeoutSecs: 2 });
+  const started = Date.now();
+  const out = await chat(cfgPath, 'call the hanging tool', {
+    apiKey: MOCK_KEY,
+    tools: [{
+      name: 'hang',
+      description: 'never resolves',
+      schema: { type: 'object', properties: {} },
+      run: () => new Promise(() => {}), // never settles → never calls resolveTool
+    }],
+  });
+  const elapsed = Date.now() - started;
+  assert.ok(
+    out.tool_calls[0].output.includes('did not resolve within'),
+    `tool error should name the bounded wait: ${out.tool_calls[0].output}`,
+  );
+  assert.ok(elapsed < 60_000, `run must not wait the full 120s backstop (${elapsed}ms)`);
+});

@@ -90,9 +90,33 @@ function wrapProvider(provider) {
   };
 }
 
+/** Wrap the user's onEvent callback so a throw can't kill the process. The
+ *  native side uses ErrorStrategy::Fatal for event TSFNs (the event is
+ *  fire-and-forget — there's no Rust side to hand an error to), so an uncaught
+ *  throw in the callback escalates to napi_fatal_exception: an UNCATCHABLE
+ *  process exit. Swallow instead (log to stderr), matching the Python
+ *  binding's semantics (a buggy onEvent must not poison the run) and the
+ *  tools/provider wrappers above. Covers sync throws and async rejections. */
+function wrapOnEvent(onEvent) {
+  if (typeof onEvent !== 'function') return undefined;
+  return function onNativeEvent(ev) {
+    try {
+      Promise.resolve(onEvent(ev)).catch((e) => {
+        console.error('[tiny-agent] onEvent callback threw (ignored):', e);
+      });
+    } catch (e) {
+      console.error('[tiny-agent] onEvent callback threw (ignored):', e);
+    }
+  };
+}
+
 class Agent extends native.Agent {
   constructor(configPath, opts = {}) {
     super(configPath, wrapTools(opts.tools), wrapProvider(opts.provider), opts.apiKey);
+  }
+
+  run(onEvent) {
+    return super.run(wrapOnEvent(onEvent));
   }
 }
 
@@ -100,7 +124,7 @@ async function chat(configPath, message, opts = {}) {
   return native.chat(
     configPath,
     message,
-    opts.onEvent,
+    wrapOnEvent(opts.onEvent),
     wrapTools(opts.tools),
     wrapProvider(opts.provider),
     opts.apiKey,

@@ -26,7 +26,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction, ThreadsafeFunctionCallMode};
@@ -147,7 +147,7 @@ fn build_extra_tools(env: Env, tools: Option<Vec<Object>>) -> Result<Vec<Box<dyn
             description,
             schema,
         };
-        let tool = ta::CallbackTool::new(def, move |input: &Value, _ctx: &ta::ToolCtx| {
+        let tool = ta::CallbackTool::new(def, move |input: &Value, ctx: &ta::ToolCtx| {
             let id = NEXT_TOOL_ID.fetch_add(1, Ordering::Relaxed);
             let (tx, rx) = mpsc::channel();
             pending_tools().lock().unwrap().insert(id, tx);
@@ -163,9 +163,20 @@ fn build_extra_tools(env: Env, tools: Option<Vec<Object>>) -> Result<Vec<Box<dyn
 
             // Block the agent worker thread for the JS result. The JS main
             // thread is free (the run() caller awaits it), so the wrapped run
-            // resolves the channel promptly; the timeout is a backstop against
-            // a user tool that never returns.
-            match rx.recv_timeout(Duration::from_secs(JS_CALLBACK_TIMEOUT_SECS)) {
+            // resolves the channel promptly. When the run set a wall-clock
+            // budget (limits.timeout_secs), the tool ctx carries its deadline —
+            // the wait is then the REMAINDER (capped by the backstop), so a
+            // never-returning JS tool can't outlive the run budget. Same shape
+            // as the custom-provider wait below.
+            let wait = ctx
+                .deadline
+                .and_then(|d| d.checked_duration_since(Instant::now()))
+                .filter(|d| *d < Duration::from_secs(JS_CALLBACK_TIMEOUT_SECS))
+                .unwrap_or(Duration::from_secs(JS_CALLBACK_TIMEOUT_SECS));
+            // Round UP for the message: a sub-second budget remainder would
+            // otherwise read as "within 0s".
+            let wait_secs = wait.as_secs() + u64::from(wait.subsec_millis() > 0);
+            match rx.recv_timeout(wait) {
                 Ok(r) => Ok(ta::ToolOutput {
                     content: r.content,
                     is_error: r.is_error,
@@ -176,7 +187,7 @@ fn build_extra_tools(env: Env, tools: Option<Vec<Object>>) -> Result<Vec<Box<dyn
                 Err(_) => {
                     pending_tools().lock().unwrap().remove(&id);
                     Err(anyhow::anyhow!(
-                        "tool \"{name}\": JS callback did not resolve within {JS_CALLBACK_TIMEOUT_SECS}s"
+                        "tool \"{name}\": JS callback did not resolve within {wait_secs}s"
                     ))
                 }
             }
@@ -438,6 +449,21 @@ impl Default for CancelToken {
 
 // ── Agent ────────────────────────────────────────────────────────────────────
 
+/// Busy error for a sync method called while `run()` is in flight. The run
+/// holds the agent mutex on its libuv worker thread for the whole duration;
+/// BLOCKING the JS main thread on that lock would freeze the event loop the
+/// run itself depends on (TSFN event/tool/provider callbacks dispatch there —
+/// a blocked loop means the run can never finish: a deadlock in all but
+/// name). try_lock + an immediate, explanatory error is the only safe shape.
+/// After the awaited run() resolves, the methods work again.
+fn agent_busy() -> Error {
+    err(
+        "Agent.run() is active: pushUser/setCancel/usage/messages/model must \
+        not be called until the awaited run() resolves — calling them while a \
+        run is in flight would freeze the JS event loop the run depends on",
+    )
+}
+
 /// A multi-turn agent. Construct from a config file path, optionally with an
 /// explicit API key; call `.run()` per turn.
 #[napi]
@@ -481,23 +507,23 @@ impl Agent {
     }
 
     /// Append a user message (text) to the conversation, then (typically) call
-    /// `.run()`.
+    /// `.run()`. Errors with a busy error while `run()` is in flight (see
+    /// [`agent_busy`]).
     #[napi]
     pub fn push_user(&self, text: String) -> Result<()> {
-        self.inner
-            .lock()
-            .map_err(|_| err("agent mutex poisoned"))?
-            .push_user(vec![ta::Block::Text(text)]);
+        let mut a = self.inner.try_lock().map_err(|_| agent_busy())?;
+        a.push_user(vec![ta::Block::Text(text)]);
         Ok(())
     }
 
-    /// Arm a `CancelToken`; its flag interrupts the next turn boundary.
+    /// Arm a `CancelToken`; its flag interrupts the next turn boundary. Safe
+    /// to call while a run is in flight? No — same busy contract as the other
+    /// sync methods; flip `token.cancel()` instead (the token itself is
+    /// lock-free by design, that's the supported mid-run cancel path).
     #[napi]
     pub fn set_cancel(&self, token: &CancelToken) -> Result<()> {
-        self.inner
-            .lock()
-            .map_err(|_| err("agent mutex poisoned"))?
-            .set_cancel(token.flag.clone());
+        let mut a = self.inner.try_lock().map_err(|_| agent_busy())?;
+        a.set_cancel(token.flag.clone());
         Ok(())
     }
 
@@ -517,28 +543,27 @@ impl Agent {
     }
 
     /// Cumulative token usage of the current/latest run (4 axes), as an object.
+    /// Busy-errors while `run()` is in flight (see [`agent_busy`]).
     #[napi]
     pub fn usage(&self) -> Result<Value> {
-        let a = self.inner.lock().map_err(|_| err("agent mutex poisoned"))?;
+        let a = self.inner.try_lock().map_err(|_| agent_busy())?;
         serde_json::to_value(a.usage()).map_err(err)
     }
 
-    /// Conversation history as a list of message objects.
+    /// Conversation history as a list of message objects. Busy-errors while
+    /// `run()` is in flight (see [`agent_busy`]).
     #[napi]
     pub fn messages(&self) -> Result<Value> {
-        let a = self.inner.lock().map_err(|_| err("agent mutex poisoned"))?;
+        let a = self.inner.try_lock().map_err(|_| agent_busy())?;
         serde_json::to_value(a.messages()).map_err(err)
     }
 
-    /// The model name this agent sends with each request.
+    /// The model name this agent sends with each request. Busy-errors while
+    /// `run()` is in flight (see [`agent_busy`]).
     #[napi]
     pub fn model(&self) -> Result<String> {
-        Ok(self
-            .inner
-            .lock()
-            .map_err(|_| err("agent mutex poisoned"))?
-            .model()
-            .to_string())
+        let a = self.inner.try_lock().map_err(|_| agent_busy())?;
+        Ok(a.model().to_string())
     }
 }
 
