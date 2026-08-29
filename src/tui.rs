@@ -126,6 +126,13 @@ pub(crate) enum Row {
     /// when the queue flush actually sends it; dropped if the queue is.
     Queued(String),
     Assistant(String),
+    /// Reasoning trace (ThinkingDelta): rendered as plain dim-italic prose
+    /// with a `✻ ` marker — deliberately NOT markdown/MdCache so it can
+    /// never read like the answer (the old code folded the trace into the
+    /// Assistant row and the two merged into one blob). A sub-agent's trace
+    /// carries a `[name] ` prefix in the text at creation. Empty traces
+    /// (whitespace-only) render nothing.
+    Thinking(String),
     /// Tool call: collapsed shows a compact one-line arg summary; expanded
     /// pretty-prints the full input JSON. In the inline model rows commit to
     /// scrollback at their default state, so `expanded` stays at its initial
@@ -579,6 +586,12 @@ fn render_transcript(rows: &[Row]) -> String {
             Row::Assistant(t) if t.is_empty() => {}
             Row::Assistant(t) => {
                 out.push_str("Tiny\n");
+                out.push_str(t);
+                out.push_str("\n\n");
+            }
+            Row::Thinking(t) if t.trim().is_empty() => {}
+            Row::Thinking(t) => {
+                out.push_str("✻ Thinking\n");
                 out.push_str(t);
                 out.push_str("\n\n");
             }
@@ -1041,6 +1054,10 @@ fn ui_loop(
     // trailing Assistant row, so consecutive deltas from the same sub-agent
     // merge — and a different sub-agent (or the parent) starts a fresh row.
     let mut sub_streaming_name: Option<String> = None;
+    // Tag of the reasoning trace currently accumulating into a trailing
+    // Row::Thinking ("" for the parent, the sub-agent's name for a child);
+    // None when no trace is in flight. Same lifecycle as `streaming`.
+    let mut thinking_stream: Option<String> = None;
     // Input history (Alt+Up/Down to recall). `draft` holds the in-progress
     // text when the user starts browsing, so Down past the newest restores it.
     let mut history: Vec<String> = Vec::new();
@@ -1129,6 +1146,7 @@ fn ui_loop(
                         run_start = None;
                         streaming = false;
                         sub_streaming_name = None;
+                        thinking_stream = None;
                         // TurnStart sets this true; without resetting it here a
                         // worker that dies during the thinking phase (before any
                         // TextDelta clears it) would leave a stale flag.
@@ -1156,20 +1174,17 @@ fn ui_loop(
                 UiMsg::Event(ev) => match ev {
                     AgentEvent::TurnStart(_) => {
                         streaming = false;
+                        thinking_stream = None;
                         activity = "thinking".into();
                         thinking = true;
                         tool_running.clear();
                     }
-                    AgentEvent::TextDelta(t) | AgentEvent::ThinkingDelta(t) => {
+                    AgentEvent::TextDelta(t) => {
                         // First visible output: the thinking placeholder is
                         // superseded by real content (same below at ToolCall).
-                        // NOTE: a ThinkingDelta (reasoning-model trace) is folded
-                        // into the same assistant row as reply text — the TUI is
-                        // frozen (README Non-goals: bugfix-only), so it only
-                        // guarantees the trace is VISIBLE, not styled as a
-                        // separate collapsible block. TinyWorker's GUI renders
-                        // that block off the same event.
                         thinking = false;
+                        // The answer starts: the trace row is final.
+                        thinking_stream = None;
                         // The PARENT is streaming: no parent tool is pending
                         // anymore. (Sub-agent deltas below don't clear — a
                         // sibling parallel tool may legitimately still run.)
@@ -1190,8 +1205,25 @@ fn ui_loop(
                         }
                         append_delta(&mut rows, &mut streaming, &t);
                     }
+                    AgentEvent::ThinkingDelta(t) => {
+                        // Reasoning trace: its own dim ✻ block, never merged
+                        // into the answer row (the old fold made the trace and
+                        // the reply read as one blob).
+                        thinking = false;
+                        tool_running.clear();
+                        // Parent speaks: close any open sub bubble so the
+                        // trace doesn't merge into it (same rule as TextDelta).
+                        if sub_streaming_name.take().is_some() {
+                            streaming = false;
+                        }
+                        if activity != "thinking" {
+                            activity = "thinking".into();
+                        }
+                        append_thinking_delta(&mut rows, &mut thinking_stream, "", &t);
+                    }
                     AgentEvent::ToolCall { name, input } => {
                         streaming = false;
+                        thinking_stream = None;
                         thinking = false;
                         activity = format!("→ {name}");
                         tool_running.on_call(&name);
@@ -1214,6 +1246,7 @@ fn ui_loop(
                         content,
                     } => {
                         streaming = false;
+                        thinking_stream = None;
                         tool_running.on_result(&name);
                         // Content stays RAW: ANSI colors survive into
                         // ansi_guided_lines at render (which strips non-SGR
@@ -1233,6 +1266,7 @@ fn ui_loop(
                     }
                     AgentEvent::Done { stop_reason } => {
                         streaming = false;
+                        thinking_stream = None;
                         // A normal turn end is the common case — no row. Only
                         // abnormal stops (max_tokens/length/error/unknown) are
                         // worth a notice.
@@ -1246,6 +1280,7 @@ fn ui_loop(
                         trigger,
                     } => {
                         streaming = false;
+                        thinking_stream = None;
                         let how = match trigger {
                             crate::agent::CompressTrigger::Preflight => "preflight",
                             crate::agent::CompressTrigger::Overflow => "overflow",
@@ -1307,14 +1342,27 @@ fn ui_loop(
                         // activity segment) is terminal-safe.
                         let name = strip_controls(&name);
                         match &*event {
-                            AgentEvent::TextDelta(t) | AgentEvent::ThinkingDelta(t) => {
-                                // ThinkingDelta folded in alongside TextDelta
-                                // (TUI shows the trace inline; see main match).
+                            AgentEvent::TextDelta(t) => {
                                 thinking = false;
+                                // The child's answer starts: its trace row
+                                // (or any sibling's) is final.
+                                thinking_stream = None;
                                 append_sub_delta(&mut rows, &mut sub_streaming_name, &name, t);
+                            }
+                            AgentEvent::ThinkingDelta(t) => {
+                                // The child's trace: its own dim ✻ block with
+                                // the child's name on the head line — never
+                                // merged into its text bubble (same rule as
+                                // the parent's trace vs the answer).
+                                thinking = false;
+                                // Close the child's text bubble so the answer
+                                // restarts in a fresh bubble after the trace.
+                                sub_streaming_name = None;
+                                append_thinking_delta(&mut rows, &mut thinking_stream, &name, t);
                             }
                             AgentEvent::ToolCall { name: tn, input } => {
                                 sub_streaming_name = None;
+                                thinking_stream = None;
                                 thinking = false;
                                 activity = format!("[{name}] → {tn}");
                                 let input = strip_controls_json(input);
@@ -1337,6 +1385,7 @@ fn ui_loop(
                                 content,
                             } => {
                                 sub_streaming_name = None;
+                                thinking_stream = None;
                                 // The row name mirrors the ToolCall arm's
                                 // format, so nearest-back matching finds it.
                                 // Content stays raw for the ANSI-aware render.
@@ -1355,9 +1404,13 @@ fn ui_loop(
                                     elapsed,
                                 });
                             }
-                            AgentEvent::Done { .. } => sub_streaming_name = None,
+                            AgentEvent::Done { .. } => {
+                                sub_streaming_name = None;
+                                thinking_stream = None;
+                            }
                             AgentEvent::Warning(w) => {
                                 sub_streaming_name = None;
+                                thinking_stream = None;
                                 rows.push(Row::sys_warn(format!("[{name}] [warn] {w}")));
                             }
                             _ => {} // TurnStart/Compressed/Usage/SubAgent: noisy or folded
@@ -1374,11 +1427,13 @@ fn ui_loop(
                     activity.clear();
                     tool_running.clear();
                     // End every open stream: a leftover `streaming` /
-                    // `sub_streaming_name` would let the NEXT run's first
-                    // TextDelta merge into a stale row (or, when the last row
-                    // is this System row, be silently dropped).
+                    // `sub_streaming_name` / `thinking_stream` would let the
+                    // NEXT run's first TextDelta merge into a stale row (or,
+                    // when the last row is this System row, be silently
+                    // dropped).
                     streaming = false;
                     sub_streaming_name = None;
+                    thinking_stream = None;
                     // Flush the queue: send the next queued message right
                     // away, keeping busy=true on success so no idle gap opens
                     // (a Ctrl-C in that gap would quit instead of cancelling).
@@ -1394,6 +1449,7 @@ fn ui_loop(
                 UiMsg::RunFinished => {
                     streaming = false;
                     sub_streaming_name = None;
+                    thinking_stream = None;
                     activity.clear();
                     tool_running.clear();
                     // Flush the queue (same contract as the Error branch).
@@ -1415,7 +1471,7 @@ fn ui_loop(
         // and queued ghosts (removed on flush, never committed). This is the
         // one place the inline model writes the conversation to scrollback, so
         // the host terminal's native selection/scroll/search cover it.
-        let stream_open = streaming || sub_streaming_name.is_some();
+        let stream_open = streaming || sub_streaming_name.is_some() || thinking_stream.is_some();
         let pending_end = commit_pending_end(&rows, committed, stream_open);
         if committed < pending_end {
             let width = term.size().map(|s| s.width).unwrap_or(80) as usize;
@@ -1478,11 +1534,16 @@ fn ui_loop(
                     render_zone_tail(f, zone_rect, &[line]);
                 } else if let Some(idx) = inflight_idx {
                     if let Some(row) = rows.get(idx) {
+                        let live = if matches!(row, Row::Thinking(_)) {
+                            LiveRow::Think
+                        } else {
+                            LiveRow::Text
+                        };
                         let l = build_history_lines(
                             std::slice::from_ref(row),
                             &mut md_cache,
                             content_w,
-                            true,
+                            live,
                             false,
                         );
                         let wrapped = wrap_history(&l, content_w);
@@ -2082,10 +2143,19 @@ fn push_tool_head(lines: &mut Vec<Line<'static>>, head: Line<'static>, hang: usi
 /// the draw/commit paths so role hierarchy, colors, `│ ` guides, the streaming
 /// cursor, and the empty placeholder are unit-testable without a terminal.
 ///
+/// Which trailing row is live (still growing) in this render — drives the
+/// `▌` cursor. `None` for the commit path (rows are final); `Text`/`Think`
+/// for the single in-flight row rendered in the viewport's transcript zone.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LiveRow {
+    None,
+    Text,
+    Think,
+}
+
 /// `inner_w` is the content width.
-/// `streaming` appends a `▌` cursor to the in-flight assistant row's last
-/// line — the lines are clones out of MdCache, so the cached render stays
-/// clean.
+/// `live` appends a `▌` cursor to the in-flight row's last line — the lines
+/// are clones out of MdCache, so the cached render stays clean.
 /// `thinking` synthesizes one transient `● …` tail line while the agent has
 /// started a turn but produced no visible output yet. It is render-only: not
 /// a row, so MdCache and the transcript are untouched.
@@ -2094,7 +2164,7 @@ fn build_history_lines(
     rows: &[Row],
     md_cache: &mut MdCache,
     inner_w: usize,
-    streaming: bool,
+    live: LiveRow,
     thinking: bool,
 ) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -2168,10 +2238,39 @@ fn build_history_lines(
                 );
                 lines.extend(rendered);
                 // Streaming cursor on the live assistant row.
-                if streaming && idx == rows.len() - 1 {
+                if live == LiveRow::Text && idx == rows.len() - 1 {
                     if let Some(last) = lines.last_mut() {
                         last.spans
                             .push(Span::styled("▌".to_string(), Style::default().fg(AGENT_FG)));
+                    }
+                }
+            }
+            Row::Thinking(t) => {
+                // Reasoning trace: plain dim-italic prose — deliberately NOT
+                // markdown/MdCache so it can never read like the answer.
+                // Wrapped here because wrap_history's final pass can't
+                // re-indent continuation lines under the marker.
+                if t.trim().is_empty() {
+                    continue; // whitespace-only trace: render nothing
+                }
+                let style = Style::default().fg(dim_fg()).add_modifier(Modifier::ITALIC);
+                let body_w = inner_w.saturating_sub(ROLE_BODY_INDENT).max(1);
+                let mut rendered: Vec<Line<'static>> = t
+                    .split('\n')
+                    .flat_map(|l| {
+                        wrap_line(&Line::from(Span::styled(l.to_string(), style)), body_w)
+                    })
+                    .collect();
+                indent_lines(&mut rendered, ROLE_BODY_INDENT);
+                // Inline marker over the first line's indent (same trick as
+                // the role icons): `✻ ` announces a trace block in one row,
+                // no header line spent.
+                rendered[0].spans[0] = Span::styled("✻ ".to_string(), style);
+                lines.extend(rendered);
+                // Streaming cursor on the live trace row.
+                if live == LiveRow::Think && idx == rows.len() - 1 {
+                    if let Some(last) = lines.last_mut() {
+                        last.spans.push(Span::styled("▌".to_string(), style));
                     }
                 }
             }
@@ -2685,9 +2784,9 @@ fn content_width(term_w: u16) -> usize {
 ///    row. Capping at the *first* ghost fixes both: the ghost and every later
 ///    row stay out of scrollback until the queue flushes (flush removes only
 ///    this still-uncommitted ghost, so the index invariant stays sound).
-/// 2. While a stream is open, a trailing **`Row::Assistant`** — the in-flight
-///    reply is still mutating and is shown live in the viewport, not committed
-///    until the stream closes.
+/// 2. While a stream is open, a trailing **`Row::Assistant`/`Row::Thinking`**
+///    — the in-flight reply or reasoning trace is still mutating and is shown
+///    live in the viewport, not committed until the stream closes.
 fn commit_pending_end(rows: &[Row], committed: usize, stream_open: bool) -> usize {
     // Cap at the first queued ghost (holds the ghost + everything after back).
     let mut pending_end = match rows[committed..]
@@ -2697,8 +2796,13 @@ fn commit_pending_end(rows: &[Row], committed: usize, stream_open: bool) -> usiz
         Some(i) => committed + i,
         None => rows.len(),
     };
-    // Hold back an in-flight trailing Assistant while its stream is open.
-    if stream_open && pending_end > committed && matches!(rows[pending_end - 1], Row::Assistant(_))
+    // Hold back an in-flight trailing Assistant/Thinking while its stream is
+    // open. Whichever stream is open, its mutating row is the trailing one
+    // (every other event either closes the stream or pushes a later row), so
+    // one trailing check covers both kinds.
+    if stream_open
+        && pending_end > committed
+        && matches!(rows[pending_end - 1], Row::Assistant(_) | Row::Thinking(_))
     {
         pending_end -= 1;
     }
@@ -2706,8 +2810,9 @@ fn commit_pending_end(rows: &[Row], committed: usize, stream_open: bool) -> usiz
 }
 
 /// Index of the row to render live in the viewport's transcript zone while a
-/// stream is open, else None. This is the row `append_delta` is currently
-/// mutating — the LAST `Row::Assistant` in `rows` — which a queued ghost may
+/// stream is open, else None. This is the row `append_delta` /
+/// `append_thinking_delta` is currently mutating — the LAST
+/// `Row::Assistant`/`Row::Thinking` in `rows` — which a queued ghost may
 /// sit behind. It is deliberately INDEPENDENT of `commit_pending_end`: that
 /// watermark caps at the first queued ghost, so when a new turn streams AFTER
 /// a ghost, the watermark points at the stale pre-ghost Assistant, not the
@@ -2715,7 +2820,8 @@ fn commit_pending_end(rows: &[Row], committed: usize, stream_open: bool) -> usiz
 /// rendered that stale row and hid the real streaming output.
 fn inflight_row_index(rows: &[Row], stream_open: bool) -> Option<usize> {
     if stream_open {
-        rows.iter().rposition(|r| matches!(r, Row::Assistant(_)))
+        rows.iter()
+            .rposition(|r| matches!(r, Row::Assistant(_) | Row::Thinking(_)))
     } else {
         None
     }
@@ -2727,7 +2833,7 @@ fn commit_rows<B: ratatui::backend::Backend>(
     md_cache: &mut MdCache,
     width: usize,
 ) -> Result<(), B::Error> {
-    let lines = build_history_lines(rows, md_cache, width, false, false);
+    let lines = build_history_lines(rows, md_cache, width, LiveRow::None, false);
     let wrapped = wrap_history(&lines, width);
     if wrapped.is_empty() {
         return Ok(());
@@ -2846,6 +2952,34 @@ fn append_delta(rows: &mut Vec<Row>, streaming: &mut bool, text: &str) {
         *streaming = true;
     }
     if let Some(Row::Assistant(buf)) = rows.last_mut() {
+        buf.push_str(&strip_controls(text));
+    }
+}
+
+/// Append a ThinkingDelta to the trace row. Consecutive deltas merge while
+/// the same stream is open (`thinking_stream` holds the tag: "" for the
+/// parent, the sub-agent name for a child); any other row in between — the
+/// answer starting, a tool call, another agent's bubble — naturally starts
+/// a fresh ✻ block on re-entry. A sub-agent's row opens with `[name] ` in
+/// the text so the render shows whose trace it is.
+fn append_thinking_delta(
+    rows: &mut Vec<Row>,
+    thinking_stream: &mut Option<String>,
+    tag: &str,
+    text: &str,
+) {
+    let merge =
+        thinking_stream.as_deref() == Some(tag) && matches!(rows.last(), Some(Row::Thinking(_)));
+    if !merge {
+        let head = if tag.is_empty() {
+            String::new()
+        } else {
+            format!("[{tag}] ")
+        };
+        rows.push(Row::Thinking(head));
+        *thinking_stream = Some(tag.to_string());
+    }
+    if let Some(Row::Thinking(buf)) = rows.last_mut() {
         buf.push_str(&strip_controls(text));
     }
 }
@@ -3890,7 +4024,7 @@ mod tests {
     /// Build history lines with the test width, not streaming.
     fn history(rows: &[Row]) -> Vec<Line<'static>> {
         let mut cache = MdCache::new();
-        build_history_lines(rows, &mut cache, TEST_W, false, false)
+        build_history_lines(rows, &mut cache, TEST_W, LiveRow::None, false)
     }
 
     #[test]
@@ -4183,7 +4317,7 @@ mod tests {
             Row::Assistant("typing".into()),
         ];
         let mut cache = MdCache::new();
-        let lines = build_history_lines(&rows, &mut cache, TEST_W, true, false);
+        let lines = build_history_lines(&rows, &mut cache, TEST_W, LiveRow::Text, false);
         assert_eq!(row_text(&lines[0]), "● done");
         assert_eq!(row_text(&lines[1]), "● typing▌");
         let last = lines[1].spans.last().expect("a cursor span");
@@ -4198,7 +4332,7 @@ mod tests {
     fn history_thinking_appends_a_transient_placeholder_tail() {
         let rows = vec![Row::User("hi".into())];
         let mut cache = MdCache::new();
-        let lines = build_history_lines(&rows, &mut cache, TEST_W, false, true);
+        let lines = build_history_lines(&rows, &mut cache, TEST_W, LiveRow::None, true);
         let last = lines.last().expect("a thinking tail line");
         assert_eq!(row_text(last), "● …");
         let icon = last.spans[0].style;
@@ -4212,9 +4346,61 @@ mod tests {
         // before its first row): the placeholder replaces the onboarding
         // cheat-sheet instead of stacking under it.
         let mut cache = MdCache::new();
-        let lines = build_history_lines(&[], &mut cache, TEST_W, false, true);
+        let lines = build_history_lines(&[], &mut cache, TEST_W, LiveRow::None, true);
         assert_eq!(lines.len(), 1);
         assert_eq!(row_text(&lines[0]), "● …");
+    }
+
+    #[test]
+    fn thinking_row_renders_dim_italic_marker_without_markdown() {
+        // The trace must NOT read like the answer: no markdown parsing
+        // (asterisks stay literal), dim+italic prose, `✻ ` head marker.
+        // (A trailing blank spacer line follows every row boundary — these
+        // assertions target the body lines, not lines.last().)
+        let rows = vec![Row::Thinking("**bold** and `code`".into())];
+        let lines = history(&rows);
+        assert_eq!(row_text(&lines[0]), "✻ **bold** and `code`");
+        let m = lines[0].spans[0].style;
+        assert_eq!(m.fg, Some(dim_fg()));
+        assert!(m.add_modifier.contains(Modifier::ITALIC));
+        let body = lines[0].spans[1].style;
+        assert_eq!(body.fg, Some(dim_fg()));
+        assert!(body.add_modifier.contains(Modifier::ITALIC));
+
+        // Multi-line traces: continuation lines indent under the marker.
+        let rows = vec![Row::Thinking("first\nsecond".into())];
+        let lines = history(&rows);
+        assert_eq!(row_text(&lines[0]), "✻ first");
+        assert_eq!(row_text(&lines[1]), "  second");
+
+        // A sub-agent's trace carries its name on the head line.
+        let rows = vec![Row::Thinking("[worker] planning".into())];
+        let lines = history(&rows);
+        assert_eq!(row_text(&lines[0]), "✻ [worker] planning");
+
+        // Whitespace-only traces render nothing but the boundary spacer —
+        // no stray bare marker.
+        let lines = history(&[Row::Thinking("  \n ".into())]);
+        assert!(lines.iter().all(|l| row_text(l).trim().is_empty()));
+    }
+
+    #[test]
+    fn thinking_row_gets_a_cursor_only_while_it_is_the_live_row() {
+        let rows = vec![Row::Thinking("reasoning".into())];
+        let mut cache = MdCache::new();
+        let lines = build_history_lines(&rows, &mut cache, TEST_W, LiveRow::Think, false);
+        // (lines.last() is the row-boundary spacer; the cursor sits on the
+        // last BODY line.)
+        assert!(
+            lines.iter().any(|l| row_text(l).ends_with('▌')),
+            "cursor on the live trace: {lines:?}"
+        );
+        // Text-live (an Assistant streaming) must NOT cursor a Thinking row.
+        let lines = build_history_lines(&rows, &mut cache, TEST_W, LiveRow::Text, false);
+        assert!(!lines.iter().any(|l| row_text(l).contains('▌')));
+        // Committed render: no cursor.
+        let lines = history(&rows);
+        assert!(!lines.iter().any(|l| row_text(l).contains('▌')));
     }
 
     #[test]
@@ -4778,6 +4964,53 @@ mod tests {
     }
 
     #[test]
+    fn append_thinking_delta_merges_consecutive_and_reopens_after_a_break() {
+        // Consecutive parent deltas merge into one trace row.
+        let mut rows = vec![];
+        let mut ts: Option<String> = None;
+        append_thinking_delta(&mut rows, &mut ts, "", "let me ");
+        append_thinking_delta(&mut rows, &mut ts, "", "think");
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(&rows[0], Row::Thinking(t) if t == "let me think"));
+        assert_eq!(ts.as_deref(), Some(""));
+
+        // The answer starting closes the trace (the event arm resets the
+        // flag); a later trace re-opens as a FRESH row instead of merging
+        // back into the answer or the old trace.
+        ts = None;
+        let mut streaming = false;
+        append_delta(&mut rows, &mut streaming, "answer");
+        append_thinking_delta(&mut rows, &mut ts, "", "more");
+        assert_eq!(rows.len(), 3);
+        assert!(matches!(&rows[1], Row::Assistant(t) if t == "answer"));
+        assert!(matches!(&rows[2], Row::Thinking(t) if t == "more"));
+
+        // A tail that isn't the open trace (interleaved notice) opens a new
+        // row — deltas are never dropped.
+        ts = None;
+        rows.push(Row::sys_info("notice"));
+        append_thinking_delta(&mut rows, &mut ts, "", "trace");
+        assert_eq!(rows.len(), 5);
+        assert!(matches!(&rows[4], Row::Thinking(t) if t == "trace"));
+    }
+
+    #[test]
+    fn append_thinking_delta_tags_sub_agent_rows_by_name() {
+        let mut rows = vec![];
+        let mut ts: Option<String> = None;
+        append_thinking_delta(&mut rows, &mut ts, "worker", "planning");
+        assert!(matches!(&rows[0], Row::Thinking(t) if t == "[worker] planning"));
+        // Same child merges; a different child opens its own tagged row.
+        append_thinking_delta(&mut rows, &mut ts, "worker", "...");
+        assert_eq!(rows.len(), 1);
+        ts = None;
+        rows.push(Row::sys_info("notice"));
+        append_thinking_delta(&mut rows, &mut ts, "other", "hmm");
+        assert_eq!(rows.len(), 3);
+        assert!(matches!(&rows[2], Row::Thinking(t) if t == "[other] hmm"));
+    }
+
+    #[test]
     fn append_sub_delta_merges_by_name_and_recovers_after_interruption() {
         let mut rows = vec![];
         let mut sub: Option<String> = None;
@@ -4979,6 +5212,37 @@ mod tests {
         // Stream open: the in-flight Assistant (last row) stays in the live
         // viewport, not committed to scrollback until the stream closes.
         assert_eq!(commit_pending_end(&rows, 0, true), 1);
+    }
+
+    #[test]
+    fn commit_pending_end_holds_back_a_trailing_thinking_trace() {
+        // A reasoning trace streams like the reply does: held in the live
+        // viewport while open, committed once closed. When the answer has
+        // started, the trace is no longer trailing — it commits right away
+        // and only the answer row is held.
+        let rows = vec![Row::User("hi".into()), Row::Thinking("trace".into())];
+        assert_eq!(commit_pending_end(&rows, 0, true), 1);
+        assert_eq!(commit_pending_end(&rows, 0, false), 2);
+        let rows = vec![
+            Row::User("hi".into()),
+            Row::Thinking("trace".into()),
+            Row::Assistant("answer".into()),
+        ];
+        assert_eq!(commit_pending_end(&rows, 0, true), 2);
+    }
+
+    #[test]
+    fn inflight_row_index_covers_a_streaming_trace() {
+        // While the trace streams (no Assistant yet), the live zone shows
+        // the Thinking row; when the answer streams, it takes over.
+        let rows = vec![Row::User("hi".into()), Row::Thinking("trace".into())];
+        assert_eq!(inflight_row_index(&rows, true), Some(1));
+        let rows = vec![
+            Row::User("hi".into()),
+            Row::Thinking("trace".into()),
+            Row::Assistant("answer".into()),
+        ];
+        assert_eq!(inflight_row_index(&rows, true), Some(2));
     }
 
     #[test]
@@ -5686,6 +5950,8 @@ mod tests {
         let rows = vec![
             Row::User("hello".into()),
             Row::Queued("later".into()),
+            Row::Thinking("pondering".into()),
+            Row::Thinking("   ".into()),   // whitespace-only → skipped
             Row::Assistant(String::new()), // empty → skipped (no bare "Tiny")
             Row::Assistant("I am fine".into()),
             Row::ToolCall {
@@ -5717,6 +5983,11 @@ mod tests {
         assert!(out.contains("You\nhello"), "user row: {out:?}");
         assert!(out.contains("You (queued)\nlater"), "queued ghost: {out:?}");
         assert!(out.contains("Tiny\nI am fine"), "assistant body: {out:?}");
+        assert!(out.contains("✻ Thinking\npondering"), "trace row: {out:?}");
+        assert!(
+            !out.contains("✻ Thinking\n   "),
+            "whitespace-only trace must be skipped"
+        );
         assert!(!out.contains("Tiny\n\n"), "empty assistant must be skipped");
         assert!(out.contains("→ shell: null"), "tool call: {out:?}");
         assert!(out.contains("✓ shell: a.txt"), "tool result: {out:?}");

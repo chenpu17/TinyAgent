@@ -355,7 +355,9 @@ running 时输入框标题显示 spinner、当前活动（thinking / writing / �
 队列长度（终端过窄放不下时优先省略活动名，保留耗时与取消提示），整个输入框边框随运行状态变色；
 空闲时标题为 ` Ask TinyAgent `。
 一轮开始还没有可见输出时，live 区显示瞬时的 `● …` 占位（渲染期合成，不进对话历史），首个文本或
-工具调用出现即消失。
+工具调用出现即消失。推理模型的思考过程单独渲染为暗色斜体的 `✻` 区块——不走 markdown、和答复正文
+视觉分离，流式期间带 `▌` 光标、输入框标题显示 thinking；答复开始后 ✻ 区块定稿进 scrollback，答复以
+正常样式另起一块（子 agent 的思考带 `[名字]` 标注）。`/export` 导出时思考以 `✻ Thinking` 段落收录。
 状态行左侧只保留模型、整体运行状态（running / idle，无计时）、上下文占用和累计 token（如
 `1.2k in · 0.8k out`）；右侧右对齐显示当前目录的完整路径
 （并行开多个窗口时一眼区分，过长时左侧截断加 `…` 前缀，剩余不足 12 列则整段隐藏——窄屏时它最先消失）。
@@ -541,7 +543,7 @@ API key 从 `api_key_env` 指定的环境变量读取，不写进配置文件。
 
 `reasoning_effort`（可选字符串，默认不设）：思考程度，**按字符串原样透传给 provider，不做枚举校验**——各家档位碎片化且随模型代际变动，TinyAgent 不维护映射表，由 provider/server 拒绝未知值。取值参考：OpenAI `none`/`low`/`medium`/`high`/`xhigh`/`max`（随模型代际扩张）、Anthropic `low`/`medium`/`high`/`max`（Claude 4.6+ adaptive thinking；Opus 4.7 起旧 `budget_tokens` 已移除）、DeepSeek `low`/`high`/`xhigh`/`max`、GLM 仅开关（`enabled`/`disabled`）。映射：OpenAI 系直接发 `reasoning_effort` 字段（老网关不认会 400，`body_fix_for_400` 自动 drop 重试，与 `max_tokens`/`stream_options` 同款）；Anthropic 发 `thinking: {"type": "adaptive"}` + `output_config: {"effort": "..."}`（effort 在**独立顶层 `output_config` 对象**里，不在 thinking 内、也不是裸顶层字段——裸顶层会被静默忽略，这是该 API 最常见的坑），`"none"` 发 `{"type": "disabled"}`。
 
-**思考内容透出**：推理模型的思考过程作为 `ThinkingDelta` 事件流式透出（OpenAI 系 `delta.reasoning_content`、Anthropic `thinking` content block），`--json` 下为 `{"type":"thinking","delta":...}`；**不进对话历史正文与上下文回传**（各家 API 也不要求回传，故只作事件透出给 UI）。GUI（如 TinyWorker）据此渲染可折叠"思考过程"区块；headless 终端把思考写到 **stderr**（不污染 stdout 的最终回复 / `summary`）；TUI 内联显示（冻结，仅保证可见，不做独立可折叠区块）。批量任务片段可覆盖此项（软字段，与 `model`/`max_tokens` 同类，不在 `forbidden_batch_override`）。
+**思考内容透出**：推理模型的思考过程作为 `ThinkingDelta` 事件流式透出（OpenAI 系 `delta.reasoning_content`、Anthropic `thinking` content block），`--json` 下为 `{"type":"thinking","delta":...}`；**不进对话历史正文与上下文回传**（各家 API 也不要求回传，故只作事件透出给 UI）。GUI（如 TinyWorker）据此渲染可折叠"思考过程"区块；headless 终端把思考写到 **stderr**（不污染 stdout 的最终回复 / `summary`）；TUI 渲染为**独立的暗色斜体 `✻` 区块**（不走 markdown、与答复正文视觉分离，流式期间输入框标题显示 thinking，结束后随答复一起定稿进 scrollback）。批量任务片段可覆盖此项（软字段，与 `model`/`max_tokens` 同类，不在 `forbidden_batch_override`）。
 
 ### 上下文压缩
 

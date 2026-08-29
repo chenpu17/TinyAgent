@@ -221,6 +221,13 @@ cargo clippy -p tiny-agent-node
   **TUI 定位（原"冻结只修 bug"政策已按产品决定放宽）**：交互体验对齐主流终端 AI 工具的基础项
   已落地一批（见下），红线仍是**架构与渲染模型**——不做全屏 / 鼠标托管 / 主题系统这类结构性扩张。
   已落地的扩展面速记：
+  - **思考区块（`Row::Thinking`）**：ThinkingDelta 不再与答复折进同一 Assistant 行（混排不可读），
+    走 `append_thinking_delta` 进独立暗色斜体 `✻` 行——`thinking_stream: Option<String>` 是当前在飞
+    trace 的 tag（"" 父 / 子 agent 名，merge 判据同 `sub_streaming_name`），答复/工具/任何其它行插入
+    即关闭、再次 trace 开新行；**不走 markdown/MdCache**（视觉上必须区别于答复）；`commit_pending_end`
+    与 `inflight_row_index` 都把 Thinking 与 Assistant 同等对待（在飞 hold back / live 区渲染 + `▌` 光标，
+    `build_history_lines` 的 `LiveRow::{Text,Think}` 决定光标归属）；空 trace 渲染为空、`/export` 以
+    `✻ Thinking` 段落收录。改这三处的人：新增任何"在飞行"必须同步 holdback/inflight/LiveRow 三件套。
   - **render-only 瞬态模式**（`thinking`、`tool_running` 同款）：渲染期合成、不进 rows / MdCache /
     转录——live 区渲染优先链 popup > thinking > inflight 流式行 > tool_running 占位
     （`→ 工具名 · 1.2s…`，并行 fan-out 聚合 `(+N)`，busy 时 120ms tick 走字）。新增瞬态展示照此模式。
@@ -409,7 +416,7 @@ cargo clippy -p tiny-agent-node
   都要加 `.envs`，别只改一条。
 - **思考内容展示策略**：`ThinkingDelta` 在 `harness` 的 `--json` NDJSON 发 `{"type":"thinking","delta":...}`；
   headless 终端打印写 **stderr**（不进 stdout 的 `summary`，可 `2>/dev/null` 屏蔽）；TUI 用 or 模式
-  `TextDelta(t) | ThinkingDelta(t)` 折进同一渲染分支（只保证可见，不做独立可折叠区块——那是 TinyWorker 的事）。
+  TUI 渲染为独立暗色斜体 `✻` 区块（`Row::Thinking`，不走 markdown/MdCache，与答复视觉分离；可折叠区块仍是 TinyWorker 的事）。
   子 agent 的思考经 `AgentEvent::SubAgent` 整体包装转发（`subagent.rs` 不逐变体 match），harness 的 SubAgent 内嵌
   match 单独把它写 stderr 带 `[name]` 前缀。
 - **改 `agent.rs` 核心路径必须配套 loop 测试**。测试外置在 `agent_tests.rs`（`agent.rs` 末尾

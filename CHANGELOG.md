@@ -77,6 +77,11 @@
 
 ### Added
 
+- **TUI 思考过程独立区块**：`ThinkingDelta` 不再与答复正文折进同一 Assistant 行（推理模型的思考
+  与回复混排成一坨不可读），改渲染为独立的暗色斜体 `✻` 区块——不走 markdown、与答复视觉
+  分离；流式期间 live 区带 `▌` 光标、输入框标题如实显示 thinking（答复开始才转 writing），
+  答复以正常样式另起一块，两者先后定稿进 scrollback；子 agent 的思考带 `[名字]` 标注，
+  `/export` 以 `✻ Thinking` 段落收录。
 - **TUI 体验改进批次**（全部改动在 bin crate、lib 零触碰；守「内联 live 区 + 原生
   scrollback」架构红线，无鼠标 / 托管滚动）：
   - **工具运行期 live 占位 + 计时**：工具执行中 live 区显示 `→ 工具名 · 1.2s…`
