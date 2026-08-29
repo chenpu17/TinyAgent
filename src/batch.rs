@@ -1956,11 +1956,17 @@ mod tests {
         std::fs::write(dir.join("b.json"), r#"{"task":"do b"}"#).unwrap();
 
         std::env::set_var("TA_BATCH_ISO_KEY", "dummy");
-        let base: Config = serde_json::from_str(&format!(
-            r#"{{"provider":"openai","api_key_env":"TA_BATCH_ISO_KEY","model":"m","base_url":"{}","workdir":"{}","tools":["write_file"]}}"#,
-            url,
-            workdir.display()
-        ))
+        // json! (not format!-into-from_str): a Windows temp path carries
+        // backslashes (C:\Users\...) whose \U etc. are invalid JSON escapes —
+        // json! serializes the path string with proper escaping, portable.
+        let base: Config = serde_json::from_value(json!({
+            "provider": "openai",
+            "api_key_env": "TA_BATCH_ISO_KEY",
+            "model": "m",
+            "base_url": url,
+            "workdir": workdir.display().to_string(),
+            "tools": ["write_file"],
+        }))
         .unwrap();
         let report = dir.join("report.json");
 
@@ -2135,10 +2141,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("t.json"), r#"{"task":"x"}"#).unwrap();
 
-        let base: Config = serde_json::from_str(&format!(
-            r#"{{"provider":"openai","api_key_env":"K","model":"m","workdir":"{}"}}"#,
-            workdir.display()
-        ))
+        let base: Config = serde_json::from_value(json!({
+            "provider": "openai",
+            "api_key_env": "K",
+            "model": "m",
+            "workdir": workdir.display().to_string(),
+        }))
         .unwrap();
         let report = dir.join("report.json");
 
@@ -2208,11 +2216,16 @@ mod tests {
         std::fs::write(dir.join("b.json"), r#"{"task":"do b"}"#).unwrap();
 
         std::env::set_var("TA_BATCH_GITISO_KEY", "dummy");
-        let base: Config = serde_json::from_str(&format!(
-            r#"{{"provider":"openai","api_key_env":"TA_BATCH_GITISO_KEY","model":"m","base_url":"{}","workdir":"{}","tools":["write_file"]}}"#,
-            url,
-            repo.display()
-        ))
+        // json! (not format!-into-from_str): Windows paths carry backslashes
+        // that are invalid JSON escapes when interpolated raw — same as above.
+        let base: Config = serde_json::from_value(json!({
+            "provider": "openai",
+            "api_key_env": "TA_BATCH_GITISO_KEY",
+            "model": "m",
+            "base_url": url,
+            "workdir": repo.display().to_string(),
+            "tools": ["write_file"],
+        }))
         .unwrap();
         let report = dir.join("report.json");
 
