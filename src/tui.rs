@@ -64,7 +64,9 @@ enum SysLevel {
     Error,
 }
 
-/// One rendered row in the message history.
+/// One rendered row in the message history. Clone: `/out` reprints a past
+/// ToolResult expanded, which clones the row out of the committed history.
+#[derive(Clone)]
 enum Row {
     User(String),
     /// A user message queued behind an in-flight run: rendered as a dim
@@ -133,6 +135,11 @@ enum SlashCmd {
     /// path is given and a clipboard tool is available). The optional arg is the
     /// destination path, whitespace-trimmed.
     Export(Option<String>),
+    /// `/out [n]` — reprint the nth-last tool result in full (default n=1,
+    /// the most recent). Successful results stay collapsed in scrollback
+    /// (only short failures auto-expand), so this is the in-TUI way to read
+    /// a full output without /export round-tripping a file.
+    Out(Option<usize>),
     Model,
     Limits,
     Tools,
@@ -163,14 +170,22 @@ fn classify(trimmed: &str) -> SlashCmd {
     } else {
         Some(raw_arg.to_string())
     };
-    // Only /export takes an argument. After the classify refactor the other
-    // commands silently dropped a trailing arg (`/model foo` ran /model with
-    // "foo" ignored); reject them as unknown so the typo is surfaced. Unknown
-    // carries the full `rest` so the message names what was actually typed.
+    // Only /export and /out take arguments. After the classify refactor the
+    // other commands silently dropped a trailing arg (`/model foo` ran /model
+    // with "foo" ignored); reject them as unknown so the typo is surfaced.
+    // Unknown carries the full `rest` so the message names what was typed.
     let stray_arg = arg.is_some();
     match word {
         "clear" if !stray_arg => SlashCmd::Clear,
         "export" => SlashCmd::Export(arg),
+        // /out takes an optional 1-based index; anything unparseable (or 0,
+        // which has no nth-last meaning) reads as unknown so the message
+        // names the typo.
+        "out" => match arg.as_deref().map(str::parse::<usize>) {
+            None => SlashCmd::Out(None),
+            Some(Ok(n)) if n >= 1 => SlashCmd::Out(Some(n)),
+            Some(_) => SlashCmd::Unknown(rest.to_string()),
+        },
         "model" if !stray_arg => SlashCmd::Model,
         "limits" if !stray_arg => SlashCmd::Limits,
         "tools" if !stray_arg => SlashCmd::Tools,
@@ -231,10 +246,14 @@ fn slash_reply(cmd: &SlashCmd, cfg: &Config) -> String {
             s
         }
         SlashCmd::Unknown(name) => format!("[unknown command: /{name} — try /help]"),
-        // Message/Clear/Export never reach here; empty keeps the match
-        // exhaustive. Export and Clear have their own side-effecting arms in
-        // the key handler.
-        SlashCmd::Message | SlashCmd::Clear | SlashCmd::Export(_) | SlashCmd::Quit => String::new(),
+        // Message/Clear never reach here; empty keeps the match exhaustive.
+        // Export/Out and Clear have their own side-effecting arms in the key
+        // handler.
+        SlashCmd::Message
+        | SlashCmd::Clear
+        | SlashCmd::Export(_)
+        | SlashCmd::Out(_)
+        | SlashCmd::Quit => String::new(),
     }
 }
 
@@ -249,7 +268,7 @@ struct SlashSpec {
     desc: &'static str,
 }
 
-const SLASH_COMMANDS: [SlashSpec; 8] = [
+const SLASH_COMMANDS: [SlashSpec; 9] = [
     SlashSpec {
         name: "clear",
         arg_hint: "",
@@ -259,6 +278,11 @@ const SLASH_COMMANDS: [SlashSpec; 8] = [
         name: "export",
         arg_hint: "[path]",
         desc: "dump the transcript to a file (or clipboard)",
+    },
+    SlashSpec {
+        name: "out",
+        arg_hint: "[n]",
+        desc: "show a tool result in full (default: last)",
     },
     SlashSpec {
         name: "model",
@@ -1718,6 +1742,33 @@ fn ui_loop(
                                         };
                                         rows.push(row);
                                     }
+                                    SlashCmd::Out(arg) => {
+                                        // Reprint a tool result in full.
+                                        // Rows commit at their default state
+                                        // and post-commit rows have no cursor
+                                        // to toggle, so the in-TUI way to read
+                                        // a full output is a fresh expanded
+                                        // row pushed through the normal commit
+                                        // channel (rendering and guides
+                                        // unchanged). Works mid-run like the
+                                        // other read-only commands.
+                                        input.drain_to_string();
+                                        let n = arg.unwrap_or(1);
+                                        match nth_last_tool_result(&rows, n) {
+                                            Some(r) => {
+                                                rows.push(r);
+                                            }
+                                            None => {
+                                                let total = rows
+                                                    .iter()
+                                                    .filter(|r| matches!(r, Row::ToolResult { .. }))
+                                                    .count();
+                                                rows.push(Row::sys_warn(format!(
+                                                    "[no tool result #{n} — {total} result(s) so far]"
+                                                )));
+                                            }
+                                        }
+                                    }
                                     cmd => {
                                         input.drain_to_string();
                                         rows.push(Row::sys_info(slash_reply(&cmd, cfg)));
@@ -2184,6 +2235,24 @@ fn tool_elapsed_for(rows: &[Row], name: &str) -> Option<String> {
 /// successful results never auto-open.
 fn auto_expand_result(is_error: bool, content: &str) -> bool {
     is_error && content.lines().count() <= 20
+}
+
+/// `/out [n]`: the nth-last ToolResult row (1-based, newest first), cloned
+/// with `expanded: true` so the reprint opens the full output. Error results
+/// participate too — a long failure that stayed collapsed can be opened the
+/// same way. None when n is past the available results (or 0, which has no
+/// nth-last meaning).
+fn nth_last_tool_result(rows: &[Row], n: usize) -> Option<Row> {
+    let mut row = rows
+        .iter()
+        .rev()
+        .filter(|r| matches!(r, Row::ToolResult { .. }))
+        .nth(n.checked_sub(1)?)?
+        .clone();
+    if let Row::ToolResult { expanded, .. } = &mut row {
+        *expanded = true;
+    }
+    Some(row)
 }
 
 /// Compact tool duration: one decimal under 10s ("1.2s"), whole seconds at
@@ -4418,7 +4487,9 @@ mod tests {
         let mut p = SlashPopup::new();
         p.update("/");
         let lines = slash_popup_lines(&p, POPUP_MAX_ROWS);
-        assert_eq!(lines.len(), SLASH_COMMANDS.len());
+        // With 9 commands over the 8-row cap, the bare "/" list is windowed
+        // (selection 0 → the window starts at the top).
+        assert_eq!(lines.len(), POPUP_MAX_ROWS.min(SLASH_COMMANDS.len()));
         // Row format: "/name" + optional " [arg]" + "  description".
         assert_eq!(
             row_text(&lines[1]),
@@ -5177,13 +5248,100 @@ mod tests {
         );
         // /export with only trailing spaces → no arg.
         assert_eq!(classify("/export "), SlashCmd::Export(None));
-        // No-arg commands reject a trailing arg (only /export takes one):
-        // `/model foo` is a typo, not a silently-ignored /model.
+        // No-arg commands reject a trailing arg (only /export and /out take
+        // one): `/model foo` is a typo, not a silently-ignored /model.
         assert_eq!(
             classify("/model foo"),
             SlashCmd::Unknown("model foo".into())
         );
         assert_eq!(classify("/clear x"), SlashCmd::Unknown("clear x".into()));
+        // /out: optional 1-based index; default (no arg) is the last result.
+        assert_eq!(classify("/out"), SlashCmd::Out(None));
+        assert_eq!(classify("/out 1"), SlashCmd::Out(Some(1)));
+        assert_eq!(classify("/out 3"), SlashCmd::Out(Some(3)));
+        // 0 / unparseable / negative all read as unknown (the message names
+        // the typo instead of quietly doing something else).
+        assert_eq!(classify("/out 0"), SlashCmd::Unknown("out 0".into()));
+        assert_eq!(classify("/out x"), SlashCmd::Unknown("out x".into()));
+        assert_eq!(classify("/out -1"), SlashCmd::Unknown("out -1".into()));
+    }
+
+    #[test]
+    fn nth_last_tool_result_clones_expanded_newest_first() {
+        let call = Row::ToolCall {
+            name: "shell".into(),
+            input: serde_json::Value::Null,
+            collapsed: String::new(),
+            expanded: false,
+            started: Instant::now(),
+        };
+        let mk = |name: &str, is_error: bool| Row::ToolResult {
+            name: name.into(),
+            content: format!("{name} body"),
+            collapsed: format!("{name} body"),
+            is_error,
+            expanded: false,
+            elapsed: None,
+        };
+        let rows = vec![
+            Row::User("q".into()),
+            call,
+            mk("a", false), // result #3 from the end
+            mk("b", true),  // #2 (error results participate)
+            Row::sys_info("mid"),
+            mk("c", false), // #1 = newest
+        ];
+        // n=1 (the default) → newest, cloned with expanded set.
+        let r = nth_last_tool_result(&rows, 1).expect("newest");
+        assert!(matches!(&r, Row::ToolResult { name, expanded: true, .. } if name == "c"));
+        // The source row is untouched (still collapsed).
+        assert!(
+            matches!(
+                &rows[5],
+                Row::ToolResult {
+                    expanded: false,
+                    ..
+                }
+            ),
+            "source row must not be mutated"
+        );
+        // n=2 skips past the newest.
+        assert!(matches!(
+            &nth_last_tool_result(&rows, 2).unwrap(),
+            Row::ToolResult { name, expanded: true, .. } if name == "b"
+        ));
+        assert!(matches!(
+            &nth_last_tool_result(&rows, 3).unwrap(),
+            Row::ToolResult { name, expanded: true, .. } if name == "a"
+        ));
+        // Past the end / 0 → None.
+        assert!(nth_last_tool_result(&rows, 4).is_none());
+        assert!(nth_last_tool_result(&rows, 0).is_none());
+    }
+
+    #[test]
+    fn out_reprint_renders_the_full_guided_body() {
+        // The /out clone flows through the normal history rendering: the head
+        // matches the original, and the expanded body shows every line under
+        // the `│ ` guide.
+        let original = Row::ToolResult {
+            name: "shell".into(),
+            content: "line1\nline2\nline3".into(),
+            collapsed: "line1".into(),
+            is_error: false,
+            expanded: false,
+            elapsed: Some("1.2s".into()),
+        };
+        let reprint = nth_last_tool_result(&[original], 1).expect("the clone");
+        let lines = history(&[reprint]);
+        let texts: Vec<String> = lines.iter().map(row_text).collect();
+        assert!(
+            texts.iter().any(|t| t.starts_with("    ✓ shell · 1.2s")),
+            "head: {texts:?}"
+        );
+        for body in ["    │ line1", "    │ line2", "    │ line3"] {
+            assert!(texts.iter().any(|t| t == body), "missing {body}: {texts:?}");
+        }
     }
 
     #[test]
