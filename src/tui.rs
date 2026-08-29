@@ -131,14 +131,25 @@ pub(crate) enum Row {
     /// viewport (incremental commit). Renders like Assistant but WITHOUT
     /// the `● ` icon (the message head already has it) — one reply must not
     /// read as N messages. Merges with append_delta like Assistant does.
-    AssistantCont(String),
+    /// `tight: true` marks a MID-PARAGRAPH chunk (line-level cut of a long
+    /// single paragraph): it renders flush against the previous row — no
+    /// spacer blank, the transcript joins it with `\n` — so a paragraph
+    /// split across chunks still reads as one block.
+    AssistantCont {
+        text: String,
+        tight: bool,
+    },
     /// Reasoning trace (ThinkingDelta): rendered as plain dim-italic prose
     /// with a `✻ ` marker — deliberately NOT markdown/MdCache so it can
     /// never read like the answer (the old code folded the trace into the
     /// Assistant row and the two merged into one blob). A sub-agent's trace
     /// carries a `[name] ` prefix in the text at creation. Empty traces
-    /// (whitespace-only) render nothing.
-    Thinking(String),
+    /// (whitespace-only) render nothing. `tight: true` marks a mid-block
+    /// chunk (line-level cut of a long trace): no `✻ ` marker, flush render.
+    Thinking {
+        text: String,
+        tight: bool,
+    },
     /// Tool call: collapsed shows a compact one-line arg summary; expanded
     /// pretty-prints the full input JSON. In the inline model rows commit to
     /// scrollback at their default state, so `expanded` stays at its initial
@@ -575,59 +586,62 @@ fn slash_popup_lines(popup: &SlashPopup, max_rows: usize) -> Vec<Line<'static>> 
 /// transcript mirroring the on-screen layout, minus styling/wrapping. Empty
 /// assistant rows (left while a turn is mid-stream) are skipped so the dump
 /// has no bare "Tiny" headers with no body.
+///
+/// Separators are chosen by the FOLLOWING block: a tight chunk (line-level
+/// cut mid-paragraph) folds into the previous block with a single `\n`, so
+/// concatenated chunks reassemble the original text; everything else starts
+/// after a blank line. A tight chunk cut inside a code fence begins with a
+/// synthetic `"```\n"` opener (see `split_streaming_row`) so it renders as
+/// code on its own — stripped here, the model never wrote that line. Corner
+/// case: a model-emitted bare ``` opener landing exactly on a cut line loses
+/// that line in the dump (readability export, not an archive).
 fn render_transcript(rows: &[Row]) -> String {
     let mut out = String::new();
     for row in rows {
-        match row {
-            Row::User(t) => {
-                out.push_str("You\n");
-                out.push_str(t);
-                out.push_str("\n\n");
+        // (block header, body, mid-block?) — a continuation chunk carries no
+        // header of its own (the head chunk has it).
+        let block: (String, &str, bool) = match row {
+            Row::User(t) => ("You\n".into(), t.as_str(), false),
+            Row::Queued(t) => ("You (queued)\n".into(), t.as_str(), false),
+            Row::Assistant(t) if t.is_empty() => continue,
+            Row::Assistant(t) => ("Tiny\n".into(), t.as_str(), false),
+            Row::AssistantCont { text: t, .. } if t.is_empty() => continue,
+            Row::AssistantCont { text: t, tight } => {
+                let body = if *tight {
+                    t.strip_prefix("```\n").unwrap_or(t)
+                } else {
+                    t.as_str()
+                };
+                (String::new(), body, *tight)
             }
-            Row::Queued(t) => {
-                out.push_str("You (queued)\n");
-                out.push_str(t);
-                out.push_str("\n\n");
-            }
-            Row::Assistant(t) if t.is_empty() => {}
-            Row::Assistant(t) => {
-                out.push_str("Tiny\n");
-                out.push_str(t);
-                out.push_str("\n\n");
-            }
-            // A split chunk: no "Tiny" header (the head chunk has it); the
-            // trailing \n\n restores the paragraph gap the split consumed,
-            // so concatenated chunks read as the original text.
-            Row::AssistantCont(t) if t.is_empty() => {}
-            Row::AssistantCont(t) => {
-                out.push_str(t);
-                out.push_str("\n\n");
-            }
-            Row::Thinking(t) if t.trim().is_empty() => {}
-            Row::Thinking(t) => {
-                out.push_str("✻ Thinking\n");
-                out.push_str(t);
-                out.push_str("\n\n");
-            }
-            Row::ToolCall { name, input, .. } => {
-                out.push_str(&format!("→ {name}: {input}\n\n"));
-            }
+            Row::Thinking { text: t, .. } if t.trim().is_empty() => continue,
+            Row::Thinking { text: t, tight } => ("✻ Thinking\n".into(), t.as_str(), *tight),
+            Row::ToolCall { name, input, .. } => (format!("→ {name}: {input}\n"), "", false),
             Row::ToolResult {
                 name,
                 content,
                 is_error,
                 ..
             } => {
-                let tag = if *is_error { "✗" } else { "✓" };
                 // Content may carry ANSI codes (kept for the TUI's colored
                 // render); the transcript wants the plain text.
-                out.push_str(&format!("{tag} {name}: {}\n\n", ansi_plain(content)));
+                let tag = if *is_error { "✗" } else { "✓" };
+                (
+                    format!("{tag} {name}: {}\n", ansi_plain(content)),
+                    "",
+                    false,
+                )
             }
-            Row::System { text, .. } => {
-                out.push_str(&format!("· {text}\n\n"));
-            }
+            Row::System { text, .. } => (format!("· {text}\n"), "", false),
+        };
+        let (header, body, mid_block) = block;
+        if !out.is_empty() {
+            out.push_str(if mid_block { "\n" } else { "\n\n" });
         }
+        out.push_str(&header);
+        out.push_str(body);
     }
+    out.push_str("\n\n");
     out
 }
 
@@ -1145,6 +1159,13 @@ fn ui_loop(
     }
 
     loop {
+        // Body width the streaming splitter estimates its wraps at —
+        // refreshed each iteration so a resize is picked up on the next
+        // event. Only needs to be close: a drifted estimate raggeds one
+        // committed row cosmetically, text is never lost.
+        let split_w = content_width(term.size().map(|s| s.width).unwrap_or(80))
+            .saturating_sub(ROLE_BODY_INDENT)
+            .max(1);
         // Drain worker events.
         loop {
             let msg = match out_rx.try_recv() {
@@ -1220,7 +1241,7 @@ fn ui_loop(
                         append_delta(&mut rows, &mut streaming, &t);
                         // Incremental commit: flush finished paragraphs into
                         // scrollback while the rest keeps streaming.
-                        split_streaming_row(&mut rows);
+                        split_streaming_row(&mut rows, split_w);
                     }
                     AgentEvent::ThinkingDelta(t) => {
                         // Reasoning trace: its own dim ✻ block, never merged
@@ -1239,7 +1260,7 @@ fn ui_loop(
                         append_thinking_delta(&mut rows, &mut thinking_stream, "", &t);
                         // Long traces flush incrementally too (they are often
                         // LONGER than the answer).
-                        split_streaming_row(&mut rows);
+                        split_streaming_row(&mut rows, split_w);
                     }
                     AgentEvent::ToolCall { name, input } => {
                         streaming = false;
@@ -1495,7 +1516,13 @@ fn ui_loop(
         let pending_end = commit_pending_end(&rows, committed, stream_open);
         if committed < pending_end {
             let width = term.size().map(|s| s.width).unwrap_or(80) as usize;
-            commit_rows(term, &rows[committed..pending_end], &mut md_cache, width)?;
+            commit_rows(
+                term,
+                &rows[committed..pending_end],
+                &mut md_cache,
+                width,
+                pending_end == rows.len(),
+            )?;
             committed = pending_end;
             dirty = true;
         }
@@ -1554,7 +1581,7 @@ fn ui_loop(
                     render_zone_tail(f, zone_rect, &[line]);
                 } else if let Some(idx) = inflight_idx {
                     if let Some(row) = rows.get(idx) {
-                        let live = if matches!(row, Row::Thinking(_)) {
+                        let live = if matches!(row, Row::Thinking { .. }) {
                             LiveRow::Think
                         } else {
                             LiveRow::Text
@@ -1564,6 +1591,7 @@ fn ui_loop(
                             &mut md_cache,
                             content_w,
                             live,
+                            false,
                             false,
                         );
                         let wrapped = wrap_history(&l, content_w);
@@ -2239,6 +2267,7 @@ fn build_history_lines(
     inner_w: usize,
     live: LiveRow,
     thinking: bool,
+    trailing_spacer: bool,
 ) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     if rows.is_empty() && !thinking {
@@ -2296,7 +2325,7 @@ fn build_history_lines(
                     true,
                 );
             }
-            Row::AssistantCont(t) => {
+            Row::AssistantCont { text: t, .. } => {
                 // An incrementally-committed chunk: same body, no `● ` head —
                 // one reply must not read as several messages.
                 push_assistant_body(
@@ -2310,7 +2339,7 @@ fn build_history_lines(
                     false,
                 );
             }
-            Row::Thinking(t) => {
+            Row::Thinking { text: t, tight } => {
                 // Reasoning trace: plain dim-italic prose — deliberately NOT
                 // markdown/MdCache so it can never read like the answer.
                 // Wrapped here because wrap_history's final pass can't
@@ -2329,8 +2358,12 @@ fn build_history_lines(
                 indent_lines(&mut rendered, ROLE_BODY_INDENT);
                 // Inline marker over the first line's indent (same trick as
                 // the role icons): `✻ ` announces a trace block in one row,
-                // no header line spent.
-                rendered[0].spans[0] = Span::styled("✻ ".to_string(), style);
+                // no header line spent. A tight (mid-block) chunk is a
+                // continuation — it keeps the indent and reads as part of
+                // the block above it.
+                if !*tight {
+                    rendered[0].spans[0] = Span::styled("✻ ".to_string(), style);
+                }
                 lines.extend(rendered);
                 // Streaming cursor on the live trace row.
                 if live == LiveRow::Think && idx == rows.len() - 1 {
@@ -2471,15 +2504,25 @@ fn build_history_lines(
         // messages stop reading as one blob), and a Thinking block gets a
         // blank after it (trace vs answer separation) and before it unless it
         // directly follows the user's message (mirrors the tight
-        // user→assistant look). Tool rows stay tight against the flow they
-        // belong to.
+        // user→assistant look). Tight chunks are the exception: cut mid-way
+        // through a paragraph/trace, they render flush against the row they
+        // continue — a blank there would tear one block into two. Tool rows
+        // stay tight against the flow they belong to.
+        // `trailing_spacer`: whether the LAST row of this (possibly partial)
+        // view ends the history. Incremental commits render SLICES of `rows`
+        // — the slice's last row is usually followed by the still-streaming
+        // tail, and an unconditional end-of-history blank there would insert
+        // a spurious empty line into scrollback after every mid-stream batch
+        // (tight chunks would read as torn paragraphs).
         let spacer = match rows.get(idx + 1) {
-            None => true,
+            None => trailing_spacer,
             Some(Row::User(_) | Row::Queued(_) | Row::System { .. }) => true,
-            Some(Row::Thinking(_)) => !matches!(row, Row::User(_)),
-            Some(Row::Assistant(_) | Row::AssistantCont(_)) => matches!(
+            Some(Row::Thinking { tight: true, .. }) => false,
+            Some(Row::Thinking { .. }) => !matches!(row, Row::User(_)),
+            Some(Row::AssistantCont { tight: true, .. }) => false,
+            Some(Row::Assistant(_) | Row::AssistantCont { .. }) => matches!(
                 row,
-                Row::Assistant(_) | Row::AssistantCont(_) | Row::Thinking(_)
+                Row::Assistant(_) | Row::AssistantCont { .. } | Row::Thinking { .. }
             ),
             Some(_) => false,
         };
@@ -2880,7 +2923,7 @@ fn commit_pending_end(rows: &[Row], committed: usize, stream_open: bool) -> usiz
         && pending_end > committed
         && matches!(
             rows[pending_end - 1],
-            Row::Assistant(_) | Row::AssistantCont(_) | Row::Thinking(_)
+            Row::Assistant(_) | Row::AssistantCont { .. } | Row::Thinking { .. }
         )
     {
         pending_end -= 1;
@@ -2902,7 +2945,7 @@ fn inflight_row_index(rows: &[Row], stream_open: bool) -> Option<usize> {
         rows.iter().rposition(|r| {
             matches!(
                 r,
-                Row::Assistant(_) | Row::AssistantCont(_) | Row::Thinking(_)
+                Row::Assistant(_) | Row::AssistantCont { .. } | Row::Thinking { .. }
             )
         })
     } else {
@@ -2915,8 +2958,9 @@ fn commit_rows<B: ratatui::backend::Backend>(
     rows: &[Row],
     md_cache: &mut MdCache,
     width: usize,
+    trailing_spacer: bool,
 ) -> Result<(), B::Error> {
-    let lines = build_history_lines(rows, md_cache, width, LiveRow::None, false);
+    let lines = build_history_lines(rows, md_cache, width, LiveRow::None, false, trailing_spacer);
     let wrapped = wrap_history(&lines, width);
     if wrapped.is_empty() {
         return Ok(());
@@ -3030,11 +3074,16 @@ fn strip_controls_json(v: &serde_json::Value) -> serde_json::Value {
 /// dropped the delta in that case, silently losing output. Control characters
 /// are stripped here, once, at the row entry point.
 fn append_delta(rows: &mut Vec<Row>, streaming: &mut bool, text: &str) {
-    if !*streaming || !matches!(rows.last(), Some(Row::Assistant(_) | Row::AssistantCont(_))) {
+    if !*streaming
+        || !matches!(
+            rows.last(),
+            Some(Row::Assistant(_) | Row::AssistantCont { .. })
+        )
+    {
         rows.push(Row::Assistant(String::new()));
         *streaming = true;
     }
-    if let Some(Row::Assistant(buf) | Row::AssistantCont(buf)) = rows.last_mut() {
+    if let Some(Row::Assistant(buf) | Row::AssistantCont { text: buf, .. }) = rows.last_mut() {
         buf.push_str(&strip_controls(text));
     }
 }
@@ -3065,39 +3114,168 @@ fn last_safe_boundary(text: &str) -> Option<usize> {
     best
 }
 
+/// How many display rows of a split row stay live in the viewport once
+/// incremental commits have started. The transcript zone shows only ~4 lines
+/// anyway; keeping the tail at two means committed rows flow up into
+/// scrollback as they are written (Claude Code's feel) instead of cycling
+/// inside the box until the paragraph closes.
+const LIVE_TAIL_ROWS: usize = 2;
+
+/// Estimated display rows `text` occupies when wrapped at `width` — per
+/// logical line, `ceil(cols / width)` with a floor of one. This is an UPPER
+/// bound of what the markdown render shows (the renderer soft-joins lines
+/// inside a paragraph, and joining can only shrink the row count), so the
+/// split fires at least as eagerly as the viewport needs.
+fn est_display_rows(text: &str, width: usize) -> usize {
+    let w = width.max(1);
+    text.split('\n')
+        .map(|l| {
+            let cols: usize = l
+                .chars()
+                .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
+                .sum();
+            cols.div_ceil(w).max(1)
+        })
+        .sum()
+}
+
+/// Byte offset where a DISPLAY-row cut may split `text` so the tail keeps
+/// ~`keep_rows` wrapped rows: the cut always sits on a wrap boundary (a char
+/// that starts a fresh display row — the char after a `\n`, or the char that
+/// overflows the width). Returns (offset, fence_open) — fence_open says the
+/// cut lands INSIDE an unclosed ``` fence; the caller then re-opens the fence
+/// in the tail so both halves render as code. A cut landing exactly ON the
+/// fence's closing line slides past it (the closer joins the prefix, tail
+/// starts fence-free). None while the text is too short. Widths use
+/// unicode-width per char, the same tables the renderer wraps with — drift
+/// only raggeds the seam cosmetically, no text is lost or duplicated.
+fn soft_cut_offset(text: &str, width: usize, keep_rows: usize) -> Option<(usize, bool)> {
+    let w = width.max(1);
+    if keep_rows == 0 {
+        return None;
+    }
+    let total = est_display_rows(text, w);
+    if total <= keep_rows {
+        return None;
+    }
+    let target = total - keep_rows; // rows that stay with the prefix
+    let mut rows = 0usize; // display rows completed on the prefix side
+    let mut fence_open = false;
+    let mut line_start = 0usize;
+    let mut col = 0usize;
+    for (i, ch) in text.char_indices() {
+        if ch == '\n' {
+            if text[line_start..i].trim_start().starts_with("```") {
+                fence_open = !fence_open;
+            }
+            rows += 1; // a line always completes exactly one final row
+            col = 0;
+            line_start = i + 1;
+            if rows == target {
+                let at = i + 1;
+                // The tail would start on the fence's closing line — slide
+                // past it (may leave an empty tail when it was the last
+                // line; the caller's empty-tail guard aborts the split).
+                if fence_open && text[at..].starts_with("```") {
+                    let nl = text[at..].find('\n')?;
+                    return Some((at + nl + 1, false));
+                }
+                return Some((at, fence_open));
+            }
+            continue;
+        }
+        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if col + cw > w {
+            rows += 1;
+            col = 0;
+            if rows == target {
+                return Some((i, fence_open));
+            }
+        }
+        col += cw;
+    }
+    None
+}
+
 /// Incremental commit: once the in-flight text outgrows the inline viewport
 /// (the live zone can only ever show its tail anyway), split the trailing
-/// streaming row at the latest safe paragraph boundary. The prefix is final
-/// and commits into scrollback on the next pass while the user keeps
-/// watching fresh content stream in the live zone — instead of the whole
-/// reply appearing in one flush when the turn ends (Claude Code's model).
+/// streaming row. The prefix is final and commits into scrollback on the
+/// next pass while the user keeps watching fresh content stream in the live
+/// zone — instead of the whole reply appearing in one flush when the turn
+/// ends (Claude Code's model).
 ///
-/// - Assistant tails split into `Assistant(prefix) + AssistantCont(tail)`:
-///   only the message head keeps the `● ` icon. A row that is already a
-///   Cont splits into two Conts (the head is far behind).
-/// - Thinking tails split into `Thinking + Thinking`: each chunk carries
-///   its own `✻ ` marker (all-dim anyway, reads as trace sections).
+/// Cut selection (`width` is the markdown body width the renderer wraps at):
+/// - **Paragraph boundary** (`last_safe_boundary`, blank line outside
+///   fences) — preferred whenever the tail it keeps live fits the current
+///   threshold (in display rows): committed chunks stay whole markdown
+///   blocks, split is `tight: false` (blank line restored between chunks).
+/// - **Display-row boundary** (`soft_cut_offset`, all but the last
+///   `LIVE_TAIL_ROWS` wrapped rows) — the fallback when the current
+///   paragraph is ITSELF taller than the threshold (or no boundary exists
+///   yet): without it a long paragraph — including the common
+///   one-huge-logical-line prose paragraph — would cycle inside the live
+///   box until it closes (the pre-row-cut behavior). The chunk is
+///   `tight: true` (mid-paragraph: renders flush, transcript joins with
+///   `\n`). Cutting inside an open ``` fence prepends a synthetic `"```\n"`
+///   opener to the tail: the unclosed prefix still renders as a code
+///   block, and the tail renders as code on its own; thinking rows skip
+///   this (plain prose render, a literal ``` would show).
+/// - Once a row has been split at all, the threshold drops from viewport
+///   height to `LIVE_TAIL_ROWS` so every further row commits as written —
+///   an 8-row re-arm window would cycle visibly between cuts. Paragraph
+///   boundaries still win there whenever the new paragraph is young (≤2
+///   rows), so paragraph structure keeps its blank-line chunks.
+///
+/// - Assistant tails split into `Assistant + AssistantCont` (loose) or
+///   `AssistantCont{tight} + AssistantCont{tight}` (row-level): only the
+///   message head keeps the `● ` icon. A row that is already a Cont splits
+///   into two Conts (the head is far behind).
+/// - Thinking tails split into `Thinking + Thinking` (each non-tight chunk
+///   carries its own `✻ ` marker, all-dim anyway, reads as trace sections;
+///   tight chunks carry none and read as continuation).
 /// - Sub-agent bubbles are NOT split: `task` returns short summaries by
 ///   contract, and an unnamed Cont chunk interleaved between two same-named
 ///   agents' bubbles would be ambiguous.
-fn split_streaming_row(rows: &mut Vec<Row>) {
-    let is_thinking = matches!(rows.last(), Some(Row::Thinking(_)));
-    let tail = {
+fn split_streaming_row(rows: &mut Vec<Row>, width: usize) {
+    let is_thinking = matches!(rows.last(), Some(Row::Thinking { .. }));
+    // Steady-state threshold once any split happened (see doc above).
+    let already_split = matches!(
+        rows.last(),
+        Some(Row::AssistantCont { .. }) | Some(Row::Thinking { tight: true, .. })
+    );
+    let (tail, tight) = {
         let text = match rows.last_mut() {
-            Some(Row::Assistant(t)) | Some(Row::AssistantCont(t)) | Some(Row::Thinking(t)) => t,
+            Some(Row::Assistant(t))
+            | Some(Row::AssistantCont { text: t, .. })
+            | Some(Row::Thinking { text: t, .. }) => t,
             _ => return,
         };
-        // Threshold: raw lines beyond the viewport height. Below that the
-        // whole reply fits (or nearly) — keep it one row for tighter
-        // rendering (no inter-chunk spacers) until it overflows.
-        if text.lines().count() <= INLINE_HEIGHT as usize {
+        let threshold = if already_split {
+            LIVE_TAIL_ROWS
+        } else {
+            INLINE_HEIGHT as usize
+        };
+        if est_display_rows(text, width) <= threshold {
             return;
         }
-        let Some(at) = last_safe_boundary(text) else {
-            return; // one huge unclosed paragraph/fence: nothing safe to cut
-        };
-        let tail = text.split_off(at);
-        // Consume the paragraph separator (\n\n stayed with the prefix).
+        let para = last_safe_boundary(text);
+        // A paragraph cut is preferred when what it keeps live fits the
+        // threshold (in display rows) — a paragraph that is ITSELF taller
+        // would keep cycling inside the live box until it closes, so we
+        // fall to the row cut instead (see doc above).
+        let para_usable =
+            matches!(para, Some(p) if est_display_rows(&text[p..], width) <= threshold);
+        let (at, tight, fence_reopen) =
+            match (para_usable, soft_cut_offset(text, width, LIVE_TAIL_ROWS)) {
+                (true, _) => (para.expect("para_usable implies Some"), false, false),
+                (false, Some((l, fo))) => (l, true, fo),
+                // Unreachable (est > threshold >= LIVE_TAIL_ROWS guarantees a
+                // row cut) — kept as a guard, not a silent no-op path.
+                (false, None) => return,
+            };
+        let mut tail = text.split_off(at);
+        // Consume the separator newlines that stayed with the prefix
+        // (paragraph cuts keep the `\n\n`; row cuts end at a char boundary).
         while text.ends_with('\n') {
             text.pop();
         }
@@ -3106,12 +3284,18 @@ fn split_streaming_row(rows: &mut Vec<Row>) {
             text.push_str(&tail);
             return;
         }
-        tail
+        if tail.is_empty() {
+            return;
+        }
+        if tight && fence_reopen && !is_thinking {
+            tail = format!("```\n{tail}");
+        }
+        (tail, tight)
     };
-    let row = match (is_thinking, tail.is_empty()) {
-        (_, true) => return,
-        (true, _) => Row::Thinking(tail),
-        (false, _) => Row::AssistantCont(tail),
+    let row = if is_thinking {
+        Row::Thinking { text: tail, tight }
+    } else {
+        Row::AssistantCont { text: tail, tight }
     };
     rows.push(row);
 }
@@ -3128,18 +3312,21 @@ fn append_thinking_delta(
     tag: &str,
     text: &str,
 ) {
-    let merge =
-        thinking_stream.as_deref() == Some(tag) && matches!(rows.last(), Some(Row::Thinking(_)));
+    let merge = thinking_stream.as_deref() == Some(tag)
+        && matches!(rows.last(), Some(Row::Thinking { .. }));
     if !merge {
         let head = if tag.is_empty() {
             String::new()
         } else {
             format!("[{tag}] ")
         };
-        rows.push(Row::Thinking(head));
+        rows.push(Row::Thinking {
+            text: head,
+            tight: false,
+        });
         *thinking_stream = Some(tag.to_string());
     }
-    if let Some(Row::Thinking(buf)) = rows.last_mut() {
+    if let Some(Row::Thinking { text: buf, .. }) = rows.last_mut() {
         buf.push_str(&strip_controls(text));
     }
 }
@@ -4184,7 +4371,7 @@ mod tests {
     /// Build history lines with the test width, not streaming.
     fn history(rows: &[Row]) -> Vec<Line<'static>> {
         let mut cache = MdCache::new();
-        build_history_lines(rows, &mut cache, TEST_W, LiveRow::None, false)
+        build_history_lines(rows, &mut cache, TEST_W, LiveRow::None, false, true)
     }
 
     #[test]
@@ -4477,7 +4664,7 @@ mod tests {
             Row::Assistant("typing".into()),
         ];
         let mut cache = MdCache::new();
-        let lines = build_history_lines(&rows, &mut cache, TEST_W, LiveRow::Text, false);
+        let lines = build_history_lines(&rows, &mut cache, TEST_W, LiveRow::Text, false, true);
         // Adjacent assistant rows get a gap (split chunks recover their
         // paragraph separator; separate messages stop reading as one blob).
         assert_eq!(row_text(&lines[0]), "● done");
@@ -4495,7 +4682,7 @@ mod tests {
     fn history_thinking_appends_a_transient_placeholder_tail() {
         let rows = vec![Row::User("hi".into())];
         let mut cache = MdCache::new();
-        let lines = build_history_lines(&rows, &mut cache, TEST_W, LiveRow::None, true);
+        let lines = build_history_lines(&rows, &mut cache, TEST_W, LiveRow::None, true, true);
         let last = lines.last().expect("a thinking tail line");
         assert_eq!(row_text(last), "● …");
         let icon = last.spans[0].style;
@@ -4509,7 +4696,7 @@ mod tests {
         // before its first row): the placeholder replaces the onboarding
         // cheat-sheet instead of stacking under it.
         let mut cache = MdCache::new();
-        let lines = build_history_lines(&[], &mut cache, TEST_W, LiveRow::None, true);
+        let lines = build_history_lines(&[], &mut cache, TEST_W, LiveRow::None, true, true);
         assert_eq!(lines.len(), 1);
         assert_eq!(row_text(&lines[0]), "● …");
     }
@@ -4520,7 +4707,10 @@ mod tests {
         // (asterisks stay literal), dim+italic prose, `✻ ` head marker.
         // (A trailing blank spacer line follows every row boundary — these
         // assertions target the body lines, not lines.last().)
-        let rows = vec![Row::Thinking("**bold** and `code`".into())];
+        let rows = vec![Row::Thinking {
+            text: "**bold** and `code`".into(),
+            tight: false,
+        }];
         let lines = history(&rows);
         assert_eq!(row_text(&lines[0]), "✻ **bold** and `code`");
         let m = lines[0].spans[0].style;
@@ -4531,27 +4721,39 @@ mod tests {
         assert!(body.add_modifier.contains(Modifier::ITALIC));
 
         // Multi-line traces: continuation lines indent under the marker.
-        let rows = vec![Row::Thinking("first\nsecond".into())];
+        let rows = vec![Row::Thinking {
+            text: "first\nsecond".into(),
+            tight: false,
+        }];
         let lines = history(&rows);
         assert_eq!(row_text(&lines[0]), "✻ first");
         assert_eq!(row_text(&lines[1]), "  second");
 
         // A sub-agent's trace carries its name on the head line.
-        let rows = vec![Row::Thinking("[worker] planning".into())];
+        let rows = vec![Row::Thinking {
+            text: "[worker] planning".into(),
+            tight: false,
+        }];
         let lines = history(&rows);
         assert_eq!(row_text(&lines[0]), "✻ [worker] planning");
 
         // Whitespace-only traces render nothing but the boundary spacer —
         // no stray bare marker.
-        let lines = history(&[Row::Thinking("  \n ".into())]);
+        let lines = history(&[Row::Thinking {
+            text: "  \n ".into(),
+            tight: false,
+        }]);
         assert!(lines.iter().all(|l| row_text(l).trim().is_empty()));
     }
 
     #[test]
     fn thinking_row_gets_a_cursor_only_while_it_is_the_live_row() {
-        let rows = vec![Row::Thinking("reasoning".into())];
+        let rows = vec![Row::Thinking {
+            text: "reasoning".into(),
+            tight: false,
+        }];
         let mut cache = MdCache::new();
-        let lines = build_history_lines(&rows, &mut cache, TEST_W, LiveRow::Think, false);
+        let lines = build_history_lines(&rows, &mut cache, TEST_W, LiveRow::Think, false, true);
         // (lines.last() is the row-boundary spacer; the cursor sits on the
         // last BODY line.)
         assert!(
@@ -4559,7 +4761,7 @@ mod tests {
             "cursor on the live trace: {lines:?}"
         );
         // Text-live (an Assistant streaming) must NOT cursor a Thinking row.
-        let lines = build_history_lines(&rows, &mut cache, TEST_W, LiveRow::Text, false);
+        let lines = build_history_lines(&rows, &mut cache, TEST_W, LiveRow::Text, false, true);
         assert!(!lines.iter().any(|l| row_text(l).contains('▌')));
         // Committed render: no cursor.
         let lines = history(&rows);
@@ -4573,7 +4775,10 @@ mod tests {
         // the paragraph separator — the gap restores it).
         let rows = vec![
             Row::Assistant("head".into()),
-            Row::AssistantCont("tail".into()),
+            Row::AssistantCont {
+                text: "tail".into(),
+                tight: false,
+            },
         ];
         let lines = history(&rows);
         let texts: Vec<String> = lines.iter().map(row_text).collect();
@@ -4590,13 +4795,16 @@ mod tests {
 
         // The Cont chunk is the live row while it streams: cursor works.
         let mut cache = MdCache::new();
-        let lines = build_history_lines(&rows, &mut cache, TEST_W, LiveRow::Text, false);
+        let lines = build_history_lines(&rows, &mut cache, TEST_W, LiveRow::Text, false, true);
         assert_eq!(row_text(&lines[2]), "  tail▌");
 
         // The trace/answer pair separates (blank after ✻, tight under ❯).
         let rows = vec![
             Row::User("q".into()),
-            Row::Thinking("trace".into()),
+            Row::Thinking {
+                text: "trace".into(),
+                tight: false,
+            },
             Row::Assistant("answer".into()),
         ];
         let texts: Vec<String> = history(&rows).iter().map(row_text).collect();
@@ -4617,7 +4825,10 @@ mod tests {
         let rows = vec![
             Row::User("hi".into()),
             Row::Assistant("first".into()),
-            Row::AssistantCont("second".into()),
+            Row::AssistantCont {
+                text: "second".into(),
+                tight: false,
+            },
         ];
         let out = render_transcript(&rows);
         assert!(out.contains("Tiny\nfirst\n\nsecond"), "merged: {out:?}");
@@ -4630,7 +4841,10 @@ mod tests {
         let rows = vec![
             Row::User("hi".into()),
             Row::Assistant("p1".into()),
-            Row::AssistantCont("p2".into()),
+            Row::AssistantCont {
+                text: "p2".into(),
+                tight: false,
+            },
         ];
         assert_eq!(commit_pending_end(&rows, 0, true), 2);
         assert_eq!(commit_pending_end(&rows, 0, false), 3);
@@ -5206,7 +5420,7 @@ mod tests {
         append_thinking_delta(&mut rows, &mut ts, "", "let me ");
         append_thinking_delta(&mut rows, &mut ts, "", "think");
         assert_eq!(rows.len(), 1);
-        assert!(matches!(&rows[0], Row::Thinking(t) if t == "let me think"));
+        assert!(matches!(&rows[0], Row::Thinking { text: t, .. } if t == "let me think"));
         assert_eq!(ts.as_deref(), Some(""));
 
         // The answer starting closes the trace (the event arm resets the
@@ -5218,7 +5432,7 @@ mod tests {
         append_thinking_delta(&mut rows, &mut ts, "", "more");
         assert_eq!(rows.len(), 3);
         assert!(matches!(&rows[1], Row::Assistant(t) if t == "answer"));
-        assert!(matches!(&rows[2], Row::Thinking(t) if t == "more"));
+        assert!(matches!(&rows[2], Row::Thinking { text: t, .. } if t == "more"));
 
         // A tail that isn't the open trace (interleaved notice) opens a new
         // row — deltas are never dropped.
@@ -5226,7 +5440,7 @@ mod tests {
         rows.push(Row::sys_info("notice"));
         append_thinking_delta(&mut rows, &mut ts, "", "trace");
         assert_eq!(rows.len(), 5);
-        assert!(matches!(&rows[4], Row::Thinking(t) if t == "trace"));
+        assert!(matches!(&rows[4], Row::Thinking { text: t, .. } if t == "trace"));
     }
 
     #[test]
@@ -5234,7 +5448,7 @@ mod tests {
         let mut rows = vec![];
         let mut ts: Option<String> = None;
         append_thinking_delta(&mut rows, &mut ts, "worker", "planning");
-        assert!(matches!(&rows[0], Row::Thinking(t) if t == "[worker] planning"));
+        assert!(matches!(&rows[0], Row::Thinking { text: t, .. } if t == "[worker] planning"));
         // Same child merges; a different child opens its own tagged row.
         append_thinking_delta(&mut rows, &mut ts, "worker", "...");
         assert_eq!(rows.len(), 1);
@@ -5242,7 +5456,7 @@ mod tests {
         rows.push(Row::sys_info("notice"));
         append_thinking_delta(&mut rows, &mut ts, "other", "hmm");
         assert_eq!(rows.len(), 3);
-        assert!(matches!(&rows[2], Row::Thinking(t) if t == "[other] hmm"));
+        assert!(matches!(&rows[2], Row::Thinking { text: t, .. } if t == "[other] hmm"));
     }
 
     #[test]
@@ -5269,44 +5483,50 @@ mod tests {
 
         // Above threshold: latest safe boundary = start of para3.
         let mut rows = vec![Row::Assistant(text.clone())];
-        split_streaming_row(&mut rows);
+        split_streaming_row(&mut rows, 80);
         assert_eq!(rows.len(), 2);
         assert!(
             matches!(&rows[0], Row::Assistant(t) if *t == format!("{}\n\n{}", para(1), para(2)))
         );
-        assert!(matches!(&rows[1], Row::AssistantCont(t) if *t == para(3)));
+        assert!(
+            matches!(&rows[1], Row::AssistantCont { text: t, tight: false } if *t == para(3)),
+            "paragraph cut keeps the whole para3 as a loose chunk"
+        );
 
         // Below threshold: one row, untouched.
         let mut rows = vec![Row::Assistant(para(1))]; // 4 lines
-        split_streaming_row(&mut rows);
+        split_streaming_row(&mut rows, 80);
         assert_eq!(rows.len(), 1);
 
-        // One huge unclosed paragraph: nothing safe to cut.
-        let one = (0..12)
-            .map(|i| format!("w{i}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let mut rows = vec![Row::Assistant(one)];
-        split_streaming_row(&mut rows);
-        assert_eq!(rows.len(), 1);
+        // A huge unclosed paragraph line-cuts instead (own test below).
 
         // Thinking rows split the same way (each chunk keeps its ✻ marker).
-        let mut rows = vec![Row::Thinking(text.clone())];
-        split_streaming_row(&mut rows);
+        let mut rows = vec![Row::Thinking {
+            text: text.clone(),
+            tight: false,
+        }];
+        split_streaming_row(&mut rows, 80);
         assert_eq!(rows.len(), 2);
-        assert!(matches!(&rows[0], Row::Thinking(t) if t.contains("l1a")));
-        assert!(matches!(&rows[1], Row::Thinking(t) if *t == para(3)));
+        assert!(matches!(&rows[0], Row::Thinking { text: t, .. } if t.contains("l1a")));
+        assert!(matches!(&rows[1], Row::Thinking { text: t, tight: false } if *t == para(3)));
 
-        // A Cont tail splits into two Conts (the head is far behind).
-        let mut rows = vec![Row::Assistant("head".into()), Row::AssistantCont(text)];
-        split_streaming_row(&mut rows);
+        // A Cont tail re-splits at the steady-state threshold (already-split →
+        // LIVE_TAIL_LINES): the 4-line paragraph no longer fits, so the line
+        // cut takes over and the new chunk is tight.
+        let mut rows = vec![
+            Row::Assistant("head".into()),
+            Row::AssistantCont { text, tight: false },
+        ];
+        split_streaming_row(&mut rows, 80);
         assert_eq!(rows.len(), 3);
-        assert!(matches!(&rows[1], Row::AssistantCont(t) if t.contains("l1a")));
-        assert!(matches!(&rows[2], Row::AssistantCont(t) if *t == para(3)));
+        assert!(matches!(&rows[1], Row::AssistantCont { text: t, .. } if t.contains("l1a")));
+        assert!(
+            matches!(&rows[2], Row::AssistantCont { text: t, tight: true } if *t == "l3c\nl3d")
+        );
 
         // Non-streaming tail rows are a no-op.
         let mut rows = vec![tool_call_row("shell")];
-        split_streaming_row(&mut rows);
+        split_streaming_row(&mut rows, 80);
         assert_eq!(rows.len(), 1);
     }
 
@@ -5325,14 +5545,260 @@ mod tests {
         let mut rows = vec![];
         let mut streaming = false;
         append_delta(&mut rows, &mut streaming, &text);
-        split_streaming_row(&mut rows);
+        split_streaming_row(&mut rows, 80);
         assert_eq!(rows.len(), 2);
         append_delta(&mut rows, &mut streaming, " more");
         assert_eq!(rows.len(), 2, "delta opened a new row instead of merging");
         assert!(
-            matches!(&rows[1], Row::AssistantCont(t) if t == "tail more"),
+            matches!(&rows[1], Row::AssistantCont { text: t, .. } if t == "tail more"),
             "delta did not land in the tail: {:?}",
             rows[1]
+        );
+    }
+
+    #[test]
+    fn commit_slices_do_not_add_an_end_of_history_blank() {
+        // Steady-state chunks: flush against each other, one blank at the
+        // true end of history only. A commit SLICE ending mid-history must
+        // not carry the trailing blank — every incremental batch would have
+        // inserted a spurious empty line into scrollback, tearing the
+        // paragraph the tight chunks are meant to keep seamless.
+        let rows = vec![
+            Row::Assistant("a".into()),
+            Row::AssistantCont {
+                text: "b".into(),
+                tight: true,
+            },
+            Row::AssistantCont {
+                text: "c".into(),
+                tight: true,
+            },
+        ];
+        let mut cache = MdCache::new();
+        let full = build_history_lines(&rows, &mut cache, TEST_W, LiveRow::None, false, true);
+        let texts: Vec<String> = full.iter().map(row_text).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "● a".to_string(),
+                "  b".to_string(),
+                "  c".to_string(),
+                String::new()
+            ]
+        );
+        // The last chunk alone, rendered as a mid-history commit batch.
+        let slice =
+            build_history_lines(&rows[2..], &mut cache, TEST_W, LiveRow::None, false, false);
+        let texts: Vec<String> = slice.iter().map(row_text).collect();
+        assert_eq!(
+            texts,
+            vec!["  c".to_string()],
+            "no spurious blank: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn soft_cut_offset_keeps_tail_rows_and_tracks_fences() {
+        // Too short to cut (and keep=0 is rejected outright).
+        assert_eq!(soft_cut_offset("a\nb", 80, 2), None);
+        assert_eq!(soft_cut_offset("anything", 80, 0), None);
+        // Plain short lines (one display row each): the cut is the start of
+        // the last-but-one line.
+        assert_eq!(soft_cut_offset("a\nb\nc", 80, 1), Some((4, false)));
+        assert_eq!(soft_cut_offset("a\nb\nc\nd", 80, 2), Some((4, false)));
+        // Cut inside an open fence (opener before, closer after).
+        let fenced = "```\ncode1\ncode2\ncode3";
+        assert_eq!(soft_cut_offset(fenced, 80, 1), Some((16, true)));
+        // Cut landing exactly ON the closing fence slides past it: the
+        // closer joins the prefix, the tail starts fence-free.
+        let closing = "```\nc1\nc2\n```\nz";
+        assert_eq!(soft_cut_offset(closing, 80, 2), Some((14, false)));
+        // A cut after the fence closed is a plain cut.
+        assert_eq!(soft_cut_offset(closing, 80, 1), Some((14, false)));
+        // One huge logical line (the common prose shape): the cut sits on a
+        // WRAP boundary — 10 chars at width 4 wrap into 3 rows (abcd / efgh /
+        // ij); keeping the last row live cuts before "i", keeping two rows
+        // cuts before "e".
+        assert_eq!(soft_cut_offset("abcdefghij", 4, 1), Some((8, false)));
+        assert_eq!(soft_cut_offset("abcdefghij", 4, 2), Some((4, false)));
+    }
+
+    #[test]
+    fn split_streaming_row_row_cuts_long_content() {
+        // A paragraph of many short lines, no blank line: no paragraph
+        // boundary exists, so the row-level fallback commits everything but
+        // the last LIVE_TAIL_ROWS rows — long content must flow up instead
+        // of cycling inside the live box until the paragraph closes.
+        let lines = (0..12).map(|i| format!("w{i}")).collect::<Vec<_>>();
+        let mut rows = vec![Row::Assistant(lines.join("\n"))];
+        split_streaming_row(&mut rows, 80);
+        assert_eq!(rows.len(), 2);
+        assert!(
+            matches!(&rows[0], Row::Assistant(t) if *t == lines[..10].join("\n")),
+            "prefix commits whole lines: {:?}",
+            rows[0]
+        );
+        assert!(
+            matches!(&rows[1], Row::AssistantCont { text: t, tight: true } if *t == "w10\nw11"),
+            "tail keeps exactly the last two rows: {:?}",
+            rows[1]
+        );
+
+        // The common prose shape: ONE huge logical line. `lines().count()`
+        // is 1 — a logical-line threshold would never fire; the display-row
+        // estimate does (200 chars at width 20 = 10 rows > 8) and cuts on a
+        // wrap boundary.
+        let mut rows = vec![Row::Assistant("x".repeat(200))];
+        split_streaming_row(&mut rows, 20);
+        assert_eq!(rows.len(), 2, "one logical line must still split");
+        assert!(
+            matches!(&rows[0], Row::Assistant(t) if t.len() == 160),
+            "prefix keeps the first 8 wrapped rows: {:?}",
+            rows[0]
+        );
+        assert!(
+            matches!(&rows[1], Row::AssistantCont { text: t, tight: true } if t.len() == 40),
+            "tail keeps the last 2 wrapped rows: {:?}",
+            rows[1]
+        );
+
+        // Steady state: an already-split row re-cuts at LIVE_TAIL_ROWS, so
+        // each further row commits as written.
+        let mut rows = vec![
+            Row::Assistant("head".into()),
+            Row::AssistantCont {
+                text: "a\nb\nc".into(),
+                tight: true,
+            },
+        ];
+        split_streaming_row(&mut rows, 80);
+        assert_eq!(rows.len(), 3);
+        assert!(matches!(&rows[1], Row::AssistantCont { text: t, .. } if t == "a"));
+        assert!(matches!(&rows[2], Row::AssistantCont { text: t, tight: true } if t == "b\nc"));
+
+        // A young paragraph (≤ LIVE_TAIL_ROWS) still gets its loose chunk —
+        // paragraph structure keeps blank-line separators in the flow.
+        let mut rows = vec![Row::AssistantCont {
+            text: "a\nb\nc\n\nd".into(),
+            tight: true,
+        }];
+        split_streaming_row(&mut rows, 80);
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(&rows[1], Row::AssistantCont { text: t, tight: false } if t == "d"));
+    }
+
+    #[test]
+    fn split_streaming_row_reopens_a_cut_fence_in_the_tail() {
+        // An unclosed fence longer than the viewport: the line cut lands
+        // inside it, so the tail gets a synthetic "```\n" opener — both
+        // halves must render as code blocks on their own.
+        let code = (0..11).map(|i| format!("c{i}")).collect::<Vec<_>>();
+        let text = format!("```\n{}", code.join("\n"));
+        let mut rows = vec![Row::Assistant(text)];
+        split_streaming_row(&mut rows, 80);
+        assert_eq!(rows.len(), 2);
+        assert!(
+            matches!(&rows[0], Row::Assistant(t) if *t == format!("```\n{}", code[..9].join("\n"))),
+            "unclosed prefix keeps its lines: {:?}",
+            rows[0]
+        );
+        assert!(
+            matches!(&rows[1], Row::AssistantCont { text: t, .. } if *t == format!("```\n{}\n{}", code[9], code[10])),
+            "tail re-opens the fence: {:?}",
+            rows[1]
+        );
+        // Both halves render as code (guided `▎ ` bodies, no blank prose).
+        let mut cache = MdCache::new();
+        let out = build_history_lines(&rows, &mut cache, TEST_W, LiveRow::None, false, true);
+        let joined: String = out.iter().map(row_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            joined.contains("▎ c8"),
+            "prefix renders as code: {joined:?}"
+        );
+        assert!(joined.contains("▎ c9"), "tail renders as code: {joined:?}");
+
+        // The transcript strips the synthetic opener back out.
+        let dumped = render_transcript(&rows);
+        assert!(
+            !dumped.contains("\n```\nc9"),
+            "synthetic opener leaked: {dumped:?}"
+        );
+        assert!(
+            dumped.contains("c9\nc10"),
+            "tight join is a single \\n: {dumped:?}"
+        );
+    }
+
+    #[test]
+    fn tight_chunks_render_flush_and_thinking_keeps_one_marker() {
+        // Mid-paragraph chunks: no blank line between them and the row they
+        // continue — a gap would tear one paragraph into two blocks.
+        let rows = vec![
+            Row::Assistant("a".into()),
+            Row::AssistantCont {
+                text: "b".into(),
+                tight: true,
+            },
+        ];
+        let texts: Vec<String> = history(&rows).iter().map(row_text).collect();
+        assert_eq!(
+            texts,
+            vec!["● a".to_string(), "  b".to_string(), String::new()]
+        );
+
+        // A tight trace chunk carries no ✻ marker (it is a continuation of
+        // the block above) and no blank separates them.
+        let rows = vec![
+            Row::Thinking {
+                text: "t1".into(),
+                tight: false,
+            },
+            Row::Thinking {
+                text: "t2".into(),
+                tight: true,
+            },
+        ];
+        let texts: Vec<String> = history(&rows).iter().map(row_text).collect();
+        assert_eq!(
+            texts,
+            vec!["✻ t1".to_string(), "  t2".to_string(), String::new()]
+        );
+
+        // Loose thinking chunks keep the old shape: marker + blank between.
+        let rows = vec![
+            Row::Thinking {
+                text: "t1".into(),
+                tight: false,
+            },
+            Row::Thinking {
+                text: "t2".into(),
+                tight: false,
+            },
+        ];
+        let texts: Vec<String> = history(&rows).iter().map(row_text).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "✻ t1".to_string(),
+                String::new(),
+                "✻ t2".to_string(),
+                String::new()
+            ]
+        );
+
+        // Transcript: tight joins with a single \n, loose with \n\n.
+        let rows = vec![
+            Row::Assistant("first".into()),
+            Row::AssistantCont {
+                text: "second".into(),
+                tight: true,
+            },
+        ];
+        let out = render_transcript(&rows);
+        assert!(out.contains("Tiny\nfirst\nsecond"), "tight join: {out:?}");
+        assert!(
+            !out.contains("first\n\nsecond"),
+            "tight must not gap: {out:?}"
         );
     }
 
@@ -5546,12 +6012,21 @@ mod tests {
         // viewport while open, committed once closed. When the answer has
         // started, the trace is no longer trailing — it commits right away
         // and only the answer row is held.
-        let rows = vec![Row::User("hi".into()), Row::Thinking("trace".into())];
+        let rows = vec![
+            Row::User("hi".into()),
+            Row::Thinking {
+                text: "trace".into(),
+                tight: false,
+            },
+        ];
         assert_eq!(commit_pending_end(&rows, 0, true), 1);
         assert_eq!(commit_pending_end(&rows, 0, false), 2);
         let rows = vec![
             Row::User("hi".into()),
-            Row::Thinking("trace".into()),
+            Row::Thinking {
+                text: "trace".into(),
+                tight: false,
+            },
             Row::Assistant("answer".into()),
         ];
         assert_eq!(commit_pending_end(&rows, 0, true), 2);
@@ -5561,11 +6036,20 @@ mod tests {
     fn inflight_row_index_covers_a_streaming_trace() {
         // While the trace streams (no Assistant yet), the live zone shows
         // the Thinking row; when the answer streams, it takes over.
-        let rows = vec![Row::User("hi".into()), Row::Thinking("trace".into())];
+        let rows = vec![
+            Row::User("hi".into()),
+            Row::Thinking {
+                text: "trace".into(),
+                tight: false,
+            },
+        ];
         assert_eq!(inflight_row_index(&rows, true), Some(1));
         let rows = vec![
             Row::User("hi".into()),
-            Row::Thinking("trace".into()),
+            Row::Thinking {
+                text: "trace".into(),
+                tight: false,
+            },
             Row::Assistant("answer".into()),
         ];
         assert_eq!(inflight_row_index(&rows, true), Some(2));
@@ -6276,8 +6760,14 @@ mod tests {
         let rows = vec![
             Row::User("hello".into()),
             Row::Queued("later".into()),
-            Row::Thinking("pondering".into()),
-            Row::Thinking("   ".into()),   // whitespace-only → skipped
+            Row::Thinking {
+                text: "pondering".into(),
+                tight: false,
+            },
+            Row::Thinking {
+                text: "   ".into(),
+                tight: false,
+            }, // whitespace-only → skipped
             Row::Assistant(String::new()), // empty → skipped (no bare "Tiny")
             Row::Assistant("I am fine".into()),
             Row::ToolCall {

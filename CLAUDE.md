@@ -221,16 +221,22 @@ cargo clippy -p tiny-agent-node
   **TUI 定位（原"冻结只修 bug"政策已按产品决定放宽）**：交互体验对齐主流终端 AI 工具的基础项
   已落地一批（见下），红线仍是**架构与渲染模型**——不做全屏 / 鼠标托管 / 主题系统这类结构性扩张。
   已落地的扩展面速记：
-  - **流式增量定稿（`split_streaming_row` + `Row::AssistantCont`）**：在途 Assistant/Thinking 行超过
-    `INLINE_HEIGHT` 行即在**最新安全段落边界**（空行分隔、且前缀 ``` 围栏成对闭合，`last_safe_boundary`）
-    切分——前缀行定稿进 scrollback、尾段继续 live 流式（Claude Code 模型：边生成边滚出，不再整篇憋到
-    回合结束一次性刷屏）。续块是 `AssistantCont`（**无 ● 图标**——一条回复不能读成 N 条消息；图标只留
-    在消息头行），`append_delta`/`commit_pending_end`/`inflight_row_index` 对它与 Assistant 同等对待；
-    思考行切分后每块各带 ✻ 标记（全 dim，读作 trace 分节）；**子 agent 气泡不切**（task 按契约返回短
-    摘要，无名 Cont 块夹在两个同名 agent 气泡间会有歧义）。行间 spacer 规则随之扩展：相邻
-    Assistant/Cont 行之间补空行（恢复切分吃掉的段落分隔）、✻ 区块前后补空行（trace 与答复视觉分离），
-    但 user→assistant 仍保持紧凑、工具行仍紧贴所属流程。已提前定稿的行不随后续/resize 重排（scrollback
-    写一次即定，与 Claude Code 同款取舍）。
+  - **流式增量定稿（`split_streaming_row(&mut rows, width)` + `Row::AssistantCont{text,tight}`）**：
+    在途 Assistant/Thinking 行的**显示行数**（`est_display_rows`：逐字符 unicode-width 累加折行——
+    是渲染实际行数的**上界**，markdown 段内软连接只会更少行，宁早切勿漏切）超过阈值即切分：前缀
+    定稿进 scrollback、尾段继续 live 流式。**切分点两级**：优先最新安全段落边界（`last_safe_boundary`，
+    空行分隔、前缀围栏闭合）——整段 markdown 块完整定稿，续块 loose（块间补空行恢复段落间距）；
+    段落本身超过阈值（**含 LLM 常见"一整段一行"散文——逻辑行数是 1，任何基于 `lines().count()` 的
+    阈值对它永不触发，必须按显示行**）退化为**显示行切分**（`soft_cut_offset`：切点总在折行边界，
+    尾段保留最后 `LIVE_TAIL_ROWS=2` 行），续块 tight——渲染紧贴前行（无空行，段落不被撕成两半）、
+    不重复 ✻ 标记、`/export` 以 `\n` 拼接。围栏内切分给尾段补合成 ```` ``` ```` 开栏（未闭合前缀照样
+    渲染成代码块；转录 strip 回去）。**阈值两档**：首切 `INLINE_HEIGHT`，切过一次后（尾行是
+    Cont/tight Thinking）降为 `LIVE_TAIL_ROWS`——之后每写一行即提交；年轻段落（≤2 行）仍走段落
+    切分保住空行结构。**`trailing_spacer` 陷阱（`build_history_lines` 第 6 参）**：commit 渲染的是
+    `rows` 切片，切片末行若按"历史末尾"无条件补空行，每批增量提交都往 scrollback 塞一个多余空行、
+    tight 段落被撕开——只有 `pending_end == rows.len()` 才传 true。续块无 ● 图标（一条回复不读成
+    N 条消息）；子 agent 气泡不切。改 `split_streaming_row` 签名（带 width）或 Cont/Thinking 形状的
+    人：测试里 ~10 处构造/匹配要跟着改。
   - **思考区块（`Row::Thinking`）**：ThinkingDelta 不再与答复折进同一 Assistant 行（混排不可读），
     走 `append_thinking_delta` 进独立暗色斜体 `✻` 行——`thinking_stream: Option<String>` 是当前在飞
     trace 的 tag（"" 父 / 子 agent 名，merge 判据同 `sub_streaming_name`），答复/工具/任何其它行插入
