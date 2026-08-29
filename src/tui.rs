@@ -1762,7 +1762,7 @@ fn ui_loop(
                         history_up(&history, &mut hist_idx, &mut draft, &mut input);
                     }
                     (KeyCode::Down, KeyModifiers::ALT) => {
-                        history_down(&history, &mut hist_idx, &mut draft, &mut input);
+                        history_down(&history, &mut hist_idx, &draft, &mut input);
                     }
                     (KeyCode::Up, _) => {
                         if up_is_history(input.line_count() == 1, hist_idx.is_some()) {
@@ -1773,7 +1773,7 @@ fn ui_loop(
                     }
                     (KeyCode::Down, _) => {
                         if hist_idx.is_some() {
-                            history_down(&history, &mut hist_idx, &mut draft, &mut input);
+                            history_down(&history, &mut hist_idx, &draft, &mut input);
                         } else {
                             input.move_down();
                         }
@@ -2232,10 +2232,6 @@ impl ToolRunning {
 
     fn clear(&mut self) {
         self.calls.clear();
-    }
-
-    fn is_empty(&self) -> bool {
-        self.calls.is_empty()
     }
 }
 
@@ -3523,7 +3519,7 @@ fn history_up(
 fn history_down(
     history: &[String],
     hist_idx: &mut Option<usize>,
-    draft: &mut String,
+    draft: &str,
     input: &mut InputBuffer,
 ) {
     if let Some(i) = *hist_idx {
@@ -4071,7 +4067,7 @@ mod tests {
         // Render-only tracker: on_call pushes, on_result removes the first
         // same-name entry (falling back to the oldest), clear/empty no-op.
         let mut t = ToolRunning::new();
-        assert!(t.is_empty());
+        assert!(t.calls.is_empty());
         t.on_call("shell");
         t.on_call("read");
         t.on_call("shell"); // parallel same-name call
@@ -4083,10 +4079,10 @@ mod tests {
         assert_eq!(t.calls[0].0, "shell");
         t.on_result("shell");
         t.on_result("shell"); // already empty → no-op, not a panic
-        assert!(t.is_empty());
+        assert!(t.calls.is_empty());
         t.on_call("x");
         t.clear();
-        assert!(t.is_empty());
+        assert!(t.calls.is_empty());
     }
 
     #[test]
@@ -5055,10 +5051,10 @@ mod tests {
         history_up(&history, &mut idx, &mut draft, &mut b); // clamped at oldest
         assert_eq!(idx, Some(0));
         assert_eq!(b.text(), "one");
-        history_down(&history, &mut idx, &mut draft, &mut b); // → two
+        history_down(&history, &mut idx, &draft, &mut b); // → two
         assert_eq!(idx, Some(1));
-        history_down(&history, &mut idx, &mut draft, &mut b); // → three
-        history_down(&history, &mut idx, &mut draft, &mut b); // past newest
+        history_down(&history, &mut idx, &draft, &mut b); // → three
+        history_down(&history, &mut idx, &draft, &mut b); // past newest
         assert_eq!(idx, None);
         assert_eq!(b.text(), "draft text");
         // Empty history: no-op, no panic.
