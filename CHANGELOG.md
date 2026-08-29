@@ -7,6 +7,12 @@
 
 ### Fixed
 
+- **TUI 体验批次修正**（与下条 Added 的 TUI 批次同源）：README 键位表退出语义漂移修正
+  （Esc 早已不是退出键，改为 `/quit`、`/exit` 或空闲 Ctrl-C 按两次）；TUI 取消后不再追加
+  第二行 `[done: cancelled]`（Esc 已有 `[cancelling…]` 提示，Done 行是纯噪声——
+  `is_normal_stop` 名单加 `cancelled`，timeout / max_turns_reached / budget_exceeded 的
+  告警保持不变）；空态按键速览补第 4 行（多行输入入口与取消键——两个最高频困惑点
+  第一屏可见）。
 - **全面审计（第四轮，P1/P2/P3）修正**（每项带回归测试；P1-1/2/3 为最高优先级项）：
   - **P1-1 atomic_write 防预置符号链接击穿**：临时文件名 `<target>.<pid>.<n>.tmp` 的 pid 与计数器均可预测，`write_file`/`edit_file` 只对目标路径做 workdir 沙盒检查、看不到临时兄弟名——攻击者（或恶意任务）在 workdir 预置同名符号链接指向 `/etc/cron.d/x`，"写进沙盒"实际写穿到任意路径。改 `create_new(true)`（O_EXCL）冲突即换名重试，符号链接永远打不开。同批：`--json` NDJSON 输出容忍下游断管（`| head` 不再 panic，改为静默放弃——stdout 已死时打印无意义）。
   - **P1-2 Python 绑定双死锁消除**：`Agent` 存 `Mutex` 而 `run()` 释放 GIL 后又要锁——重入调用（自定义工具 / provider 回调里碰 agent 方法，如 `push_user`）GIL↔Mutex 互等死锁；两个线程各自 `push_user` 也互等。锁模型重构为单一 `with_agent` 入口（`allow_threads` 内拿锁），重入（run 期间的 agent 方法调用）从死锁改为明确的"agent is running"报错。
@@ -71,6 +77,27 @@
 
 ### Added
 
+- **TUI 体验改进批次**（全部改动在 bin crate、lib 零触碰；守「内联 live 区 + 原生
+  scrollback」架构红线，无鼠标 / 托管滚动）：
+  - **工具运行期 live 占位 + 计时**：工具执行中 live 区显示 `→ 工具名 · 1.2s…`
+    （同 turn 并行 fan-out 聚合为 `(+N)`），busy 时 120ms tick 走字——长 shell 期间
+    底部不再是空白盲区。渲染期合成、不进 rows / 转录。
+  - **`/out [n]` 命令**：重印第 n 新的工具结果全文（默认最新一条；错误结果同样可
+    展开），`/help` 与补全弹窗经同一张命令表自动跟上。此前成功结果的完整输出在
+    TUI 内不可见，只能 `/export` 绕路。
+  - **`--resume` 历史转录进原生 scrollback**：user / assistant 消息与工具调用、结果
+    按 `tool_use_id` 配对重建单行视图（`· ` 系统行标注 resumed；图片跳过——显示层
+    转录，本体留在 agent 历史），恢复后对话区不再一片空白；停在 tool_result 中途的
+    会话 auto-start 续跑时，任务文本直接可见（不再依赖 `--task` 才有镜像行）。
+  - **`TINYAGENT_TUI_THEME=light` 浅色终端适配**：dim 文字（系统行 / 预览 / 状态段，
+    原 Gray 在浅底近白隐形）换 DarkGray，行内代码白→青（深浅底皆可读）；dark 默认
+    零漂移（与旧常量逐值相等的测试钉住），不做自动探测（终端背景色上报不可靠）。
+  - **键位对齐主流终端 AI 工具**：单行输入（含空输入）或浏览中 ↑/↓ 历史召回、
+    多行时恢复跨行移动（Alt+↑/↓ 语义不变）；`Ctrl-D` 删光标后字符（空输入且空闲
+    → 退出，backspace 的镜像）；行尾 `\`+Enter 换行（bash 同款行续接——不上报
+    修饰键的终端如 macOS Terminal.app 的唯一手动多行入口）；空闲 `Ctrl-C` 双击
+    确认退出（2s 窗口内再按一次，首按只提示——退出不可恢复所以加确认，忙时
+    单击取消的语义不变，取消可恢复）。
 - **MIT LICENSE**：仓库此前无许可文件（发布产物默认保留所有权利，第三方无法合法
   复用）。补根 `LICENSE`（MIT）并同步 5 处元数据（根 / 双绑定 `Cargo.toml`、
   `pyproject.toml`、`package.json`）；release tarball 附带 LICENSE。

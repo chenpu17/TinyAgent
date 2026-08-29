@@ -152,7 +152,8 @@ cargo clippy -p tiny-agent-node
   （全量替换，不 push sys_info 行——完整 checklist 已在 `todo` 工具结果行可见）。每帧把 `plan done/total`（全完成绿/进行中黄）作为
   `build_status_line` 的 `plan: Option<(&str, Style)>` 段渲染。`build_status_line` 的可选段按**存活优先级**贪心添加：ctx > plan > stats
   （窄屏先省 stats、再 plan、ctx 最后），用一个 `Vec<(String,Style)>` + 累积 `prefix_w` 的通用循环取代旧的 if/else-if；**plan=None 时行为与
-  启用前逐字节相同**（既有 `build_status_line_*` 测试全过）。TUI 的"冻结只修 bug"政策对此**破例一次**（产品决定）；其余 TUI 改动仍守冻结。
+  启用前逐字节相同**（既有 `build_status_line_*` 测试全过）。这是原"冻结只修 bug"政策的首次破例（后来的
+  TUI 体验批次将政策整体放宽为"基础体验对齐、架构红线不动"，见 TUI 条目——本段是当时的首个例外，历史保留）。
 - **Skill（技能，`skills.rs` + `tools/skill.rs`）**：对齐 **agentskills.io 开放标准**（不是 Claude Code 私有扩展——
   `disable-model-invocation`/`context:fork`/`$ARGUMENTS`/`!cmd` 注入/嵌套惰性发现等依赖 CC 特有会话/权限/子代理模型，
   不实现）。启动时（`lib.rs::assemble`）扫描全局 `~/.config/tinyagent/skills/`（`skills::default_global_skills_dir`
@@ -217,6 +218,27 @@ cargo clippy -p tiny-agent-node
   回合结束（stream 关闭）才整条提交。**`ratatui` 的 `scrolling-regions` feature 已在 Cargo.toml 启用**：
   默认回退路径每次 `insert_before` 都 `Terminal::clear()`（发一个 DSR 光标查询 `\x1b[6n`），开了
   scrolling-regions 走 CSR(DECSTBM) 滚动区路径、无此查询且渲染更平滑（CSR 现代终端普遍支持）。
+  **TUI 定位（原"冻结只修 bug"政策已按产品决定放宽）**：交互体验对齐主流终端 AI 工具的基础项
+  已落地一批（见下），红线仍是**架构与渲染模型**——不做全屏 / 鼠标托管 / 主题系统这类结构性扩张。
+  已落地的扩展面速记：
+  - **render-only 瞬态模式**（`thinking`、`tool_running` 同款）：渲染期合成、不进 rows / MdCache /
+    转录——live 区渲染优先链 popup > thinking > inflight 流式行 > tool_running 占位
+    （`→ 工具名 · 1.2s…`，并行 fan-out 聚合 `(+N)`，busy 时 120ms tick 走字）。新增瞬态展示照此模式。
+  - **`/out [n]`**：从 rows 尾部找第 n 新的 `ToolResult` 克隆置 `expanded: true` 重印
+    （`nth_last_tool_result`）——展开渲染与提交通道全复用，无新渲染路径；`SLASH_COMMANDS` 一张表
+    同时驱动 /help 与补全弹窗（新增命令只改表 + classify + Enter match 三处）。
+  - **resume 转录**（`tui::transcript_rows(&[Message]) -> Vec<Row>`）：main.rs 在 build_agent
+    **消费 `initial` 之前**快照；先一遍扫全部 ToolUse 建 id→name map，ToolResult 按 id 反查配名
+    （查不到用 `(unknown)`），`elapsed: None`（字段本就为 resume 设计）；Image 跳过（转录是显示层）。
+    resume 时**跳过 initial_task 镜像**（末条 user 已在转录里，再镜像重复）；`Row` 因此 `pub(crate)`。
+  - **浅色主题**（`TINYAGENT_TUI_THEME=light`）：`THEME_LIGHT: OnceLock<bool>` 进程级一次设定
+    （`run()` 入口读 env，OnceLock 无法复位——**测试不得 set 它**，light/dark 两态逻辑抽纯函数
+    `theme_light_from` / `redye_inline_code` 测）；dim 文字走 `dim_fg()`（dark=Gray 现状 / light=DarkGray）、
+    行内代码走 `code_fg()`（dark=White / light=青）——新增暗色 UI 元素用 `dim_fg()` 别再引常量。
+  - **键位语义**：单行输入（含空）或浏览中 ↑/↓ 走历史召回（判定 `up_is_history`），多行恢复跨行
+    移动；`Ctrl-D` 删后字符（`InputBuffer::delete_forward`，backspace 镜像）/ 空输入空闲退出；
+    行尾 `\`+Enter 换行（行续接）；空闲 `Ctrl-C` 双击 2s 窗口确认退出（判定 `ctrl_c_should_quit`），
+    忙时单击取消不变。`is_normal_stop` 名单含 `cancelled`（Esc 已提示，Done 行是噪声）。
 
 ## 容易踩的坑
 
@@ -387,7 +409,7 @@ cargo clippy -p tiny-agent-node
   都要加 `.envs`，别只改一条。
 - **思考内容展示策略**：`ThinkingDelta` 在 `harness` 的 `--json` NDJSON 发 `{"type":"thinking","delta":...}`；
   headless 终端打印写 **stderr**（不进 stdout 的 `summary`，可 `2>/dev/null` 屏蔽）；TUI 用 or 模式
-  `TextDelta(t) | ThinkingDelta(t)` 折进同一渲染分支（TUI 冻结，只保证可见，不做可折叠区块——那是 TinyWorker 的事）。
+  `TextDelta(t) | ThinkingDelta(t)` 折进同一渲染分支（只保证可见，不做独立可折叠区块——那是 TinyWorker 的事）。
   子 agent 的思考经 `AgentEvent::SubAgent` 整体包装转发（`subagent.rs` 不逐变体 match），harness 的 SubAgent 内嵌
   match 单独把它写 stderr 带 `[name]` 前缀。
 - **改 `agent.rs` 核心路径必须配套 loop 测试**。测试外置在 `agent_tests.rs`（`agent.rs` 末尾
