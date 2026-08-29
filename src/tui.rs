@@ -126,6 +126,12 @@ pub(crate) enum Row {
     /// when the queue flush actually sends it; dropped if the queue is.
     Queued(String),
     Assistant(String),
+    /// Continuation of the previous Assistant message — a chunk split off
+    /// the streaming row by `split_streaming_row` once it outgrew the live
+    /// viewport (incremental commit). Renders like Assistant but WITHOUT
+    /// the `● ` icon (the message head already has it) — one reply must not
+    /// read as N messages. Merges with append_delta like Assistant does.
+    AssistantCont(String),
     /// Reasoning trace (ThinkingDelta): rendered as plain dim-italic prose
     /// with a `✻ ` marker — deliberately NOT markdown/MdCache so it can
     /// never read like the answer (the old code folded the trace into the
@@ -586,6 +592,14 @@ fn render_transcript(rows: &[Row]) -> String {
             Row::Assistant(t) if t.is_empty() => {}
             Row::Assistant(t) => {
                 out.push_str("Tiny\n");
+                out.push_str(t);
+                out.push_str("\n\n");
+            }
+            // A split chunk: no "Tiny" header (the head chunk has it); the
+            // trailing \n\n restores the paragraph gap the split consumed,
+            // so concatenated chunks read as the original text.
+            Row::AssistantCont(t) if t.is_empty() => {}
+            Row::AssistantCont(t) => {
                 out.push_str(t);
                 out.push_str("\n\n");
             }
@@ -1204,6 +1218,9 @@ fn ui_loop(
                             activity = "writing".into();
                         }
                         append_delta(&mut rows, &mut streaming, &t);
+                        // Incremental commit: flush finished paragraphs into
+                        // scrollback while the rest keeps streaming.
+                        split_streaming_row(&mut rows);
                     }
                     AgentEvent::ThinkingDelta(t) => {
                         // Reasoning trace: its own dim ✻ block, never merged
@@ -1220,6 +1237,9 @@ fn ui_loop(
                             activity = "thinking".into();
                         }
                         append_thinking_delta(&mut rows, &mut thinking_stream, "", &t);
+                        // Long traces flush incrementally too (they are often
+                        // LONGER than the answer).
+                        split_streaming_row(&mut rows);
                     }
                     AgentEvent::ToolCall { name, input } => {
                         streaming = false;
@@ -2143,6 +2163,59 @@ fn push_tool_head(lines: &mut Vec<Line<'static>>, head: Line<'static>, hang: usi
 /// the draw/commit paths so role hierarchy, colors, `│ ` guides, the streaming
 /// cursor, and the empty placeholder are unit-testable without a terminal.
 ///
+/// Render one Assistant(-shaped) body: markdown via MdCache, indented under
+/// the role column. `head` swaps the first line's indent for the bold `● `
+/// icon (message head); a continuation chunk keeps the plain indent so its
+/// text aligns under the head's body. The live-streaming `▌` cursor lands on
+/// this row's last line when `live` selects it AND it is the last row.
+// (8 params: the row context the shared body render needs; a struct just for
+// this would add noise — same allow as build_history_lines.)
+#[allow(clippy::too_many_arguments)]
+fn push_assistant_body(
+    lines: &mut Vec<Line<'static>>,
+    md_cache: &mut MdCache,
+    inner_w: usize,
+    t: &str,
+    live: LiveRow,
+    idx: usize,
+    rows_len: usize,
+    head: bool,
+) {
+    let markdown_width = inner_w.saturating_sub(ROLE_BODY_INDENT).max(1);
+    // M6: reuse the cached render unless this row's text grew since last
+    // frame (streaming). Prior rows and scroll redraws hit the cache; only
+    // the in-flight row (or a first render) re-parses markdown. The cache is
+    // keyed by (text, width), not row index — see MdCache docs for why.
+    let mut rendered = md_cache
+        .get_or_render(t, markdown_width, |txt| {
+            render_markdown(txt, markdown_width)
+                .iter()
+                .map(line_to_owned)
+                .collect()
+        })
+        .to_vec();
+    if rendered.is_empty() {
+        rendered.push(Line::default());
+    }
+    indent_lines(&mut rendered, ROLE_BODY_INDENT);
+    if head {
+        // Inline role icon: the first body line's indent becomes the `● `
+        // marker — same column, one row saved, no header line.
+        rendered[0].spans[0] = Span::styled(
+            "● ".to_string(),
+            Style::default().fg(AGENT_FG).add_modifier(Modifier::BOLD),
+        );
+    }
+    lines.extend(rendered);
+    // Streaming cursor on the live assistant row.
+    if live == LiveRow::Text && idx == rows_len - 1 {
+        if let Some(last) = lines.last_mut() {
+            last.spans
+                .push(Span::styled("▌".to_string(), Style::default().fg(AGENT_FG)));
+        }
+    }
+}
+
 /// Which trailing row is live (still growing) in this render — drives the
 /// `▌` cursor. `None` for the commit path (rows are final); `Text`/`Think`
 /// for the single in-flight row rendered in the viewport's transcript zone.
@@ -2212,38 +2285,30 @@ fn build_history_lines(
                 );
             }
             Row::Assistant(t) => {
-                let markdown_width = inner_w.saturating_sub(ROLE_BODY_INDENT).max(1);
-                // M6: reuse the cached render unless this row's text
-                // grew since last frame (streaming). Prior rows and
-                // scroll redraws hit the cache; only the in-flight row
-                // (or a first render) re-parses markdown. The cache is keyed by
-                // (text, width), not row index — see MdCache docs for why.
-                let mut rendered = md_cache
-                    .get_or_render(t, markdown_width, |txt| {
-                        render_markdown(txt, markdown_width)
-                            .iter()
-                            .map(line_to_owned)
-                            .collect()
-                    })
-                    .to_vec();
-                if rendered.is_empty() {
-                    rendered.push(Line::default());
-                }
-                indent_lines(&mut rendered, ROLE_BODY_INDENT);
-                // Inline role icon: the first body line's indent becomes the
-                // `● ` marker — same column, one row saved, no header line.
-                rendered[0].spans[0] = Span::styled(
-                    "● ".to_string(),
-                    Style::default().fg(AGENT_FG).add_modifier(Modifier::BOLD),
+                push_assistant_body(
+                    &mut lines,
+                    md_cache,
+                    inner_w,
+                    t,
+                    live,
+                    idx,
+                    rows.len(),
+                    true,
                 );
-                lines.extend(rendered);
-                // Streaming cursor on the live assistant row.
-                if live == LiveRow::Text && idx == rows.len() - 1 {
-                    if let Some(last) = lines.last_mut() {
-                        last.spans
-                            .push(Span::styled("▌".to_string(), Style::default().fg(AGENT_FG)));
-                    }
-                }
+            }
+            Row::AssistantCont(t) => {
+                // An incrementally-committed chunk: same body, no `● ` head —
+                // one reply must not read as several messages.
+                push_assistant_body(
+                    &mut lines,
+                    md_cache,
+                    inner_w,
+                    t,
+                    live,
+                    idx,
+                    rows.len(),
+                    false,
+                );
             }
             Row::Thinking(t) => {
                 // Reasoning trace: plain dim-italic prose — deliberately NOT
@@ -2399,15 +2464,26 @@ fn build_history_lines(
                 }
             }
         }
-        // Turn boundary: a blank spacer separates this execution flow from the
-        // next user message / queued ghost / system line.
-        let next = rows.get(idx + 1);
-        if next.is_none()
-            || matches!(
-                next,
-                Some(Row::User(_) | Row::Queued(_) | Row::System { .. })
-            )
-        {
+        // Row-boundary spacers. Base rule (today's): a blank before the next
+        // user / queued / system row, or at the end of the history. On top:
+        // adjacent assistant-shaped rows get a gap (an incrementally-split
+        // chunk recovers the paragraph gap the split consumed; two separate
+        // messages stop reading as one blob), and a Thinking block gets a
+        // blank after it (trace vs answer separation) and before it unless it
+        // directly follows the user's message (mirrors the tight
+        // user→assistant look). Tool rows stay tight against the flow they
+        // belong to.
+        let spacer = match rows.get(idx + 1) {
+            None => true,
+            Some(Row::User(_) | Row::Queued(_) | Row::System { .. }) => true,
+            Some(Row::Thinking(_)) => !matches!(row, Row::User(_)),
+            Some(Row::Assistant(_) | Row::AssistantCont(_)) => matches!(
+                row,
+                Row::Assistant(_) | Row::AssistantCont(_) | Row::Thinking(_)
+            ),
+            Some(_) => false,
+        };
+        if spacer {
             lines.push(Line::default());
         }
     }
@@ -2796,13 +2872,16 @@ fn commit_pending_end(rows: &[Row], committed: usize, stream_open: bool) -> usiz
         Some(i) => committed + i,
         None => rows.len(),
     };
-    // Hold back an in-flight trailing Assistant/Thinking while its stream is
-    // open. Whichever stream is open, its mutating row is the trailing one
-    // (every other event either closes the stream or pushes a later row), so
-    // one trailing check covers both kinds.
+    // Hold back an in-flight trailing Assistant/AssistantCont/Thinking while
+    // its stream is open. Whichever stream is open, its mutating row is the
+    // trailing one (every other event either closes the stream or pushes a
+    // later row), so one trailing check covers all kinds.
     if stream_open
         && pending_end > committed
-        && matches!(rows[pending_end - 1], Row::Assistant(_) | Row::Thinking(_))
+        && matches!(
+            rows[pending_end - 1],
+            Row::Assistant(_) | Row::AssistantCont(_) | Row::Thinking(_)
+        )
     {
         pending_end -= 1;
     }
@@ -2820,8 +2899,12 @@ fn commit_pending_end(rows: &[Row], committed: usize, stream_open: bool) -> usiz
 /// rendered that stale row and hid the real streaming output.
 fn inflight_row_index(rows: &[Row], stream_open: bool) -> Option<usize> {
     if stream_open {
-        rows.iter()
-            .rposition(|r| matches!(r, Row::Assistant(_) | Row::Thinking(_)))
+        rows.iter().rposition(|r| {
+            matches!(
+                r,
+                Row::Assistant(_) | Row::AssistantCont(_) | Row::Thinking(_)
+            )
+        })
     } else {
         None
     }
@@ -2947,13 +3030,90 @@ fn strip_controls_json(v: &serde_json::Value) -> serde_json::Value {
 /// dropped the delta in that case, silently losing output. Control characters
 /// are stripped here, once, at the row entry point.
 fn append_delta(rows: &mut Vec<Row>, streaming: &mut bool, text: &str) {
-    if !*streaming || !matches!(rows.last(), Some(Row::Assistant(_))) {
+    if !*streaming || !matches!(rows.last(), Some(Row::Assistant(_) | Row::AssistantCont(_))) {
         rows.push(Row::Assistant(String::new()));
         *streaming = true;
     }
-    if let Some(Row::Assistant(buf)) = rows.last_mut() {
+    if let Some(Row::Assistant(buf) | Row::AssistantCont(buf)) = rows.last_mut() {
         buf.push_str(&strip_controls(text));
     }
+}
+
+/// Byte offset where the tail of `text` may be split off: the START of the
+/// last paragraph that follows a blank line OUTSIDE any open ``` fence, so
+/// everything before it is final (closed markdown blocks). None when no safe
+/// boundary exists. The offset is where a new paragraph's first line begins;
+/// the `\n\n` separator itself stays with the prefix and is trimmed there.
+fn last_safe_boundary(text: &str) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    let mut fence_open = false;
+    let mut prev_blank = false;
+    let mut seen_content = false;
+    let mut offset = 0usize;
+    for line in text.split('\n') {
+        let is_blank = line.trim().is_empty();
+        if prev_blank && !is_blank && !fence_open && seen_content {
+            best = Some(offset);
+        }
+        if line.trim_start().starts_with("```") {
+            fence_open = !fence_open;
+        }
+        seen_content |= !is_blank;
+        prev_blank = is_blank;
+        offset += line.len() + 1; // +1 for the '\n' split_inclusive-style step
+    }
+    best
+}
+
+/// Incremental commit: once the in-flight text outgrows the inline viewport
+/// (the live zone can only ever show its tail anyway), split the trailing
+/// streaming row at the latest safe paragraph boundary. The prefix is final
+/// and commits into scrollback on the next pass while the user keeps
+/// watching fresh content stream in the live zone — instead of the whole
+/// reply appearing in one flush when the turn ends (Claude Code's model).
+///
+/// - Assistant tails split into `Assistant(prefix) + AssistantCont(tail)`:
+///   only the message head keeps the `● ` icon. A row that is already a
+///   Cont splits into two Conts (the head is far behind).
+/// - Thinking tails split into `Thinking + Thinking`: each chunk carries
+///   its own `✻ ` marker (all-dim anyway, reads as trace sections).
+/// - Sub-agent bubbles are NOT split: `task` returns short summaries by
+///   contract, and an unnamed Cont chunk interleaved between two same-named
+///   agents' bubbles would be ambiguous.
+fn split_streaming_row(rows: &mut Vec<Row>) {
+    let is_thinking = matches!(rows.last(), Some(Row::Thinking(_)));
+    let tail = {
+        let text = match rows.last_mut() {
+            Some(Row::Assistant(t)) | Some(Row::AssistantCont(t)) | Some(Row::Thinking(t)) => t,
+            _ => return,
+        };
+        // Threshold: raw lines beyond the viewport height. Below that the
+        // whole reply fits (or nearly) — keep it one row for tighter
+        // rendering (no inter-chunk spacers) until it overflows.
+        if text.lines().count() <= INLINE_HEIGHT as usize {
+            return;
+        }
+        let Some(at) = last_safe_boundary(text) else {
+            return; // one huge unclosed paragraph/fence: nothing safe to cut
+        };
+        let tail = text.split_off(at);
+        // Consume the paragraph separator (\n\n stayed with the prefix).
+        while text.ends_with('\n') {
+            text.pop();
+        }
+        // An all-blank prefix would render as an empty message — undo.
+        if text.trim().is_empty() {
+            text.push_str(&tail);
+            return;
+        }
+        tail
+    };
+    let row = match (is_thinking, tail.is_empty()) {
+        (_, true) => return,
+        (true, _) => Row::Thinking(tail),
+        (false, _) => Row::AssistantCont(tail),
+    };
+    rows.push(row);
 }
 
 /// Append a ThinkingDelta to the trace row. Consecutive deltas merge while
@@ -4318,9 +4478,12 @@ mod tests {
         ];
         let mut cache = MdCache::new();
         let lines = build_history_lines(&rows, &mut cache, TEST_W, LiveRow::Text, false);
+        // Adjacent assistant rows get a gap (split chunks recover their
+        // paragraph separator; separate messages stop reading as one blob).
         assert_eq!(row_text(&lines[0]), "● done");
-        assert_eq!(row_text(&lines[1]), "● typing▌");
-        let last = lines[1].spans.last().expect("a cursor span");
+        assert_eq!(row_text(&lines[1]), "");
+        assert_eq!(row_text(&lines[2]), "● typing▌");
+        let last = lines[2].spans.last().expect("a cursor span");
         assert_eq!(last.content.as_ref(), "▌");
         assert_eq!(last.style.fg, Some(AGENT_FG));
         // Not streaming: no cursor anywhere.
@@ -4401,6 +4564,78 @@ mod tests {
         // Committed render: no cursor.
         let lines = history(&rows);
         assert!(!lines.iter().any(|l| row_text(l).contains('▌')));
+    }
+
+    #[test]
+    fn assistant_cont_renders_without_icon_and_gets_the_live_cursor() {
+        // A continuation chunk: body indented under the head's icon column,
+        // no `● ` of its own, a gap between the chunks (the split consumed
+        // the paragraph separator — the gap restores it).
+        let rows = vec![
+            Row::Assistant("head".into()),
+            Row::AssistantCont("tail".into()),
+        ];
+        let lines = history(&rows);
+        let texts: Vec<String> = lines.iter().map(row_text).collect();
+        // (trailing blank = end-of-history spacer)
+        assert_eq!(
+            texts,
+            vec![
+                "● head".to_string(),
+                String::new(),
+                "  tail".to_string(),
+                String::new()
+            ]
+        );
+
+        // The Cont chunk is the live row while it streams: cursor works.
+        let mut cache = MdCache::new();
+        let lines = build_history_lines(&rows, &mut cache, TEST_W, LiveRow::Text, false);
+        assert_eq!(row_text(&lines[2]), "  tail▌");
+
+        // The trace/answer pair separates (blank after ✻, tight under ❯).
+        let rows = vec![
+            Row::User("q".into()),
+            Row::Thinking("trace".into()),
+            Row::Assistant("answer".into()),
+        ];
+        let texts: Vec<String> = history(&rows).iter().map(row_text).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "❯ q".to_string(),
+                "✻ trace".to_string(),
+                String::new(),
+                "● answer".to_string(),
+                String::new(),
+            ]
+        );
+    }
+
+    #[test]
+    fn render_transcript_merges_cont_chunks_without_repeat_headers() {
+        let rows = vec![
+            Row::User("hi".into()),
+            Row::Assistant("first".into()),
+            Row::AssistantCont("second".into()),
+        ];
+        let out = render_transcript(&rows);
+        assert!(out.contains("Tiny\nfirst\n\nsecond"), "merged: {out:?}");
+        assert_eq!(out.matches("Tiny").count(), 1, "chunk repeated the header");
+    }
+
+    #[test]
+    fn commit_and_inflight_cover_cont_chunks() {
+        // The streaming Cont tail is held back while open, committed closed.
+        let rows = vec![
+            Row::User("hi".into()),
+            Row::Assistant("p1".into()),
+            Row::AssistantCont("p2".into()),
+        ];
+        assert_eq!(commit_pending_end(&rows, 0, true), 2);
+        assert_eq!(commit_pending_end(&rows, 0, false), 3);
+        // Live zone points at the Cont tail while it streams.
+        assert_eq!(inflight_row_index(&rows, true), Some(2));
     }
 
     #[test]
@@ -5008,6 +5243,97 @@ mod tests {
         append_thinking_delta(&mut rows, &mut ts, "other", "hmm");
         assert_eq!(rows.len(), 3);
         assert!(matches!(&rows[2], Row::Thinking(t) if t == "[other] hmm"));
+    }
+
+    #[test]
+    fn last_safe_boundary_only_cuts_at_closed_paragraphs_outside_fences() {
+        // A plain paragraph boundary.
+        assert_eq!(last_safe_boundary("a\n\nb"), Some(3));
+        // Latest boundary wins (para3, not para2).
+        let text = "p1\n\np2\n\np3";
+        assert_eq!(last_safe_boundary(text), text.find("p3"));
+        // A blank line inside an open fence is NOT a boundary; the one after
+        // the fence closes is.
+        let fenced = "```\ncode\n\nstill code\n```\n\nafter";
+        assert_eq!(last_safe_boundary(fenced), fenced.find("after"));
+        // No blank line → nothing safe.
+        assert_eq!(last_safe_boundary("one\nlong\nparagraph"), None);
+        // Leading blanks with no content before them → nothing to commit.
+        assert_eq!(last_safe_boundary("\n\nx"), None);
+    }
+
+    #[test]
+    fn split_streaming_row_flushes_prefix_and_keeps_tail_live() {
+        let para = |n: usize| format!("l{n}a\nl{n}b\nl{n}c\nl{n}d"); // 4 lines
+        let text = format!("{}\n\n{}\n\n{}", para(1), para(2), para(3)); // 12 lines
+
+        // Above threshold: latest safe boundary = start of para3.
+        let mut rows = vec![Row::Assistant(text.clone())];
+        split_streaming_row(&mut rows);
+        assert_eq!(rows.len(), 2);
+        assert!(
+            matches!(&rows[0], Row::Assistant(t) if *t == format!("{}\n\n{}", para(1), para(2)))
+        );
+        assert!(matches!(&rows[1], Row::AssistantCont(t) if *t == para(3)));
+
+        // Below threshold: one row, untouched.
+        let mut rows = vec![Row::Assistant(para(1))]; // 4 lines
+        split_streaming_row(&mut rows);
+        assert_eq!(rows.len(), 1);
+
+        // One huge unclosed paragraph: nothing safe to cut.
+        let one = (0..12)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut rows = vec![Row::Assistant(one)];
+        split_streaming_row(&mut rows);
+        assert_eq!(rows.len(), 1);
+
+        // Thinking rows split the same way (each chunk keeps its ✻ marker).
+        let mut rows = vec![Row::Thinking(text.clone())];
+        split_streaming_row(&mut rows);
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(&rows[0], Row::Thinking(t) if t.contains("l1a")));
+        assert!(matches!(&rows[1], Row::Thinking(t) if *t == para(3)));
+
+        // A Cont tail splits into two Conts (the head is far behind).
+        let mut rows = vec![Row::Assistant("head".into()), Row::AssistantCont(text)];
+        split_streaming_row(&mut rows);
+        assert_eq!(rows.len(), 3);
+        assert!(matches!(&rows[1], Row::AssistantCont(t) if t.contains("l1a")));
+        assert!(matches!(&rows[2], Row::AssistantCont(t) if *t == para(3)));
+
+        // Non-streaming tail rows are a no-op.
+        let mut rows = vec![tool_call_row("shell")];
+        split_streaming_row(&mut rows);
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn split_deltas_merge_into_the_cont_tail() {
+        // After a split, further TextDeltas must append to the Cont tail, not
+        // open a new message row.
+        let text = format!(
+            "{}\n\n{}",
+            (0..10)
+                .map(|i| format!("x{i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            "tail"
+        );
+        let mut rows = vec![];
+        let mut streaming = false;
+        append_delta(&mut rows, &mut streaming, &text);
+        split_streaming_row(&mut rows);
+        assert_eq!(rows.len(), 2);
+        append_delta(&mut rows, &mut streaming, " more");
+        assert_eq!(rows.len(), 2, "delta opened a new row instead of merging");
+        assert!(
+            matches!(&rows[1], Row::AssistantCont(t) if t == "tail more"),
+            "delta did not land in the tail: {:?}",
+            rows[1]
+        );
     }
 
     #[test]

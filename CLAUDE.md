@@ -221,6 +221,16 @@ cargo clippy -p tiny-agent-node
   **TUI 定位（原"冻结只修 bug"政策已按产品决定放宽）**：交互体验对齐主流终端 AI 工具的基础项
   已落地一批（见下），红线仍是**架构与渲染模型**——不做全屏 / 鼠标托管 / 主题系统这类结构性扩张。
   已落地的扩展面速记：
+  - **流式增量定稿（`split_streaming_row` + `Row::AssistantCont`）**：在途 Assistant/Thinking 行超过
+    `INLINE_HEIGHT` 行即在**最新安全段落边界**（空行分隔、且前缀 ``` 围栏成对闭合，`last_safe_boundary`）
+    切分——前缀行定稿进 scrollback、尾段继续 live 流式（Claude Code 模型：边生成边滚出，不再整篇憋到
+    回合结束一次性刷屏）。续块是 `AssistantCont`（**无 ● 图标**——一条回复不能读成 N 条消息；图标只留
+    在消息头行），`append_delta`/`commit_pending_end`/`inflight_row_index` 对它与 Assistant 同等对待；
+    思考行切分后每块各带 ✻ 标记（全 dim，读作 trace 分节）；**子 agent 气泡不切**（task 按契约返回短
+    摘要，无名 Cont 块夹在两个同名 agent 气泡间会有歧义）。行间 spacer 规则随之扩展：相邻
+    Assistant/Cont 行之间补空行（恢复切分吃掉的段落分隔）、✻ 区块前后补空行（trace 与答复视觉分离），
+    但 user→assistant 仍保持紧凑、工具行仍紧贴所属流程。已提前定稿的行不随后续/resize 重排（scrollback
+    写一次即定，与 Claude Code 同款取舍）。
   - **思考区块（`Row::Thinking`）**：ThinkingDelta 不再与答复折进同一 Assistant 行（混排不可读），
     走 `append_thinking_delta` 进独立暗色斜体 `✻` 行——`thinking_stream: Option<String>` 是当前在飞
     trace 的 tag（"" 父 / 子 agent 名，merge 判据同 `sub_streaming_name`），答复/工具/任何其它行插入
