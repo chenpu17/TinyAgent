@@ -1541,8 +1541,18 @@ fn ui_loop(
                         input.newline();
                     }
                     // Enter sends (queues while busy). The input stays editable
-                    // during a run.
+                    // during a run. Exception first: a trailing `\` on the
+                    // last line turns Enter into a newline (bash line
+                    // continuation) — the one multiline entry path terminals
+                    // that don't report Shift/Alt+Enter modifiers (macOS
+                    // Terminal.app) can rely on.
                     (KeyCode::Enter, _) => {
+                        if input.lines_view().last().is_some_and(|l| l.ends_with('\\')) {
+                            input.end();
+                            input.backspace(); // drop the backslash
+                            input.newline();
+                            continue;
+                        }
                         if !input.is_empty() {
                             // Strip control chars once at submission, so what
                             // enters rows / input history / the wire is clean.
@@ -1727,39 +1737,47 @@ fn ui_loop(
                     (KeyCode::Char('k'), KeyModifiers::CONTROL) => input.kill_to_line_end(),
                     (KeyCode::Char('a'), KeyModifiers::CONTROL) => input.home(),
                     (KeyCode::Char('e'), KeyModifiers::CONTROL) => input.end(),
+                    // Ctrl-D: delete forward at the caret (the backspace
+                    // mirror); on an EMPTY idle input it quits instead — the
+                    // terminal-tool convention. Empty + busy is a no-op:
+                    // nothing to delete, and quitting mid-run stays on /quit
+                    // or the double-Ctrl-C confirmation.
+                    (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                        if !input.is_empty() {
+                            input.delete_forward();
+                        } else if !busy {
+                            let _ = in_tx.send(None);
+                            return Ok(queued.len());
+                        }
+                    }
                     (KeyCode::Backspace, _) => input.backspace(),
                     (KeyCode::Left, _) => input.move_left(),
                     (KeyCode::Right, _) => input.move_right(),
-                    // Alt+Up/Down recall input history; Up/Down move the caret
-                    // across lines inside the buffer.
+                    // History recall. Alt+Up/Down ALWAYS recall; plain Up/Down
+                    // recall when the buffer is single-line (or a browse is
+                    // already active) and move the caret across lines otherwise
+                    // — the readline/zsh convention, so the empty-input Up that
+                    // every terminal user reaches for just works.
                     (KeyCode::Up, KeyModifiers::ALT) => {
-                        if !history.is_empty() {
-                            match hist_idx {
-                                None => {
-                                    draft = input.text();
-                                    hist_idx = Some(history.len() - 1);
-                                }
-                                Some(0) => {}
-                                Some(i) => hist_idx = Some(i - 1),
-                            }
-                            if let Some(i) = hist_idx {
-                                input.set_text(&history[i]);
-                            }
-                        }
+                        history_up(&history, &mut hist_idx, &mut draft, &mut input);
                     }
                     (KeyCode::Down, KeyModifiers::ALT) => {
-                        if let Some(i) = hist_idx {
-                            if i + 1 < history.len() {
-                                hist_idx = Some(i + 1);
-                                input.set_text(&history[i + 1]);
-                            } else {
-                                hist_idx = None;
-                                input.set_text(&draft);
-                            }
+                        history_down(&history, &mut hist_idx, &mut draft, &mut input);
+                    }
+                    (KeyCode::Up, _) => {
+                        if up_is_history(input.line_count() == 1, hist_idx.is_some()) {
+                            history_up(&history, &mut hist_idx, &mut draft, &mut input);
+                        } else {
+                            input.move_up();
                         }
                     }
-                    (KeyCode::Up, _) => input.move_up(),
-                    (KeyCode::Down, _) => input.move_down(),
+                    (KeyCode::Down, _) => {
+                        if hist_idx.is_some() {
+                            history_down(&history, &mut hist_idx, &mut draft, &mut input);
+                        } else {
+                            input.move_down();
+                        }
+                    }
                     (KeyCode::Home, _) => input.home(),
                     (KeyCode::End, _) => input.end(),
                     // PageUp/PageDown are intentionally not handled: with mouse
@@ -3268,6 +3286,19 @@ impl InputBuffer {
         }
     }
 
+    /// Delete the char after the cursor (Ctrl-D); at the end of a line, join
+    /// the next line onto this one — the forward mirror of `backspace`.
+    fn delete_forward(&mut self) {
+        if self.col < self.lines[self.row].len() {
+            let next_ch = self.lines[self.row][self.col..].chars().next().unwrap();
+            let end = self.col + next_ch.len_utf8();
+            self.lines[self.row].replace_range(self.col..end, "");
+        } else if self.row + 1 < self.lines.len() {
+            let next = self.lines.remove(self.row + 1);
+            self.lines[self.row].push_str(&next);
+        }
+    }
+
     /// Split the current line at the cursor; cursor lands at the start of the
     /// new line.
     fn newline(&mut self) {
@@ -3459,6 +3490,59 @@ fn word_boundary_left(line: &str, col: usize) -> usize {
         .find(|(_, c)| c.is_whitespace())
         .map(|(i, c)| i + c.len_utf8())
         .unwrap_or(0)
+}
+
+/// Recall the previous (older) history entry into the buffer, saving the
+/// current text as `draft` on the first recall so Down past the newest
+/// restores it. Shared by plain Up (single-line buffer or already browsing)
+/// and Alt+Up (always).
+fn history_up(
+    history: &[String],
+    hist_idx: &mut Option<usize>,
+    draft: &mut String,
+    input: &mut InputBuffer,
+) {
+    if history.is_empty() {
+        return;
+    }
+    match *hist_idx {
+        None => {
+            *draft = input.text();
+            *hist_idx = Some(history.len() - 1);
+        }
+        Some(0) => {}
+        Some(i) => *hist_idx = Some(i - 1),
+    }
+    if let Some(i) = *hist_idx {
+        input.set_text(&history[i]);
+    }
+}
+
+/// Recall the next (newer) history entry; past the newest restores the draft
+/// and stops browsing.
+fn history_down(
+    history: &[String],
+    hist_idx: &mut Option<usize>,
+    draft: &mut String,
+    input: &mut InputBuffer,
+) {
+    if let Some(i) = *hist_idx {
+        if i + 1 < history.len() {
+            *hist_idx = Some(i + 1);
+            input.set_text(&history[i + 1]);
+        } else {
+            *hist_idx = None;
+            input.set_text(draft);
+        }
+    }
+}
+
+/// Whether plain Up recalls history (vs moving the caret across lines): the
+/// readline/zsh convention — a SINGLE-line buffer has no lines to cross, and
+/// an active browse keeps walking history. A multi-line buffer keeps the
+/// caret motion (recalling would clobber the multi-line draft).
+fn up_is_history(single_line: bool, browsing: bool) -> bool {
+    single_line || browsing
 }
 
 /// Byte offset where the next word right of `col` starts: leave the current
@@ -4891,6 +4975,107 @@ mod tests {
         b.backspace(); // delete 中
         assert_eq!(b.text(), "文");
         assert_eq!(b.col, 0);
+    }
+
+    #[test]
+    fn delete_forward_deletes_char_or_joins_next_line() {
+        // Mid-line: deletes the char AFTER the caret; caret stays put.
+        let mut b = InputBuffer::new();
+        b.set_text("abcd"); // cursor at end
+        b.move_left(); // "abc|d"
+        b.move_left(); // "ab|cd"
+        b.delete_forward(); // delete 'c'
+        assert_eq!(b.text(), "abd");
+        assert_eq!(b.col, 2);
+        // At the end of a line: joins the NEXT line onto this one (forward
+        // mirror of backspace's join-onto-previous).
+        let mut b = InputBuffer::new();
+        b.set_text("ab\ncd"); // cursor at end of "cd" → move up to "ab"
+        b.move_up();
+        b.end();
+        b.delete_forward();
+        assert_eq!(b.text(), "abcd");
+        assert_eq!(b.line_count(), 1);
+        assert_eq!(b.cursor_pos(), (0, 2));
+        // CJK: deletes the whole wide char, not one of its bytes.
+        let mut b = InputBuffer::new();
+        b.set_text("中文");
+        b.home(); // before 中
+        b.delete_forward();
+        assert_eq!(b.text(), "文");
+        assert_eq!(b.col, 0);
+        // No-op at the very end of the buffer.
+        let mut b = InputBuffer::new();
+        b.set_text("end");
+        b.delete_forward();
+        assert_eq!(b.text(), "end");
+    }
+
+    #[test]
+    fn backslash_enter_becomes_a_newline_instead_of_sending() {
+        // The `\`+Enter line continuation the Enter handler applies: the same
+        // op sequence (end → backspace → newline) pinned here so refactors of
+        // the handler keep the semantics. A trailing backslash on the last
+        // line turns Enter into a newline — bash semantics, and the one
+        // multiline path for terminals that don't report Shift/Alt+Enter.
+        let mut b = InputBuffer::new();
+        b.set_text("abc\\"); // cursor already at end
+        assert!(b.lines_view().last().unwrap().ends_with('\\'));
+        b.end();
+        b.backspace(); // drop the backslash
+        b.newline();
+        assert_eq!(b.text(), "abc\n");
+        assert_eq!(b.line_count(), 2);
+        // No trailing backslash: the same keys would just send — the guard is
+        // the ends_with check, not the op sequence.
+        let mut b = InputBuffer::new();
+        b.set_text("plain");
+        assert!(!b.lines_view().last().unwrap().ends_with('\\'));
+    }
+
+    #[test]
+    fn history_recall_walks_back_and_restores_the_draft() {
+        // The shared history_up/history_down both Alt+Up/Down and plain Up/Down
+        // route through: first recall saves the in-progress draft, Up walks
+        // older, Down walks newer, past the newest restores the draft.
+        let history = vec!["one".to_string(), "two".to_string(), "three".to_string()];
+        let mut idx = None;
+        let mut draft = String::new();
+        let mut b = InputBuffer::new();
+        b.set_text("draft text");
+
+        history_up(&history, &mut idx, &mut draft, &mut b); // → three (newest)
+        assert_eq!(idx, Some(2));
+        assert_eq!(b.text(), "three");
+        assert_eq!(draft, "draft text");
+        history_up(&history, &mut idx, &mut draft, &mut b); // → two
+        assert_eq!(idx, Some(1));
+        assert_eq!(b.text(), "two");
+        history_up(&history, &mut idx, &mut draft, &mut b); // → one
+        history_up(&history, &mut idx, &mut draft, &mut b); // clamped at oldest
+        assert_eq!(idx, Some(0));
+        assert_eq!(b.text(), "one");
+        history_down(&history, &mut idx, &mut draft, &mut b); // → two
+        assert_eq!(idx, Some(1));
+        history_down(&history, &mut idx, &mut draft, &mut b); // → three
+        history_down(&history, &mut idx, &mut draft, &mut b); // past newest
+        assert_eq!(idx, None);
+        assert_eq!(b.text(), "draft text");
+        // Empty history: no-op, no panic.
+        let empty: Vec<String> = Vec::new();
+        history_up(&empty, &mut idx, &mut draft, &mut b);
+        assert_eq!(idx, None);
+        assert_eq!(b.text(), "draft text");
+    }
+
+    #[test]
+    fn up_is_history_for_single_line_or_active_browse() {
+        // Single-line (incl. empty) buffers recall; multi-line buffers keep
+        // caret motion unless a browse is already active.
+        assert!(up_is_history(true, false));
+        assert!(up_is_history(true, true));
+        assert!(!up_is_history(false, false));
+        assert!(up_is_history(false, true));
     }
 
     #[test]
