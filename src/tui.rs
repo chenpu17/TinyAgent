@@ -862,6 +862,10 @@ fn ui_loop(
     // output (text delta or tool call) and at run end. Render-only — the live
     // viewport renders a `● …` line from it; nothing is committed for it.
     let mut thinking = false;
+    // Transient in-flight tool tracker (render-only, like `thinking`): the
+    // ToolCall row commits immediately, so this placeholder is what keeps the
+    // live zone showing WHICH tool is running and for how long.
+    let mut tool_running = ToolRunning::new();
     // Name of the sub-agent whose text is currently accumulating into the
     // trailing Assistant row, so consecutive deltas from the same sub-agent
     // merge — and a different sub-agent (or the parent) starts a fresh row.
@@ -943,6 +947,7 @@ fn ui_loop(
                         // worker that dies during the thinking phase (before any
                         // TextDelta clears it) would leave a stale flag.
                         thinking = false;
+                        tool_running.clear();
                         dirty = true;
                         rows.push(Row::sys_error(
                             "[worker stopped unexpectedly — type /quit to exit]",
@@ -967,6 +972,7 @@ fn ui_loop(
                         streaming = false;
                         activity = "thinking".into();
                         thinking = true;
+                        tool_running.clear();
                     }
                     AgentEvent::TextDelta(t) | AgentEvent::ThinkingDelta(t) => {
                         // First visible output: the thinking placeholder is
@@ -978,6 +984,10 @@ fn ui_loop(
                         // separate collapsible block. TinyWorker's GUI renders
                         // that block off the same event.
                         thinking = false;
+                        // The PARENT is streaming: no parent tool is pending
+                        // anymore. (Sub-agent deltas below don't clear — a
+                        // sibling parallel tool may legitimately still run.)
+                        tool_running.clear();
                         // Parent speaks: close any open sub-agent bubble AND
                         // keep this delta out of it — streaming=false forces
                         // append_delta to open a fresh row even though the sub
@@ -998,6 +1008,7 @@ fn ui_loop(
                         streaming = false;
                         thinking = false;
                         activity = format!("→ {name}");
+                        tool_running.on_call(&name);
                         // Strip control chars once at entry so both the
                         // collapsed summary and the expanded pretty-print
                         // render clean.
@@ -1017,6 +1028,7 @@ fn ui_loop(
                         content,
                     } => {
                         streaming = false;
+                        tool_running.on_result(&name);
                         // Content stays RAW: ANSI colors survive into
                         // ansi_guided_lines at render (which strips non-SGR
                         // sequences itself), so strip_controls is gone from
@@ -1121,8 +1133,12 @@ fn ui_loop(
                                 activity = format!("[{name}] → {tn}");
                                 let input = strip_controls_json(input);
                                 let collapsed = compact(&input);
+                                // Same display name as the row below, so the
+                                // placeholder and the committed head agree.
+                                let row_name = format!("[{name}] {tn}");
+                                tool_running.on_call(&row_name);
                                 rows.push(Row::ToolCall {
-                                    name: format!("[{name}] {tn}"),
+                                    name: row_name,
                                     input,
                                     collapsed,
                                     expanded: false,
@@ -1139,6 +1155,7 @@ fn ui_loop(
                                 // format, so nearest-back matching finds it.
                                 // Content stays raw for the ANSI-aware render.
                                 let row_name = format!("[{name}] {tn}");
+                                tool_running.on_result(&row_name);
                                 let elapsed = tool_elapsed_for(&rows, &row_name);
                                 let collapsed = crate::agent::preview(&ansi_plain(content));
                                 // Same auto-expand contract as the parent arm.
@@ -1169,6 +1186,7 @@ fn ui_loop(
                 UiMsg::Error(e) => {
                     rows.push(Row::sys_error(format!("[error] {e}")));
                     activity.clear();
+                    tool_running.clear();
                     // End every open stream: a leftover `streaming` /
                     // `sub_streaming_name` would let the NEXT run's first
                     // TextDelta merge into a stale row (or, when the last row
@@ -1191,6 +1209,7 @@ fn ui_loop(
                     streaming = false;
                     sub_streaming_name = None;
                     activity.clear();
+                    tool_running.clear();
                     // Flush the queue (same contract as the Error branch).
                     let flush = flush_next_queued(&mut queued, &mut rows, &mut md_cache, in_tx);
                     apply_flush(
@@ -1254,9 +1273,11 @@ fn ui_loop(
                 // Transcript zone (the rows above the input box inside the
                 // viewport): the slash popup while typing a command, else the
                 // thinking placeholder before any output, else the in-flight
-                // streaming row. Each is bottom-aligned so its last line sits
-                // flush above the input box. Already-committed turns live in
-                // the host terminal's scrollback above this viewport.
+                // streaming row, else the running-tool placeholder (a tool
+                // execution streams nothing of its own). Each is bottom-aligned
+                // so its last line sits flush above the input box.
+                // Already-committed turns live in the host terminal's
+                // scrollback above this viewport.
                 if popup.is_open() {
                     let lines = slash_popup_lines(&popup, zone_rect.height as usize);
                     render_zone_top(f, zone_rect, &lines);
@@ -1281,6 +1302,8 @@ fn ui_loop(
                         let wrapped = wrap_history(&l, content_w);
                         render_zone_tail(f, zone_rect, &wrapped);
                     }
+                } else if let Some(line) = tool_running_line(&tool_running, Instant::now()) {
+                    render_zone_tail(f, zone_rect, &[line]);
                 }
 
                 // Input box. The editing prompt is stable; Enter queues while
@@ -1477,6 +1500,7 @@ fn ui_loop(
                             // flight start a fresh Assistant row.
                             streaming = false;
                             sub_streaming_name = None;
+                            tool_running.clear();
                             rows.push(Row::sys_warn("[cancelling…]"));
                             // Cancelling stops the whole line: queued messages
                             // are dropped too, and their ghost rows go with them.
@@ -2125,6 +2149,71 @@ fn fmt_tool_elapsed(d: Duration) -> String {
     } else {
         format!("{secs:.0}s")
     }
+}
+
+/// Render-only state for tool calls currently executing, mirroring the
+/// `thinking` placeholder's contract: synthesized at render time, never
+/// entering rows / MdCache / the transcript. The ToolCall row itself commits
+/// to scrollback the moment it appears, so without this the live zone goes
+/// blank for the whole execution — a 60s shell showed nothing but the
+/// input-box spinner and the whole-run clock, with no per-tool timing.
+struct ToolRunning {
+    /// (display name, start) per in-flight call; parallel `task` fan-out can
+    /// legitimately hold several at once.
+    calls: Vec<(String, Instant)>,
+}
+
+impl ToolRunning {
+    fn new() -> Self {
+        Self { calls: Vec::new() }
+    }
+
+    /// A tool call started (parent or sub-agent arm).
+    fn on_call(&mut self, name: &str) {
+        self.calls.push((name.to_string(), Instant::now()));
+    }
+
+    /// A tool result arrived: remove the FIRST same-name entry. With no
+    /// same-name entry (interleaved names make the matching approximate,
+    /// like `tool_elapsed_for`) the oldest drops; an empty list is a no-op.
+    fn on_result(&mut self, name: &str) {
+        if self.calls.is_empty() {
+            return;
+        }
+        let pos = self.calls.iter().position(|(n, _)| n == name).unwrap_or(0);
+        self.calls.remove(pos);
+    }
+
+    fn clear(&mut self) {
+        self.calls.clear();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.calls.is_empty()
+    }
+}
+
+/// The live-zone placeholder line while tools execute: `→ name · 1.2s…`, dim
+/// elapsed (read at render time so the busy clock tick keeps it moving), with
+/// `(+N)` when more than one call is in flight. None when nothing runs.
+fn tool_running_line(state: &ToolRunning, now: Instant) -> Option<Line<'static>> {
+    let (name, started) = state.calls.first()?;
+    let elapsed = fmt_tool_elapsed(now.checked_duration_since(*started).unwrap_or_default());
+    let more = state.calls.len().saturating_sub(1);
+    let tail = if more > 0 {
+        format!(" · {elapsed}… (+{more})")
+    } else {
+        format!(" · {elapsed}…")
+    };
+    Some(Line::from(vec![
+        Span::styled(
+            format!("→ {name}"),
+            Style::default()
+                .fg(TOOL_CALL_FG)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(tail, Style::default().fg(DIM_FG)),
+    ]))
 }
 
 /// Session/run elapsed for the status bar: "Ns" under a minute, else "MmSSs"
@@ -3842,6 +3931,48 @@ mod tests {
         assert_eq!(fmt_tool_elapsed(Duration::from_millis(9_940)), "9.9s");
         assert_eq!(fmt_tool_elapsed(Duration::from_secs(10)), "10s");
         assert_eq!(fmt_tool_elapsed(Duration::from_secs(65)), "65s");
+    }
+
+    #[test]
+    fn tool_running_tracks_calls_fifo_and_clears() {
+        // Render-only tracker: on_call pushes, on_result removes the first
+        // same-name entry (falling back to the oldest), clear/empty no-op.
+        let mut t = ToolRunning::new();
+        assert!(t.is_empty());
+        t.on_call("shell");
+        t.on_call("read");
+        t.on_call("shell"); // parallel same-name call
+        assert_eq!(t.calls.len(), 3);
+        t.on_result("shell"); // first same-name (oldest shell) drops
+        assert_eq!(t.calls.len(), 2);
+        assert_eq!(t.calls[0].0, "read");
+        t.on_result("missing"); // no same-name → oldest drops
+        assert_eq!(t.calls[0].0, "shell");
+        t.on_result("shell");
+        t.on_result("shell"); // already empty → no-op, not a panic
+        assert!(t.is_empty());
+        t.on_call("x");
+        t.clear();
+        assert!(t.is_empty());
+    }
+
+    #[test]
+    fn tool_running_line_shows_name_elapsed_and_parallel_count() {
+        let now = Instant::now();
+        let mut t = ToolRunning::new();
+        assert!(tool_running_line(&t, now).is_none(), "nothing in flight");
+        t.calls = vec![("shell".into(), now - Duration::from_millis(3200))];
+        let l = tool_running_line(&t, now).expect("a placeholder line");
+        assert_eq!(l.spans[0].content.as_ref(), "→ shell");
+        assert_eq!(l.spans[0].style.fg, Some(TOOL_CALL_FG));
+        assert!(l.spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(l.spans[1].content.as_ref(), " · 3.2s…");
+        assert_eq!(l.spans[1].style.fg, Some(DIM_FG));
+        // Parallel calls aggregate: the OLDEST call's elapsed + (+N) count.
+        t.calls.push(("read".into(), now));
+        let l = tool_running_line(&t, now).expect("a placeholder line");
+        assert_eq!(l.spans[0].content.as_ref(), "→ shell");
+        assert_eq!(l.spans[1].content.as_ref(), " · 3.2s… (+1)");
     }
 
     #[test]
