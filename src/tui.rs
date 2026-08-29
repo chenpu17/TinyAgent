@@ -23,13 +23,15 @@ use unicode_width::UnicodeWidthStr;
 /// stored state.
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-// Theme: the one place history-row / chrome colors are defined.
+// Theme: the one place history-row / chrome colors are defined. `dim_fg()`
+// is a function, not a const, because it flips with TINYAGENT_TUI_THEME
+// (see `theme_light_from`): Gray (color 7) is near-invisible on light
+// terminals, where DarkGray (color 8) reads as the intended mid-gray.
 const USER_FG: Color = Color::Cyan;
 const AGENT_FG: Color = Color::Green;
 const TOOL_CALL_FG: Color = Color::Yellow;
 const TOOL_OK_FG: Color = Color::Green;
 const TOOL_ERR_FG: Color = Color::Red;
-const DIM_FG: Color = Color::Gray;
 
 // Markdown header emphasis by level: h1 pops, h2/h3 steady, deeper recedes.
 const MD_H1_FG: Color = Color::Yellow;
@@ -39,6 +41,54 @@ const MD_DEEP_FG: Color = Color::DarkGray;
 // Status-bar model badge: black on cyan (echoes USER_FG as a solid block).
 const BADGE_FG: Color = Color::Black;
 const BADGE_BG: Color = Color::Cyan;
+
+// ── Light-terminal theme knob ────────────────────────────────────────────
+// The named colors above map onto the terminal's 16-color palette, which
+// FLIPS with the terminal theme. On a light background Gray (color 7) — the
+// one dim color used across system rows, previews, status segments, code
+// bars, and the empty-state sheet — is near-white and effectively invisible,
+// and tui-markdown styles inline code fg White (white-on-white). No
+// autodetection (COLORFGBG et al. are unreliable); `TINYAGENT_TUI_THEME=`
+// light|dark (default dark) is the explicit knob, read once at TUI start.
+// Everything else (role/tool colors, the badge, the ANSI-parsing palettes
+// that carry TOOL OUTPUT colors chosen by other programs) stays put — those
+// read fine on both backgrounds.
+
+/// Whether the light palette is active. Set once in `run` from the env;
+/// tests read the unset (dark) default.
+static THEME_LIGHT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Pure decision core of the env knob: exactly `light` selects the light
+/// palette; anything else (including unset) stays dark.
+fn theme_light_from(var: Option<&str>) -> bool {
+    var.is_some_and(|v| v.eq_ignore_ascii_case("light"))
+}
+
+/// Bind the knob from the real environment. Called once at TUI start; later
+/// calls are no-ops (OnceLock keeps the first value).
+fn set_theme_from_env(var: Option<String>) {
+    let _ = THEME_LIGHT.set(theme_light_from(var.as_deref()));
+}
+
+/// The dim foreground: Gray on dark terminals (color 7, the classic dim),
+/// DarkGray on light ones (color 8 — there it IS the mid-gray).
+fn dim_fg() -> Color {
+    if *THEME_LIGHT.get().unwrap_or(&false) {
+        Color::DarkGray
+    } else {
+        Color::Gray
+    }
+}
+
+/// Inline-code foreground: tui-markdown hardcodes fg White, which vanishes on
+/// light backgrounds — the light theme re-dyes it cyan (readable on both).
+fn code_fg() -> Color {
+    if *THEME_LIGHT.get().unwrap_or(&false) {
+        MD_H23_FG
+    } else {
+        Color::White
+    }
+}
 
 /// Keep prose readable on wide terminals while leaving the reading column
 /// left-anchored. Input and status chrome use the available terminal width.
@@ -487,9 +537,9 @@ fn slash_popup_lines(popup: &SlashPopup, max_rows: usize) -> Vec<Line<'static>> 
                 if c.arg_hint.is_empty() {
                     Span::raw(String::new())
                 } else {
-                    Span::styled(format!(" {}", c.arg_hint), Style::default().fg(DIM_FG))
+                    Span::styled(format!(" {}", c.arg_hint), Style::default().fg(dim_fg()))
                 },
-                Span::styled(format!("  {}", c.desc), Style::default().fg(DIM_FG)),
+                Span::styled(format!("  {}", c.desc), Style::default().fg(dim_fg())),
             ])
         })
         .collect();
@@ -772,6 +822,8 @@ pub fn run(
     auto_start: bool,
     resume_rows: Vec<Row>,
 ) -> Result<()> {
+    // Bind the palette knob before any rendering reads dim_fg()/code_fg().
+    set_theme_from_env(std::env::var("TINYAGENT_TUI_THEME").ok());
     // UI → worker: user inputs (None = quit).
     let (in_tx, in_rx) = mpsc::channel::<Option<Input>>();
     // Worker → quit-path: the worker signals it has exited, so quitting can
@@ -1421,7 +1473,7 @@ fn ui_loop(
                             "● ".to_string(),
                             Style::default().fg(AGENT_FG).add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled("…", Style::default().fg(DIM_FG)),
+                        Span::styled("…", Style::default().fg(dim_fg())),
                     ]);
                     render_zone_tail(f, zone_rect, &[line]);
                 } else if let Some(idx) = inflight_idx {
@@ -1496,7 +1548,7 @@ fn ui_loop(
                 let input_lines: Vec<Line> = if body.is_empty() {
                     vec![Line::from(vec![
                         Span::styled(prompt.clone(), prompt_style),
-                        Span::styled(INPUT_PLACEHOLDER, Style::default().fg(DIM_FG)),
+                        Span::styled(INPUT_PLACEHOLDER, Style::default().fg(dim_fg())),
                     ])]
                 } else {
                     lines_view
@@ -2052,7 +2104,7 @@ fn build_history_lines(
         // and cancel keys are the two highest-frequency confusions (a bare
         // Enter sends, so multi-line needs a discoverable escape hatch; Esc
         // only cancels mid-run), so they earn a line over everything else.
-        let style = Style::default().fg(DIM_FG).add_modifier(Modifier::ITALIC);
+        let style = Style::default().fg(dim_fg()).add_modifier(Modifier::ITALIC);
         for l in [
             "  no messages yet — type below; /help lists commands",
             "  / completes commands · Enter sends",
@@ -2083,10 +2135,10 @@ fn build_history_lines(
                 push_role(
                     &mut lines,
                     "❯ ",
-                    Style::default().fg(DIM_FG).add_modifier(Modifier::BOLD),
+                    Style::default().fg(dim_fg()).add_modifier(Modifier::BOLD),
                     t,
-                    Style::default().fg(DIM_FG),
-                    Some((" · queued", Style::default().fg(DIM_FG))),
+                    Style::default().fg(dim_fg()),
+                    Some((" · queued", Style::default().fg(dim_fg()))),
                 );
             }
             Row::Assistant(t) => {
@@ -2142,7 +2194,7 @@ fn build_history_lines(
                     if has_summary {
                         Span::styled(
                             format!("  {}", collapsed.lines().next().unwrap_or_default()),
-                            Style::default().fg(DIM_FG),
+                            Style::default().fg(dim_fg()),
                         )
                     } else {
                         Span::raw(String::new())
@@ -2158,7 +2210,7 @@ fn build_history_lines(
                 if *expanded {
                     let body =
                         serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string());
-                    let mut body = ansi_guided_lines(&body, Style::default().fg(DIM_FG));
+                    let mut body = ansi_guided_lines(&body, Style::default().fg(dim_fg()));
                     indent_lines(&mut body, TOOL_INDENT);
                     lines.extend(body);
                 }
@@ -2196,7 +2248,7 @@ fn build_history_lines(
                         let preview = ansi_plain(collapsed);
                         Span::styled(
                             format!("  {}", preview.lines().next().unwrap_or_default()),
-                            Style::default().fg(if *is_error { TOOL_ERR_FG } else { DIM_FG }),
+                            Style::default().fg(if *is_error { TOOL_ERR_FG } else { dim_fg() }),
                         )
                     } else {
                         Span::raw(String::new())
@@ -2211,7 +2263,7 @@ fn build_history_lines(
                     let body_style = if *is_error {
                         Style::default().fg(TOOL_ERR_FG)
                     } else {
-                        Style::default().fg(DIM_FG)
+                        Style::default().fg(dim_fg())
                     };
                     let mut body = ansi_guided_lines(content, body_style);
                     indent_lines(&mut body, TOOL_INDENT);
@@ -2220,7 +2272,7 @@ fn build_history_lines(
             }
             Row::System { text, level } => {
                 let fg = match level {
-                    SysLevel::Info => DIM_FG,
+                    SysLevel::Info => dim_fg(),
                     SysLevel::Warn => TOOL_CALL_FG,
                     SysLevel::Error => TOOL_ERR_FG,
                 };
@@ -2268,7 +2320,7 @@ fn build_history_lines(
                 "● ",
                 Style::default().fg(AGENT_FG).add_modifier(Modifier::BOLD),
             ),
-            Span::styled("…", Style::default().fg(DIM_FG)),
+            Span::styled("…", Style::default().fg(dim_fg())),
         ]));
     }
     lines
@@ -2430,7 +2482,7 @@ fn tool_running_line(state: &ToolRunning, now: Instant) -> Option<Line<'static>>
                 .fg(TOOL_CALL_FG)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(tail, Style::default().fg(DIM_FG)),
+        Span::styled(tail, Style::default().fg(dim_fg())),
     ]))
 }
 
@@ -2518,7 +2570,7 @@ fn build_status_line(
         // pops AGENT_FG, the status state segment matches it.
         Style::default().fg(AGENT_FG).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(DIM_FG)
+        Style::default().fg(dim_fg())
     };
     let mut spans = vec![
         Span::styled(badge, Style::default().fg(BADGE_FG).bg(BADGE_BG)),
@@ -2538,7 +2590,7 @@ fn build_status_line(
     if let Some((t, s)) = plan {
         opt.push((t.to_string(), s));
     }
-    opt.push((stats.to_string(), Style::default().fg(DIM_FG)));
+    opt.push((stats.to_string(), Style::default().fg(dim_fg())));
     let mut prefix_w = 0usize;
     for (text, style) in &opt {
         prefix_w += text.width();
@@ -2596,7 +2648,7 @@ fn right_path_seg(path: &str, avail: usize) -> Option<Span<'static>> {
     let pad = avail - tw;
     Some(Span::styled(
         format!("{}{text}", " ".repeat(pad)),
-        Style::default().fg(DIM_FG),
+        Style::default().fg(dim_fg()),
     ))
 }
 
@@ -2745,7 +2797,7 @@ fn render_zone_tail(f: &mut Frame, rect: Rect, lines: &[Line<'static>]) {
             "↑ +{hidden} line{} above",
             if hidden == 1 { "" } else { "s" }
         ),
-        Style::default().fg(DIM_FG).add_modifier(Modifier::ITALIC),
+        Style::default().fg(dim_fg()).add_modifier(Modifier::ITALIC),
     ));
     let [hint_rect, tail_rect] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(rect);
@@ -3040,7 +3092,7 @@ fn fmt_ctx(ctx_tokens: u64, max_context_tokens: u64) -> Option<(String, Style)> 
     if max_context_tokens == 0 {
         return Some((
             format!("ctx {}", fmt_tokens(ctx_tokens)),
-            Style::default().fg(DIM_FG),
+            Style::default().fg(dim_fg()),
         ));
     }
     let pct = ctx_tokens.saturating_mul(100) / max_context_tokens.max(1);
@@ -3049,7 +3101,7 @@ fn fmt_ctx(ctx_tokens: u64, max_context_tokens: u64) -> Option<(String, Style)> 
     } else if pct >= 60 {
         TOOL_CALL_FG
     } else {
-        DIM_FG
+        dim_fg()
     };
     // The window size is a round configured number — "256k" reads cleaner
     // than "256.0k", so drop a trailing ".0" on the denominator only (the
@@ -3222,7 +3274,10 @@ fn ansi_guided_lines(text: &str, base_style: Style) -> Vec<Line<'static>> {
     ansi_to_lines(text)
         .into_iter()
         .map(|l| {
-            let mut spans = vec![Span::styled("│ ".to_string(), Style::default().fg(DIM_FG))];
+            let mut spans = vec![Span::styled(
+                "│ ".to_string(),
+                Style::default().fg(dim_fg()),
+            )];
             spans.extend(l.spans.into_iter().map(|s| {
                 if s.style == Style::default() {
                     Span::styled(s.content.into_owned(), base_style)
@@ -3296,7 +3351,7 @@ fn render_markdown(md: &str, width: usize) -> Vec<Line<'_>> {
             let mut line = line;
             line.spans.insert(
                 0,
-                Span::styled("▎ ".to_string(), Style::default().fg(DIM_FG)),
+                Span::styled("▎ ".to_string(), Style::default().fg(dim_fg())),
             );
             lines.push(line);
             continue;
@@ -3305,7 +3360,7 @@ fn render_markdown(md: &str, width: usize) -> Vec<Line<'_>> {
         if is_hrule(&line_text) {
             lines.push(Line::from(Span::styled(
                 "─".repeat(width.max(1)),
-                Style::default().fg(DIM_FG),
+                Style::default().fg(dim_fg()),
             )));
             continue;
         }
@@ -3342,9 +3397,21 @@ fn render_markdown(md: &str, width: usize) -> Vec<Line<'_>> {
                 s0.content = "• ".into();
             }
         }
+        redye_inline_code(&mut line, code_fg());
         lines.push(line);
     }
     lines
+}
+
+/// Re-dye tui-markdown's inline-code spans (fg White — invisible on a light
+/// background) to `fg`. Pure, so the light/dark pair is testable without the
+/// process-global theme knob.
+fn redye_inline_code(line: &mut Line, fg: Color) {
+    for s in line.spans.iter_mut() {
+        if s.style.fg == Some(Color::White) {
+            s.style.fg = Some(fg);
+        }
+    }
 }
 
 /// Snapshot a `Line` with every span's borrowed content materialized into an
@@ -3758,7 +3825,7 @@ mod tests {
         for l in code {
             // Span 0 is the dim border bar; the code spans stay default.
             assert_eq!(l.spans[0].content.as_ref(), "▎ ");
-            assert_eq!(l.spans[0].style.fg, Some(DIM_FG));
+            assert_eq!(l.spans[0].style.fg, Some(dim_fg()));
             assert!(
                 l.spans[1..].iter().all(|s| s.style.fg.is_none()),
                 "code body must keep the default fg: {:?}",
@@ -3784,7 +3851,7 @@ mod tests {
             .find(|l| row_text(l).contains('─'))
             .expect("an hr line");
         assert_eq!(row_text(rule), "─".repeat(12));
-        assert_eq!(rule.spans[0].style.fg, Some(DIM_FG));
+        assert_eq!(rule.spans[0].style.fg, Some(dim_fg()));
         // is_hrule itself: ≥3 chars of -,*,_ only; "--" and "- item" are not.
         assert!(is_hrule("---") && is_hrule("***") && is_hrule("___"));
         assert!(is_hrule(" - - - "));
@@ -3840,9 +3907,58 @@ mod tests {
         );
         for l in &lines {
             let st = l.spans[0].style;
-            assert_eq!(st.fg, Some(DIM_FG));
+            assert_eq!(st.fg, Some(dim_fg()));
             assert!(st.add_modifier.contains(Modifier::ITALIC));
         }
+    }
+
+    #[test]
+    fn theme_light_from_matches_light_case_insensitively() {
+        // Only the exact value "light" (ASCII case-insensitive) opts in;
+        // unset / "dark" / empty / typo all keep the dark default.
+        assert!(theme_light_from(Some("light")));
+        assert!(theme_light_from(Some("Light")));
+        assert!(theme_light_from(Some("LIGHT")));
+        assert!(!theme_light_from(Some("dark")));
+        assert!(!theme_light_from(Some("")));
+        assert!(!theme_light_from(None));
+    }
+
+    #[test]
+    fn theme_fg_accessors_default_to_the_legacy_dark_constants() {
+        // Tests never set THEME_LIGHT (OnceLock is process-global and cannot
+        // be reset), so the accessors here exercise the unset → dark branch.
+        // Pins "default zero drift": dark theme is byte-identical to the
+        // pre-knob DIM_FG / White constants.
+        assert_eq!(dim_fg(), Color::Gray);
+        assert_eq!(code_fg(), Color::White);
+    }
+
+    #[test]
+    fn redye_inline_code_rewrites_only_white_spans() {
+        let mut line = Line::from(vec![
+            Span::styled("plain", Style::default()),
+            Span::styled("code", Style::default().fg(Color::White)),
+            Span::styled("other", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                "bold-code",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]);
+        redye_inline_code(&mut line, MD_H23_FG);
+        let fgs: Vec<_> = line.spans.iter().map(|s| s.style.fg).collect();
+        assert_eq!(
+            fgs,
+            vec![None, Some(MD_H23_FG), Some(Color::Cyan), Some(MD_H23_FG)]
+        );
+        // Modifiers survive — only fg is touched.
+        assert!(line.spans[3].style.add_modifier.contains(Modifier::BOLD));
+        // Dark theme passes White as the target: White spans already match, no-op.
+        let mut dark = Line::from(Span::styled("code", Style::default().fg(Color::White)));
+        redye_inline_code(&mut dark, Color::White);
+        assert_eq!(dark.spans[0].style.fg, Some(Color::White));
     }
 
     #[test]
@@ -3891,7 +4007,7 @@ mod tests {
         let st = lines[0].spans[0].style;
         assert_eq!(st.fg, Some(TOOL_CALL_FG));
         assert!(st.add_modifier.contains(Modifier::BOLD));
-        assert_eq!(lines[0].spans[1].style.fg, Some(DIM_FG));
+        assert_eq!(lines[0].spans[1].style.fg, Some(dim_fg()));
 
         // Success stays compact and uses a dim preview. The ok head is NOT
         // bold: a green bold "✓" would read as a second "● " agent icon.
@@ -3899,7 +4015,7 @@ mod tests {
         let ok = lines[1].spans[0].style;
         assert_eq!(ok.fg, Some(TOOL_OK_FG));
         assert!(!ok.add_modifier.contains(Modifier::BOLD));
-        assert_eq!(lines[1].spans[1].style.fg, Some(DIM_FG));
+        assert_eq!(lines[1].spans[1].style.fg, Some(dim_fg()));
 
         // Error preview is red as well as carrying an explicit failure glyph;
         // the failure head alone earns the bold.
@@ -3975,7 +4091,7 @@ mod tests {
         // Info nests in the tool gutter; warn/error rise to column 0 so they
         // stand out from the execution detail they interrupt.
         let cases = [
-            (0, DIM_FG, "    · "),
+            (0, dim_fg(), "    · "),
             (2, TOOL_CALL_FG, "· "),
             (4, TOOL_ERR_FG, "· "),
         ];
@@ -4055,9 +4171,9 @@ mod tests {
         // Inline dim icon + dim body, tagged `· queued` on the first line.
         assert_eq!(row_text(&lines[0]), "❯ later · queued");
         let icon = lines[0].spans[0].style;
-        assert_eq!(icon.fg, Some(DIM_FG));
+        assert_eq!(icon.fg, Some(dim_fg()));
         assert!(icon.add_modifier.contains(Modifier::BOLD));
-        assert_eq!(lines[0].spans[1].style.fg, Some(DIM_FG));
+        assert_eq!(lines[0].spans[1].style.fg, Some(dim_fg()));
     }
 
     #[test]
@@ -4088,7 +4204,7 @@ mod tests {
         let icon = last.spans[0].style;
         assert_eq!(icon.fg, Some(AGENT_FG));
         assert!(icon.add_modifier.contains(Modifier::BOLD));
-        assert_eq!(last.spans[1].style.fg, Some(DIM_FG));
+        assert_eq!(last.spans[1].style.fg, Some(dim_fg()));
         // Not thinking: no tail, the trailing spacer stays last.
         let lines = history(&rows);
         assert_eq!(row_text(lines.last().unwrap()), "");
@@ -4272,7 +4388,7 @@ mod tests {
         assert_eq!(l.spans[0].style.fg, Some(TOOL_CALL_FG));
         assert!(l.spans[0].style.add_modifier.contains(Modifier::BOLD));
         assert_eq!(l.spans[1].content.as_ref(), " · 3.2s…");
-        assert_eq!(l.spans[1].style.fg, Some(DIM_FG));
+        assert_eq!(l.spans[1].style.fg, Some(dim_fg()));
         // Parallel calls aggregate: the OLDEST call's elapsed + (+N) count.
         t.calls.push(("read".into(), now));
         let l = tool_running_line(&t, now).expect("a placeholder line");
@@ -4309,7 +4425,7 @@ mod tests {
         let wide = build_status_line("glm", "idle", false, None, None, stats, "", 200);
         assert_eq!(wide.spans.len(), 3);
         assert_eq!(wide.spans[2].content.as_ref(), stats);
-        assert_eq!(wide.spans[2].style.fg, Some(DIM_FG));
+        assert_eq!(wide.spans[2].style.fg, Some(dim_fg()));
         // Medium: stats no longer fit, so the bar drops to badge+state only.
         let medium_width = " glm ".width() + "  idle".width();
         let medium = build_status_line("glm", "idle", false, None, None, stats, "", medium_width);
@@ -4324,7 +4440,7 @@ mod tests {
         assert_eq!(st.fg, Some(AGENT_FG));
         assert!(st.add_modifier.contains(Modifier::BOLD));
         let idle = build_status_line("glm", "idle", false, None, None, stats, "", 200);
-        assert_eq!(idle.spans[1].style.fg, Some(DIM_FG));
+        assert_eq!(idle.spans[1].style.fg, Some(dim_fg()));
         // Model badge keeps its black-on-cyan look.
         assert_eq!(wide.spans[0].style.bg, Some(Color::Cyan));
     }
@@ -4332,12 +4448,12 @@ mod tests {
     #[test]
     fn build_status_line_ctx_outlives_the_stats() {
         let stats = " · 5 in · 6 out";
-        let ctx = Some(("ctx 21% (54.7k/256k)", Style::default().fg(DIM_FG)));
+        let ctx = Some(("ctx 21% (54.7k/256k)", Style::default().fg(dim_fg())));
         // Wide: ctx sits between the state and the stats, keeping its style.
         let wide = build_status_line("glm", "idle", false, ctx, None, stats, "", 200);
         assert_eq!(wide.spans.len(), 4);
         assert_eq!(wide.spans[2].content.as_ref(), " · ctx 21% (54.7k/256k)");
-        assert_eq!(wide.spans[2].style.fg, Some(DIM_FG));
+        assert_eq!(wide.spans[2].style.fg, Some(dim_fg()));
         assert_eq!(wide.spans[3].content.as_ref(), stats);
         // Narrower: stats drop out but ctx stays — it's the most decision-relevant
         // number, so it outlives the stats and is the last segment standing.
@@ -4353,7 +4469,7 @@ mod tests {
         // first, then plan, then ctx (ctx survives longest). plan=None ⇒ the
         // segment is absent and behavior matches pre-plan exactly.
         let stats = " · 5 in · 6 out";
-        let ctx = Some(("ctx 21%", Style::default().fg(DIM_FG)));
+        let ctx = Some(("ctx 21%", Style::default().fg(dim_fg())));
         let plan = Some((" · plan 2/5", Style::default().fg(TOOL_CALL_FG)));
         // Wide: all four optional segments present, plan between ctx and stats.
         let wide = build_status_line("glm", "idle", false, ctx, plan, stats, "", 200);
@@ -4380,7 +4496,7 @@ mod tests {
         // Fits: right-aligned with padding, dim.
         let seg = right_path_seg("/tmp/proj", 20).expect("fits");
         assert_eq!(seg.content.as_ref(), "           /tmp/proj");
-        assert_eq!(seg.style.fg, Some(DIM_FG));
+        assert_eq!(seg.style.fg, Some(dim_fg()));
         // Under 12 columns left: no segment at all.
         assert!(right_path_seg("/tmp/proj", 11).is_none());
         assert_eq!(
@@ -4422,12 +4538,12 @@ mod tests {
         // Unknown window size → absolute value only, dim.
         let (t, s) = fmt_ctx(54_700, 0).unwrap();
         assert_eq!(t, "ctx 54.7k");
-        assert_eq!(s.fg, Some(DIM_FG));
+        assert_eq!(s.fg, Some(dim_fg()));
         // Known window → percentage + both numbers; round denominator drops
         // its ".0". Fill-level color grading: dim < 60%, yellow ≥ 60%, red ≥ 80%.
         let (t, s) = fmt_ctx(54_700, 256_000).unwrap();
         assert_eq!(t, "ctx 21% (54.7k/256k)");
-        assert_eq!(s.fg, Some(DIM_FG));
+        assert_eq!(s.fg, Some(dim_fg()));
         let (_, s) = fmt_ctx(160_000, 256_000).unwrap(); // 62%
         assert_eq!(s.fg, Some(TOOL_CALL_FG));
         let (t, s) = fmt_ctx(210_000, 256_000).unwrap(); // 82%
@@ -4773,7 +4889,7 @@ mod tests {
         // Every line gets the dim "│ " guide.
         for l in &lines {
             assert_eq!(l.spans[0].content.as_ref(), "│ ");
-            assert_eq!(l.spans[0].style.fg, Some(DIM_FG));
+            assert_eq!(l.spans[0].style.fg, Some(dim_fg()));
         }
         // ANSI-colored spans keep their own color…
         let red = lines[0]
@@ -4997,7 +5113,7 @@ mod tests {
             "fence leaked: {texts:?}"
         );
         for l in lines.iter().filter(|l| row_text(l).starts_with("▎ let ")) {
-            assert_eq!(l.spans[0].style.fg, Some(DIM_FG));
+            assert_eq!(l.spans[0].style.fg, Some(dim_fg()));
             assert!(
                 l.spans[1..].iter().all(|s| s.style.fg.is_none()),
                 "unclosed fence tail must stay default fg: {:?}",
