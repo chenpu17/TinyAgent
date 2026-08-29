@@ -1861,12 +1861,16 @@ fn build_history_lines(
 ) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     if rows.is_empty() && !thinking {
-        // Empty conversation (post-/clear): the guide line plus a two-line
-        // key cheat-sheet — cheapest onboarding real estate there is.
+        // Empty conversation (post-/clear): the guide line plus a key
+        // cheat-sheet — cheapest onboarding real estate there is. The newline
+        // and cancel keys are the two highest-frequency confusions (a bare
+        // Enter sends, so multi-line needs a discoverable escape hatch; Esc
+        // only cancels mid-run), so they earn a line over everything else.
         let style = Style::default().fg(DIM_FG).add_modifier(Modifier::ITALIC);
         for l in [
             "  no messages yet — type below; /help lists commands",
             "  / completes commands · Enter sends",
+            "  Alt+Enter (or \\+Enter) newline · Esc cancels a run",
             "  scroll / select / copy are native to your terminal",
         ] {
             lines.push(Line::from(Span::styled(l.to_string(), style)));
@@ -3552,6 +3556,7 @@ mod tests {
             vec![
                 "  no messages yet — type below; /help lists commands".to_string(),
                 "  / completes commands · Enter sends".to_string(),
+                "  Alt+Enter (or \\+Enter) newline · Esc cancels a run".to_string(),
                 "  scroll / select / copy are native to your terminal".to_string(),
             ]
         );
