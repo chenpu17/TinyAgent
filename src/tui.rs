@@ -878,6 +878,9 @@ fn ui_loop(
     // Slash-command completion popup: refreshed from the input text before
     // every draw, consulted by the key handler while open.
     let mut popup = SlashPopup::new();
+    // First idle Ctrl-C timestamp: a second press within CTRL_C_QUIT_WINDOW
+    // actually quits; the first only shows the "press again" notice.
+    let mut ctrl_c_armed: Option<Instant> = None;
     // Full cwd path for the status bar's right-aligned segment — computed
     // once, not per frame.
     let cwd_path: String = std::env::current_dir()
@@ -1488,10 +1491,12 @@ fn ui_loop(
                     // TUI. When idle the two now DIVERGE: Esc clears the input
                     // box (it quit before, which was easy to hit by accident
                     // right after a run — quit via /quit or /exit now), while
-                    // Ctrl-C still quits. raw mode turns Ctrl-C into a normal
-                    // key. The transcript lives in native scrollback, so quitting
-                    // just releases the live region — the conversation stays
-                    // selectable above it.
+                    // Ctrl-C quits on a SECOND press within 2s (same accident
+                    // profile as Esc had: the busy-cancel muscle memory firing
+                    // the instant a run ends). raw mode turns Ctrl-C into a
+                    // normal key. The transcript lives in native scrollback,
+                    // so quitting just releases the live region — the
+                    // conversation stays selectable above it.
                     (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                         if busy {
                             cancel.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1515,10 +1520,15 @@ fn ui_loop(
                                 }
                             }
                         } else if matches!(key.code, KeyCode::Char('c')) {
-                            // Ctrl-C in idle quits (Esc no longer does — use
-                            // /quit, /exit, or Ctrl-C).
-                            let _ = in_tx.send(None);
-                            return Ok(queued.len());
+                            // Ctrl-C in idle: first press arms (notice row),
+                            // second within the window quits. /quit and /exit
+                            // stay single-shot.
+                            if ctrl_c_should_quit(ctrl_c_armed, Instant::now()) {
+                                let _ = in_tx.send(None);
+                                return Ok(queued.len());
+                            }
+                            ctrl_c_armed = Some(Instant::now());
+                            rows.push(Row::sys_info("[press Ctrl-C again to quit]"));
                         } else {
                             // Esc in idle: clear the input box instead of
                             // quitting. Quit via /quit or /exit.
@@ -2105,6 +2115,18 @@ fn drop_queued_ghosts(rows: &mut Vec<Row>) -> bool {
     let had = rows.iter().any(|r| matches!(r, Row::Queued(_)));
     rows.retain(|r| !matches!(r, Row::Queued(_)));
     had
+}
+
+/// How long a first idle Ctrl-C arms the quit confirmation. A single press
+/// in idle only shows the "press again" notice — the busy-Ctrl-C muscle
+/// memory firing right after a run ends must not kill the session (the same
+/// accident that got Esc-as-quit removed).
+const CTRL_C_QUIT_WINDOW: Duration = Duration::from_secs(2);
+
+/// Whether a second idle Ctrl-C (at `now`) confirms the quit. None armed (or
+/// past the window) means this press only arms.
+fn ctrl_c_should_quit(armed: Option<Instant>, now: Instant) -> bool {
+    armed.is_some_and(|t| now.duration_since(t) <= CTRL_C_QUIT_WINDOW)
 }
 
 /// Stop reasons that mean "the turn ended normally", across both provider
@@ -3851,6 +3873,24 @@ mod tests {
         assert_eq!(fmt_elapsed(60), "1m00s");
         assert_eq!(fmt_elapsed(245), "4m05s");
         assert_eq!(fmt_elapsed(3600), "60m00s");
+    }
+
+    #[test]
+    fn ctrl_c_double_press_confirms_within_the_window() {
+        let now = Instant::now();
+        // Not armed yet: the first press only arms.
+        assert!(!ctrl_c_should_quit(None, now));
+        // Armed just now / inside the 2s window: confirms.
+        assert!(ctrl_c_should_quit(Some(now), now));
+        assert!(ctrl_c_should_quit(
+            Some(now - Duration::from_millis(1990)),
+            now
+        ));
+        // Past the window: this press re-arms rather than quits.
+        assert!(!ctrl_c_should_quit(
+            Some(now - Duration::from_millis(2100)),
+            now
+        ));
     }
 
     #[test]

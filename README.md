@@ -330,8 +330,8 @@ tiny-agent --config examples/harness.json --task "跑测试" --retries 3 --outpu
 | `Ctrl-A` / `Ctrl-E` | 移到行首 / 行尾 |
 | `↑`/`↓` | 输入区跨行移动（补全弹窗打开时为移动弹窗选中） |
 | `Alt+↑`/`Alt+↓` | 输入历史翻页 |
-| `Ctrl-C` | 忙 → 取消当前轮（同时丢弃排队消息）；空闲 → 退出 |
-| `Esc` | 忙 → 取消当前轮；空闲 → 清空输入框（补全弹窗打开时只关弹窗）。退出用 `/quit`、`/exit` 或 `Ctrl-C` |
+| `Ctrl-C` | 忙 → 取消当前轮（同时丢弃排队消息）；空闲 → 连按两次退出（2 秒内再按一次，首按只提示） |
+| `Esc` | 忙 → 取消当前轮；空闲 → 清空输入框（补全弹窗打开时只关弹窗）。退出用 `/quit`、`/exit`，或空闲连按两次 `Ctrl-C` |
 
 运行中（running）输入框保持可编辑：可以继续打字，`Enter` 会把消息排队——live 区显示暗色的
 `❯ … · queued` 占位行，输入框标题同步显示队列长度；当前轮结束后最老的
@@ -362,7 +362,7 @@ running 时输入框标题显示 spinner、当前活动（thinking / writing / �
 ≥80% 转红。agent 用过 `todo` 后，状态条另显一段 `plan done/total`（如 `plan 2/5`，全部完成转绿、
 进行中为黄），实时反映任务计划进度——完整 checklist 仍在最近一条 `todo` 工具结果行里。
 终端变窄时状态条先省略 token、再省略 plan，上下文段保留到最后，只保留模型和运行状态为止。退出
-（Esc / 空闲 Ctrl-C）时若仍有排队消息，终端还原后会在 stderr 提示被丢弃的条数。
+（`/quit`、`/exit`，或空闲 `Ctrl-C` 连按两次）时若仍有排队消息，终端还原后会在 stderr 提示被丢弃的条数。
 一轮正常结束（end_turn / stop 等）不再打印 `[done: …]` 行，只有异常停止（max_tokens /
 length / error 等）才显示警告。工具输出里的 ANSI 颜色序列（如 git diff 的红绿）会按
 原样着色显示，其余控制序列一律剥除；`/export` 导出的则是去掉转义码的纯文本。
