@@ -2106,11 +2106,13 @@ fn drop_queued_ghosts(rows: &mut Vec<Row>) -> bool {
 /// Stop reasons that mean "the turn ended normally", across both provider
 /// families (Anthropic: end_turn / tool_use / stop_sequence; OpenAI: stop /
 /// tool_calls). Only abnormal stops (max_tokens / length / error / unknown)
-/// get a System row — a routine end needs no noise.
+/// get a System row — a routine end needs no noise. `cancelled` is here too:
+/// the Esc/Ctrl-C handler already printed `[cancelling…]`, so a second
+/// `[done: cancelled]` line would just duplicate the notice.
 fn is_normal_stop(reason: &str) -> bool {
     matches!(
         reason,
-        "end_turn" | "tool_use" | "stop" | "tool_calls" | "stop_sequence"
+        "end_turn" | "tool_use" | "stop" | "tool_calls" | "stop_sequence" | "cancelled"
     )
 }
 
@@ -3849,13 +3851,15 @@ mod tests {
     #[test]
     fn is_normal_stop_covers_both_provider_families() {
         // Anthropic: end_turn / tool_use / stop_sequence; OpenAI: stop /
-        // tool_calls — none of these get a "[done: …]" row.
+        // tool_calls — none of these get a "[done: …]" row. `cancelled` is
+        // silent too: the Esc/Ctrl-C path already printed "[cancelling…]".
         for normal in [
             "end_turn",
             "tool_use",
             "stop",
             "tool_calls",
             "stop_sequence",
+            "cancelled",
         ] {
             assert!(is_normal_stop(normal), "{normal} should be silent");
         }
