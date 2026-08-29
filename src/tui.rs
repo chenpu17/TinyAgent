@@ -938,6 +938,10 @@ pub fn run(
     result.map(|_| ())
 }
 
+// The loop state is threaded as plain locals (rows/queued/history/…); the
+// parameters are exactly the pieces owned by the caller. Grouping them into
+// a struct would only shuffle the same fields to one more place.
+#[allow(clippy::too_many_arguments)]
 fn ui_loop(
     term: &mut Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     cfg: &Config,
