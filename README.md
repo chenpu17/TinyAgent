@@ -313,6 +313,7 @@ tiny-agent --config examples/harness.json --task "跑测试" --retries 3 --outpu
 - `--session none` 关闭持久化——不读不写，一次性 headless 运行不在 cwd 留文件（与 `--resume` 互斥）
 - `--resume` 加载历史继续；此时 config 里的 `task` 视为已消费，用 `--task` 追加新指令
 - 崩溃也不丢已完成的轮次；TUI 模式同样生效
+- TUI `--resume` 会把历史**转录进原生 scrollback**（用户/助手消息、工具调用与结果按 id 配对重建单行视图，`· ` 系统行标注"resumed"），图片不转录；停在 tool_result 中途的会话恢复后自动续跑，末条任务文本直接可见
 
 ## TUI 对话模式
 

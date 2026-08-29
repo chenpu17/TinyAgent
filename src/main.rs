@@ -324,6 +324,16 @@ fn main() -> Result<()> {
     // can show "running" instead of letting the user submit into a queue.
     #[cfg_attr(not(feature = "tui"), allow(unused_variables))]
     let auto_start = initial.last().is_some_and(|m| m.role == Role::User);
+    // Snapshot the resumed history as TUI display rows BEFORE build_agent
+    // consumes `initial` — the TUI rebuilds the transcript in scrollback from
+    // this (display-only; the agent keeps the real history). Headless runs
+    // skip the work.
+    #[cfg(feature = "tui")]
+    let resume_rows = if resumed && tui_mode {
+        tui::transcript_rows(&initial)
+    } else {
+        Vec::new()
+    };
     let client = provider::new_client(cfg.limits.timeout_secs);
     let mut agent = build_agent(&cfg, initial, &client)?;
     if let Some(path) = session {
@@ -360,7 +370,7 @@ fn main() -> Result<()> {
             } else {
                 cfg.task.clone()
             };
-            tui::run(agent, &cfg, initial_task, auto_start)
+            tui::run(agent, &cfg, initial_task, auto_start, resume_rows)
         }
         #[cfg(not(feature = "tui"))]
         {

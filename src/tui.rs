@@ -1,6 +1,6 @@
 use crate::agent::{Agent, AgentEvent};
 use crate::config::Config;
-use crate::provider::Block;
+use crate::provider::{Block, Message, Role};
 use anyhow::Result;
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -57,8 +57,9 @@ const TOOL_INDENT: usize = 4;
 /// Severity of a `Row::System` notice — drives its color (info dim, warn
 /// yellow, error red). The text keeps its `[warn]`/`[error]`-style prefix, so
 /// the plain-text /export transcript stays self-describing without the level.
+/// pub(crate): rides along with the pub(crate) `Row::System` variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SysLevel {
+pub(crate) enum SysLevel {
     Info,
     Warn,
     Error,
@@ -66,8 +67,9 @@ enum SysLevel {
 
 /// One rendered row in the message history. Clone: `/out` reprints a past
 /// ToolResult expanded, which clones the row out of the committed history.
-#[derive(Clone)]
-enum Row {
+/// pub(crate): crosses into main.rs as the resume-transcript payload.
+#[derive(Clone, Debug)]
+pub(crate) enum Row {
     User(String),
     /// A user message queued behind an in-flight run: rendered as a dim
     /// `❯ … · queued` ghost. Removed (and replaced by the real Row::User)
@@ -677,11 +679,98 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// Rebuild a resumed session's messages as display rows, so `--resume` opens
+/// on a visible conversation instead of a blank transcript (the history lives
+/// in the agent; the rows list starts empty). Display-only approximation:
+/// ToolResult blocks name their tool via a tool_use_id → name lookup over all
+/// ToolUse blocks (`elapsed` is None — the field exists for exactly this
+/// case), images are skipped (the bytes stay in the agent's context; a
+/// transcript line carries nothing), and multi-block messages flatten in
+/// order — text accumulated before a tool block flushes as its own row so the
+/// interleaving reads like a live session.
+pub(crate) fn transcript_rows(msgs: &[Message]) -> Vec<Row> {
+    let mut names: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for m in msgs {
+        for b in &m.content {
+            if let Block::ToolUse { id, name, .. } = b {
+                names.insert(id.as_str(), name.as_str());
+            }
+        }
+    }
+    let role_row = |role: Role, text: String| match role {
+        Role::User => Row::User(text),
+        Role::Assistant => Row::Assistant(text),
+    };
+    let mut rows = Vec::new();
+    for m in msgs {
+        let mut text = String::new();
+        for b in &m.content {
+            let flush = |rows: &mut Vec<Row>, text: &mut String| {
+                if !text.is_empty() {
+                    rows.push(role_row(m.role, std::mem::take(text)));
+                }
+            };
+            match b {
+                Block::Text(t) => {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(t);
+                }
+                Block::Image { .. } => {} // display layer skips images
+                Block::ToolUse { name, input, .. } => {
+                    flush(&mut rows, &mut text);
+                    let input = strip_controls_json(input);
+                    let collapsed = compact(&input);
+                    rows.push(Row::ToolCall {
+                        name: name.clone(),
+                        input,
+                        collapsed,
+                        expanded: false,
+                        started: Instant::now(),
+                    });
+                }
+                Block::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                    ..
+                } => {
+                    flush(&mut rows, &mut text);
+                    let name = names
+                        .get(tool_use_id.as_str())
+                        .copied()
+                        .unwrap_or("(unknown)");
+                    let collapsed = crate::agent::preview(&ansi_plain(content));
+                    rows.push(Row::ToolResult {
+                        name: name.to_string(),
+                        content: content.clone(),
+                        collapsed,
+                        is_error: *is_error,
+                        expanded: false,
+                        // No call row started in THIS process — the duration
+                        // of a pre-resume call is unknowable.
+                        elapsed: None,
+                    });
+                }
+                // non_exhaustive forward-compat: a future block type renders
+                // nothing in the transcript until given an arm.
+                _ => {}
+            }
+        }
+        if !text.is_empty() {
+            rows.push(role_row(m.role, text));
+        }
+    }
+    rows
+}
+
 pub fn run(
     agent: Agent,
     cfg: &Config,
     initial_task: Option<String>,
     auto_start: bool,
+    resume_rows: Vec<Row>,
 ) -> Result<()> {
     // UI → worker: user inputs (None = quit).
     let (in_tx, in_rx) = mpsc::channel::<Option<Input>>();
@@ -797,6 +886,7 @@ pub fn run(
         &cancel,
         initial_task.as_deref(),
         auto_start,
+        resume_rows,
     );
 
     // Stop the worker before restoring the terminal. If terminal restoration
@@ -856,6 +946,7 @@ fn ui_loop(
     cancel: &std::sync::atomic::AtomicBool,
     initial_task: Option<&str>,
     auto_start: bool,
+    resume_rows: Vec<Row>,
 ) -> Result<usize> {
     // The full conversation, in append order. Finalized prefixes are committed
     // into the terminal scrollback via insert_before and never re-rendered; the
@@ -938,13 +1029,25 @@ fn ui_loop(
     let mut last_draw = Instant::now();
 
     rows.push(Row::sys_info(welcome_text(&cfg.model, cfg.tools.len())));
-    // Mirror the initial task (already in the agent's history) so the user
-    // sees what's running. Do NOT re-send it over in_tx: main has already
-    // placed it in the agent's messages, and a second send would duplicate the
-    // task and create two adjacent user messages (Anthropic rejects that 400).
-    // The worker starts the run itself.
-    if let Some(task) = initial_task {
-        rows.push(Row::User(task.to_string()));
+    if resume_rows.is_empty() {
+        // Mirror the initial task (already in the agent's history) so the user
+        // sees what's running. Do NOT re-send it over in_tx: main has already
+        // placed it in the agent's messages, and a second send would duplicate
+        // the task and create two adjacent user messages (Anthropic rejects
+        // that 400). The worker starts the run itself.
+        if let Some(task) = initial_task {
+            rows.push(Row::User(task.to_string()));
+        }
+    } else {
+        // Resumed session: the transcript already ends with the final user
+        // message (including a --task folded into it by main), so mirroring
+        // initial_task here would duplicate it. The rebuilt rows are ordinary
+        // rows — the first commit pass flushes them into scrollback.
+        rows.push(Row::sys_info(format!(
+            "[resumed session — {} transcript rows restored]",
+            resume_rows.len()
+        )));
+        rows.extend(resume_rows);
     }
     // The worker auto-runs when the session ends with a user message (an
     // initial task, or a resumed session stopped mid-turn). Show "running" so
@@ -5143,6 +5246,99 @@ mod tests {
         assert!(up_is_history(true, true));
         assert!(!up_is_history(false, false));
         assert!(up_is_history(false, true));
+    }
+
+    #[test]
+    fn transcript_rows_rebuilds_history_with_tool_pairing() {
+        // The resumed-session transcript: text flattens per message, tool
+        // blocks interleave in order, results pair with their call by
+        // tool_use_id, unknown ids fall back to a placeholder name.
+        let msgs = vec![
+            Message::user(vec![Block::Text("do it".into())]),
+            Message::assistant(vec![
+                Block::Text("running".into()),
+                Block::ToolUse {
+                    id: "t1".into(),
+                    name: "shell".into(),
+                    input: serde_json::json!({"cmd": "ls"}),
+                },
+            ]),
+            Message::user(vec![Block::ToolResult {
+                tool_use_id: "t1".into(),
+                content: "a.txt".into(),
+                image: None,
+                is_error: false,
+            }]),
+            Message::assistant(vec![Block::Text("done".into())]),
+            // A user message mixing text with an orphaned result (id with no
+            // matching call) exercises both fallbacks in one message.
+            Message::user(vec![
+                Block::Text("orphan:".into()),
+                Block::ToolResult {
+                    tool_use_id: "gone".into(),
+                    content: "?".into(),
+                    image: None,
+                    is_error: true,
+                },
+            ]),
+        ];
+        let rows = transcript_rows(&msgs);
+        let shape = |r: &Row| match r {
+            Row::User(_) => "U",
+            Row::Assistant(_) => "A",
+            Row::ToolCall { .. } => "C",
+            Row::ToolResult { .. } => "R",
+            _ => "?",
+        };
+        assert_eq!(
+            rows.iter().map(shape).collect::<Vec<_>>(),
+            vec!["U", "A", "C", "R", "A", "U", "R"],
+            "flattened order: {rows:?}"
+        );
+        assert!(matches!(&rows[0], Row::User(t) if t == "do it"));
+        assert!(matches!(&rows[1], Row::Assistant(t) if t == "running"));
+        // The paired result names its tool and carries elapsed=None.
+        match &rows[3] {
+            Row::ToolResult {
+                name,
+                is_error,
+                elapsed,
+                ..
+            } => {
+                assert_eq!(name, "shell");
+                assert!(!is_error);
+                assert_eq!(elapsed, &None, "resumed results have no duration");
+            }
+            other => panic!("expected a ToolResult, got {other:?}"),
+        }
+        // The orphan: text flushed first, result under the placeholder name.
+        assert!(matches!(&rows[5], Row::User(t) if t == "orphan:"));
+        match &rows[6] {
+            Row::ToolResult { name, is_error, .. } => {
+                assert_eq!(name, "(unknown)");
+                assert!(*is_error);
+            }
+            other => panic!("expected a ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transcript_rows_skip_images_and_join_multi_block_text() {
+        // Images are display-skip (bytes stay in the agent's context); text
+        // blocks within one message join with newlines into a single row.
+        let msgs = vec![Message::user(vec![
+            Block::Text("look".into()),
+            Block::Image {
+                media_type: "image/png".into(),
+                data: "iVBOR…".into(),
+            },
+            Block::Text("at this".into()),
+        ])];
+        let rows = transcript_rows(&msgs);
+        assert_eq!(rows.len(), 1, "one row, no image placeholder: {rows:?}");
+        assert!(matches!(&rows[0], Row::User(t) if t == "look\nat this"));
+        // Empty history → empty rows (fresh session path).
+        assert!(transcript_rows(&[]).is_empty());
     }
 
     #[test]
