@@ -9,6 +9,7 @@
 //! dependency, no cycle.
 
 use crate::provider::{Block, Message, Role, Usage};
+use base64::Engine;
 use std::time::Duration;
 
 // ─── Context compression ────────────────────────────────────────────
@@ -41,6 +42,109 @@ pub(crate) const COMPACT_UTILIZATION_PCT: u64 = 85;
 /// Rough chars-per-token for the preflight size estimate (matches OpenCode's
 /// "JSON-serialize the request and assume four characters per token").
 pub(crate) const CHARS_PER_TOKEN: usize = 4;
+
+/// Conservative per-page token estimate for a PDF document block, feeding the
+/// preflight compaction heuristic. Anthropic documents 1,500–3,000 tokens per
+/// page (each page is extracted as text AND rendered as an image; dense pages
+/// sit at the top of the range) and community measurements skew toward the
+/// high end, so the estimate takes the ceiling: over-estimating compacts
+/// slightly early (harmless), under-estimating risks a context overflow
+/// mid-run. The provider's real usage remains the billing source of truth.
+pub(crate) const PDF_TOKENS_PER_PAGE: usize = 3_000;
+
+/// Rough page count for a base64-encoded PDF, without a real PDF parser.
+/// Best-of three heuristics:
+/// 1. plain `/Type /Page` / `/Type/Page` object markers (the common case for
+///    LaTeX / browser / Word output, which write page objects uncompressed);
+/// 2. the largest `/Count N` within a short window of a `/Type /Pages` node —
+///    the page-tree root's count, which still catches documents whose page
+///    objects are hidden inside compressed object streams (PDF 1.5+ ObjStm),
+///    where a byte scan sees none;
+/// 3. if neither yields anything (fully opaque bytes), a size fallback of
+///    ~100 KiB/page (typical for text PDFs), floored at 1.
+///
+/// An estimate only — it feeds [`estimate_tokens`], never gates a request.
+pub(crate) fn pdf_page_estimate(b64: &str) -> usize {
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(b64.as_bytes())
+        .unwrap_or_default();
+    if raw.is_empty() {
+        return 1;
+    }
+    let found = count_page_objects(&raw, b"/Type /Page")
+        .max(count_page_objects(&raw, b"/Type/Page"))
+        .max(pages_tree_count(&raw));
+    if found > 0 {
+        found
+    } else {
+        (raw.len() / (100 * 1024)).max(1)
+    }
+}
+
+/// Count occurrences of a `needle` (`/Type /Page` or `/Type/Page`) that don't
+/// extend into a longer name: the byte after a hit must not be alphanumeric.
+/// `/Type /Pages` (the parent tree node, not a page) and `/PageMode`-style
+/// longer names are thereby rejected.
+fn count_page_objects(hay: &[u8], needle: &[u8]) -> usize {
+    let mut count = 0;
+    let mut from = 0;
+    while hay.len() - from >= needle.len() {
+        let Some(rel) = hay[from..].windows(needle.len()).position(|w| w == needle) else {
+            break;
+        };
+        let end = from + rel + needle.len();
+        if !hay.get(end).is_some_and(|c| c.is_ascii_alphanumeric()) {
+            count += 1;
+        }
+        from = end;
+    }
+    count
+}
+
+/// Largest `/Count N` within a short window around a `/Type /Pages` node. The
+/// page-tree root's `/Count` is the document's page total (intermediate nodes
+/// carry subtree counts ≤ it). Restricting the scan to this window keeps
+/// outline/bookmark `/Count` entries — which count visible items, not pages —
+/// out of the max.
+fn pages_tree_count(hay: &[u8]) -> usize {
+    let mut best = 0;
+    for needle in [b"/Type /Pages".as_slice(), b"/Type/Pages".as_slice()] {
+        let mut from = 0;
+        while hay.len() - from >= needle.len() {
+            let Some(rel) = hay[from..].windows(needle.len()).position(|w| w == needle) else {
+                break;
+            };
+            let node = from + rel;
+            // A dict's key order is arbitrary, so look slightly BACKWARD too
+            // (`<< /Count 3 /Type /Pages … >>`); 64 bytes can't reach past the
+            // previous object's `/Count` in any realistic layout.
+            let lo = node.saturating_sub(64);
+            let hi = (node + 512).min(hay.len());
+            if let Some(n) = count_in_window(&hay[lo..hi]) {
+                best = best.max(n);
+            }
+            from = node + needle.len();
+        }
+    }
+    best
+}
+
+/// First `/Count N` (N decimal) inside a window, if any.
+fn count_in_window(win: &[u8]) -> Option<usize> {
+    let idx = win.windows(6).position(|w| w == b"/Count")?;
+    let mut j = idx + 6;
+    while matches!(win.get(j), Some(b' ' | b'\r' | b'\n' | b'\t')) {
+        j += 1;
+    }
+    let start = j;
+    while matches!(win.get(j), Some(c) if c.is_ascii_digit()) {
+        j += 1;
+    }
+    if j == start {
+        return None;
+    }
+    std::str::from_utf8(&win[start..j]).ok()?.parse().ok()
+}
 
 /// A transcript larger than this is summarized in message-aligned chunks then
 /// combined, bounding the per-call compression ratio so detail isn't crushed
@@ -88,6 +192,10 @@ pub(crate) fn total_chars(messages: &[Message]) -> usize {
         .map(|b| match b {
             Block::Text(t) => t.len(),
             Block::Image { data, .. } => data.len() / 100, // base64 is ~33% overhead
+            // Char-floor only (same heuristic as images) for the legacy
+            // `compress_threshold_chars` gate; the page-aware token estimate
+            // lives in `estimate_tokens`.
+            Block::Document { data, .. } => data.len() / 100,
             Block::ToolUse { input, .. } => input.to_string().len(),
             // A tool result may carry an image payload (e.g. load_image).
             // Count it like a top-level image, or a load_image-heavy
@@ -117,7 +225,23 @@ pub(crate) fn estimate_tokens(
     tool_schema_chars: usize,
 ) -> usize {
     let chars = total_chars(messages) + system.map(|s| s.len()).unwrap_or(0) + tool_schema_chars;
-    chars / CHARS_PER_TOKEN
+    // PDF document blocks are estimated per PAGE (Anthropic processes each
+    // page as text + image, 1.5–3k tokens/page), not by payload size — a
+    // 10 MiB text PDF is hundreds of pages, which any bytes-per-token
+    // heuristic grossly under-counts. `pdf_page_estimate` re-decodes and
+    // re-scans per call: the preflight runs once per turn and the scan is
+    // memory-bandwidth-bound (~ms even at the 10 MiB cap), so no cache is
+    // worth the state it would add to the plain-data Block.
+    let pdf_tokens: usize = messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter_map(|b| match b {
+            Block::Document { data, .. } => Some(pdf_page_estimate(data)),
+            _ => None,
+        })
+        .sum::<usize>()
+        .saturating_mul(PDF_TOKENS_PER_PAGE);
+    chars / CHARS_PER_TOKEN + pdf_tokens
 }
 
 /// True if a provider error looks like "the request was too long for the
@@ -247,6 +371,7 @@ pub(crate) fn window_lines(messages: &[Message], cut: usize) -> Vec<String> {
             let line = match b {
                 Block::Text(t) => format!("[{role}] {t}\n"),
                 Block::Image { .. } => format!("[{role}] <image>\n"),
+                Block::Document { .. } => format!("[{role}] <document>\n"),
                 Block::ToolUse { name, input, .. } => {
                     format!(
                         "[{role}] tool_call {name}: {}\n",

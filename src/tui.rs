@@ -808,7 +808,8 @@ pub(crate) fn transcript_rows(msgs: &[Message]) -> Vec<Row> {
                     }
                     text.push_str(t);
                 }
-                Block::Image { .. } => {} // display layer skips images
+                Block::Image { .. } => {}    // display layer skips images
+                Block::Document { .. } => {} // …and PDF documents likewise
                 Block::ToolUse { name, input, .. } => {
                     flush(&mut rows, &mut text);
                     let input = strip_controls_json(input);
@@ -6521,16 +6522,25 @@ mod tests {
     fn transcript_rows_skip_images_and_join_multi_block_text() {
         // Images are display-skip (bytes stay in the agent's context); text
         // blocks within one message join with newlines into a single row.
+        // PDF document blocks skip the same way.
         let msgs = vec![Message::user(vec![
             Block::Text("look".into()),
             Block::Image {
                 media_type: "image/png".into(),
                 data: "iVBOR…".into(),
             },
+            Block::Document {
+                media_type: "application/pdf".into(),
+                data: "JVBERi0=".into(),
+            },
             Block::Text("at this".into()),
         ])];
         let rows = transcript_rows(&msgs);
-        assert_eq!(rows.len(), 1, "one row, no image placeholder: {rows:?}");
+        assert_eq!(
+            rows.len(),
+            1,
+            "one row, no image/document placeholder: {rows:?}"
+        );
         assert!(matches!(&rows[0], Row::User(t) if t == "look\nat this"));
         // Empty history → empty rows (fresh session path).
         assert!(transcript_rows(&[]).is_empty());

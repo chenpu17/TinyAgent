@@ -7,6 +7,7 @@
 - **单一可执行文件**，无运行时依赖；musl 静态编译后可丢到路由器 / 树莓派 / CI runner 直接跑
 - **两种 LLM 后端**：Anthropic 原生 API + OpenAI 兼容协议（覆盖 DeepSeek / vLLM / Ollama 等），均带 token 用量统计
 - **图片输入**：`--image` 参数或 `load_image` 工具（png / jpeg / gif / webp，base64）
+- **PDF 文档输入**：库侧 `Block::Document`（Anthropic 原生 `document` block，逐页"转图 + 抽取文本"处理；`load_document_block` 读取 + `push_user` 推入）
 - **精炼工具集**：`shell`、`read_file`、`write_file`、`edit_file`、`list_dir`、`task`（子 agent；同 turn 多调用并行）、`todo`（任务计划，落进 result.json 的 `plan` 字段）默认启用；`load_image`（视觉）需在 `tools` 显式加入。均可在 config 的 `tools` 里裁剪
 - **Harness 契约**：`--output result.json` 写结构化结果（含 token 用量、每次工具调用的 input/output），`--json` 流式 NDJSON；exit code 语义化（`0` 成功 / `124` 超时 / `130` 取消 / `1` 其它），可直接进 CI / 评测 pipeline
 - **CLI 覆盖**：`--model` / `--max-turns` / `--timeout` 免改配置做 A/B 对照
@@ -97,6 +98,16 @@ agent.set_hooks(Arc::new(Policy));
 **常驻会话的热更新**（GUI 宿主场景）：CLI 的 config 在构建时定格，但宿主可以让一个 `Agent` 活整个会话、按需换挡——`set_model` / `set_reasoning_effort` / `set_max_tokens` / `set_max_context_tokens` 都是**纯字段替换**，下次请求生效，MCP 连接、工具装配、历史与 session 全不动（重建 Agent 要重跑 MCP 握手，实测可达秒级）。MCP server 集合也可热增删：`add_mcp_server(McpServerConfig)` / `remove_mcp_server(name)` / `tool_names()`（语义见[MCP 运行时热增删](#运行时热增删库-api)节）。`Agent::compact(&mut events)` 是压缩的**宿主主动入口**：轮次间调用即折叠历史（滚动摘要 + 安全切点 + 落盘 + `Compressed { trigger: "manual" }` 事件），返回 `dropped`/`kept`/摘要调用的 `usage`——这笔成本不进下一次 run 的账单（run 入口会重置总账），由宿主自行记账。这些方法的 `&mut self` 签名即顺序契约：run 持有借用，「轮次间调用」由借用检查器强制。注意 `task` 子 agent 持构造期 config 快照，不跟随换挡。
 
 run 结束后从 [`RunOutcome`](src/agent.rs)（或 `Agent::usage()` / `messages()` / `model()` getter）读回诚实的 token 账单与历史。`AgentEvent` 派生了 `Serialize`，绑定层可直接序列化成宿主语言的 dict / object。`Message` 带**稳定 id**（`id: Option<String>`，agent 在消息进入历史时铸造、跨 save/load 不变、压缩折叠不重排存活者）——往消息上挂宿主侧资产（图片卡 / 文件链接）时锚 id 而不是下标，压缩/truncate 后锚点不漂移。
+
+**PDF 文档输入**（`Block::Document`）：Anthropic 协议原生支持把 PDF 作为 `document` content block——服务端逐页"转图 + 抽取文本"，图表/版面都能看。库侧用 `load_document_block(path)` 读本地文件（`.pdf` 后缀 + `%PDF-` 头校验、10 MiB 上限，对齐 `load_image`），随消息推入：
+
+```rust
+use tiny_agent::{load_document_block, Block};
+let doc = load_document_block(std::path::Path::new("report.pdf"))?;
+agent.push_user(vec![doc, Block::Text("总结这份报告的要点".into())]);
+```
+
+三条语义：① **仅 Anthropic provider**——OpenAI 兼容端点在发请求前显式报错（不会静默丢弃文档），纯 custom-provider 绑定不受影响；② 预压缩按**页数**估 token（官方口径每页 1,500–3,000、取保守上沿 3,000；页数是免解析启发式：裸扫 page 对象标记 + 页树 `/Count` 互为补充，全无可见结构时按 ~100 KiB/页兜底）——文本型 PDF 有几百页，按字节的估算会差几个数量级；③ TUI / resume 转录不渲染文档字节（与图片同款跳过），压缩摘要转录里以 `<document>` 占位。
 
 ### Python / TypeScript 绑定
 

@@ -102,6 +102,16 @@ impl OpenAi {
                             "type": "image_url",
                             "image_url": {"url": format!("data:{media_type};base64,{data}")}
                         })),
+                        // Unreachable in practice: `chat` rejects document
+                        // blocks before building any body (see
+                        // `reject_documents`). Defensive depth only — if a
+                        // future path skips that gate, the request still says
+                        // the document was omitted rather than silently
+                        // dropping it.
+                        Block::Document { .. } => parts.push(json!({
+                            "type": "text",
+                            "text": "[document block omitted: not supported by this provider]"
+                        })),
                         Block::ToolResult {
                             tool_use_id,
                             content,
@@ -198,8 +208,33 @@ impl LearnedFixes {
     }
 }
 
+/// Reject histories containing PDF document blocks. The OpenAI-compatible
+/// protocol has no `document` content type (file inputs ride the Responses
+/// API, not chat completions), so a document can't be forwarded — error
+/// explicitly instead of silently dropping content the model was told about.
+/// Pure (no HTTP) so it's directly unit-testable; `chat` gates on it first.
+fn reject_documents(messages: &[Message]) -> Result<()> {
+    let has_doc = messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .any(|b| matches!(b, Block::Document { .. }));
+    if has_doc {
+        bail!(
+            "PDF document blocks are only supported by the Anthropic provider; \
+             this OpenAI-compatible endpoint cannot receive them"
+        );
+    }
+    Ok(())
+}
+
 impl Provider for OpenAi {
     fn chat(&self, req: &ChatRequest, on_event: &mut dyn FnMut(ChatEvent)) -> Result<ChatResponse> {
+        // Fail fast (before any body building or HTTP) if the history carries a
+        // PDF document block: the chat-completions protocol has no document
+        // content block, so the only honest options are an explicit error or
+        // silently dropping the document — we error. Deterministic; no tokens
+        // are burned because nothing is sent.
+        reject_documents(req.messages)?;
         let mut messages: Vec<Value> = Vec::new();
         if let Some(sys) = req.system {
             messages.push(json!({"role": "system", "content": sys}));
@@ -721,6 +756,50 @@ mod tests {
         assert_eq!(msgs[0]["role"], "tool");
         assert_eq!(msgs[1]["role"], "user");
         assert_eq!(msgs[1]["content"][1]["type"], "image_url");
+    }
+
+    #[test]
+    fn document_blocks_are_rejected_before_any_request() {
+        // PDF document blocks are Anthropic-only: chat-completions has no
+        // document content type, so `chat` must fail fast (no HTTP, no burned
+        // tokens) with an explicit error naming the limitation — silently
+        // dropping the document would hide content the model was told about.
+        let doc = || {
+            vec![Message::user(vec![
+                Block::Document {
+                    media_type: "application/pdf".into(),
+                    data: "JVBERi0=".into(),
+                },
+                Block::Text("summarize".into()),
+            ])]
+        };
+        let err = reject_documents(&doc()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("Anthropic"), "message names the fix: {msg}");
+        // Clean histories pass — text, images, tool traffic.
+        let img_only = [Message::user(vec![Block::Image {
+            media_type: "image/png".into(),
+            data: "AAAA".into(),
+        }])];
+        assert!(reject_documents(&img_only).is_ok());
+        assert!(reject_documents(&[]).is_ok());
+    }
+
+    #[test]
+    fn document_block_in_message_jsons_is_an_omission_placeholder() {
+        // Defensive depth only (chat's reject_documents gate runs first): if a
+        // future path skips that gate, the wire still SAYS the document was
+        // omitted rather than silently dropping it.
+        let m = Message::user(vec![Block::Document {
+            media_type: "application/pdf".into(),
+            data: "JVBERi0=".into(),
+        }]);
+        let msgs = OpenAi::message_jsons(&m);
+        assert_eq!(msgs[0]["content"][0]["type"], "text");
+        assert!(msgs[0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("omitted"));
     }
 
     #[test]

@@ -77,6 +77,14 @@
 
 ### Added
 
+- **PDF 文档输入（`Block::Document`，Anthropic 侧）**：`Message` content 支持 PDF 文档块，对齐
+  Anthropic `document` content block（base64 source，服务端逐页"转图 + 抽取文本"）。新增
+  `load_document_block(path)` 读取 helper（`.pdf` 后缀 + `%PDF-` 头校验 + 10 MiB 上限，对齐
+  `load_image`），宿主经 `agent.push_user(vec![doc, Block::Text(…)])` 推入。预压缩按**页数**估
+  token（官方口径 1,500–3,000/页、取保守上沿 3,000；页数为免解析启发式——裸扫 page 对象标记 +
+  页树 `/Count` 互为补充，全无可见结构按 ~100 KiB/页兜底），文本型 PDF 不再被按字节的估算差出
+  数量级。OpenAI 兼容端点发请求前**显式报错**（不静默丢弃文档）；TUI / resume 转录显示跳过，
+  压缩摘要转录以 `<document>` 占位。
 - **MCP 运行时热增删（库 API）**：`Agent::add_mcp_server(McpServerConfig)` /
   `remove_mcp_server(name)` / `tool_names()`——GUI 宿主轮次间增删 MCP server，不重建
   Agent（重建要重跑所有幸存 server 的握手）。撞名是可恢复错误且带回滚（刚 spawn 的子进程

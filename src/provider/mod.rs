@@ -36,6 +36,15 @@ pub enum Block {
         media_type: String,
         data: String,
     },
+    /// base64-encoded PDF document (`media_type: "application/pdf"`). Maps to
+    /// Anthropic's `document` content block (every page is processed as image +
+    /// extracted text server-side). PDF support is Anthropic-native: the
+    /// OpenAI-compatible provider REJECTS requests containing this block with
+    /// an explicit error rather than silently dropping the document.
+    Document {
+        media_type: String,
+        data: String,
+    },
     ToolUse {
         id: String,
         name: String,

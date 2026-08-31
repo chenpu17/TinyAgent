@@ -1,3 +1,4 @@
+mod document;
 mod file;
 mod image;
 pub mod mcp;
@@ -6,6 +7,7 @@ mod skill;
 mod subagent;
 pub(crate) mod todo;
 
+pub use document::load_document_block;
 pub use image::load_block;
 pub use skill::{ListSkill, ReadSkill};
 

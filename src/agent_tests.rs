@@ -3340,6 +3340,147 @@ fn proactive_compress_on_token_estimate() {
     assert_eq!(cap[1].message_count, 3, "main call saw the folded history");
 }
 
+// ── PDF document blocks: page-estimate heuristic & preflight ─────────────
+
+/// base64 of `bytes` (test helper for building Document blocks).
+fn b64(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// A minimal fake PDF: a page-tree node + `pages` plain page objects.
+fn fake_pdf(pages: usize, with_markers: bool, tree_count: Option<usize>) -> Vec<u8> {
+    let mut out = b"%PDF-1.4\n".to_vec();
+    let kids = (0..pages)
+        .map(|i| format!("{} 0 R", i + 2))
+        .collect::<Vec<_>>()
+        .join(" ");
+    match tree_count {
+        Some(n) => out.extend_from_slice(
+            format!("1 0 obj << /Type /Pages /Kids [{kids}] /Count {n} >> endobj\n").as_bytes(),
+        ),
+        None => out.extend_from_slice(
+            format!("1 0 obj << /Type /Pages /Kids [{kids}] >> endobj\n").as_bytes(),
+        ),
+    }
+    if with_markers {
+        for i in 0..pages {
+            out.extend_from_slice(format!("{} 0 obj << /Type /Page >> endobj\n", i + 2).as_bytes());
+        }
+    }
+    out
+}
+
+#[test]
+fn pdf_page_estimate_counts_plain_page_objects() {
+    // 3 uncompressed page objects (the common LaTeX/browser/Word shape) → 3.
+    assert_eq!(pdf_page_estimate(&b64(&fake_pdf(3, true, None))), 3);
+}
+
+#[test]
+fn pdf_page_estimate_excludes_pages_tree_nodes() {
+    // The `/Type /Pages` PARENT node must not count as a page: tree + 2 page
+    // objects (no /Count to cross-check) → 2, not 3. Also covers the no-space
+    // `/Type/Page` spelling.
+    let raw = fake_pdf(2, true, None);
+    assert_eq!(pdf_page_estimate(&b64(&raw)), 2);
+    let nospace = b"%PDF-1.4\n1 0 obj << /Type/Page >> endobj\n2 0 obj << /Type/Page >> endobj\n";
+    assert_eq!(pdf_page_estimate(&b64(nospace)), 2);
+}
+
+#[test]
+fn pdf_page_estimate_recovers_count_when_markers_are_hidden() {
+    // ObjStm-compressed PDFs (1.5+) can hide page objects from a byte scan;
+    // the page-tree /Count is the recovery path. Marker count (0) < /Count 5.
+    assert_eq!(pdf_page_estimate(&b64(&fake_pdf(5, false, Some(5)))), 5);
+    // Mixed: markers say 2 but the tree says 5 → trust the larger.
+    assert_eq!(pdf_page_estimate(&b64(&fake_pdf(5, true, Some(5)))), 5);
+}
+
+#[test]
+fn pdf_page_estimate_falls_back_to_size_for_opaque_bytes() {
+    // No markers, no tree → ~100 KiB/page fallback, floored at 1.
+    let raw = vec![b'x'; 250 * 1024]; // → 2 pages
+    assert_eq!(pdf_page_estimate(&b64(&raw)), 2);
+    let small = b"%PDF-1.4 opaque stream bytes";
+    assert_eq!(pdf_page_estimate(&b64(small)), 1);
+    // Undecodable base64 → treated as 1 page (an estimate, never an error).
+    assert_eq!(pdf_page_estimate("!!not-base64!!"), 1);
+}
+
+#[test]
+fn estimate_tokens_counts_pdf_by_pages_not_bytes() {
+    // A 3-page PDF estimates at 3 × PDF_TOKENS_PER_PAGE regardless of payload
+    // size — a bytes-per-token heuristic would under-count a dense text PDF
+    // by orders of magnitude.
+    let doc = Block::Document {
+        media_type: "application/pdf".into(),
+        data: b64(&fake_pdf(3, true, None)),
+    };
+    let msgs = vec![Message::user(vec![doc, Block::Text("summarize".into())])];
+    let est = estimate_tokens(&msgs, None, 0);
+    // Expected from the same inputs total_chars uses: the doc's char floor
+    // (base64 len / 100) + the text, over CHARS_PER_TOKEN, plus pages ×
+    // PDF_TOKENS_PER_PAGE.
+    let doc_floor = match &msgs[0].content[0] {
+        Block::Document { data, .. } => data.len() / 100,
+        _ => unreachable!(),
+    };
+    let expected = (doc_floor + "summarize".len()) / CHARS_PER_TOKEN + 3 * PDF_TOKENS_PER_PAGE;
+    assert_eq!(est, expected);
+    // Same payload with NO page structure visible still counts (fallback ≥1).
+    let opaque = Block::Document {
+        media_type: "application/pdf".into(),
+        data: b64(b"%PDF-1.4 tiny"),
+    };
+    let msgs = vec![Message::user(vec![opaque])];
+    assert!(estimate_tokens(&msgs, None, 0) >= PDF_TOKENS_PER_PAGE);
+}
+
+#[test]
+fn pdf_estimate_drives_preflight_compression() {
+    // A document block's page estimate must trip the same 85%-of-window
+    // preflight gate a long text does: 3 pages × 3000 tokens > 85% of a
+    // 10k window → compress BEFORE the main request.
+    let mut cfg = cfg_with(5, 0, 0); // char threshold off
+    cfg.limits.max_context_tokens = 10_000;
+    cfg.limits.keep_recent_messages = 2;
+    cfg.max_tokens = 100;
+    let initial = vec![
+        Message::user(vec![
+            Block::Document {
+                media_type: "application/pdf".into(),
+                data: b64(&fake_pdf(3, true, None)),
+            },
+            Block::Text("the task".into()),
+        ]),
+        Message::assistant(vec![Block::Text("a1".into())]),
+        user_text("u1"),
+        Message::assistant(vec![Block::Text("a2".into())]),
+        user_text("u2"),
+    ];
+    let (prov, state) = MockProvider::new(vec![
+        mock::resp_text("SUMMARY", None), // summarize_prefix call
+        mock::resp_text("final", None),   // main call on folded history
+    ]);
+    let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+    let mut events = Vec::new();
+    let o = agent.run(&mut |e| events.push(e)).unwrap();
+    assert_eq!(o.stop_reason, "end_turn");
+    assert_eq!(state.calls(), 2);
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::Compressed { .. })));
+    // The summarizer transcript shows the document as a marker line, and the
+    // main call saw the folded (3-message) history.
+    let cap = state.captured();
+    assert!(
+        cap[0].user_texts.iter().any(|t| t.contains("<document>")),
+        "summary transcript marks the doc"
+    );
+    assert_eq!(cap[1].message_count, 3, "main call saw the folded history");
+}
+
 #[test]
 fn overflow_error_triggers_force_compress_then_retry() {
     // The core overflow path: the provider rejects the request as too long

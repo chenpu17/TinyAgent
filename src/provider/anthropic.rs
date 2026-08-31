@@ -43,6 +43,14 @@ impl Anthropic {
                     "type": "image",
                     "source": {"type": "base64", "media_type": media_type, "data": data}
                 }),
+                // Anthropic's `document` block (PDF support): same base64
+                // source shape as images; media_type is "application/pdf".
+                // Only base64 is wired — the url / Files-API `file_id` sources
+                // are host-side concerns (download and push the bytes).
+                Block::Document { media_type, data } => json!({
+                    "type": "document",
+                    "source": {"type": "base64", "media_type": media_type, "data": data}
+                }),
                 Block::ToolUse { id, name, input } => json!({
                     "type": "tool_use", "id": id, "name": name, "input": input
                 }),
@@ -922,6 +930,25 @@ mod tests {
         // text only → bare string (unchanged shape)
         let v = Anthropic::message_json(&mk("plain", None));
         assert_eq!(v["content"][0]["content"], "plain");
+    }
+
+    #[test]
+    fn document_block_serializes_as_anthropic_document_source() {
+        // PDF support wire shape: a `document` content block with a base64
+        // source object, mirroring the image block's structure.
+        let m = Message::user(vec![
+            Block::Document {
+                media_type: "application/pdf".into(),
+                data: "JVBERi0=".into(), // b64("%PDF-")
+            },
+            Block::Text("summarize this".into()),
+        ]);
+        let v = Anthropic::message_json(&m);
+        assert_eq!(v["content"][0]["type"], "document");
+        assert_eq!(v["content"][0]["source"]["type"], "base64");
+        assert_eq!(v["content"][0]["source"]["media_type"], "application/pdf");
+        assert_eq!(v["content"][0]["source"]["data"], "JVBERi0=");
+        assert_eq!(v["content"][1]["type"], "text");
     }
 
     /// A representative agent-turn request: system prompt + two tools + two

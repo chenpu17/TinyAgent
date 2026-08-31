@@ -46,7 +46,7 @@ pub use hooks::{Hooks, ToolDecision};
 pub use provider::{
     Block, ChatRequest, ChatResponse, Message, Provider, Role, SimpleChatResponse, ToolDef, Usage,
 };
-pub use tools::{CallbackTool, Tool, ToolConcurrency, ToolCtx, ToolOutput};
+pub use tools::{load_document_block, CallbackTool, Tool, ToolConcurrency, ToolCtx, ToolOutput};
 
 /// Wire together provider + tools (the config's built-in whitelist + any MCP
 /// servers) + [`Agent`], returning a ready-to-run agent.
