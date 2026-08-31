@@ -52,6 +52,12 @@ pub struct Captured {
     /// `cache:true`. The mock doesn't build an HTTP body, so this records the
     /// agent's intent rather than the wire-level cache_control markup.
     pub cache: bool,
+    /// The request's model / max_tokens / reasoning_effort — lets tests
+    /// assert the host hot-update setters (`Agent::set_model` et al.) reached
+    /// the request, not just the getter.
+    pub model: String,
+    pub max_tokens: u32,
+    pub reasoning_effort: Option<String>,
     /// The per-request timeout the agent set. Lets a test assert the
     /// reader-thread leak backstop is always present (a streaming request is
     /// never sent with `None`, which would let the sse-reader worker thread
@@ -149,6 +155,9 @@ impl Provider for MockProvider {
             tool_result_ids,
             user_texts,
             cache: req.cache,
+            model: req.model.to_string(),
+            max_tokens: req.max_tokens,
+            reasoning_effort: req.reasoning_effort.map(str::to_string),
             per_request_timeout: req.per_request_timeout,
         });
 

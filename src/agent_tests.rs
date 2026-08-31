@@ -1750,6 +1750,97 @@ fn empty_assistant_turn_is_not_persisted() {
 }
 
 #[test]
+fn hot_update_setters_take_effect_on_next_request() {
+    // Pure field replacement: the swapped model/effort/budget must travel on
+    // the next ChatRequest — the provider is stateless w.r.t. them, so no
+    // rebuild is involved. Asserted against the mock's captured request, not
+    // just the getters, so a regression that reads config instead of the
+    // agent fields can't pass.
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, state) = MockProvider::new(vec![mock::resp_text("ok", None)]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("hi")],
+        test_ctx(),
+    );
+    agent.set_model("other-model");
+    agent.set_reasoning_effort(Some("high"));
+    agent.set_max_tokens(7);
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o.stop_reason, "end_turn");
+    assert_eq!(agent.model(), "other-model");
+    let cap = state.captured();
+    assert_eq!(cap[0].model, "other-model");
+    assert_eq!(cap[0].max_tokens, 7);
+    assert_eq!(cap[0].reasoning_effort.as_deref(), Some("high"));
+}
+
+#[test]
+fn hot_update_setter_edges() {
+    // max_tokens clamps to 1 (a persistent 0 would 400 every later request);
+    // effort Some→None clears; set_model accepts whatever the host says
+    // (validity fails honestly at the next request, like a config typo).
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, state) = MockProvider::new(vec![
+        mock::resp_text("ok", None),
+        mock::resp_text("ok", None),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("hi")],
+        test_ctx(),
+    );
+    agent.set_max_tokens(0);
+    agent.set_reasoning_effort(Some("low"));
+    let _ = agent.run(&mut |_| {}).unwrap();
+    agent.set_reasoning_effort(None);
+    agent.set_model("");
+    let _ = agent.run(&mut |_| {}).unwrap();
+    let cap = state.captured();
+    assert_eq!(cap[0].max_tokens, 1, "0 clamps to 1");
+    assert_eq!(cap[0].reasoning_effort.as_deref(), Some("low"));
+    assert_eq!(cap[1].reasoning_effort, None, "None clears the hint");
+    assert_eq!(cap[1].model, "", "model passes through verbatim");
+}
+
+#[test]
+fn set_max_context_tokens_switches_preflight_to_token_gate() {
+    // A tiny ceiling set at runtime must arm the preflight estimate: the run
+    // compresses (summary + main calls) even though the static config left
+    // max_context_tokens at 0 (char heuristic, threshold 0 = never).
+    let mut cfg = cfg_with(5, 0, 0);
+    cfg.limits.keep_recent_messages = 2;
+    let initial = vec![
+        user_text("task"),
+        Message::assistant(vec![Block::Text("a1".into())]),
+        user_text("u1"),
+        Message::assistant(vec![Block::Text("a2".into())]),
+        user_text("u2"),
+    ];
+    let (prov, state) = MockProvider::new(vec![
+        mock::resp_text("SUMMARY", None),
+        mock::resp_text("final answer", None),
+    ]);
+    let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+    agent.set_max_context_tokens(1); // any history trips the 85% gate
+    let mut events = Vec::new();
+    let o = agent.run(&mut |e| events.push(e)).unwrap();
+    assert_eq!(o.stop_reason, "end_turn");
+    assert_eq!(state.calls(), 2, "summary + folded main request");
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::Compressed {
+            trigger: CompressTrigger::Preflight,
+            ..
+        }
+    )));
+}
+
+#[test]
 fn parallel_tool_uses_pair_with_n_tool_results() {
     // One assistant turn with 2 tool_use → the NEXT request's trailing
     // message must be a user turn carrying 2 tool_results (N:N), or a

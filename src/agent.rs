@@ -517,6 +517,60 @@ impl Agent {
         &self.limits
     }
 
+    // ── Host hot-update setters (long-lived agents) ──────────────────────────
+    //
+    // For CLI runs the config is fixed at build time, but a GUI host keeps
+    // one Agent alive for a whole session and wants to swap request knobs
+    // WITHOUT the rebuild (an MCP handshake re-run costs seconds — the reason
+    // hosts asked for these). All of them are pure field replacements that
+    // take effect on the NEXT request: the model/effort/budget travel on
+    // `ChatRequest` per call and are never baked into the provider or the
+    // tool assembly. The `&mut self` signature is the sequencing contract —
+    // a run holds the borrow, so "call between runs" is enforced by the
+    // compiler, not convention.
+
+    /// Swap the model for subsequent requests (same provider/endpoint).
+    ///
+    /// Scope notes:
+    /// - `task` sub-agents spawned later still use the model captured at
+    ///   construction — they do NOT follow this setter (the `task` tool holds
+    ///   a config snapshot). Swap before spawning if it must apply.
+    /// - With a session enabled, the next save records the new model — a
+    ///   resumed session keeps the swap.
+    /// - Validity is the caller's: an unknown model name fails at the next
+    ///   request, honestly, like a config typo.
+    pub fn set_model(&mut self, model: &str) {
+        self.model = model.to_string();
+    }
+
+    /// Swap the reasoning-effort hint forwarded to the provider verbatim
+    /// (`None` = server default). Same next-request semantics as
+    /// [`Agent::set_model`]; as everywhere, no enum validation — vendor
+    /// ladders differ and shift across generations.
+    pub fn set_reasoning_effort(&mut self, effort: Option<&str>) {
+        self.reasoning_effort = effort.map(str::to_string);
+    }
+
+    /// Swap the per-request output budget (`max_tokens`). Clamped to ≥1: a
+    /// persistent 0 would turn every subsequent request into an instant
+    /// provider 400, and "generate nothing" is not a meaningful persistent
+    /// setting. Same next-request semantics as [`Agent::set_model`].
+    pub fn set_max_tokens(&mut self, max_tokens: u32) {
+        self.max_tokens = max_tokens.max(1);
+    }
+
+    /// Update the context-window ceiling used by the preflight compression
+    /// estimate (`limits.max_context_tokens`; 0 = fall back to the char
+    /// heuristic). The config value is static by design, but a host learns
+    /// the REAL window from its model catalog at runtime — a wrong ceiling
+    /// makes the preflight fire far too early or never (small-window models
+    /// then lean entirely on overflow recovery, which wastes a full request
+    /// before it triggers). Affects the next preflight check only; no other
+    /// limit is touched and `max_total_tokens` is unaffected.
+    pub fn set_max_context_tokens(&mut self, tokens: u64) {
+        self.limits.max_context_tokens = tokens;
+    }
+
     /// Attach the RECOVERABLE per-turn cancellation flag; checked at every
     /// turn boundary and shared with tools (via ToolCtx) so a running shell can
     /// be interrupted too, not only the streaming read.
