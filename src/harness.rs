@@ -268,6 +268,12 @@ fn event_json(ev: &AgentEvent) -> Value {
         AgentEvent::TurnStart(n) => json!({"type": "turn", "n": *n}),
         AgentEvent::TextDelta(t) => json!({"type": "text", "delta": t.clone()}),
         AgentEvent::ThinkingDelta(t) => json!({"type": "thinking", "delta": t.clone()}),
+        AgentEvent::ToolInputDelta { id, name, delta } => json!({
+            "type": "tool_input",
+            "id": id.clone(),
+            "name": name.clone(),
+            "delta": delta.clone(),
+        }),
         AgentEvent::ToolCall { name, input } => {
             json!({"type": "tool_call", "name": name.clone(), "input": input.clone()})
         }
@@ -673,6 +679,12 @@ impl<Out: Write, Err: Write> HumanRenderer<Out, Err> {
                 // from --json's structured events).
                 let _ = write!(self.err, "{t}");
                 let _ = self.err.flush();
+            }
+            AgentEvent::ToolInputDelta { .. } => {
+                // Plain headless stays quiet: the full `ToolCall` line (with
+                // the assembled input) prints moments later — pre-echoing
+                // every fragment would just duplicate it. `--json` consumers
+                // (and TUI/GUI hosts) get the fragments via event_json above.
             }
             AgentEvent::ToolCall { name, input } => {
                 let _ = writeln!(self.out, "\n[tool →] {name} {}", compact(input));
@@ -1355,6 +1367,15 @@ mod tests {
         assert_eq!(v["cache_creation_input_tokens"], 200);
         assert_eq!(v["cache_read_input_tokens"], 300);
         // Compressed → trigger stringifies for both variants.
+        let v = event_json(&AgentEvent::ToolInputDelta {
+            id: "c1".into(),
+            name: "shell".into(),
+            delta: "{\"comma".into(),
+        });
+        assert_eq!(v["type"], "tool_input");
+        assert_eq!(v["id"], "c1");
+        assert_eq!(v["name"], "shell");
+        assert_eq!(v["delta"], "{\"comma");
         let v = event_json(&AgentEvent::Compressed {
             dropped: 3,
             kept: 5,

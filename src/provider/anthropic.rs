@@ -388,8 +388,20 @@ impl Anthropic {
                             }
                         }
                         "input_json_delta" => {
-                            if let Some(Pending::ToolUse { json, .. }) = &mut pending {
-                                json.push_str(delta["partial_json"].as_str().unwrap_or_default());
+                            if let Some(Pending::ToolUse { id, name, json }) = &mut pending {
+                                let frag = delta["partial_json"].as_str().unwrap_or_default();
+                                // Display feed only (mirrors the OpenAI
+                                // provider): the assembled input lands in the
+                                // ToolUse block; this lets a UI render the
+                                // arguments as they stream in.
+                                if !frag.is_empty() {
+                                    on_event(ChatEvent::ToolInputDelta {
+                                        id: id.clone(),
+                                        name: name.clone(),
+                                        delta: frag.to_string(),
+                                    });
+                                }
+                                json.push_str(frag);
                             }
                         }
                         // Anthropic extended-thinking streaming: each delta
@@ -682,6 +694,36 @@ mod tests {
             }
             other => panic!("expected tool_use, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn stream_tool_input_deltas_carry_block_id_and_name() {
+        // partial_json fragments surface as ToolInputDelta tagged with the
+        // pending block's id+name (from content_block_start), so a UI can
+        // pair fragments across parallel same-name tool calls.
+        let raw = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"shell\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"comma\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"nd\\\":\\\"ls -la\\\"}\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n",
+        );
+        let mut events = Vec::new();
+        Anthropic::parse_stream(raw.as_bytes(), &mut |e| events.push(e)).unwrap();
+        let deltas: Vec<(String, String, String)> = events
+            .into_iter()
+            .filter_map(|e| match e {
+                ChatEvent::ToolInputDelta { id, name, delta } => Some((id, name, delta)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            deltas,
+            vec![
+                ("toolu_1".into(), "shell".into(), "{\"comma".into()),
+                ("toolu_1".into(), "shell".into(), "nd\":\"ls -la\"}".into()),
+            ]
+        );
     }
 
     #[test]

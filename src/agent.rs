@@ -75,6 +75,18 @@ pub enum AgentEvent {
     /// `{"ThinkingDelta": "..."}` so a downstream UI (TinyWorker) renders a
     /// collapsible "thinking" block. Not part of the reply text nor history.
     ThinkingDelta(String),
+    /// Incremental fragment of a tool call's input JSON while the model
+    /// streams it — serializes as `{"ToolInputDelta": {"id":…, "name":…,
+    /// "delta":…}}`. Lets a UI render "constructing call…" with progressively
+    /// assembled arguments instead of a black box until the call completes
+    /// (`id`/`name` pair fragments across parallel same-name calls). Display
+    /// feed only: the authoritative assembled input arrives in the `ToolCall`
+    /// event / `Block::ToolUse`; this never enters history.
+    ToolInputDelta {
+        id: String,
+        name: String,
+        delta: String,
+    },
     ToolCall {
         name: String,
         input: Value,
@@ -1000,6 +1012,9 @@ impl Agent {
                     self.provider.chat(&req, &mut |e| match e {
                         ChatEvent::TextDelta(t) => events(AgentEvent::TextDelta(t)),
                         ChatEvent::ThinkingDelta(t) => events(AgentEvent::ThinkingDelta(t)),
+                        ChatEvent::ToolInputDelta { id, name, delta } => {
+                            events(AgentEvent::ToolInputDelta { id, name, delta })
+                        }
                     })
                 }; // req dropped here → &self.messages borrow released
                    // Baseline AFTER normalize_adjacent, so a same-role merge that

@@ -565,6 +565,18 @@ impl OpenAi {
                     }
                     if let Some(args) = call["function"]["arguments"].as_str() {
                         entry.arguments.push_str(args);
+                        // Surface the fragment as it lands: the assembled
+                        // input only exists when the stream ends, but a UI
+                        // wants "constructing call…" rendered live. id/name
+                        // ride the same entry (a call's first delta carries
+                        // them), so parallel same-name calls stay pairable.
+                        if !args.is_empty() {
+                            on_event(ChatEvent::ToolInputDelta {
+                                id: entry.id.clone(),
+                                name: entry.name.clone(),
+                                delta: args.to_string(),
+                            });
+                        }
                     }
                 }
             }
@@ -761,6 +773,47 @@ mod tests {
             }
             other => panic!("expected tool_use, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn stream_tool_input_deltas_pair_fragments_with_call_ids() {
+        // Argument fragments must surface as ToolInputDelta as they land,
+        // carrying the call's id+name so a UI can pair fragments across
+        // parallel same-name calls. The c1 fragments arrive split across
+        // deltas that carry no id/name of their own — the accumulated entry
+        // supplies them. Empty fragments (the first delta's `arguments:""`)
+        // are filtered, not emitted.
+        let raw = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"shell\",\"arguments\":\"\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"comma\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"c2\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"nd\\\":\\\"ls\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut events = Vec::new();
+        let resp = OpenAi::parse_stream(raw.as_bytes(), &mut |e| events.push(e)).unwrap();
+        assert_eq!(resp.stop_reason, "tool_use");
+        let deltas: Vec<(String, String, String)> = events
+            .into_iter()
+            .filter_map(|e| match e {
+                ChatEvent::ToolInputDelta { id, name, delta } => Some((id, name, delta)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            deltas,
+            vec![
+                ("c1".into(), "shell".into(), "{\"comma".into()),
+                (
+                    "c2".into(),
+                    "read_file".into(),
+                    "{\"path\":\"a.txt\"}".into()
+                ),
+                ("c1".into(), "shell".into(), "nd\":\"ls\"}".into()),
+            ],
+            "fragments in arrival order, each tagged with its call id+name"
+        );
     }
 
     #[test]

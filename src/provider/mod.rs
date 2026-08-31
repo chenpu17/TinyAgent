@@ -102,6 +102,20 @@ pub enum ChatEvent {
     /// (DeepSeek V4 thinking + tool-use multi-turn is the documented exception;
     /// not handled here).
     ThinkingDelta(String),
+    /// Incremental fragment of a tool call's input JSON while the model
+    /// streams it (OpenAI `tool_calls[].function.arguments` fragments /
+    /// Anthropic `input_json_delta.partial_json`). `id` + `name` identify the
+    /// call — both are known by the time argument fragments arrive (OpenAI
+    /// sends them in the call's first delta, Anthropic in
+    /// `content_block_start`), so a UI can pair fragments across parallel
+    /// calls that share a tool name. Like [`ChatEvent::ThinkingDelta`] this is
+    /// display feed only: the authoritative assembled input arrives later in
+    /// the `ToolUse` block / `ToolCall` agent event and never overlaps history.
+    ToolInputDelta {
+        id: String,
+        name: String,
+        delta: String,
+    },
 }
 
 /// Token usage for one chat. Best-effort: None when the server didn't report

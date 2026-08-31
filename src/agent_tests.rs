@@ -2521,6 +2521,75 @@ fn compact_clears_a_stale_cancel_flag() {
 }
 
 #[test]
+fn tool_input_deltas_forward_live_and_stay_out_of_history() {
+    // Streaming argument fragments surface as AgentEvent::ToolInputDelta
+    // BEFORE the assembled ToolCall event, tagged with the call's id+name —
+    // and are display feed only: the history carries the assembled ToolUse
+    // input, never the fragment stream.
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, _) = MockProvider::new(vec![
+        MockTurn::OkToolStream {
+            id: "c1".into(),
+            name: "shell".into(),
+            frags: vec!["{\"comma".into(), "nd\":\"ls\"}".into()],
+        },
+        mock::resp_text("done", None),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("hi")],
+        test_ctx(),
+    );
+    let mut events = Vec::new();
+    let o = agent.run(&mut |e| events.push(e)).unwrap();
+    assert_eq!(o.stop_reason, "end_turn");
+    let deltas: Vec<(String, String, String)> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolInputDelta { id, name, delta } => {
+                Some((id.clone(), name.clone(), delta.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        deltas,
+        vec![
+            ("c1".into(), "shell".into(), "{\"comma".into()),
+            ("c1".into(), "shell".into(), "nd\":\"ls\"}".into()),
+        ]
+    );
+    // Fragment events precede the assembled ToolCall…
+    let first_delta = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::ToolInputDelta { .. }))
+        .unwrap();
+    let tool_call = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::ToolCall { name, .. } if name == "shell"))
+        .unwrap();
+    assert!(
+        first_delta < tool_call,
+        "deltas stream before the call completes"
+    );
+    // …whose input is the joined, parsed object.
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::ToolCall { input, .. } if input["command"] == "ls"
+    )));
+    // History purity: the assistant turn holds the assembled ToolUse; no
+    // fragment text appears as a standalone block anywhere.
+    let assistant = &agent.messages[1];
+    assert!(matches!(
+        assistant.content.as_slice(),
+        [Block::ToolUse { id, name, input }]
+            if *id == "c1" && *name == "shell" && input["command"] == "ls"
+    ));
+}
+
+#[test]
 fn compress_preserves_tool_use_tool_result_pairing_in_tail() {
     // Integration-level companion to `safe_cut_skips_tool_pairs` (which
     // only unit-tests find_safe_cut's cut SELECTION). This runs a REAL

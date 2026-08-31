@@ -14,6 +14,16 @@ use std::sync::{Arc, Mutex};
 /// injected error (consumed in FIFO order).
 pub enum MockTurn {
     Ok(ChatResponse),
+    /// A tool-call turn assembled from streamed argument fragments: each
+    /// fragment fires a `ChatEvent::ToolInputDelta` before the response
+    /// returns, exercising the streaming-input path the same way the real
+    /// providers do with `arguments` / `input_json_delta` fragments (the
+    /// joined fragments become the ToolUse input, parsed or `{"_raw": …}`).
+    OkToolStream {
+        id: String,
+        name: String,
+        frags: Vec<String>,
+    },
     Err(String),
 }
 
@@ -179,6 +189,25 @@ impl Provider for MockProvider {
                     }
                 }
                 Ok(resp)
+            }
+            MockTurn::OkToolStream { id, name, frags } => {
+                for f in &frags {
+                    if !f.is_empty() {
+                        on_event(ChatEvent::ToolInputDelta {
+                            id: id.clone(),
+                            name: name.clone(),
+                            delta: f.clone(),
+                        });
+                    }
+                }
+                let joined: String = frags.concat();
+                let input = serde_json::from_str(&joined)
+                    .unwrap_or_else(|_| serde_json::json!({"_raw": joined}));
+                Ok(ChatResponse {
+                    blocks: vec![Block::ToolUse { id, name, input }],
+                    stop_reason: "tool_use".into(),
+                    usage: None,
+                })
             }
             MockTurn::Err(msg) => Err(anyhow!(msg)),
         }
