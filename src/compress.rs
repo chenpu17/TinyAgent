@@ -119,7 +119,18 @@ fn pages_tree_count(hay: &[u8]) -> usize {
             // (`<< /Count 3 /Type /Pages … >>`); 64 bytes can't reach past the
             // previous object's `/Count` in any realistic layout.
             let lo = node.saturating_sub(64);
-            let hi = (node + 512).min(hay.len());
+            // Forward: bound the window by the SAME object — a dict's /Count
+            // sits inside the object declaring /Type /Pages, so cut at its
+            // `endobj` (64 KiB sanity cap if malformed input has none). That
+            // is wide enough for any /Kids array (~7 bytes per page ref ⇒
+            // ~4 KiB at the API's 600-page cap) AND immune to outline /
+            // bookmark /Count entries, which live in DIFFERENT objects.
+            let hi = hay[node..]
+                .windows(6)
+                .position(|w| w == b"endobj")
+                .map(|p| node + p)
+                .unwrap_or((node + 64 * 1024).min(hay.len()))
+                .min(hay.len());
             if let Some(n) = count_in_window(&hay[lo..hi]) {
                 best = best.max(n);
             }
@@ -192,9 +203,11 @@ pub(crate) fn total_chars(messages: &[Message]) -> usize {
         .map(|b| match b {
             Block::Text(t) => t.len(),
             Block::Image { data, .. } => data.len() / 100, // base64 is ~33% overhead
-            // Char-floor only (same heuristic as images) for the legacy
-            // `compress_threshold_chars` gate; the page-aware token estimate
-            // lives in `estimate_tokens`.
+            // Char floor (same heuristic as images) — the legacy
+            // `compress_threshold_chars` gate's only signal for documents, and
+            // a small conservative extra on top of the page-aware estimate in
+            // `estimate_tokens` (both over-estimate, which is the safe
+            // direction for a compaction preflight).
             Block::Document { data, .. } => data.len() / 100,
             Block::ToolUse { input, .. } => input.to_string().len(),
             // A tool result may carry an image payload (e.g. load_image).

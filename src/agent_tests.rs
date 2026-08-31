@@ -3395,6 +3395,15 @@ fn pdf_page_estimate_recovers_count_when_markers_are_hidden() {
     assert_eq!(pdf_page_estimate(&b64(&fake_pdf(5, false, Some(5)))), 5);
     // Mixed: markers say 2 but the tree says 5 → trust the larger.
     assert_eq!(pdf_page_estimate(&b64(&fake_pdf(5, true, Some(5)))), 5);
+    // A large /Kids array (~7 bytes/page) pushes /Count past a small forward
+    // window — 600 page refs ≈ 4 KiB of Kids before the count shows up. The
+    // window must still find it (large documents are where the count matters).
+    let kids = (2..602)
+        .map(|i| format!("{i} 0 R"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let big = format!("%PDF-1.5\n1 0 obj << /Type /Pages /Kids [{kids}] /Count 600 >> endobj\n");
+    assert_eq!(pdf_page_estimate(&b64(big.as_bytes())), 600);
 }
 
 #[test]

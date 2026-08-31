@@ -142,6 +142,34 @@ mod tests {
     }
 
     #[test]
+    fn document_block_roundtrips_as_snake_case_tag() {
+        // A PDF document block must survive save/load and pin its wire shape:
+        // snake_case variant tag `document` with media_type/data fields (the
+        // session-file format is load-bearing across versions — a rename here
+        // would silently orphan existing sessions' documents).
+        let msgs = vec![Message::user(vec![
+            Block::Document {
+                media_type: "application/pdf".into(),
+                data: "JVBERi0=".into(),
+            },
+            Block::Text("summarize".into()),
+        ])];
+        let json = serde_json::to_string(&msgs).unwrap();
+        assert!(
+            json.contains(r#""document":{"media_type":"application/pdf","data":"JVBERi0="}"#),
+            "wire shape pinned: {json}"
+        );
+        let back: Vec<Message> = serde_json::from_str(&json).unwrap();
+        match &back[0].content[0] {
+            Block::Document { media_type, data } => {
+                assert_eq!(media_type, "application/pdf");
+                assert_eq!(data, "JVBERi0=");
+            }
+            other => panic!("expected Document, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn save_load_roundtrip() {
         let dir = std::env::temp_dir().join(format!("ta-session-{}", std::process::id()));
         let path = dir.join("s.json");
