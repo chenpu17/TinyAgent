@@ -2590,6 +2590,106 @@ fn tool_input_deltas_forward_live_and_stay_out_of_history() {
 }
 
 #[test]
+fn message_ids_minted_on_ingest_and_unique() {
+    // Ingest-point assignment: construction/ingest (try_new), the run loop's
+    // assistant turn, and push_user each mint a unique id. A follow-up that
+    // MERGES into a trailing user turn keeps that turn's id (no new message
+    // entered the history).
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, _) = MockProvider::new(vec![mock::resp_text("ok", None)]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("hi")],
+        test_ctx(),
+    );
+    assert_eq!(agent.messages[0].id.as_deref(), Some("m1"));
+    let _ = agent.run(&mut |_| {}).unwrap();
+    let assistant_id = agent.messages[1].id.clone();
+    assert!(assistant_id.is_some(), "assistant turn minted an id");
+    assert_ne!(assistant_id.as_deref(), Some("m1"));
+    // Follow-up after an assistant turn → a new user message, new id.
+    let _ = agent.push_user(vec![Block::Text("more".into())]);
+    let followup_id = agent.messages[2].id.clone();
+    assert!(followup_id.is_some());
+    assert_ne!(followup_id, assistant_id);
+    // All ids pairwise distinct.
+    let ids: Vec<&str> = agent
+        .messages
+        .iter()
+        .map(|m| m.id.as_deref().unwrap())
+        .collect();
+    let mut uniq = ids.clone();
+    uniq.sort_unstable();
+    uniq.dedup();
+    assert_eq!(ids.len(), uniq.len(), "no id repeats");
+    // Merge case: pushing while the history ends in user keeps the id.
+    let before = agent.messages.last().unwrap().id.clone();
+    let _ = agent.push_user(vec![Block::Text("again".into())]);
+    assert_eq!(agent.messages.last().unwrap().id, before);
+    assert_eq!(agent.messages.len(), 3, "merged, not appended");
+}
+
+#[test]
+fn resumed_message_ids_preserved_and_not_reissued() {
+    // A history carrying ids (resumed save / host-supplied) keeps them
+    // verbatim, and fresh mints skip past them — a process restart must
+    // never re-issue an id the saved lineage already uses.
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, _) = MockProvider::new(vec![]);
+    let mut resumed = Message::assistant(vec![Block::Text("a1".into())]);
+    resumed.id = Some("m9".into());
+    let mut opener = user_text("task");
+    opener.id = Some("m5".into());
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![opener, resumed],
+        test_ctx(),
+    );
+    assert_eq!(agent.messages[0].id.as_deref(), Some("m5"));
+    assert_eq!(agent.messages[1].id.as_deref(), Some("m9"));
+    let _ = agent.push_user(vec![Block::Text("follow-up".into())]);
+    let minted = agent.messages[2].id.clone().expect("new message minted");
+    assert_ne!(minted.as_str(), "m5");
+    assert_ne!(minted.as_str(), "m9");
+}
+
+#[test]
+fn compression_keeps_tail_ids_and_mints_new_entries() {
+    // Folding the middle never renumbers the survivors: the kept head keeps
+    // its id, the tail messages keep theirs verbatim (anchors don't drift),
+    // and the fold's fresh entries (summary carrier / fresh head) get mints
+    // so the post-compress history is fully anchored.
+    let mut cfg = cfg_with(5, 0, 0);
+    cfg.limits.keep_recent_messages = 2;
+    let initial = vec![
+        user_text("task"),
+        Message::assistant(vec![Block::Text("a1".into())]),
+        user_text("u1"),
+        Message::assistant(vec![Block::Text("a2".into())]),
+        user_text("u2"),
+    ];
+    let (prov, _) = MockProvider::new(vec![mock::resp_text("SUMMARY", None)]);
+    let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+    let ids_before: Vec<Option<String>> = agent.messages.iter().map(|m| m.id.clone()).collect();
+    let outcome = agent.compact(&mut |_| {}).unwrap().expect("folds");
+    assert_eq!(outcome.kept, 3);
+    assert_eq!(agent.messages.len(), 3);
+    // Head survives with its id; the tail (messages[3..] → folded [1..])
+    // keeps ids verbatim; everything is anchored.
+    assert_eq!(agent.messages[0].id, ids_before[0]);
+    assert_eq!(agent.messages[1].id, ids_before[3]);
+    assert_eq!(agent.messages[2].id, ids_before[4]);
+    assert!(
+        agent.messages.iter().all(|m| m.id.is_some()),
+        "post-compress history fully anchored"
+    );
+}
+
+#[test]
 fn compress_preserves_tool_use_tool_result_pairing_in_tail() {
     // Integration-level companion to `safe_cut_skips_tool_pairs` (which
     // only unit-tests find_safe_cut's cut SELECTION). This runs a REAL

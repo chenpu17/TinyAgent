@@ -59,6 +59,18 @@ pub enum Role {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
+    /// Stable identity for host-side anchoring (a GUI's sidecar assets —
+    /// image cards, pages, file links — keyed per message). Assigned by the
+    /// agent when a message ENTERS its history (construction, `push_user`,
+    /// the run loop, the compression fold) and preserved verbatim across
+    /// save/load — folding the middle out never renumbers the survivors, so
+    /// index-based anchors don't drift. `None` on a message the agent hasn't
+    /// ingested; hosts may supply their own id instead (uniqueness among
+    /// host-supplied ids is the host's contract — the agent only guarantees
+    /// the ones it mints don't collide). Serialized only when present, so
+    /// pre-id session files stay valid and round-trip byte-identically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub role: Role,
     pub content: Vec<Block>,
 }
@@ -66,6 +78,7 @@ pub struct Message {
 impl Message {
     pub fn user(blocks: Vec<Block>) -> Self {
         Self {
+            id: None,
             role: Role::User,
             content: blocks,
         }
@@ -73,6 +86,7 @@ impl Message {
 
     pub fn assistant(blocks: Vec<Block>) -> Self {
         Self {
+            id: None,
             role: Role::Assistant,
             content: blocks,
         }

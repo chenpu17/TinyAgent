@@ -402,6 +402,12 @@ pub struct Agent {
     /// One compression failure disables further attempts for this run,
     /// so a persistent error doesn't retry (and warn) every single turn.
     compress_failed: bool,
+    /// Monotonic source for agent-minted message ids (`m<n>`). Survives
+    /// `clear_messages` on purpose — ids must never repeat within a session
+    /// lineage, even after the transcript is dropped. Seeded past any ids in
+    /// the initial history (see `fresh_message_id`) so a resumed process
+    /// can't re-issue an id the saved history already uses.
+    next_msg_id: u64,
     /// Running token totals for the current run (reset at run_impl entry).
     /// Kept on self — not a local — so `run_error` can snapshot the partial
     /// cost into the returned `RunError` when a run fails mid-way, letting a
@@ -493,12 +499,18 @@ impl Agent {
         } else {
             cfg.system_prompt.clone()
         };
+        // Ingest point for the initial history: id-less messages (a fresh
+        // task, an old-format session file) get agent-minted ids here; ones
+        // that already carry an id (resumed save, host-supplied) keep it.
+        let mut messages = initial;
+        let mut next_msg_id = 0u64;
+        assign_missing_ids(&mut messages, &mut next_msg_id);
         Ok(Self {
             provider,
             provider_label: cfg.provider.as_str().to_string(),
             tools,
             tool_defs,
-            messages: initial,
+            messages,
             system,
             model: cfg.model.clone(),
             max_tokens: cfg.max_tokens,
@@ -509,6 +521,7 @@ impl Agent {
             cancel: None,
             shutdown: None,
             compress_failed: false,
+            next_msg_id,
             usage: Usage::default(),
             tool_schema_chars,
         })
@@ -798,7 +811,14 @@ impl Agent {
     /// if the session file couldn't be persisted.
     #[cfg_attr(not(feature = "tui"), allow(dead_code))]
     pub fn push_user(&mut self, blocks: Vec<Block>) -> Option<String> {
+        let before = self.messages.len();
         append_user_turn(&mut self.messages, blocks);
+        // A NEW user message entered the history (vs. blocks merged into a
+        // trailing user turn, which keeps that turn's id): mint its anchor id.
+        if self.messages.len() > before && self.messages.last().unwrap().id.is_none() {
+            let id = fresh_message_id(&self.messages, &mut self.next_msg_id);
+            self.messages.last_mut().unwrap().id = Some(id);
+        }
         self.save_session()
     }
 
@@ -1132,7 +1152,12 @@ impl Agent {
             // `tool_uses` tuples collected below, and the tool_results
             // built from them all see one consistent id set.
             normalize_tool_use_ids(&mut resp.blocks);
-            self.messages.push(Message::assistant(resp.blocks.clone()));
+            // Anchor id minted before the push (minting needs `&self.messages`
+            // for the collision scan — impossible while the push borrows).
+            let assistant_id = fresh_message_id(&self.messages, &mut self.next_msg_id);
+            let mut assistant = Message::assistant(resp.blocks.clone());
+            assistant.id = Some(assistant_id);
+            self.messages.push(assistant);
             if let Some(w) = self.save_session() {
                 events(AgentEvent::Warning(w));
             }
@@ -1577,6 +1602,40 @@ fn append_user_turn(messages: &mut Vec<Message>, blocks: Vec<Block>) {
         messages.push(Message::user(blocks));
     }
 }
+
+/// Mint a message id that isn't already used in `messages`. The counter alone
+/// would suffice for a fresh agent, but a RESUMED history carries ids minted
+/// by an earlier process whose counter started over — scan for collisions and
+/// bump past them (host-supplied custom ids are respected too; uniqueness
+/// among THOSE is the host's contract). O(n) per mint, only on ingest of new
+/// messages — negligible against the requests it brackets.
+fn fresh_message_id(messages: &[Message], next: &mut u64) -> String {
+    loop {
+        // saturating per the numeric-writer convention; u64::MAX messages in
+        // one history is not a real scenario (and re-issuing the max id then
+        // is the least of the problems).
+        *next = next.saturating_add(1);
+        let id = format!("m{}", *next);
+        if !messages
+            .iter()
+            .any(|m| m.id.as_deref() == Some(id.as_str()))
+        {
+            return id;
+        }
+    }
+}
+
+/// Assign ids to every id-less message (ingest point for constructed /
+/// resumed histories). Messages that already carry one — from a previous
+/// save, or supplied by the host — keep it untouched.
+fn assign_missing_ids(messages: &mut [Message], next: &mut u64) {
+    for i in 0..messages.len() {
+        if messages[i].id.is_none() {
+            let id = fresh_message_id(messages, next);
+            messages[i].id = Some(id);
+        }
+    }
+}
 impl Agent {
     /// Host-initiated history compression — the idle-time entry point the
     /// preflight/overflow paths don't offer. A GUI whose context gauge says
@@ -1731,6 +1790,11 @@ impl Agent {
 
         let dropped = cut - 1;
         self.messages = compress::fold_summary(&self.messages, cut, &summary);
+        // The fold constructs fresh messages (the summary carrier, and a fresh
+        // user head when the history opens on an assistant) with no id; kept
+        // head/tail messages carry theirs through the clone. Mint for the
+        // new entries so the post-compress history stays fully anchored.
+        assign_missing_ids(&mut self.messages, &mut self.next_msg_id);
         if let Some(w) = self.save_session() {
             events(AgentEvent::Warning(w));
         }

@@ -388,7 +388,9 @@ test('custom provider recovers after an error', async (t) => {
 
 test('custom provider request messages shape', async (t) => {
   // Lock down the JSON shape handed to the provider: messages is a list of
-  // {role, content: [blocks]}, a text block is the externally-tagged {text: str}.
+  // {id?, role, content: [blocks]}, a text block is the externally-tagged
+  // {text: str}. id is the agent-minted anchor (present on ingested
+  // messages; hosts read it back via messages()).
   let seen;
   const { cfgPath } = providerConfig(t);
   const a = new Agent(cfgPath, {
@@ -396,7 +398,7 @@ test('custom provider request messages shape', async (t) => {
   });
   a.pushUser('hello world');
   await a.run();
-  assert.deepStrictEqual(seen.messages[0], { role: 'user', content: [{ text: 'hello world' }] });
+  assert.deepStrictEqual(seen.messages[0], { id: 'm1', role: 'user', content: [{ text: 'hello world' }] });
 });
 
 test('custom provider passes through non-end-turn stop_reason', async (t) => {

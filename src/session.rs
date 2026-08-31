@@ -154,6 +154,31 @@ mod tests {
     }
 
     #[test]
+    fn message_ids_roundtrip_and_old_format_loads() {
+        // id is serialized when present and survives save/load verbatim
+        // (stable anchoring across restarts); an id-less message stays
+        // byte-identical (key omitted), and a PRE-id session file (no id
+        // key at all) still loads — the field defaults to None.
+        let msgs = vec![Message::user(vec![Block::Text("hi".into())])];
+        let json_idless = serde_json::to_string(&msgs).unwrap();
+        assert!(
+            !json_idless.contains("\"id\""),
+            "id-less messages serialize without the key: {json_idless}"
+        );
+        let mut with_id = Message::assistant(vec![Block::Text("a".into())]);
+        with_id.id = Some("m42".into());
+        let json = serde_json::to_string(&[with_id]).unwrap();
+        let back: Vec<Message> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back[0].id.as_deref(), Some("m42"));
+        // Pre-id format: an id-less message serializes to EXACTLY what older
+        // versions wrote (the key is omitted, not nulled), so those files
+        // still load — the field defaults to None.
+        let legacy: Vec<Message> = serde_json::from_str(&json_idless).unwrap();
+        assert_eq!(legacy[0].id, None);
+        assert_eq!(legacy[0].role, Role::User);
+    }
+
+    #[test]
     fn corrupt_session_returns_none() {
         // A truncated/garbled session must degrade to "start fresh" instead
         // of killing --resume.
