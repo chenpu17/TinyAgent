@@ -94,7 +94,7 @@ agent.set_hooks(Arc::new(Policy));
 
 **工具能力标记**：自定义 `Tool` 还可用两个默认方法向 loop 声明能力——`concurrency()` 返回 `ToolConcurrency::Parallel` 即获得与内置 `task` 同款的同 turn 多调用并行执行（承诺可重入 + 轮询 `ctx.cancel`）；`available_to_subagent()` 返回 `false` 即退出子 agent 继承。路由按能力、不按名字，第三方工具与内置工具一视同仁。
 
-**常驻会话的热更新**（GUI 宿主场景）：CLI 的 config 在构建时定格，但宿主可以让一个 `Agent` 活整个会话、按需换挡——`set_model` / `set_reasoning_effort` / `set_max_tokens` / `set_max_context_tokens` 都是**纯字段替换**，下次请求生效，MCP 连接、工具装配、历史与 session 全不动（重建 Agent 要重跑 MCP 握手，实测可达秒级）。`Agent::compact(&mut events)` 是压缩的**宿主主动入口**：轮次间调用即折叠历史（滚动摘要 + 安全切点 + 落盘 + `Compressed { trigger: "manual" }` 事件），返回 `dropped`/`kept`/摘要调用的 `usage`——这笔成本不进下一次 run 的账单（run 入口会重置总账），由宿主自行记账。这些方法的 `&mut self` 签名即顺序契约：run 持有借用，「轮次间调用」由借用检查器强制。注意 `task` 子 agent 持构造期 config 快照，不跟随换挡。
+**常驻会话的热更新**（GUI 宿主场景）：CLI 的 config 在构建时定格，但宿主可以让一个 `Agent` 活整个会话、按需换挡——`set_model` / `set_reasoning_effort` / `set_max_tokens` / `set_max_context_tokens` 都是**纯字段替换**，下次请求生效，MCP 连接、工具装配、历史与 session 全不动（重建 Agent 要重跑 MCP 握手，实测可达秒级）。MCP server 集合也可热增删：`add_mcp_server(McpServerConfig)` / `remove_mcp_server(name)` / `tool_names()`（语义见[MCP 运行时热增删](#运行时热增删库-api)节）。`Agent::compact(&mut events)` 是压缩的**宿主主动入口**：轮次间调用即折叠历史（滚动摘要 + 安全切点 + 落盘 + `Compressed { trigger: "manual" }` 事件），返回 `dropped`/`kept`/摘要调用的 `usage`——这笔成本不进下一次 run 的账单（run 入口会重置总账），由宿主自行记账。这些方法的 `&mut self` 签名即顺序契约：run 持有借用，「轮次间调用」由借用检查器强制。注意 `task` 子 agent 持构造期 config 快照，不跟随换挡。
 
 run 结束后从 [`RunOutcome`](src/agent.rs)（或 `Agent::usage()` / `messages()` / `model()` getter）读回诚实的 token 账单与历史。`AgentEvent` 派生了 `Serialize`，绑定层可直接序列化成宿主语言的 dict / object。`Message` 带**稳定 id**（`id: Option<String>`，agent 在消息进入历史时铸造、跨 save/load 不变、压缩折叠不重排存活者）——往消息上挂宿主侧资产（图片卡 / 文件链接）时锚 id 而不是下标，压缩/truncate 后锚点不漂移。
 
@@ -424,6 +424,35 @@ stdio server 可注入环境变量（`env`，叠加在宿主环境之上、同�
 | **auto**（默认） | 先按 Streamable HTTP 探测，失败自动回落旧版 SSE |
 
 不支持的边角：Streamable HTTP 的 GET 流（server-initiated 消息）。`examples/mcp_echo.py`（stdio）与 `examples/mcp_http_echo.py`（/mcp + /sse 双端点）是零依赖测试服务器，也是协议参考实现。内置工具白名单（`tools`）与 MCP 工具互不影响。
+
+### 运行时热增删（库 API）
+
+config 在启动时定格 server 集合；库宿主（GUI、长驻服务）可以在**轮次间**按需增删，不重建 Agent（重建要重跑所有幸存 server 的握手）：
+
+```rust
+use tiny_agent::{build_agent_with, McpServerConfig};
+
+// 用户刚在设置里启了一个 server：
+let added = agent.add_mcp_server(McpServerConfig {
+    name: "web".into(),
+    command: Some("duckduckgo-mcp-server".into()),
+    args: vec![],
+    url: None, transport: None, headers: Default::default(), env: Default::default(),
+})?;
+// added == ["mcp_web_search", "mcp_web_fetch_content"]，下一次请求即生效
+
+let names = agent.tool_names();          // 当前全部工具名（内置 + MCP + skill 注入）
+let removed = agent.remove_mcp_server("web")?;   // 按 CONFIG name 删，返回移除的工具数
+```
+
+语义要点：
+
+- **撞名是可恢复错误**：新 server 的消毒名与现有任何工具（或新 server 内部）冲突 → `Err`，刚 spawn 的子进程随即被杀（回滚），Agent 状态与调用前完全一致——不会部分生效。启动路径同款撞名在构建时报错。
+- **不打印**：与启动时的 `mcp: … ready` 日志不同，热增删全程无输出（宿主可能在 raw-mode TUI 下打印会花屏），成败只看返回值。
+- **`task` 子 agent 不感知**：`task` 工具持构造期 MCP 快照，热增的 server 对本 Agent 生命周期内任何时点 spawn 的子 agent 都不可见（共享该槽位留给后续版本）。移除一个仍被子 agent 快照持有的 server 时，连接活到最后一个持有者释放。
+- **remove 按配置名**：`remove_mcp_server("web")` 的参数是 `McpServerConfig.name`，不是消毒后的 `mcp_web_search` 展示名；没有该 server 的工具时返回 `Err`（拼写错误不会静默无操作）。stdio 子进程在最后一个持有者 drop 时被同步杀掉（进程组），不残留孤儿。
+- **shutdown 联动**：若已调过 `set_shutdown`（会话结束 teardown），热增的工具自动挂上同一 reaper——临近退出时增的 server 不会被遗留。
+- 同款 `&mut self` 顺序契约：run 持有借用，「轮次间调用」由借用检查器强制（见「[库 API](#库-api程序化调用)」的热更新段）。
 
 ### 第一个 TinyAgent MCP 工具
 

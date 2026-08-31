@@ -68,6 +68,9 @@ pub struct Captured {
     pub model: String,
     pub max_tokens: u32,
     pub reasoning_effort: Option<String>,
+    /// Tool names as sent on this request — pins hot add/remove actually
+    /// reaching the request side, not just the agent's getter.
+    pub tool_names: Vec<String>,
     /// The per-request timeout the agent set. Lets a test assert the
     /// reader-thread leak backstop is always present (a streaming request is
     /// never sent with `None`, which would let the sse-reader worker thread
@@ -168,6 +171,7 @@ impl Provider for MockProvider {
             model: req.model.to_string(),
             max_tokens: req.max_tokens,
             reasoning_effort: req.reasoning_effort.map(str::to_string),
+            tool_names: req.tools.iter().map(|t| t.name.clone()).collect(),
             per_request_timeout: req.per_request_timeout,
         });
 

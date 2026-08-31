@@ -232,6 +232,14 @@ pub trait Tool: Send + Sync {
     fn available_to_subagent(&self) -> bool {
         true
     }
+
+    /// The MCP server (CONFIG name, unsanitized) this tool belongs to, for
+    /// `Agent::remove_mcp_server`'s hot-remove routing. Default `None` for
+    /// every non-MCP tool — capability-marker style (like `concurrency()`):
+    /// no downcasting and no display-name prefix parsing on the agent side.
+    fn mcp_server(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// A tool backed by a closure — the zero-boilerplate way to add a custom tool,

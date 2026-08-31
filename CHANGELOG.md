@@ -77,6 +77,13 @@
 
 ### Added
 
+- **MCP 运行时热增删（库 API）**：`Agent::add_mcp_server(McpServerConfig)` /
+  `remove_mcp_server(name)` / `tool_names()`——GUI 宿主轮次间增删 MCP server，不重建
+  Agent（重建要重跑所有幸存 server 的握手）。撞名是可恢复错误且带回滚（刚 spawn 的子进程
+  随即被杀、Agent 状态不变，绝不部分生效）；remove 按**配置名**路由（`Tool::mcp_server()`
+  能力标记，非消毒展示名），最后一个持有者 drop 时同步杀 stdio 子进程组、不残留孤儿；
+  已 `set_shutdown` 时热增的工具自动补挂同一 reaper。`task` 子 agent 持构造期快照、
+  不感知热增删（文档化边界）。热增路径无任何打印（raw-mode TUI 宿主安全）。
 - **宿主热更新 API（GUI 常驻会话）**：`set_model` / `set_reasoning_effort` / `set_max_tokens` /
   `set_max_context_tokens` 纯字段替换、下次请求生效——换模型档位不再需要重建 Agent（重跑 MCP 握手
   可达 15s），宿主可拆掉整套懒重建状态机。`task` 子 agent 持构造期 config 快照、不跟随换挡。

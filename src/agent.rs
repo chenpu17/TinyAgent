@@ -1,5 +1,5 @@
 use crate::compress;
-use crate::config::{Config, Limits};
+use crate::config::{Config, Limits, McpServerConfig};
 use crate::hooks::ToolDecision;
 use crate::provider::{Block, ChatEvent, ChatRequest, Message, Provider, Role, ToolDef, Usage};
 use crate::tools::{Tool, ToolConcurrency, ToolCtx, ToolOutput};
@@ -414,9 +414,9 @@ pub struct Agent {
     /// retry loop bill the failed attempt's burned tokens (honest cost).
     usage: Usage,
     /// Pre-serialized size of the tool definitions (name + description +
-    /// schema JSON). tool_defs never changes after construction, so
-    /// estimate_tokens would otherwise re-serialize every schema on EVERY
-    /// turn's preflight check.
+    /// schema JSON). Fixed at construction except for MCP hot add/remove,
+    /// which rebuilds it via `refresh_tool_defs` — recomputing per turn would
+    /// re-serialize every schema on EVERY turn's preflight check.
     tool_schema_chars: usize,
 }
 
@@ -641,6 +641,91 @@ impl Agent {
             t.set_shutdown(&flag);
         }
         self.shutdown = Some(flag);
+    }
+
+    // ── MCP hot add/remove (long-lived agents) ───────────────────────────────
+    //
+    // Startup fixes the MCP server set from the config; a host keeping one
+    // Agent alive for a whole session instead wants to attach a server the
+    // user just configured (and drop one they switched off) WITHOUT a full
+    // rebuild — a rebuild re-runs every surviving server's handshake. Same
+    // `&mut self` sequencing contract as the hot-update setters above: a run
+    // holds the borrow, so "call between runs" is compiler-enforced.
+
+    /// Display names of every tool currently exposed (built-in, MCP,
+    /// skill-injected, host-registered). Lets a host confirm what a hot-add
+    /// landed as, or which names a removal took away.
+    pub fn tool_names(&self) -> Vec<String> {
+        self.tool_defs.iter().map(|d| d.name.clone()).collect()
+    }
+
+    /// Attach one MCP server at runtime: spawn the child (stdio) or open the
+    /// HTTP transport, run the handshake, and add the tools to the NEXT
+    /// request. Returns the new display names (`mcp_<server>_<tool>`).
+    ///
+    /// - A name collision with any existing tool (or within the new server
+    ///   itself) is a recoverable [`anyhow::Error`]: the just-spawned child is
+    ///   killed by dropping the fresh tool set, and the agent is left exactly
+    ///   as it was. No partial add.
+    /// - This never prints (unlike startup's `mcp: … ready` line): a host can
+    ///   drive a raw-mode TUI, where a stray eprintln corrupts the screen.
+    /// - NOT propagated to `task` sub-agents: the `task` tool snapshots the
+    ///   MCP tool set at construction, so a server added here never reaches a
+    ///   child spawned at any point in this agent's lifetime (sharing that
+    ///   slot is deliberately deferred).
+    /// - If the session-end shutdown flag is already armed (see
+    ///   [`Agent::set_shutdown`]), the new tools arm it too — a server
+    ///   hot-added shortly before quit isn't orphaned.
+    pub fn add_mcp_server(&mut self, cfg: McpServerConfig) -> Result<Vec<String>> {
+        let existing = self.tool_names();
+        let fresh = crate::tools::mcp::build_one(&cfg, &existing)?;
+        let mut added = Vec::with_capacity(fresh.len());
+        for mut t in fresh {
+            if let Some(flag) = &self.shutdown {
+                t.set_shutdown(flag);
+            }
+            added.push(t.def().name.clone());
+            self.tools.push(Box::new(t));
+        }
+        self.refresh_tool_defs();
+        Ok(added)
+    }
+
+    /// Detach an MCP server by CONFIG name (the `name` field of
+    /// [`McpServerConfig`] — NOT the sanitized `mcp_<server>_<tool>` display
+    /// names). Removes every tool that server contributed; the connection's
+    /// stdio child dies when the LAST holder drops — immediately if only this
+    /// agent held it, at run end if an in-flight `task` sub-agent still holds
+    /// a snapshot clone (the armed shutdown reaper also covers it at
+    /// session end).
+    ///
+    /// Returns how many tools were removed; errors when the agent has no
+    /// tools from a server by that name (typo, or never added) so a silent
+    /// no-op can't masquerade as success.
+    pub fn remove_mcp_server(&mut self, name: &str) -> Result<usize> {
+        let before = self.tools.len();
+        self.tools.retain(|t| t.mcp_server() != Some(name));
+        let removed = before - self.tools.len();
+        if removed == 0 {
+            anyhow::bail!("no MCP server '{name}' attached to this agent");
+        }
+        self.refresh_tool_defs();
+        Ok(removed)
+    }
+
+    /// Rebuild the cached request-side tool mirror (`tool_defs` + the
+    /// schema-char estimate) after the tool list changed at runtime.
+    /// `validate_tool_names` doesn't re-run: hot-added names are structurally
+    /// valid (`sanitize_name` emits only `[A-Za-z0-9_]`, capped at 64) and
+    /// unique by construction (`build_one`'s collision gate), so the
+    /// `try_new` invariant holds.
+    fn refresh_tool_defs(&mut self) {
+        self.tool_defs = self.tools.iter().map(|t| t.def()).collect();
+        self.tool_schema_chars = self
+            .tool_defs
+            .iter()
+            .map(|t| t.name.len() + t.description.len() + t.schema.to_string().len())
+            .sum();
     }
 
     /// Install the third-party interception layer ([`crate::hooks::Hooks`]).

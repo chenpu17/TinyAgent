@@ -41,7 +41,7 @@ pub use agent::{
     extract_plan, Agent, AgentEvent, CompressOutcome, CompressTrigger, RunCost, RunError,
     RunOutcome, TodoItem, ToolCallRecord,
 };
-pub use config::{Config, Limits};
+pub use config::{Config, Limits, McpServerConfig};
 pub use hooks::{Hooks, ToolDecision};
 pub use provider::{
     Block, ChatRequest, ChatResponse, Message, Provider, Role, SimpleChatResponse, ToolDef, Usage,

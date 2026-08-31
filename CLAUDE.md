@@ -119,6 +119,22 @@ cargo clippy -p tiny-agent-node
   Warning 事件、compact 透传 Err——内部发会双报），空摘要退化路径返回 `dropped:0` + usage 不吞账。
   `CompressTrigger::{Preflight,Overflow,Manual}` 非 non_exhaustive（tui.rs 穷尽 match 是想要的编译期点名），
   加变体要同步 harness ×2 + tui ×1 的 match。
+- **MCP 运行时热增删（`Agent::add_mcp_server` / `remove_mcp_server` / `tool_names`，同属热更新面）**：
+  路由按 `Tool::mcp_server()` **能力标记**（`tools/mod.rs` trait 默认 None，`McpTool` 覆写返回**配置名**
+  ——未消毒，与展示名/wire 名三方独立；agent 侧零 downcast 零前缀解析，第三方工具同理可参与）。易错点：
+  ① **撞名 = 可恢复 Err + 回滚**：`tools::mcp::build_one` 先 spawn 后 `check_new_names`（纯函数：新旧全集
+  HashSet 撞即 bail，含新 server 内部互撞），冲突 `?` 返回时 fresh Vec 被 Drop → `StdioTransport::drop`
+  杀进程组——绝无部分生效；② **热增路径不打印**（`build_one` 与 `build()` 共用 `start_server`，但 build 的
+  `mcp: ready` eprintln 只留在启动路径——宿主可能在 raw-mode TUI 下，agent 层永不打印）；③ **增删后
+  `refresh_tool_defs`** 重建 `tool_defs` + `tool_schema_chars`（请求侧镜像与预扣估算都吃它），
+  `validate_tool_names` **不重跑**（sanitize 结构性保证字符集/长度、唯一性靠闸门——重建校验属重复防御）；
+  ④ **子 agent 不感知**（SubAgent 持构造期 `mcp_tools` 快照：热增 server 对本 agent 生命周期内任何时点
+  spawn 的子 agent 都不可见——产品决策「文档化不传播」，共享槽位留 v2）；remove 一个仍被子 agent 快照
+  持有的 server 时连接活到最后持有者 drop（armed reaper 会话末兜底杀 child）；⑤ add 时若已
+  `set_shutdown` 则新工具补挂同一 flag（临近退出热增不遗留孤儿）。**活的握手/调用/冲突回滚/进程回收链路**
+  只在 `agent_tests.rs::hot_add_remove_mcp_server_live`（`#[ignore]`，本地 python3 起
+  `examples/mcp_echo.py`，`cargo test hot_add_remove -- --ignored --nocapture`；末尾 pgrep 断言 child
+  零残留）；hermetic 用例只钉路由/错误形状/无变异三件事。
 - **子 agent（`task` 工具，`tools/subagent.rs`）**：主 agent 把聚焦子任务交给一个全新子 agent
   （独立历史 + 独立 turn 预算，`SUBAGENT_MAX_TURNS=25` 封顶），只把最终摘要作 tool 结果返回。
   **同 turn 多个 `task` 调用并行**：`agent.rs` 的工具执行分两遍——叶子工具（shell/read_file/…）

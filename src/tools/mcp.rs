@@ -17,6 +17,10 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone)]
 pub struct McpTool {
     client: Arc<Mutex<McpClient>>,
+    /// The owning server's CONFIG name (unsanitized) — what
+    /// `Agent::remove_mcp_server` routes by. Distinct from the sanitized
+    /// display name in `def` and from the wire name.
+    server: String,
     wire_name: String,
     def: ToolDef,
 }
@@ -31,6 +35,13 @@ const MAX_MCP_IMAGE_B64: usize = 14 * 1024 * 1024;
 impl Tool for McpTool {
     fn def(&self) -> ToolDef {
         self.def.clone()
+    }
+
+    /// The CONFIG name of the owning MCP server — what
+    /// `Agent::remove_mcp_server(name)` routes by. `None` for every non-MCP
+    /// tool (the trait default), so the agent never parses display names.
+    fn mcp_server(&self) -> Option<&str> {
+        Some(&self.server)
     }
 
     fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
@@ -116,6 +127,37 @@ impl Tool for McpTool {
     }
 }
 
+/// Start one MCP server and wrap its enumerated tools. Shared by `build`
+/// (startup) and `build_one` (hot-add); returns concrete tools holding one
+/// shared `Arc`'d client for the whole server.
+fn start_server(cfg: &McpServerConfig) -> Result<Vec<McpTool>> {
+    let (client, infos) = McpClient::start(cfg)?;
+    let client = Arc::new(Mutex::new(client));
+    let mut out = Vec::with_capacity(infos.len());
+    for info in infos {
+        let display = sanitize_name(&cfg.name, &info.name);
+        out.push(McpTool {
+            client: client.clone(),
+            // Config name, unsanitized — remove_mcp_server routes by it.
+            server: cfg.name.clone(),
+            def: ToolDef {
+                name: display,
+                description: info.description,
+                schema: if info.input_schema.is_null() {
+                    json!({"type": "object", "properties": {}})
+                } else {
+                    info.input_schema
+                },
+            },
+            // The MCP *wire* name is the original, unsanitized tool name —
+            // tools/call must dispatch with the name the server knows.
+            // Only the name shown to the model is sanitized.
+            wire_name: info.name,
+        });
+    }
+    Ok(out)
+}
+
 /// Start every configured MCP server and collect their tools.
 /// A server that fails the handshake aborts startup with a clear error.
 ///
@@ -127,29 +169,10 @@ pub(crate) fn build(servers: &[McpServerConfig]) -> Result<Vec<McpTool>> {
     let mut out: Vec<McpTool> = Vec::new();
     let mut display_names: Vec<String> = Vec::new();
     for cfg in servers {
-        let (client, infos) = McpClient::start(cfg)?;
-        let n = infos.len();
-        let client = Arc::new(Mutex::new(client));
-        for info in infos {
-            let display = sanitize_name(&cfg.name, &info.name);
-            display_names.push(display.clone());
-            out.push(McpTool {
-                client: client.clone(),
-                def: ToolDef {
-                    name: display,
-                    description: info.description,
-                    schema: if info.input_schema.is_null() {
-                        json!({"type": "object", "properties": {}})
-                    } else {
-                        info.input_schema
-                    },
-                },
-                // The MCP *wire* name is the original, unsanitized tool name —
-                // tools/call must dispatch with the name the server knows.
-                // Only the name shown to the model is sanitized.
-                wire_name: info.name,
-            });
-        }
+        let tools = start_server(cfg)?;
+        let n = tools.len();
+        display_names.extend(tools.iter().map(|t| t.def.name.clone()));
+        out.extend(tools);
         eprintln!("mcp: server '{}' ready ({} tools)", cfg.name, n);
     }
     // Cross-server collisions after sanitization are the real risk — e.g.
@@ -157,6 +180,20 @@ pub(crate) fn build(servers: &[McpServerConfig]) -> Result<Vec<McpTool>> {
     // `mcp_a_b_c`. Surface it at startup rather than silently shadowing a tool.
     dedup_check(&display_names)?;
     Ok(out)
+}
+
+/// Start ONE MCP server for `Agent::add_mcp_server` (hot-add). Unlike `build`
+/// this never prints — the agent layer can sit behind a raw-mode TUI, where an
+/// eprintln corrupts the screen. `existing` holds every display name the agent
+/// already exposes (built-in, MCP, skill-injected, host-registered); a
+/// collision is a recoverable `Err`, and the `?` on that path drops the fresh
+/// tool set, killing the just-spawned child via the Drop chain — a failed
+/// hot-add leaves no orphan server process.
+pub(crate) fn build_one(cfg: &McpServerConfig, existing: &[String]) -> Result<Vec<McpTool>> {
+    let tools = start_server(cfg)?;
+    let names: Vec<String> = tools.iter().map(|t| t.def.name.clone()).collect();
+    check_new_names(&names, existing)?;
+    Ok(tools)
 }
 
 /// Build the agent-facing tool name `mcp_<server>_<tool>`, sanitized so the
@@ -225,9 +262,28 @@ fn dedup_check(names: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Hot-add collision gate: the new server's display names must not collide
+/// with each other OR with any name the agent already exposes. Pure, so the
+/// collision logic is testable without a live server. (The charset/length
+/// halves of `validate_tool_names` are structurally guaranteed here —
+/// `sanitize_name` emits only `[A-Za-z0-9_]` capped at 64.)
+fn check_new_names(new: &[String], existing: &[String]) -> Result<()> {
+    let mut seen: HashSet<&str> = existing.iter().map(|s| s.as_str()).collect();
+    for n in new {
+        if !seen.insert(n.as_str()) {
+            bail!(
+                "MCP tool name collision after sanitization: '{n}' — the new \
+                 server's tool maps to an identifier the agent already exposes; \
+                 use more distinct server/tool names"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{build, dedup_check, sanitize_name, McpServerConfig};
+    use super::{build, check_new_names, dedup_check, sanitize_name, McpServerConfig};
     use crate::tools::{Tool as _, ToolCtx};
     use serde_json::json;
 
@@ -281,6 +337,33 @@ mod tests {
         let r = dedup_check(&["mcp_a_b".into(), "mcp_a_b".into()]);
         assert!(r.is_err());
         assert!(format!("{}", r.unwrap_err()).contains("collision"));
+    }
+
+    #[test]
+    fn check_new_names_passes_when_disjoint() {
+        let existing = vec!["mcp_fs_read".to_string(), "shell".to_string()];
+        let new = vec!["mcp_db_query".to_string(), "mcp_db_exec".to_string()];
+        assert!(check_new_names(&new, &existing).is_ok());
+    }
+
+    #[test]
+    fn check_new_names_rejects_collision_with_existing() {
+        let existing = vec!["mcp_a_b_c".to_string()];
+        // server "a" + tool "b.c" and server "a.b" + tool "c" both sanitize
+        // to mcp_a_b_c — the hot-add side must refuse, not shadow.
+        let new = vec!["mcp_a_b_c".to_string()];
+        let r = check_new_names(&new, &existing);
+        assert!(r.is_err());
+        assert!(format!("{}", r.unwrap_err()).contains("already exposes"));
+    }
+
+    #[test]
+    fn check_new_names_rejects_collision_within_batch() {
+        // Two tools of the SAME new server colliding (e.g. "b.c" and "b_c")
+        // must also fail — `existing` alone wouldn't catch it.
+        let new = vec!["mcp_a_b".to_string(), "mcp_a_b".to_string()];
+        let r = check_new_names(&new, &[]);
+        assert!(r.is_err());
     }
 
     /// 真实 MCP 端到端：起一个 keyless 的 filesystem server，枚举它的工具，

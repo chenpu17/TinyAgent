@@ -369,6 +369,29 @@ impl Tool for ShutdownTrackingTool {
     }
 }
 
+/// A tool posing as one from an MCP server — exercises the agent-side
+/// `mcp_server()` routing of `remove_mcp_server` without a live server
+/// (the live handshake path is covered by the manual e2e).
+struct FakeMcpTool {
+    server: String,
+    name: String,
+}
+impl Tool for FakeMcpTool {
+    fn def(&self) -> ToolDef {
+        ToolDef {
+            name: self.name.clone(),
+            description: "fake mcp tool".into(),
+            schema: json!({"type": "object", "properties": {}}),
+        }
+    }
+    fn run(&self, _input: &Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+        Ok(ToolOutput::text("ok"))
+    }
+    fn mcp_server(&self) -> Option<&str> {
+        Some(&self.server)
+    }
+}
+
 /// A tool that bills synthetic usage to the parent run — pins that
 /// `ToolOutput::usage` folds into the agent's totals and emits a Usage
 /// event. This is the path the `task` sub-agent relies on for honest cost.
@@ -1838,6 +1861,190 @@ fn set_max_context_tokens_switches_preflight_to_token_gate() {
             ..
         }
     )));
+}
+
+#[test]
+fn remove_mcp_server_routes_by_config_name_marker() {
+    // Hot-remove routes by the mcp_server() marker (config name), taking the
+    // whole server's tools and nothing else — the plain EchoTool (marker
+    // None by trait default) must survive. Asserted on the NEXT REQUEST's
+    // captured tool list, not just the getter, so a stale `tool_defs` mirror
+    // can't pass.
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, state) = MockProvider::new(vec![
+        mock::resp_text("ok", None),
+        mock::resp_text("ok", None),
+    ]);
+    let tools: Vec<Box<dyn Tool>> = vec![
+        Box::new(EchoTool::new("shell")),
+        Box::new(FakeMcpTool {
+            server: "db".into(),
+            name: "mcp_db_query".into(),
+        }),
+        Box::new(FakeMcpTool {
+            server: "db".into(),
+            name: "mcp_db_exec".into(),
+        }),
+        Box::new(FakeMcpTool {
+            server: "fs".into(),
+            name: "mcp_fs_read".into(),
+        }),
+    ];
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        tools,
+        vec![user_text("hi")],
+        test_ctx(),
+    );
+    let _ = agent.run(&mut |_| {}).unwrap();
+    let removed = agent.remove_mcp_server("db").unwrap();
+    assert_eq!(removed, 2);
+    let _ = agent.run(&mut |_| {}).unwrap();
+    let cap = state.captured();
+    assert_eq!(cap[0].tool_names.len(), 4, "before: all four tools sent");
+    assert_eq!(
+        cap[1].tool_names,
+        vec!["shell".to_string(), "mcp_fs_read".to_string()],
+        "after: db's tools gone from the request, fs and shell kept"
+    );
+}
+
+#[test]
+fn remove_mcp_server_unknown_name_is_err_and_keeps_tools() {
+    // A name the agent has no tools from (typo / never added) must be a loud
+    // Err, never a silent no-op the host mistakes for success.
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, _) = MockProvider::new(vec![]);
+    let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool::new("shell"))];
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        tools,
+        vec![user_text("hi")],
+        test_ctx(),
+    );
+    let before = agent.tool_names();
+    let err = agent.remove_mcp_server("ghost").unwrap_err();
+    assert!(format!("{err:#}").contains("ghost"));
+    assert_eq!(agent.tool_names(), before, "failed remove mutates nothing");
+}
+
+#[test]
+fn add_mcp_server_failed_handshake_leaves_agent_unchanged() {
+    // Hermetic add-path guard: a server that can't even spawn (nonexistent
+    // binary) is a recoverable Err with NO partial mutation — the agent's
+    // tool list before and after is identical. The successful path (spawn +
+    // handshake + tools on the next request + collision rollback) is the
+    // manual e2e against examples/mcp_echo.py.
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, _) = MockProvider::new(vec![]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(EchoTool::new("shell"))],
+        vec![user_text("hi")],
+        test_ctx(),
+    );
+    let before = agent.tool_names();
+    let bad = McpServerConfig {
+        name: "nope".into(),
+        command: Some("/nonexistent-tinyagent-test-mcp".into()),
+        args: vec![],
+        url: None,
+        transport: None,
+        headers: Default::default(),
+        env: Default::default(),
+    };
+    assert!(agent.add_mcp_server(bad).is_err());
+    assert_eq!(agent.tool_names(), before, "failed add mutates nothing");
+}
+
+/// 真实热增删端到端：起 examples/mcp_echo.py（本地 stdio MCP server，无网络），
+/// 覆盖「spawn → 握手 → 工具进下一请求 → 真实 tools/call → 冲突回滚 →
+/// 移除后 child 被同步回收」全链路——hermetic 用例只到路由与错误形状为止。
+/// `#[ignore]`：需要 python3，不进常规 CI；
+/// `cargo test hot_add_remove -- --ignored --nocapture`。
+#[test]
+#[ignore]
+fn hot_add_remove_mcp_server_live() {
+    let echo = McpServerConfig {
+        name: "e1".into(),
+        command: Some("python3".into()),
+        args: vec![format!(
+            "{}/examples/mcp_echo.py",
+            env!("CARGO_MANIFEST_DIR")
+        )],
+        url: None,
+        transport: None,
+        headers: Default::default(),
+        env: Default::default(),
+    };
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, state) = MockProvider::new(vec![
+        mock::resp_tool("c1", "mcp_e1_echo", json!({"text": "hi"}), None),
+        mock::resp_text("done", None),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("hi")],
+        test_ctx(),
+    );
+    assert!(agent.tool_names().is_empty());
+
+    // Hot-add: handshake runs inside the call; the tool lands on the agent.
+    let added = agent.add_mcp_server(echo.clone()).unwrap();
+    assert_eq!(added, vec!["mcp_e1_echo".to_string()]);
+    assert_eq!(agent.tool_names(), vec!["mcp_e1_echo".to_string()]);
+
+    // Real dispatch through the live server (not a mock): the model calls the
+    // hot-added tool and the loop's tools/call must reach the python child.
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o.final_text, "done");
+    assert_eq!(
+        state.captured()[0].tool_names,
+        vec!["mcp_e1_echo".to_string()],
+        "hot-added tool reaches the request side"
+    );
+    let echoed = agent.messages.iter().find_map(|m| {
+        m.content.iter().find_map(|b| match b {
+            Block::ToolResult { content, .. } if content.starts_with("echo: ") => {
+                Some(content.clone())
+            }
+            _ => None,
+        })
+    });
+    assert_eq!(
+        echoed.as_deref(),
+        Some("echo: hi"),
+        "the result must come from the real server"
+    );
+
+    // Collision rollback: adding the same server name again sanitizes to the
+    // same display name → Err, and the just-spawned second child is killed by
+    // dropping the fresh tool set (agent state unchanged, first server alive).
+    let before = agent.tool_names();
+    let err = agent.add_mcp_server(echo.clone()).unwrap_err();
+    assert!(format!("{err:#}").contains("collision"));
+    assert_eq!(agent.tool_names(), before);
+
+    // Hot-remove: the last holder drops → StdioTransport::drop kills the
+    // process group synchronously, so no orphan survives the call.
+    assert_eq!(agent.remove_mcp_server("e1").unwrap(), 1);
+    assert!(agent.tool_names().is_empty());
+    if let Ok(out) = std::process::Command::new("pgrep")
+        .arg("-f")
+        .arg("mcp_echo.py")
+        .output()
+    {
+        assert!(
+            !out.status.success(),
+            "no mcp_echo.py child may outlive remove_mcp_server (pgrep: {})",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    } // no pgrep on this platform → best-effort, skip the process check
 }
 
 #[test]
