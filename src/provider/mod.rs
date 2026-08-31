@@ -113,7 +113,7 @@ pub enum ChatEvent {
 /// default to 0 when the provider doesn't report caching. `input_tokens` is the
 /// *non-cached* input (the two cache fields are separate), so the honest billed
 /// input is `input_tokens + cache_creation*1.25 + cache_read*0.1`.
-#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Usage {
     /// Defaults to 0 when a custom provider omits it (`#[serde(default)]` — an
     /// unreported axis reads as "no tokens here", matching how the built-in

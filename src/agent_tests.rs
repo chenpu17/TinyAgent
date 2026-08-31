@@ -2400,6 +2400,127 @@ fn overflow_recovery_with_keep_recent_zero() {
 }
 
 #[test]
+fn compact_between_runs_folds_reports_and_does_not_bill_run_totals() {
+    // The host-facing idle entry: fold on demand (no threshold applies),
+    // report dropped/kept, fire Compressed{trigger: Manual}, and hand the
+    // summary's usage to the CALLER — self.usage resets at each run entry,
+    // so folding it there would silently vanish (and it must not leak into
+    // the next RunOutcome).
+    let mut cfg = cfg_with(5, 0, 0);
+    cfg.limits.keep_recent_messages = 2;
+    let initial = vec![
+        user_text("task"),
+        Message::assistant(vec![Block::Text("a1".into())]),
+        user_text("u1"),
+        Message::assistant(vec![Block::Text("a2".into())]),
+        user_text("u2"),
+    ];
+    let (prov, state) = MockProvider::new(vec![mock::resp_text("SUMMARY", mock::mk_usage(3, 5))]);
+    let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+    let mut events = Vec::new();
+    let outcome = agent.compact(&mut |e| events.push(e)).unwrap();
+    let o = outcome.expect("5-message history has a safe cut");
+    assert_eq!(o.dropped, 2);
+    assert_eq!(o.kept, 3);
+    assert_eq!(
+        o.usage,
+        mock::mk_usage(3, 5),
+        "summary billing returned to host"
+    );
+    assert_eq!(agent.messages.len(), 3);
+    assert_eq!(state.calls(), 1);
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::Compressed {
+            dropped: 2,
+            kept: 3,
+            trigger: CompressTrigger::Manual
+        }
+    )));
+    assert_eq!(
+        agent.usage(),
+        Usage::default(),
+        "idle compact cost must NOT fold into run totals (they reset per run)"
+    );
+}
+
+#[test]
+fn compact_returns_none_when_nothing_compressible() {
+    // Short history → no safe cut → Ok(None), and no summary request fired.
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, state) = MockProvider::new(vec![]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("hi")],
+        test_ctx(),
+    );
+    let outcome = agent.compact(&mut |_| {}).unwrap();
+    assert!(outcome.is_none());
+    assert_eq!(state.calls(), 0);
+    assert_eq!(agent.messages.len(), 1);
+}
+
+#[test]
+fn compact_failure_errors_and_a_retry_attempt_is_fresh() {
+    // Err = the summary request itself failed. The stale compress_failed it
+    // sets must NOT swallow the NEXT manual attempt — the run loop's
+    // "disable for this run" semantics would otherwise turn the host's retry
+    // button into a silent no-op.
+    let mut cfg = cfg_with(5, 0, 0);
+    cfg.limits.keep_recent_messages = 2;
+    let initial = vec![
+        user_text("task"),
+        Message::assistant(vec![Block::Text("a1".into())]),
+        user_text("u1"),
+        Message::assistant(vec![Block::Text("a2".into())]),
+        user_text("u2"),
+    ];
+    let (prov, state) = MockProvider::new(vec![
+        MockTurn::Err("mock: summary endpoint down".into()),
+        mock::resp_text("SUMMARY", None),
+    ]);
+    let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+    let err = agent.compact(&mut |_| {}).unwrap_err();
+    assert!(err.to_string().contains("summary endpoint down"), "{err:#}");
+    assert_eq!(agent.messages.len(), 5, "failed pass folds nothing");
+    assert_eq!(state.calls(), 1);
+    // Second manual attempt is fresh (stale flag cleared at entry).
+    let outcome = agent.compact(&mut |_| {}).unwrap();
+    assert!(outcome.is_some(), "retry must not be swallowed");
+    assert_eq!(agent.messages.len(), 3);
+}
+
+#[test]
+fn compact_clears_a_stale_cancel_flag() {
+    // A cancel left set by a previously-interrupted run would abort the
+    // summary request before it starts (the streaming layer consults the
+    // flag live). compact resets it at entry — same rationale as run()'s
+    // entry reset.
+    let mut cfg = cfg_with(5, 0, 0);
+    cfg.limits.keep_recent_messages = 2;
+    let initial = vec![
+        user_text("task"),
+        Message::assistant(vec![Block::Text("a1".into())]),
+        user_text("u1"),
+        Message::assistant(vec![Block::Text("a2".into())]),
+        user_text("u2"),
+    ];
+    let (prov, _) = MockProvider::new(vec![mock::resp_text("SUMMARY", None)]);
+    let flag = Arc::new(AtomicBool::new(false));
+    let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+    agent.set_cancel(flag.clone());
+    flag.store(true, Ordering::Relaxed); // stale interrupt from an earlier run
+    let outcome = agent.compact(&mut |_| {}).unwrap();
+    assert!(
+        outcome.is_some(),
+        "stale cancel must not kill the summary call"
+    );
+    assert!(!flag.load(Ordering::Relaxed), "entry reset cleared it");
+}
+
+#[test]
 fn compress_preserves_tool_use_tool_result_pairing_in_tail() {
     // Integration-level companion to `safe_cut_skips_tool_pairs` (which
     // only unit-tests find_safe_cut's cut SELECTION). This runs a REAL

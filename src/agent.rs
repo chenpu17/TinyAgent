@@ -27,12 +27,30 @@ use std::time::{Duration, Instant};
 const STREAM_BACKSTOP: Duration = Duration::from_secs(10 * 60);
 
 /// What triggered a history compression: the per-turn preflight estimate
-/// crossing the configured threshold, or overflow recovery after the
-/// provider rejected a request as too long for the context window.
+/// crossing the configured threshold, overflow recovery after the provider
+/// rejected a request as too long for the context window, or the host
+/// explicitly asking for one between runs ([`Agent::compact`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum CompressTrigger {
     Preflight,
     Overflow,
+    Manual,
+}
+
+/// What a compression pass reports to its caller. Public shape for the
+/// host-initiated [`Agent::compact`]; the run loop consumes the same struct
+/// internally (billing only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct CompressOutcome {
+    /// Middle messages folded into the summary (`cut - 1`). `0` together with
+    /// `usage: Some(_)` marks the degenerate pass: the summary call ran (and
+    /// billed) but its text was empty/unusable, so nothing was folded and
+    /// compression is disabled for the rest of the run (a `Warning` said why).
+    pub dropped: usize,
+    /// History length after the fold (`messages().len()` at the event).
+    pub kept: usize,
+    /// Usage billed by the summary call(s); `None` = provider reported none.
+    pub usage: Option<Usage>,
 }
 
 /// Events emitted during a run; frontends (headless printer / TUI) consume them.
@@ -919,14 +937,20 @@ impl Agent {
             // Preflight compression: if the history is large enough that this
             // request would blow the window, summarize first. The summary
             // request is a real billed call; fold its usage into the run totals
-            // so result.json / TUI report honest costs. compress returns
-            // Option<Option<Usage>>: outer None = no compression ran; inner
-            // None = compression ran but the provider reported no usage. We only
-            // count/emit on Some(Some): a usage-less summary contributes nothing
-            // and must not emit a noise Usage{0,0} event into the NDJSON stream
-            // / TUI status.
-            if let Some(Some(u)) = self.compress(events, deadline, /*force*/ false) {
-                self.bill_chat(events, &u);
+            // so result.json / TUI report honest costs. Err = the summary call
+            // itself failed (compress_failed is set inside): warn through the
+            // event stream — the host-facing compact propagates its Err instead,
+            // which is why compress() doesn't warn on that path itself.
+            match self.compress(events, deadline, CompressTrigger::Preflight) {
+                Ok(Some(outcome)) => {
+                    if let Some(u) = outcome.usage {
+                        self.bill_chat(events, &u);
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => events(AgentEvent::Warning(format!(
+                    "context compression failed (disabled for this run): {e:#}"
+                ))),
             }
 
             // Overflow recovery (OpenCode semantics): if the provider rejects
@@ -999,10 +1023,19 @@ impl Agent {
                             // The server proved it's too long: force one
                             // compression regardless of the size threshold, and
                             // fold its usage into the run totals (honest cost).
-                            if let Some(Some(u)) =
-                                self.compress(events, deadline, /*force*/ true)
-                            {
-                                self.bill_chat(events, &u);
+                            // Err = the summary call failed (compress_failed
+                            // set inside) — warn and fall through to the
+                            // unrecoverable-overflow error below.
+                            match self.compress(events, deadline, CompressTrigger::Overflow) {
+                                Ok(Some(outcome)) => {
+                                    if let Some(u) = outcome.usage {
+                                        self.bill_chat(events, &u);
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(e) => events(AgentEvent::Warning(format!(
+                                    "context compression failed (disabled for this run): {e:#}"
+                                ))),
                             }
                             // Only retry if compression actually shrank the
                             // history; otherwise there's nothing more we can do.
@@ -1530,31 +1563,84 @@ fn append_user_turn(messages: &mut Vec<Message>, blocks: Vec<Block>) {
     }
 }
 impl Agent {
+    /// Host-initiated history compression — the idle-time entry point the
+    /// preflight/overflow paths don't offer. A GUI whose context gauge says
+    /// 80% wants to fold NOW, not after the next request trips a threshold or
+    /// (worse) a 400. Semantics are the manual twin of the run-loop
+    /// compression: rolling summary + `find_safe_cut` + `fold_summary`, the
+    /// session file is rewritten, and a `Compressed { trigger: Manual }`
+    /// event fires through `events`. The size threshold does NOT apply — the
+    /// caller IS the decision.
+    ///
+    /// Call this BETWEEN runs: the `&mut self` signature makes a concurrent
+    /// `run` unrepresentable, so the compiler enforces the sequencing. A
+    /// stale `cancel` flag from a previously-cancelled run is cleared at
+    /// entry (same rationale as `run`'s reset — otherwise the summary request
+    /// would abort instantly on a flag nobody wanted anymore), and a stale
+    /// `compress_failed` is cleared too: a manual call is a fresh, visible
+    /// attempt, and silently no-op'ing the host's button would look broken.
+    ///
+    /// Returns:
+    /// - `Ok(Some(outcome))` — folded; `dropped == 0` is the degenerate
+    ///   empty-summary pass (billed, nothing folded, a Warning said why);
+    /// - `Ok(None)` — nothing compressible (no safe cut: history too short
+    ///   for `keep_recent_messages`);
+    /// - `Err` — the summary request failed; compression is disabled for the
+    ///   next run until it resets at `run` entry (or another `compact`).
+    ///
+    /// Cost accounting: the summary's `usage` is returned in the outcome and
+    /// deliberately NOT folded into [`Agent::usage`] — those totals reset at
+    /// every `run` entry, so folding it in would vanish at the next run. The
+    /// HOST owns this cost (persist it, display it, meter it); it will not
+    /// appear in the next `RunOutcome` or result.json.
+    pub fn compact(
+        &mut self,
+        events: &mut dyn FnMut(AgentEvent),
+    ) -> Result<Option<CompressOutcome>> {
+        // Fresh-attempt resets (see the doc). Order: clear the disable flag,
+        // then cancel — a summary chat consults the flag live.
+        self.compress_failed = false;
+        if let Some(c) = &self.cancel {
+            c.store(false, Ordering::Relaxed);
+        }
+        // No run deadline: summary_call falls back to its per-request
+        // backstop (STREAM_BACKSTOP), so a stuck summary can't hang forever.
+        self.compress(events, /* deadline: */ None, CompressTrigger::Manual)
+    }
+
     /// Compress history if it's too large, summarizing the middle via the LLM
     /// and keeping only the head (+ folded summary) and recent tail. Failures
-    /// degrade gracefully (warn and continue uncompressed).
+    /// degrade gracefully for the run loop (warn and continue uncompressed).
     ///
-    /// `force=true` skips the size threshold — used by overflow recovery, where
-    /// the provider has just PROVEN the request is too long. The preflight path
-    /// (`force=false`) gates on a token estimate against `max_context_tokens`
-    /// when set, else the legacy char heuristic.
+    /// `trigger` picks both the gate and the report: `Preflight` gates on the
+    /// size threshold (token estimate against `max_context_tokens` when set,
+    /// else the legacy char heuristic); `Overflow` and `Manual` skip it — the
+    /// provider has just PROVEN the request too long, or the host has decided
+    /// it wants the fold now regardless of size.
     ///
-    /// Returns the summary request's token usage wrapped twice:
-    /// - outer `None` — no compression ran (below threshold / out of budget /
-    ///   nothing compressible when forced);
-    /// - `Some(None)` — compression ran but the provider reported no usage
-    ///   (count nothing, emit no Usage event);
-    /// - `Some(Some(u))` — compression ran and billed `u` (count + emit).
+    /// Returns:
+    /// - `Ok(None)` — no compression ran (below threshold / out of budget /
+    ///   nothing compressible / disabled by an earlier failure);
+    /// - `Ok(Some(outcome))` — ran; `outcome.usage` is `None` when the
+    ///   provider reported no usage (count nothing, emit no Usage event).
+    ///   `dropped == 0` is the degenerate empty-summary pass (billed, nothing
+    ///   folded, compression now disabled for the run);
+    /// - `Err` — the summary request itself failed. `compress_failed` is set
+    ///   (inside), but NO Warning is emitted here: the two callers disagree
+    ///   on the failure channel — the run loop reports it as an event, the
+    ///   host-facing `compact` propagates the `Err` — so emitting it here
+    ///   would double-report on one of them.
     fn compress(
         &mut self,
         events: &mut dyn FnMut(AgentEvent),
         deadline: Option<Instant>,
-        force: bool,
-    ) -> Option<Option<Usage>> {
-        // Threshold gate. force=true (overflow recovery) skips it — the provider
-        // just proved the request is too long, so compress regardless of size.
+        trigger: CompressTrigger,
+    ) -> Result<Option<CompressOutcome>> {
+        // Threshold gate. Overflow/Manual skip it — the provider just proved
+        // the request too long, or the host asked for the fold explicitly.
         // Otherwise the trigger depends on config: a token estimate against
         // max_context_tokens when set, else the legacy char heuristic.
+        let force = !matches!(trigger, CompressTrigger::Preflight);
         if !force {
             let over = if self.limits.max_context_tokens > 0 {
                 let est = compress::estimate_tokens(
@@ -1578,10 +1664,10 @@ impl Agent {
                 threshold > 0 && compress::total_chars(&self.messages) > threshold
             };
             if self.compress_failed || !over {
-                return None;
+                return Ok(None);
             }
         } else if self.compress_failed {
-            return None;
+            return Ok(None);
         }
         // Compression is best-effort: never let the summary request eat the
         // run's remaining budget — that would leave the main request with a
@@ -1591,35 +1677,40 @@ impl Agent {
             if d.saturating_duration_since(Instant::now())
                 < compress::COMPRESS_RESERVE + Duration::from_secs(5)
             {
-                return None;
+                return Ok(None);
             }
         }
-        let cut = compress::find_safe_cut(&self.messages, self.limits.keep_recent_messages)?;
+        let cut = match compress::find_safe_cut(&self.messages, self.limits.keep_recent_messages) {
+            Some(c) => c,
+            None => return Ok(None),
+        };
 
         let (summary, sum_usage) = match self.summarize_prefix(cut, deadline) {
             Ok((s, u)) if !s.trim().is_empty() => (s, u),
             Ok((_empty, u)) => {
                 // The summary request ran (so compression "happened") even
                 // though the model returned empty/unusable text. Pass `u`
-                // through unchanged: if the provider billed usage, the caller
-                // counts/emits it; if it reported none, count nothing and emit
-                // no noise Usage{0,0} event. Either way disable compression for
-                // the rest of this run (don't retry every turn), and WARN — a
-                // silent disable here (unlike the Err arm below) would leave a
-                // growing context with no explanation for why it stops
-                // compacting. Fires once: compress_failed gates future attempts.
+                // through so the caller can bill it honestly; `dropped: 0`
+                // tells the caller nothing was folded. Either way disable
+                // compression for the rest of this run (don't retry every
+                // turn), and WARN — a silent disable here (unlike the Err arm
+                // below) would leave a growing context with no explanation
+                // for why it stops compacting. Fires once: compress_failed
+                // gates future attempts.
                 self.compress_failed = true;
                 events(AgentEvent::Warning(
                     "context compression produced an empty summary (disabled for this run)".into(),
                 ));
-                return Some(u);
+                return Ok(Some(CompressOutcome {
+                    dropped: 0,
+                    kept: self.messages.len(),
+                    usage: u,
+                }));
             }
             Err(e) => {
                 self.compress_failed = true;
-                events(AgentEvent::Warning(format!(
-                    "context compression failed (disabled for this run): {e:#}"
-                )));
-                return None;
+                // No Warning here — see the fn doc (caller-owned channel).
+                return Err(e);
             }
         };
 
@@ -1631,19 +1722,18 @@ impl Agent {
         events(AgentEvent::Compressed {
             dropped,
             kept: self.messages.len(),
-            // force=true is the overflow-recovery call (the provider rejected
-            // the request as too long); the gated call is the preflight path.
-            trigger: if force {
-                CompressTrigger::Overflow
-            } else {
-                CompressTrigger::Preflight
-            },
+            trigger,
         });
-        // The summary is a real billed request — pass its usage through so the
-        // caller can add it to the totals. If the provider didn't report usage,
-        // the inner is None and the caller counts/emits nothing (no Usage{0,0}
-        // noise event in the NDJSON stream / TUI status).
-        Some(sum_usage)
+        // The summary is a real billed request — `usage` travels in the
+        // outcome so the caller decides the ledger: the run loop folds it
+        // into its totals (bill_chat), the host-facing compact returns it
+        // for the host's own metering (self.usage resets per run, so folding
+        // it here would silently vanish at the next run entry).
+        Ok(Some(CompressOutcome {
+            dropped,
+            kept: self.messages.len(),
+            usage: sum_usage,
+        }))
     }
 
     /// Build the transcript of the prefix being summarized and the prior running

@@ -38,8 +38,8 @@ pub mod tools;
 
 // ── Facade re-exports (the library's public face) ──────────────────────────
 pub use agent::{
-    extract_plan, Agent, AgentEvent, CompressTrigger, RunCost, RunError, RunOutcome, TodoItem,
-    ToolCallRecord,
+    extract_plan, Agent, AgentEvent, CompressOutcome, CompressTrigger, RunCost, RunError,
+    RunOutcome, TodoItem, ToolCallRecord,
 };
 pub use config::{Config, Limits};
 pub use hooks::{Hooks, ToolDecision};

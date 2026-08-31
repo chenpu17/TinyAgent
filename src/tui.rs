@@ -1325,6 +1325,7 @@ fn ui_loop(
                         let how = match trigger {
                             crate::agent::CompressTrigger::Preflight => "preflight",
                             crate::agent::CompressTrigger::Overflow => "overflow",
+                            crate::agent::CompressTrigger::Manual => "manual",
                         };
                         rows.push(Row::sys_info(format!(
                             "[context compressed ({how}): dropped {dropped} messages, {kept} kept]"

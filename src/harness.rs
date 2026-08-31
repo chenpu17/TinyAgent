@@ -305,6 +305,7 @@ fn event_json(ev: &AgentEvent) -> Value {
             let how = match trigger {
                 crate::agent::CompressTrigger::Preflight => "preflight",
                 crate::agent::CompressTrigger::Overflow => "overflow",
+                crate::agent::CompressTrigger::Manual => "manual",
             };
             // Additive field: existing consumers of dropped/kept are unaffected.
             json!({"type": "compressed", "dropped": *dropped, "kept": *kept, "trigger": how})
@@ -712,6 +713,7 @@ impl<Out: Write, Err: Write> HumanRenderer<Out, Err> {
                 let how = match trigger {
                     crate::agent::CompressTrigger::Preflight => "preflight",
                     crate::agent::CompressTrigger::Overflow => "overflow",
+                    crate::agent::CompressTrigger::Manual => "manual",
                 };
                 let _ = writeln!(
                     self.out,
@@ -1368,6 +1370,12 @@ mod tests {
             trigger: CompressTrigger::Overflow,
         });
         assert_eq!(v["trigger"], "overflow");
+        let v = event_json(&AgentEvent::Compressed {
+            dropped: 1,
+            kept: 2,
+            trigger: CompressTrigger::Manual,
+        });
+        assert_eq!(v["trigger"], "manual");
         // Warning → {"type":"warning","message":..}
         let v = event_json(&AgentEvent::Warning("careful".into()));
         assert_eq!(v["type"], "warning");
