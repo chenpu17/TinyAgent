@@ -2590,6 +2590,36 @@ fn tool_input_deltas_forward_live_and_stay_out_of_history() {
 }
 
 #[test]
+fn tool_result_turn_gets_an_id() {
+    // The tool-result user turn is a NEW message entering history — it must
+    // carry an anchor id like every other entry. Found by e2e (session file
+    // had a None id at the tool_result turn); pins the fix.
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, _) = MockProvider::new(vec![
+        mock::resp_tool("c1", "echo", json!({}), None),
+        mock::resp_text("done", None),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("hi")],
+        test_ctx(),
+    );
+    let _ = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(agent.messages.len(), 4);
+    assert!(
+        agent.messages.iter().all(|m| m.id.is_some()),
+        "every history entry is anchored: {:?}",
+        agent
+            .messages
+            .iter()
+            .map(|m| m.id.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn message_ids_minted_on_ingest_and_unique() {
     // Ingest-point assignment: construction/ingest (try_new), the run loop's
     // assistant turn, and push_user each mint a unique id. A follow-up that

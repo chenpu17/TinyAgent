@@ -1463,7 +1463,12 @@ impl Agent {
                     }
                 }
             }
-            self.messages.push(Message::user(results));
+            // Anchor id minted before the push (minting scans `&self.messages`
+            // for collisions — impossible while the push borrows it).
+            let results_id = fresh_message_id(&self.messages, &mut self.next_msg_id);
+            let mut results_msg = Message::user(results);
+            results_msg.id = Some(results_id);
+            self.messages.push(results_msg);
             if let Some(w) = self.save_session() {
                 events(AgentEvent::Warning(w));
             }
