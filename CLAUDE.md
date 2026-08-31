@@ -79,6 +79,12 @@ cargo clippy -p tiny-agent-node
   顶层字段（裸顶层会被静默忽略，这是 API 头号坑），`Some("none")` → `{"type":"disabled"}`，`None` 不加字段）——**不走老 `budget_tokens`**（Opus 4.7 起传了 400）。
   `Config`/`ChatRequest`/`Agent`/`PartialConfig` 四层透传；`summary_call` 传 `None`（压缩摘要不思考）。子 agent 复用
   父 cfg 自动继承。软字段（同 `model`/`max_tokens`），允许 batch 任务片段覆盖，不在 `forbidden_batch_override`。
+  **工具参数增量（`ToolInputDelta { id, name, delta }`）与 ThinkingDelta 同款纪律**：纯展示馈送、永不进
+  `text`/`blocks`——openai 在 `arguments` 分片落地即发（空串过滤）、anthropic 在 `input_json_delta` 复用
+  pending 块的 id/name，权威装配输入在 `ToolCall` 事件 / `Block::ToolUse`。**键是 tool_use id 不是 name**
+  （同 turn 并行同名调用 name 必撞；两侧 id 都在流早期可得）。harness `--json` 吐 `{"type":"tool_input",...}`，
+  plain headless 刻意安静（完整 ToolCall 行随后来）；TUI 走 `_ => {}` 兜底。mock 的 `OkToolStream` 变体
+  驱动 loop 级测试（分片→事件→拼装）。新增流式透出项照这套纪律抄。
 - **核心 loop 在 `agent.rs`**：累计 usage、cancel 复位、上下文压缩的有状态编排（`compress`/
   `summarize_prefix`/`summary_call`，读写 Agent 字段 + 驱动 provider）在这里。压缩的**纯函数与常量**
   （`estimate_tokens`/`find_safe_cut`/`fold_summary`/`window_lines`/`chunk_lines`/`SUMMARY_*` 等）抽到
@@ -102,6 +108,17 @@ cargo clippy -p tiny-agent-node
   "budget_exceeded"`（exit 125）停；turn 边界语义同 `timeout_secs`——顶破上限的那轮照常跑完
   （工具执行、assistant 入历史），闸门只拒开下一轮，配对不破。batch task 片段只能收紧（更小值），
   0 视为"无上限"被忽略。它和 `max_turns`/`timeout` 是 loop 的三个 turn 边界停止条件。
+- **宿主热更新面（run 外的 `&mut self` 方法，GUI 常驻场景）**：`set_model` / `set_reasoning_effort` /
+  `set_max_tokens`（钳 ≥1）/ `set_max_context_tokens` 与 `compact()` 都是**纯字段操作/复用 compress 路径**，
+  `&mut self` 签名即顺序契约——run 持有借用，「轮次间调用」由借用检查器强制，无需运行期守卫。两条易错语义：
+  ① **`task` 子 agent 不跟随**（SubAgent 持构造期 cfg 快照，set_model 后 spawn 的子 agent 仍用旧模型）——文档
+  化的边界，别为传播去改 SubAgent 读父字段；② **`compact()` 的成本口径**：摘要 usage 经 `CompressOutcome`
+  返回宿主、**绝不进 `self.usage`**（run 入口重置总账，折进去会凭空消失）——与 run 内压缩走 `bill_chat` 进
+  run 账单是对偶的两条路径，改 billing 的人别合并它们。`compact` 入口清陈旧 cancel + compress_failed
+  （手动调用是新的显式尝试）；内部 `compress(events, deadline, trigger)` 的失败通道归调用方（run 循环发
+  Warning 事件、compact 透传 Err——内部发会双报），空摘要退化路径返回 `dropped:0` + usage 不吞账。
+  `CompressTrigger::{Preflight,Overflow,Manual}` 非 non_exhaustive（tui.rs 穷尽 match 是想要的编译期点名），
+  加变体要同步 harness ×2 + tui ×1 的 match。
 - **子 agent（`task` 工具，`tools/subagent.rs`）**：主 agent 把聚焦子任务交给一个全新子 agent
   （独立历史 + 独立 turn 预算，`SUBAGENT_MAX_TURNS=25` 封顶），只把最终摘要作 tool 结果返回。
   **同 turn 多个 `task` 调用并行**：`agent.rs` 的工具执行分两遍——叶子工具（shell/read_file/…）
@@ -205,6 +222,16 @@ cargo clippy -p tiny-agent-node
   检查处中断并写 result.json），二次 `process::exit(130)`。两平台同构：`CANCEL_PTR` 静态 + 计数
   （首次优雅 / 二次硬退）。**批量模式**（`batch::run`）也装它：cancel 标志由 worker 在起任务前 gate
   （在跑的跑完、未起的标记 `cancelled`、照常合并 report、exit 130）。TUI 不用它——raw 模式下 crossterm 把 Ctrl-C 当普通按键。
+- **消息稳定 id（`Message.id: Option<String>`，宿主 sidecar 锚点）**：**ingest 点分配**（不是构造时——
+  全局计数器会让 67 处测试构造的期望值断言爆掉，测试本就只断 len/role/blocks，ingest 分配零扰动）：
+  `try_new` 入口（initial/resume）、`push_user`（新消息才铸；merge 进末尾 user 沿用原 id）、run 循环
+  assistant 持久化、`compress` fold 之后（`assign_missing_ids`）。铸法 `fresh_message_id`：`m<n>` 计数器 +
+  存量碰撞扫描——resume 的历史带着前一个进程铸的 id，单纯重启计数器会重发旧号；宿主自带 id 原样保留
+  （其间唯一性是宿主契约）。`next_msg_id` 不随 `clear_messages` 重置（同血脉 id 永不重复）。serde
+  `default + skip_serializing_if`：无 id 序列化逐字节同旧格式、旧 session 文件照常加载。压缩保头/尾原
+  id（锚点不漂移）、摘要载体铸新 id。**新增"消息进历史"入口的人必须补 id 分配点**（漏了 → 宿主锚点
+  对那条消息拿 None）；绑定层零代码改动（pushUser 自动铸），Node 测试有一处 deepStrictEqual 期望带
+  `id: 'm1'`。
 - **会话持久化**由 `session.rs` 负责；`--session none`（`main::session_target` 判定字面量 `none`）
   关闭读写，与 `--resume` 互斥（直接 bail）。
 - **TUI 是可选 feature**（`ratatui` + `crossterm` + `tui-markdown` + `unicode-width`），

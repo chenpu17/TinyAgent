@@ -77,6 +77,19 @@
 
 ### Added
 
+- **宿主热更新 API（GUI 常驻会话）**：`set_model` / `set_reasoning_effort` / `set_max_tokens` /
+  `set_max_context_tokens` 纯字段替换、下次请求生效——换模型档位不再需要重建 Agent（重跑 MCP 握手
+  可达 15s），宿主可拆掉整套懒重建状态机。`task` 子 agent 持构造期 config 快照、不跟随换挡。
+- **`Agent::compact()` 手动压缩入口**：轮次间（run 外，借用检查器强制顺序）主动折叠历史，语义与
+  run 内压缩一致（滚动摘要 + 安全切点 + session 落盘），`CompressTrigger` 加 `Manual` 变体
+  （NDJSON `"trigger":"manual"`）。返回 `CompressOutcome { dropped, kept, usage }`——摘要成本
+  返回宿主记账、不进下一次 run 的账单。入口清掉陈旧 cancel 与 compress_failed。
+- **`ToolInputDelta` 工具参数流式透出**：模型边构造调用参数边发增量（`ChatEvent` / `AgentEvent` /
+  `--json` 的 `{"type":"tool_input","id","name","delta"}`，键为 tool_use id 可精确配对并行同名
+  调用），GUI 不再有参数生成期的黑盒。纯展示馈送，权威输入仍在 `ToolCall` 事件，不进历史。
+- **`Message` 稳定 id**：`Message.id: Option<String>`（agent 在消息进入历史时铸造、跨 save/load
+  不变、压缩折叠不重排存活者；无 id 序列化逐字节同旧格式）。宿主 sidecar（图片卡 / 文件链接）
+  锚 id 而非下标，压缩 / truncate 后锚点不漂移。
 - **TUI 流式增量定稿**：长回复不再"憋到回合结束一次性刷屏"——在途内容超出 live 区高度后，已完结的
   段落**提前提交进原生 scrollback**；无段落边界可切的超长单段（LLM 常见的"一整段一行"散文）按
   **显示行**行级切分，内容以行为单位连续向上滚出（Claude Code 的观感），live 区只保留正在生成的
