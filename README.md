@@ -109,6 +109,15 @@ agent.push_user(vec![doc, Block::Text("总结这份报告的要点".into())]);
 
 三条语义：① **仅 Anthropic provider**——OpenAI 兼容端点在发请求前显式报错（不会静默丢弃文档），纯 custom-provider 绑定不受影响；② 预压缩按**页数**估 token（官方口径每页 1,500–3,000、取保守上沿 3,000；页数是免解析启发式：裸扫 page 对象标记 + 页树 `/Count` 互为补充，全无可见结构时按 ~100 KiB/页兜底）——文本型 PDF 有几百页，按字节的估算会差几个数量级；③ TUI / resume 转录不渲染文档字节（与图片同款跳过），压缩摘要转录里以 `<document>` 占位。
 
+**OpenAI 兼容端点要接 PDF 附件？**（前端 / GUI 宿主）核心侧拒绝是刻意的——chat-completions 生态没有标准 PDF 内容类型（OpenAI 的文件输入在 Responses API；Kimi / GLM / Doubao 的文档理解各走自家非 OpenAI 兼容的 file API），任何"转发"都只能是某家网关的方言或静默丢内容。宿主侧四条路，按成本排：
+
+1. **UI 按 provider 门控**——宿主本就知道 `cfg.provider`，非 anthropic 不出附件按钮；拒绝错误发生在发请求前（零 token、确定性），直接透给用户也无妨。
+2. **host 侧抽文本**——PyMuPDF / pdftotext 抽成文本推入，全端点可用；丢图表 / 版面。
+3. **host 侧逐页转图**——PDF 页渲染成 PNG 推 `Block::Image`，需视觉模型；成本与 Anthropic 原生处理同量级（~1.6k token/页）。
+4. **custom provider 对接端点自家文档 API**——绑定的 `provider=` 回调收到的是整体序列化的 messages（文档块以 `{"document":{"media_type":…,"data":…}}` 原样在场），宿主自行处理，不受核心拒绝影响。
+
+另：绑定层的 `pushUser` 目前只收文本——文档块推入面透出到 Python / TS（与 hooks 同批的 backlog）是前端做 PDF 附件的前置依赖，Rust 宿主现在就可用 `push_user`。
+
 ### Python / TypeScript 绑定
 
 两个语言绑定是 workspace 成员（`bindings/python`、`bindings/node`），各自 path-依赖根库，把上面同一套能力（agent loop、自定义工具、流式事件、取消、诚实 usage）导出给宿主语言。两者都**复用 `CallbackTool`** 注入自定义工具，**不改核心代码**。

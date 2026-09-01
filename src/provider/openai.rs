@@ -219,9 +219,14 @@ fn reject_documents(messages: &[Message]) -> Result<()> {
         .flat_map(|m| &m.content)
         .any(|b| matches!(b, Block::Document { .. }));
     if has_doc {
+        // The message carries the workaround, not just the refusal — a
+        // frontend surfacing it raw (provider-gating missed the attachment)
+        // still tells the user what to do instead.
         bail!(
             "PDF document blocks are only supported by the Anthropic provider; \
-             this OpenAI-compatible endpoint cannot receive them"
+             this OpenAI-compatible endpoint cannot receive them — extract the \
+             text (or render pages as images) host-side before pushing, or \
+             gate the attachment on the provider"
         );
     }
     Ok(())
@@ -776,6 +781,12 @@ mod tests {
         let err = reject_documents(&doc()).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("Anthropic"), "message names the fix: {msg}");
+        // The message carries the workaround too — a frontend surfacing the
+        // error raw still tells the user what to do.
+        assert!(
+            msg.contains("extract the text"),
+            "message carries a workaround: {msg}"
+        );
         // Clean histories pass — text, images, tool traffic.
         let img_only = [Message::user(vec![Block::Image {
             media_type: "image/png".into(),
