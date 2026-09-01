@@ -14,9 +14,16 @@ cargo fmt --all                            # 格式化（CI 有 --check 门禁�
 ```
 
 每次改完**两个 clippy 都要跑**：TUI 代码在 `#[cfg(feature = "tui")]` 后，默认构建看不到，
-默认配置的 clippy 也看不到 TUI 代码——单跑一个会漏。**`cargo fmt --all` 同理**（CI 的 fmt
-job 对全 workspace `--check`，含双绑定 crate；存量 305 处漂移已在一个纯格式 commit 清零，
-该 commit 记在 `.git-blame-ignore-revs`，`git blame` 配 ignoreRevsFile 后可跳过）。
+默认配置的 clippy 也看不到 TUI 代码——单跑一个会漏。CI 里两个 clippy 都带 `-D warnings`，
+本地跑出任何黄字即等于红灯。**`cargo fmt --all` 同理**（CI 的 fmt job 对全 workspace
+`--check`，含双绑定 crate；存量 305 处漂移已在一个纯格式 commit 清零，该 commit 记在
+`.git-blame-ignore-revs`，`git blame` 配 ignoreRevsFile 后可跳过）。
+**测试命令必带 `--features mock` 才真正跑到 `tests/lib_api.rs`**：该文件整体门在
+`#![cfg(feature = "mock")]` 后（`provider::mock` 是 `cfg(any(test, feature = "mock"))`，
+而集成测试编译时 lib 不带 `cfg(test)`），不带 mock 的 `cargo test` 把它编成 **0 个测试
+照样全绿**——绿灯不等于 lib_api 集成测试跑过。CI 另有两道本地复现不了的 job：musl
+静态构建冒烟（每次 push 必过，"嵌入式低配 Linux"是核心交付定位）与 cargo-audit
+（RustSec 扫依赖树）——升级/新增依赖或动平台相关代码时留意这两道门。
 
 ### 语言绑定（workspace 成员 `bindings/python`、`bindings/node`）
 
