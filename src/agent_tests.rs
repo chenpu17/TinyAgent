@@ -3447,6 +3447,24 @@ fn estimate_tokens_counts_pdf_by_pages_not_bytes() {
 }
 
 #[test]
+fn pdf_page_estimate_matches_a_real_producer_pdf() {
+    // Guard against the heuristic drifting away from REAL PDF structure: the
+    // fixture is genuine `cupsfilter` output (CUPS/macOS text pipeline, 3
+    // pages — verified against PDFKit's pageCount when committed), not the
+    // synthetic `fake_pdf` used elsewhere. Synthetic fixtures pin the
+    // heuristic's LOGIC (marker exclusion, /Count recovery, fallbacks); this
+    // one pins that real producers' byte layouts still land in the scanned
+    // structures. (Measured when introduced: exact match on CUPS 3p/46p and
+    // Quartz image-PDF 1p; ObjStm-hidden page objects — Word/Acrobat output —
+    // remain covered only synthetically, no such producer ran offline.)
+    use base64::Engine;
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cups_3p.pdf");
+    let raw = std::fs::read(path).expect("committed fixture cups_3p.pdf");
+    let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
+    assert_eq!(pdf_page_estimate(&b64), 3);
+}
+
+#[test]
 fn pdf_estimate_drives_preflight_compression() {
     // A document block's page estimate must trip the same 85%-of-window
     // preflight gate a long text does: 3 pages × 3000 tokens > 85% of a
