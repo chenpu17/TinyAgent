@@ -114,7 +114,7 @@ agent.push_user(vec![doc, Block::Text("总结这份报告的要点".into())]);
 1. **UI 按 provider 门控**——宿主本就知道 `cfg.provider`，非 anthropic 不出附件按钮；拒绝错误发生在发请求前（零 token、确定性），直接透给用户也无妨。
 2. **host 侧抽文本**——PyMuPDF / pdftotext 抽成文本推入，全端点可用；丢图表 / 版面。
 3. **host 侧逐页转图**——PDF 页渲染成 PNG 推 `Block::Image`，需视觉模型；成本与 Anthropic 原生处理同量级（~1.6k token/页）。
-4. **custom provider 对接端点自家文档 API**——绑定的 `provider=` 回调收到的是整体序列化的 messages（文档块以 `{"document":{"media_type":…,"data":…}}` 原样在场），宿主自行处理，不受核心拒绝影响。
+4. **custom provider 对接端点自家文档 API**——注入自定义 Provider 后核心拒绝即不再适用（拒绝只发生在内置 `OpenAi` provider 上）。两个注入点：Rust 宿主用 `build_agent_with_provider`（复用 config 的工具 / MCP 装配、只换 provider——**provider 侧预处理的唯一公开入口**，见上文自定义 provider 段），Python / TS 绑定用 `provider=` 回调。两侧收到的 messages 都是整体序列化的（文档块以 `{"document":{"media_type":…,"data":…}}` 原样在场），宿主可自行对接端点自家的文档 API、或预转文本/图后再发。
 
 另：绑定层的 `pushUser` 目前只收文本——文档块推入面透出到 Python / TS（与 hooks 同批的 backlog）是前端做 PDF 附件的前置依赖，Rust 宿主现在就可用 `push_user`。
 

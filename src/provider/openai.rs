@@ -219,14 +219,13 @@ fn reject_documents(messages: &[Message]) -> Result<()> {
         .flat_map(|m| &m.content)
         .any(|b| matches!(b, Block::Document { .. }));
     if has_doc {
-        // The message carries the workaround, not just the refusal — a
-        // frontend surfacing it raw (provider-gating missed the attachment)
-        // still tells the user what to do instead.
+        // The message is written to be surfaced RAW to an end user (frontend
+        // provider-gating missed the attachment → the user reads this), so it
+        // says what to DO, in user terms — no host/developer jargon.
         bail!(
-            "PDF document blocks are only supported by the Anthropic provider; \
-             this OpenAI-compatible endpoint cannot receive them — extract the \
-             text (or render pages as images) host-side before pushing, or \
-             gate the attachment on the provider"
+            "this endpoint does not support PDF documents (only the Anthropic \
+             provider does): convert the document to text or images and \
+             resend, or use the Anthropic provider"
         );
     }
     Ok(())
@@ -781,11 +780,12 @@ mod tests {
         let err = reject_documents(&doc()).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("Anthropic"), "message names the fix: {msg}");
-        // The message carries the workaround too — a frontend surfacing the
-        // error raw still tells the user what to do.
+        // The message is user-actionable (frontends surface it raw): it says
+        // what to do, in user terms — pinned so a future rewording doesn't
+        // regress into developer jargon.
         assert!(
-            msg.contains("extract the text"),
-            "message carries a workaround: {msg}"
+            msg.contains("convert the document to text or images"),
+            "message carries a user-actionable fix: {msg}"
         );
         // Clean histories pass — text, images, tool traffic.
         let img_only = [Message::user(vec![Block::Image {

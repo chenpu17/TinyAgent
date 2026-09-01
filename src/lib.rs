@@ -96,7 +96,10 @@ pub fn build_agent_with(
 /// Like [`build_agent_with`], but the caller supplies the [`Provider`] directly
 /// instead of it being built from the config. The Python / TypeScript bindings
 /// use this to inject a user-supplied custom provider (host-language function
-/// wrapped in a `Provider` impl).
+/// wrapped in a `Provider` impl) — and Rust callers use it the same way: it is
+/// the public injection point for any **provider-side preprocessing** (e.g.
+/// routing PDF document blocks to an endpoint's own document API before
+/// sending), reusing the config's tool / MCP assembly unchanged.
 ///
 /// `api_key` is still required because the built-in tool whitelist may include
 /// `task` (sub-agent), whose child agents build their *own* provider from the
