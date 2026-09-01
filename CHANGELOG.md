@@ -7,6 +7,15 @@
 
 ### Fixed
 
+- **压缩摘要空正文自愈（思考网关）**：混合思考网关（deepseek / glm 系）把 reasoning_content 计入
+  max_tokens 预算，summary_call 不发 `reasoning_effort`（刻意——见下）时这类网关落默认思考档，
+  UPDATE 分支（带旧摘要的滚动更新）诱导的长推敲可整块烧光 1024 起步预算——`finish=length` 映射为
+  `stop_reason:"max_tokens"` 且正文零字，空文本落压缩退化分支（dropped=0 + Warning，TinyWorker
+  验收反馈 #7）。修法 provider 无关：首段 `max_tokens` 截断且**正文为空**视为该假设失效，预算加倍
+  （封顶 8192、不钳回轮次上限——首轮已证明 cap 级预算必死于思考）重试一次；非空正文的真截断首轮
+  即接受、重试仍截断也接受。两轮 usage 合并返回（烧掉的首轮照计费）。刻意不改成低档
+  `reasoning_effort`：Anthropic 上任何非 "none" 的 effort 是**开启** adaptive thinking（与意图相反），
+  OpenAI 兼容网关对 "low" 的解释不可预测。
 - **TUI 体验批次修正**（与下条 Added 的 TUI 批次同源）：README 键位表退出语义漂移修正
   （Esc 早已不是退出键，改为 `/quit`、`/exit` 或空闲 Ctrl-C 按两次）；TUI 取消后不再追加
   第二行 `[done: cancelled]`（Esc 已有 `[cancelling…]` 提示，Done 行是纯噪声——

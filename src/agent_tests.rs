@@ -2652,6 +2652,116 @@ fn compact_between_runs_folds_reports_and_does_not_bill_run_totals() {
 }
 
 #[test]
+fn compact_retries_when_reasoning_burns_the_whole_budget() {
+    // TinyWorker acceptance #7: hybrid-thinking gateways (deepseek / glm)
+    // bill reasoning_content against max_tokens; a long UPDATE-branch trace
+    // can consume the ENTIRE budget → finish=length (mapped "max_tokens")
+    // with ZERO body characters. That shape must retry ONCE with a doubled
+    // budget instead of degrading to dropped=0 — and the burned attempt
+    // still bills (usage merges across attempts).
+    let mut cfg = cfg_with(5, 0, 0);
+    cfg.limits.keep_recent_messages = 2;
+    let initial = vec![
+        user_text("task"),
+        Message::assistant(vec![Block::Text("a1".into())]),
+        user_text("u1"),
+        Message::assistant(vec![Block::Text("a2".into())]),
+        user_text("u2"),
+    ];
+    let (prov, state) = MockProvider::new(vec![
+        // Attempt 1: length-capped, zero body — the failure shape.
+        MockTurn::Ok(ChatResponse {
+            blocks: vec![],
+            stop_reason: "max_tokens".into(),
+            usage: mock::mk_usage(30, 1024),
+        }),
+        // Attempt 2 (doubled budget): trace + body fit, normal summary.
+        mock::resp_text("SUMMARY", mock::mk_usage(20, 200)),
+    ]);
+    let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+    let mut events = Vec::new();
+    let o = agent
+        .compact(&mut |e| events.push(e))
+        .unwrap()
+        .expect("recovers");
+    assert_eq!(state.calls(), 2, "exactly one retry");
+    assert_eq!(o.dropped, 2, "compression happened — no degradation");
+    assert_eq!(
+        o.usage,
+        mock::mk_usage(50, 1224),
+        "both attempts bill honestly (30+20 in / 1024+200 out)"
+    );
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::Compressed {
+            dropped: 2,
+            trigger: CompressTrigger::Manual,
+            ..
+        }
+    )));
+    // The retry ran with the doubled budget.
+    let caps = state.captured();
+    assert_eq!(caps[0].max_tokens, caps[1].max_tokens / 2);
+}
+
+#[test]
+fn compact_degrades_without_retry_on_empty_end_turn_summary() {
+    // The retry targets ONLY the length-capped zero-body shape: a genuinely
+    // empty reply (end_turn, no text) is the model's actual answer and still
+    // takes the degradation branch on attempt 1 — no second request.
+    let mut cfg = cfg_with(5, 0, 0);
+    cfg.limits.keep_recent_messages = 2;
+    let initial = vec![
+        user_text("task"),
+        Message::assistant(vec![Block::Text("a1".into())]),
+        user_text("u1"),
+        Message::assistant(vec![Block::Text("a2".into())]),
+        user_text("u2"),
+    ];
+    let (prov, state) = MockProvider::new(vec![MockTurn::Ok(ChatResponse {
+        blocks: vec![],
+        stop_reason: "end_turn".into(),
+        usage: mock::mk_usage(10, 5),
+    })]);
+    let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+    let mut events = Vec::new();
+    let o = agent
+        .compact(&mut |e| events.push(e))
+        .unwrap()
+        .expect("degraded outcome");
+    assert_eq!(state.calls(), 1, "no retry for end_turn empties");
+    assert_eq!(o.dropped, 0, "degradation branch");
+    assert_eq!(o.usage, mock::mk_usage(10, 5));
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::Warning(w) if w.contains("empty summary"))));
+}
+
+#[test]
+fn compact_accepts_a_truncated_but_nonempty_summary_first_try() {
+    // A length-capped reply WITH body text is "truncated but coherent" — the
+    // original acceptance still holds: no retry, fold the partial summary.
+    let mut cfg = cfg_with(5, 0, 0);
+    cfg.limits.keep_recent_messages = 2;
+    let initial = vec![
+        user_text("task"),
+        Message::assistant(vec![Block::Text("a1".into())]),
+        user_text("u1"),
+        Message::assistant(vec![Block::Text("a2".into())]),
+        user_text("u2"),
+    ];
+    let (prov, state) = MockProvider::new(vec![MockTurn::Ok(ChatResponse {
+        blocks: vec![Block::Text("partial summary…".into())],
+        stop_reason: "max_tokens".into(),
+        usage: mock::mk_usage(10, 1024),
+    })]);
+    let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+    let o = agent.compact(&mut |_| {}).unwrap().expect("folds");
+    assert_eq!(state.calls(), 1, "non-empty body accepted on attempt 1");
+    assert_eq!(o.dropped, 2);
+}
+
+#[test]
 fn compact_returns_none_when_nothing_compressible() {
     // Short history → no safe cut → Ok(None), and no summary request fired.
     let cfg = cfg_with(5, 0, 0);

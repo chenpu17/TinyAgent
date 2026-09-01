@@ -94,6 +94,17 @@ cargo clippy -p tiny-agent-node
   **`find_safe_cut` 空尾语义**：keep_recent=0 时 cut==n（空尾）是**合法**切点——真实 loop 每个请求点
   历史必 user 结尾，若钳到 n-1 扫边界必落空、该配置下压缩被静默禁用（A2 修复）；`fold_summary` 对空尾
   产出单条 user 头。守卫是 `saturating_add(2)`（usize::MAX 级 keep_recent 不 panic/回绕）。
+  **`summary_call` 空正文重试（思考网关自愈，TinyWorker 反馈 #7）**：混合思考网关（deepseek/glm）把
+  reasoning_content 计入 max_tokens，UPDATE 分支（带旧摘要）诱导的长推敲可整块烧光 1024 起步预算 →
+  `finish=length` 映射成 stop_reason `"max_tokens"` 且**正文零字**——「截断仍连贯」的接受假设在零正文时
+  为假，空文本随后落退化分支（dropped=0 + Warning）。修法是 provider 无关的两段尝试：`attempt==0 &&
+  stop_reason=="max_tokens" && text.trim().is_empty()` → 预算 `saturating_mul(2).min(8192)` 重试一次；
+  加倍值**刻意不钳回调用方的轮次上限**（首轮已证明 cap 级预算必死于思考，钳回等于重放已知必死的请求），
+  认死理的网关对加倍值报 400 则该次压缩失败（≈旧退化、多一次廉价请求）。非空正文的真截断首轮即接受、
+  重试仍截断也接受。两轮 usage 经 `merge_usage` 合并返回（诚实成本——烧掉的首轮照计费）。**配套纪律**：
+  summary_call 的 `reasoning_effort` 恒 `None` 且**不**改成低档值——Anthropic 上任何 Some(非 "none")
+  effort 是**开启** adaptive thinking（与意图相反），OpenAI 兼容网关对 "low" 的解释是掷硬币；默认开思考
+  的网关交给上面的空正文重试兜住。
   **数值写端一律 saturating**：usage 累计 / RunCost / merge_usage / trace_meta / batch 汇总的 `+=`
   全部是 `saturating_add`（读端 `Usage::total()` 本就饱和）——新增累加点照做，谎报 u64::MAX 不 panic
   （debug）也不回绕躲预算闸门（release）。

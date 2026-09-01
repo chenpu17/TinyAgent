@@ -2011,64 +2011,96 @@ impl Agent {
         deadline: Option<Instant>,
         n_calls: usize,
     ) -> Result<(String, Option<Usage>)> {
-        let req = ChatRequest {
-            system: Some(compress::SUMMARY_SYSTEM),
-            messages: &[Message::user(vec![Block::Text(prompt.to_string())])],
-            tools: &[],
-            model: &self.model,
-            max_tokens,
-            // Even share of (remaining − reserve) across all summary calls, so
-            // a multi-chunk compression can't starve the main chat that follows
-            // in the same turn.
-            per_request_timeout: Some(match deadline {
-                Some(d) => {
-                    let remaining = d
-                        .saturating_duration_since(Instant::now())
-                        .saturating_sub(compress::COMPRESS_RESERVE);
-                    // Floor at 1s: with the deadline nearly exhausted the even
-                    // share rounds to ~0, and a zero Duration is an instant
-                    // timeout — the summary would fail before the request is
-                    // even sent. Same 1s-floor convention as
-                    // clamp_child_timeout.
-                    (remaining / (n_calls as u32)).max(Duration::from_secs(1))
+        let mut max_tokens = max_tokens;
+        // Honest cost: a burned first attempt still bills, so usage merges
+        // across attempts and the caller's ledger sees every request sent.
+        let mut spent: Option<Usage> = None;
+        for attempt in 0..2 {
+            let req = ChatRequest {
+                system: Some(compress::SUMMARY_SYSTEM),
+                messages: &[Message::user(vec![Block::Text(prompt.to_string())])],
+                tools: &[],
+                model: &self.model,
+                max_tokens,
+                // Even share of (remaining − reserve) across all summary calls, so
+                // a multi-chunk compression can't starve the main chat that follows
+                // in the same turn.
+                per_request_timeout: Some(match deadline {
+                    Some(d) => {
+                        let remaining = d
+                            .saturating_duration_since(Instant::now())
+                            .saturating_sub(compress::COMPRESS_RESERVE);
+                        // Floor at 1s: with the deadline nearly exhausted the even
+                        // share rounds to ~0, and a zero Duration is an instant
+                        // timeout — the summary would fail before the request is
+                        // even sent. Same 1s-floor convention as
+                        // clamp_child_timeout.
+                        (remaining / (n_calls as u32)).max(Duration::from_secs(1))
+                    }
+                    // No run budget: the summary calls still get a per-request
+                    // cap (the reader-thread leak backstop), evenly shared.
+                    None => STREAM_BACKSTOP / (n_calls as u32),
+                }),
+                cancel: self.cancel_flag(),
+                // The summary is one-off: the next compression summarizes a
+                // different transcript, so a cache breakpoint would only ever pay
+                // the 1.25× write premium with no subsequent read. Skip caching.
+                cache: false,
+                // Summaries don't reason — drop the thinking config so a reasoning
+                // model doesn't burn a thinking trace on a compression call.
+                // (NOT a low-effort value: on Anthropic any Some(non-"none")
+                // effort ENABLES adaptive thinking — the opposite of the intent —
+                // and on unknown OpenAI-compatible gateways "low" is a coin flip.
+                // Gateways that default to thinking anyway are handled by the
+                // empty-body retry below, provider-agnostically.)
+                reasoning_effort: None,
+            };
+            let resp = self.provider.chat(&req, &mut |_| {})?;
+            spent = compress::merge_usage(spent, resp.usage);
+            // parse_loop reports cancel/idle-timeout/truncation as Ok with a
+            // non-end_turn stop_reason and PARTIAL, half-written blocks. Folding
+            // such a summary into the history would poison every later turn, so
+            // bail on those. max_tokens is DIFFERENT: the model stopped at the
+            // output budget, so the text is coherent (just incomplete) — accepting
+            // it beats disabling compression, because compress_failed also gates
+            // the overflow-recovery path (two failures for the price of one).
+            // EXCEPT the zero-body shape: hybrid-thinking gateways (deepseek /
+            // glm) bill reasoning_content against the same max_tokens, and an
+            // UPDATE-branch prompt can induce a long enough trace to consume the
+            // ENTIRE budget — finish=length with zero content characters (usage
+            // shows output == budget exactly; TinyWorker acceptance #7). "Truncated
+            // but coherent" is false for an empty body, so retry ONCE with a
+            // doubled budget, which leaves room for the same trace plus a body.
+            // A genuine long-text truncation (non-empty body) is still accepted on
+            // the first attempt; a retry that truncates again is accepted too.
+            match resp.stop_reason.as_str() {
+                "end_turn" | "max_tokens" => {}
+                other => {
+                    anyhow::bail!("summary request did not complete (stop_reason={other})")
                 }
-                // No run budget: the summary calls still get a per-request
-                // cap (the reader-thread leak backstop), evenly shared.
-                None => STREAM_BACKSTOP / (n_calls as u32),
-            }),
-            cancel: self.cancel_flag(),
-            // The summary is one-off: the next compression summarizes a
-            // different transcript, so a cache breakpoint would only ever pay
-            // the 1.25× write premium with no subsequent read. Skip caching.
-            cache: false,
-            // Summaries don't reason — drop the thinking config so a reasoning
-            // model doesn't burn a thinking trace on a compression call.
-            reasoning_effort: None,
-        };
-        let resp = self.provider.chat(&req, &mut |_| {})?;
-        // parse_loop reports cancel/idle-timeout/truncation as Ok with a
-        // non-end_turn stop_reason and PARTIAL, half-written blocks. Folding
-        // such a summary into the history would poison every later turn, so
-        // bail on those. max_tokens is DIFFERENT: the model stopped at the
-        // output budget, so the text is coherent (just incomplete) — accepting
-        // it beats disabling compression, because compress_failed also gates
-        // the overflow-recovery path (two failures for the price of one).
-        match resp.stop_reason.as_str() {
-            "end_turn" | "max_tokens" => {}
-            other => {
-                anyhow::bail!("summary request did not complete (stop_reason={other})")
             }
+            let text = resp
+                .blocks
+                .iter()
+                .filter_map(|b| match b {
+                    Block::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if attempt == 0 && resp.stop_reason == "max_tokens" && text.trim().is_empty() {
+                // Deliberately NOT clamped to the caller's turn cap: the first
+                // attempt just proved a cap-sized budget dies to reasoning, so
+                // clamping would repeat a known-doomed request. A strict gateway
+                // that 400s on the doubled value fails this call (≈ today's
+                // degradation, one cheap request later). 8192 ceiling keeps the
+                // retry under common model output caps.
+                max_tokens = max_tokens.saturating_mul(2).min(8192);
+                continue;
+            }
+            return Ok((text, spent));
         }
-        let text = resp
-            .blocks
-            .iter()
-            .filter_map(|b| match b {
-                Block::Text(t) => Some(t.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        Ok((text, resp.usage))
+        unreachable!("attempt 1 always returns");
     }
 }
 
