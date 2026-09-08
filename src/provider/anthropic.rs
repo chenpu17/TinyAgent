@@ -453,6 +453,30 @@ impl Anthropic {
                         usage.output_tokens = o;
                         saw_usage = true;
                     }
+                    // Some Anthropic-protocol gateways report input (and
+                    // cache) tokens ONLY here — message_start carries zeros
+                    // (real-journey A/B on a glm relay found input billed as
+                    // 0, breaking the honest-cost contract). Fold with max so
+                    // a real-API run that already counted them at
+                    // message_start never double-counts.
+                    if let Some(i) = ev["usage"]["input_tokens"].as_u64() {
+                        usage.input_tokens = usage.input_tokens.max(i);
+                        saw_usage = saw_usage || i > 0;
+                    }
+                    for (cur, key) in [
+                        (
+                            &mut usage.cache_creation_input_tokens,
+                            "cache_creation_input_tokens",
+                        ),
+                        (
+                            &mut usage.cache_read_input_tokens,
+                            "cache_read_input_tokens",
+                        ),
+                    ] {
+                        if let Some(v) = ev["usage"][key].as_u64() {
+                            *cur = (*cur).max(v);
+                        }
+                    }
                 }
                 "error" => {
                     // Return with stop_reason "stream_error" carrying the
@@ -521,6 +545,39 @@ mod tests {
 
     fn parse(raw: &[u8]) -> ChatResponse {
         Anthropic::parse_stream(raw, &mut |_| {}).unwrap()
+    }
+
+    /// Real-journey A/B finding: some Anthropic-protocol gateways (a glm
+    /// relay) zero message_start.usage and report input/cache tokens ONLY in
+    /// message_delta.usage — parse must fold them or every run bills input
+    /// as 0 (honest-cost contract). max-fold keeps a real-API stream (which
+    /// counts input at message_start and may repeat it in the delta) from
+    /// double-counting.
+    #[test]
+    fn usage_input_only_in_message_delta_is_counted() {
+        let raw = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"input_tokens\":14,\"output_tokens\":32,\"cache_read_input_tokens\":6}}\n\n",
+        );
+        let resp = parse(raw.as_bytes());
+        let u = resp.usage.expect("delta-only usage must surface as Some");
+        assert_eq!((u.input_tokens, u.output_tokens), (14, 32));
+        assert_eq!(u.cache_read_input_tokens, 6);
+        // No double count: message_start already billed, delta repeats it.
+        let raw2 = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1500,\"cache_read_input_tokens\":800}}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":1500,\"output_tokens\":9}}\n\n",
+        );
+        let u2 = parse(raw2.as_bytes()).usage.unwrap();
+        assert_eq!(
+            (
+                u2.input_tokens,
+                u2.cache_read_input_tokens,
+                u2.output_tokens
+            ),
+            (1500, 800, 9)
+        );
     }
 
     #[test]
