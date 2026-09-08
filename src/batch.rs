@@ -703,11 +703,15 @@ fn run_one_attempt(
     // so without arming the MCP shutdown-reaper here a stuck MCP call (blocked
     // in the 120s CALL_TIMEOUT) would orphan the server child. Deliberately
     // does NOT call set_cancel: the batch worker gate checks this flag before
-    // dispatching tasks (CLAUDE.md "批量 Ctrl-C 是 worker gate"), and passing
-    // it to set_cancel would race with agent::run()'s entry-point
-    // store(false) reset across parallel workers. shutdown is never reset, so
-    // it is safe to share (mirrors main.rs single-run, which arms shutdown on
-    // the same flag — only the cancel side is batch-specific).
+    // dispatching tasks (CLAUDE.md "批量 Ctrl-C 是 worker gate") and in-flight
+    // tasks run to completion ("convergence" semantics — their outcomes,
+    // partial or full, still land in report.json). An earlier rationale —
+    // racing agent::run()'s entry-point store(false) reset — is gone since
+    // the cancel-ownership contract change (run never clears), but sharing
+    // the flag would CHANGE behavior to mid-run interruption, so it stays
+    // unshared. shutdown is never reset, so it is safe to share (mirrors
+    // main.rs single-run, which arms shutdown on the same flag — only the
+    // cancel side is batch-specific).
     // CONTRACT (A5): arming on this flag means the FIRST Ctrl-C — which only
     // stops task DISPATCH — also fires the reaper for every in-flight agent's
     // MCP servers (immediate teardown, unlike the "finish on their own" the
@@ -748,7 +752,7 @@ fn run_one_attempt(
             "bad_task",
             format!(
                 "task file must not override '{field}' (only task/system_prompt/model/max_tokens/\
-                 limits/reasoning_effort/inject_environment are overridable in batch mode)"
+                 limits/reasoning_effort/inject_environment/code are overridable in batch mode)"
             ),
             &zero,
             0,

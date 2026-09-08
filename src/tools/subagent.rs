@@ -191,11 +191,20 @@ impl Tool for SubAgent {
 /// Resolve the task identity: non-empty (after trim) and capped at 64
 /// CHARS — `name` tags every forwarded `SubAgent { name, .. }` event, so a
 /// model-supplied sentence as the name must not flood the event stream.
+/// Names starting with `__` are refused: that prefix is reserved for
+/// internal markers (`__code__` tags guest-originated calls in hooks ctx),
+/// and a task named "code"/"__code__" must never be confusable with one.
 fn task_name(input: &Value) -> Result<String> {
     let raw = input["name"]
         .as_str()
-        .filter(|s| !s.trim().is_empty())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow::anyhow!("task requires a non-empty `name`"))?;
+    // Trim FIRST (correctness-review #6): `" __code__"` must not slip past
+    // the reserved-prefix check into a marker-shaped task name.
+    if raw.starts_with("__") {
+        anyhow::bail!("task name must not start with '__' (reserved for internal markers)");
+    }
     Ok(raw.chars().take(64).collect())
 }
 
@@ -407,7 +416,7 @@ mod tests {
     fn mock_agent_ext(
         turns: Vec<mock::MockTurn>,
         max_total_tokens: u64,
-        budget: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+        budget: Option<crate::tools::BudgetGate>,
     ) -> Agent {
         let cfg = crate::config::Config {
             provider: crate::config::ProviderKind::Anthropic,
@@ -424,6 +433,7 @@ mod tests {
             mcp_servers: vec![],
             reasoning_effort: None,
             inject_environment: false,
+            code: Default::default(),
         };
         let mut cfg = cfg;
         cfg.limits.max_total_tokens = max_total_tokens;
@@ -461,6 +471,18 @@ mod tests {
         let capped = task_name(&json!({"name": cjk})).unwrap();
         assert_eq!(capped.chars().count(), 64);
         assert!(capped.chars().all(|c| c == '汉'));
+    }
+
+    #[test]
+    fn task_name_rejects_reserved_prefix() {
+        // `__` is reserved for internal markers — a task named `__code__`
+        // (or anything `__`-prefixed) must be refused so hooks can trust the
+        // `ctx.subagent` tag as "code-sandbox origin" vs. a named task
+        // (run_code design D14 / review 低-6). Plain names stay fine.
+        assert!(task_name(&json!({"name": "__code__"})).is_err());
+        assert!(task_name(&json!({"name": "__anything"})).is_err());
+        assert_eq!(task_name(&json!({"name": "code"})).unwrap(), "code");
+        assert_eq!(task_name(&json!({"name": "scout-2"})).unwrap(), "scout-2");
     }
 
     #[test]
@@ -521,13 +543,17 @@ mod tests {
         // would have run on, each parallel child independently burning a
         // whole budget before the parent's join-time fold.
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(100));
+        let gate = crate::tools::BudgetGate {
+            used: counter.clone(),
+            cap: 150,
+        };
         let mut agent = mock_agent_ext(
             vec![
                 mock::resp_tool("t1", "noop", json!({}), mock::mk_usage(100, 0)),
                 mock::resp_text("unreached", mock::mk_usage(100, 0)),
             ],
             /* max_total_tokens */ 150,
-            Some(counter.clone()),
+            Some(gate),
         );
         let out = run_subagent(&mut agent, "scout", &mut |_| {}, usize::MAX);
         // Stopped after turn 1: the child's own bill is 100 (not 200), and the
@@ -829,7 +855,10 @@ mod tests {
             shell_timeout_secs: 77,
             hooks: Some(hooks.clone()),
             subagent: None,
-            budget: Some(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(42))),
+            budget: Some(crate::tools::BudgetGate {
+                used: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(42)),
+                cap: 100,
+            }),
             deadline: Some(deadline),
         };
         let child = child_ctx(&parent, "scout");
@@ -842,8 +871,8 @@ mod tests {
         );
         assert!(
             std::sync::Arc::ptr_eq(
-                parent.budget.as_ref().unwrap(),
-                child.budget.as_ref().unwrap()
+                &parent.budget.as_ref().unwrap().used,
+                &child.budget.as_ref().unwrap().used
             ),
             "child must SHARE the fleet budget counter (collective cap)"
         );
@@ -871,6 +900,7 @@ mod tests {
             mcp_servers: vec![],
             reasoning_effort: None,
             inject_environment: false,
+            code: Default::default(),
         }
     }
 }

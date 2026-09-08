@@ -78,7 +78,12 @@ pub enum ToolDecision {
 /// **Scope.** `on_chat_request` observes MAIN-turn requests only; the
 /// compression summary request is deliberately not surfaced (it's an internal
 /// housekeeping call, and rewriting it would need summary-consistency
-/// semantics this layer doesn't define).
+/// semantics this layer doesn't define). Likewise, `run_code`'s
+/// `tools.list()` self-introspection (code feature) bypasses the gate —
+/// listing which tools exist is not a side-effecting policy surface, while
+/// every `tools.call(...)` from the sandbox DOES gate, with
+/// `ctx.subagent == Some("__code__")` so a policy can treat code-originated
+/// calls apart from top-level and `task` ones.
 ///
 /// **Threat model.** This layer is a compile-time extension point for the
 /// embedder's own approval / policy system — NOT a built-in security
@@ -95,6 +100,14 @@ pub enum ToolDecision {
 ///   output for it and reports `executed = true` — a third flavour of
 ///   "attempted but failed" alongside tool Err results (only a `before_tool`
 ///   Deny reports `executed = false`).
+/// - One more pairing gap, from `run_code`'s own interception layer (code
+///   feature): a call the sandbox's deny_paths / fs_write_dirs rules reject
+///   passes `before_tool` (Allow) but never reaches `after_tool` — the
+///   rejection is a sandbox policy decision, not a hooks one, so
+///   `executed = false` stays reserved for `before_tool` Deny. Audit-style
+///   hooks that pair before/after counts will see these as unmatched
+///   `before_tool`s; the rejection itself lands in the sandbox's `meta`
+///   audit trace.
 /// - A panicking HOOKS method is not caught anywhere: on the parent thread
 ///   (top-level gate / after-notify / chat observation) it unwinds through
 ///   `Agent::run` and may leave the already-saved session with an unpaired

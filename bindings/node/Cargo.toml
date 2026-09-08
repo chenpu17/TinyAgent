@@ -8,6 +8,14 @@ license = "MIT"
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+default = []
+# Forwarding feature for the run_code sandbox (design §8.6): off by default so
+# the standard npm artifact doesn't carry wasmtime (~10MB); building with it
+# makes enableCode()/disableCode()/setCodeConfig() functional — without it
+# they return a clear rebuild-hint error instead of silently no-op'ing.
+code = ["ta_core/code"]
+
 [dependencies]
 # The core library. Aliased (same reason as bindings/python): this crate's lib
 # name — the npm package import — is `tiny-agent`, so the dependency it wraps

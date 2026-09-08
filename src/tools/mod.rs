@@ -2,6 +2,12 @@ mod document;
 mod file;
 mod image;
 pub mod mcp;
+// The wasm-sandboxed JS tool. Gated: wasmtime adds ≈4.6 MiB to the release
+// binary, and enabling the tool is a per-deployment trust decision
+// (run_code_design.md §15). Tests
+// live at the bottom of the file, same gate.
+#[cfg(feature = "code")]
+pub mod run_code;
 mod shell;
 mod skill;
 mod subagent;
@@ -9,6 +15,8 @@ pub(crate) mod todo;
 
 pub use document::load_document_block;
 pub use image::load_block;
+#[cfg(feature = "code")]
+pub use run_code::RunCodeTool;
 pub use skill::{ListSkill, ReadSkill};
 
 use crate::agent::AgentEvent;
@@ -17,6 +25,7 @@ use crate::provider::{Block, ToolDef, Usage};
 use anyhow::{bail, Result};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Shared context passed to every tool invocation.
 pub struct ToolCtx {
@@ -43,19 +52,21 @@ pub struct ToolCtx {
     /// identity that tags its forwarded events) — lets hooks tell top-level
     /// calls from sub-agent calls. None on the main agent.
     pub subagent: Option<String>,
-    /// Run-wide token spend counter shared by the parent agent and EVERY
-    /// `task` sub-agent of the current run (`max_total_tokens > 0` only).
-    /// Each agent `fetch_add`s its OWN direct chat spend (turn chats +
-    /// compression summaries); the budget gates — parent and children alike —
-    /// read this SAME counter, so N parallel sub-agents collectively trip the
-    /// cap instead of each independently burning a full budget before the
-    /// parent's join-time fold (the old "事后熔断" hole). Installed per run by
-    /// `Agent::run` (fresh counter — usage totals also reset per run);
-    /// `run_as_subagent` keeps the inherited one. IMPORTANT for callers: when
-    /// the parent folds a sub-agent's `ToolOutput.usage` into its own totals
-    /// (accounting), it must NOT also add here — the child already counted
-    /// its direct spend (double-add would halve the effective budget).
-    pub budget: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// Run-wide token budget gate shared by the parent agent and EVERY `task`
+    /// sub-agent of the current run (`max_total_tokens > 0` only). Each agent
+    /// `fetch_add`s its OWN direct chat spend (turn chats + compression
+    /// summaries); the budget gates — parent and children alike — read this
+    /// SAME gate, so N parallel sub-agents collectively trip the cap instead
+    /// of each independently burning a full budget before the parent's
+    /// join-time fold (the old "事后熔断" hole). Installed per run by
+    /// `Agent::run` (fresh gate — usage totals also reset per run);
+    /// `run_as_subagent` keeps the inherited one. The sandbox's
+    /// `tools.budget()` reads it to report `tokens_left`. IMPORTANT for
+    /// callers: when the parent folds a sub-agent's `ToolOutput.usage` into
+    /// its own totals (accounting), it must NOT also add here — the child
+    /// already counted its direct spend (double-add would halve the
+    /// effective budget).
+    pub budget: Option<BudgetGate>,
     /// The run's wall-clock deadline (`limits.timeout_secs` from run start),
     /// published so a `task` sub-agent can clamp its own timeout to the
     /// parent's REMAINING time instead of a fresh full copy (a child spawned
@@ -66,6 +77,42 @@ pub struct ToolCtx {
     /// (`shell_timeout_secs`, the MCP call timeout), and host callbacks in
     /// the language bindings cannot be interrupted at all.
     pub deadline: Option<std::time::Instant>,
+}
+
+/// The run-level token-budget gate (`limits.max_total_tokens`): the fleet-wide
+/// spend counter PLUS the cap it gates against, so a consumer that only sees
+/// the [`ToolCtx`] — the run_code sandbox's `tools.budget()` — can report
+/// REMAINING headroom without re-deriving the cap from config. One gate per
+/// top-level run (`Agent::run` installs a fresh one); `task` sub-agents and
+/// the sandbox clone it (Arc-backed `used`), so parent, children, and
+/// in-flight guest calls all read/write the same numbers.
+#[derive(Clone)]
+pub struct BudgetGate {
+    /// Saturating-accumulated billed tokens. Each agent bills its OWN direct
+    /// chats (turn chats + compression summaries); tool-billed usage folds
+    /// into totals OUTSIDE the gate (see the `budget` field doc on ToolCtx).
+    pub used: Arc<std::sync::atomic::AtomicU64>,
+    /// `limits.max_total_tokens`. A gate is only installed when the cap is
+    /// > 0 — 0 means "no limit" and leaves [`ToolCtx::budget`] None.
+    pub cap: u64,
+}
+
+impl BudgetGate {
+    pub fn new(cap: u64) -> Self {
+        Self {
+            used: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            cap,
+        }
+    }
+
+    /// Remaining headroom, saturating: between a turn's billing and the next
+    /// turn-boundary gate check the counter may legitimately sit ABOVE the
+    /// cap (the gate stops the NEXT turn, it never kills the running one) —
+    /// report 0 there, never a wrapped huge number.
+    pub fn tokens_left(&self) -> u64 {
+        self.cap
+            .saturating_sub(self.used.load(std::sync::atomic::Ordering::Relaxed))
+    }
 }
 
 #[derive(Debug)]
@@ -167,6 +214,17 @@ pub(crate) fn validate_tool_names(tools: &[Box<dyn Tool>]) -> Result<()> {
                  (Anthropic tool name / OpenAI function name)"
             );
         }
+        // run_code's `tools.list()` rides the host_call_tool import under this
+        // reserved name — a same-named real tool would be unreachable from the
+        // sandbox while LOOKING available (silent shadowing by a string). The
+        // check is feature-gated: without `code` the reserved name is inert.
+        #[cfg(feature = "code")]
+        if name == "__tools_list" {
+            bail!(
+                "tool name '__tools_list' is reserved (run_code's tools.list \
+                 channel) — pick another name"
+            );
+        }
         if !seen.insert(name.clone()) {
             bail!(
                 "duplicate tool name '{name}': built-in, MCP, and custom tools \
@@ -235,6 +293,22 @@ pub trait Tool: Send + Sync {
         true
     }
 
+    /// Whether the `run_code` sandbox's guest registry may carry this tool
+    /// (`tools.call` from LLM-written JS). **Default false — the guest
+    /// surface is opt-in**, its own capability axis distinct from
+    /// [`Self::available_to_subagent`] (a tool can be right for child agents
+    /// yet wrong to expose to generated code, or vice versa). The built-ins
+    /// the sandbox is built around — file 四件套, shell, shared MCP tools —
+    /// override true; `task`/`todo`/run_code/skill tools and every
+    /// unannotated third-party tool stay out. Host callbacks
+    /// ([`CallbackTool`]) opt in per instance via
+    /// [`CallbackTool::with_code_access`]: a callback runs arbitrary host
+    /// code, so sandbox visibility must be an explicit authorization, not a
+    /// side effect of registering it top-level.
+    fn available_to_code(&self) -> bool {
+        false
+    }
+
     /// The MCP server (CONFIG name, unsanitized) this tool belongs to, for
     /// `Agent::remove_mcp_server`'s hot-remove routing. Default `None` for
     /// every non-MCP tool — capability-marker style (like `concurrency()`):
@@ -274,6 +348,9 @@ pub type ToolFn = Box<dyn Fn(&Value, &ToolCtx) -> Result<ToolOutput> + Send + Sy
 pub struct CallbackTool {
     def: ToolDef,
     func: ToolFn,
+    /// Opt-in to the run_code guest registry (see [`Tool::available_to_code`]
+    /// — default closed; set via [`CallbackTool::with_code_access`]).
+    code_access: bool,
 }
 
 impl CallbackTool {
@@ -284,7 +361,19 @@ impl CallbackTool {
         Self {
             def,
             func: Box::new(func),
+            code_access: false,
         }
+    }
+
+    /// Expose THIS tool to `tools.call` inside the run_code sandbox (the
+    /// default is closed — see [`Tool::available_to_code`]). Builder-style:
+    /// `CallbackTool::new(def, f).with_code_access()`. The callback then
+    /// runs LLM-written arguments under the same hooks gate and call-quota
+    /// accounting as every other guest call — authorizing it is authorizing
+    /// generated code to invoke host code, so keep it deliberate.
+    pub fn with_code_access(mut self) -> Self {
+        self.code_access = true;
+        self
     }
 }
 
@@ -294,6 +383,51 @@ impl Tool for CallbackTool {
     }
     fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         (self.func)(input, ctx)
+    }
+    fn available_to_code(&self) -> bool {
+        self.code_access
+    }
+}
+
+/// Arc-shared handle to a host-injected tool so the SAME instance serves
+/// both the agent's top-level list and (on the tool's own
+/// [`Tool::available_to_code`] opt-in) the run_code guest registry — host
+/// callbacks keep single-instance state instead of being duplicated. Every
+/// `&self` trait method delegates; `set_shutdown` can only reach the inner
+/// tool while the Arc is still exclusive (it never is once both lists hold a
+/// handle), so in practice it is a no-op — realistic injected tools
+/// (`CallbackTool`) have nothing to tear down, and a tool needing
+/// session-end teardown should not be injected as a shared handle.
+pub(crate) struct SharedTool {
+    pub(crate) inner: Arc<Box<dyn Tool>>,
+}
+
+impl Tool for SharedTool {
+    fn def(&self) -> ToolDef {
+        self.inner.def()
+    }
+    fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        self.inner.run(input, ctx)
+    }
+    fn run_with_emit(
+        &self,
+        input: &Value,
+        ctx: &ToolCtx,
+        emit: &mut dyn FnMut(AgentEvent),
+    ) -> Result<ToolOutput> {
+        self.inner.run_with_emit(input, ctx, emit)
+    }
+    fn concurrency(&self) -> ToolConcurrency {
+        self.inner.concurrency()
+    }
+    fn available_to_subagent(&self) -> bool {
+        self.inner.available_to_subagent()
+    }
+    fn available_to_code(&self) -> bool {
+        self.inner.available_to_code()
+    }
+    fn mcp_server(&self) -> Option<&str> {
+        self.inner.mcp_server()
     }
 }
 
@@ -329,7 +463,35 @@ pub fn build(
                 api_key.to_string(),
                 shared_mcp.to_vec(),
             )),
-            other => bail!("unknown tool in config: {other}"),
+            // Registry / sub-agent paths only (design §8.1): assembly strips
+            // `run_code` from the whitelist it builds (the top-level instance
+            // comes solely from `assemble`'s single construction point), so a
+            // `run_code` entry reaches here only via a child registry build —
+            // where available_to_subagent() filters it straight back out. The
+            // nested instance is constructed-and-dropped, which is cheap (a
+            // four-field snapshot; the engine is a process-level OnceLock).
+            #[cfg(feature = "code")]
+            "run_code" => Box::new(crate::tools::run_code::RunCodeTool::new(
+                cfg,
+                std::sync::Arc::new(std::sync::RwLock::new(cfg.code.clone())),
+                client,
+                api_key,
+                shared_mcp.to_vec(),
+                vec![],
+            )),
+            other => {
+                // Feature-off + explicit listing: fail with the remedy, not
+                // just "unknown tool" (design §8.1 — the tool EXISTS, the
+                // build just doesn't carry it).
+                if other == "run_code" {
+                    bail!(
+                        "unknown tool in config: run_code — the sandboxed JS \
+                         tool needs the `code` cargo feature; rebuild with \
+                         --features code"
+                    );
+                }
+                bail!("unknown tool in config: {other}")
+            }
         });
     }
     Ok(out)
@@ -424,6 +586,29 @@ fn confine(ctx: &ToolCtx, full: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test 13's feature-off half: listing `run_code` without the `code`
+    /// cargo feature is an actionable error, not a silent gap. Only compiled
+    /// (and run) on feature-off test invocations — the feature-ON behavior
+    /// (construction succeeds) is covered in run_code.rs's tests.
+    #[cfg(not(feature = "code"))]
+    #[test]
+    fn run_code_listing_errors_without_feature() {
+        let cfg: crate::config::Config = serde_json::from_str(
+            "{\"provider\":\"openai\",\"api_key_env\":\"K\",\"model\":\"m\",\
+             \"inject_environment\":false,\"tools\":[\"read_file\",\"run_code\"]}",
+        )
+        .unwrap();
+        let names = cfg.tools.clone();
+        // No unwrap_err: `Vec<Box<dyn Tool>>` isn't Debug. Assert on the
+        // error text via match so the feature-ON tree also typechecks this
+        // test's body out (it's cfg(not(feature = "code")) gated anyway).
+        let err = match build(&names, &cfg, &reqwest::blocking::Client::new(), "k", &[]) {
+            Err(e) => format!("{e:#}"),
+            Ok(_) => panic!("run_code must not resolve in a feature-off build"),
+        };
+        assert!(err.contains("run_code") && err.contains("code"), "{err}");
+    }
 
     #[test]
     fn truncate_marks_omission() {

@@ -2,10 +2,10 @@ use crate::compress;
 use crate::config::{Config, Limits, McpServerConfig};
 use crate::hooks::ToolDecision;
 use crate::provider::{Block, ChatEvent, ChatRequest, Message, Provider, Role, ToolDef, Usage};
-use crate::tools::{Tool, ToolConcurrency, ToolCtx, ToolOutput};
+use crate::tools::{BudgetGate, Tool, ToolConcurrency, ToolCtx, ToolOutput};
 use anyhow::Result;
 use serde_json::Value;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -75,6 +75,14 @@ pub enum AgentEvent {
     /// `{"ThinkingDelta": "..."}` so a downstream UI (TinyWorker) renders a
     /// collapsible "thinking" block. Not part of the reply text nor history.
     ThinkingDelta(String),
+    /// A `console.log` line from inside a `run_code` sandbox (code feature) —
+    /// serializes as `{"CodeLog": "..."}`. Emitted while the host-side log
+    /// buffer is under its cap (§6: events stop with collection once full).
+    /// Harness `--json` maps it to `{"type":"code_log","delta":…}`; plain
+    /// headless prints to stderr (ThinkingDelta discipline); the TUI commits
+    /// it as a transcript row (reviewable, `/export`-able). Never enters
+    /// history — the collected logs ride the tool result instead.
+    CodeLog(String),
     /// Incremental fragment of a tool call's input JSON while the model
     /// streams it — serializes as `{"ToolInputDelta": {"id":…, "name":…,
     /// "delta":…}}`. Lets a UI render "constructing call…" with progressively
@@ -418,6 +426,16 @@ pub struct Agent {
     /// which rebuilds it via `refresh_tool_defs` — recomputing per turn would
     /// re-serialize every schema on EVERY turn's preflight check.
     tool_schema_chars: usize,
+    /// The ONE top-level `run_code` instance (design §8.6, H3): constructed by
+    /// `assemble` and installed post-construction via `set_code_tool`. When
+    /// enabled, a CLONE lives in `tools` — both share the
+    /// `Arc<RwLock<CodeConfig>>`, so `set_code_config` reaches the instance
+    /// the model actually dispatches to (that sharing is the whole point of
+    /// the single-construction-point rule). `None` on feature-off builds and
+    /// for agents built by direct `try_new` (callers who want the tool must
+    /// go through the `build_agent*` helpers).
+    #[cfg(feature = "code")]
+    code_tool: Option<crate::tools::run_code::RunCodeTool>,
 }
 
 /// Build the system prompt with a leading `# Environment` block (OS / Shell /
@@ -524,6 +542,8 @@ impl Agent {
             next_msg_id,
             usage: Usage::default(),
             tool_schema_chars,
+            #[cfg(feature = "code")]
+            code_tool: None,
         })
     }
 
@@ -740,6 +760,101 @@ impl Agent {
         self.ctx.hooks = Some(hooks);
     }
 
+    // ── run_code switch face (code feature, design §8.6) ─────────────────────
+
+    /// Install the single top-level `run_code` instance ([`crate::assemble`]
+    /// is the only caller — the single-construction-point rule, H3). Same
+    /// post-construction-setter shape as [`Agent::set_hooks`]: `try_new`'s
+    /// signature stays feature-neutral. The instance's enablement is already
+    /// reflected in the tool list assemble handed to `try_new`; this only
+    /// parks the live handle the switch methods below act on.
+    #[cfg(feature = "code")]
+    pub fn set_code_tool(&mut self, tool: crate::tools::run_code::RunCodeTool) {
+        self.code_tool = Some(tool);
+    }
+
+    /// Atomically replace the WHOLE [`CodeConfig`] (switch + every limit /
+    /// path knob). The write lands in the `Arc<RwLock<CodeConfig>>` shared
+    /// with the boxed instance in the tool list, so it governs the NEXT
+    /// execution — in-flight executions keep the snapshot they started with
+    /// (read-lock-clone-release inside `RunCodeTool`). An `enabled` flip
+    /// syncs the tool table: enabling pushes a clone of the installed
+    /// instance (same shared Arc — A-10), disabling removes it.
+    ///
+    /// Errors when this agent has no installed instance (feature-off build,
+    /// or direct `try_new` construction) — there is nothing to configure.
+    #[cfg(feature = "code")]
+    pub fn set_code_config(&mut self, cfg: crate::config::CodeConfig) -> Result<()> {
+        let tool = self
+            .code_tool
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no run_code tool installed on this agent"))?;
+        let want = cfg.enabled;
+        {
+            let mut g = tool
+                .code_cfg
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *g = cfg;
+        }
+        self.sync_code_tool(want)
+    }
+
+    /// Flip just the `enabled` bit (convenience derivative of
+    /// [`Agent::set_code_config`]). Enabling makes `run_code` visible to the
+    /// model on the NEXT request (`refresh_tool_defs` rebuilds the mirror);
+    /// disabling removes it from both dispatch and the request payload —
+    /// zero schema cost while off (D15).
+    #[cfg(feature = "code")]
+    pub fn set_code_enabled(&mut self, enabled: bool) -> Result<()> {
+        let tool = self
+            .code_tool
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no run_code tool installed on this agent"))?;
+        {
+            let mut g = tool
+                .code_cfg
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            g.enabled = enabled;
+        }
+        self.sync_code_tool(enabled)
+    }
+
+    /// Make the tool table agree with the config's `enabled` bit.
+    /// Push/remove + `refresh_tool_defs` — the same rebuild path MCP hot
+    /// add/remove uses. The pushed instance is a CLONE of the installed one:
+    /// cheap (snapshot fields + a shared registry Arc), and the shared
+    /// `Arc<RwLock<CodeConfig>>` is what keeps later `set_code_config`
+    /// calls reaching it.
+    #[cfg(feature = "code")]
+    fn sync_code_tool(&mut self, want: bool) -> Result<()> {
+        let has = self.tool_defs.iter().any(|d| d.name == "run_code");
+        if want == has {
+            return Ok(());
+        }
+        if want {
+            let Some(tool) = self.code_tool.as_ref() else {
+                anyhow::bail!("no run_code tool installed on this agent");
+            };
+            // has == false here (want != has held), so the push cannot
+            // collide. The one corner: a HAND-built agent (direct `try_new`
+            // + `set_code_tool`) whose table already carries a same-named
+            // custom tool took the early return above — that tool stays and
+            // is treated as the run_code face; assembly-built agents can't
+            // reach this (the whitelist strip guarantees uniqueness). The
+            // remove branch below mirrors the same hand-built corner in
+            // reverse: `retain` drops a same-named custom tool too. Both
+            // corners are out of contract for hand-built agents — assembly
+            // agents never see them.
+            self.tools.push(Box::new(tool.clone()));
+        } else {
+            self.tools.retain(|t| t.def().name != "run_code");
+        }
+        self.refresh_tool_defs();
+        Ok(())
+    }
+
     pub(crate) fn cancelled(&self) -> bool {
         self.cancel
             .as_ref()
@@ -753,29 +868,6 @@ impl Agent {
         self.cancel
             .clone()
             .unwrap_or_else(|| Arc::new(AtomicBool::new(false)))
-    }
-
-    /// Hooks gate for one pending tool call: the installed layer's decision, or
-    /// `Allow` when no layer is set (the default — zero overhead beyond one
-    /// Option check). Callers hold the ORIGINAL input for audit; only execution
-    /// may see a `Modify` replacement. Gates run where they're called: on this
-    /// (parent) thread for the top-level turn — serial by construction, before
-    /// any parallel worker spawns — and on a worker thread inside a sub-agent
-    /// (see the `Hooks` doc, "Concurrency").
-    fn gate_tool(&self, name: &str, input: &Value) -> ToolDecision {
-        match &self.ctx.hooks {
-            Some(h) => h.before_tool(name, input, &self.ctx),
-            None => ToolDecision::Allow,
-        }
-    }
-
-    /// Hooks after-notification for a finished tool call. `input` is always the
-    /// ORIGINAL (never a `Modify` replacement); `executed` is false only for a
-    /// denied call (which still gets its error output reported).
-    fn notify_after(&self, name: &str, input: &Value, output: &ToolOutput, executed: bool) {
-        if let Some(h) = &self.ctx.hooks {
-            h.after_tool(name, input, output, executed);
-        }
     }
 
     /// Fold one request's usage into the run totals and emit the per-request
@@ -813,13 +905,15 @@ impl Agent {
     /// while running, so the parent's accounting fold must stay counter-free
     /// (a double add would halve the fleet's effective budget).
     fn bill_chat(&mut self, events: &mut dyn FnMut(AgentEvent), u: &Usage) {
-        if let Some(c) = &self.ctx.budget {
+        if let Some(g) = &self.ctx.budget {
             // fetch_update (not fetch_add): saturating per the numeric-writer
             // convention — a wrapping add could roll a huge lying counter back
             // to a small value and dodge the budget gate.
-            let _ = c.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_add(u.total()))
-            });
+            let _ = g
+                .used
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_add(u.total()))
+                });
         }
         self.fold_usage(events, u);
     }
@@ -990,8 +1084,8 @@ impl Agent {
         // one so parent + siblings + child all read/write the same numbers.
         self.ctx.deadline = deadline;
         if reset_cancel {
-            self.ctx.budget =
-                (self.limits.max_total_tokens > 0).then(|| Arc::new(AtomicU64::new(0)));
+            self.ctx.budget = (self.limits.max_total_tokens > 0)
+                .then(|| BudgetGate::new(self.limits.max_total_tokens));
         }
         let mut turns = 0u32;
         let mut final_text = String::new();
@@ -1043,7 +1137,7 @@ impl Agent {
                     .ctx
                     .budget
                     .as_ref()
-                    .map_or_else(|| self.usage.total(), |c| c.load(Ordering::Relaxed));
+                    .map_or_else(|| self.usage.total(), |g| g.used.load(Ordering::Relaxed));
                 if spent >= self.limits.max_total_tokens {
                     stop_reason = "budget_exceeded".into();
                     break;
@@ -1370,43 +1464,23 @@ impl Agent {
                 if parallel {
                     parallel_slots.push(i); // ToolCall announced + run in the batch below
                 } else {
-                    events(AgentEvent::ToolCall {
-                        name: name.clone(),
-                        input: input.clone(),
-                    });
-                    // Hooks gate (serial, on this thread). Deny → an error
-                    // result that is STILL recorded (N:N pairing + honest audit
-                    // log) — never Slot::Cancelled, which stays reserved for
-                    // cancel. Allow/Modify proceed below.
-                    match self.gate_tool(name, input) {
-                        ToolDecision::Deny(reason) => {
-                            let output = ToolOutput::error(reason);
-                            self.notify_after(name, input, &output, false);
-                            slots[i] = Slot::Ran(Box::new(output));
-                        }
-                        decision => {
-                            // Allow → original input; Modify → replacement
-                            // clone. The audit trail (records, ToolCall events)
-                            // keeps the ORIGINAL in both cases.
-                            let effective: &Value = match &decision {
-                                ToolDecision::Modify(v) => v,
-                                _ => input,
-                            };
-                            let output = {
-                                let mut fwd = |ev: AgentEvent| events(ev);
-                                run_tool(
-                                    &self.tools,
-                                    &self.tool_defs,
-                                    name,
-                                    effective,
-                                    &self.ctx,
-                                    &mut fwd,
-                                )
-                            };
-                            self.notify_after(name, input, &output, true);
-                            slots[i] = Slot::Ran(Box::new(output));
-                        }
-                    }
+                    // One complete inline call: ToolCall event → gate → run →
+                    // after-notification (see execute_tool_call). The
+                    // ToolResult event is NOT emitted here — the assembly pass
+                    // below owns block order, N:N pairing, and the
+                    // cancelled-slot synthesis.
+                    let output = {
+                        let mut fwd = |ev: AgentEvent| events(ev);
+                        execute_tool_call(
+                            &self.tools,
+                            &self.tool_defs,
+                            &self.ctx,
+                            name,
+                            input,
+                            &mut fwd,
+                        )
+                    };
+                    slots[i] = Slot::Ran(Box::new(output));
                 }
             }
 
@@ -1450,10 +1524,10 @@ impl Agent {
                 for &i in &parallel_slots {
                     let name = &tool_uses[i].1;
                     let input = &tool_uses[i].2;
-                    match self.gate_tool(name, input) {
+                    match gate_tool_call(&self.ctx, name, input) {
                         ToolDecision::Deny(reason) => {
                             let output = ToolOutput::error(reason);
-                            self.notify_after(name, input, &output, false);
+                            notify_tool_after(&self.ctx, name, input, &output, false);
                             slots[i] = Slot::Ran(Box::new(output));
                         }
                         ToolDecision::Allow => {
@@ -1499,7 +1573,7 @@ impl Agent {
                             .join()
                             .unwrap_or_else(|_| ToolOutput::error("parallel tool worker panicked"));
                         let (i, _, _) = runnable[pos];
-                        self.notify_after(&tool_uses[i].1, &tool_uses[i].2, &output, true);
+                        notify_tool_after(ctx, &tool_uses[i].1, &tool_uses[i].2, &output, true);
                         slots[i] = Slot::Ran(Box::new(output));
                     }
                 });
@@ -1576,6 +1650,37 @@ impl Agent {
     }
 }
 
+/// Hooks gate for one pending tool call: the installed layer's decision, or
+/// `Allow` when no layer is set (the default — zero overhead beyond one
+/// Option check). Callers hold the ORIGINAL input for audit; only execution
+/// may see a `Modify` replacement. Gates run where they're called: on the
+/// parent thread for the top-level turn — serial by construction, before any
+/// parallel worker spawns — and on a worker thread inside a sub-agent (see
+/// the `Hooks` doc, "Concurrency"). A free function (was an `Agent` method;
+/// it only ever read `&self.ctx`) so [`execute_tool_call`] and the parallel
+/// batch's gate-before-spawn phase share one gate without borrowing the agent.
+pub(crate) fn gate_tool_call(ctx: &ToolCtx, name: &str, input: &Value) -> ToolDecision {
+    match &ctx.hooks {
+        Some(h) => h.before_tool(name, input, ctx),
+        None => ToolDecision::Allow,
+    }
+}
+
+/// Hooks after-notification for a finished tool call. `input` is always the
+/// ORIGINAL (never a `Modify` replacement); `executed` is false only for a
+/// denied call (which still gets its error output reported).
+pub(crate) fn notify_tool_after(
+    ctx: &ToolCtx,
+    name: &str,
+    input: &Value,
+    output: &ToolOutput,
+    executed: bool,
+) {
+    if let Some(h) = &ctx.hooks {
+        h.after_tool(name, input, output, executed);
+    }
+}
+
 /// Locate a tool by name in the cached `defs`, returning its index into the
 /// parallel `tools` vec. Shared by the inline leaf pass (capability routing
 /// needs the live tool to read `concurrency()`) and [`run_tool`] — one shared
@@ -1591,9 +1696,11 @@ fn find_tool(defs: &[ToolDef], name: &str) -> Option<usize> {
 /// (so tools with progress to stream — the `task` sub-agent — can emit into
 /// the parent run). A missing tool or a tool Err becomes a `ToolOutput::error`
 /// rather than aborting the run — the result is still paired N:N with the
-/// tool_use that triggered it. Shared by the sequential leaf pass and the
-/// parallel batch.
-fn run_tool(
+/// tool_use that triggered it. Shared by [`execute_tool_call`], the parallel
+/// batch workers, and `run_code`'s inner dispatch (which hand-rolls the
+/// gate → intercept → run → after sequence so the deny_paths layer can sit
+/// between the hooks gate and execution — design §7).
+pub(crate) fn run_tool(
     tools: &[Box<dyn Tool>],
     defs: &[ToolDef],
     name: &str,
@@ -1615,6 +1722,52 @@ fn run_tool(
             }
         },
         None => ToolOutput::error(format!("unknown tool: {name}")),
+    }
+}
+
+/// One complete inline tool call: `ToolCall` event → hooks gate →
+/// [`run_tool`] → after-notification, returning the output. Deliberately does
+/// NOT emit the `ToolResult` event — that belongs to the caller: the loop's
+/// assembly pass emits it for every slot in block order (it owns N:N pairing
+/// and the cancelled-slot synthesis), and the planned `run_code` inner
+/// dispatch will emit it right after each call returns (docs/run_code_design.md
+/// §4). Records push / usage folding likewise stay with the caller. The
+/// sequential leaf pass is the current user; the parallel batch cannot use
+/// this wholesale (its contract is gate-before-spawn on the parent thread, run
+/// on workers, after-join), so it composes [`gate_tool_call`] /
+/// [`notify_tool_after`] / [`run_tool`] by hand instead.
+pub(crate) fn execute_tool_call(
+    tools: &[Box<dyn Tool>],
+    defs: &[ToolDef],
+    ctx: &ToolCtx,
+    name: &str,
+    input: &Value,
+    emit: &mut dyn FnMut(AgentEvent),
+) -> ToolOutput {
+    emit(AgentEvent::ToolCall {
+        name: name.to_string(),
+        input: input.clone(),
+    });
+    // Hooks gate (serial on the caller's thread). Deny → an error output that
+    // the caller STILL records (N:N pairing + honest audit log) — the
+    // reserved-for-cancel slot semantics live in the caller, not here.
+    match gate_tool_call(ctx, name, input) {
+        ToolDecision::Deny(reason) => {
+            let output = ToolOutput::error(reason);
+            notify_tool_after(ctx, name, input, &output, false);
+            output
+        }
+        decision => {
+            // Allow → original input; Modify → replacement. The audit trail
+            // (records, ToolCall events) keeps the ORIGINAL in both cases.
+            let effective: &Value = match &decision {
+                ToolDecision::Modify(v) => v,
+                _ => input,
+            };
+            let output = run_tool(tools, defs, name, effective, ctx, emit);
+            notify_tool_after(ctx, name, input, &output, true);
+            output
+        }
     }
 }
 

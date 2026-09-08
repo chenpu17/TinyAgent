@@ -9,12 +9,15 @@
 cargo build --features tui                 # 默认只编 headless；TUI 要带 feature
 cargo test --features tui,mock             # 单测（含 TUI 输入/渲染逻辑 + lib_api 集成测试）
 cargo clippy --features tui --all-targets  # lint TUI 版
-cargo clippy --all-targets                # lint headless 版（两个 feature 配置都要过）
+cargo clippy --all-targets                # lint headless 版
+cargo clippy --features code --all-targets # lint code 版（run_code.rs 在 feature 后）
+cargo test --features code,mock            # run_code 沙箱套件（改 run_code.rs 必跑）
 cargo fmt --all                            # 格式化（CI 有 --check 门禁，改完代码必跑）
 ```
 
-每次改完**两个 clippy 都要跑**：TUI 代码在 `#[cfg(feature = "tui")]` 后，默认构建看不到，
-默认配置的 clippy 也看不到 TUI 代码——单跑一个会漏。CI 里两个 clippy 都带 `-D warnings`，
+每次改完**三个 clippy 配置都要跑**（headless / tui / code）：`#[cfg(feature)]` 后的代码，
+不带该 feature 的构建与 clippy 都看不到——单跑一两个会漏。TUI 代码在 `tui` 后；
+`run_code.rs` 与 `agent.rs` 的 `set_code_*` 在 `code` 后。CI 里三个 clippy 都带 `-D warnings`，
 本地跑出任何黄字即等于红灯。**`cargo fmt --all` 同理**（CI 的 fmt job 对全 workspace
 `--check`，含双绑定 crate；存量 305 处漂移已在一个纯格式 commit 清零，该 commit 记在
 `.git-blame-ignore-revs`，`git blame` 配 ignoreRevsFile 后可跳过）。
@@ -27,8 +30,12 @@ cargo fmt --all                            # 格式化（CI 有 --check 门禁�
 
 ### 语言绑定（workspace 成员 `bindings/python`、`bindings/node`）
 
-两者 path-依赖根库（`features = ["mock"]`），都复用 `CallbackTool` 注入自定义工具、不改核心。改了核心
-provider/agent 后，两个绑定的测试都要跟着跑一遍回归。
+两者 path-依赖根库（`features = ["mock"]`），都复用 `CallbackTool` 注入自定义工具、不改核心。两者各带一个
+默认关闭的 `code` **转发 feature**（`code = ["ta_core/code"]`）：编入后 `enable_code`/`disable_code`/
+`set_code_config`（Node 侧 camelCase）真实生效；未编入时三方法返回带重建提示的明确错误（设计 §8.6——
+避免给所有 wheel 强加 ~10MB wasmtime）。绑定测试 build-自适应（探测 wheel 是否带 feature，另一侧 skip）。
+改了核心 provider/agent 后，两个绑定的测试都要跟着跑一遍回归；动了 run_code/装配则另跑
+`maturin develop --features code` + `npm run build:debug -- --features code` 的双构建。
 
 ```sh
 # Python（PyO3 + maturin；raw cargo build 链接不了 cdylib，必须走 maturin）
@@ -150,7 +157,11 @@ cargo clippy -p tiny-agent-node
   ④ **子 agent 不感知**（SubAgent 持构造期 `mcp_tools` 快照：热增 server 对本 agent 生命周期内任何时点
   spawn 的子 agent 都不可见——产品决策「文档化不传播」，共享槽位留 v2）；remove 一个仍被子 agent 快照
   持有的 server 时连接活到最后持有者 drop（armed reaper 会话末兜底杀 child）；⑤ add 时若已
-  `set_shutdown` 则新工具补挂同一 flag（临近退出热增不遗留孤儿）。**活的握手/调用/冲突回滚/进程回收链路**
+  `set_shutdown` 则新工具补挂同一 flag（临近退出热增不遗留孤儿）。**run_code 的 guest registry 同样
+  不感知**（与 ④ 同一条政策，外部评审曾当 P1 报过——实为既定快照语义）：registry 按构造期四件套在
+  `Arc<OnceLock>` 里惰性建一次、跨克隆共享，热增的 server JS 看不到；热删的 server 仍可被已建 registry
+  调用（连接活到 registry drop；该 server 已不在顶层列表 → shutdown 不再经它武装 reaper，最坏退出时
+  等满一次 MCP CALL_TIMEOUT 后由 `StdioTransport::drop` 杀进程组——延迟，无孤儿）。**活的握手/调用/冲突回滚/进程回收链路**
   只在 `agent_tests.rs::hot_add_remove_mcp_server_live`（`#[ignore]`，本地 python3 起
   `examples/mcp_echo.py`，`cargo test hot_add_remove -- --ignored --nocapture`；末尾 pgrep 断言 child
   零残留）；hermetic 用例只钉路由/错误形状/无变异三件事。
@@ -222,7 +233,13 @@ cargo clippy -p tiny-agent-node
   （允许 `/`，禁 `..`/绝对/`\`/空/`.` 组件）+ `confined_to(dir, full, "skill directory")` 双层沙盒——后者复用 `tools/mod.rs`
   抽出的 `pub(crate) confined_to(root, full, label)`（`confine` 委托它，root 在内 canonicalize；TOCTOU caveat 同 workdir 沙盒）。
   **`list_skill` 工具**列技能目录树（`walk_skill`，`file_type` 不跟随 symlink 防逃逸、深度封顶 4、跳隐藏），供模型 level-3 自主
-  发现资源。`read_skill`/`list_skill` 都**不在 `cfg.tools` 白名单**（skill≠tool，刻意决策）——扫到技能时由 `assemble` 自动配套注入
+  发现资源。**内置（embedded）skill（v2 P2）**：`SkillEntry.source` 是 `SkillSource::{Dir, Embedded(String)}`
+  枚举——`skills::embedded_entry(text)` 按同款 frontmatter 校验建条目；`read_skill` 对 Embedded 直接吐全文
+  （读非 SKILL.md 的 file 报"无附属文件"）、`list_skill` 列单文件；`assemble` 在 `code.enabled` 时把
+  run_code 的用法指南（`src/tools/run_code_skill.md`，`include_str!`）经 `insert_builtin` 注入——**磁盘同名
+  skill 覆盖内置**（insert_builtin 撞名即 no-op、保持名字序），allowed-tools 白名单告警检查对 `run_code`
+  在 enabled 时放行（它的 membership 由 code.enabled 驱动、不在 cfg.tools 白名单里）。
+  `read_skill`/`list_skill` 都**不在 `cfg.tools` 白名单**（skill≠tool，刻意决策）——扫到技能时由 `assemble` 自动配套注入
   （`tool_list.push(ReadSkill)` + `push(ListSkill)`，各 `index.clone()`）。**子 agent 不继承**：`subagent.rs:133` 硬编码
   system_prompt 覆盖为 `SUBAGENT_SYSTEM_PROMPT`，且子 agent 走白名单建工具集，故既无简介也无 `read_skill`/`list_skill`
   （决策，不改 subagent.rs）。坏 skill（缺 SKILL.md / 缺 frontmatter 字段 / name 不合规 / name≠目录 / description 超长）
@@ -231,6 +248,89 @@ cargo clippy -p tiny-agent-node
   字面量名匹配，不支持 glob/`Tool(spec)`。`assemble` 为注入简介 **clone cfg**（改 `cfg2.system_prompt`）并返回
   `(tool_list, ctx, cfg)` 三元组（带 `#[allow(clippy::type_complexity)]`）——`Agent::new` 从该 clone 读 system_prompt；改
   `assemble` 签名的人注意两个调用点（`build_agent_with` / `build_agent_with_provider`）都要拿返回的 cfg 传给 `Agent::new`。
+- **run_code 沙箱 JS 工具（`tools/run_code.rs`，feature `code`；设计/需求文档 `docs/run_code_design.md` / `docs/run_code_requirements.md`）**：
+  LLM 写 JS 在进程内 wasm 沙箱执行、经 `tools.call()` 编排既有工具。QuickJS-ng 编译成 wasm（`assets/quickjs.wasm`
+  `include_bytes!` 嵌入；重编走 `examples/build-quickjs.sh` + `examples/quickjs_glue.c`——**改 glue 源码必须重编资产**，
+  两者保持 sha256 奇偶；宿主纯 Rust 零 C，musl 交叉不碰 C 工具链），wasmtime 36 驱动、纯同步。**两层开关默认全关**：
+  cargo feature（体积闸，musl release +3.6MiB）+ `code.enabled`（运行期）。`run_code` **不在 `tools` 白名单语义内**——
+  membership 由 `code.enabled` 驱动：`assemble` 把名字从白名单 strip 掉、**总是构造唯一实例**（H3：经 `CodeInstall` +
+  `Agent::set_code_tool` 后置安装，`try_new` 签名 feature 无关；两个 `build_agent_with*` 调用点零变化）。热更新面：
+  `Agent::set_code_config`（整包原子替换）/ `set_code_enabled`——载体 `Arc<RwLock<CodeConfig>>` 与工具实例共享，
+  **只达 Agent 与 RunCodeTool 两处、不外递 Arc**（绑定走 with_agent/try_lock 锁内调 Agent 方法、dict 按值转）。
+  enabled 翻转同步工具表（push/remove + `refresh_tool_defs`，MCP 热增删同款重建路径）；开关态不进 session 文件
+  （hooks 同款"层活在实例上"口径）。
+  **wasmtime 36 中断事实（M3 实测钉死，改墙钟/cancel/fuel 必读）**：① epoch 中断的**投递载体是 epoch-deadline 回调返回
+  `Err`**（`UpdateDeadline` 无 trap 变体；`set_fuel(0)` 是死路——运行中函数把 fuel 缓存在 wasm local、check 点才回写，
+  实测 guest 跑过中断点 25s）；② epoch 检查只在 **wasm 循环头**发射、函数入口只初始化缓存 deadline——warm 平凡程序
+  在单个 10ms tick 内跑完，故 cancel/deadline 必须**入口门⓪**（guest 启动前直接拒，fuel_used=0）+ epoch 回调 +
+  `host_call_tool` 入口 + 收尾裁决（含 `_initialize`/编译失败路径，quickjs stdlib init debug 下 >1s）**四点**；
+  ③ `max_wasm_stack` **384 KiB**（非 1.5 MiB）——开 epoch 插桩后深递归会先损坏 quickjs 无检查的内部递归状态
+  （终态是不可归因的 OOB trap），384 KiB 让原生栈上限决定性赢得竞速、稳定归因 StackOverflow；④ wasmtime 按模块缓存
+  机器码——冷首次执行 ~10s 懒编译（debug），**测试必须先 warm 模块再计时/再 spawn cancel 翻转线程**（翻转线程先于
+  warmup spawn 会让入口门吃掉用例而不是在飞投递）。
+  **结果装配（D3）**：`assemble_with_logs(value, logs, cap)`——值优先整行适配，只有值**单独**超限才截断值、日志整段丢；
+  `truncated` 审计键稀疏；`logs_dropped` 只计**超宿主日志上限未收集**的行。宿主日志上限按 `chars + 1`（**0 字符行也计费**——
+  chars-only 检查放过 `while(1) console.log()`，sec 评审 M-1）。**wall_deadline 一律 `checked_add().flatten()`**
+  （u64::MAX 级 timeout_secs 经 batch TightenOrInit 0-基底真实可达；溢出=无墙钟，cancel/fuel/mem 仍生效）；
+  `WallDeadline{from_cfg}` 记录约束侧，`deadline_why` 据此点名旋钮。内部调用走**与外层同款 hooks 闸门**
+  （`__code__` 身份标记，顶层串行同序）；子 agent **不继承** run_code（`available_to_subagent` false）。
+  usage 经 `compress::merge_usage` 折进自身 ToolOutput.usage（子 agent/task 同款纪律：工具账单不进预算计数器）；
+  审计 `meta` 双哈希（fnv64 + sha256 截 128bit，in_hash=模型原始输入 / in_hash_eff=Modify 后实发）。
+  事件面：`AgentEvent::CodeLog(String)`（console 行实时透出，`--json` 吐 `{"type":"code_log"}`、plain 走 stderr、
+  TUI 提交 `Row::sys_info` 转录行——设计 L6：可回看可 `/export`，瞬态会丢执行日志）。数值写端照库纪律 saturating。
+  **guest 内调工具的输出预算不继承 `ctx.max_output_chars`**（`guest_ctx` 用 `GUEST_OUTPUT_CHARS`=2M，设计 D13）：
+  该帽是给模型眼睛的展示预算，guest 输出落 JS 堆（`code.mem_mb` 限）、根本不进对话——继承会让设计自己的
+  `LIMIT 5000` 式整读不可达，真实旅程 A/B 实测模型退回 17 次手动翻页、烧穿 300k run 级预算
+  （主要烧在逐页膨胀的 cache_read 上）。字符单位不变（truncate/read_file 字节窗照算），只换量级。
+- **guest I/O 结构化 + prelude + 磁盘缓存（v2 P1，设计 D16/D17）**：① read_file 头部规模元数据 +
+  `format:"json"`（`{content, lines_total, chars_total, truncated, next_offset}`，无行号前缀；**只有 limit
+  截断给 next_offset**——chars/bytes 截断可能切行中、线对齐续读不可能，置 null 让调用方转 raw）+
+  `raw:true` 字节窗 base64（offset/limit **按字节**，窗帽 `min(RAW_READ_MAX=1.4MB, ctx.max_output_chars/2)`
+  ——主 loop 展示预算拉不走数据规模块，guest 2M 预算吃满窗）+ write_file `content_b64`（字节保真写，
+  开放问题 1 的解）。② **prelude**（`PRELUDE_SRC` → `prelude_line()` 展平成**单物理行**注入 guest 代码前——
+  quickjs 行号相对 eval 源，多行 prelude 会把用户栈帧行号整体偏移；展平后恒 +1，不变式测试钉住）：
+  `readAll`/`readLines`/`writeVerified` 三件、清单**封闭**（每个新助手都是「模型以为有其实没有」的新幻觉面），
+  描述（设计附录 A 即规格）点名三者，改 prelude 必须同步附录 A 与描述。`eval_code` 每次调用新建 JS
+  runtime——prelude 不能分两次 eval、只能拼进同段（函数体内 var/function 声明，用户代码可遮蔽）。
+  prelude 还挂 `tools.budget = () => tools.call("__budget", {})`（v2：保留名直通 host，免额度/免 hooks/
+  免审计，与 `__tools_list` 同类；返回剩余调用/墙钟/燃料/run token——高循环波「预算烧穿」实证的解。
+  v0.7 起 `tokens_left` 经 `ToolCtx::budget: Option<BudgetGate>`（used 计数器 + cap 打包，lib.rs 门面
+  re-export）读出：gate 侧 `cap.saturating_sub(used)`，无闸门（max_total_tokens=0）为 null；guest ctx
+  clone 的是 gate（used 是 Arc），读数是活的。改 `bill_chat`/run 入口安装/闸门读三处的人注意字段
+  从裸计数器换成了 `g.used`）。
+  **guest 注册表滤除用独立标记 `Tool::available_to_code()`（默认 false）**，不再搭
+  `available_to_subagent()` 便车（两条退出面解耦）；文件四件套/shell/`McpTool` 显式 true——
+  **McpTool 漏覆写 = AppWorld 机制整体断**。宿主 extra_tools 经 `SharedTool`（Arc 同实例）进注册表、
+  `CallbackTool::with_code_access()` 逐工具授权；guest-only 原语 `copy_bytes`（host 流式字节保真复制，
+  策略面在拦截层 copy 臂：src 读规则/dst 写规则）注册在 retain 之后。错误封套带结构化字段
+  `kind/tool/retryable`（glue 附到 Error 上；`tool` 类刻意不给 retryable——host 无法机判；
+  **args 解析失败也是 `host` 类结构化错误而非静默 `{}`**——`parse_guest_args`，v0.8，对称于坏指针；
+  shipped glue 恒发合法 JSON，该路径仅限绕过 JS 包装直戳 import 的 guest，模型可见词汇表不变），
+  glue 随之重建（sha256 `3c1c8790…`，build 脚本头部有奇偶记录）。
+  ③ **wasmtime 磁盘编译缓存**：Cargo `cache` feature + 显式 `CacheConfig::with_directory`（手写 XDG：
+  `$XDG_CACHE_HOME`（绝对）else `$HOME/.cache`，下挂 `tinyagent/wasmtime`）——**别**换回 `load_default`
+  （musl/无 HOME 行为不可控）；目录失败**优雅降级为无缓存**，绝不阻塞沙箱。A/B 墙钟里 debug 每进程 ~10s
+  懒编译从此只付一次（改此路径记得 musl 冒烟在 CI 覆盖）。
+- **描述瘦身 + 内置 skill（v2 P2，设计 D18）**：run_code 描述只留身份/环境/**封闭助手清单**/返回纪律/
+  技能指针（889 字符，`slim_description_*` 测试钉 ≤1200 上限；含【数值】段——Number 是 float64、
+  超 2^53 静默失真、移植 Python 整数算术一律 BigInt 字面量，bench scriptout 实证 float64 直译答 816≠1048），深契约（read_file 三模式、字节保真复制、
+  示例）移进内置 skill `run-code`（见 skills 条目的 embedded 机制）。**描述、skill 正文、设计附录 A 三处
+  同源同步**——附录 A 由源码程序化再生成，改 prelude/助手清单/read_file 契约时三处一起动。附修：read_file
+  的 raw **默认**窗口按 3 字节对齐（**显式 limit 照传不夺**——调用方点名要那几个字节；只有默认窗口对齐），
+  保证跟随 next_offset 分页时各窗 `content_b64` 字符串拼接 == 整个文件的 base64
+  （`read_file_raw_windows_concatenate_losslessly` 测试钉住）；跨窗字节保真复制配方见 skill 正文。
+  另一 fidelity 修复（A/B 首跑抓到）：json content **逐行保留原始行终止符**（含每页末行 \n 与 CRLF，
+  不再「strip 后 join("\n")」——那会丢末行换行、归一 CRLF，按换行计数每文件少 1）；prelude
+  readAll 页间改 `join("")`（页自带终止符，join("\n") 会在页界注入空行）。
+- **read_file 分页窗口**（`tools/file.rs`）：offset 跳过**不花**字节预算——Phase 1 用 fill_buf/consume 按块数
+  换行扫到目标行（有界内存），Phase 2 才 `take(max_output_chars*4+1024)` 读窗口；旧从文件起算 take，令
+  ~4×max_output_chars 字节后的每一页都不可达（A/B 实测 900 行文件 573 行后翻不动、边界行还被静默切断——
+  修后字节窗从窗口起点计，切断必伴随字符帽 truncate 标记，不再有静默半行）。行号是 `offset+i` 全局号。
+  **输出头部前置规模元数据**（v2 P1）：非空文本输出首行是
+  `[文件名: 总行数 · 总字符 · complete|行区间 a-b]`——「装不进对话」的换臂决策信息前移到首次读取
+  （totals 扫描 `TOTALS_SCAN_MAX`=8MiB 封顶、超出报 `N+` 下界，别为 1GB 日志每页全量扫）；空文件与
+  offset 越界保持旧形状。另有 `format:"json"`（结构化分页字段）与 `raw:true`（字节窗 base64，
+  offset/limit **按字节**）两模式，guest prelude 依赖之——见 run_code 条目。
 - **运行环境事实注入 system prompt**（`agent.rs::system_with_env` + `Agent::new` 单点）：构造 agent 时在
   system prompt 最前面插一段 `# Environment`（OS / Shell / 工作目录），让模型知道自己跑在哪个平台、据此下发兼容命令
   （否则默认 bash 语法在 Windows `cmd /C` 下静默失效还 exit 0，如 `echo $((555+666))` 原样回显）。**只给事实不给语法示例**：

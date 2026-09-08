@@ -18,22 +18,99 @@ const EDIT_FILE_MAX_BYTES: u64 = 8 * 1024 * 1024;
 /// multi-GB string and OOM before it ever hits disk. The estimate is checked BEFORE
 /// the allocation.
 const EDIT_FILE_OUTPUT_MAX: u128 = 64 * 1024 * 1024;
+/// Bound for the whole-file totals scan behind read_file's head/JSON metadata:
+/// counting every line of an arbitrarily large file on every read would make
+/// paging a 1 GB log O(filesize) per call. Past this bound the totals report as
+/// `N+ lines · >8 MB` — a lower bound that still answers the arm-decision
+/// question ("this will not fit in the conversation") without the scan cost.
+const TOTALS_SCAN_MAX: u64 = 8 * 1024 * 1024;
+/// Cap for one raw (base64) read window. Base64 expands 3→4 and the guest's
+/// data-scale budget is 2M chars, so 1.4 MB of raw bytes keeps the encoded
+/// string under it; the effective per-call cap additionally folds in
+/// ctx.max_output_chars/2 so a MAIN-loop caller (display-scale budget) cannot
+/// inject a megabyte-scale blob into the conversation via raw mode.
+const RAW_READ_MAX_BYTES: u64 = 1_400_000;
+
+/// Whole-file line/char totals for read_file's size metadata (head line and
+/// JSON fields). `capped` marks a scan that stopped at TOTALS_SCAN_MAX — the
+/// counts are then lower bounds. `chars` counts UTF-8 non-continuation bytes,
+/// which is exact for valid UTF-8 and a tight approximation otherwise.
+struct Totals {
+    lines: u64,
+    chars: u64,
+    capped: bool,
+}
+
+fn scan_totals(full: &std::path::Path) -> std::io::Result<Totals> {
+    use std::io::BufRead;
+    let mut r = std::io::BufReader::new(std::fs::File::open(full)?);
+    let mut nl = 0u64;
+    let mut chars = 0u64;
+    let mut last: Option<u8> = None;
+    let mut capped = false;
+    let mut scanned = 0u64;
+    loop {
+        let chunk = r.fill_buf()?;
+        if chunk.is_empty() {
+            break;
+        }
+        let mut take = chunk.len();
+        if scanned.saturating_add(take as u64) > TOTALS_SCAN_MAX {
+            take = (TOTALS_SCAN_MAX - scanned) as usize; // >0: scanned < MAX here
+            capped = true;
+        }
+        let c = &chunk[..take];
+        nl += c.iter().filter(|&&b| b == b'\n').count() as u64;
+        chars += c.iter().filter(|&&b| (b & 0xC0) != 0x80).count() as u64;
+        last = c.last().copied();
+        let len = take;
+        r.consume(len);
+        scanned += len as u64;
+        if capped {
+            break;
+        }
+    }
+    let lines = nl + u64::from(last.is_some_and(|b| b != b'\n'));
+    Ok(Totals {
+        lines,
+        chars,
+        capped,
+    })
+}
 
 pub struct ReadFile;
 
 impl Tool for ReadFile {
+    /// Guest-registry opt-in (run_code's `tools.call` surface) — the file
+    /// tools are the sandbox's built-in I/O substrate.
+    fn available_to_code(&self) -> bool {
+        true
+    }
+
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "read_file".into(),
-            description:
-                "Read a text file with line numbers (path relative to the working directory)."
-                    .into(),
+            description: "Read a text file with line numbers (path relative to the working \
+                          directory). The first output line reports the file's total size \
+                          (`[name: N lines · M chars · complete]`, or `· lines a-b` when the \
+                          window is partial) — use it to decide up front whether the data \
+                          fits in the conversation or should be processed programmatically. \
+                          `format:\"json\"` returns structured fields (content without line \
+                          numbers, lines_total, chars_total, truncated, next_offset) for \
+                          programmatic paging. `raw:true` reads a byte window (offset/limit \
+                          in BYTES) as base64 `{content_b64, bytes_total, truncated, \
+                          next_offset}` for byte-exact work (mainly inside run_code); the \
+                          default window is 3-byte aligned, so a pager following next_offset \
+                          can concatenate content_b64 across windows losslessly."
+                .into(),
             schema: json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
-                    "offset": {"type": "integer", "description": "First line to read (1-based, optional)"},
-                    "limit": {"type": "integer", "description": "Max number of lines (optional)"}
+                    "offset": {"type": "integer", "description": "First line to read (1-based, optional; byte offset when raw)"},
+                    "limit": {"type": "integer", "description": "Max number of lines (bytes when raw, optional)"},
+                    "format": {"type": "string", "enum": ["json"], "description": "Return structured JSON instead of numbered text (optional)"},
+                    "raw": {"type": "boolean", "description": "Read a byte window as base64 (implies JSON output; offset/limit in bytes, optional)"}
                 },
                 "required": ["path"]
             }),
@@ -45,40 +122,125 @@ impl Tool for ReadFile {
             .as_str()
             .context("read_file: missing \"path\"")?;
         let full = resolve(ctx, path)?;
+        let file_len = std::fs::metadata(&full).map(|m| m.len()).unwrap_or(0);
+        if input["raw"].as_bool().unwrap_or(false) {
+            return read_file_raw(path, &full, input, ctx, file_len);
+        }
+        let json_mode = input["format"].as_str() == Some("json");
+
         // Stream line by line and stop once the output cap is hit, so a
         // huge file never gets pulled into memory whole.
         let f = std::fs::File::open(&full)
             .with_context(|| format!("cannot read {}", full.display()))?;
-        let reader = std::io::BufReader::new(f);
-        // Bound the BYTES read from disk so a newline-less huge file can't OOM
-        // on a single line allocation — reader.lines() buffers a whole line
-        // into memory before the per-line truncation below can throw it away,
-        // so without this cap a multi-GB single-line file defeats the "bounded
-        // read". 4× the char cap + slack mirrors the shell tool's byte budget:
-        // ample for the output window, and no single line can exceed it.
+        let mut reader = std::io::BufReader::new(f);
+        // Bound the BYTES read for the OUTPUT WINDOW so a newline-less huge
+        // file can't OOM on a single line allocation — read_until buffers a
+        // whole line into memory before the per-line truncation below can
+        // throw it away. 4× the char cap + slack mirrors the shell tool's
+        // byte budget: ample for the window, and no single line can exceed
+        // it. The cap is applied AFTER the offset skip (see below), not from
+        // the file start.
         let max_bytes = (ctx.max_output_chars.saturating_mul(4)).saturating_add(1024) as u64;
-        let mut reader = reader.take(max_bytes);
 
         let offset = input["offset"].as_u64().unwrap_or(1).max(1) as usize;
         let limit = input["limit"].as_u64().map(|n| n as usize);
 
         use std::io::BufRead;
-        let mut out = String::new();
-        let mut lines_seen = 0usize;
-        // Does the byte cap actually bite? Computed once: the manual line
-        // loop below uses it to deliver the valid prefix of a fragment the
-        // cap split mid-multi-byte-char (BufRead::lines() turned that into a
-        // hard "invalid UTF-8" error for ANY CJK file larger than the cap).
-        let byte_capped = std::fs::metadata(&full)
-            .map(|m| m.len() > max_bytes)
-            .unwrap_or(false);
+
+        // ── Phase 1: skip to the output window's first line ─────────────────
+        // Skipping used to consume the byte cap (the old code read-and-
+        // discarded offset lines under the same `take(max_bytes)`), which
+        // made every page past the first ~4×max_output_chars bytes of a file
+        // UNREACHABLE — real-journey A/B found a 900-line file unpageable
+        // past line 573, with the boundary line silently cut mid-content.
+        // Scan for newlines in fixed-size chunks instead: bounded memory,
+        // and skipped lines no longer spend the window's byte budget.
+        let mut window_start: u64 = 0; // bytes consumed by the skip
+        let mut eof_in_skip = false;
+        if offset > 1 {
+            let need = offset - 1;
+            let mut skipped = 0usize;
+            let mut total_nl = 0usize; // every newline seen while skipping
+            let mut last_ended_nl = true; // ...and whether the stream so far ends with one
+            loop {
+                let chunk = match reader.fill_buf() {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return Err(e).with_context(|| format!("cannot read {}", full.display()))
+                    }
+                };
+                if chunk.is_empty() {
+                    // EOF before the skip finished: `need` overshoots the file.
+                    eof_in_skip = true;
+                    break;
+                }
+                let nl = chunk.iter().filter(|&&b| b == b'\n').count();
+                if skipped + nl >= need {
+                    // The need-th newline of this chunk ends the skip.
+                    let want = need - skipped;
+                    let mut cnt = 0usize;
+                    let mut idx = chunk.len();
+                    for (i, &b) in chunk.iter().enumerate() {
+                        if b == b'\n' {
+                            cnt += 1;
+                            if cnt == want {
+                                idx = i + 1;
+                                break;
+                            }
+                        }
+                    }
+                    reader.consume(idx);
+                    window_start += idx as u64;
+                    break;
+                }
+                let len = chunk.len();
+                last_ended_nl = chunk.ends_with(b"\n");
+                total_nl += nl;
+                reader.consume(len);
+                window_start += len as u64;
+                skipped += nl;
+            }
+            if eof_in_skip {
+                if json_mode {
+                    let t = scan_totals(&full).ok();
+                    return Ok(ToolOutput::text(read_file_json(
+                        "",
+                        offset,
+                        0,
+                        t.as_ref(),
+                        false,
+                        "none",
+                        None,
+                    )));
+                }
+                let total_lines = total_nl + usize::from(!last_ended_nl);
+                return Ok(ToolOutput::text(format!(
+                    "... [offset {offset} beyond EOF; file has {total_lines} lines]\n"
+                )));
+            }
+        }
+
+        // ── Phase 2: read the window under the byte + char caps ────────────
+        let mut reader = reader.take(max_bytes);
+        // Does the byte cap actually bite? Computed against the REMAINING
+        // file from the window start: the manual line loop below uses this
+        // to deliver the valid prefix of a fragment the cap split mid-
+        // multi-byte-char (BufRead::lines() turned that into a hard "invalid
+        // UTF-8" error for ANY CJK window larger than the cap).
+        let byte_capped = file_len.saturating_sub(window_start) > max_bytes;
         // C14: the output budget is tracked in CHARS (matching
         // max_output_chars and truncate()). `out.len()` is bytes, so CJK
         // content hit the budget at ~⅓ of the configured chars and truncated
         // early. `formatted` includes the line number + tab prefix, all
         // single-byte-ish overhead — counting the whole formatted line keeps
         // the accounting simple and the cap conservative.
+        let mut out = String::new(); // text mode accumulator
+        let mut plain = String::new(); // json mode content accumulator
+        let mut lines_seen = 0usize;
+        let mut emitted = 0usize; // lines actually delivered to the output
         let mut chars_out = 0usize;
+        let mut window_bytes = 0u64;
+        let mut truncation = "none";
         let mut buf: Vec<u8> = Vec::new();
         loop {
             buf.clear();
@@ -87,14 +249,33 @@ impl Tool for ReadFile {
                 Ok(_) => {}
                 Err(e) => return Err(e).with_context(|| format!("cannot read {}", full.display())),
             }
-            let i = lines_seen; // 0-based line index, as the old enumerate() gave
+            window_bytes += buf.len() as u64;
+            // (A byte cap that cuts a line mid-content always coincides with
+            // the CHAR cap tripping on the same line — 4× byte budget ≥ any
+            // line's chars at that point — so `truncate()`'s marker already
+            // marks every real cut. The OLD from-file-start accounting could
+            // deliver a silently cut SHORT boundary line; windowing removed
+            // that shape.)
+            let i = lines_seen; // 0-based line index within the window
             lines_seen += 1;
-            if i < offset - 1 {
-                continue;
-            }
+            // JSON mode preserves each line's ORIGINAL terminator (incl. CRLF
+            // and the file's final newline): `content` is the data channel —
+            // readAll/readLines and newline-counting consumers must see the
+            // exact bytes, not a normalized "lines joined by \n" rendering
+            // (which silently dropped every page's trailing newline — an A/B
+            // task found both arms undercounting by exactly one per file).
+            // Text mode keeps stripping for display.
+            let term: &str = if buf.ends_with(b"\r\n") {
+                "\r\n"
+            } else if buf.ends_with(b"\n") {
+                "\n"
+            } else {
+                "" // EOF without a final newline (or a mid-line byte-cap cut)
+            };
             if let Some(l) = limit {
-                if i - (offset - 1) >= l {
+                if i >= l {
                     out.push_str("... [line limit reached]\n");
+                    truncation = "limit";
                     break;
                 }
             }
@@ -123,65 +304,231 @@ impl Tool for ReadFile {
             if line.chars().count() > remaining {
                 truncate(&mut line, remaining);
             }
-            let formatted = format!("{:>6}\t{}\n", i + 1, line);
-            chars_out += formatted.chars().count();
-            out.push_str(&formatted);
+            if json_mode {
+                plain.push_str(&line);
+                plain.push_str(term);
+                chars_out += line.chars().count() + term.chars().count();
+            } else {
+                let formatted = format!("{:>6}\t{}\n", offset + i, line);
+                chars_out += formatted.chars().count();
+                out.push_str(&formatted);
+            }
+            emitted += 1;
             if chars_out >= ctx.max_output_chars {
-                truncate(&mut out, ctx.max_output_chars);
+                if !json_mode {
+                    truncate(&mut out, ctx.max_output_chars);
+                }
+                // The char cap can cut mid-line; in JSON mode content's last
+                // line may be partial and line-aligned resume is impossible
+                // (a paged reader must switch to raw mode). In text mode the
+                // truncate() marker already says so — both need the head's
+                // range (not "complete").
+                truncation = "chars";
                 break;
             }
         }
-        // C15: `lines_seen` only counts what the byte-capped reader yielded —
-        // for a file truncated by that cap it UNDERREPORTS the total, and the
-        // "file has N lines" note lied about the file. Say "lines read"
-        // instead when the cap bit.
-        if out.is_empty() {
-            // Distinguish a truly empty file from an offset past EOF. The
-            // latter used to read as "[empty file]", which misleads the
-            // model into thinking the file has no content.
-            if lines_seen == 0 {
-                out.push_str("[empty file]");
-            } else if byte_capped {
-                out.push_str(&format!(
-                    "... [offset {offset} beyond the {lines_seen} lines read (file was truncated)]\n"
-                ));
-            } else {
-                out.push_str(&format!(
-                    "... [offset {offset} beyond EOF; file has {lines_seen} lines]\n"
-                ));
-            }
+        // Did the byte cap end the window (line-aligned or mid-line) without
+        // limit/chars already claiming the reason?
+        if truncation == "none" && file_len > window_start.saturating_add(window_bytes) {
+            truncation = "bytes";
         }
-        Ok(ToolOutput::text(out))
+        let truncated = truncation != "none";
+        if json_mode {
+            let t = scan_totals(&full).ok();
+            // Line-aligned resume is only exact under the limit cut; chars/
+            // bytes cuts can land mid-line.
+            let next = match truncation {
+                "limit" => Some((offset + emitted) as u64),
+                _ => None,
+            };
+            return Ok(ToolOutput::text(read_file_json(
+                &plain,
+                offset,
+                emitted,
+                t.as_ref(),
+                truncated,
+                truncation,
+                next,
+            )));
+        }
+        if out.is_empty() {
+            // The skip landed exactly on EOF (the file ends with the last
+            // skipped newline) or the file is empty — both mean the window
+            // is past the end. Report the true line count rather than the
+            // old "[empty file]" misdirection.
+            if offset == 1 {
+                out.push_str("[empty file]");
+                return Ok(ToolOutput::text(out));
+            }
+            out.push_str(&format!(
+                "... [offset {offset} beyond EOF; file has {} lines]\n",
+                offset - 1
+            ));
+            return Ok(ToolOutput::text(out));
+        }
+        // ── Head metadata line: the file's totals up front ─────────────────
+        // The arm-decision information ("does this fit in the conversation?")
+        // must be available at the FIRST read, before paging has sunk any
+        // cost — the model can then pick the right strategy immediately.
+        // `complete` vs a `lines a-b` range doubles as the completeness
+        // signal for text mode.
+        let t = scan_totals(&full).ok();
+        let size_part = match &t {
+            Some(t) if t.capped => format!("{}+ lines · >{} MB", t.lines, TOTALS_SCAN_MAX / MIB),
+            Some(t) => format!("{} lines · {} chars", t.lines, t.chars),
+            None => ">8 MB".to_string(),
+        };
+        let range_part = if truncated {
+            format!("lines {}-{}", offset, offset + emitted.saturating_sub(1))
+        } else {
+            "complete".to_string()
+        };
+        let head = format!("[{path}: {size_part} · {range_part}]\n");
+        Ok(ToolOutput::text(format!("{head}{out}")))
     }
+}
+
+const MIB: u64 = 1024 * 1024;
+
+/// raw:true — a byte window as base64. offset/limit are BYTES here (a
+/// line-indexed offset cannot address byte-exact slices). The limit folds in
+/// half the caller's char budget so a display-scale caller can't pull a
+/// data-scale blob into the conversation, while the guest's 2M-char budget
+/// still gets the full RAW_READ_MAX_BYTES window.
+fn read_file_raw(
+    path: &str,
+    full: &std::path::Path,
+    input: &Value,
+    ctx: &ToolCtx,
+    file_len: u64,
+) -> Result<ToolOutput> {
+    use base64::Engine;
+    use std::io::{Read, Seek, SeekFrom};
+    let offset = input["offset"].as_u64().unwrap_or(0);
+    let cap = RAW_READ_MAX_BYTES
+        .min((ctx.max_output_chars as u64) / 2)
+        .max(1);
+    // An EXPLICIT limit is honored as-is (min the cap) — the caller asked for
+    // those exact bytes. The DEFAULT window is aligned down to a multiple of
+    // 3 bytes (when ≥3): base64 concatenation is lossless only at 3-byte
+    // boundaries (b64(x||y) == b64(x)+b64(y) iff len(x)%3==0), so a pager
+    // following next_offset without naming a limit can join content_b64
+    // across windows and hand the joined string straight to write_file's
+    // content_b64. The FINAL window is the short remainder — nothing follows
+    // it, so any length is fine there.
+    let limit = match input["limit"].as_u64() {
+        Some(l) => l.min(cap),
+        None if cap >= 3 => cap - cap % 3,
+        None => cap,
+    } as usize;
+    let mut f =
+        std::fs::File::open(full).with_context(|| format!("cannot read {}", full.display()))?;
+    if offset >= file_len {
+        return Ok(ToolOutput::text(
+            json!({
+                "path": path, "content_b64": "", "offset": offset,
+                "bytes_read": 0, "bytes_total": file_len,
+                "truncated": false, "next_offset": null,
+            })
+            .to_string(),
+        ));
+    }
+    f.seek(SeekFrom::Start(offset))
+        .with_context(|| format!("cannot read {}", full.display()))?;
+    let mut bytes = vec![0u8; limit];
+    let n = f
+        .read(&mut bytes)
+        .with_context(|| format!("cannot read {}", full.display()))?;
+    bytes.truncate(n);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let end = offset + n as u64;
+    let truncated = end < file_len;
+    Ok(ToolOutput::text(
+        json!({
+            "path": path, "content_b64": b64, "offset": offset,
+            "bytes_read": n, "bytes_total": file_len,
+            "truncated": truncated,
+            "next_offset": if truncated { json!(end) } else { Value::Null },
+        })
+        .to_string(),
+    ))
+}
+
+/// format:"json" — the same line window as text mode, but structured: content
+/// carries no line-number prefixes, and totals/truncation/next_offset let a
+/// paged reader loop without parsing display markers.
+#[allow(clippy::too_many_arguments)]
+fn read_file_json(
+    content: &str,
+    first_line: usize,
+    lines: usize,
+    totals: Option<&Totals>,
+    truncated: bool,
+    truncation: &str,
+    next_offset: Option<u64>,
+) -> String {
+    json!({
+        "content": content,
+        "first_line": first_line,
+        "lines": lines,
+        "lines_total": totals.map(|t| t.lines),
+        "chars_total": totals.map(|t| t.chars),
+        "totals_capped": totals.map(|t| t.capped),
+        "truncated": truncated,
+        "truncation": truncation,
+        "next_offset": next_offset,
+    })
+    .to_string()
 }
 
 pub struct WriteFile;
 
 impl Tool for WriteFile {
+    /// Guest-registry opt-in (run_code's `tools.call` surface) — the file
+    /// tools are the sandbox's built-in I/O substrate.
+    fn available_to_code(&self) -> bool {
+        true
+    }
+
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "write_file".into(),
             description: "Write (overwrite) a file with the given full content. \
-                          Parent directories are created automatically."
+                          Parent directories are created automatically. Pass \
+                          `content_b64` (base64) instead of `content` to write \
+                          exact bytes — the only byte-faithful write path when \
+                          the payload is not valid text or must survive an exact \
+                          round-trip."
                 .into(),
             schema: json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
-                    "content": {"type": "string", "description": "Complete new file content"}
+                    "content": {"type": "string", "description": "Complete new file content (UTF-8 text)"},
+                    "content_b64": {"type": "string", "description": "Complete content as base64 bytes (alternative to content; writes exact bytes)"}
                 },
-                "required": ["path", "content"]
+                "required": ["path"]
             }),
         }
     }
 
     fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        use base64::Engine;
         let path = input["path"]
             .as_str()
             .context("write_file: missing \"path\"")?;
-        let content = input["content"]
-            .as_str()
-            .context("write_file: missing \"content\"")?;
+        let content = input["content"].as_str();
+        let content_b64 = input["content_b64"].as_str();
+        let bytes: Vec<u8> = match (content, content_b64) {
+            (Some(_), Some(_)) => {
+                bail!("write_file: pass either \"content\" or \"content_b64\", not both")
+            }
+            (Some(c), None) => c.as_bytes().to_vec(),
+            (None, Some(b64)) => base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .context("write_file: content_b64 is not valid base64")?,
+            (None, None) => bail!("write_file: missing \"content\""),
+        };
         let full = resolve(ctx, path)?;
         // Atomic write (temp + fsync + rename), matching edit_file: a crash or
         // SIGKILL mid-write_file must not leave a truncated target file. The
@@ -190,13 +537,13 @@ impl Tool for WriteFile {
         // write_file's content from history, the model can't redo the write
         // from an in-context copy either. atomic_write also creates the parent
         // dir, so the explicit create_dir_all above is dropped.
-        crate::harness::atomic_write(&full, content.as_bytes())
+        crate::harness::atomic_write(&full, &bytes)
             .with_context(|| format!("cannot write {}", full.display()))?;
         // Echo the path as given (usually relative) — less confusing than
         // the canonicalized absolute form.
         Ok(ToolOutput::text(format!(
             "wrote {path} ({} bytes)",
-            content.len()
+            bytes.len()
         )))
     }
 }
@@ -204,6 +551,12 @@ impl Tool for WriteFile {
 pub struct EditFile;
 
 impl Tool for EditFile {
+    /// Guest-registry opt-in (run_code's `tools.call` surface) — the file
+    /// tools are the sandbox's built-in I/O substrate.
+    fn available_to_code(&self) -> bool {
+        true
+    }
+
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "edit_file".into(),
@@ -325,6 +678,12 @@ impl Tool for EditFile {
 pub struct ListDir;
 
 impl Tool for ListDir {
+    /// Guest-registry opt-in (run_code's `tools.call` surface) — the file
+    /// tools are the sandbox's built-in I/O substrate.
+    fn available_to_code(&self) -> bool {
+        true
+    }
+
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "list_dir".into(),
@@ -406,6 +765,44 @@ mod tests {
             .unwrap();
         assert!(out.content.contains("beyond EOF"), "got: {}", out.content);
         assert!(out.content.contains("2 lines"), "got: {}", out.content);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Real-journey A/B regression: the offset skip used to consume the byte
+    /// cap, so every page past the first ~4×max_output_chars BYTES of a file
+    /// was physically unreachable (a 900-line file unpageable past line 573 —
+    /// the model's aggregation silently undercounted). The skip now scans
+    /// newlines without spending the window budget: a page deep into the
+    /// file must return its lines, with the ORIGINAL global line numbers.
+    #[test]
+    fn read_file_pages_beyond_the_first_byte_window() {
+        let dir = std::env::temp_dir().join(format!("ta-page-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        // 800 lines × ~60 bytes ≈ 48KB ≫ max_bytes (4×1000+1024 = 5024):
+        // line 700 sits far past the old cap's reach.
+        let filler = "x".repeat(50);
+        let content: String = (1..=800)
+            .map(|i| format!("line-{i:04}-{filler}\n"))
+            .collect();
+        fs::write(dir.join("big.txt"), content).unwrap();
+        let out = ReadFile
+            .run(
+                &json!({"path": "big.txt", "offset": 700, "limit": 3}),
+                &ctx_in(&dir),
+            )
+            .unwrap();
+        assert!(out.content.contains("line-0700-"), "got: {}", out.content);
+        assert!(out.content.contains("line-0702-"), "got: {}", out.content);
+        assert!(
+            !out.content.contains("line-0699-"),
+            "window must start at the offset"
+        );
+        // Global numbering, not window-relative.
+        assert!(
+            out.content.contains("   700\t"),
+            "line numbers stay global: {}",
+            out.content
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -669,5 +1066,224 @@ mod tests {
         assert_eq!(fs::read_to_string(&outside).unwrap(), "orig");
         fs::remove_dir_all(&dir).ok();
         let _ = fs::remove_file(&outside);
+    }
+
+    // ── v2 guest I/O: head metadata, structured JSON, raw byte windows ──────
+
+    #[test]
+    fn read_file_head_reports_totals_and_completeness() {
+        // First output line = the file's totals + completeness, so the
+        // "does this fit in the conversation" decision is available at the
+        // FIRST read (before paging has sunk any cost).
+        let dir = std::env::temp_dir().join(format!("ta-head-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("f.txt"), "alpha\nbeta\n").unwrap();
+        let out = ReadFile
+            .run(&json!({"path": "f.txt"}), &ctx_in(&dir))
+            .unwrap();
+        let first = out.content.lines().next().unwrap();
+        assert_eq!(first, "[f.txt: 2 lines · 11 chars · complete]");
+        // Partial window reports the shown range instead.
+        let out = ReadFile
+            .run(&json!({"path": "f.txt", "limit": 1}), &ctx_in(&dir))
+            .unwrap();
+        let first = out.content.lines().next().unwrap();
+        assert_eq!(first, "[f.txt: 2 lines · 11 chars · lines 1-1]");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_file_head_counts_missing_trailing_newline() {
+        let dir = std::env::temp_dir().join(format!("ta-head-nl-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("f.txt"), "alpha\nbeta").unwrap(); // no trailing \n
+        let out = ReadFile
+            .run(&json!({"path": "f.txt"}), &ctx_in(&dir))
+            .unwrap();
+        let first = out.content.lines().next().unwrap();
+        assert_eq!(first, "[f.txt: 2 lines · 10 chars · complete]");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_file_json_mode_structures_content_and_paging() {
+        // format:"json": no line-number prefixes, plus totals / truncated /
+        // next_offset so a paged reader loops without parsing display markers.
+        let dir = std::env::temp_dir().join(format!("ta-json-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let content: String = (1..=25).map(|i| format!("row-{i:02}\n")).collect();
+        fs::write(dir.join("f.txt"), content).unwrap();
+        let out = ReadFile
+            .run(
+                &json!({"path": "f.txt", "offset": 1, "limit": 10, "format": "json"}),
+                &ctx_in(&dir),
+            )
+            .unwrap();
+        let v: Value = serde_json::from_str(&out.content).unwrap();
+        // Content preserves each line's terminator, including the page's
+        // last newline (byte-faithful data channel — see the term logic in
+        // the read loop).
+        assert_eq!(
+            v["content"],
+            "row-01\nrow-02\nrow-03\nrow-04\nrow-05\nrow-06\nrow-07\nrow-08\nrow-09\nrow-10\n"
+        );
+        assert_eq!(v["first_line"], 1);
+        assert_eq!(v["lines"], 10);
+        assert_eq!(v["lines_total"], 25);
+        assert_eq!(v["chars_total"], 175); // 25 rows × 7 chars
+        assert_eq!(v["truncated"], true);
+        assert_eq!(v["truncation"], "limit");
+        assert_eq!(v["next_offset"], 11);
+        // The reported next_offset resumes exactly where the page ended.
+        let out2 = ReadFile
+            .run(
+                &json!({"path": "f.txt", "offset": 11, "limit": 100, "format": "json"}),
+                &ctx_in(&dir),
+            )
+            .unwrap();
+        let v2: Value = serde_json::from_str(&out2.content).unwrap();
+        assert_eq!(v2["truncated"], false);
+        assert_eq!(v2["next_offset"], Value::Null);
+        assert!(v2["content"].as_str().unwrap().starts_with("row-11\n"));
+        // Final page carries the file's closing newline too.
+        assert!(v2["content"].as_str().unwrap().ends_with("row-25\n"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_file_json_mode_empty_file_is_structured() {
+        let dir = std::env::temp_dir().join(format!("ta-json-e-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("empty.txt"), "").unwrap();
+        let out = ReadFile
+            .run(
+                &json!({"path": "empty.txt", "format": "json"}),
+                &ctx_in(&dir),
+            )
+            .unwrap();
+        let v: Value = serde_json::from_str(&out.content).unwrap();
+        assert_eq!(v["content"], "");
+        assert_eq!(v["lines_total"], 0);
+        assert_eq!(v["truncated"], false);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_file_raw_returns_base64_byte_window() {
+        // raw:true: offset/limit are BYTES; the window is exact — including
+        // bytes that are not valid UTF-8 (the whole point of the mode).
+        let dir = std::env::temp_dir().join(format!("ta-raw-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let bytes: Vec<u8> = (0u8..=255).collect();
+        fs::write(dir.join("bin.dat"), &bytes).unwrap();
+        let mut ctx = ctx_in(&dir);
+        ctx.max_output_chars = 2_000_000; // guest-scale budget: full window
+        let out = ReadFile
+            .run(
+                &json!({"path": "bin.dat", "raw": true, "offset": 3, "limit": 10}),
+                &ctx,
+            )
+            .unwrap();
+        let v: Value = serde_json::from_str(&out.content).unwrap();
+        use base64::Engine;
+        assert_eq!(
+            v["content_b64"],
+            base64::engine::general_purpose::STANDARD.encode(&bytes[3..13])
+        );
+        assert_eq!(v["bytes_read"], 10);
+        assert_eq!(v["bytes_total"], 256);
+        assert_eq!(v["truncated"], true);
+        assert_eq!(v["next_offset"], 13);
+        // Display-scale budget clamps the window instead of injecting a
+        // megabyte-scale blob into the conversation. The clamped window is
+        // 3-byte aligned (500 → 498) so cross-window base64 concatenation
+        // stays lossless (see read_file_raw_windows_concatenate_losslessly).
+        fs::write(dir.join("big.dat"), vec![0u8; 2000]).unwrap();
+        let out = ReadFile
+            .run(&json!({"path": "big.dat", "raw": true}), &ctx_in(&dir))
+            .unwrap();
+        let v: Value = serde_json::from_str(&out.content).unwrap();
+        assert_eq!(v["bytes_read"], 498, "1000-char budget → 498-byte window");
+        assert_eq!(v["truncated"], true);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_file_raw_windows_concatenate_losslessly() {
+        // The byte-exact copy contract (D16): a pager that follows
+        // next_offset and JOINS the per-window content_b64 must get exactly
+        // base64(whole file) — which requires every non-final window to be a
+        // multiple of 3 bytes. RAW_READ_MAX_BYTES (1.4M) and the guest-budget
+        // window (1M) are both non-multiples, so the alignment is enforced in
+        // read_file_raw itself, not left to the caller (writeVerified's
+        // explicit CH=1399995 limit predates this and still works).
+        let dir = std::env::temp_dir().join(format!("ta-rawjoin-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let mut bytes = Vec::new();
+        // Mixed non-UTF-8 content with a size that forces several windows
+        // under a small budget (cap = max_output_chars/2 = 100 bytes →
+        // 99-byte windows).
+        for i in 0..350u32 {
+            bytes.push((i % 256) as u8);
+            bytes.push(0xFF);
+        }
+        fs::write(dir.join("blob.bin"), &bytes).unwrap();
+        let ctx = ctx_in(&dir); // max_output_chars = 1000 → 100-byte cap
+        let tool = ReadFile;
+        let mut joined = String::new();
+        let mut off = 0u64;
+        loop {
+            let out = tool
+                .run(
+                    &json!({"path": "blob.bin", "raw": true, "offset": off}),
+                    &ctx,
+                )
+                .unwrap();
+            let v: Value = serde_json::from_str(&out.content).unwrap();
+            joined.push_str(v["content_b64"].as_str().unwrap());
+            if !v["truncated"].as_bool().unwrap() {
+                break;
+            }
+            off = v["next_offset"].as_u64().unwrap();
+        }
+        use base64::Engine;
+        assert_eq!(
+            joined,
+            base64::engine::general_purpose::STANDARD.encode(&bytes),
+            "joined window b64 must equal whole-file b64"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_file_b64_writes_exact_bytes() {
+        // The byte-faithful path (open q1 / real-journey task4: a text
+        // round-trip used to eat a trailing newline).
+        let dir = std::env::temp_dir().join(format!("ta-wb64-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode("tail-no-newline");
+        let out = WriteFile
+            .run(
+                &json!({"path": "out.txt", "content_b64": b64}),
+                &ctx_in(&dir),
+            )
+            .unwrap();
+        assert!(out.content.contains("15 bytes"), "{}", out.content);
+        // Exact bytes on disk — no implicit trailing newline.
+        assert_eq!(fs::read(dir.join("out.txt")).unwrap(), b"tail-no-newline");
+        // Ambiguity and garbage are hard errors.
+        let err = WriteFile
+            .run(
+                &json!({"path": "x", "content": "a", "content_b64": "YQ=="}),
+                &ctx_in(&dir),
+            )
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("not both"), "{err:#}");
+        let err = WriteFile
+            .run(&json!({"path": "x", "content_b64": "!!!"}), &ctx_in(&dir))
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("base64"), "{err:#}");
+        fs::remove_dir_all(&dir).ok();
     }
 }

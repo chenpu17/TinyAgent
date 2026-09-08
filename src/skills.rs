@@ -24,19 +24,37 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// One discovered skill: its declared identity + the directory holding
-/// `SKILL.md` (and any sidecar files). Carries the full agentskills.io
-/// frontmatter — `license`/`compatibility`/`allowed_tools`/`metadata` are
-/// parsed and stored so a standard skill loads without error, though only
-/// `name`+`description` surface in the level-1 system-prompt intro (the intro
-/// is permanent context and counts toward the compression estimate, so it must
-/// stay short). `allowed_tools` additionally drives a whitelist check at
-/// assembly. `Default` is derived so tests can build one with `..Default::default()`.
+/// Where a skill's content lives: a real directory on disk (skills-dir scan,
+/// with `SKILL.md` + optional sidecar files) or embedded in the binary (a
+/// built-in skill — full `SKILL.md` text, no sidecars). Disk entries win on a
+/// name clash: a user's `.tinyagent/skills/<name>/` overrides the built-in,
+/// so the shipped guide is never a cage.
+#[derive(Clone, Debug)]
+pub enum SkillSource {
+    Dir(PathBuf),
+    /// Full `SKILL.md` text (frontmatter + body), compiled into the binary.
+    Embedded(String),
+}
+
+impl Default for SkillSource {
+    fn default() -> Self {
+        SkillSource::Dir(PathBuf::new())
+    }
+}
+
+/// One discovered skill: its declared identity + where its content lives.
+/// Carries the full agentskills.io frontmatter — `license`/`compatibility`/
+/// `allowed_tools`/`metadata` are parsed and stored so a standard skill loads
+/// without error, though only `name`+`description` surface in the level-1
+/// system-prompt intro (the intro is permanent context and counts toward the
+/// compression estimate, so it must stay short). `allowed_tools` additionally
+/// drives a whitelist check at assembly. `Default` is derived so tests can
+/// build one with `..Default::default()`.
 #[derive(Clone, Debug, Default)]
 pub struct SkillEntry {
     pub name: String,
     pub description: String,
-    pub dir: PathBuf,
+    pub source: SkillSource,
     pub license: Option<String>,
     pub compatibility: Option<String>,
     /// `allowed-tools` frontmatter, split on whitespace. Experimental per the
@@ -63,12 +81,40 @@ impl SkillIndex {
         &self.entries
     }
 
+    /// Build an index from ready-made entries (sorted order is the caller's
+    /// responsibility). Test-only helper — normal construction goes through
+    /// [`scan`] (+ [`embedded_entry`] for built-ins).
+    #[cfg(test)]
+    pub(crate) fn from_entries(entries: Vec<SkillEntry>) -> Self {
+        Self { entries }
+    }
+
+    /// Look up a full entry by name (linear scan — the index is small).
+    pub fn entry_of(&self, name: &str) -> Option<&SkillEntry> {
+        self.entries.iter().find(|e| e.name == name)
+    }
+
     /// Look up a skill's directory by name (linear scan — the index is small).
+    /// `None` for embedded built-ins (they have no directory).
     pub fn dir_of(&self, name: &str) -> Option<&Path> {
-        self.entries
-            .iter()
-            .find(|e| e.name == name)
-            .map(|e| e.dir.as_path())
+        match self.entry_of(name).map(|e| &e.source) {
+            Some(SkillSource::Dir(d)) => Some(d.as_path()),
+            _ => None,
+        }
+    }
+
+    /// Add a built-in skill UNLESS a disk skill of the same name already
+    /// exists (disk wins — the user's override of a shipped guide). Insertion
+    /// keeps the name-sorted order the scan established, so the intro list
+    /// stays deterministic.
+    pub fn insert_builtin(&mut self, e: SkillEntry) {
+        if self.entry_of(&e.name).is_some() {
+            return;
+        }
+        let pos = self
+            .entries
+            .partition_point(|x| x.name.as_str() < e.name.as_str());
+        self.entries.insert(pos, e);
     }
 }
 
@@ -193,7 +239,7 @@ pub fn scan(dirs: &[PathBuf]) -> (SkillIndex, Vec<String>) {
                 SkillEntry {
                     name: fm.name,
                     description: fm.description,
-                    dir: sub.clone(),
+                    source: SkillSource::Dir(sub.clone()),
                     license: fm.license,
                     compatibility: fm.compatibility,
                     allowed_tools: fm.allowed_tools,
@@ -213,6 +259,31 @@ pub fn scan(dirs: &[PathBuf]) -> (SkillIndex, Vec<String>) {
         index.entries.truncate(MAX_SKILLS);
     }
     (index, warnings)
+}
+
+/// Build an embedded (built-in) skill entry from a full `SKILL.md` text — the
+/// same frontmatter validation as the disk scan (name/description required,
+/// name charset rules, description ≤1024 chars), but no directory: the text is
+/// the whole skill and `read_skill` serves it directly. Returns `None` on
+/// malformed content; the caller skips with a warning (a broken built-in is a
+/// build bug, never a startup failure).
+pub fn embedded_entry(content: &str) -> Option<SkillEntry> {
+    let fm = parse_frontmatter(content)?;
+    if !valid_skill_name(&fm.name) {
+        return None;
+    }
+    if fm.description.chars().count() > 1024 {
+        return None;
+    }
+    Some(SkillEntry {
+        name: fm.name,
+        description: fm.description,
+        source: SkillSource::Embedded(content.to_string()),
+        license: fm.license,
+        compatibility: fm.compatibility,
+        allowed_tools: fm.allowed_tools,
+        metadata: fm.metadata,
+    })
 }
 
 /// Read at most [`SCAN_READ_CAP`] bytes, lossily decoded (the cap can split a
@@ -608,7 +679,10 @@ mod tests {
         let (idx, _) = scan(&[global.clone(), project.clone()]);
         let shared = idx.entries().iter().find(|e| e.name == "shared").unwrap();
         assert_eq!(shared.description, "PROJECT");
-        assert!(shared.dir.starts_with(&project));
+        assert!(matches!(
+            &shared.source,
+            SkillSource::Dir(d) if d.starts_with(&project)
+        ));
         // order is sorted by name (independent of readdir order)
         let names: Vec<&str> = idx.entries().iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["only-g", "shared"]);
@@ -720,7 +794,7 @@ mod tests {
             entries.push(SkillEntry {
                 name: format!("skill-{i:03}"),
                 description: "x".repeat(1024),
-                dir: PathBuf::from("/x"),
+                source: SkillSource::Dir(PathBuf::from("/x")),
                 ..Default::default()
             });
         }
@@ -737,7 +811,7 @@ mod tests {
             entries: vec![SkillEntry {
                 name: "a".into(),
                 description: "d".into(),
-                dir: PathBuf::from("/x"),
+                source: SkillSource::Dir(PathBuf::from("/x")),
                 ..Default::default()
             }],
         };
@@ -836,7 +910,7 @@ mod tests {
             entries: vec![SkillEntry {
                 name: "deploy".into(),
                 description: "ship it".into(),
-                dir: PathBuf::from("/x/deploy"),
+                source: SkillSource::Dir(PathBuf::from("/x/deploy")),
                 ..Default::default()
             }],
         };
@@ -852,12 +926,60 @@ mod tests {
             entries: vec![SkillEntry {
                 name: "x".into(),
                 description: "y".into(),
-                dir: PathBuf::from("/x"),
+                source: SkillSource::Dir(PathBuf::from("/x")),
                 ..Default::default()
             }],
         };
         let out = render_intro(None, &idx);
         assert!(out.starts_with("## 可用技能"));
+    }
+
+    #[test]
+    fn embedded_entry_parses_and_validates() {
+        let e = embedded_entry("---\nname: run-code\ndescription: guide\n---\nbody")
+            .expect("valid built-in content should parse");
+        assert_eq!(e.name, "run-code");
+        assert_eq!(e.description, "guide");
+        assert!(matches!(e.source, SkillSource::Embedded(_)));
+        // Same validation rules as the disk scan.
+        assert!(embedded_entry("---\ndescription: no name\n---\n").is_none());
+        assert!(embedded_entry("---\nname: bad name\ndescription: d\n---\n").is_none());
+        let over = "x".repeat(1025);
+        assert!(embedded_entry(&format!("---\nname: a\ndescription: {over}\n---\n")).is_none());
+    }
+
+    #[test]
+    fn insert_builtin_respects_disk_override_and_order() {
+        let disk = SkillEntry {
+            name: "run-code".into(),
+            description: "FROM DISK".into(),
+            source: SkillSource::Dir(PathBuf::from("/x/run-code")),
+            ..Default::default()
+        };
+        let mut idx = SkillIndex::from_entries(vec![disk]);
+        idx.insert_builtin(
+            embedded_entry("---\nname: run-code\ndescription: built-in\n---\nb").unwrap(),
+        );
+        // Disk wins: the built-in is a no-op.
+        assert_eq!(idx.entry_of("run-code").unwrap().description, "FROM DISK");
+
+        // Without a clash the built-in lands, in name-sorted position.
+        let mut idx = SkillIndex::from_entries(vec![SkillEntry {
+            name: "zeta".into(),
+            description: "z".into(),
+            ..Default::default()
+        }]);
+        idx.insert_builtin(
+            embedded_entry("---\nname: alpha\ndescription: built-in\n---\nb").unwrap(),
+        );
+        let names: Vec<&str> = idx.entries().iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "zeta"]);
+        assert!(matches!(
+            idx.entry_of("alpha").unwrap().source,
+            SkillSource::Embedded(_)
+        ));
+        // An embedded skill has no directory.
+        assert!(idx.dir_of("alpha").is_none());
     }
 
     #[test]

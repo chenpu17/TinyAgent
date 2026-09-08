@@ -270,6 +270,87 @@ impl McpServerConfig {
     }
 }
 
+/// `run_code` tool configuration (design docs/run_code_design.md §9). Plain
+/// data living on every [`Config`] regardless of the `code` cargo feature, so
+/// configs round-trip identically on builds without it — the tool itself only
+/// exists behind `--features code`. The deny/fs lists and the call limit are
+/// enforced by the M2 interception layer; the wall clock is the remaining M3
+/// item.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CodeConfig {
+    /// Off by default (design D15): enabling `run_code` is an explicit trust
+    /// decision — compiled in but not switched on, the model does NOT get
+    /// "loop + code execution" as ambient capability.
+    pub enabled: bool,
+    /// Glob patterns (workdir-relative; `*` stays inside a segment, `**`
+    /// crosses) that the 4 file tools refuse for guest-originated calls.
+    /// Guards model MISREADING (e.g. "back up my env file"), not a hostile
+    /// guest — shell passes `cat .env` straight through (design §7).
+    pub deny_paths: Vec<String>,
+    /// Empty = the whole workdir is writable by guest write_file/edit_file;
+    /// otherwise only these dirs (wholesale replacement, not additive).
+    pub fs_write_dirs: Vec<String>,
+    /// 单次 run_code 执行的工具调用上限（每次调用独立计满，不跨次累计）。
+    /// 默认 200（TinyAgentBench AppWorld 校准，2026-09）：真实批量任务的
+    /// 金标方案在 91–244 次 API 调用区间，50 连"先摸元数据再批量写"的
+    /// 两阶段打法都装不下（实测 agent 在摸底盘点阶段触顶、正事零执行）；
+    /// 200 覆盖多数单阶段任务，更大的活由报错文案引导分批续跑。
+    pub max_tool_calls: u32,
+    pub mem_mb: u32,
+    /// Wall-clock cap; 0 = none (fuel/memory still bound the run). Enforcement
+    /// (epoch + entry checks) lands in M3 — parsed from M1.
+    pub timeout_secs: u64,
+    /// Deterministic-execution fuel budget (wasmtime fuel). M1 calibration:
+    /// 1e9 ≈ 11.6s of pure interpreter loop on a debug build (~8.7e7 fuel/s;
+    /// release faster). Default 5e9 (v2 P2 A/B evidence): a 2.5 MB readAll
+    /// (117k lines → guest JSON parse + array build) exceeds 1e9, killing the
+    /// documented "整读常见数据文件" path on first attempt — 5e9 covers it
+    /// and stays well under the default timeout_secs=120.
+    pub fuel: u64,
+    /// Result cap in CHARS (same unit as `limits.max_output_chars`).
+    pub max_result_chars: usize,
+}
+
+impl Default for CodeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            deny_paths: default_deny_paths(),
+            fs_write_dirs: Vec::new(),
+            max_tool_calls: 200,
+            mem_mb: 256,
+            timeout_secs: 120,
+            fuel: 5_000_000_000,
+            max_result_chars: 60_000,
+        }
+    }
+}
+
+/// Default `deny_paths` (design §7): modern secret/credential shapes. Nested
+/// `.aws` needs its own entry — `**/.aws/**` does not match the directory
+/// itself at the workdir root.
+fn default_deny_paths() -> Vec<String> {
+    [
+        ".env*",
+        "**/.env*",
+        "**/id_rsa*",
+        "**/id_ed25519*",
+        "**/id_ecdsa*",
+        "**/*.pem",
+        "**/.git/**",
+        // linked worktrees carry `.git` as a FILE, not a directory
+        "**/.git",
+        "**/.git-credentials",
+        "**/.netrc",
+        ".aws/**",
+        "**/.aws/**",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -319,6 +400,10 @@ pub struct Config {
     /// reject unknown ones. `None` = server default.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// `run_code` sandbox config (plain data — parses on any build; the tool
+    /// itself requires the `code` cargo feature, design §9).
+    #[serde(default)]
+    pub code: CodeConfig,
 }
 
 /// Canonicalize + validate a workdir (must exist and be a directory). Shared
@@ -399,6 +484,7 @@ impl Config {
             mcp_servers,
             reasoning_effort,
             inject_environment,
+            code,
         } = p;
         if let Some(v) = provider {
             self.provider = v;
@@ -471,6 +557,15 @@ impl Config {
         if let Some(v) = mcp_servers {
             self.mcp_servers = v;
         }
+        if let Some(pc) = code {
+            if pc.enabled.is_some() {
+                anyhow::bail!(
+                    "task file must not set code.enabled — untrusted fragments \
+                     cannot switch the sandbox on or off"
+                );
+            }
+            self.code.merge_partial(pc);
+        }
         Ok(())
     }
 }
@@ -493,6 +588,7 @@ pub struct PartialConfig {
     pub mcp_servers: Option<Vec<McpServerConfig>>,
     pub reasoning_effort: Option<String>,
     pub inject_environment: Option<bool>,
+    pub code: Option<PartialCodeConfig>,
 }
 
 impl PartialConfig {
@@ -523,6 +619,10 @@ impl PartialConfig {
             mcp_servers,
             reasoning_effort: _,
             inject_environment: _,
+            // `code` is soft: its sub-fields each have a clamp/merge policy
+            // in CodeConfig::merge_partial (§9), and the one that isn't
+            // (enabled) is rejected by Config::apply → bad_task.
+            code: _,
         } = self;
         if provider.is_some() {
             return Some("provider");
@@ -546,6 +646,69 @@ impl PartialConfig {
             return Some("mcp_servers");
         }
         None
+    }
+}
+
+/// Batch-overlay shape for [`CodeConfig`] (design §9): every field optional.
+/// The merge is per-field — an untrusted fragment can only TIGHTEN — and
+/// `enabled` never reaches the merge (Config::apply rejects its presence
+/// outright: untrusted input may not switch the sandbox on or off).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PartialCodeConfig {
+    pub enabled: Option<bool>,
+    pub deny_paths: Option<Vec<String>>,
+    pub fs_write_dirs: Option<Vec<String>>,
+    pub max_tool_calls: Option<u32>,
+    pub mem_mb: Option<u32>,
+    pub timeout_secs: Option<u64>,
+    pub fuel: Option<u64>,
+    pub max_result_chars: Option<usize>,
+}
+
+impl CodeConfig {
+    /// §9 merge table. Exhaustive destructure (no `..`): a field added to
+    /// [`PartialCodeConfig`] without a policy here is a compile error — the
+    /// same anti-fossil discipline as `PartialLimits`.
+    fn merge_partial(&mut self, p: PartialCodeConfig) {
+        let PartialCodeConfig {
+            enabled: _, // rejected by Config::apply before we get here
+            deny_paths,
+            fs_write_dirs,
+            max_tool_calls,
+            mem_mb,
+            timeout_secs,
+            fuel,
+            max_result_chars,
+        } = p;
+        if let Some(v) = deny_paths {
+            // Union — a fragment can only ADD denials. Sort+dedup (plain
+            // `dedup` only collapses ADJACENT copies, so a duplicate added by
+            // a fragment would survive it); order is semantically inert for a
+            // match list and sorted output keeps configs diffable.
+            self.deny_paths.extend(v);
+            self.deny_paths.sort();
+            self.deny_paths.dedup();
+        }
+        if let Some(v) = fs_write_dirs {
+            // Intersection with EMPTY = "whole workdir writable" as the
+            // universe element (中-6: semantics must not flip based on
+            // whether the value came from the default or an explicit
+            // config): either side empty → the other side; both non-empty →
+            // entry-wise intersection (may be empty — tightened to
+            // nowhere-writable, a legal end state).
+            if self.fs_write_dirs.is_empty() {
+                self.fs_write_dirs = v;
+            } else if !v.is_empty() {
+                let frag: std::collections::HashSet<_> = v.iter().collect();
+                self.fs_write_dirs.retain(|d| frag.contains(d));
+            }
+        }
+        self.max_tool_calls = Clamp::Tighten.merge(self.max_tool_calls, max_tool_calls);
+        self.mem_mb = Clamp::Tighten.merge(self.mem_mb, mem_mb);
+        self.timeout_secs = Clamp::TightenOrInit.merge(self.timeout_secs, timeout_secs);
+        self.fuel = Clamp::Tighten.merge(self.fuel, fuel);
+        self.max_result_chars = Clamp::Tighten.merge(self.max_result_chars, max_result_chars);
     }
 }
 
@@ -1135,5 +1298,125 @@ mod tests {
         );
         assert_eq!(cfg.limits.stream_idle_secs, 9, "Tighten field must land");
         assert_eq!(cfg.limits.shell_timeout_secs, 10, "Replace field must land");
+    }
+
+    /// §9 per-field merge strategies for `code` fragments — the §13-18-style
+    /// vector table: enabled is REJECTED (untrusted fragments cannot switch
+    /// the sandbox), deny_paths unions+dedups, fs_write_dirs intersects with
+    /// empty-as-universe semantics, and the numeric knobs clamp per their
+    /// declared Clamp variant.
+    #[test]
+    fn code_fragment_merge_strategies() {
+        let base: Config = serde_json::from_str(
+            r#"{"provider":"anthropic","api_key_env":"K","model":"m","inject_environment":false,
+                "code":{"enabled":true,"deny_paths":[".env","secrets/**"],
+                "fs_write_dirs":["src","docs"],"max_tool_calls":50,
+                "timeout_secs":120,"fuel":1000000000}}"#,
+        )
+        .unwrap();
+
+        // `enabled` present in ANY form → bad_task (even `true == base`).
+        for enabled in ["true", "false"] {
+            let frag: PartialConfig =
+                serde_json::from_str(&format!(r#"{{"code":{{"enabled":{enabled}}}}}"#)).unwrap();
+            let err = base.clone().apply(frag).unwrap_err().to_string();
+            assert!(
+                err.contains("code.enabled"),
+                "enabled presence must be rejected: {err}"
+            );
+        }
+
+        let frag: PartialConfig = serde_json::from_str(
+            r#"{"code":{"deny_paths":[".env","logs/**"],"fs_write_dirs":["src","out"],
+                "max_tool_calls":10,"mem_mb":64,"timeout_secs":30,
+                "fuel":500000000,"max_result_chars":2000}}"#,
+        )
+        .unwrap();
+        let mut cfg = base.clone();
+        cfg.apply(frag).unwrap();
+        let c = &cfg.code;
+        // Union with dedup (.env already present).
+        let mut deny = c.deny_paths.clone();
+        deny.sort();
+        assert_eq!(deny, [".env", "logs/**", "secrets/**"]);
+        // Intersection: ["src","docs"] ∩ ["src","out"] = ["src"].
+        assert_eq!(c.fs_write_dirs, ["src"]);
+        // Tighten / TightenOrInit.
+        assert_eq!(c.max_tool_calls, 10, "Tighten takes the smaller");
+        assert_eq!(c.mem_mb, 64, "Tighten takes the smaller");
+        assert_eq!(
+            c.timeout_secs, 30,
+            "TightenOrInit takes the smaller of two finite values"
+        );
+        assert_eq!(c.fuel, 500_000_000, "Tighten takes the smaller");
+        assert_eq!(c.max_result_chars, 2000, "Tighten takes the smaller");
+
+        // Tighten has NO 0-sentinel: a fragment 0 is the tightest value and
+        // shuts the knob off entirely (fuel=0 / max_tool_calls=0 = the guest
+        // cannot run / cannot call tools) — untrusted fragments may only
+        // tighten, and "off" is the tightest.
+        let frag: PartialConfig =
+            serde_json::from_str(r#"{"code":{"fuel":0,"max_tool_calls":0}}"#).unwrap();
+        let mut cfg = base.clone();
+        cfg.apply(frag).unwrap();
+        assert_eq!(cfg.code.fuel, 0, "Tighten: fragment 0 wins");
+        assert_eq!(cfg.code.max_tool_calls, 0, "Tighten: fragment 0 wins");
+
+        // fs_write_dirs universe semantics: fragment empty → base kept;
+        // base empty → fragment adopted (default = whole workdir writable).
+        let frag: PartialConfig = serde_json::from_str(r#"{"code":{"fs_write_dirs":[]}}"#).unwrap();
+        let mut cfg = base.clone();
+        cfg.apply(frag).unwrap();
+        assert_eq!(
+            cfg.code.fs_write_dirs,
+            ["src", "docs"],
+            "empty fragment = universe"
+        );
+        let mut cfg: Config =
+            serde_json::from_str(r#"{"provider":"anthropic","api_key_env":"K","model":"m"}"#)
+                .unwrap();
+        let frag: PartialConfig =
+            serde_json::from_str(r#"{"code":{"fs_write_dirs":["only"]}}"#).unwrap();
+        cfg.apply(frag).unwrap();
+        assert_eq!(cfg.code.fs_write_dirs, ["only"], "empty base = universe");
+
+        // Disjoint intersection may legally empty out (tightened to
+        // nowhere-writable — writes then all fail, reads still pass).
+        let frag: PartialConfig =
+            serde_json::from_str(r#"{"code":{"fs_write_dirs":["nowhere"]}}"#).unwrap();
+        let mut cfg = base;
+        cfg.apply(frag).unwrap();
+        assert_eq!(cfg.code.fs_write_dirs, Vec::<String>::new());
+
+        // timeout_secs TightenOrInit: fragment 0 (no limit) is the LOOSEST
+        // value — ignored over a finite base.
+        let mut cfg: Config = serde_json::from_str(
+            r#"{"provider":"anthropic","api_key_env":"K","model":"m",
+                "code":{"timeout_secs":60}}"#,
+        )
+        .unwrap();
+        let frag: PartialConfig = serde_json::from_str(r#"{"code":{"timeout_secs":0}}"#).unwrap();
+        cfg.apply(frag).unwrap();
+        assert_eq!(
+            cfg.code.timeout_secs, 60,
+            "fragment 0 = no limit = loosest, ignored"
+        );
+
+        // u64::MAX is a finite value; TightenOrInit only adopts it over a 0
+        // (no-limit) base — exactly how an untrusted batch fragment can land
+        // it. The sandbox must then degrade it to "no wall clock" (checked
+        // add, see run_code::huge_timeout_secs_degrades_to_no_wall_clock) —
+        // the merge must at least accept it without panicking. Over the
+        // finite default (120) the fragment is the LOOSER value and is
+        // ignored, MAX never even reaches the sandbox.
+        let mut cfg: Config = serde_json::from_str(
+            r#"{"provider":"anthropic","api_key_env":"K","model":"m",
+                "code":{"timeout_secs":0}}"#,
+        )
+        .unwrap();
+        let frag: PartialConfig =
+            serde_json::from_str(r#"{"code":{"timeout_secs":18446744073709551615}}"#).unwrap();
+        cfg.apply(frag).unwrap();
+        assert_eq!(cfg.code.timeout_secs, u64::MAX);
     }
 }

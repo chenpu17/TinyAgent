@@ -9,6 +9,7 @@
 - **图片输入**：`--image` 参数或 `load_image` 工具（png / jpeg / gif / webp，base64）
 - **PDF 文档输入**：库侧 `Block::Document`（Anthropic 原生 `document` block，逐页"转图 + 抽取文本"处理；`load_document_block` 读取 + `push_user` 推入）
 - **精炼工具集**：`shell`、`read_file`、`write_file`、`edit_file`、`list_dir`、`task`（子 agent；同 turn 多调用并行）、`todo`（任务计划，落进 result.json 的 `plan` 字段）默认启用；`load_image`（视觉）需在 `tools` 显式加入。均可在 config 的 `tools` 里裁剪
+- **沙箱 JS 执行（可选 `code` feature）**：`run_code` 工具让模型在进程内 wasm 沙箱（QuickJS-in-wasm）里写 JS 编排既有工具——能力构造性收敛（无网络 / 无文件系统直访，工具调用全走 hooks 闸门），fuel / 墙钟 / 内存 / 调用数四重限额；两层开关（feature + `code.enabled`）默认都关
 - **Harness 契约**：`--output result.json` 写结构化结果（含 token 用量、每次工具调用的 input/output），`--json` 流式 NDJSON；exit code 语义化（`0` 成功 / `124` 超时 / `130` 取消 / `1` 其它），可直接进 CI / 评测 pipeline
 - **CLI 覆盖**：`--model` / `--max-turns` / `--timeout` 免改配置做 A/B 对照
 - **批量任务**：`--batch <dir>` 并发跑一组任务片段，`--retries` 对 transient 失败指数退避重试，`--failed` 只重跑上一轮失败的任务并合并进完整报告
@@ -161,6 +162,10 @@ a = tiny_agent.Agent("chat.json", provider=echo_provider)  # 无 api_key
 
 非流式 v1：返回整段文本，作为单条 delta 发出；不支持 tool_use（需要工具调用请用内置 provider + 自定义 `Tool`）。provider 抛异常会**诚实地 fail 该轮**。**取消 / 超时契约**：callable 在 GIL 内同步执行，`timeout_secs` 与取消**不会中断它**——agent 等它返回，可长时间运行的 provider 必须自行设限；预算与超时仍在轮次边界生效。
 
+**`run_code` 开关**（绑定默认不带 `code` feature，`maturin develop --features code` 编入）：`a.enable_code()`
+/ `a.disable_code()` 运行期开关、`a.set_code_config({...})` 整包替换 code 配置（dict 形状同配置文件的
+`code` 节，未知键报错、缺省键重置为默认值）。未编入该 feature 时三个方法返回带重建提示的明确错误。
+
 **Node.js / TypeScript（`import { chat, Agent }`，napi-rs）**
 
 ```sh
@@ -201,6 +206,10 @@ await a.run();
 ```
 
 与自定义工具同款 TSFN round-trip（JS 调 `resolveProvider(id, result)` 唤醒 worker）。非流式 v1：返回整段文本，作为单条 delta 发出；不支持 tool_use（需要工具调用请用内置 provider + 自定义 `Tool`）。provider 抛异常会**诚实地 reject 该轮**。worker 等待回调的上限取 `min(本次请求剩余预算, 120s)`——run 设了 `timeout_secs` 时永不超出预算（预算仍在轮次边界生效；同步阻塞的 host 代码本身无法被中断）。
+
+**`runCode` 开关**（绑定默认不带 `code` feature，`npm run build -- --features code` 编入）：`a.enableCode()`
+/ `a.disableCode()` 运行期开关、`a.setCodeConfig({...})` 整包替换 code 配置（对象形状同配置文件的
+`code` 节，未知键报错、缺省键重置为默认值）。未编入该 feature 时三个方法返回带重建提示的明确错误。
 
 ## 使用
 
@@ -470,6 +479,7 @@ let removed = agent.remove_mcp_server("web")?;   // 按 CONFIG name 删，返回
 - **撞名是可恢复错误**：新 server 的消毒名与现有任何工具（或新 server 内部）冲突 → `Err`，刚 spawn 的子进程随即被杀（回滚），Agent 状态与调用前完全一致——不会部分生效。启动路径同款撞名在构建时报错。
 - **不打印**：与启动时的 `mcp: … ready` 日志不同，热增删全程无输出（宿主可能在 raw-mode TUI 下打印会花屏），成败只看返回值。
 - **`task` 子 agent 不感知**：`task` 工具持构造期 MCP 快照，热增的 server 对本 Agent 生命周期内任何时点 spawn 的子 agent 都不可见（共享该槽位留给后续版本）。移除一个仍被子 agent 快照持有的 server 时，连接活到最后一个持有者释放。
+- **`run_code` guest registry 同样不感知**（`code` feature）：沙箱内工具注册表按构造期快照惰性构建一次（跨克隆共享缓存），与 `task` 子 agent 同一条文档化边界——热增的 server 在 JS 里看不到；热删的 server 仍可被已构建的 registry 调用（连接活到 registry 释放，最坏在退出时等满一次 MCP 调用超时后由 Drop 杀进程组，不残留孤儿）。需要沙箱与热增删严格同步的宿主，重建 Agent 而非热增删。
 - **remove 按配置名**：`remove_mcp_server("web")` 的参数是 `McpServerConfig.name`，不是消毒后的 `mcp_web_search` 展示名；没有该 server 的工具时返回 `Err`（拼写错误不会静默无操作）。stdio 子进程在最后一个持有者 drop 时被同步杀掉（进程组），不残留孤儿。
 - **shutdown 联动**：若已调过 `set_shutdown`（会话结束 teardown），热增的工具自动挂上同一 reaper——临近退出时增的 server 不会被遗留。
 - 同款 `&mut self` 顺序契约：run 持有借用，「轮次间调用」由借用检查器强制（见「[库 API](#库-api程序化调用)」的热更新段）。
@@ -555,6 +565,7 @@ tiny-agent --config examples/web-search.json --task "搜一下 Anthropic 最近�
   "inject_environment": true,
   "tools": ["shell", "read_file", "write_file", "edit_file", "list_dir", "load_image"],
   "mcp_servers": [],
+  "code": {"enabled": false},
   "reasoning_effort": "可选，思考程度字符串原样透传（none/low/medium/high/xhigh/max），不校验",
   "limits": {
     "max_turns": 30,
@@ -683,7 +694,7 @@ skill 扫描读取 64KiB 等）：不可信的 server / 目录最多拖慢，不
 TinyAgent 的定位是**可审计、可无人值守的 agent 执行单元**——一个跑完一定留下完整、诚实、机器可读账单的一次性进程。下面这些方向与该定位冲突，明确不做（把力气挡在护城河上）：
 
 - **不做 `--serve` / HTTP 服务模式**：长驻、多租户、鉴权是另一个产品，与"一次性执行单元"直接冲突。要集成的用户用 `--json`（NDJSON 流）+ exit code 包一层即可。
-- **不自建沙箱 / 命令过滤**：半吊子过滤只制造虚假安全感。隔离的官方答案是**在容器或受限用户下运行**（见上文安全说明）。（库 API 的 Hooks 拦截层是给嵌入方接自己的审批/策略系统用的编译期扩展点，不是内置安全边界——威胁模型见 `src/hooks.rs`。）
+- **不给 `shell` 自建沙箱 / 命令过滤**：半吊子命令过滤只制造虚假安全感，隔离的官方答案仍是**在容器或受限用户下运行**（见上文安全说明）。（`run_code` 不在此列也不破此例：它是 wasm **能力构造性**沙箱——不是给既有工具套过滤器，而是新建一个“没有授予就没有能力”的执行面，网络 / 文件系统在 guest 里根本不存在，见上文专节。库 API 的 Hooks 拦截层是给嵌入方接自己的审批/策略系统用的编译期扩展点，不是内置安全边界——威胁模型见 `src/hooks.rs`。）
 - **不做插件系统**：工具是编译期的内置 + MCP，不引入运行时加载。（Hooks 与工具能力标记同理：编译期 trait 扩展，不加载动态代码。）
 - **TUI 保持极简定位**：交互体验对齐主流终端 AI 工具（键位、浅色适配、结果查看等基础体验保证可用），但不做全屏 / 鼠标托管 / 主题系统这类结构性扩张——它是 dogfooding / 演示工具，对标全职迭代的 Claude Code / Codex，追平是负 ROI。
 
@@ -765,13 +776,14 @@ GUI 可渲染"正在构造调用…"（headless 终端不重复打印——完�
 | 工具 | 说明 |
 |---|---|
 | `shell` | 在工作目录执行命令（sh -c / cmd /C），超时后 kill 整个进程组（默认 120s，`limits.shell_timeout_secs` 可调、0=不限），输出有界读取并按 `max_output_chars` 截断；命令留下的、仍持有输出管道的后台进程在 2s 宽限后被回收并标注（想留后台进程运行请重定向其输出：`cmd >log 2>&1 &`，不持管道即不受影响） |
-| `read_file` | 读文本文件，带行号，支持 offset/limit；流式读取，超大文件不会整段进内存 |
+| `read_file` | 读文本文件，带行号，支持 offset/limit；流式读取，超大文件不会整段进内存；头部带 `[文件名: N 行 · M 字符]` 规模元数据；`format:"json"` 返回结构化 JSON（无前缀，带 totals/next_offset）、`raw:true` 返回 base64 字节窗（字节保真，供 run_code 沙箱读写二进制） |
 | `write_file` | 全量重写文件，自动创建父目录 |
 | `edit_file` | 精确替换：`old_string`→`new_string`，默认要求唯一匹配（`replace_all` 全替换）；匹配 0 或 >1 时报错引导补上下文，复用 `restrict_to_workdir` 沙箱 |
 | `list_dir` | 列目录，最多 500 条 |
 | `load_image` | 加载本地图片让模型"看到"（需视觉模型） |
 | `task` | 把一块工作委派给一个**子 agent**（独立上下文 + 独立 turn 预算），只把子 agent 的最终摘要作为结果返回，保持主上下文清爽。详见下节 |
 | `todo` | 记录/更新任务计划（全量替换语义，每次发完整列表），最终计划落进 result.json 的 `plan` 字段。模型可见的是可读 checklist，审计真相是结构化 input |
+| `run_code` | 在进程内 wasm 沙箱（QuickJS）执行 JS，代码经 `tools.call()` 编排本会话工具（可选 `code` feature + `code.enabled` 双开关，默认关；见下文专节） |
 
 ## 子 agent（`task` 工具）
 
@@ -811,6 +823,82 @@ GUI 可渲染"正在构造调用…"（headless 终端不重复打印——完�
 ] }
 ```
 
+## run_code（沙箱 JS 执行，可选 `code` feature）
+
+`run_code` 让模型把"需要循环 / 批量 / 多步数据处理"的逻辑写成一段 **JS**，在进程内的 wasm 沙箱
+（QuickJS 编译为 wasm、wasmtime 驱动，纯 Rust 宿主不碰 C 工具链）里执行——代码经 `tools.call()`
+回调 agent **既有**工具（文件工具、MCP 工具），一次调用完成本来要几十轮 shell + read_file 折腾的
+编排；而能力面是**构造性收敛**的：沙箱没有网络、没有系统调用、没有文件系统直访，能触达的世界 =
+被授予的工具 + 配置允许的路径。
+
+**两层开关，默认都关**（信任与体积各自独立把关）：
+
+1. **编译期**：`cargo build --features code`（wasmtime + 嵌入的 quickjs.wasm 资产，musl 静态构建同样可用）；
+   模块机器码经磁盘缓存复用（`$XDG_CACHE_HOME` 或 `$HOME/.cache` 下的 `tinyagent/wasmtime/`，新进程
+   不再重付懒编译；目录不可用时静默降级为无缓存）；
+2. **运行期**：`"code": {"enabled": true}`——feature 编入但未开启时 `run_code` 不进工具表，模型不可见、零 schema 成本。
+
+```json
+"code": {
+  "enabled": true,
+  "deny_paths": [".env", "secrets/**"],
+  "fs_write_dirs": [],
+  "max_tool_calls": 200,
+  "mem_mb": 256,
+  "timeout_secs": 120,
+  "fuel": 5000000000,
+  "max_result_chars": 60000
+}
+```
+
+| 字段 | 默认 | 语义 |
+|---|---|---|
+| `enabled` | `false` | 运行期开关；`run_code` 不在 `tools` 白名单语义内（开关即 membership，见下） |
+| `deny_paths` | `.env`、密钥类目录等 | **经工具的**文件读写拒绝清单（glob：`*` 单段、`**` 跨段），定位**防误读不防恶意** |
+| `fs_write_dirs` | `[]` = 整个 workdir 可写 | 经工具的写路径白名单（相对 workdir；交集语义，可收紧到无处可写） |
+| `max_tool_calls` | 200 | 沙箱内工具调用次数上限（含失败调用）。AppWorld 高循环任务实证：金标方案 91–244 次调用，旧默认 50 连"先摸元数据再批量写"的两阶段打法都装不下（实测摸底阶段即触顶、正事零执行） |
+| `timeout_secs` | 120 | 墙钟；`0` = 无墙钟（仍受 cancel / fuel / mem 约束） |
+| `fuel` | 5e9 | 指令预算（纯计算循环；debug 构建实测 ≈ 11.6s/1e9，release 更快）。默认 5e9 的依据：v2 P2 A/B 实测 2.5 MB 文件 `readAll` 整读（guest 内 JSON 解析 + 建数组）超 1e9，首试即 fuel 耗尽、靠模型重试自救；5e9 覆盖该场景且仍低于默认 `timeout_secs=120` |
+| `mem_mb` | 256 | 沙箱线性内存上限 |
+| `max_result_chars` | 60000 | 返回值 + console 日志总尺寸（字符口径；超限截断日志、保返回值） |
+
+**沙箱内环境**：纯同步 ES2023——无 async/Promise/timer/`import`/`fetch`，`Date.now`/`Math.random`
+不可用（评测可复现）。API 五个：`tools.call(name, args)`（失败 throw、可 try/catch 后继续，异常带
+结构化字段 `e.kind`/`e.tool`/`e.retryable`——`denied`/`hooks`/`budget`/`deadline`/`unknown_tool`
+类重试无意义，工具自身失败为 `tool` 类且刻意不给 retryable，由模型读 message 自行判断）、
+`tools.list()`（不确定工具名时先调它）、`tools.budget()`（剩余调用次数 / 墙钟 / 燃料 / run 级
+token 预算 `tokens_left`——未设 `max_total_tokens` 时为 null；查询本身免费，长批量开工前对一下
+额度）、`console.log(...)`（实时透出 + 随结果返回）、
+`copy_bytes(src, dst)`（经 `tools.call`：host 流式**字节保真复制**，二进制 / 非 UTF-8 / 大文件
+逐字节一致，内容不经过 JS 字符串）。另有三个内置助手（`readAll(path)` / `readLines(path)` /
+`writeVerified(path, content)`）：大文件整读 / 逐行读 / 字节保真写（写后 raw 读回比对，不经文本
+往返），底层就是 `read_file` 的 `format:"json"` 分页与 `raw`/`content_b64` 字节通道——此外没有
+别的内置助手。工具描述刻意保持精简
+（封闭助手清单 + 指针），深契约与完整示例在**内置技能 `run-code`** 里（`code.enabled` 时自动出现在
+技能列表、经 `read_skill` 按需加载；在自己的技能目录放同名 `run-code/` 可覆盖它）。**可调工具集** =
+主 agent 的工具白名单（含 MCP），但不含 `task` / `todo` / `run_code` 自身；宿主经 `build_agent_with`
+注入的自定义工具**默认对沙箱不可见**，逐工具用 `CallbackTool::with_code_access()` 显式授权后才进
+`tools.call` 面（第三方 `Tool` 实现同理覆写 `available_to_code()`，默认 false）；每次内部调用走与外层
+**完全相同的 hooks 闸门**（`__code__` 身份标记，可在钩子里单独决策）。
+
+**资源终止与诚实边界**：任一限额超限即强制终止，错误消息带来源标记（cancel / deadline / fuel /
+mem 四路独立）；`_initialize` / 编译阶段的错误同样归因。在飞的内部工具调用**不可**被外层超时打断
+（对齐 `timeout_secs` 软上限口径）——总墙钟 ≤ `timeout_secs` + 最后一次在飞调用自身的上限。内部调用
+不进外层 `tool_calls` 明细，但逐调用摘要（工具名 / 耗时 / 入参哈希）、`fuel_used`、终止原因挂进
+`result.json` 对应条目的 `meta` 字段；内部工具 usage 折进 `run_code` 自身账单（诚实成本）。
+
+**与安全说明的关系**：`shell` 仍是无过滤直通（容器是它的答案，`run_code` 不改变这一点）；`run_code`
+是另一条轴——**不给模型新能力**，只把"模型已有的工具能力"装进一个可限额、可审计的编排层。注意
+`deny_paths` 只拦**经文件工具**的访问：若 `shell` 在白名单里，沙箱代码经 `tools.call("shell", …)`
+仍可达任意路径——要硬隔离请从 `tools` 去掉 `shell`（或配合 `restrict_to_workdir`）。批量任务片段可
+覆盖 `code` 子字段但**只能收紧**：`enabled` 出现即整个任务拒收（`bad_task`），数值字段取 min、
+`deny_paths` 并集、`fs_write_dirs` 交集。
+
+库 / 绑定宿主另有运行期 API：Rust `Agent::set_code_config` / `set_code_enabled`（热更新面，轮次间
+生效）；Python `enable_code()` / `disable_code()` / `set_code_config({...})`；Node `enableCode()` /
+`disableCode()` / `setCodeConfig({...})`（绑定各自带默认关闭的 `code` 转发 feature——未编入时这些
+方法返回明确的重建提示错误，而不是静默无操作）。
+
 ## Skill（技能）
 
 Skill 是可命名、按需加载的**指令/知识包**：把"怎么做某类任务"的步骤、脚本、参考资料打包成
@@ -825,6 +913,8 @@ https://agentskills.io/specification)——三级渐进式披露、6 字段 fron
 
 - 全局：`~/.config/tinyagent/skills/`（或 `$XDG_CONFIG_HOME/tinyagent/skills/`）——个人通用技能。
 - 项目：`<工作目录>/.tinyagent/skills/`——随仓库分发、团队共享。
+- 内置：二进制内嵌的技能（目前仅 `code` feature 启用时的 `run-code`，即 run_code 沙箱的完整用法指南）——
+  只在对应功能开启时出现在列表里，磁盘同名技能目录可覆盖它。
 
 每个技能是该目录下的一个**子目录**，至少含一个 `SKILL.md`，可按约定放资源子目录：
 
@@ -921,6 +1011,8 @@ tool whitelist`。真正的"按轮临时预批准"需要每轮权限/激活层�
 cargo test --features tui,mock   # 单元测试（含 TUI 输入/渲染逻辑 + lib_api 集成测试）
 cargo clippy --features tui --all-targets   # lint（TUI 版）
 cargo clippy --all-targets                 # lint（headless 版）
+cargo test --features code,mock            # run_code 沙箱套件（改 run_code.rs 必跑）
+cargo clippy --features code --all-targets # lint（code 版——run_code.rs 在 feature 后，上面两个看不到）
 
 # 无 API key 的端到端冒烟测试：
 python3 examples/mock_openai.py 8791 &      # OpenAI 兼容 SSE mock
@@ -948,6 +1040,12 @@ release 下 panic 不触发 `Drop`——调试 destructors（如 TUI 终端还�
    （`.github/workflows/release.yml`：musl x86_64 静态二进制 + sha256 上传 GitHub Releases，
    附自动生成的 release notes）。gitee 侧 `git push origin --tags` 同步标签。
 
+   **产物带 `code` feature**（0.3.x 起）：musl 二进制编译入 run_code 沙箱
+   （较无 feature 版 +≈4.6 MiB），但运行期开关 `code.enabled` 默认关——
+   config 显式写 `"code": {"enabled": true}` 才暴露给模型（红线：被注入模型
+   默认不获得"循环 + 代码执行"能力，见 run_code 专节）。要更小体积的自建
+   用户去掉 `--features code` 即可（约 2.7 MiB）。
+
 ## 代码结构
 
 ```
@@ -970,6 +1068,7 @@ src/
 │   ├── mcp.rs   (261) #   MCP 工具包装（sanitize_name + wire_name 分发）
 │   ├── subagent.rs(571) # task 子 agent 工具（独立上下文 + turn 封顶；不可递归；事件转发 + usage 折算 + 审计 meta trace）
 │   └── todo.rs  (286) # todo 工具（任务计划，全量替换；plan 从 records 派生落 result.json）
+│   └── run_code.rs (~2900) # run_code 工具（feature `code`）：QuickJS-in-wasm 沙箱——epoch/fuel/mem 限额、tools.call 回调经 hooks 闸门、审计 meta（双哈希）
 ├── mcp.rs      (802)   # MCP 客户端（stdio / Streamable HTTP / 旧版 SSE）
 ├── session.rs   (125)  # 会话持久化
 ├── batch.rs     (644)  # 批量任务 + --retries/--failed + 报告合并

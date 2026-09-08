@@ -510,3 +510,108 @@ test('never-resolving JS tool wait is bounded by the run budget, not 120s', asyn
   );
   assert.ok(elapsed < 60_000, `run must not wait the full 120s backstop (${elapsed}ms)`);
 });
+
+// ── N. runCode runtime switch (design §8.6; binding's `code` feature) ───────
+//
+// The binding's `code` cargo feature is OFF by default (the standard npm
+// artifact stays ~10MB lighter), so these tests adapt to whichever build they
+// run against: the default build must reject the three methods with the
+// rebuild hint (a clear error, never a silent no-op); a
+// `npm run build -- --features code` build must actually flip the tool
+// table / apply the config object.
+
+// Probe once at module scope (throwaway agent, custom provider → no network):
+// disableCode succeeds on a code build and leaves the switch in its default
+// OFF state; the default build raises the rebuild hint.
+const CODE_BUILT = (() => {
+  const workdir = fs.mkdtempSync(path.join(os.tmpdir(), 'ta-node-code-probe-'));
+  const cfgPath = path.join(workdir, 'config.json');
+  fs.writeFileSync(cfgPath, JSON.stringify({
+    provider: 'openai',
+    api_key_env: 'TA_NODE_UNUSED_KEY',
+    base_url: 'http://unused',
+    model: 'mock-model',
+    max_tokens: 256,
+    tools: [],
+    workdir,
+  }));
+  try {
+    new Agent(cfgPath, { provider: () => ({ text: 'x', stop_reason: 'end_turn' }) }).disableCode();
+    return true;
+  } catch {
+    return false;
+  } finally {
+    fs.rmSync(workdir, { recursive: true, force: true });
+  }
+})();
+
+test('runCode: default build rejects the switch methods with a rebuild hint', { skip: CODE_BUILT }, async (t) => {
+  const { cfgPath } = providerConfig(t);
+  const a = new Agent(cfgPath, { provider: () => ({ text: 'x', stop_reason: 'end_turn' }) });
+  assert.throws(() => a.enableCode(), /code` feature/);
+  assert.throws(() => a.disableCode(), /code` feature/);
+  assert.throws(() => a.setCodeConfig({ enabled: true }), /code` feature/);
+});
+
+test('runCode: enable/disable flips the model-visible tool table', { skip: !CODE_BUILT }, async (t) => {
+  const seen = [];
+  const { cfgPath } = providerConfig(t);
+  const a = new Agent(cfgPath, {
+    provider: (request) => {
+      seen.push(request.tools.map((tool) => tool.name));
+      return { text: 'done', stop_reason: 'end_turn' };
+    },
+  });
+  a.disableCode(); // deterministic OFF start (the probe left it off already)
+  a.pushUser('hi');
+  await a.run();
+  assert.ok(!seen[0].includes('run_code'), 'off by default (D15)');
+  a.enableCode();
+  a.pushUser('hi');
+  await a.run();
+  assert.ok(seen[1].includes('run_code'), 'enableCode surfaces the tool');
+  a.disableCode();
+  a.pushUser('hi');
+  await a.run();
+  assert.ok(!seen[2].includes('run_code'), 'disableCode removes it again');
+});
+
+test('runCode: setCodeConfig applies the dict; unknown keys error', { skip: !CODE_BUILT }, async (t) => {
+  const seen = [];
+  const { cfgPath } = providerConfig(t);
+  const a = new Agent(cfgPath, {
+    provider: (request) => {
+      seen.push(request.tools.map((tool) => tool.name));
+      return { text: 'done', stop_reason: 'end_turn' };
+    },
+  });
+  a.disableCode();
+  // The object goes through the same serde shape as the config file's "code"
+  // section — a typo'd key errors instead of being silently ignored.
+  assert.throws(() => a.setCodeConfig({ enabled: true, timeout_sec: 5 }), /unknown field/);
+  a.setCodeConfig({ enabled: true });
+  a.pushUser('hi');
+  await a.run();
+  assert.ok(seen[0].includes('run_code'), 'setCodeConfig drives the switch too');
+});
+
+test('runCode: busy error when called during run(); works again after (A-10c)', { skip: !CODE_BUILT }, async (t) => {
+  // The code methods ride the same try_lock path as the other sync methods:
+  // called from the provider callback (which runs on the JS thread while the
+  // run holds the agent lock on its worker thread) they must throw the busy
+  // error — blocking would freeze the event loop the round-trip depends on.
+  const { cfgPath } = providerConfig(t);
+  let busyErr = null;
+  const a = new Agent(cfgPath, {
+    provider: () => {
+      try { a.enableCode(); } catch (e) { busyErr = e.message; }
+      return { text: 'done', stop_reason: 'end_turn' };
+    },
+  });
+  a.disableCode();
+  a.pushUser('hi');
+  await a.run();
+  assert.ok(busyErr && busyErr.includes('Agent.run() is active'), busyErr);
+  // After the awaited run resolves, the method works again.
+  a.enableCode();
+});

@@ -10,6 +10,14 @@ license = "MIT"
 name = "tiny_agent"
 crate-type = ["cdylib"]
 
+[features]
+default = []
+# Forwarding feature for the run_code sandbox (design §8.6): off by default so
+# standard wheels don't carry wasmtime (~10MB); building with it makes
+# enable_code()/disable_code()/set_code_config() functional — without it they
+# return a clear rebuild-hint error instead of silently no-op'ing.
+code = ["ta_core/code"]
+
 [dependencies]
 # The core library. Aliased to `ta_core` (and locally `use ta_core as ta;`) so
 # this crate's own lib name `tiny_agent` (the Python import) doesn't collide

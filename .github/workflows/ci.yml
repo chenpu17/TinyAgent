@@ -47,6 +47,24 @@ jobs:
       - run: cargo test
       - run: cargo test --features tui,mock
 
+  code:
+    # `code` feature（run_code 沙箱）门禁：第三个 clippy 配置——run_code.rs
+    # 与 agent.rs 的 set_code_* 在 #[cfg(feature="code")] 后，默认/tui 构建都
+    # 看不到（与 tui 同款盲区，单跑前两个 clippy 会漏）。测试带 mock 同时
+    # 跑到 lib_api 集成层。单独 job 而非并进 test 矩阵：wasmtime+cranelift
+    # 依赖树大，3 平台全量构建不划算——沙箱平台中立（quickjs.wasm 资产嵌入、
+    # 宿主纯 Rust），ubuntu 单平台钉住，对齐绑定层"先单平台"的先例。
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --features code --all-targets -- -D warnings
+      - run: cargo test --features code,mock
+
   python-binding:
     # 绑定测试只在 ubuntu 跑：绑定层从未在 Windows 验证过（三次 Windows
     # 修复全是核心代码），先不做 continue-on-error 的虚假信心，等手动
@@ -72,6 +90,10 @@ jobs:
           maturin develop
           python -m pytest tests/ -q
       - run: cargo clippy -p tiny-agent-py --all-targets -- -D warnings
+      # The `code` forwarding feature (run_code switch methods) must stay
+      # compiling; the behavioral tests for it run against a --features code
+      # build locally — the compile gate is the cheap CI equivalent.
+      - run: cargo clippy -p tiny-agent-py --features code --all-targets -- -D warnings
 
   node-binding:
     runs-on: ubuntu-latest
@@ -91,6 +113,8 @@ jobs:
           npm run build:debug
           npm test
       - run: cargo clippy -p tiny-agent-node --all-targets -- -D warnings
+      # `code` forwarding feature compile gate (same rationale as the python job).
+      - run: cargo clippy -p tiny-agent-node --features code --all-targets -- -D warnings
 
   musl:
     # 移植性冒烟：musl 静态构建是"嵌入式低配 Linux"定位的核心交付物，
@@ -104,6 +128,10 @@ jobs:
       - run: rustup target add x86_64-unknown-linux-musl
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --release --target x86_64-unknown-linux-musl
+      # code 变体冒烟：wasmtime+cranelift 纯 Rust 静态链接（quickjs.wasm 资产
+      # 已嵌入、构建不碰 C 工具链，设计 D1）——"嵌入式低配 Linux + 沙箱"是
+      # 核心交付组合，随每次 push 确认它仍编得出静态 ELF。
+      - run: cargo build --release --target x86_64-unknown-linux-musl --features code
 
   audit:
     # cargo-audit：RustSec 公告库扫描依赖树。依赖面小（reqwest + serde +

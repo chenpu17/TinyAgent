@@ -27,8 +27,12 @@ jobs:
       - name: Install musl-tools
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
+      # 产物带 code feature（run_code 沙箱编译入内、运行期 enabled 默认关，
+      # 用户 config "code":{"enabled":true} 才暴露给模型）——产品拍板 2026-09：
+      # A/B 指标已验证（PRD §10 两批），+4.6 MiB 换开箱可用；默认关维持
+      # "被注入模型默认不获得循环+代码执行能力"的红线（设计 D15）。
       - name: Build static binary
-        run: cargo build --release --target x86_64-unknown-linux-musl
+        run: cargo build --release --target x86_64-unknown-linux-musl --features code
 
       # 扩展点：后续版本可加 aarch64-musl / macOS / Windows 产物，
       # 每平台一个 job、同样的打包命名约定。

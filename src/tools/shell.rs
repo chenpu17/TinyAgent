@@ -9,11 +9,26 @@ use std::time::{Duration, Instant};
 pub struct Shell;
 
 impl Tool for Shell {
+    /// Guest-registry opt-in (run_code's `tools.call` surface) — shell is
+    /// part of the sandbox's built-in I/O substrate (byte pipelines, file
+    /// ops the JS stdlib lacks).
+    fn available_to_code(&self) -> bool {
+        true
+    }
+
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "shell".into(),
             description: "Run a shell command in the working directory and return \
-                          stdout+stderr. Use for builds, tests, git, and any CLI work."
+                          stdout+stderr (combined; truncated to the output cap). Use for \
+                          builds, tests, git, and CLI work - and for DATA: prefer computing \
+                          over reading large files into the conversation (awk/sort/uniq \
+                          pipelines, or a heredoc script: `python3 - <<'PY' ... PY`). \
+                          Redirect bulky output to a file and grep/read it. A background \
+                          job that keeps the output pipes open blocks completion - redirect \
+                          its output (`cmd >/dev/null 2>&1 &`) to let it survive across \
+                          calls. Each command is killed after shell_timeout_secs \
+                          (default 120s); split longer work."
                 .into(),
             schema: json!({
                 "type": "object",

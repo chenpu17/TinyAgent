@@ -41,12 +41,18 @@ pub use agent::{
     extract_plan, Agent, AgentEvent, CompressOutcome, CompressTrigger, RunCost, RunError,
     RunOutcome, TodoItem, ToolCallRecord,
 };
-pub use config::{Config, Limits, McpServerConfig};
+pub use config::{CodeConfig, Config, Limits, McpServerConfig};
 pub use hooks::{Hooks, ToolDecision};
 pub use provider::{
     Block, ChatRequest, ChatResponse, Message, Provider, Role, SimpleChatResponse, ToolDef, Usage,
 };
-pub use tools::{load_document_block, CallbackTool, Tool, ToolConcurrency, ToolCtx, ToolOutput};
+pub use tools::{
+    load_document_block, BudgetGate, CallbackTool, Tool, ToolConcurrency, ToolCtx, ToolOutput,
+};
+// The sandboxed JS tool only exists behind `--features code`; its CONFIG is
+// plain data and unconditional (above) so configs parse on any build.
+#[cfg(feature = "code")]
+pub use tools::run_code::RunCodeTool;
 
 /// Wire together provider + tools (the config's built-in whitelist + any MCP
 /// servers) + [`Agent`], returning a ready-to-run agent.
@@ -83,14 +89,16 @@ pub fn build_agent_with(
     extra_tools: Vec<Box<dyn tools::Tool>>,
     api_key: &str,
 ) -> anyhow::Result<Agent> {
-    let (tool_list, ctx, cfg) = assemble(cfg, client, extra_tools, api_key)?;
-    Agent::try_new(
+    let (tool_list, ctx, cfg, code) = assemble(cfg, client, extra_tools, api_key)?;
+    let mut agent = Agent::try_new(
         &cfg,
         provider::build(&cfg, api_key, client.clone()),
         tool_list,
         initial,
         ctx,
-    )
+    )?;
+    code.install(&mut agent);
+    Ok(agent)
 }
 
 /// Like [`build_agent_with`], but the caller supplies the [`Provider`] directly
@@ -113,8 +121,32 @@ pub fn build_agent_with_provider(
     extra_tools: Vec<Box<dyn tools::Tool>>,
     api_key: &str,
 ) -> anyhow::Result<Agent> {
-    let (tool_list, ctx, cfg) = assemble(cfg, client, extra_tools, api_key)?;
-    Agent::try_new(&cfg, provider, tool_list, initial, ctx)
+    let (tool_list, ctx, cfg, code) = assemble(cfg, client, extra_tools, api_key)?;
+    let mut agent = Agent::try_new(&cfg, provider, tool_list, initial, ctx)?;
+    code.install(&mut agent);
+    Ok(agent)
+}
+
+/// What `assemble` hands back for the `code` feature: the ONE top-level
+/// `run_code` instance (design §8.6, H3 single construction point). The type
+/// exists unconditionally — feature-off builds get the default (empty) one —
+/// so `assemble`'s signature doesn't fork per feature.
+#[derive(Default)]
+struct CodeInstall {
+    #[cfg(feature = "code")]
+    tool: Option<tools::run_code::RunCodeTool>,
+}
+
+impl CodeInstall {
+    /// Hand the instance to a freshly built agent. No-op without the feature.
+    fn install(self, agent: &mut Agent) {
+        #[cfg(feature = "code")]
+        if let Some(t) = self.tool {
+            agent.set_code_tool(t);
+        }
+        #[cfg(not(feature = "code"))]
+        let _ = agent;
+    }
 }
 
 /// Shared tool-list + [`ToolCtx`] assembly for the `build_agent*` helpers:
@@ -124,13 +156,13 @@ pub fn build_agent_with_provider(
 /// any extra tools. Factored out so [`build_agent_with`] and
 /// [`build_agent_with_provider`] stay in lockstep — only the provider
 /// construction differs between them.
-#[allow(clippy::type_complexity)] // returns (tools, ctx, cfg): cfg carries the skill-augmented system_prompt
+#[allow(clippy::type_complexity)] // returns (tools, ctx, cfg, code): cfg carries the skill-augmented system_prompt
 fn assemble(
     cfg: &Config,
     client: &reqwest::blocking::Client,
     extra_tools: Vec<Box<dyn tools::Tool>>,
     api_key: &str,
-) -> anyhow::Result<(Vec<Box<dyn tools::Tool>>, ToolCtx, Config)> {
+) -> anyhow::Result<(Vec<Box<dyn tools::Tool>>, ToolCtx, Config, CodeInstall)> {
     use anyhow::Context;
     let workdir = cfg
         .workdir
@@ -145,13 +177,86 @@ fn assemble(
     } else {
         Vec::new()
     };
-    let mut tool_list = tools::build(&cfg.tools, cfg, client, api_key, &mcp_tools)?;
+
+    // run_code (H3/H4): the tool's membership in the model-visible list is
+    // driven by `code.enabled`, NOT by the whitelist — so strip the name here
+    // and let the single constructed instance be the ONLY top-level run_code.
+    // With the feature off the name falls through to tools::build's unknown
+    // arm, whose message names the remedy (rebuild with --features code).
+    // The retain below only exists with the code feature; without it the
+    // binding is never mutated.
+    #[cfg_attr(not(feature = "code"), allow(unused_mut))]
+    let mut whitelist = cfg.tools.clone();
+    #[cfg(feature = "code")]
+    {
+        if whitelist.iter().any(|t| t == "run_code") && !cfg.code.enabled {
+            anyhow::bail!(
+                "run_code listed in tools but code.enabled=false — set \
+                 code.enabled=true to enable it, or drop run_code from tools"
+            );
+        }
+        whitelist.retain(|t| t != "run_code");
+    }
+    #[cfg(not(feature = "code"))]
+    if cfg.code.enabled {
+        // The config parses on any build (CodeConfig is plain data), so an
+        // enabled flag on a feature-less build would otherwise be a silent
+        // no-op (sec-review n-3) — say so once per PROCESS: batch assembles
+        // one agent per task and would otherwise print this N times
+        // (correctness-review n-2).
+        static SAID: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        SAID.get_or_init(|| {
+            eprintln!(
+                "[config] code.enabled=true ignored: this build lacks the `code` \
+                 cargo feature — rebuild with --features code to get run_code"
+            );
+        });
+    }
+    let mut tool_list = tools::build(&whitelist, cfg, client, api_key, &mcp_tools)?;
+    // Borrow, don't consume: the run_code snapshot below still needs the set.
     tool_list.extend(
         mcp_tools
-            .into_iter()
+            .iter()
+            .cloned()
             .map(|t| Box::new(t) as Box<dyn tools::Tool>),
     );
-    tool_list.extend(extra_tools);
+    // Host-injected tools: Arc-shared so the SAME instance serves the
+    // top-level list (via SharedTool) and — only if the tool opts in with
+    // `available_to_code()` — the run_code guest registry (v2 review: the
+    // registry previously rebuilt from the whitelist alone, so an injected
+    // tool was "usable top-level, invisible in code").
+    let extra_shared: Vec<std::sync::Arc<Box<dyn tools::Tool>>> =
+        extra_tools.into_iter().map(std::sync::Arc::new).collect();
+    tool_list.extend(extra_shared.iter().map(|t| {
+        Box::new(tools::SharedTool {
+            inner: std::sync::Arc::clone(t),
+        }) as Box<dyn tools::Tool>
+    }));
+
+    // The single run_code instance (code feature). Constructed here because
+    // only assemble holds all four snapshot inputs; cheap (field clones — the
+    // engine is a process-level OnceLock, the registry builds lazily on first
+    // use). Enabled (D15, default false) → a clone goes into the tool list so
+    // the model sees it; the live handle travels back via CodeInstall so the
+    // agent's switch methods (set_code_config / set_code_enabled) can reach
+    // the same shared config Arc as the boxed instance (A-10).
+    #[cfg(feature = "code")]
+    let code = {
+        let tool = tools::run_code::RunCodeTool::new(
+            cfg,
+            std::sync::Arc::new(std::sync::RwLock::new(cfg.code.clone())),
+            client,
+            api_key,
+            mcp_tools.to_vec(),
+            extra_shared.clone(),
+        );
+        if cfg.code.enabled {
+            tool_list.push(Box::new(tool.clone()));
+        }
+        CodeInstall { tool: Some(tool) }
+    };
+    #[cfg(not(feature = "code"))]
+    let code = CodeInstall::default();
 
     // Skills (progressive disclosure, agentskills.io open standard): scan global
     // + project dirs, preload only each skill's name+description into the system
@@ -164,9 +269,27 @@ fn assemble(
     // (assembly never mutates caller state); Agent::new then reads the augmented
     // system_prompt from this clone.
     let skill_dirs = resolve_skill_dirs(&workdir);
-    let (index, warnings) = skills::scan(&skill_dirs);
+    // `mut` only for the code-feature built-in injection below (same
+    // cfg_attr pattern as `whitelist` above).
+    #[cfg_attr(not(feature = "code"), allow(unused_mut))]
+    let (mut index, warnings) = skills::scan(&skill_dirs);
     for w in &warnings {
         eprintln!("[skill] {w}");
+    }
+    // Built-in skill (v2 P2): run_code's full usage guide ships IN the binary
+    // as an embedded skill — the tool description stays slim (closed helper
+    // list + a pointer) while the deep contracts load on demand via
+    // read_skill as compressible history. Injected only when the tool is
+    // actually enabled; `insert_builtin` is a no-op when a disk skill of the
+    // same name exists, so a user's run-code/ override always wins. A
+    // malformed built-in (build bug) degrades to a warning, never a startup
+    // failure — same contract as a bad disk skill.
+    #[cfg(feature = "code")]
+    if cfg.code.enabled {
+        match skills::embedded_entry(tools::run_code::RUN_CODE_SKILL_MD) {
+            Some(e) => index.insert_builtin(e),
+            None => eprintln!("[skill] built-in run-code skill is malformed, skipped"),
+        }
     }
     // allowed-tools (experimental frontmatter field): warn-only — TinyAgent has
     // no per-turn permission/activation layer, so it can't grant a skill's
@@ -174,9 +297,14 @@ fn assemble(
     // declared tool that isn't available so the author notices the mismatch;
     // literal-name match only (the spec is space-separated tool names; Claude
     // Code's glob/`Tool(spec)` patterns are an extension we don't support).
+    // `run_code` is known when enabled — it's driven by code.enabled rather
+    // than the whitelist the rest of the check reads (see the strip above).
     for e in index.entries() {
         for t in &e.allowed_tools {
-            let known = cfg.tools.iter().any(|c| c == t) || t == "read_skill" || t == "list_skill";
+            let known = cfg.tools.iter().any(|c| c == t)
+                || t == "read_skill"
+                || t == "list_skill"
+                || (t == "run_code" && cfg.code.enabled);
             if !known {
                 eprintln!(
                     "[skill] {} declares allowed-tool {:?} not in the tool whitelist",
@@ -212,7 +340,7 @@ fn assemble(
         budget: None,
         deadline: None,
     };
-    Ok((tool_list, ctx, cfg))
+    Ok((tool_list, ctx, cfg, code))
 }
 
 /// Skill search dirs, global first + project last (so the project dir overrides

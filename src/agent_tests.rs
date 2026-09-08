@@ -1700,10 +1700,10 @@ impl Provider for CancelOnChatProvider {
     ) -> Result<ChatResponse> {
         on_event(ChatEvent::TextDelta("partial".into()));
         // Simulate a Ctrl-C landing as the stream wraps up: the agent's own
-        // cancel Arc flips true here — AFTER run()'s entry reset, BEFORE the
-        // abort check runs. (A real cancel during the final streaming bytes
-        // hits the same window: CancellableSse breaks the stream, chat()
-        // returns with whatever stop_reason the provider last sent.)
+        // cancel Arc flips true here — before the loop's abort check runs.
+        // (A real cancel during the final streaming bytes hits the same
+        // window: CancellableSse breaks the stream, chat() returns with
+        // whatever stop_reason the provider last sent.)
         self.flag.store(true, Ordering::Relaxed);
         Ok(ChatResponse {
             blocks: vec![Block::Text("partial".into())],
@@ -2249,7 +2249,7 @@ fn run_installs_a_fleet_budget_counter_and_resets_it_per_run() {
     agent.run(&mut |_| {}).unwrap();
     let counter = agent.ctx.budget.clone().expect("counter installed by run");
     assert_eq!(
-        counter.load(Ordering::Relaxed),
+        counter.used.load(Ordering::Relaxed),
         65,
         "both chats billed: 40 + 25"
     );
@@ -2260,12 +2260,12 @@ fn run_installs_a_fleet_budget_counter_and_resets_it_per_run() {
     agent.run(&mut |_| {}).unwrap();
     let counter2 = agent.ctx.budget.clone().expect("counter re-installed");
     assert_eq!(
-        counter2.load(Ordering::Relaxed),
+        counter2.used.load(Ordering::Relaxed),
         10,
         "fresh counter per run"
     );
     assert!(
-        !(std::sync::Arc::ptr_eq(&counter, &counter2)),
+        !(std::sync::Arc::ptr_eq(&counter.used, &counter2.used)),
         "a new run must replace, not reuse, the counter"
     );
 }
@@ -2296,7 +2296,7 @@ fn tool_billed_usage_does_not_double_count_in_the_fleet_counter() {
     // Fleet counter = direct chats ONLY (40+10); BillTool's 111 is a
     // child-spend stand-in that "already counted itself" elsewhere.
     let counter = agent.ctx.budget.clone().expect("counter installed");
-    assert_eq!(counter.load(Ordering::Relaxed), 50);
+    assert_eq!(counter.used.load(Ordering::Relaxed), 50);
 }
 
 #[test]
@@ -5581,4 +5581,417 @@ fn huge_timeout_secs_does_not_panic_on_clock_overflow() {
         state.captured()[0].per_request_timeout.is_some(),
         "STREAM_BACKSTOP must still cap the request"
     );
+}
+
+// ── run_code e2e (requires the `code` feature; design §13 A-1) ─────────────
+//
+// The loop-level contract: a model-direct `run_code` call drives the wasm
+// guest, whose own `tools.call` produces INNER ToolCall/ToolResult events in
+// the parent stream while the outer call returns the guest's JSON result as
+// its tool output. Everything runs offline (MockProvider + real wasm).
+
+#[cfg(feature = "code")]
+#[test]
+fn run_code_a1_loop_round_trip() {
+    use crate::tools::run_code::RunCodeTool;
+    use std::sync::RwLock;
+
+    let dir = std::env::temp_dir().join(format!("ta-run-code-a1-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("note.txt"), "hello-a1\n").unwrap();
+
+    let cfg = cfg_with(5, 0, 0);
+    let run_code = Box::new(RunCodeTool::new(
+        &cfg,
+        Arc::new(RwLock::new(cfg.code.clone())),
+        &reqwest::blocking::Client::new(),
+        "k",
+        vec![],
+        vec![],
+    ));
+    let (prov, state) = MockProvider::new(vec![
+        mock::resp_tool(
+            "t1",
+            "run_code",
+            json!({"code": "const r = readAll(\"note.txt\");\n\
+                          const list = tools.list();\n\
+                          return {head: r.slice(0, 30), knows: list.some(t => t.name === \"read_file\")};"}),
+            None,
+        ),
+        mock::resp_text("done", None),
+    ]);
+    let ctx = ToolCtx {
+        workdir: dir.clone(),
+        max_output_chars: 2000,
+        restrict_to_workdir: false,
+        cancel: None,
+        shell_timeout_secs: 5,
+        hooks: None,
+        subagent: None,
+        budget: None,
+        deadline: None,
+    };
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![run_code],
+        vec![user_text("go")],
+        ctx,
+    );
+    let mut events = Vec::new();
+    let o = agent.run(&mut |e| events.push(e)).unwrap();
+    assert_eq!(o.stop_reason, "end_turn");
+
+    // Outer result = the guest's JSON return value (A-1's core assertion:
+    // the sandbox round-trips data through a real tool call).
+    let outer = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::ToolResult {
+                name,
+                is_error: false,
+                content,
+            } if name == "run_code" => Some(content.clone()),
+            _ => None,
+        })
+        .expect("outer run_code ToolResult event");
+    assert!(outer.contains("hello-a1"), "{outer}");
+    assert!(outer.contains("\"knows\":true"), "{outer}");
+
+    // Inner events reached the parent stream, paired and ordered:
+    // ToolCall(read_file) < ToolResult(read_file) < ToolResult(run_code).
+    let pos = |needle: &str, is_result: bool| {
+        events.iter().position(|e| match e {
+            AgentEvent::ToolCall { name, .. } => !is_result && name == needle,
+            AgentEvent::ToolResult { name, .. } => is_result && name == needle,
+            _ => false,
+        })
+    };
+    let inner_call = pos("read_file", false).expect("inner ToolCall event");
+    let inner_result = pos("read_file", true).expect("inner ToolResult event");
+    let outer_pos = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::ToolResult { name, .. } if name == "run_code"))
+        .unwrap();
+    assert!(inner_call < inner_result);
+    assert!(
+        inner_result < outer_pos,
+        "inner result precedes the outer one"
+    );
+
+    // The second request pairs the OUTER run_code tool_use with exactly one
+    // tool_result (inner calls live inside run_code's result, not as blocks).
+    let cap = &state.captured()[1];
+    assert_eq!(cap.tool_use_ids, cap.tool_result_ids);
+    assert_eq!(cap.trailing_tool_results, 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A-2 (US-1, the CSV story): the guest loops over paged reads, aggregates
+/// in-memory, writes the CSV via write_file, and returns a compact summary —
+/// one tool call doing what used to cost a turn per page.
+#[cfg(feature = "code")]
+#[test]
+fn run_code_a2_csv_pipeline() {
+    use crate::tools::run_code::RunCodeTool;
+    use std::sync::RwLock;
+
+    // Hermetic half of US-1: the read→aggregate→write pipeline over paged
+    // FILES (read_file paging stands in for the mock DB tool — no hermetic
+    // McpTool exists). The MCP leg the real scenario uses is pinned by
+    // run_code::tests::guest_reaches_mcp_tools_live (#[ignore]).
+    let dir = std::env::temp_dir().join(format!("ta-run-code-a2-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // Five "pages" of `name,amount` rows (the read_file line-number prefix is
+    // stripped in-guest by splitting on the first tab — the F-2 contract).
+    let mut expected = std::collections::BTreeMap::new();
+    for p in 1..=5 {
+        let mut page = String::new();
+        for r in 0..4 {
+            let name = format!("cust-{}", p * 10 + r);
+            let amount = p * 100 + r;
+            page.push_str(&format!("{name},{amount}\n"));
+            *expected.entry(name).or_insert(0u64) += amount;
+        }
+        std::fs::write(dir.join(format!("page{p}.txt")), page).unwrap();
+    }
+
+    let cfg = cfg_with(5, 0, 0);
+    let run_code = Box::new(RunCodeTool::new(
+        &cfg,
+        Arc::new(RwLock::new(cfg.code.clone())),
+        &reqwest::blocking::Client::new(),
+        "k",
+        vec![],
+        vec![],
+    ));
+    let (prov, _) = MockProvider::new(vec![
+        mock::resp_tool(
+            "t1",
+            "run_code",
+            json!({"code": r#"
+                let totals = {};
+                for (let p = 1; p <= 5; p++) {
+                    const t = tools.call("read_file", {path: "page" + p + ".txt"});
+                    for (const line of t.split("\n")) {
+                        const tab = line.indexOf("\t");
+                        if (tab < 0) continue;
+                        const [name, amount] = line.slice(tab + 1).split(",");
+                        totals[name] = (totals[name] || 0) + Number(amount);
+                    }
+                }
+                const lines = ["name,total",
+                    ...Object.entries(totals).map(([n, v]) => n + "," + v)];
+                tools.call("write_file", {path: "totals.csv", content: lines.join("\n")});
+                return {file: "totals.csv", customers: Object.keys(totals).length};"#}),
+            None,
+        ),
+        mock::resp_text("done", None),
+    ]);
+    let ctx = ToolCtx {
+        workdir: dir.clone(),
+        max_output_chars: 4000,
+        restrict_to_workdir: false,
+        cancel: None,
+        shell_timeout_secs: 5,
+        hooks: None,
+        subagent: None,
+        budget: None,
+        deadline: None,
+    };
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![run_code],
+        vec![user_text("aggregate")],
+        ctx,
+    );
+    let mut events = Vec::new();
+    let o = agent.run(&mut |e| events.push(e)).unwrap();
+    assert_eq!(o.stop_reason, "end_turn");
+
+    // The CSV landed with correct sums…
+    let csv = std::fs::read_to_string(dir.join("totals.csv")).unwrap();
+    assert!(csv.starts_with("name,total"), "{csv}");
+    for (name, total) in &expected {
+        assert!(csv.contains(&format!("{name},{total}")), "{csv}");
+    }
+    // …the outer tool result is the guest's compact summary…
+    let outer = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::ToolResult {
+                name,
+                is_error: false,
+                content,
+            } if name == "run_code" => Some(content.clone()),
+            _ => None,
+        })
+        .expect("outer run_code result");
+    assert!(outer.contains("\"customers\":20"), "{outer}");
+    // …and the audit trace counted all 6 inner calls (5 reads + 1 write).
+    let rec = o.tool_calls.iter().find(|c| c.name == "run_code").unwrap();
+    let meta = rec.meta.as_ref().expect("run_code audit meta");
+    assert_eq!(meta["call_count"], 6, "{meta}");
+    let inner_ok = meta["calls"].as_array().unwrap();
+    assert!(inner_ok.iter().all(|c| c["ok"] == true), "{meta}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A-3 / test 14 (authorization equivalence): under the SAME hooks layer, a
+/// model-direct read_file and a guest-internal read_file produce equivalent
+/// gate decisions and after-notify sequences — same tool, same input, same
+/// executed outcome; the ONLY difference is the ctx's sub-agent marker
+/// (`-` at top level vs `__code__` from the sandbox).
+#[cfg(feature = "code")]
+#[test]
+fn run_code_a3_gate_sequence_equivalence() {
+    use crate::tools::run_code::RunCodeTool;
+    use std::sync::RwLock;
+
+    let dir = std::env::temp_dir().join(format!("ta-run-code-a3-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("note.txt"), "shared-note\n").unwrap();
+
+    let cfg = cfg_with(6, 0, 0);
+    let run_code = Box::new(RunCodeTool::new(
+        &cfg,
+        Arc::new(RwLock::new(cfg.code.clone())),
+        &reqwest::blocking::Client::new(),
+        "k",
+        vec![],
+        vec![],
+    ));
+    let (prov, _) = MockProvider::new(vec![
+        // Turn 1: the MODEL calls read_file directly.
+        mock::resp_tool("t1", "read_file", json!({"path": "note.txt"}), None),
+        // Turn 2: the MODEL calls run_code, whose guest calls the same tool.
+        mock::resp_tool(
+            "t2",
+            "run_code",
+            json!({"code": r#"return tools.call("read_file", {path: "note.txt"}).trim();"#}),
+            None,
+        ),
+        mock::resp_text("done", None),
+    ]);
+    let ctx = ToolCtx {
+        workdir: dir.clone(),
+        max_output_chars: 2000,
+        restrict_to_workdir: false,
+        cancel: None,
+        shell_timeout_secs: 5,
+        hooks: None,
+        subagent: None,
+        budget: None,
+        deadline: None,
+    };
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![run_code],
+        vec![user_text("go")],
+        ctx,
+    );
+    let hooks = Arc::new(CaptureHooks::new());
+    agent.set_hooks(hooks.clone());
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o.stop_reason, "end_turn");
+
+    // Gate order and inputs are IDENTICAL for both origins; only the marker
+    // differs (the last field in each "before:tool:input:tag" entry).
+    let befores: Vec<String> = hooks
+        .calls()
+        .into_iter()
+        .filter(|c| c.starts_with("before:read_file:"))
+        .collect();
+    assert_eq!(befores.len(), 2, "{befores:?}");
+    let top = befores[0].clone();
+    let inner = befores[1].clone();
+    assert!(top.ends_with(":-"), "top-level marker: {top}");
+    assert!(inner.ends_with(":__code__"), "guest marker: {inner}");
+    let drop_last = |s: &str| match s.rfind(':') {
+        Some(i) => s[..i].to_string(),
+        None => s.to_string(),
+    };
+    assert_eq!(
+        drop_last(&top),
+        drop_last(&inner),
+        "same tool + same input on both origins"
+    );
+    // Both actually executed (Allow) — after_tool with executed=true twice.
+    let afters: Vec<String> = hooks
+        .calls()
+        .into_iter()
+        .filter(|c| c.starts_with("after:read_file:true:"))
+        .collect();
+    assert_eq!(afters.len(), 2, "{afters:?}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A-10a / test 16a (switch face): enabled=false keeps run_code out of the
+/// model's view; a static config enable exposes it; the runtime setter
+/// round-trips; an explicit whitelist mention without the enable errors with
+/// the remedy.
+#[cfg(feature = "code")]
+#[test]
+fn run_code_a10a_switch_face() {
+    let base = r#"{"provider":"openai","api_key_env":"MOCK_API_KEY","model":"m",
+        "inject_environment":false,"tools":["read_file"]}"#;
+
+    // 1. Default (enabled=false): not in the tool list, model cannot see it.
+    let cfg: Config = serde_json::from_str(base).unwrap();
+    let agent = crate::build_agent_with_provider(
+        &cfg,
+        Box::new(MockProvider::new(vec![mock::resp_text("x", None)]).0),
+        vec![],
+        &reqwest::blocking::Client::new(),
+        vec![],
+        "k",
+    )
+    .unwrap();
+    assert!(!agent.tool_names().contains(&"run_code".to_string()));
+
+    // 2. Explicit whitelist mention without the enable → actionable error.
+    let cfg: Config = serde_json::from_str(
+        r#"{"provider":"openai","api_key_env":"MOCK_API_KEY","model":"m",
+            "inject_environment":false,"tools":["read_file","run_code"]}"#,
+    )
+    .unwrap();
+    let err = match crate::build_agent_with_provider(
+        &cfg,
+        Box::new(MockProvider::new(vec![mock::resp_text("x", None)]).0),
+        vec![],
+        &reqwest::blocking::Client::new(),
+        vec![],
+        "k",
+    ) {
+        Err(e) => e,
+        Ok(_) => panic!("explicit run_code listing without code.enabled must be rejected"),
+    };
+    assert!(
+        format!("{err:#}").contains("code.enabled"),
+        "error must name the switch: {err:#}"
+    );
+
+    // 3. Static enable: visible …
+    let mut cfg: Config = serde_json::from_str(base).unwrap();
+    cfg.code.enabled = true;
+    let mut agent = crate::build_agent_with_provider(
+        &cfg,
+        Box::new(MockProvider::new(vec![mock::resp_text("x", None)]).0),
+        vec![],
+        &reqwest::blocking::Client::new(),
+        vec![],
+        "k",
+    )
+    .unwrap();
+    assert!(agent.tool_names().contains(&"run_code".to_string()));
+
+    // 4. …and the runtime round-trip flips it (refresh covers the defs the
+    // next request would serialize).
+    agent.set_code_enabled(false).unwrap();
+    assert!(!agent.tool_names().contains(&"run_code".to_string()));
+    agent.set_code_enabled(true).unwrap();
+    assert!(agent.tool_names().contains(&"run_code".to_string()));
+    // set_code_config's enabled flip does the same table sync.
+    let mut tuned = cfg.code.clone();
+    tuned.enabled = false;
+    agent.set_code_config(tuned).unwrap();
+    assert!(!agent.tool_names().contains(&"run_code".to_string()));
+    // 5. And the enabled instance is callable end-to-end (the A-1 loop
+    // already covers the full run; here we just prove dispatch finds it).
+    agent.set_code_enabled(true).unwrap();
+    let names = agent.tool_names();
+    assert!(names.contains(&"run_code".to_string()) && names.contains(&"read_file".to_string()));
+}
+
+/// Switch face on a hand-built agent (no `set_code_tool` install — the
+/// feature-off / direct-`try_new` shape): every switch/config call errors
+/// with the same actionable message (review: the None branch had no pin).
+#[cfg(feature = "code")]
+#[test]
+fn run_code_switch_face_none_branch() {
+    let cfg = cfg_with(3, 0, 0);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(MockProvider::new(vec![mock::resp_text("x", None)]).0),
+        vec![],
+        vec![user_text("hi")],
+        test_ctx(),
+    );
+    for call in ["enable", "disable", "config"] {
+        let r = match call {
+            "enable" => agent.set_code_enabled(true),
+            "disable" => agent.set_code_enabled(false),
+            _ => agent.set_code_config(cfg.code.clone()),
+        };
+        let err = r.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no run_code tool installed"),
+            "{call}: actionable error, got: {err:#}"
+        );
+    }
 }

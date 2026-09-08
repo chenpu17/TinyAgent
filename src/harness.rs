@@ -268,6 +268,7 @@ fn event_json(ev: &AgentEvent) -> Value {
         AgentEvent::TurnStart(n) => json!({"type": "turn", "n": *n}),
         AgentEvent::TextDelta(t) => json!({"type": "text", "delta": t.clone()}),
         AgentEvent::ThinkingDelta(t) => json!({"type": "thinking", "delta": t.clone()}),
+        AgentEvent::CodeLog(t) => json!({"type": "code_log", "delta": t.clone()}),
         AgentEvent::ToolInputDelta { id, name, delta } => json!({
             "type": "tool_input",
             "id": id.clone(),
@@ -678,6 +679,12 @@ impl<Out: Write, Err: Write> HumanRenderer<Out, Err> {
                 // debugging, and redirectable away (2>/dev/null / separate stream
                 // from --json's structured events).
                 let _ = write!(self.err, "{t}");
+                let _ = self.err.flush();
+            }
+            AgentEvent::CodeLog(t) => {
+                // Sandbox console.log → stderr too (ThinkingDelta discipline):
+                // complete lines, so one writeln each with a `[code]` tag.
+                let _ = writeln!(self.err, "[code] {t}");
                 let _ = self.err.flush();
             }
             AgentEvent::ToolInputDelta { .. } => {
@@ -1426,6 +1433,11 @@ mod tests {
         });
         assert_eq!(v["type"], "done");
         assert_eq!(v["stop_reason"], "end_turn");
+        // CodeLog → {"type":"code_log","delta":..} (mirrors ThinkingDelta's
+        // stderr-for-plain / streamed-for-json discipline).
+        let v = event_json(&AgentEvent::CodeLog("hi".into()));
+        assert_eq!(v["type"], "code_log");
+        assert_eq!(v["delta"], "hi");
     }
 
     #[test]

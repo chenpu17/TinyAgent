@@ -1366,6 +1366,13 @@ fn ui_loop(
                         // carries the entire plan, so a plain assign is correct.
                         plan = todos.clone();
                     }
+                    AgentEvent::CodeLog(line) => {
+                        // Sandbox console.log → committed transcript row (design
+                        // L6: reviewable in scrollback and `/export`-able — a
+                        // render-only transient would lose the execution log).
+                        // sys_info styling keeps it visually apart from replies.
+                        rows.push(Row::sys_info(format!("· {line}")));
+                    }
                     AgentEvent::SubAgent { name, event } => {
                         // Render the child's event tagged with its name so the
                         // user can see each sub-agent's progress (and tell

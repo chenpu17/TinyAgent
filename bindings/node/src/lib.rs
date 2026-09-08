@@ -41,6 +41,19 @@ fn err(e: impl std::fmt::Display) -> Error {
     Error::from_reason(e.to_string())
 }
 
+/// Error for the runCode methods when this module was built without its
+/// `code` cargo feature (design §8.6: off by default so the standard npm
+/// artifact stays ~10MB lighter) — a clear rebuild hint instead of a silent
+/// no-op.
+#[cfg(not(feature = "code"))]
+fn code_feature_missing() -> Error {
+    err(
+        "this tiny-agent build lacks the `code` feature — rebuild with \
+         `npm run build -- --features code` to use enableCode()/\
+         disableCode()/setCodeConfig()",
+    )
+}
+
 // ── AsyncTask return wrapper ─────────────────────────────────────────────────
 
 /// Carries a serde `Value` through napi's `AsyncTask` return path. The task's
@@ -458,9 +471,10 @@ impl Default for CancelToken {
 /// After the awaited run() resolves, the methods work again.
 fn agent_busy() -> Error {
     err(
-        "Agent.run() is active: pushUser/setCancel/usage/messages/model must \
-        not be called until the awaited run() resolves — calling them while a \
-        run is in flight would freeze the JS event loop the run depends on",
+        "Agent.run() is active: sync methods (pushUser, setCancel, usage, \
+        messages, model, enableCode/disableCode/setCodeConfig) must not be \
+        called until the awaited run() resolves — calling them while a run is \
+        in flight would freeze the JS event loop the run depends on",
     )
 }
 
@@ -564,6 +578,64 @@ impl Agent {
     pub fn model(&self) -> Result<String> {
         let a = self.inner.try_lock().map_err(|_| agent_busy())?;
         Ok(a.model().to_string())
+    }
+
+    /// Enable the sandboxed `runCode` tool for the NEXT request (runtime
+    /// switch — the tool becomes visible to the model; zero schema cost
+    /// while disabled). Same busy contract as the other sync methods.
+    ///
+    /// Requires this module built with its `code` cargo feature
+    /// (`npm run build -- --features code`); otherwise a clear error.
+    #[napi]
+    pub fn enable_code(&self) -> Result<()> {
+        self.code_switch(true)
+    }
+
+    /// Remove `runCode` from the model's toolset (runtime switch). Does not
+    /// interrupt an in-flight execution — the next request just stops
+    /// offering the tool. Same feature requirement as `enableCode`.
+    #[napi]
+    pub fn disable_code(&self) -> Result<()> {
+        self.code_switch(false)
+    }
+
+    /// Atomically replace the WHOLE code config (switch + every limit /
+    /// path knob) from an object shaped like the config file's `"code"`
+    /// section: unknown keys error, missing keys reset to their DEFAULTS
+    /// (they do not retain previous values — send the full object to keep
+    /// a knob). Takes effect for the next execution; an in-flight one keeps
+    /// its snapshot. Busy-errors while `run()` is in flight.
+    #[napi]
+    pub fn set_code_config(&self, cfg: Value) -> Result<()> {
+        #[cfg(feature = "code")]
+        {
+            let parsed: ta::CodeConfig =
+                serde_json::from_value(cfg).map_err(|e| err(format!("code config object: {e}")))?;
+            let mut a = self.inner.try_lock().map_err(|_| agent_busy())?;
+            a.set_code_config(parsed).map_err(err)
+        }
+        #[cfg(not(feature = "code"))]
+        {
+            let _ = cfg;
+            Err(code_feature_missing())
+        }
+    }
+}
+
+impl Agent {
+    /// Shared body of `enable_code` / `disable_code` (same cfg split, so the
+    /// feature-missing error text lives in exactly one place).
+    fn code_switch(&self, enabled: bool) -> Result<()> {
+        #[cfg(feature = "code")]
+        {
+            let mut a = self.inner.try_lock().map_err(|_| agent_busy())?;
+            a.set_code_enabled(enabled).map_err(err)
+        }
+        #[cfg(not(feature = "code"))]
+        {
+            let _ = enabled;
+            Err(code_feature_missing())
+        }
     }
 }
 

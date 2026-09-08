@@ -81,8 +81,8 @@ impl Tool for ReadSkill {
                 "read_skill: unsafe file path {file:?} — must be a relative path inside the skill directory (no .., absolute paths, or backslashes)"
             )));
         }
-        let dir = match self.index.dir_of(skill) {
-            Some(d) => d,
+        let entry = match self.index.entry_of(skill) {
+            Some(e) => e,
             None => {
                 let known: Vec<&str> = self
                     .index
@@ -95,6 +95,24 @@ impl Tool for ReadSkill {
                     known.join(", ")
                 )));
             }
+        };
+        // Built-in (embedded) skills have no directory and bundle no resource
+        // files — the SKILL.md text IS the skill. Served raw like a disk
+        // SKILL.md (frontmatter included), under the same char cap.
+        if let crate::skills::SkillSource::Embedded(text) = &entry.source {
+            if file != "SKILL.md" {
+                return Ok(ToolOutput::error(format!(
+                    "read_skill: skill {skill:?} is built into the binary and bundles no resource files (only SKILL.md is readable)"
+                )));
+            }
+            let mut content = text.clone();
+            truncate(&mut content, ctx.max_output_chars);
+            return Ok(ToolOutput::text(content));
+        }
+        let dir = match &entry.source {
+            crate::skills::SkillSource::Dir(d) => d,
+            // The embedded arm returned above; kept for exhaustiveness.
+            crate::skills::SkillSource::Embedded(_) => unreachable!(),
         };
         let full = dir.join(file);
         let resolved = match confined_to(dir, &full, "skill directory") {
@@ -167,8 +185,8 @@ impl Tool for ListSkill {
         let skill = input["skill"]
             .as_str()
             .context("list_skill: missing \"skill\"")?;
-        let dir = match self.index.dir_of(skill) {
-            Some(d) => d,
+        let entry = match self.index.entry_of(skill) {
+            Some(e) => e,
             None => {
                 let known: Vec<&str> = self
                     .index
@@ -182,14 +200,23 @@ impl Tool for ListSkill {
                 )));
             }
         };
-        const MAX_DEPTH: usize = 4;
-        let mut paths: Vec<String> = Vec::new();
-        walk_skill(dir, dir, 0, MAX_DEPTH, &mut paths);
-        paths.sort();
-        let mut out = if paths.is_empty() {
-            String::from("(skill directory is empty)")
-        } else {
-            paths.join("\n")
+        // Built-in (embedded) skills have no directory to walk — list the one
+        // file they have so a level-3 discovery attempt isn't a dead end.
+        let mut out = match &entry.source {
+            crate::skills::SkillSource::Embedded(_) => String::from(
+                "SKILL.md\n(built-in skill: bundled into the binary, no resource files)",
+            ),
+            crate::skills::SkillSource::Dir(dir) => {
+                const MAX_DEPTH: usize = 4;
+                let mut paths: Vec<String> = Vec::new();
+                walk_skill(dir, dir, 0, MAX_DEPTH, &mut paths);
+                paths.sort();
+                if paths.is_empty() {
+                    String::from("(skill directory is empty)")
+                } else {
+                    paths.join("\n")
+                }
+            }
         };
         truncate(&mut out, ctx.max_output_chars);
         Ok(ToolOutput::text(out))
@@ -294,6 +321,57 @@ mod tests {
             budget: None,
             deadline: None,
         }
+    }
+
+    #[test]
+    fn read_skill_serves_embedded_skill_md() {
+        let idx = SkillIndex::from_entries(vec![crate::skills::embedded_entry(
+            "---\nname: run-code\ndescription: guide\n---\nBODY-TEXT",
+        )
+        .unwrap()]);
+        let dir = std::env::temp_dir();
+        let out = ReadSkill::new(idx)
+            .run(&json!({"skill": "run-code"}), &ctx(&dir))
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        // Served raw like a disk SKILL.md: body (and frontmatter) intact.
+        assert!(out.content.contains("BODY-TEXT"), "{}", out.content);
+    }
+
+    #[test]
+    fn read_skill_embedded_has_no_resource_files() {
+        let idx = SkillIndex::from_entries(vec![crate::skills::embedded_entry(
+            "---\nname: run-code\ndescription: guide\n---\nbody",
+        )
+        .unwrap()]);
+        let dir = std::env::temp_dir();
+        let out = ReadSkill::new(idx)
+            .run(
+                &json!({"skill": "run-code", "file": "scripts/helper.js"}),
+                &ctx(&dir),
+            )
+            .unwrap();
+        assert!(out.is_error, "{}", out.content);
+        assert!(
+            out.content.contains("bundles no resource files"),
+            "{}",
+            out.content
+        );
+    }
+
+    #[test]
+    fn list_skill_embedded_lists_only_skill_md() {
+        let idx = SkillIndex::from_entries(vec![crate::skills::embedded_entry(
+            "---\nname: run-code\ndescription: guide\n---\nbody",
+        )
+        .unwrap()]);
+        let dir = std::env::temp_dir();
+        let out = ListSkill::new(idx)
+            .run(&json!({"skill": "run-code"}), &ctx(&dir))
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("SKILL.md"), "{}", out.content);
+        assert!(out.content.contains("built-in"), "{}", out.content);
     }
 
     #[test]

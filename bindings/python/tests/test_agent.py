@@ -574,3 +574,121 @@ def test_usage_from_other_thread_during_run_does_not_deadlock(tmp_path):
     assert usage["input_tokens"] >= 0
     t.join(timeout=30)
     assert not t.is_alive(), "run() deadlocked against a cross-thread sync call"
+
+
+# ── 15. run_code runtime switch (design §8.6; binding's `code` feature) ──────
+#
+# The binding's `code` cargo feature is OFF by default (standard wheels stay
+# ~10MB lighter), so these tests adapt to whichever wheel they run against:
+# the default build must reject the three methods with the rebuild hint (a
+# clear error, never a silent no-op), a `maturin develop --features code`
+# build must actually flip the tool table / apply the config dict.
+
+CODE_HINT = "code` feature"
+
+
+def _mock_agent(tmp_path, provider=None):
+    if provider is None:
+        def provider(request):
+            return {"text": "done", "stop_reason": "end_turn"}
+    cfg = openai_config("http://unused", tools=[], workdir=str(tmp_path))
+    return tiny_agent.Agent(cfg, provider=provider)
+
+
+def _probe_code_feature(agent) -> bool:
+    """True when this wheel was built with the `code` feature (disable_code
+    succeeds; the default build raises the rebuild hint). Probes with the
+    disable direction so a feature wheel stays in the default OFF state."""
+    try:
+        agent.disable_code()
+        return True
+    except RuntimeError:
+        return False
+
+
+def test_code_methods_without_feature_hint_rebuild(tmp_path):
+    """Default build: enable/disable/set_code_config raise a clear rebuild
+    error instead of silently no-op'ing (design §8.6)."""
+    agent = _mock_agent(tmp_path)
+    if _probe_code_feature(agent):
+        pytest.skip("wheel built with the code feature — hint path not reachable")
+    for call in (lambda: agent.enable_code(),
+                 lambda: agent.disable_code(),
+                 lambda: agent.set_code_config({"enabled": True})):
+        with pytest.raises(RuntimeError, match=CODE_HINT):
+            call()
+
+
+def test_enable_disable_code_flips_tooltable(tmp_path):
+    """Feature build: enable_code makes run_code visible in the NEXT request's
+    tools payload; disable_code removes it again (zero schema cost while off).
+    The provider observes the tool table directly."""
+    seen = []
+
+    def provider(request):
+        seen.append([t["name"] for t in request["tools"]])
+        return {"text": "done", "stop_reason": "end_turn"}
+
+    agent = _mock_agent(tmp_path, provider=provider)
+    if not _probe_code_feature(agent):
+        pytest.skip("wheel built without the code feature — switch path not reachable")
+    agent.push_user("hi")
+    agent.run()
+    assert "run_code" not in seen[0], "off by default (D15)"
+    agent.enable_code()
+    agent.push_user("hi")
+    agent.run()
+    assert "run_code" in seen[1], "enable_code surfaces the tool"
+    agent.disable_code()
+    agent.push_user("hi")
+    agent.run()
+    assert "run_code" not in seen[2], "disable_code removes it again"
+
+
+def test_set_code_config_rejects_unknown_keys(tmp_path):
+    """Feature build: the dict goes through the same serde shape as the config
+    file's `code` section — unknown keys error (typo protection), and
+    {"enabled": true} flips the switch on."""
+    seen = []
+
+    def provider(request):
+        seen.append([t["name"] for t in request["tools"]])
+        return {"text": "done", "stop_reason": "end_turn"}
+
+    agent = _mock_agent(tmp_path, provider=provider)
+    if not _probe_code_feature(agent):
+        pytest.skip("wheel built without the code feature")
+    with pytest.raises(RuntimeError, match="unknown field"):
+        agent.set_code_config({"enabled": True, "timeout_sec": 5})  # typo'd key
+    agent.set_code_config({"enabled": True})
+    agent.push_user("hi")
+    agent.run()
+    assert "run_code" in seen[0], "set_code_config drives the switch too"
+
+
+def test_code_method_from_callback_raises_instead_of_deadlocking(tmp_path):
+    """A-10c busy semantics: the code methods ride the same with_agent lock
+    path as the other sync methods — calling one from an on_event callback
+    during run() must raise the explanatory reentry error, not deadlock. Run
+    in a helper thread so a regression fails on the join timeout."""
+    def provider(request):
+        return {"text": "done", "stop_reason": "end_turn"}
+
+    agent = _mock_agent(tmp_path, provider=provider)
+    if not _probe_code_feature(agent):
+        pytest.skip("wheel built without the code feature")
+    agent.push_user("hi")
+    outcome = {}
+
+    def on_event(ev):
+        try:
+            agent.disable_code()
+            outcome["err"] = None
+        except RuntimeError as e:
+            outcome["err"] = str(e)
+
+    t = threading.Thread(target=agent.run, kwargs={"on_event": on_event})
+    t.start()
+    t.join(timeout=30)
+    assert not t.is_alive(), "run() deadlocked: code method re-entered the lock"
+    assert outcome["err"] is not None, "disable_code from on_event should have raised"

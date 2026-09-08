@@ -60,6 +60,18 @@ fn load_config(obj: &Bound<'_, PyAny>) -> PyResult<ta::Config> {
     Ok(cfg)
 }
 
+/// Error for the run_code methods when this module was built without its
+/// `code` cargo feature (design §8.6: off by default so standard wheels stay
+/// ~10MB lighter) — a clear rebuild hint instead of a silent no-op.
+#[cfg(not(feature = "code"))]
+fn code_feature_missing() -> PyErr {
+    pyo3::exceptions::PyRuntimeError::new_err(
+        "this tiny_agent build lacks the `code` feature — rebuild with \
+         `maturin develop --features code` to use enable_code()/\
+         disable_code()/set_code_config()",
+    )
+}
+
 /// Shape a Python tool callback's return value accepts: a plain `str`, or a
 /// dict with `content` and optional `is_error`.
 #[derive(serde::Deserialize)]
@@ -323,6 +335,21 @@ pub struct Agent {
 }
 
 impl Agent {
+    /// Shared body of `enable_code` / `disable_code` (same cfg split, so the
+    /// feature-missing error text lives in exactly one place).
+    fn code_switch(&self, py: Python<'_>, enabled: bool) -> PyResult<()> {
+        #[cfg(feature = "code")]
+        {
+            self.with_agent(py, |a| a.set_code_enabled(enabled))
+                .and_then(|r| r.map_err(to_pyerr))
+        }
+        #[cfg(not(feature = "code"))]
+        {
+            let _ = (py, enabled);
+            Err(code_feature_missing())
+        }
+    }
+
     /// Run `f` on the inner agent with (a) the same-thread reentry guard and
     /// (b) the GIL released while blocked on the lock.
     ///
@@ -448,6 +475,46 @@ impl Agent {
     /// The model name this agent sends with each request.
     fn model(&self, py: Python<'_>) -> PyResult<String> {
         self.with_agent(py, |a| a.model().to_string())
+    }
+
+    /// Enable the sandboxed `run_code` tool for the NEXT request (runtime
+    /// switch — the tool becomes visible to the model; zero schema cost
+    /// while disabled). Same busy contract as the other sync methods:
+    /// calling during `run()` deadlocks-waits (other thread) or errors
+    /// (same thread).
+    ///
+    /// Requires the module built with its `code` cargo feature
+    /// (`maturin develop --features code`); otherwise a clear error.
+    fn enable_code(&self, py: Python<'_>) -> PyResult<()> {
+        self.code_switch(py, true)
+    }
+
+    /// Remove `run_code` from the model's toolset (runtime switch). Does not
+    /// interrupt an in-flight execution — the next request just stops
+    /// offering the tool. Same feature requirement as `enable_code`.
+    fn disable_code(&self, py: Python<'_>) -> PyResult<()> {
+        self.code_switch(py, false)
+    }
+
+    /// Atomically replace the WHOLE code config (switch + every limit / path
+    /// knob) from a dict shaped like the config file's `"code"` section:
+    /// unknown keys error, missing keys reset to their DEFAULTS (they do not
+    /// retain previous values — send the full dict to keep a knob). Takes
+    /// effect for the next execution; an in-flight one keeps its snapshot.
+    fn set_code_config(&self, cfg: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<()> {
+        #[cfg(feature = "code")]
+        {
+            let parsed: ta::CodeConfig = depythonize(cfg)
+                .map_err(|e| anyhow::anyhow!("code config dict: {e}"))
+                .map_err(to_pyerr)?;
+            self.with_agent(py, |a| a.set_code_config(parsed))
+                .and_then(|r| r.map_err(to_pyerr))
+        }
+        #[cfg(not(feature = "code"))]
+        {
+            let _ = (cfg, py);
+            Err(code_feature_missing())
+        }
     }
 }
 
