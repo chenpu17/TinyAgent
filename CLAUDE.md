@@ -100,7 +100,7 @@ cargo clippy -p tiny-agent-node
   plain headless 刻意安静（完整 ToolCall 行随后来）；TUI 走 `_ => {}` 兜底。mock 的 `OkToolStream` 变体
   驱动 loop 级测试（分片→事件→拼装）。新增流式透出项照这套纪律抄。
 - **PDF 文档块（`Block::Document { media_type, data }`，Anthropic-only）**：对齐 Anthropic `document` content block（base64 source；url/Files-API `file_id` 两种 source 不做——宿主自己下载后推字节）。**四层接入点清单（新增 Block 变体照抄）**：① anthropic `message_json`（`{"type":"document","source":{"type":"base64",…}}`）；② openai `chat()` 入口 `reject_documents` **显式报错**（chat-completions 无 document 内容类型，静默丢弃比报错更糟；`message_jsons` 里的 omission placeholder 文本臂是防御纵深——正常路径不可达）；③ compress 三处（`total_chars` 给 base64-len/100 地板走 legacy char 阈值；`estimate_tokens` 按**页数×`PDF_TOKENS_PER_PAGE`=3000** token-side 加法；`window_lines` 出 `<document>` 占位行）；④ tui `transcript_rows` 显示跳过（与 Image 同款）。mock 的 capture 是 `_ => {}` 兜底、agent loop 不穷尽 match Block——新变体不强制点名这些点。**token 预估按页不按字节**：官方口径 1,500–3,000/页（逐页转图+抽文本，官方自己 3 页全视觉样例 ≈2,333/页），社区实测偏低估 → 取上沿 3000（preflight 宁早压，真实 usage 仍是记账权威）。`pdf_page_estimate`（compress.rs）免解析启发式：裸扫 `/Type /Page`/`/Type/Page`（尾字节非字母数字，排掉 `/Pages` 父节点与 `/PageMode` 类长名）与 `/Pages` 节点 ±窗口内 `/Count` 取 max（救 ObjStm 压缩流藏 page 对象的 PDF 1.5+；窗口限定在页树节点附近是防 outline 书签的 `/Count` 混入），双零按 ~100 KiB/页兜底、地板 1——每次 preflight 重解码重扫（10 MiB 封顶 ~ms 级，不值得给 Block 加缓存状态）。**实测对真实产商 PDF 精确**（CUPS 文本管线 3/46 页、Quartz 图像管线 1 页，PDFKit 真值逐一匹配；`tests/fixtures/cups_3p.pdf` 真件 fixture 永久钉住；ObjStm 藏 page 对象的 Word/Acrobat 类输出离线无产商、仅合成用例覆盖——`/Count` 恢复路径在案）。读取 helper `tools/document.rs::load_document_block`（`.pdf` 后缀 + `%PDF-` 头 + 10 MiB take 有界读，镜像 `load_block`；lib.rs 门面 re-export）。**刻意不做 `load_document` 工具**（模型驱动加载是后续可选项；本期 host-push only，经 `push_user`）。
-- **核心 loop 在 `agent.rs`**：累计 usage、cancel 复位、上下文压缩的有状态编排（`compress`/
+- **核心 loop 在 `agent.rs`**：累计 usage、cancel 轮询、上下文压缩的有状态编排（`compress`/
   `summarize_prefix`/`summary_call`，读写 Agent 字段 + 驱动 provider）在这里。压缩的**纯函数与常量**
   （`estimate_tokens`/`find_safe_cut`/`fold_summary`/`window_lines`/`chunk_lines`/`SUMMARY_*` 等）抽到
   `compress.rs`（单向被 agent 依赖；`window_lines` 反向调 `crate::agent::preview`，不构成环）。`AgentEvent`
@@ -443,7 +443,8 @@ cargo clippy -p tiny-agent-node
     `with_agent` 入口（`py.allow_threads` 内拿锁——闭包与返回值须 `Send`）。`run()` 释放 GIL
     跑 loop；自定义工具的闭包在 agent 线程执行，用 `Python::with_gil` **短暂重获 GIL** 调回
     Python。`set_cancel(token)` **必须在 `run()` 之前**调（把共享 `Arc<AtomicBool>` 装进
-    agent）——run 期间持有 mutex，`run()` 入口不复位 cancel（与主 agent 一致）。
+    agent）。cancel 契约：`run()` 永不清标志——复用 agent 多轮的宿主在新任务受理点调
+    `clear_cancel()`（绑定已透出），否则上一轮取消后每轮秒回 cancelled。
     **重入即死锁**（P1-2 教训）：回调里再调 agent 方法会 GIL↔Mutex 互等——run 期间的
     agent 方法调用经 `IN_RUN` thread-local 判定，报 "agent is running" 而非挂死；
     两个线程各自调方法也要靠 with_agent 的锁排队，别绕过它直拿 mutex。
@@ -519,8 +520,17 @@ cargo clippy -p tiny-agent-node
   `agent::append_user_turn` 会把新 user 内容折进已有的末尾 user 消息——新增 user 入口走它，别直接 push。
   另有兜底：`agent::run()` 每轮发请求前 `normalize_adjacent` 把相邻同 role 合并（保块顺序，不动配对），
   防 resumed/手改的损坏历史触发 400。别依赖它当正常路径，正常仍走 append_user_turn。
-- **cancel 标志一旦 `store(true)` 全库不会自动复位**（无 `store(false)`）。`agent::run()` 入口
-  显式复位，所以"取消本轮"后下一条消息能正常再跑。新增触发 cancel 的地方不用管复位。
+- **cancel 契约（TinyWorker 反馈落地）：run() 永不清，受理方清残留**。cancel 是电平标志、归嵌入方
+  所有；`store(true)` 全库无自动复位，`agent::run()` **也不清**（旧入口 `store(false)` 已删——它会把
+  宿主受理窗口内（懒构建可达数秒~15s）按下的停止当残留误清，用户停止被静默丢弃）。预置 true 的 run
+  在循环首检即返回：`cancelled`、turns==0、零 provider 请求。清残留的主体责任在**受理新任务的一方**：
+  `Agent::clear_cancel()`（pub，绑定层 `clear_cancel`/`clearCancel` 已透出）。库内四个受理点：TUI
+  `run_once`（每条提交输入/初始 auto-run）、`harness::run_with_retries` attempt 间（cancel = 梯子终态，
+  不重试——消掉旧「隐式复活」）、`batch` 重试梯（同款 attempt 间判定；batch agent 本就不装 cancel flag，
+  行为零变化）、`compact()` 入口。**破坏面**：嵌入方「set_cancel + 复用 agent 多轮」漏改的症状是每轮
+  秒回 cancelled（确定可见、`turns==0` 可机判），不是静默。测试组：`run_with_preset_cancel_returns…` /
+  `run_does_not_clear…` / `clear_cancel_lets_the_next_run_proceed` /
+  `parallel_children_both_honour…` / `single_run_cancel_during_failed_attempt…` + 绑定两侧回归。
 - **批量任务片段只能覆盖** `task`/`system_prompt`/`model`/`max_tokens`/`limits`；安全字段
   （`provider`/`base_url`/`api_key_env`/`workdir`/`tools`/`restrict_to_workdir`/`mcp_servers`）
   禁止覆盖（`config::forbidden_batch_override`），覆盖即 `bad_task` 失败、不执行。
@@ -555,12 +565,13 @@ cargo clippy -p tiny-agent-node
   （"收敛"）。**例外（A5，既定取舍）**：每个 agent 都用 `set_shutdown` 挂了同一个 flag 的 reaper——首次
   Ctrl-C 也会**立即杀掉在跑任务的 MCP server**（防二次 Ctrl-C 硬退留孤儿子进程，0.3.0 修复的另一半）；
   依赖 MCP 的在跑任务可能因此提前失败。**没有**把 cancel 标志传给
-  agent 中断流式——因为多 worker 共享一个 flag 会和 `agent::run()` 入口的 `store(false)` 复位竞争
-  （一个 worker 起新 run 会清掉另一个在跑的取消信号）。要立刻退出按第二次 Ctrl-C（`_exit(130)`）。
-- **子 agent 用 `run_as_subagent`，入口不复位 cancel 标志**：子 agent 继承父的 cancel Arc，但不像
-  `agent::run()` 那样在入口 `store(false)`——否则并行批次里后启动的兄弟会清掉刚按下的 Ctrl-C
-  （与上一条「批量 Ctrl-C 不传 flag」同一类竞争，这里 flag 确实共享，靠跳过复位化解）。spawn 时
-  batch gate 保证 flag 为 false，所以运行中见到 `true` 一定是真取消。别给 `run_as_subagent` 加复位。
+  agent 中断流式——保持「在跑的任务跑完（收敛）、产出照常落盘」的语义（旧论据「与 run() 入口复位
+  竞争」随 cancel 契约改版消失，但不传 flag 本身仍是既定取舍：传了就变成中途打断在跑任务）。
+  要立刻退出按第二次 Ctrl-C（`_exit(130)`）。
+- **子 agent 与 `run()` 在 cancel 上已无区别**（cancel 契约改版后两个入口都不清标志，只剩 budget/
+  deadline 安装差异：`run_as_subagent` 继承父的闸门不重装）。子 agent 继承父的 cancel Arc，任何入口
+  清掉共享标志都会丢掉整批的 Ctrl-C——测试 `run_as_subagent_does_not_reset_a_set_cancel_flag` 与
+  `parallel_children_both_honour…` 钉住。**别给任何 run 入口加回清残留**。
 - **子 agent 共享父的 MCP 工具（Arc-clone），不重启 server**：`SubAgent` 持父的 `mcp_tools`，建子 agent
   时 clone 而非重跑 `tools::mcp::build`。旧路径每次 `task` 都 `McpClient::start` 全部 server——并行 task
   批次会 spawn N×(#servers) 个子进程。改 `SubAgent::new` 签名别漏传 `mcp_tools`。
@@ -611,7 +622,7 @@ cargo clippy -p tiny-agent-node
 - **改 `agent.rs` 核心路径必须配套 loop 测试**。测试外置在 `agent_tests.rs`（`agent.rs` 末尾
   `#[cfg(test)] #[path = "agent_tests.rs"] mod tests;` 引入，靠 `use super::*` 仍可达 agent 私有项；
   压缩纯函数的测试靠 `use crate::compress::*`）。用 `provider/mock.rs` 的脚本化 Provider 覆盖不变量：
-  cancel 复位、tool_use/tool_result N:N 配对（含中途取消时合成的 `[cancelled by user]` 进 history
+  cancel 契约（run 永不清 / 预置即取消 / 受理点 clear_cancel）、tool_use/tool_result N:N 配对（含中途取消时合成的 `[cancelled by user]` 进 history
   但不进 `tool_calls`）、压缩、usage 累计、hooks 闸门（Deny 记录不占 Cancelled / Modify 审计留原始
   输入 / Allow 与无 hooks 逐字段等价，`CaptureHooks` 记录精确调用序列）。动了 loop 逻辑先补/查这些
   测试，别只靠 mock server 跑一遍就提交。

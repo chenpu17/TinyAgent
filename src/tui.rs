@@ -934,6 +934,14 @@ pub fn run(
         // (out_rx dropped) so the loop can stop instead of pushing into
         // a dead channel.
         let run_once = |agent: &mut Agent| -> bool {
+            // Acceptance point (cancel contract, TinyWorker): run() never
+            // clears the flag, so the party accepting the new task does.
+            // This closure IS that point — it fires once per submitted user
+            // input (and for the initial/resumed auto-run). Without this, an
+            // Esc that cancelled the previous turn would instantly cancel
+            // every following one. Idle Esc never touches the flag, so the
+            // clear cannot swallow a stop the user just signalled.
+            agent.clear_cancel();
             let res = agent.run(&mut |ev| {
                 let _ = out_tx.send(UiMsg::Event(ev));
             });

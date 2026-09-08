@@ -534,10 +534,25 @@ impl Agent {
     /// to call while a run is in flight? No — same busy contract as the other
     /// sync methods; flip `token.cancel()` instead (the token itself is
     /// lock-free by design, that's the supported mid-run cancel path).
+    /// Contract (kernel, TinyWorker): the flag is level-triggered and `run()`
+    /// NEVER clears it — after a cancelled run, call `clearCancel()` at the
+    /// point you accept the next task (e.g. right before `pushUser`/`run` of
+    /// a new message) or every following run resolves instantly cancelled.
     #[napi]
     pub fn set_cancel(&self, token: &CancelToken) -> Result<()> {
         let mut a = self.inner.try_lock().map_err(|_| agent_busy())?;
         a.set_cancel(token.flag.clone());
+        Ok(())
+    }
+
+    /// Clear the cancel flag — the acceptance-point half of the cancel
+    /// contract (see `set_cancel`). Call this when accepting a NEW task, not
+    /// during a run (a stop signalled mid-run must land). Busy-errors while
+    /// `run()` is in flight (see [`agent_busy`]).
+    #[napi]
+    pub fn clear_cancel(&self) -> Result<()> {
+        let a = self.inner.try_lock().map_err(|_| agent_busy())?;
+        a.clear_cancel();
         Ok(())
     }
 

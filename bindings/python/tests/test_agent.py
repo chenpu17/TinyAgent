@@ -204,6 +204,41 @@ def test_cancel_interrupts_run():
         hang_stop.set()  # release the blocked handler thread
 
 
+def test_stale_cancel_persists_until_clear_cancel():
+    """Kernel cancel-ownership contract (TinyWorker): run() NEVER clears the
+    flag. A stop left over from a cancelled run makes every following run
+    return instantly cancelled (turns=0, zero requests) until the HOST clears
+    it at its acceptance point — clear_cancel()."""
+    def ok(handler, body):
+        write_sse(handler, text_sse("done"))
+
+    mock = ScriptedMock([ok]).start()
+    try:
+        cfg = openai_config(mock.url, tools=[])
+        a = tiny_agent.Agent(cfg, api_key=MOCK_KEY)
+        a.push_user("hi")
+        tok = tiny_agent.CancelToken()
+        a.set_cancel(tok)
+
+        tok.cancel()  # stop signalled before the run (acceptance window)
+        out = a.run()
+        assert out["stop_reason"] == "cancelled"
+        assert out["turns"] == 0
+
+        # No clear in between: cancelled again, deterministically (not a race).
+        out2 = a.run()
+        assert out2["stop_reason"] == "cancelled"
+        assert out2["turns"] == 0
+
+        # Acceptance point: clear, then the follow-up runs to completion.
+        a.clear_cancel()
+        out3 = a.run()
+        assert out3["stop_reason"] == "end_turn"
+        assert out3["turns"] == 1
+    finally:
+        mock.stop()
+
+
 # ── 5. honest 4-axis token usage ──────────────────────────────────────────────
 
 def test_usage_four_axes_reported():

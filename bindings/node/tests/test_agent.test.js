@@ -113,6 +113,39 @@ test('cancel interrupts the in-flight run', async (t) => {
   assert.strictEqual(out.stop_reason, 'cancelled');
 });
 
+test('stale cancel persists until clearCancel (acceptance contract)', async (t) => {
+  // Kernel cancel-ownership contract (TinyWorker): run() NEVER clears the
+  // flag. A stop left over from a cancelled run makes every following run
+  // return instantly cancelled (turns=0, zero requests) until the HOST
+  // clears it at its acceptance point — clearCancel().
+  const mock = await ScriptedMock.start([
+    (_body, res) => respondSse(res, textSse('done')),
+  ]);
+  t.after(() => mock.stop());
+
+  const { cfgPath } = writeConfig(t, mock.url, { tools: [] });
+  const a = new Agent(cfgPath, { apiKey: MOCK_KEY });
+  a.pushUser('hi');
+  const tok = new CancelToken();
+  a.setCancel(tok);
+
+  tok.cancel(); // stop signalled before the run (the embedder's acceptance window)
+  const out = await a.run();
+  assert.strictEqual(out.stop_reason, 'cancelled');
+  assert.strictEqual(out.turns, 0);
+
+  // No clear in between: cancelled again, deterministically (not a race).
+  const out2 = await a.run();
+  assert.strictEqual(out2.stop_reason, 'cancelled');
+  assert.strictEqual(out2.turns, 0);
+
+  // Acceptance point: clear, then the follow-up runs to completion.
+  a.clearCancel();
+  const out3 = await a.run();
+  assert.strictEqual(out3.stop_reason, 'end_turn');
+  assert.strictEqual(out3.turns, 1);
+});
+
 // ── 4. honest 4-axis token usage ─────────────────────────────────────────────
 
 test('usage four axes are reported', async (t) => {

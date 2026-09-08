@@ -1558,12 +1558,14 @@ fn hooks_mixed_turn_gates_leaves_first_then_batch_in_block_order() {
 }
 
 #[test]
-fn run_resets_stale_cancel_so_first_turn_is_not_cancelled() {
-    // A cancel left set from a previous run must be cleared at entry —
-    // cancel is level-triggered and never auto-clears elsewhere, so
-    // without the reset the first turn breaks "cancelled" before chat.
+fn run_with_preset_cancel_returns_immediately_zero_requests() {
+    // Cancel-ownership contract (TinyWorker): run() NEVER clears the flag, so
+    // a run started with cancel already set (a stop signalled during the
+    // embedder's acceptance window — e.g. its lazy build) is honoured: the
+    // loop-head check fires before turns/chat, giving stop_reason
+    // "cancelled", turns == 0, zero provider requests, zero tokens.
     let cfg = cfg_with(5, 0, 0);
-    let (prov, _) = MockProvider::new(vec![mock::resp_text("done", None)]);
+    let (prov, state) = MockProvider::new(vec![mock::resp_text("done", None)]);
     let mut agent = Agent::new(
         &cfg,
         Box::new(prov),
@@ -1571,10 +1573,129 @@ fn run_resets_stale_cancel_so_first_turn_is_not_cancelled() {
         vec![user_text("hi")],
         test_ctx(),
     );
-    agent.set_cancel(Arc::new(AtomicBool::new(true))); // stale cancel
+    let flag = Arc::new(AtomicBool::new(true)); // stop already signalled
+    agent.set_cancel(flag.clone());
     let o = agent.run(&mut |_| {}).unwrap();
-    assert_eq!(o.stop_reason, "end_turn");
-    assert_eq!(o.turns, 1);
+    assert_eq!(o.stop_reason, "cancelled");
+    assert_eq!(o.turns, 0, "cancel must preempt the first turn entirely");
+    assert_eq!(
+        o.input_tokens
+            + o.output_tokens
+            + o.cache_creation_input_tokens
+            + o.cache_read_input_tokens,
+        0,
+        "no provider call may be billed"
+    );
+    assert!(
+        state.captured().is_empty(),
+        "run must not consult the provider when cancel is preset"
+    );
+}
+
+#[test]
+fn run_does_not_clear_a_stale_cancel_flag() {
+    // The old entry-point store(false) is GONE: a cancel that ended one run
+    // persists into the next (level-triggered, embedder-owned). This locks
+    // "run never clears" — the acceptance party (TUI input handler, retry
+    // ladder, embedder) clears via clear_cancel instead. A second run
+    // without a clear returns cancelled again with zero provider requests.
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, state) = MockProvider::new(vec![mock::resp_text("done", None)]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("hi")],
+        test_ctx(),
+    );
+    let flag = Arc::new(AtomicBool::new(false));
+    agent.set_cancel(flag.clone());
+    flag.store(true, Ordering::Relaxed);
+    let o1 = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o1.stop_reason, "cancelled");
+    assert!(flag.load(Ordering::Relaxed), "run must leave the flag set");
+    // No clear in between: the second run is cancelled too — deterministically,
+    // not by racing an implicit reset.
+    let o2 = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o2.stop_reason, "cancelled");
+    assert_eq!(o2.turns, 0);
+    assert!(
+        state.captured().is_empty(),
+        "neither run may consult the provider"
+    );
+}
+
+#[test]
+fn clear_cancel_lets_the_next_run_proceed() {
+    // The acceptance-point remedy: after a cancelled run, the party accepting
+    // the next task calls clear_cancel, and the following run executes
+    // normally. This is the embedder-visible loop TinyWorker drives:
+    // run (cancelled) → clear_cancel at send-message → run → completes.
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, _) = MockProvider::new(vec![
+        mock::resp_text("done", None),
+        mock::resp_text("again", None),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("hi")],
+        test_ctx(),
+    );
+    let flag = Arc::new(AtomicBool::new(false));
+    agent.set_cancel(flag.clone());
+    // Stale stop from an earlier turn → this run is cancelled instantly.
+    flag.store(true, Ordering::Relaxed);
+    let o1 = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o1.stop_reason, "cancelled");
+    // Acceptance point: clear, then the follow-up runs to completion.
+    agent.clear_cancel();
+    agent.push_user(vec![Block::Text("again".into())]);
+    let o2 = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o2.stop_reason, "end_turn");
+    assert_eq!(o2.turns, 1);
+    assert!(!flag.load(Ordering::Relaxed));
+    // clear_cancel is idempotent and safe without a flag installed.
+    agent.clear_cancel();
+}
+
+#[test]
+fn parallel_children_both_honour_shared_parent_cancel_none_clears_it() {
+    // Acceptance #5: two sub-agent children share the parent's cancel Arc;
+    // with the flag set, BOTH run_as_subagent calls return cancelled and
+    // neither clears the flag (a sibling clearing it would drop the parent's
+    // Ctrl-C for the whole batch). Since the contract change no entry point
+    // clears at all — this pins that nothing regressed to per-run clearing.
+    let flag = Arc::new(AtomicBool::new(true)); // parent Ctrl-C already fired
+    let mk = || {
+        let (prov, _) = MockProvider::new(vec![mock::resp_text("x", None)]);
+        let mut a = Agent::new(
+            &cfg_with(5, 0, 0),
+            Box::new(prov),
+            vec![],
+            vec![user_text("hi")],
+            test_ctx(),
+        );
+        a.set_cancel(flag.clone());
+        a
+    };
+    let mut a = mk();
+    let mut b = mk();
+    let (oa, ob) = std::thread::scope(|s| {
+        let ha = s.spawn(|| a.run_as_subagent(&mut |_| {}));
+        let hb = s.spawn(|| b.run_as_subagent(&mut |_| {}));
+        (
+            ha.join().expect("child A panicked"),
+            hb.join().expect("child B panicked"),
+        )
+    });
+    assert_eq!(oa.unwrap().stop_reason, "cancelled");
+    assert_eq!(ob.unwrap().stop_reason, "cancelled");
+    assert!(
+        flag.load(Ordering::Relaxed),
+        "no child may clear the shared parent flag"
+    );
 }
 
 #[test]
@@ -1608,15 +1729,14 @@ fn streaming_request_carries_timeout_backstop_without_run_deadline() {
 
 #[test]
 fn run_as_subagent_does_not_reset_a_set_cancel_flag() {
-    // The `task` sub-agent's child shares the parent's cancel Arc and runs
-    // via run_as_subagent, which — unlike the top-level run — must NOT reset
-    // the flag at entry. If it did, a sibling starting later in a parallel
-    // `task` batch would clear a Ctrl-C another child (or the parent) is
-    // mid-responding to, dropping the cancel for the whole batch (the race
-    // CLAUDE.md records batch::run avoiding by not sharing the flag). Pin
-    // the invariant directly: with the flag already set, the sub-agent run
-    // honours it (stop_reason "cancelled") and leaves the flag set, rather
-    // than resetting it and proceeding.
+    // The `task` sub-agent's child shares the parent's cancel Arc. Since the
+    // cancel-ownership contract change NO entry point clears the flag (see
+    // run()'s doc), so this is no longer a run-vs-subagent distinction — but
+    // the invariant stays worth pinning directly: with the flag already set,
+    // the sub-agent run honours it (stop_reason "cancelled") and leaves the
+    // flag set. A regression to per-run clearing here would let a sibling
+    // starting later in a parallel `task` batch drop a Ctrl-C signalled for
+    // the whole batch.
     let cfg = cfg_with(5, 0, 0);
     let (prov, _) = MockProvider::new(vec![mock::resp_text("x", None)]);
     let mut agent = Agent::new(
@@ -2962,8 +3082,9 @@ fn compact_failure_errors_and_a_retry_attempt_is_fresh() {
 fn compact_clears_a_stale_cancel_flag() {
     // A cancel left set by a previously-interrupted run would abort the
     // summary request before it starts (the streaming layer consults the
-    // flag live). compact resets it at entry — same rationale as run()'s
-    // entry reset.
+    // flag live). compact clears it at entry — the acceptance-point pattern
+    // (run() never clears; whoever accepts new work does — here the host
+    // explicitly starting a manual compact is accepting that work).
     let mut cfg = cfg_with(5, 0, 0);
     cfg.limits.keep_recent_messages = 2;
     let initial = vec![
@@ -4597,9 +4718,9 @@ fn single_run_no_retry_when_retries_zero() {
 #[test]
 fn single_run_cancel_during_backoff_exits_130() {
     // A Ctrl-C during the retry backoff must cancel (exit 130) instead of
-    // being swallowed: the next agent.run would clear the flag at entry and
-    // proceed, making the first Ctrl-C look like a no-op. The sleeper
-    // simulates the signal by flipping the shared cancel flag.
+    // sleeping out the full window: the sliced sleeper notices the flag
+    // within ~100ms. The sleeper simulates the signal by flipping the
+    // shared cancel flag.
     let cfg = cfg_with(5, 0, 0);
     let (prov, state) = MockProvider::new(vec![
         MockTurn::Err("503".into()),
@@ -4629,6 +4750,55 @@ fn single_run_cancel_during_backoff_exits_130() {
     );
     let s = std::fs::read_to_string(&out).unwrap();
     assert!(s.contains("cancelled during retry backoff"), "{s}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Simulates "user pressed stop and the stream died": flips the shared cancel
+/// flag, then fails the request transiently — a 503 arriving right after a
+/// Ctrl-C, the exact path the between-attempts check exists for.
+struct CancelThenErrProvider {
+    flag: Arc<AtomicBool>,
+}
+impl Provider for CancelThenErrProvider {
+    fn chat(
+        &self,
+        _req: &ChatRequest,
+        _on_event: &mut dyn FnMut(ChatEvent),
+    ) -> Result<ChatResponse> {
+        self.flag.store(true, Ordering::Relaxed);
+        Err(anyhow::anyhow!("stream cut (503) while cancelling"))
+    }
+}
+
+#[test]
+fn single_run_cancel_during_failed_attempt_exits_130() {
+    // Cancel-ownership contract: a stop signalled DURING a failed attempt is
+    // TERMINAL for the ladder — no attempt 2 "revive". The provider flips the
+    // flag then errors transiently; the between-attempts check must break
+    // with exit 130 (attempts stays 1) instead of sleeping and re-running,
+    // which pre-contract ran a full attempt 2 as if the user hadn't stopped.
+    let cfg = cfg_with(5, 0, 0);
+    let flag = Arc::new(AtomicBool::new(false));
+    let prov = CancelThenErrProvider { flag: flag.clone() };
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    agent.set_cancel(flag.clone());
+    let dir = std::env::temp_dir().join(format!("ta-retry-cancel2-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let out = dir.join("r.json");
+    let code = crate::harness::run_with_retries(&mut agent, Some(&out), false, 3, |_| {}).unwrap();
+    assert_eq!(code, 130, "stop during a failed attempt → exit 130");
+    let s = std::fs::read_to_string(&out).unwrap();
+    assert!(s.contains("cancelled during retry ladder"), "{s}");
+    assert!(
+        s.contains("\"attempts\": 1"),
+        "attempt 2 must not start: {s}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

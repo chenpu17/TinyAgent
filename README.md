@@ -100,6 +100,8 @@ agent.set_hooks(Arc::new(Policy));
 
 run 结束后从 [`RunOutcome`](src/agent.rs)（或 `Agent::usage()` / `messages()` / `model()` getter）读回诚实的 token 账单与历史。`AgentEvent` 派生了 `Serialize`，绑定层可直接序列化成宿主语言的 dict / object。`Message` 带**稳定 id**（`id: Option<String>`，agent 在消息进入历史时铸造、跨 save/load 不变、压缩折叠不重排存活者）——往消息上挂宿主侧资产（图片卡 / 文件链接）时锚 id 而不是下标，压缩/truncate 后锚点不漂移。
 
+**取消契约**（`set_cancel` / `clear_cancel`）：cancel 是**电平标志、归嵌入方所有**，`run()` 永不清除——run 期间任何时刻置位都有效；带着已置位的 cancel 启动 run 会立即返回（`stop_reason: "cancelled"`、`turns: 0`、零请求零 token）。清残留的主体责任在**受理新任务的一方**：`set_cancel` 装好共享 `Arc<AtomicBool>` 后，在受理点（标记会话 running 的同一处）调 `clear_cancel()`——受理点可能远早于 `run()`（懒构建可达数秒），让内核在 run 入口清会把窗口内用户的停止误当残留吞掉。内置调用点已按此契约工作：TUI 在提交每条输入时清、重试梯把取消视为终态不重试、`compact()` 入口清。绑定层同款：`clear_cancel()`（Python）/ `clearCancel()`（Node）。
+
 **PDF 文档输入**（`Block::Document`）：Anthropic 协议原生支持把 PDF 作为 `document` content block——服务端逐页"转图 + 抽取文本"，图表/版面都能看。库侧用 `load_document_block(path)` 读本地文件（`.pdf` 后缀 + `%PDF-` 头校验、10 MiB 上限，对齐 `load_image`），随消息推入：
 
 ```rust
@@ -417,7 +419,7 @@ length / error 等）才显示警告。工具输出里的 ANSI 颜色序列（�
 | `/model` `/limits` `/tools` `/system` | 只读查看当前配置 |
 | `/help` | 命令列表 |
 
-取消机制：每轮开始会复位 cancel 标志，`Ctrl-C` 在流式 chunk 间（≤200ms）生效，取消后可继续发下一条。
+取消机制：`Ctrl-C` 在流式 chunk 间（≤200ms）生效，取消后可继续发下一条——内核 `run()` 不清停止标志（电平契约，嵌入方在受理点负责清），TUI 在提交每条新输入时自动清掉上一轮的残留停止。
 
 多行粘贴：终端开启 bracketed paste，一次粘贴含换行的多行会被当作**单条**消息，不会因换行被提前发送——直接粘贴即可，无需手动改 Alt+Enter。手动输入多行除了 `Alt+Enter` / `Shift+Enter`，也可在行尾打 `\` 再按 `Enter` 换行（行续接）——终端不上报修饰键时（如 macOS Terminal.app）这是唯一的手动多行入口。
 
@@ -1025,7 +1027,7 @@ agent loop（含 tool_use 配对、token 用量解析、流式取消）。注意
 release 下 panic 不触发 `Drop`——调试 destructors（如 TUI 终端还原）用 debug 构建。
 
 核心 agent loop 有进程内回归测试：`src/provider/mock.rs` 是 cfg(test) 的脚本化 Provider，
-`src/agent.rs` 的 `#[cfg(test)]` 模块覆盖 cancel 复位、tool_use/tool_result N:N 配对（含中途取消的
+`src/agent.rs` 的 `#[cfg(test)]` 模块覆盖 cancel 契约（run 永不清、预置即取消、受理点 `clear_cancel`）、tool_use/tool_result N:N 配对（含中途取消的
 合成 `[cancelled by user]`）、上下文压缩、usage 累计等不变量。**改 `agent.rs` 核心路径请配套补 loop 测试。**
 
 ## 发布流程

@@ -429,8 +429,19 @@ impl Agent {
     }
 
     /// Arm a `CancelToken`; its flag interrupts the next turn boundary.
+    /// Contract (kernel, TinyWorker): the flag is level-triggered and `run()`
+    /// NEVER clears it — after a cancelled run, call `clear_cancel()` at the
+    /// point you accept the next task (e.g. right before `push_user`/`run` of
+    /// a new message) or every following run returns instantly cancelled.
     fn set_cancel(&self, token: &CancelToken, py: Python<'_>) -> PyResult<()> {
         self.with_agent(py, |a| a.set_cancel(token.flag.clone()))
+    }
+
+    /// Clear the cancel flag — the acceptance-point half of the cancel
+    /// contract (see `set_cancel`). Call this when accepting a NEW task, not
+    /// during a run (a stop signalled mid-run must land).
+    fn clear_cancel(&self, py: Python<'_>) -> PyResult<()> {
+        self.with_agent(py, |a| a.clear_cancel())
     }
 
     /// Run one turn (until end_turn / max_turns / cancel / error). `on_event`

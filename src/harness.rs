@@ -147,6 +147,19 @@ pub(crate) fn run_with_retries(
                     break (EXIT_ERROR, None, Some(format!("{re:#}")));
                 }
                 if attempt <= retries {
+                    // A cancel observed between attempts is TERMINAL for the
+                    // ladder (TinyWorker contract): run() no longer clears
+                    // the flag at entry, but even under the old implicit
+                    // clear a stop signalled during a failed attempt was a
+                    // "revive" bug — attempt 2 ran as if the user hadn't
+                    // asked to stop. Honour it here instead of retrying.
+                    if agent.cancelled() {
+                        break (
+                            EXIT_CANCELLED,
+                            None,
+                            Some("cancelled during retry ladder".into()),
+                        );
+                    }
                     let backoff = crate::retry::backoff(attempt - 1);
                     let msg = format!("{re:#}");
                     if json {
@@ -161,11 +174,9 @@ pub(crate) fn run_with_retries(
                     // ~100ms instead of after the full ~40s sleep. The shared
                     // slice core (retry::sleep_cancelable_with) honors the
                     // injected `sleep` per slice (a no-op in tests) and reads
-                    // the agent's own cancel flag. A Ctrl-C during the backoff
-                    // flips that flag, but the next agent.run clears it at entry
-                    // and would proceed — making the first Ctrl-C look like a
-                    // no-op (only the second SIGINT force-exits) — so honor it
-                    // here instead of falling through to the next attempt.
+                    // the agent's own cancel flag — without the slicing, a
+                    // cancel that lands mid-backoff would only surface at the
+                    // next attempt's between-attempts check above.
                     if crate::retry::sleep_cancelable_with(backoff, &mut sleep, || {
                         agent.cancelled()
                     }) {

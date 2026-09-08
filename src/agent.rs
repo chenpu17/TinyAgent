@@ -674,6 +674,10 @@ impl Agent {
     /// separate `set_shutdown` signal, which the frontend fires ONLY on session
     /// end. (P1 audit fix: previously this propagated `cancel` to the MCP
     /// reaper, so a TUI Esc killed the server the next turn couldn't reuse.)
+    ///
+    /// Contract: the flag is level-triggered, owned by the embedder, and never
+    /// cleared by [`Agent::run`] — clear a stale stop at your acceptance point
+    /// with [`Agent::clear_cancel`].
     pub fn set_cancel(&mut self, flag: Arc<AtomicBool>) {
         self.ctx.cancel = Some(flag.clone());
         self.cancel = Some(flag);
@@ -1041,34 +1045,62 @@ impl Agent {
     }
 
     /// Run the loop until the model stops calling tools, or a limit is hit.
-    /// Resets a stale cancel flag from a previous run (this `Agent` may be
-    /// reused across runs — TUI follow-ups, harness retries — so a Ctrl-C that
-    /// ended the last run must not bleed into this one).
+    ///
+    /// NEVER clears the cancel flag (TinyWorker contract, v0.3.1): cancel is
+    /// level-triggered, owned by the embedder, and a `true` observed at ANY
+    /// point — including before this call — is honoured. A run started with
+    /// cancel already set returns immediately from the loop-head check:
+    /// `stop_reason == "cancelled"`, zero turns, zero provider requests.
+    /// The party that ACCEPTS a new task (the TUI's input handler, a retry
+    /// ladder between attempts, an embedding host's send-message path) is
+    /// responsible for clearing a stale cancel at acceptance time via
+    /// [`Agent::clear_cancel`] — the acceptor is the only one who knows the
+    /// previous run truly ended, and its acceptance point may sit well before
+    /// this call (an embedder's lazy build can take seconds).
     pub fn run(&mut self, events: &mut dyn FnMut(AgentEvent)) -> Result<RunOutcome, RunError> {
-        self.run_impl(events, /* reset_cancel */ true)
+        self.run_impl(events, /* top_level */ true)
     }
 
-    /// Drive this agent as a `task` sub-agent's child. Like `run`, but does NOT
-    /// reset the shared cancel flag at entry. The child inherits the parent's
-    /// cancel `Arc`; resetting here would let a sibling sub-agent starting
-    /// slightly later in a parallel `task` batch clear a Ctrl-C just signalled
-    /// on the shared flag — dropping the cancel for the whole batch. That is the
-    /// exact race CLAUDE.md records `batch::run` dodging by not sharing the flag
-    /// with its workers. Skipping the reset is safe: the child is freshly built
-    /// per call (no stale cancel to clear), and the batch gate guarantees the
-    /// flag is false when workers spawn — so any `true` the child later observes
-    /// is a real cancel it must honour, never stale state.
+    /// Drive this agent as a `task` sub-agent's child. Identical to `run`
+    /// except it does NOT install a fresh run: the budget gate and deadline
+    /// stay the ones the parent published, so parent + siblings + child all
+    /// read/write the same numbers (a parallel `task` batch must trip the
+    /// token cap collectively, and a child spawned near the deadline clamps
+    /// to the parent's remaining time).
+    ///
+    /// Since the cancel-ownership contract change, this no longer differs
+    /// from `run` on cancel either — NO entry point clears the flag. A child
+    /// shares the parent's cancel `Arc`; clearing it here would drop a Ctrl-C
+    /// signalled for the whole batch, and even absent that, run() clearing it
+    /// would race every sibling. The child is freshly built per call, so it
+    /// has no stale cancel of its own; any `true` it observes on the shared
+    /// flag is a real cancel it must honour.
     pub(crate) fn run_as_subagent(
         &mut self,
         events: &mut dyn FnMut(AgentEvent),
     ) -> Result<RunOutcome, RunError> {
-        self.run_impl(events, /* reset_cancel */ false)
+        self.run_impl(events, /* top_level */ false)
+    }
+
+    /// Clear the cancel flag — the acceptance-point half of the cancel
+    /// contract (see [`Agent::run`]): `run` never clears cancel, so whoever
+    /// accepts a NEW task clears any stale stop left over from the previous
+    /// one, at the moment of acceptance. Call this from the same place the
+    /// host marks the session "running" (the TUI does it when submitting a
+    /// user message; `run_with_retries` between attempts; `compact` at its
+    /// entry; an embedding host in its send-message path). Only meaningful
+    /// between runs — during a run the flag must stay untouched so a stop
+    /// request lands.
+    pub fn clear_cancel(&self) {
+        if let Some(c) = &self.cancel {
+            c.store(false, Ordering::Relaxed);
+        }
     }
 
     fn run_impl(
         &mut self,
         events: &mut dyn FnMut(AgentEvent),
-        reset_cancel: bool,
+        top_level: bool,
     ) -> Result<RunOutcome, RunError> {
         let start = Instant::now();
         // Each top-level run gets a fresh compression budget. In the TUI the
@@ -1079,17 +1111,11 @@ impl Agent {
         // Fresh usage totals per run (this Agent may be reused across runs —
         // TUI follow-ups, harness retries).
         self.usage = Usage::default();
-        // Reset any stale cancel from a previous run: cancel is level-triggered
-        // and never auto-clears elsewhere, so without this a Ctrl-C that ended
-        // the last turn would cancel this one before it starts. Only the
-        // top-level `run` resets — a `task` sub-agent (run_as_subagent) shares
-        // the parent's flag and must NOT reset, or a sibling starting later in a
-        // parallel batch would race a just-signalled Ctrl-C (see run_as_subagent).
-        if reset_cancel {
-            if let Some(c) = &self.cancel {
-                c.store(false, Ordering::Relaxed);
-            }
-        }
+        // NOTE: cancel is deliberately NOT touched here. The old entry-point
+        // `store(false)` silently dropped a stop signalled during the
+        // embedder's acceptance window (lazy build can sit between the
+        // host's "running" mark and this call) — see run()'s doc for the
+        // contract and clear_cancel for the acceptance-point remedy.
         // Overall run deadline. Each chat is capped to the time left so a
         // single stuck request can't outlive the run budget — which is
         // otherwise only enforced at turn boundaries. checked_add: a plain
@@ -1112,7 +1138,7 @@ impl Agent {
         // follow-ups, harness retries); run_as_subagent keeps the inherited
         // one so parent + siblings + child all read/write the same numbers.
         self.ctx.deadline = deadline;
-        if reset_cancel {
+        if top_level {
             self.ctx.budget = (self.limits.max_total_tokens > 0)
                 .then(|| BudgetGate::new(self.limits.max_total_tokens));
         }
@@ -1985,11 +2011,11 @@ impl Agent {
         events: &mut dyn FnMut(AgentEvent),
     ) -> Result<Option<CompressOutcome>> {
         // Fresh-attempt resets (see the doc). Order: clear the disable flag,
-        // then cancel — a summary chat consults the flag live.
+        // then cancel — a summary chat consults the flag live. Clearing here
+        // is the acceptance-point pattern (see clear_cancel): the host
+        // explicitly starting a manual compact is accepting new work.
         self.compress_failed = false;
-        if let Some(c) = &self.cancel {
-            c.store(false, Ordering::Relaxed);
-        }
+        self.clear_cancel();
         // No run deadline: summary_call falls back to its per-request
         // backstop (STREAM_BACKSTOP), so a stuck summary can't hang forever.
         self.compress(events, /* deadline: */ None, CompressTrigger::Manual)
