@@ -129,6 +129,16 @@ pub enum AgentEvent {
         kept: usize,
         trigger: CompressTrigger,
     },
+    /// The reply hit the output-token limit (`stop_reason: "max_tokens"`)
+    /// and the agent appended its one-shot wrap-up turn
+    /// (`Config::salvage_on_max_tokens`, default on) to salvage a usable
+    /// conclusion — at most once per run, billed as an ordinary turn.
+    /// Serializes as the string `"MaxTokensSalvage"` (unit variant, external
+    /// tagging); harness `--json` maps it to `{"type":"salvage"}` and plain
+    /// headless writes one stderr line. Informational — the wrap-up request
+    /// itself is an ordinary main turn (hooks / billing / turn budget all
+    /// apply to it like any other).
+    MaxTokensSalvage,
     /// A non-fatal problem worth surfacing (session save failed, compression
     /// disabled after an error, …). Frontends decide how to show it — the
     /// headless printer writes stderr, the TUI renders a system line. NEVER
@@ -375,6 +385,20 @@ impl RunCost {
     }
 }
 
+/// One-shot wrap-up nudges for `salvage_on_max_tokens`. Deliberately generic
+/// English (aligned with `SUBAGENT_SYSTEM_PROMPT`) and deliberately NOT
+/// phrased around any evaluation's answer-format contract — the product must
+/// not couple to a benchmark's "Final answer:" convention.
+const SALVAGE_NUDGE_PARTIAL: &str = "Your previous reply was cut off at the \
+     output-token limit. Do not continue it — finish now with a concise, \
+     complete statement of the result.";
+/// Variant for a reply that died with ZERO blocks (reasoning consumed the
+/// whole budget; the empty assistant message never entered history). The
+/// nudge folds into the trailing user turn via `append_user_turn`.
+const SALVAGE_NUDGE_EMPTY: &str = "Your previous reply produced no visible \
+     text before hitting the output-token limit (reasoning consumed the \
+     budget). Reply now with minimal reasoning and a direct, concise answer.";
+
 pub struct Agent {
     provider: Box<dyn Provider>,
     /// The protocol family declared by the config ("anthropic" / "openai") —
@@ -393,6 +417,10 @@ pub struct Agent {
     /// Reasoning effort forwarded to the provider verbatim (None = default).
     reasoning_effort: Option<String>,
     limits: Limits,
+    /// Whether a reply truncated at the output-token limit with no pending
+    /// tool calls gets the one-shot wrap-up turn (from
+    /// `Config::salvage_on_max_tokens`).
+    salvage_on_max_tokens: bool,
     ctx: ToolCtx,
     session_path: Option<std::path::PathBuf>,
     /// Set by the frontend (e.g. TUI Esc) to stop at the next turn boundary.
@@ -534,6 +562,7 @@ impl Agent {
             max_tokens: cfg.max_tokens,
             reasoning_effort: cfg.reasoning_effort.clone(),
             limits: cfg.limits.clone(),
+            salvage_on_max_tokens: cfg.salvage_on_max_tokens,
             ctx,
             session_path: None,
             cancel: None,
@@ -1088,6 +1117,10 @@ impl Agent {
                 .then(|| BudgetGate::new(self.limits.max_total_tokens));
         }
         let mut turns = 0u32;
+        // One-shot allowance for `salvage_on_max_tokens`: at most one
+        // wrap-up turn per run (a salvage turn that ALSO truncates is
+        // returned as-is, never salvaged twice).
+        let mut salvage_used = false;
         let mut final_text = String::new();
         let mut records: Vec<ToolCallRecord> = Vec::new();
         let mut stop_reason: String;
@@ -1321,6 +1354,23 @@ impl Agent {
             // empty for this turn and has_tool_use is necessarily false, so just
             // stop here with the provider's stop_reason.
             if resp.blocks.is_empty() {
+                // max_tokens with ZERO visible blocks (reasoning consumed
+                // the whole budget): salvage once with a wrap-up turn. The
+                // empty assistant message stays OUT of history (strict APIs
+                // reject it — the reason this break exists); the nudge folds
+                // into the trailing user message via append_user_turn.
+                if resp.stop_reason == "max_tokens"
+                    && self.salvage_on_max_tokens
+                    && !salvage_used
+                    && !self.cancelled()
+                {
+                    salvage_used = true;
+                    events(AgentEvent::MaxTokensSalvage);
+                    if let Some(w) = self.push_user(vec![Block::Text(SALVAGE_NUDGE_EMPTY.into())]) {
+                        events(AgentEvent::Warning(w));
+                    }
+                    continue;
+                }
                 break;
             }
             // Repair tool_use ids BEFORE the assistant message is persisted:
@@ -1391,6 +1441,26 @@ impl Agent {
                 }
                 if let Some(w) = self.save_session() {
                     events(AgentEvent::Warning(w));
+                }
+                // max_tokens truncation WITHOUT pending calls: the partial
+                // text above is already in history — append the one-shot
+                // wrap-up nudge as a fresh user turn instead of ending the
+                // run on a cut-off reply. Truncation WITH tool_use keeps
+                // the old semantics (half-call dropped above, stop): a
+                // wrap-up turn can't usefully resume an aborted call stream.
+                if resp.stop_reason == "max_tokens"
+                    && !has_tool_use
+                    && self.salvage_on_max_tokens
+                    && !salvage_used
+                    && !self.cancelled()
+                {
+                    salvage_used = true;
+                    events(AgentEvent::MaxTokensSalvage);
+                    if let Some(w) = self.push_user(vec![Block::Text(SALVAGE_NUDGE_PARTIAL.into())])
+                    {
+                        events(AgentEvent::Warning(w));
+                    }
+                    continue;
                 }
                 break;
             }

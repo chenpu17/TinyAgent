@@ -2140,7 +2140,7 @@ fn aborted_stream_does_not_execute_truncated_tool_use() {
     // must NOT run (executing truncated args is garbage), and no
     // tool_result is synthesized — the orphaned tool_use is dropped.
     let cfg = cfg_with(5, 0, 0);
-    let (prov, _) = MockProvider::new(vec![MockTurn::Ok(ChatResponse {
+    let (prov, state) = MockProvider::new(vec![MockTurn::Ok(ChatResponse {
         blocks: vec![
             Block::Text("partial...".into()),
             Block::ToolUse {
@@ -2168,6 +2168,155 @@ fn aborted_stream_does_not_execute_truncated_tool_use() {
     );
     assert!(!ran.load(Ordering::Relaxed), "tool.run was not called");
     assert_eq!(o.final_text, "partial..."); // partial text still surfaced
+    assert_eq!(
+        state.calls(),
+        1,
+        "truncation WITH a pending tool_use never salvages (the half-call \
+         stream can't be usefully resumed)"
+    );
+}
+
+// ── salvage_on_max_tokens: one-shot wrap-up on output-limit truncation ──
+//
+// Bench forensics: reasoning-heavy gateways burn the whole completion
+// budget on thinking, leaving a truncated (or zero-block) reply and an
+// empty summary. The bounded self-heal appends ONE wrap-up user turn and
+// runs it like any other main turn (billed, turn-budgeted, cancel-aware).
+
+fn max_tokens_turn(text: &str) -> MockTurn {
+    MockTurn::Ok(ChatResponse {
+        blocks: vec![Block::Text(text.into())],
+        stop_reason: "max_tokens".into(),
+        usage: None,
+    })
+}
+
+#[test]
+fn salvage_wraps_up_truncated_reply_once() {
+    // Partial text + max_tokens → one nudge turn → the wrap-up's end_turn
+    // answer becomes the run's conclusion.
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, state) = MockProvider::new(vec![
+        max_tokens_turn("partial result: the total is approximately..."),
+        mock::resp_text("the total is 42", None),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o.stop_reason, "end_turn");
+    assert_eq!(
+        state.calls(),
+        2,
+        "exactly one wrap-up turn after the truncation"
+    );
+    assert!(
+        state.captured().iter().any(|c| c
+            .user_texts
+            .iter()
+            .any(|t| t.contains("output-token limit"))),
+        "the wrap-up nudge must reach the model as a user turn"
+    );
+    assert_eq!(o.final_text, "the total is 42");
+}
+
+#[test]
+fn salvage_disabled_by_config() {
+    let mut cfg = cfg_with(5, 0, 0);
+    cfg.salvage_on_max_tokens = false;
+    let (prov, state) = MockProvider::new(vec![
+        max_tokens_turn("partial..."),
+        mock::resp_text("never served", None),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o.stop_reason, "max_tokens");
+    assert_eq!(state.calls(), 1, "no wrap-up turn when disabled");
+    assert_eq!(o.final_text, "partial...");
+}
+
+#[test]
+fn salvage_fires_at_most_once() {
+    // The wrap-up turn itself also truncates → returned as-is, never a
+    // second nudge (bounded self-heal).
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, state) = MockProvider::new(vec![
+        max_tokens_turn("partial..."),
+        max_tokens_turn("still going..."),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o.stop_reason, "max_tokens");
+    assert_eq!(state.calls(), 2, "salvage runs once, never twice");
+}
+
+#[test]
+fn salvage_fires_on_empty_blocks() {
+    // Reasoning ate the whole budget: zero blocks + max_tokens. The empty
+    // assistant message must NOT enter history (strict APIs reject it — the
+    // empty-blocks break) — the nudge folds into the trailing user turn.
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, state) = MockProvider::new(vec![
+        MockTurn::Ok(ChatResponse {
+            blocks: vec![],
+            stop_reason: "max_tokens".into(),
+            usage: None,
+        }),
+        mock::resp_text("answer", None),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o.stop_reason, "end_turn");
+    assert_eq!(state.calls(), 2);
+    assert!(
+        state.captured().iter().any(|c| c
+            .user_texts
+            .iter()
+            .any(|t| t.contains("output-token limit"))),
+        "the nudge must ride a USER message (never an empty assistant one)"
+    );
+    assert_eq!(o.final_text, "answer");
+}
+
+#[test]
+fn salvage_respects_max_turns() {
+    // The wrap-up turn is an ordinary turn: with max_turns=1 there is no
+    // budget left for it — the truncation surfaces honestly as
+    // max_turns_reached at the gate.
+    let cfg = cfg_with(1, 0, 0);
+    let (prov, state) = MockProvider::new(vec![max_tokens_turn("partial...")]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o.stop_reason, "max_turns_reached");
+    assert_eq!(state.calls(), 1);
 }
 
 #[test]

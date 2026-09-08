@@ -119,6 +119,17 @@ cargo clippy -p tiny-agent-node
   summary_call 的 `reasoning_effort` 恒 `None` 且**不**改成低档值——Anthropic 上任何 Some(非 "none")
   effort 是**开启** adaptive thinking（与意图相反），OpenAI 兼容网关对 "low" 的解释是掷硬币；默认开思考
   的网关交给上面的空正文重试兜住。
+  **`salvage_on_max_tokens`（max_tokens 截断一次性收尾自愈，bench 实证驱动）**：assistant 轮以
+  stop_reason `max_tokens` 截断且**原始 blocks 无 tool_use** 时，push_user 一条英文 wrap-up nudge
+  （`SALVAGE_NUDGE_PARTIAL`/`SALVAGE_NUDGE_EMPTY`——**刻意不写 "Final answer:"**，那是评测判卷契约，
+  产品不耦合答案格式）再跑一轮。两个触发点：①aborted 分支尾部（有部分文本，assistant 消息已在历史，
+  nudge 追加为独立 user 轮）；②空 blocks break（思考烧穿零文本，空 assistant **不入历史**——nudge 经
+  append_user_turn 折进尾随 user）。约束：每 run 恰一次（`salvage_used` 局部，salvage 轮再截断照原样
+  返回）；消耗 turn 预算、照常 bill_chat 计费与 on_chat_request hooks、`continue` 回循环头自然过
+  cancel/max_turns/timeout/budget 四闸门（零特判）；**截断带 tool_use 不 salvage**（半调用已丢弃即停，
+  aborted 测试钉住）。事件 `AgentEvent::MaxTokensSalvage`（unit 变体：`--json` 吐
+  `{"type":"salvage"}`、plain 走 stderr 一行、TUI wildcard 兜底）。Config 软字段默认 true
+  （`PartialConfig` 软覆盖、不在 forbidden 表）；子 agent 经 cfg 快照自动继承、各 run 独立一次。
   **数值写端一律 saturating**：usage 累计 / RunCost / merge_usage / trace_meta / batch 汇总的 `+=`
   全部是 `saturating_add`（读端 `Usage::total()` 本就饱和）——新增累加点照做，谎报 u64::MAX 不 panic
   （debug）也不回绕躲预算闸门（release）。

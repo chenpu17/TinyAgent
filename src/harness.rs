@@ -317,6 +317,7 @@ fn event_json(ev: &AgentEvent) -> Value {
             // Additive field: existing consumers of dropped/kept are unaffected.
             json!({"type": "compressed", "dropped": *dropped, "kept": *kept, "trigger": how})
         }
+        AgentEvent::MaxTokensSalvage => json!({"type": "salvage"}),
         AgentEvent::Warning(w) => json!({"type": "warning", "message": w.clone()}),
         AgentEvent::TodoUpdate { todos } => {
             // Live plan-progress for `--json` pipelines. `todos` is the agent's
@@ -685,6 +686,16 @@ impl<Out: Write, Err: Write> HumanRenderer<Out, Err> {
                 // Sandbox console.log → stderr too (ThinkingDelta discipline):
                 // complete lines, so one writeln each with a `[code]` tag.
                 let _ = writeln!(self.err, "[code] {t}");
+                let _ = self.err.flush();
+            }
+            AgentEvent::MaxTokensSalvage => {
+                // One line on stderr (ThinkingDelta discipline — never mingle
+                // with stdout's reply stream): the truncated reply is being
+                // followed by a wrap-up turn.
+                let _ = writeln!(
+                    self.err,
+                    "[salvage] reply hit the output-token limit; requesting a concise wrap-up"
+                );
                 let _ = self.err.flush();
             }
             AgentEvent::ToolInputDelta { .. } => {

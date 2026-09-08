@@ -32,6 +32,9 @@ fn default_max_tokens() -> u32 {
 fn default_inject_environment() -> bool {
     true
 }
+fn default_salvage_on_max_tokens() -> bool {
+    true
+}
 fn default_tools() -> Vec<String> {
     vec![
         "shell".into(),
@@ -386,6 +389,16 @@ pub struct Config {
     /// Default on; set false to disable. Soft field (batch-overridable).
     #[serde(default = "default_inject_environment")]
     pub inject_environment: bool,
+    /// When a reply is cut off at the output-token limit
+    /// (`stop_reason: "max_tokens"`) with no pending tool calls, append one
+    /// wrap-up user turn asking for a concise best-effort conclusion instead
+    /// of returning a truncated (or, when reasoning consumed the whole
+    /// budget, empty) reply. Bounded self-heal: at most one salvage turn per
+    /// run — a salvage turn that also truncates is returned as-is; the
+    /// salvage turn consumes turn budget and is billed like any other.
+    /// Default on. Soft field (batch-overridable).
+    #[serde(default = "default_salvage_on_max_tokens")]
+    pub salvage_on_max_tokens: bool,
     #[serde(default)]
     pub limits: Limits,
     /// External MCP tool servers (stdio transport).
@@ -484,6 +497,7 @@ impl Config {
             mcp_servers,
             reasoning_effort,
             inject_environment,
+            salvage_on_max_tokens,
             code,
         } = p;
         if let Some(v) = provider {
@@ -521,6 +535,9 @@ impl Config {
         }
         if let Some(v) = inject_environment {
             self.inject_environment = v;
+        }
+        if let Some(v) = salvage_on_max_tokens {
+            self.salvage_on_max_tokens = v;
         }
         if let Some(l) = limits {
             // Same exhaustive-destructure discipline as above: a new
@@ -588,6 +605,7 @@ pub struct PartialConfig {
     pub mcp_servers: Option<Vec<McpServerConfig>>,
     pub reasoning_effort: Option<String>,
     pub inject_environment: Option<bool>,
+    pub salvage_on_max_tokens: Option<bool>,
     pub code: Option<PartialCodeConfig>,
 }
 
@@ -619,6 +637,7 @@ impl PartialConfig {
             mcp_servers,
             reasoning_effort: _,
             inject_environment: _,
+            salvage_on_max_tokens: _,
             // `code` is soft: its sub-fields each have a clamp/merge policy
             // in CodeConfig::merge_partial (§9), and the one that isn't
             // (enabled) is rejected by Config::apply → bad_task.

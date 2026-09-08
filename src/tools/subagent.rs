@@ -433,6 +433,7 @@ mod tests {
             mcp_servers: vec![],
             reasoning_effort: None,
             inject_environment: false,
+            salvage_on_max_tokens: true,
             code: Default::default(),
         };
         let mut cfg = cfg;
@@ -900,6 +901,7 @@ mod tests {
             mcp_servers: vec![],
             reasoning_effort: None,
             inject_environment: false,
+            salvage_on_max_tokens: true,
             code: Default::default(),
         }
     }
