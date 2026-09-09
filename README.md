@@ -563,7 +563,7 @@ tiny-agent --config examples/web-search.json --task "搜一下 Anthropic 最近�
   "api_key_env": "ANTHROPIC_API_KEY",
   "model": "claude-haiku-4-5-20251001",
   "max_tokens": 8192,
-  "system_prompt": "可选系统提示词",
+  "system_prompt": "可选系统提示词（通用 agentic 纪律参考见 examples/prompts/agentic.md）",
   "task": "headless 模式要执行的任务（可被 --task 覆盖）",
   "workdir": "工具操作的工作目录，默认当前目录",
   "restrict_to_workdir": false,
