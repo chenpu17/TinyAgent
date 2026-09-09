@@ -846,6 +846,8 @@ GUI 可渲染"正在构造调用…"（headless 终端不重复打印——完�
 ```json
 "code": {
   "enabled": true,
+  "skill_injection": "on_demand",
+  "precheck": false,
   "deny_paths": [".env", "secrets/**"],
   "fs_write_dirs": [],
   "max_tool_calls": 200,
@@ -859,6 +861,8 @@ GUI 可渲染"正在构造调用…"（headless 终端不重复打印——完�
 | 字段 | 默认 | 语义 |
 |---|---|---|
 | `enabled` | `false` | 运行期开关；`run_code` 不在 `tools` 白名单语义内（开关即 membership，见下） |
+| `skill_injection` | `"on_demand"` | 内置技能 `run-code` 的三态披露：`"on_demand"`（默认，模型经 `read_skill` 按需加载）；`"eager"`（装配时把技能正文以合成 read_skill 问答对预置进会话历史——微调/评测的轨迹对齐用，resume 的历史不重复注入）；`"off"`（内置技能关闭，`read_skill` 命中返回明确的「已被配置关闭」错误；磁盘同名覆盖仍照常服务） |
+| `precheck` | `false` | 执行前静态预检：单遍 lexer 检出沙箱不支持的写法（`async`/`await`/`import`、未声明的 `Promise`/`setTimeout`/`fetch` 调用、`Date.now`/`Math.random`、`tools.call` 保留名 `run_code`/`task`/`todo`），命中即拒答并附修正指引，**代码不执行、无副作用、不占预算**。注意 `__tools_list`/`__budget` 不在检出集内——它们是可工作的只读内省拦截（`tools.budget()` 的底层通道） |
 | `deny_paths` | `.env`、密钥类目录等 | **经工具的**文件读写拒绝清单（glob：`*` 单段、`**` 跨段），定位**防误读不防恶意** |
 | `fs_write_dirs` | `[]` = 整个 workdir 可写 | 经工具的写路径白名单（相对 workdir；交集语义，可收紧到无处可写） |
 | `max_tool_calls` | 200 | 沙箱内工具调用次数上限（含失败调用）。AppWorld 高循环任务实证：金标方案 91–244 次调用，旧默认 50 连"先摸元数据再批量写"的两阶段打法都装不下（实测摸底阶段即触顶、正事零执行） |
@@ -866,6 +870,16 @@ GUI 可渲染"正在构造调用…"（headless 终端不重复打印——完�
 | `fuel` | 5e9 | 指令预算（纯计算循环；debug 构建实测 ≈ 11.6s/1e9，release 更快）。默认 5e9 的依据：v2 P2 A/B 实测 2.5 MB 文件 `readAll` 整读（guest 内 JSON 解析 + 建数组）超 1e9，首试即 fuel 耗尽、靠模型重试自救；5e9 覆盖该场景且仍低于默认 `timeout_secs=120` |
 | `mem_mb` | 256 | 沙箱线性内存上限 |
 | `max_result_chars` | 60000 | 返回值 + console 日志总尺寸（字符口径；超限截断日志、保返回值） |
+
+**预检的诚实定位**：`precheck` 是**效率/体验特性，不是安全机制**——词法扫描可被混淆绕过
+（`globalThis["Date"]["now"]()`），安全仍由既有层承担（能力沙箱、确定性桩运行时抛错、保留名
+运行时拦截）；漏检的代价仅是退回现状（运行时失败），不少任何安全保证。默认关闭。拒答文案以
+`run_code precheck: ` 前缀开头、一次报告全部命中（类间固定序：环境语法 → 确定性 → 保留工具，
+每类封顶 20 处）。两新字段的生效时点不对称：`skill_injection` 是**装配期**决策
+（`set_code_config` 热更不会重新注入，与快照语义先例一致），`precheck` 是**调用期**决策（每次
+执行经快照生效）。启用 `code.enabled` 时审计锚点自动落盘：result.json 增 `"code"` 键
+（`skill_injection`/`precheck` 的装配时值），NDJSON 模式首行打印同内容——bench 复盘可归因轨迹
+出自哪种披露/预检配置。
 
 **沙箱内环境**：纯同步 ES2023——无 async/Promise/timer/`import`/`fetch`，`Date.now`/`Math.random`
 不可用（评测可复现）。API 五个：`tools.call(name, args)`（失败 throw、可 try/catch 后继续，异常带
@@ -897,7 +911,8 @@ mem 四路独立）；`_initialize` / 编译阶段的错误同样归因。在飞
 `deny_paths` 只拦**经文件工具**的访问：若 `shell` 在白名单里，沙箱代码经 `tools.call("shell", …)`
 仍可达任意路径——要硬隔离请从 `tools` 去掉 `shell`（或配合 `restrict_to_workdir`）。批量任务片段可
 覆盖 `code` 子字段但**只能收紧**：`enabled` 出现即整个任务拒收（`bad_task`），数值字段取 min、
-`deny_paths` 并集、`fs_write_dirs` 交集。
+`deny_paths` 并集、`fs_write_dirs` 交集、`skill_injection` 取收紧档（off < on_demand < eager，
+片段不得扩大披露）、`precheck` 只能由 true 收紧为 false（片段不得开启预检）。
 
 库 / 绑定宿主另有运行期 API：Rust `Agent::set_code_config` / `set_code_enabled`（热更新面，轮次间
 生效）；Python `enable_code()` / `disable_code()` / `set_code_config({...})`；Node `enableCode()` /
