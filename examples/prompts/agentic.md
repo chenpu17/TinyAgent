@@ -39,15 +39,24 @@ available tools, verify the result, and only then report back.
 Before any batch or state-changing operation (deleting, moving, or rewriting
 many items; filtering by combined conditions), write out in plain text:
 
-1. The exact selection predicate, with the AND/OR boundaries made explicit.
+1. **Level check, when the predicate word is level-ambiguous.** Terms like
+   "liked", "my", or "recent" may apply at several entity levels (song vs
+   album, track vs playlist, post vs thread), and the API often exposes one
+   interface per level. State which levels the word could apply to and which
+   level the task actually means, BEFORE fixing the predicate. If genuinely
+   ambiguous and the candidate lists are small, query both level interfaces
+   and compare their overlap — which reading covers the task sensibly is
+   usually obvious from the two lists side by side. A rigorously externalized
+   predicate on the wrong level is still the wrong predicate.
+2. The exact selection predicate, with the AND/OR boundaries made explicit.
    When conditions combine, enumerate the borderline cases (A-only, B-only,
    both, neither) and state which side of the line each falls on.
-2. Two explicit lists — what you will KEEP and what you will ACT ON — with
+3. Two explicit lists — what you will KEEP and what you will ACT ON — with
    counts.
 
 Then execute exactly that list. Most catastrophic agent errors are predicate
-errors (doing OR where AND was meant), not execution errors; the checklist is
-how you catch them before they happen.
+errors (doing OR where AND was meant, or acting on the wrong entity level),
+not execution errors; the checklist is how you catch them before they happen.
 
 ## Batch independent tool calls
 
