@@ -545,7 +545,23 @@ pub(crate) fn resolve(ctx: &ToolCtx, path: &str) -> Result<PathBuf> {
 /// not to resist an adversarial process with concurrent filesystem access. A
 /// TOCTOU-hardened version (openat / `O_NOFOLLOW` directory-fd walk) would need
 /// platform-specific code on Windows and is out of scope for this threat model.
+/// No path beyond this size can open on ANY supported OS — unix PATH_MAX
+/// caps a syscall path at 4096 bytes, Windows `\\?\` at 32767 UTF-16 chars
+/// (so >32 KiB also implies >16383 components). Past it the string is a
+/// payload, not a filename, and [`confined_to`]'s deepest-existing-ancestor
+/// walk below would pay one canonicalize per component for nothing: each
+/// failed call is µs-scale on unix but ~100µs+ on Windows filter drivers
+/// (60k segments measured 10.7s there; sec-review M-2 shape, surfaced by
+/// the Windows E2E run). The cap sits one step ABOVE the Windows hard limit
+/// so no openable path anywhere changes behavior — only payload strings
+/// bail before the walk. Length only (never `components()`, an extra O(n)
+/// scan) — `OsStr::len` is a stored field read.
+const MAX_ANYOS_PATH_BYTES: usize = 32 * 1024;
+
 pub(crate) fn confined_to(root: &Path, full: &Path, label: &str) -> Result<PathBuf> {
+    if full.as_os_str().len() > MAX_ANYOS_PATH_BYTES {
+        anyhow::bail!("path too long to be a real file: {}", full.display());
+    }
     let root_c = root
         .canonicalize()
         .map_err(|e| anyhow::anyhow!("cannot canonicalize root {}: {}", root.display(), e))?;
@@ -691,6 +707,29 @@ mod tests {
         // With restrict off, resolve just joins — no escape check, no error.
         let resolved = resolve(&ctx, "../outside.txt").unwrap();
         assert!(resolved.ends_with("../outside.txt"));
+    }
+
+    /// 60k segments / 120KB — past every OS's openable-path limits. The
+    /// deepest-existing-ancestor walk inside [`confined_to`] must never run:
+    /// on Windows each failed canonicalize costs ~100µs+ and 60k of them
+    /// measured 10.7s (sec-review M-2 shape). The time bound fails pre-fix
+    /// builds.
+    #[test]
+    fn confined_to_rejects_payload_paths_without_a_walk() {
+        let dir = workdir("payload");
+        let deep = format!("{}x", "a/".repeat(60_000));
+        let full = dir.join(&deep);
+        let t = std::time::Instant::now();
+        let err = confined_to(&dir, &full, "working directory").unwrap_err();
+        assert!(
+            err.to_string().contains("too long"),
+            "payload must bail before the walk: {err}"
+        );
+        assert!(
+            t.elapsed().as_secs() < 5,
+            "must bail, not walk: {:?}",
+            t.elapsed()
+        );
     }
 
     #[test]

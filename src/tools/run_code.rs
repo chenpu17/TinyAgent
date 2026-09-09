@@ -1018,6 +1018,14 @@ fn write_traverses_symlink(workdir_canon: &Path, path: &str) -> bool {
     let Ok(rel) = full.strip_prefix(workdir_canon) else {
         return false;
     };
+    // Payload paths (sec-review M-2): the walk below pays one symlink_metadata
+    // per segment — µs-scale on unix, ~100µs+ on Windows filter drivers (60k
+    // segments measured 12s there). Over-limit rels are denied fail-closed by
+    // the workdir_relative length check right after regardless, so skipping
+    // the walk only saves the doomed syscalls, never flips a decision.
+    if rel.as_os_str().len() > MAX_REL_PATH_BYTES || rel.components().count() > MAX_REL_SEGMENTS {
+        return false;
+    }
     let mut cur = workdir_canon.to_path_buf();
     for comp in rel.components() {
         cur.push(comp.as_os_str());
@@ -1030,22 +1038,54 @@ fn write_traverses_symlink(workdir_canon: &Path, path: &str) -> bool {
 
 /// Lexical `.`/`..` collapse WITHOUT symlink resolution — used only when the
 /// target doesn't exist yet, where there is nothing to resolve. `..` past
-/// the root saturates (PathBuf::pop on an empty path is a no-op), matching
-/// the escape-detection above (a path that lexical-collapses outside the
+/// the root saturates (parts simply run empty — a no-op), matching the
+/// escape-detection above (a path that lexical-collapses outside the
 /// workdir fails `strip_prefix` → outside).
+///
+/// NOT `out.push(c.as_os_str())` per component: on Windows, per-component
+/// `PathBuf::push` fed from a verbatim-joined long path costs ~1.5ms EACH
+/// (60k segments measured 92s, while components() iteration and any
+/// whole-string build are µs — Windows E2E finding, sec-review M-2 shape).
+/// Collect, collapse, then assemble with amortized-O(1) OsString pushes:
+/// linear on every OS, identical collapse semantics.
 fn lexical_normalize(p: &Path) -> PathBuf {
     use std::path::Component;
-    let mut out = PathBuf::new();
+    let mut head = PathBuf::new(); // prefix + root, kept verbatim as-is
+    let mut parts: Vec<std::ffi::OsString> = Vec::new();
     for comp in p.components() {
         match comp {
+            Component::Prefix(_) | Component::RootDir => head.push(comp.as_os_str()),
             Component::CurDir => {}
             Component::ParentDir => {
-                out.pop();
+                parts.pop();
             }
-            c => out.push(c.as_os_str()),
+            Component::Normal(name) => parts.push(name.to_os_string()),
         }
     }
-    out
+    let sep: &std::ffi::OsStr = std::path::MAIN_SEPARATOR_STR.as_ref();
+    let mut out = head.into_os_string();
+    for part in parts {
+        // `PathBuf::push` inserts a separator only between existing content
+        // and the part — an empty base (relative paths: head is empty) must
+        // not grow a leading one, or "out" becomes "\out".
+        if !out.is_empty() && !ends_with_sep(&out) {
+            out.push(sep);
+        }
+        out.push(&part);
+    }
+    PathBuf::from(out)
+}
+
+/// The rightmost-byte separator check `PathBuf::push` performs, byte-level:
+/// exact because UTF-8/WTF-8 never embeds 0x2F or 0x5C inside a multi-byte
+/// sequence.
+fn ends_with_sep(s: &std::ffi::OsStr) -> bool {
+    match s.as_encoded_bytes().last() {
+        Some(b'/') => true,
+        #[cfg(windows)]
+        Some(b'\\') => true,
+        _ => false,
+    }
 }
 
 /// Does any deny pattern match the workdir-relative path?
@@ -3395,16 +3435,28 @@ return t.length;"#}),
         );
     }
 
+    /// Dangling-symlink setup; false where the platform can't test it
+    /// (non-unix would need symlink privileges we don't assume). Runtime
+    /// bool, not `#[cfg]` + `return` — the latter makes the body below
+    /// unreachable and fails `clippy --features code` on Windows with
+    /// `-D warnings` (`unreachable_statement`), a gate Linux CI can't see.
+    #[cfg(unix)]
+    fn create_dangling_symlink(target: &str, link: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+
+    #[cfg(not(unix))]
+    fn create_dangling_symlink(_target: &str, _link: &Path) -> bool {
+        false
+    }
+
     /// 中-1: a dangling symlink write target is refused BEFORE matching —
     /// `ln -s .env bak` then "write bak" must not land on `.env`.
     #[test]
     fn dangling_symlink_write_target_rejected() {
         let dir = scratch();
         std::fs::write(dir.join(".env"), "SECRET=1\n").unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(".env", dir.join("bak")).unwrap();
-        #[cfg(not(unix))]
-        {
+        if !create_dangling_symlink(".env", &dir.join("bak")) {
             eprintln!("symlink test skipped on this platform");
             return;
         }
