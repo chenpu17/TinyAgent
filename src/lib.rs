@@ -148,14 +148,21 @@ pub fn build_agent_with_provider(
 struct CodeInstall {
     #[cfg(feature = "code")]
     tool: Option<tools::run_code::RunCodeTool>,
+    /// Assembly-time `(skill_injection, precheck)` audit facts
+    /// (finetune_support NFR-3) — `Some` only when the sandbox is enabled.
+    #[cfg(feature = "code")]
+    audit: Option<(config::SkillInjection, bool)>,
 }
 
 impl CodeInstall {
     /// Hand the instance to a freshly built agent. No-op without the feature.
     fn install(self, agent: &mut Agent) {
         #[cfg(feature = "code")]
-        if let Some(t) = self.tool {
-            agent.set_code_tool(t);
+        {
+            agent.set_code_audit(self.audit);
+            if let Some(t) = self.tool {
+                agent.set_code_tool(t);
+            }
         }
         #[cfg(not(feature = "code"))]
         let _ = agent;
@@ -272,7 +279,16 @@ fn assemble(
         if cfg.code.enabled {
             tool_list.push(Box::new(tool.clone()));
         }
-        CodeInstall { tool: Some(tool) }
+        CodeInstall {
+            tool: Some(tool),
+            // Captured at assembly (FD-7): skill_injection is an
+            // assembly-time decision — a later set_code_config replace must
+            // not rewrite the audit of what actually happened.
+            audit: cfg
+                .code
+                .enabled
+                .then_some((cfg.code.skill_injection, cfg.code.precheck)),
+        }
     };
     #[cfg(not(feature = "code"))]
     let code = CodeInstall::default();

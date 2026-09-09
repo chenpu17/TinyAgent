@@ -13,6 +13,33 @@ pub struct ResultMeta {
     pub provider: String,
     /// RFC 3339 UTC timestamp of the run's start, e.g. "2026-08-15T07:41:02Z".
     pub started_at: String,
+    /// run_code audit anchor (finetune_support NFR-3): the assembly-time
+    /// skill_injection/precheck decision. `Some` only when the sandbox was
+    /// enabled at assembly — absent key = byte-identical default output.
+    pub code: Option<CodeFacts>,
+}
+
+/// The run_code facts worth auditing for a bench rerun (NFR-3).
+pub struct CodeFacts {
+    pub skill_injection: &'static str,
+    pub precheck: bool,
+}
+
+/// Read the agent's assembly-time code audit facts (`None` unless the sandbox
+/// was enabled at assembly — the byte-identical-default condition).
+pub(crate) fn code_facts_of(agent: &Agent) -> Option<CodeFacts> {
+    #[cfg(feature = "code")]
+    {
+        agent.code_audit().map(|(si, pc)| CodeFacts {
+            skill_injection: si.as_str(),
+            precheck: pc,
+        })
+    }
+    #[cfg(not(feature = "code"))]
+    {
+        let _ = agent;
+        None
+    }
 }
 
 impl ResultMeta {
@@ -23,6 +50,7 @@ impl ResultMeta {
             model: agent.model().to_string(),
             provider: agent.provider().to_string(),
             started_at: now_rfc3339(),
+            code: code_facts_of(agent),
         }
     }
 }
@@ -119,6 +147,25 @@ pub(crate) fn run_with_retries(
     // terminal NDJSON event and result.json then say "context_overflow"
     // (matching batch's report vocabulary) instead of the generic "error".
     let mut failed_overflow = false;
+    // NFR-3 audit anchor (finetune_support): when the run_code sandbox was
+    // enabled at assembly, open the stream with the skill_injection/precheck
+    // decision so a bench rerun can attribute trajectories without result.json.
+    if let Some(cf) = code_facts_of(agent) {
+        if json {
+            let v = json!({
+                "type": "code",
+                "enabled": true,
+                "skill_injection": cf.skill_injection,
+                "precheck": cf.precheck,
+            });
+            print_ndjson(&serde_json::to_string(&v).unwrap_or_else(|_| "{}".into()));
+        } else {
+            eprintln!(
+                "[code] skill_injection={} precheck={}",
+                cf.skill_injection, cf.precheck
+            );
+        }
+    }
     let (code, outcome, error) = loop {
         let result = agent.run(&mut |ev| {
             if json {
@@ -433,7 +480,7 @@ pub fn write_result(
     // additive keys, consumers indexing by key are unaffected. `preserve_order`
     // is on, so insertion order below is the output order.
     let finished_at = now_rfc3339();
-    let result = match outcome {
+    let mut result = match outcome {
         Some(o) => {
             let tool_calls: Vec<_> = o
                 .tool_calls
@@ -528,6 +575,17 @@ pub fn write_result(
             result
         }
     };
+    // run_code audit anchor (NFR-3): additive key, only when the sandbox was
+    // enabled at assembly — default-config output stays byte-identical. Both
+    // branches above land here before serialization, so a single insertion
+    // covers success and failure (the `plan` precedent).
+    if let Some(cf) = &meta.code {
+        result["code"] = json!({
+            "enabled": true,
+            "skill_injection": cf.skill_injection,
+            "precheck": cf.precheck,
+        });
+    }
     let bytes = serde_json::to_string_pretty(&result)?;
     atomic_write(path, bytes.as_bytes())
 }
@@ -884,6 +942,7 @@ mod tests {
             model: "test-model".into(),
             provider: "openai".into(),
             started_at: "2026-08-15T07:41:02Z".into(),
+            code: None,
         }
     }
 
@@ -1184,6 +1243,62 @@ mod tests {
         assert!(
             !nparsed.as_object().unwrap().contains_key("plan"),
             "plan key absent when no todo used"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_result_emits_code_facts_only_when_sandbox_enabled() {
+        // NFR-3 audit anchor: `code: Some` stamps the assembly-time
+        // skill_injection/precheck decision on BOTH the success and failure
+        // branches; `code: None` (default config, or a build without the code
+        // feature) leaves result.json byte-identical to pre-feature — the
+        // other tests in this module all go through meta() (code: None) and
+        // several assert exact bytes, so they are that regression's witness.
+        let dir = std::env::temp_dir().join(format!("ta-codefacts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let m = ResultMeta {
+            model: "m".into(),
+            provider: "openai".into(),
+            started_at: "2026-08-15T07:41:02Z".into(),
+            code: Some(CodeFacts {
+                skill_injection: "eager",
+                precheck: true,
+            }),
+        };
+        let o = RunOutcome {
+            final_text: "done".into(),
+            turns: 1,
+            stop_reason: "end_turn".into(),
+            tool_calls: vec![],
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            elapsed: std::time::Duration::from_secs_f64(1.0),
+        };
+        let path = dir.join("ok.json");
+        write_result(&path, Some(&o), None, 1, "error", None, &m).unwrap();
+        let parsed: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed["code"]["enabled"], true);
+        assert_eq!(parsed["code"]["skill_injection"], "eager");
+        assert_eq!(parsed["code"]["precheck"], true);
+
+        // Failure branch (no outcome) stamps the same anchor.
+        let epath = dir.join("err.json");
+        write_result(&epath, None, Some("boom"), 1, "error", None, &m).unwrap();
+        let eparsed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&epath).unwrap()).unwrap();
+        assert_eq!(eparsed["code"]["skill_injection"], "eager");
+
+        // Absent (not null) when the sandbox was never enabled.
+        let np = dir.join("plain.json");
+        write_result(&np, Some(&o), None, 1, "error", None, &meta()).unwrap();
+        let nparsed: Value = serde_json::from_str(&std::fs::read_to_string(&np).unwrap()).unwrap();
+        assert!(
+            !nparsed.as_object().unwrap().contains_key("code"),
+            "code key absent when sandbox not enabled"
         );
 
         std::fs::remove_dir_all(&dir).ok();

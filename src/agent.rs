@@ -464,6 +464,15 @@ pub struct Agent {
     /// go through the `build_agent*` helpers).
     #[cfg(feature = "code")]
     code_tool: Option<crate::tools::run_code::RunCodeTool>,
+    /// Assembly-time audit facts `(skill_injection, precheck)` for the harness's
+    /// result.json / NDJSON anchor (finetune_support NFR-3). Captured at
+    /// install time — NOT read live — because `skill_injection` is an
+    /// assembly-time decision: a runtime `set_code_config` replace does not
+    /// re-inject (FD-7), so the live value could misreport what actually
+    /// happened. `Some` only when the sandbox was enabled at assembly;
+    /// `None` on feature-off builds and direct `try_new` agents.
+    #[cfg(feature = "code")]
+    code_audit: Option<(crate::config::SkillInjection, bool)>,
 }
 
 /// Build the system prompt with a leading `# Environment` block (OS / Shell /
@@ -573,6 +582,8 @@ impl Agent {
             tool_schema_chars,
             #[cfg(feature = "code")]
             code_tool: None,
+            #[cfg(feature = "code")]
+            code_audit: None,
         })
     }
 
@@ -804,6 +815,22 @@ impl Agent {
     #[cfg(feature = "code")]
     pub fn set_code_tool(&mut self, tool: crate::tools::run_code::RunCodeTool) {
         self.code_tool = Some(tool);
+    }
+
+    /// Install the assembly-time audit facts (see the `code_audit` field doc).
+    /// Called by `CodeInstall::install` — the only path that knows the
+    /// effective post-merge config the session assembled with.
+    #[cfg(feature = "code")]
+    pub(crate) fn set_code_audit(&mut self, audit: Option<(crate::config::SkillInjection, bool)>) {
+        self.code_audit = audit;
+    }
+
+    /// The assembly-time code audit facts `(skill_injection, precheck)`, for
+    /// the harness's result.json / NDJSON anchor. `None` when the sandbox was
+    /// not enabled at assembly (or no assembly happened).
+    #[cfg(feature = "code")]
+    pub(crate) fn code_audit(&self) -> Option<(crate::config::SkillInjection, bool)> {
+        self.code_audit
     }
 
     /// Atomically replace the WHOLE [`CodeConfig`] (switch + every limit /

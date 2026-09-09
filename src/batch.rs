@@ -799,6 +799,7 @@ fn run_one_attempt(
         model: agent.model().to_string(),
         provider: agent.provider().to_string(),
         started_at: started_at.to_string(),
+        code: harness::code_facts_of(&agent),
     };
 
     let outcome = agent.run(&mut |_| {}); // quiet: no per-event printing
