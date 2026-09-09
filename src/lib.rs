@@ -90,14 +90,10 @@ pub fn build_agent_with(
     api_key: &str,
 ) -> anyhow::Result<Agent> {
     let (tool_list, ctx, cfg, code, eager) = assemble(cfg, client, extra_tools, api_key)?;
-    // FR-1 eager skill injection: fresh sessions only (FD-3) — a non-empty
-    // initial history is a RESUMED session, which is authoritative: its
-    // creation-time policy already applied, and re-injecting would duplicate
-    // the pair.
-    let initial = match (eager, initial.is_empty()) {
-        (Some(pair), true) => pair,
-        _ => initial,
-    };
+    // FR-1 eager skill injection (FD-3 + e2e 修订)：内容判定——已在历史中
+    // 披露过（eager 会话 resume / 真实 read_skill 调用）则不重注；headless
+    // 与 batch 的任务消息在 initial 里，前置后边界按 append_user_turn 合并。
+    let initial = prepend_eager_pair(eager, initial);
     let mut agent = Agent::try_new(
         &cfg,
         provider::build(&cfg, api_key, client.clone()),
@@ -130,11 +126,8 @@ pub fn build_agent_with_provider(
     api_key: &str,
 ) -> anyhow::Result<Agent> {
     let (tool_list, ctx, cfg, code, eager) = assemble(cfg, client, extra_tools, api_key)?;
-    // Same FR-1 eager rule as build_agent_with: fresh sessions only (FD-3).
-    let initial = match (eager, initial.is_empty()) {
-        (Some(pair), true) => pair,
-        _ => initial,
-    };
+    // Same FR-1 rule as build_agent_with (FD-3 + e2e 修订).
+    let initial = prepend_eager_pair(eager, initial);
     let mut agent = Agent::try_new(&cfg, provider, tool_list, initial, ctx)?;
     code.install(&mut agent);
     Ok(agent)
@@ -425,6 +418,54 @@ fn assemble(
         deadline: None,
     };
     Ok((tool_list, ctx, cfg, code, eager_pair))
+}
+
+/// Prepend the eager skill pair to a caller-supplied `initial` history
+/// (FD-3, e2e 修订：判定从「initial 为空」改为内容判定)。The original
+/// empty-only criterion never fires on the HEADLESS paths — `main.rs` and
+/// `batch.rs` both put the task message into `initial`, so a fresh bench run
+/// always looked "resumed" and the pair was silently skipped.
+///
+/// Injection is skipped when the history already carries the disclosure:
+/// a resumed eager session contains the pair itself, and a history with a
+/// real `read_skill("run-code")` exchange already has the body — either way
+/// re-injecting duplicates it (the resume rule's actual intent).
+///
+/// Boundary: the pair ends in a `user(tool_result)` message, and a leading
+/// user task message must MERGE into it (`append_user_turn`'s rule — two
+/// adjacent user messages 400 on Anthropic). The merged shape
+/// (`[tool_result, text]` in one user message) is exactly what the bindings /
+/// TUI paths produce today: they build on an empty `initial` and the first
+/// `run()` merges the task the same way.
+fn prepend_eager_pair(eager: Option<Vec<Message>>, initial: Vec<Message>) -> Vec<Message> {
+    let Some(mut pair) = eager else {
+        return initial;
+    };
+    let already_disclosed = initial.iter().any(|m| {
+        m.role == Role::Assistant
+            && m.content.iter().any(|b| {
+                matches!(
+                    b,
+                    Block::ToolUse { name, input, .. }
+                        if name == "read_skill"
+                            && input.get("skill").and_then(serde_json::Value::as_str)
+                                == Some("run-code")
+                )
+            })
+    });
+    if already_disclosed {
+        return initial;
+    }
+    let mut rest = initial;
+    if rest.first().is_some_and(|m| m.role == Role::User) {
+        let first = rest.remove(0);
+        match pair.last_mut() {
+            Some(last_user) => last_user.content.extend(first.content),
+            None => rest.insert(0, first),
+        }
+    }
+    pair.extend(rest);
+    pair
 }
 
 /// Name of the built-in run_code skill (finetune_support_design FR-1) — the

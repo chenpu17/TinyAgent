@@ -2,13 +2,13 @@
 
 | 项 | 值 |
 |---|---|
-| 状态 | v0.2（M1–M4 已落码；A-3 溢出行定稿） |
-| 版本 | v0.2 |
+| 状态 | v0.3（M1–M5 已落码；FD-3 经 e2e 修订） |
+| 版本 | v0.3 |
 | 日期 | 2026-09-09 |
 | 关联文档 | `docs/finetune_support_requirements.md` v0.2（需求规格，FR/NFR/A 编号在本文引用）；`docs/run_code_design.md`（既有设计，D 编号在本文引用）、`docs/run_code_requirements.md` |
 | 代码基线 | master @ 3c170b2（其后行号会漂移，以代码为准） |
 | 决策编号 | 本文 FD-n 独立编号；引用 run_code_design 的决策写 D-n |
-| 修订记录 | v0.1：首版。含一条设计阶段对需求文档的事实修正（FD-9：FR-2 检出表第三行的 `__tools_list`/`__budget` 是**可工作的内省拦截**而非 D11 排除集，检出集合收窄为 `{run_code, task, todo}`）——需求方数据侧以本文附录 A 文案为准；v0.2：M4 落码时补 A-3 溢出行的文案形状（附录 A-3 末尾，`等 N 处` 在逐处段落形态下的对应物） |
+| 修订记录 | v0.1：首版。含一条设计阶段对需求文档的事实修正（FD-9：FR-2 检出表第三行的 `__tools_list`/`__budget` 是**可工作的内省拦截**而非 D11 排除集，检出集合收窄为 `{run_code, task, todo}`）——需求方数据侧以本文附录 A 文案为准；v0.2：M4 落码时补 A-3 溢出行的文案形状（附录 A-3 末尾，`等 N 处` 在逐处段落形态下的对应物）；v0.3：e2e 首跑抓出 FD-3 判定缺陷——「initial 为空」在 headless/batch 主路径永假（任务消息总在 initial 里，eager 永不注入），判定改为内容判定（历史已含 read_skill("run-code") 披露即跳过）+ 前置边界合并（对尾 user(tool_result) 与任务 user 按 append_user_turn 合并） |
 
 ---
 
@@ -55,7 +55,7 @@ FR-2 guest 执行前静态预检（每次调用经 snapshot() 读锁，热更即
 |---|---|---|---|
 | FD-1 | `skill_injection` / `precheck` 住 `CodeConfig` | 配置单一事实源；绑定层经 `set_code_config(dict)` 的 serde 缺省自然到达（NFR-5 零新 API）；batch 收紧语义复用 `PartialCodeConfig`/`merge_partial` 穷尽解构先例（新臂无策略即编译错误——反化石纪律自动覆盖） | 独立 skills 配置节（需求方只有 run-code 一个内置场景，需求文档范围外条款一致）；全局开关（多一个事实源） |
 | FD-2 | `SkillInjection` 派生 `Ord`，声明序 = `Off < OnDemand < Eager`（按披露量）；`merge_partial` 用 `Clamp::Tighten`（min）；`precheck: bool` 同用 Tighten（false<true，片段只能关不能开） | 「不可信片段不得扩大披露/不得开启新行为」翻译成 min 语义零新机制；枚举 `Default = OnDemand` 满足 Tighten 的 `Default` bound（其值仅 TightenOrInit 使用） | 手写臂级 if 链（fossil 四连的前车之鉴，Clamp 存在就是为了消灭它） |
-| FD-3 | eager 注入 = 合成 `tool_use`/`tool_result` N:N 配对，**仅当 `initial` 为空**（新会话）时由 `build_agent_with`/`build_agent_with_provider` 前置进 initial；id 分配走 `try_new` 里 `assign_missing_ids`（agent.rs:553）既有 ingest 点，不新设分配点 | Q-1 定案的实现化：与真实 read_skill 路径逐字节一致（见 FD-4）；`--resume` 会话历史非空 → 跳过（会话自身历史是权威——它创建时若是 eager 则配对已在其中，重复注入反而污染）；空 initial = 新会话是唯一无歧义判定 | user 消息内嵌（撞「Anthropic 不允许相邻 user」，须走 append_user_turn 合并，形态反而分叉）；`Agent::new` 内部感知 skill（装配层职责；try_new 直连路径本就不带 skill 机制，隐式注入反而制造两条行为分叉的构造路径） |
+| FD-3 | eager 注入 = 合成 `tool_use`/`tool_result` N:N 配对，**当 initial 尚无该披露**（v0.3 内容判定：历史中不存在 `read_skill("run-code")` 的 tool_use——空 initial（绑定/TUI）、任务消息 initial（headless/batch 新会话）都注入；eager 会话 resume 的合成对或真实调用已在历史则跳过）时由 `build_agent_with`/`build_agent_with_provider` 前置进 initial，**边界按 append_user_turn 合并**（对尾 user(tool_result) 与首条任务 user 合成一条——相邻 user Anthropic 400，合并后形状与绑定/TUI 的 run() 路径一致）；id 分配走 `try_new` 里 `assign_missing_ids`（agent.rs:553）既有 ingest 点，不新设分配点 | Q-1 定案的实现化：与真实 read_skill 路径逐字节一致（见 FD-4）；`--resume` 会话历史非空 → 跳过（会话自身历史是权威——它创建时若是 eager 则配对已在其中，重复注入反而污染）；空 initial = 新会话是唯一无歧义判定 | user 消息内嵌（撞「Anthropic 不允许相邻 user」，须走 append_user_turn 合并，形态反而分叉）；`Agent::new` 内部感知 skill（装配层职责；try_new 直连路径本就不带 skill 机制，隐式注入反而制造两条行为分叉的构造路径） |
 | FD-4 | eager 注入的正文与 `read_skill` **共用同一段取正文代码**：把 ReadSkill 对「effective entry 的 SKILL.md 正文 + `truncate(cap)`」抽成自由函数 `skills::serve_skill_body(entry, max_output_chars)`，ReadSkill 的 embedded/磁盘两臂与 assemble 的 eager 注入都调它 | 「逐字节一致」（A-1）用**构造**保证而非约定保证：同一份文本、同一个截断帽、同一条路径。磁盘同名覆盖时 eager 注入的自然是磁盘版正文（与 read_skill 在那会话里会返回的一致）；磁盘读取失败 → eprintln 告警 + 跳过注入（对齐 malformed skill「降级不致命」先例） | assemble 里复制一份截断逻辑（必然漂移）；注入 `RUN_CODE_SKILL_MD` 常量原文（绕过磁盘覆盖语义） |
 | FD-5 | off 档的 read_skill 明确错误用 **tombstone**：`ReadSkill` 增字段 `disabled: Option<String>`；assemble 在 off 档且 index 无磁盘同名覆盖时塞 `Some("run-code")`；命中时返回附录 A-0 文案。index 里有磁盘覆盖则照常服务、不塞 tombstone | A-1 要的是「明确未启用错误」而非通用 unknown skill——通用错误的 available 列表随环境漂移，评测轨迹里无法区分「写错名」与「被关闭」；而磁盘 run-code 是用户显式资产，FR-1 范围条款明确不动磁盘 skill 机制 | 依赖既有 unknown skill 错误（语义不含「未启用」，且 available 列表内容随环境变）；off 时连磁盘覆盖一并屏蔽（违反 FR-1 范围条款） |
 | FD-6 | 审计锚点：① result.json 增 `"code"` 对象 `{"enabled":true,"skill_injection":"…","precheck":…}`，**仅 `code.enabled` 时出现**（默认配置 result.json 逐字节不动——NFR-1；additive key 先例见 attribution 字段注释 harness.rs:430）；载体 = `ResultMeta` 加字段、`from_agent` 读 Agent 新增只读 getter（避免 17 个 `run_with_retries` 测试调用点改签名）；batch 复用同一 `write_result` 自动覆盖。② NDJSON `--json` 模式在首个 turn 前打一行 `{"type":"code",…}`（同条件才打；harness 层 print，不动 AgentEvent 枚举）；非 json headless 打一行 stderr | 需求 v0.2 修订一的双锚点落地到真实存在的两个产物上（TinyAgent 没有「会话 manifest」）；getter 路径保持 harness 签名稳定 | 新 AgentEvent 变体（装配期事实不是运行期事件，且枚举加变体牵动全部消费端 match）；总是打印（默认配置漂移，破 NFR-1） |
@@ -121,10 +121,9 @@ if cfg.code.enabled {
 
 ```rust
 let (tool_list, ctx, cfg, code, eager) = assemble(...)?;
-let initial = match (eager, initial.is_empty()) {
-    (Some(pair), true) => pair,        // 新会话：合成配对即全部初始历史
-    _ => initial,                      // resume / 非 eager：原样
-};
+let initial = prepend_eager_pair(eager, initial);
+// 内容判定（v0.3）：历史已含 read_skill("run-code") 披露 → 原样；
+// 否则前置合成对，首条任务 user 合并进对尾的 user(tool_result)
 ```
 
 ### 3.3 eager 合成配对的具体形状

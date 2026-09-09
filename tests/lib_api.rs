@@ -454,18 +454,21 @@ fn eager_skill_injection_prepends_synthetic_pair() {
     );
 }
 
-/// A-1 eager + resume: a non-empty initial history is a resumed session —
-/// authoritative, NOT re-injected (FD-3).
+/// A-1 eager + headless 形状（e2e 修订回归）：`main.rs` / `batch.rs` 把任务
+/// 消息放进 initial——这不是 resume。对要前置，且边界合并（对尾的
+/// user(tool_result) 与任务 user 合成一条，append_user_turn 规则——相邻
+/// user 在 Anthropic 400；合并后的形状与绑定/TUI 路径 run() 时产生的完全
+/// 一致）。
 #[cfg(feature = "code")]
 #[test]
-fn eager_injection_skips_resumed_history() {
+fn eager_injection_prepends_before_headless_task_message() {
     use tiny_agent::provider::new_client;
-    let dir = fr1_scratch("resume");
+    let dir = fr1_scratch("headless");
     let cfg = fr1_config("eager", &dir);
     let client = new_client(0);
     let (provider, _s) = MockProvider::new(vec![]);
     let initial = vec![tiny_agent::Message::user(vec![tiny_agent::Block::Text(
-        "resumed task".into(),
+        "用 run_code 计算 1 到 100 的和".into(),
     )])];
     let agent = tiny_agent::build_agent_with_provider(
         &cfg,
@@ -475,10 +478,61 @@ fn eager_injection_skips_resumed_history() {
         vec![],
         "",
     )
-    .expect("assemble eager over resume");
+    .expect("assemble eager over headless task");
     let msgs = agent.messages();
-    assert_eq!(msgs.len(), 1, "no re-injection on resume: {msgs:?}");
-    assert!(matches!(&msgs[0].content[0], tiny_agent::Block::Text(t) if t == "resumed task"));
+    assert_eq!(msgs.len(), 2, "pair + merged task: {msgs:?}");
+    assert_eq!(msgs[0].role, tiny_agent::Role::Assistant);
+    assert!(
+        matches!(&msgs[0].content[0], tiny_agent::Block::ToolUse { name, .. } if name == "read_skill")
+    );
+    // 边界合并成单条 user：tool_result 在前、任务文本在后，无相邻 user。
+    assert_eq!(msgs[1].role, tiny_agent::Role::User);
+    match (&msgs[1].content[0], &msgs[1].content[1..]) {
+        (tiny_agent::Block::ToolResult { tool_use_id, .. }, [tiny_agent::Block::Text(task)]) => {
+            assert_eq!(tool_use_id, "eager-run-code");
+            assert_eq!(task, "用 run_code 计算 1 到 100 的和");
+        }
+        other => panic!("expected [tool_result, text] in ONE user message, got {other:?}"),
+    }
+}
+
+/// A-1 eager + 已披露历史不重注（FD-3 内容判定，e2e 修订）：历史里已有
+/// `read_skill("run-code")` 交换（eager 会话 resume 的合成对、或真实调用）
+/// 时正文已在历史中，再注入即重复——原样保留。
+#[cfg(feature = "code")]
+#[test]
+fn eager_injection_skips_already_disclosed_history() {
+    use tiny_agent::provider::new_client;
+    let dir = fr1_scratch("resume");
+    let cfg = fr1_config("eager", &dir);
+    let client = new_client(0);
+    let (provider, _s) = MockProvider::new(vec![]);
+    let initial = vec![
+        tiny_agent::Message::user(vec![tiny_agent::Block::Text("resumed task".into())]),
+        tiny_agent::Message::assistant(vec![tiny_agent::Block::ToolUse {
+            id: "old-call".into(),
+            name: "read_skill".into(),
+            input: json!({"skill": "run-code"}),
+        }]),
+        tiny_agent::Message::user(vec![tiny_agent::Block::ToolResult {
+            tool_use_id: "old-call".into(),
+            content: "(the previously served body)".into(),
+            image: None,
+            is_error: false,
+        }]),
+    ];
+    let agent = tiny_agent::build_agent_with_provider(
+        &cfg,
+        Box::new(provider),
+        initial,
+        &client,
+        vec![],
+        "",
+    )
+    .expect("assemble eager over disclosed history");
+    let msgs = agent.messages();
+    assert_eq!(msgs.len(), 3, "no re-injection: {msgs:?}");
+    assert_eq!(msgs[1].content.len(), 1, "history untouched");
 }
 
 /// A-1 on_demand (default): no injection — history starts empty.
