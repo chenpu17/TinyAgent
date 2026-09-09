@@ -18,6 +18,10 @@ pub use image::load_block;
 #[cfg(feature = "code")]
 pub use run_code::RunCodeTool;
 pub use skill::{ListSkill, ReadSkill};
+// Only the code-feature assembly (eager injection) serves skill bodies outside
+// ReadSkill itself.
+#[cfg(feature = "code")]
+pub(crate) use skill::serve_skill_body;
 
 use crate::agent::AgentEvent;
 use crate::config::Config;

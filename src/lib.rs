@@ -89,7 +89,15 @@ pub fn build_agent_with(
     extra_tools: Vec<Box<dyn tools::Tool>>,
     api_key: &str,
 ) -> anyhow::Result<Agent> {
-    let (tool_list, ctx, cfg, code) = assemble(cfg, client, extra_tools, api_key)?;
+    let (tool_list, ctx, cfg, code, eager) = assemble(cfg, client, extra_tools, api_key)?;
+    // FR-1 eager skill injection: fresh sessions only (FD-3) — a non-empty
+    // initial history is a RESUMED session, which is authoritative: its
+    // creation-time policy already applied, and re-injecting would duplicate
+    // the pair.
+    let initial = match (eager, initial.is_empty()) {
+        (Some(pair), true) => pair,
+        _ => initial,
+    };
     let mut agent = Agent::try_new(
         &cfg,
         provider::build(&cfg, api_key, client.clone()),
@@ -121,7 +129,12 @@ pub fn build_agent_with_provider(
     extra_tools: Vec<Box<dyn tools::Tool>>,
     api_key: &str,
 ) -> anyhow::Result<Agent> {
-    let (tool_list, ctx, cfg, code) = assemble(cfg, client, extra_tools, api_key)?;
+    let (tool_list, ctx, cfg, code, eager) = assemble(cfg, client, extra_tools, api_key)?;
+    // Same FR-1 eager rule as build_agent_with: fresh sessions only (FD-3).
+    let initial = match (eager, initial.is_empty()) {
+        (Some(pair), true) => pair,
+        _ => initial,
+    };
     let mut agent = Agent::try_new(&cfg, provider, tool_list, initial, ctx)?;
     code.install(&mut agent);
     Ok(agent)
@@ -156,13 +169,19 @@ impl CodeInstall {
 /// any extra tools. Factored out so [`build_agent_with`] and
 /// [`build_agent_with_provider`] stay in lockstep — only the provider
 /// construction differs between them.
-#[allow(clippy::type_complexity)] // returns (tools, ctx, cfg, code): cfg carries the skill-augmented system_prompt
+#[allow(clippy::type_complexity)] // returns (tools, ctx, cfg, code, eager): cfg carries the skill-augmented system_prompt; eager = FR-1 synthetic skill pair (code feature, else None)
 fn assemble(
     cfg: &Config,
     client: &reqwest::blocking::Client,
     extra_tools: Vec<Box<dyn tools::Tool>>,
     api_key: &str,
-) -> anyhow::Result<(Vec<Box<dyn tools::Tool>>, ToolCtx, Config, CodeInstall)> {
+) -> anyhow::Result<(
+    Vec<Box<dyn tools::Tool>>,
+    ToolCtx,
+    Config,
+    CodeInstall,
+    Option<Vec<Message>>,
+)> {
     use anyhow::Context;
     let workdir = cfg
         .workdir
@@ -279,16 +298,56 @@ fn assemble(
     // Built-in skill (v2 P2): run_code's full usage guide ships IN the binary
     // as an embedded skill — the tool description stays slim (closed helper
     // list + a pointer) while the deep contracts load on demand via
-    // read_skill as compressible history. Injected only when the tool is
-    // actually enabled; `insert_builtin` is a no-op when a disk skill of the
-    // same name exists, so a user's run-code/ override always wins. A
-    // malformed built-in (build bug) degrades to a warning, never a startup
-    // failure — same contract as a bad disk skill.
+    // read_skill as compressible history. `insert_builtin` is a no-op when a
+    // disk skill of the same name exists, so a user's run-code/ override
+    // always wins. A malformed built-in (build bug) degrades to a warning,
+    // never a startup failure — same contract as a bad disk skill.
+    //
+    // `code.skill_injection` (finetune_support_design FR-1) branches this:
+    //   on_demand — status quo above (byte-identical default);
+    //   eager     — also inject the body into history as a synthetic
+    //               read_skill tool_use/tool_result pair (FD-3/FD-4);
+    //   off       — skip the builtin entirely; tombstone read_skill when no
+    //               disk override serves the name (FD-5).
+    #[cfg(feature = "code")]
+    let (mut eager_pair, mut run_code_tombstone) = (None, false);
+    #[cfg(not(feature = "code"))]
+    let eager_pair: Option<Vec<Message>> = None;
     #[cfg(feature = "code")]
     if cfg.code.enabled {
-        match skills::embedded_entry(tools::run_code::RUN_CODE_SKILL_MD) {
-            Some(e) => index.insert_builtin(e),
-            None => eprintln!("[skill] built-in run-code skill is malformed, skipped"),
+        use crate::config::SkillInjection;
+        match cfg.code.skill_injection {
+            SkillInjection::Off => {
+                run_code_tombstone = index.entry_of(RUN_CODE_SKILL_NAME).is_none();
+            }
+            policy @ (SkillInjection::OnDemand | SkillInjection::Eager) => {
+                match skills::embedded_entry(tools::run_code::RUN_CODE_SKILL_MD) {
+                    Some(e) => index.insert_builtin(e),
+                    None => eprintln!("[skill] built-in run-code skill is malformed, skipped"),
+                }
+                if policy == SkillInjection::Eager {
+                    // Serve the EFFECTIVE entry (a disk override wins) through
+                    // the same function read_skill uses — byte-identity by
+                    // construction (FD-4). Failure degrades to a warning and
+                    // no injection (the on_demand path still works).
+                    match index.entry_of(RUN_CODE_SKILL_NAME) {
+                        Some(entry) => {
+                            match tools::serve_skill_body(entry, cfg.limits.max_output_chars) {
+                                Ok(out) if !out.is_error => {
+                                    eager_pair = Some(eager_read_skill_pair(&out.content))
+                                }
+                                Ok(out) => {
+                                    eprintln!("[skill] eager injection skipped: {}", out.content)
+                                }
+                                Err(e) => eprintln!("[skill] eager injection skipped: {e:#}"),
+                            }
+                        }
+                        None => eprintln!(
+                            "[skill] eager injection skipped: {RUN_CODE_SKILL_NAME} skill unavailable"
+                        ),
+                    }
+                }
+            }
         }
     }
     // allowed-tools (experimental frontmatter field): warn-only — TinyAgent has
@@ -316,7 +375,16 @@ fn assemble(
     let mut cfg = cfg.clone();
     if !index.is_empty() {
         cfg.system_prompt = Some(skills::render_intro(cfg.system_prompt.as_deref(), &index));
-        tool_list.push(Box::new(tools::ReadSkill::new(index.clone())) as Box<dyn tools::Tool>);
+        #[cfg_attr(not(feature = "code"), allow(unused_mut))]
+        let mut read_skill = tools::ReadSkill::new(index.clone());
+        // FR-1 off: explicit "disabled by configuration" error instead of the
+        // generic unknown-skill one (FD-5) — only reachable when other skills
+        // keep read_skill itself registered.
+        #[cfg(feature = "code")]
+        if run_code_tombstone {
+            read_skill.disable_builtin(RUN_CODE_SKILL_NAME);
+        }
+        tool_list.push(Box::new(read_skill) as Box<dyn tools::Tool>);
         tool_list.push(Box::new(tools::ListSkill::new(index)) as Box<dyn tools::Tool>);
     }
 
@@ -340,7 +408,44 @@ fn assemble(
         budget: None,
         deadline: None,
     };
-    Ok((tool_list, ctx, cfg, code))
+    Ok((tool_list, ctx, cfg, code, eager_pair))
+}
+
+/// Name of the built-in run_code skill (finetune_support_design FR-1) — the
+/// frontmatter `name:` of `tools/run_code_skill.md`. A literal here (not a
+/// parse) because the off/eager branches must name the entry BEFORE/AROUND
+/// `insert_builtin`; a test pins it against the parsed frontmatter.
+#[cfg(feature = "code")]
+const RUN_CODE_SKILL_NAME: &str = "run-code";
+
+/// Fixed tool_use id of the eager injection's synthetic pair (FD-3). The real
+/// path's id is provider-minted randomness, so byte-identity covers the
+/// message SHAPE (roles, block kinds, content) — a stable literal here makes
+/// the synthetic pair mechanically recognizable in bench trajectories.
+#[cfg(feature = "code")]
+const EAGER_TOOL_USE_ID: &str = "eager-run-code";
+
+/// The synthetic read_skill round-trip injected for `skill_injection =
+/// "eager"` (FD-3/FD-4): assistant tool_use + user tool_result, N:N paired,
+/// byte-identical in shape to a real `read_skill("run-code")` exchange
+/// (agent.rs's assistant/tool_result pushes). Ids are deliberately NOT set —
+/// the pair enters via `initial`, and `Agent::try_new`'s ingest point
+/// (`assign_missing_ids`) mints them, the same as any fresh history.
+#[cfg(feature = "code")]
+fn eager_read_skill_pair(body: &str) -> Vec<Message> {
+    vec![
+        Message::assistant(vec![Block::ToolUse {
+            id: EAGER_TOOL_USE_ID.into(),
+            name: "read_skill".into(),
+            input: serde_json::json!({"skill": RUN_CODE_SKILL_NAME}),
+        }]),
+        Message::user(vec![Block::ToolResult {
+            tool_use_id: EAGER_TOOL_USE_ID.into(),
+            content: body.to_string(),
+            image: None,
+            is_error: false,
+        }]),
+    ]
 }
 
 /// Skill search dirs, global first + project last (so the project dir overrides

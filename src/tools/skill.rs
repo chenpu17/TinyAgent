@@ -24,13 +24,33 @@ use std::path::Path;
 /// and injected automatically alongside the level-1 intro when skills are
 /// discovered. Sub-agents build their own tool list from the whitelist, so they
 /// don't carry it — matching the "skills belong to the main agent" decision.
+///
+/// `disabled` is the finetune-support tombstone (finetune_support_design
+/// FD-5): when `code.skill_injection = "off"` suppresses the built-in
+/// `run-code` skill AND no disk skill of that name exists, assembly marks the
+/// name here so `read_skill("run-code")` fails with an explicit "disabled by
+/// configuration" error instead of the generic unknown-skill one — a bench
+/// trajectory can then tell "disabled" apart from "misspelled".
 pub struct ReadSkill {
     index: SkillIndex,
+    disabled: Option<String>,
 }
 
 impl ReadSkill {
     pub fn new(index: SkillIndex) -> Self {
-        Self { index }
+        Self {
+            index,
+            disabled: None,
+        }
+    }
+
+    /// Mark a built-in skill name as disabled by configuration (see the
+    /// struct doc). Assembly calls this only when the index holds no entry
+    /// under the name (a disk override is never tombstoned). Only the
+    /// code-feature assembly sets tombstones, hence the gate.
+    #[cfg(feature = "code")]
+    pub(crate) fn disable_builtin(&mut self, name: &str) {
+        self.disabled = Some(name.to_string());
     }
 }
 
@@ -67,6 +87,15 @@ impl Tool for ReadSkill {
         let skill = input["skill"]
             .as_str()
             .context("read_skill: missing \"skill\"")?;
+        // Tombstone check BEFORE the index lookup (finetune_support_design
+        // FD-5): the name is known-but-disabled, not unknown. Copy pinned by
+        // finetune_support_design 附录 A-0 (model-visible text that training
+        // data depends on — change only via that doc's revision log).
+        if self.disabled.as_deref() == Some(skill) {
+            return Ok(ToolOutput::error(format!(
+                "read_skill: skill {skill:?} 已被配置关闭（code.skill_injection = \"off\"）。run_code 的环境事实见其工具描述；完整用法文档在此配置下不可用。"
+            )));
+        }
         let file = input["file"].as_str().unwrap_or("SKILL.md");
         // Two-layer confinement:
         // 1. `safe_relative_path` — a syntactic first pass that rejects obvious
@@ -96,18 +125,19 @@ impl Tool for ReadSkill {
                 )));
             }
         };
+        // SKILL.md itself (embedded or disk) is served through the shared
+        // `serve_skill_body` — the SAME function the eager injection path
+        // uses, so "eager pair == what read_skill would return" holds by
+        // construction (finetune_support_design FD-4), not by convention.
+        if file == "SKILL.md" {
+            return serve_skill_body(entry, ctx.max_output_chars);
+        }
         // Built-in (embedded) skills have no directory and bundle no resource
-        // files — the SKILL.md text IS the skill. Served raw like a disk
-        // SKILL.md (frontmatter included), under the same char cap.
-        if let crate::skills::SkillSource::Embedded(text) = &entry.source {
-            if file != "SKILL.md" {
-                return Ok(ToolOutput::error(format!(
-                    "read_skill: skill {skill:?} is built into the binary and bundles no resource files (only SKILL.md is readable)"
-                )));
-            }
-            let mut content = text.clone();
-            truncate(&mut content, ctx.max_output_chars);
-            return Ok(ToolOutput::text(content));
+        // files — the SKILL.md text IS the skill.
+        if let crate::skills::SkillSource::Embedded(_) = &entry.source {
+            return Ok(ToolOutput::error(format!(
+                "read_skill: skill {skill:?} is built into the binary and bundles no resource files (only SKILL.md is readable)"
+            )));
         }
         let dir = match &entry.source {
             crate::skills::SkillSource::Dir(d) => d,
@@ -137,6 +167,52 @@ impl Tool for ReadSkill {
             .with_context(|| format!("read_skill: {} is not valid UTF-8", resolved.display()))?;
         truncate(&mut content, ctx.max_output_chars);
         Ok(ToolOutput::text(content))
+    }
+}
+
+/// Serve a skill's `SKILL.md` body (embedded built-in or disk override alike):
+/// the single content-producing path shared by [`ReadSkill`] and the eager
+/// skill injection at assembly (finetune_support_design FD-4) — "the eager
+/// pair is byte-identical to what read_skill would have returned" holds
+/// because both call THIS function with the same char cap. Served raw
+/// (frontmatter included), truncated to `max_output_chars`.
+///
+/// Error channels preserved from the original inline code: an escape from the
+/// skill directory is a soft `ToolOutput::error` (model-correctable), while
+/// fs/UTF-8 failures propagate as anyhow errors (host-side problems).
+pub(crate) fn serve_skill_body(
+    entry: &crate::skills::SkillEntry,
+    max_output_chars: usize,
+) -> anyhow::Result<ToolOutput> {
+    match &entry.source {
+        crate::skills::SkillSource::Embedded(text) => {
+            let mut content = text.clone();
+            truncate(&mut content, max_output_chars);
+            Ok(ToolOutput::text(content))
+        }
+        crate::skills::SkillSource::Dir(dir) => {
+            let full = dir.join("SKILL.md");
+            let resolved = match confined_to(dir, &full, "skill directory") {
+                Ok(p) => p,
+                Err(_) => {
+                    return Ok(ToolOutput::error(
+                        "read_skill: file \"SKILL.md\" is outside the skill directory",
+                    ));
+                }
+            };
+            // Same byte-bound formula as the resource-file path in run():
+            // 4× the char cap + slack, strict UTF-8.
+            let max_bytes = max_output_chars.saturating_mul(4).saturating_add(1024) as u64;
+            let mut bytes = Vec::new();
+            std::fs::File::open(&resolved)
+                .and_then(|f| f.take(max_bytes).read_to_end(&mut bytes))
+                .with_context(|| format!("read_skill: cannot read {}", resolved.display()))?;
+            let mut content = String::from_utf8(bytes).with_context(|| {
+                format!("read_skill: {} is not valid UTF-8", resolved.display())
+            })?;
+            truncate(&mut content, max_output_chars);
+            Ok(ToolOutput::text(content))
+        }
     }
 }
 
@@ -633,5 +709,69 @@ mod tests {
         assert!(!out.content.contains(".hidden"), "{}", out.content);
         assert!(!out.content.contains("leaf.txt"), "{}", out.content);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// FR-1 off (finetune_support_design FD-5): a tombstoned name gets the
+    /// explicit "disabled by configuration" error — pinned verbatim to 附录
+    /// A-0 (model-visible text that training data depends on).
+    #[cfg(feature = "code")]
+    #[test]
+    fn read_skill_tombstone_returns_disabled_error() {
+        let idx = SkillIndex::from_entries(vec![]);
+        let dir = std::env::temp_dir();
+        let mut rs = ReadSkill::new(idx);
+        rs.disable_builtin("run-code");
+        let out = rs.run(&json!({"skill": "run-code"}), &ctx(&dir)).unwrap();
+        assert!(out.is_error, "{}", out.content);
+        assert_eq!(
+            out.content,
+            "read_skill: skill \"run-code\" 已被配置关闭（code.skill_injection = \"off\"）。run_code 的环境事实见其工具描述；完整用法文档在此配置下不可用。"
+        );
+        // A different name still falls through to the generic unknown error.
+        let out = rs.run(&json!({"skill": "other"}), &ctx(&dir)).unwrap();
+        assert!(out.is_error);
+        assert!(out.content.contains("unknown skill"), "{}", out.content);
+    }
+
+    /// FD-4: the shared serving function IS the read_skill path — same input,
+    /// same bytes, same truncation cap. Pin both directions (embedded and
+    /// disk) so a future refactor can't fork the two.
+    #[cfg(feature = "code")]
+    #[test]
+    fn serve_skill_body_is_byte_identical_to_read_skill() {
+        let entry =
+            crate::skills::embedded_entry(crate::tools::run_code::RUN_CODE_SKILL_MD).unwrap();
+        let idx = SkillIndex::from_entries(vec![entry.clone()]);
+        let dir = std::env::temp_dir();
+        let via_tool = ReadSkill::new(idx)
+            .run(&json!({"skill": "run-code"}), &ctx(&dir))
+            .unwrap();
+        let direct = serve_skill_body(&entry, 1000).unwrap();
+        assert!(!via_tool.is_error && !direct.is_error);
+        assert_eq!(via_tool.content, direct.content);
+
+        // Disk arm: a SKILL.md on disk served both ways, identical bytes.
+        let root = dir.join(format!("ta-ssb-{}", std::process::id()));
+        let sub = root.join("probe");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(
+            sub.join("SKILL.md"),
+            "---\nname: probe\ndescription: p\n---\nDISK-BODY",
+        )
+        .unwrap();
+        let disk_entry = crate::skills::SkillEntry {
+            name: "probe".into(),
+            source: crate::skills::SkillSource::Dir(sub.clone()),
+            ..Default::default()
+        };
+        let idx = SkillIndex::from_entries(vec![disk_entry.clone()]);
+        let via_tool = ReadSkill::new(idx)
+            .run(&json!({"skill": "probe"}), &ctx(&dir))
+            .unwrap();
+        let direct = serve_skill_body(&disk_entry, 1000).unwrap();
+        assert!(!via_tool.is_error && !direct.is_error);
+        assert_eq!(via_tool.content, direct.content);
+        assert!(via_tool.content.contains("DISK-BODY"));
+        fs::remove_dir_all(&root).ok();
     }
 }

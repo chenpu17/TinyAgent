@@ -362,3 +362,187 @@ fn new_panics_on_an_invalid_tool_set() {
         vec![Box::new(plain_tool("dup")), Box::new(plain_tool("dup"))];
     let _ = tiny_agent::Agent::new(&cfg, Box::new(provider), dup, Vec::new(), plain_ctx());
 }
+
+// ── FR-1 skill_injection (finetune_support_design) — code feature only ─────
+
+#[cfg(feature = "code")]
+fn fr1_scratch(tag: &str) -> std::path::PathBuf {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let d = std::env::temp_dir().join(format!(
+        "ta-lib-fr1-{}-{tag}-{}",
+        std::process::id(),
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+/// code.enabled + a skill_injection policy, in an isolated workdir, with an
+/// output cap large enough that serving never truncates (byte-identity
+/// assertions below compare against the full shipped skill md).
+#[cfg(feature = "code")]
+fn fr1_config(skill_injection: &str, workdir: &std::path::Path) -> Config {
+    serde_json::from_value(json!({
+        "provider": "openai",
+        "api_key_env": "NONE",
+        "model": "mock-model",
+        "tools": [],
+        "inject_environment": false,
+        "workdir": workdir.to_str().unwrap(),
+        "limits": {"max_output_chars": 4000000},
+        "code": {"enabled": true, "skill_injection": skill_injection}
+    }))
+    .expect("fr1 config")
+}
+
+/// A-1 eager: a fresh session starts with the synthetic read_skill pair —
+/// byte-identical content to the shipped skill md (the same bytes read_skill
+/// would serve: they share `serve_skill_body`), N:N paired, ids minted by the
+/// ingest point.
+#[cfg(feature = "code")]
+#[test]
+fn eager_skill_injection_prepends_synthetic_pair() {
+    use tiny_agent::provider::new_client;
+    let dir = fr1_scratch("eager");
+    let cfg = fr1_config("eager", &dir);
+    let client = new_client(0);
+    let (provider, _s) = MockProvider::new(vec![]);
+    let agent = tiny_agent::build_agent_with_provider(
+        &cfg,
+        Box::new(provider),
+        Vec::new(),
+        &client,
+        vec![],
+        "",
+    )
+    .expect("assemble eager");
+    let msgs = agent.messages();
+    assert_eq!(msgs.len(), 2, "synthetic pair only, got: {msgs:?}");
+    assert_eq!(msgs[0].role, tiny_agent::Role::Assistant);
+    match &msgs[0].content[0] {
+        tiny_agent::Block::ToolUse { id, name, input } => {
+            assert_eq!(id, "eager-run-code");
+            assert_eq!(name, "read_skill");
+            assert_eq!(input, &json!({"skill": "run-code"}));
+        }
+        other => panic!("expected tool_use, got {other:?}"),
+    }
+    assert_eq!(msgs[1].role, tiny_agent::Role::User);
+    let md = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/tools/run_code_skill.md"
+    ))
+    .unwrap();
+    match &msgs[1].content[0] {
+        tiny_agent::Block::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+            ..
+        } => {
+            assert_eq!(tool_use_id, "eager-run-code", "N:N paired");
+            assert!(!is_error);
+            assert_eq!(content, &md, "byte-identical to the shipped skill md");
+        }
+        other => panic!("expected tool_result, got {other:?}"),
+    }
+    assert!(
+        msgs[0].id.is_some() && msgs[1].id.is_some() && msgs[0].id != msgs[1].id,
+        "ids minted by the ingest point: {:?} / {:?}",
+        msgs[0].id,
+        msgs[1].id
+    );
+}
+
+/// A-1 eager + resume: a non-empty initial history is a resumed session —
+/// authoritative, NOT re-injected (FD-3).
+#[cfg(feature = "code")]
+#[test]
+fn eager_injection_skips_resumed_history() {
+    use tiny_agent::provider::new_client;
+    let dir = fr1_scratch("resume");
+    let cfg = fr1_config("eager", &dir);
+    let client = new_client(0);
+    let (provider, _s) = MockProvider::new(vec![]);
+    let initial = vec![tiny_agent::Message::user(vec![tiny_agent::Block::Text(
+        "resumed task".into(),
+    )])];
+    let agent = tiny_agent::build_agent_with_provider(
+        &cfg,
+        Box::new(provider),
+        initial,
+        &client,
+        vec![],
+        "",
+    )
+    .expect("assemble eager over resume");
+    let msgs = agent.messages();
+    assert_eq!(msgs.len(), 1, "no re-injection on resume: {msgs:?}");
+    assert!(matches!(&msgs[0].content[0], tiny_agent::Block::Text(t) if t == "resumed task"));
+}
+
+/// A-1 on_demand (default): no injection — history starts empty.
+#[cfg(feature = "code")]
+#[test]
+fn on_demand_injects_nothing() {
+    use tiny_agent::provider::new_client;
+    let dir = fr1_scratch("ondemand");
+    let cfg = fr1_config("on_demand", &dir);
+    let client = new_client(0);
+    let (provider, _s) = MockProvider::new(vec![]);
+    let agent = tiny_agent::build_agent_with_provider(
+        &cfg,
+        Box::new(provider),
+        Vec::new(),
+        &client,
+        vec![],
+        "",
+    )
+    .expect("assemble on_demand");
+    assert!(agent.messages().is_empty());
+}
+
+/// A-1 off: with another disk skill keeping read_skill registered, asking for
+/// run-code yields the tombstone error (附录 A-0, verbatim) through the real
+/// loop; and nothing is injected into history.
+#[cfg(feature = "code")]
+#[test]
+fn off_skill_injection_tombstones_read_skill() {
+    use tiny_agent::provider::new_client;
+    let dir = fr1_scratch("off");
+    let sk = dir.join(".tinyagent").join("skills").join("probe");
+    std::fs::create_dir_all(&sk).unwrap();
+    std::fs::write(
+        sk.join("SKILL.md"),
+        "---\nname: probe\ndescription: p\n---\nbody\n",
+    )
+    .unwrap();
+    let cfg = fr1_config("off", &dir);
+    let client = new_client(0);
+    let (provider, _s) = MockProvider::new(vec![
+        resp_tool(
+            "t1",
+            "read_skill",
+            json!({"skill": "run-code"}),
+            mk_usage(5, 1),
+        ),
+        resp_text("done", mk_usage(3, 1)),
+    ]);
+    let mut agent = tiny_agent::build_agent_with_provider(
+        &cfg,
+        Box::new(provider),
+        Vec::new(),
+        &client,
+        vec![],
+        "",
+    )
+    .expect("assemble off");
+    assert!(agent.messages().is_empty(), "off injects nothing");
+    let outcome = agent.run(&mut |_| {}).expect("run with tombstone");
+    assert_eq!(outcome.tool_calls.len(), 1);
+    assert!(outcome.tool_calls[0].is_error);
+    assert_eq!(
+        outcome.tool_calls[0].output,
+        "read_skill: skill \"run-code\" 已被配置关闭（code.skill_injection = \"off\"）。run_code 的环境事实见其工具描述；完整用法文档在此配置下不可用。"
+    );
+}
