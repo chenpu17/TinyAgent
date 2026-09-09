@@ -253,6 +253,9 @@ tiny-agent --config examples/harness.json --batch examples/tasks --jobs 2 --isol
 # 只重跑上一轮 report.json 里失败的任务（结果合并回完整报告），并对 transient 失败重试 2 次
 tiny-agent --config examples/harness.json --batch examples/tasks --failed --retries 2 --report report.json
 
+# 版本 + 编译期 feature 清单（机器可读，CI 可断言二进制没漏编 code/tui；无需配置文件）
+tiny-agent --version --json
+
 # MCP 工具服务器（stdio）
 tiny-agent --config examples/mcp.json
 

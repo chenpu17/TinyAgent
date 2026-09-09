@@ -101,6 +101,13 @@ struct Cli {
     #[arg(long)]
     failed: bool,
 
+    /// Print the version and compiled-in feature set, then exit. Combine with
+    /// `--json` for a machine-readable manifest that downstream CI can assert
+    /// on (a rebuild that silently dropped `--features code` once caused a
+    /// false regression in bench comparisons).
+    #[arg(long)]
+    version: bool,
+
     /// Batch mode: per-task workdir isolation. none (default) = all workers
     /// share the base workdir; copy = each task gets a throwaway copy (excludes
     /// target/node_modules/.git/results); git = each task gets a
@@ -111,8 +118,79 @@ struct Cli {
     isolate: String,
 }
 
+/// Compiled-in target triple approximation: `arch-os[-env]`, with the env
+/// suffix only where it disambiguates the ABI (musl vs gnu matters for the
+/// static-build deliverable; bare `macos`/`windows` would add noise). Enough
+/// for CI to assert "this artifact is the musl static build".
+fn target_label() -> String {
+    let abi = if cfg!(target_env = "musl") {
+        "musl"
+    } else if cfg!(target_env = "gnu") {
+        "gnu"
+    } else if cfg!(target_env = "msvc") {
+        "msvc"
+    } else {
+        ""
+    };
+    let base = format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS);
+    if abi.is_empty() {
+        base
+    } else {
+        format!("{base}-{abi}")
+    }
+}
+
+/// Compiled-in optional features, in stable order, so the manifest is diffable.
+fn compiled_features() -> Vec<&'static str> {
+    [
+        cfg!(feature = "code").then_some("code"),
+        cfg!(feature = "mock").then_some("mock"),
+        cfg!(feature = "tui").then_some("tui"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// `--version` handler. Plain prints one human line; with `--json` prints a
+/// machine-readable manifest (name / version / target / features) so a CI
+/// pipeline can assert the binary carries the features the run expects
+/// instead of discovering a silent degrade mid-benchmark.
+fn print_version_manifest(json: bool) {
+    let features = compiled_features();
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "name": env!("CARGO_PKG_NAME"),
+                "version": env!("CARGO_PKG_VERSION"),
+                "target": target_label(),
+                "features": features,
+            })
+        );
+    } else {
+        println!(
+            "{} {} ({}) features: {}",
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+            target_label(),
+            if features.is_empty() {
+                "none".to_string()
+            } else {
+                features.join(",")
+            }
+        );
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // `--version` answers before config resolution — CI asserting on the build
+    // must not need a config file (or an API key) to exist.
+    if cli.version {
+        print_version_manifest(cli.json);
+        return Ok(());
+    }
     let cli_task = cli.task.clone();
     let config_path = resolve_config_path(cli.config.clone())?;
     let mut cfg = Config::load(&config_path)?;
