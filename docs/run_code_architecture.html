@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>run_code · 为什么、怎么做、做了什么 — TinyAgent</title>
+<style>
+  :root{
+    --ink:#17202e; --sub:#5b6b80; --faint:#93a1b5;
+    --line:#e3e8f0; --paper:#ffffff; --wash:#f6f8fb;
+    --accent:#2f6bff; --accent-soft:#eaf1ff;
+    --good:#0d9668; --good-soft:#e7f8f1;
+    --bad:#d14a3a;  --bad-soft:#fdeeea;
+    --dark:#101828;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{
+    font-family:"PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",system-ui,sans-serif;
+    color:var(--ink); background:var(--wash);
+  }
+  code{
+    font-family:"SF Mono",Menlo,Consolas,monospace; font-size:.85em;
+    background:#eef1f6; border-radius:4px; padding:1px 5px;
+  }
+  .wrap{max-width:1120px;margin:0 auto;padding:0 32px}
+
+  /* ── 顶导航 ─────────────────────────────── */
+  nav{
+    position:sticky;top:0;z-index:10;
+    background:rgba(246,248,251,.9);backdrop-filter:blur(8px);
+    border-bottom:1px solid var(--line);
+  }
+  nav .wrap{display:flex;align-items:center;justify-content:space-between;height:54px}
+  .logo{font-weight:800;font-size:14px;letter-spacing:.06em}
+  .logo span{color:var(--accent)}
+  nav ul{list-style:none;display:flex;gap:22px}
+  nav a{color:var(--sub);text-decoration:none;font-size:13px}
+  nav a:hover{color:var(--accent)}
+
+  /* ── Hero ───────────────────────────────── */
+  .hero{background:var(--dark);color:#fff;padding:76px 0 70px}
+  .hero .kicker{color:#7ea2ff;font-size:14px;font-weight:700;letter-spacing:.18em}
+  .hero h1{font-size:46px;line-height:1.25;margin:16px 0 20px;letter-spacing:-.01em}
+  .hero h1 em{font-style:normal;color:#8fb0ff}
+  .hero p{font-size:17px;line-height:1.8;color:#b8c4d6;max-width:760px}
+  .hero .badges{display:flex;gap:10px;margin-top:30px;flex-wrap:wrap}
+  .hero .badge{
+    font-size:12.5px;color:#cdd8e8;border:1px solid #2c3a52;border-radius:999px;padding:6px 14px;
+  }
+  .hero .badge b{color:#fff}
+
+  /* ── 章节通用 ───────────────────────────── */
+  section{padding:64px 0}
+  .sec-no{
+    font-size:13px;font-weight:800;color:var(--accent);letter-spacing:.2em;margin-bottom:10px;
+  }
+  h2{font-size:32px;letter-spacing:-.01em;margin-bottom:14px}
+  .sec-lead{font-size:16px;line-height:1.8;color:var(--sub);max-width:780px;margin-bottom:36px}
+  .sec-lead b{color:var(--ink)}
+
+  /* ── 01 目的：三个痛点 ───────────────────── */
+  .pains{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:30px}
+  .pain{
+    background:var(--paper);border:1px solid var(--line);border-radius:14px;padding:22px 22px 20px;
+  }
+  .pain .icon{
+    width:38px;height:38px;border-radius:10px;background:var(--bad-soft);color:var(--bad);
+    display:flex;align-items:center;justify-content:center;font-size:19px;margin-bottom:14px;
+  }
+  .pain h3{font-size:16.5px;margin-bottom:8px}
+  .pain p{font-size:13.5px;line-height:1.75;color:var(--sub)}
+  .goal{
+    background:var(--accent-soft);border:1px solid #cadcff;border-radius:14px;
+    padding:22px 26px;font-size:15.5px;line-height:1.8;color:#1d3f8f;
+  }
+  .goal b{color:var(--accent)}
+
+  /* ── 02 差异对比 ─────────────────────────── */
+  .versus{display:grid;grid-template-columns:1fr 64px 1fr;gap:0;align-items:stretch;margin-bottom:26px}
+  .side{border-radius:16px;padding:26px 26px 22px}
+  .side.old{background:var(--bad-soft);border:1.5px solid #f3c5bd}
+  .side.new{background:var(--good-soft);border:1.5px solid #abe5d0}
+  .side h3{font-size:18px;margin-bottom:4px}
+  .side.old h3{color:var(--bad)} .side.new h3{color:var(--good)}
+  .side .sub{font-size:12.5px;color:var(--sub);margin-bottom:18px}
+  .vs{
+    display:flex;align-items:center;justify-content:center;
+    font-size:15px;font-weight:800;color:var(--faint);letter-spacing:.1em;
+  }
+  /* 轮次可视化：17 格 vs 1 格 */
+  .turns{display:flex;flex-direction:column;gap:5px;margin-bottom:18px}
+  .turn{
+    display:flex;align-items:center;gap:8px;font-size:11.5px;color:var(--sub);
+  }
+  .turn .bar{height:14px;border-radius:4px}
+  .old .bar{background:#e8a89c}
+  .new .bar{background:#5ecfaa}
+  .turn .lab{white-space:nowrap}
+  .more{font-size:11.5px;color:var(--faint);padding-left:2px}
+  .side ul{list-style:none}
+  .side li{font-size:13px;line-height:1.7;color:#3c4a5e;padding:3px 0 3px 18px;position:relative}
+  .old li::before{content:"✗";position:absolute;left:0;color:var(--bad);font-weight:700}
+  .new li::before{content:"✓";position:absolute;left:0;color:var(--good);font-weight:700}
+  .kpi-row{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+  .kpi{
+    background:var(--paper);border:1px solid var(--line);border-radius:12px;
+    padding:16px 20px;display:flex;align-items:baseline;gap:12px;
+  }
+  .kpi b{font-size:26px;color:var(--accent);white-space:nowrap}
+  .kpi span{font-size:12.5px;color:var(--sub);line-height:1.5}
+
+  /* ── 03 技术方案：分层图 ─────────────────── */
+  .stack{display:flex;flex-direction:column;gap:0}
+  .layer{
+    border-radius:14px;padding:20px 24px;position:relative;
+  }
+  .layer h3{font-size:16.5px;margin-bottom:6px}
+  .layer p{font-size:13.5px;line-height:1.75;color:var(--sub)}
+  .layer.llm{background:var(--paper);border:1px solid var(--line)}
+  .layer.host{background:var(--accent-soft);border:1.5px solid #cadcff}
+  .layer.host h3{color:var(--accent)}
+  .layer.guest{background:var(--good-soft);border:2px dashed var(--good)}
+  .layer.guest h3{color:var(--good)}
+  .connector{
+    align-self:center;color:var(--faint);font-size:12px;
+    padding:4px 0;line-height:1;display:flex;flex-direction:column;align-items:center;gap:1px;
+  }
+  .connector i{font-style:normal;font-size:16px}
+  .hostgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:12px}
+  .hostcell{
+    background:rgba(255,255,255,.75);border:1px solid #cadcff;border-radius:9px;
+    padding:9px 12px;font-size:12px;color:#33507e;line-height:1.5;
+  }
+  .hostcell b{display:block;font-size:12.5px;color:var(--accent);margin-bottom:1px}
+  .guestgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}
+  .guestcell{
+    background:rgba(255,255,255,.8);border:1px solid #abe5d0;border-radius:9px;
+    padding:10px 14px;font-size:12.5px;color:#14563f;line-height:1.6;
+  }
+  .guestcell b{color:var(--good)}
+
+  /* ── 04 执行流程 ─────────────────────────── */
+  .steps{display:grid;grid-template-columns:repeat(6,1fr);gap:0}
+  .step{padding:0 10px;position:relative}
+  .step + .step::before{
+    content:"";position:absolute;left:-8px;top:17px;width:16px;height:2px;background:var(--line);
+  }
+  .step .n{
+    width:34px;height:34px;border-radius:50%;background:var(--dark);color:#fff;
+    display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:700;margin-bottom:12px;
+  }
+  .step h4{font-size:14px;margin-bottom:6px}
+  .step p{font-size:12px;line-height:1.65;color:var(--sub)}
+  .flow-note{
+    margin-top:26px;background:var(--paper);border:1px solid var(--line);border-radius:12px;
+    padding:14px 20px;font-size:13px;line-height:1.75;color:var(--sub);
+  }
+  .flow-note b{color:var(--bad)}
+
+  /* ── 05 优势 ─────────────────────────────── */
+  .advs{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+  .adv{background:var(--paper);border:1px solid var(--line);border-radius:14px;padding:22px}
+  .adv h3{font-size:15.5px;margin-bottom:8px;display:flex;align-items:center;gap:8px}
+  .adv h3::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--accent)}
+  .adv p{font-size:13px;line-height:1.75;color:var(--sub)}
+
+  /* ── 页脚 ───────────────────────────────── */
+  footer{
+    border-top:1px solid var(--line);padding:22px 0 34px;
+    font-size:12.5px;color:var(--faint);
+  }
+  footer .wrap{display:flex;justify-content:space-between}
+
+  @media(max-width:960px){
+    .pains,.advs,.kpi-row{grid-template-columns:1fr}
+    .versus{grid-template-columns:1fr}
+    .vs{padding:10px 0}
+    .steps{grid-template-columns:1fr 1fr;gap:20px}
+    .step + .step::before{display:none}
+    .hostgrid,.guestgrid{grid-template-columns:1fr 1fr}
+    .hero h1{font-size:34px}
+    nav ul{display:none}
+  }
+  @media print{
+    nav{position:static}
+    body{background:#fff}
+    section{padding:36px 0}
+  }
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="wrap">
+    <div class="logo">TINYAGENT <span>/ run_code</span></div>
+    <ul>
+      <li><a href="#why">① 为什么做</a></li>
+      <li><a href="#diff">② 以前 vs 现在</a></li>
+      <li><a href="#how">③ 技术方案</a></li>
+      <li><a href="#flow">④ 执行流程</a></li>
+      <li><a href="#gain">⑤ 得到什么</a></li>
+    </ul>
+  </div>
+</nav>
+
+<!-- ═══ Hero ═══ -->
+<div class="hero">
+  <div class="wrap">
+    <div class="kicker">RUN CODE · 进程内 WASM 沙箱</div>
+    <h1>别让模型当搬运工。<br><em>让它写代码，把活干完。</em></h1>
+    <p>
+      传统 agent 里，模型每碰一次文件都要走一轮对话：读一页、想一轮、再读一页——
+      中间数据全部挤进上下文，成本和延迟随数据量线性爆炸。
+      <b style="color:#fff">run_code</b> 反过来做：模型写一段 JS，在<b style="color:#fff">进程内 wasm 沙箱</b>里
+      自主编排既有工具，数据在沙箱里流转，<b style="color:#fff">只有结论回到对话</b>。
+    </p>
+    <div class="badges">
+      <span class="badge">纯同步 · <b>无 tokio</b></span>
+      <span class="badge">纯 Rust 宿主 · <b>musl 可静态</b></span>
+      <span class="badge">体积代价 <b>+3.6 MiB</b></span>
+      <span class="badge">默认关闭 · <b>显式开启</b></span>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ 01 为什么做 ═══ -->
+<section id="why">
+  <div class="wrap">
+    <div class="sec-no">01 · 为什么做</div>
+    <h2>没有 run_code 时，问题出在哪</h2>
+    <p class="sec-lead">
+      agent 的所有能力都经「对话」这一根管子进出。处理小文件没问题，
+      一旦碰上<b>成批数据</b>，这根管子就成了瓶颈——三个结构性痛点：
+    </p>
+    <div class="pains">
+      <div class="pain">
+        <div class="icon">⇅</div>
+        <h3>每一字节都要过模型上下文</h3>
+        <p>读文件的结果必须作为 tool_result 回到对话，模型才能看到。900 行的文件 = 900 行进上下文，哪怕模型只需要其中一个总数。</p>
+      </div>
+      <div class="pain">
+        <div class="icon">⟳</div>
+        <h3>轮次 = 成本 = 延迟</h3>
+        <p>每次翻页都是一次完整的 LLM 往返。数据越大，轮次越多，token 账单和墙钟时间同步膨胀——还挤占 max_turns 预算。</p>
+      </div>
+      <div class="pain">
+        <div class="icon">▦</div>
+        <h3>上下文被中间数据挤爆</h3>
+        <p>中间结果不是结论，却霸占着最贵的资源：上下文窗口。窗口满了触发压缩，早期信息被摘要掉，任务质量随之劣化。</p>
+      </div>
+    </div>
+    <div class="goal">
+      <b>实现目的：</b>把「数据处理」从对话里搬进进程内沙箱——模型负责<b>决策与编排</b>（写代码），
+      沙箱负责<b>搬运与计算</b>（执行代码），对话里只流动<b>意图与结论</b>。
+    </div>
+  </div>
+</section>
+
+<!-- ═══ 02 以前 vs 现在 ═══ -->
+<section id="diff" style="background:var(--paper);border-top:1px solid var(--line);border-bottom:1px solid var(--line)">
+  <div class="wrap">
+    <div class="sec-no">02 · 以前 vs 现在</div>
+    <h2>同一个任务，两条路径</h2>
+    <p class="sec-lead">
+      真实 A/B 实证：「读入一批整数（含超 2^53 的大数），算精确总和并写回结果文件」——
+      模型在旧路径上<b>手动翻页 17 次仍烧穿 300k token 预算</b>，换 run_code 后<b>一段 JS 一次完成</b>。
+    </p>
+
+    <div class="versus">
+      <div class="side old">
+        <h3>以前：逐页搬运</h3>
+        <div class="sub">read_file 翻页 → 模型看 → 再翻页 → … 每一页都进上下文</div>
+        <div class="turns">
+          <div class="turn"><div class="bar" style="width:64px"></div><span class="lab">第 1 轮 · 读第 1 页</span></div>
+          <div class="turn"><div class="bar" style="width:64px"></div><span class="lab">第 2 轮 · 读第 2 页</span></div>
+          <div class="turn"><div class="bar" style="width:64px"></div><span class="lab">第 3 轮 · …</span></div>
+          <div class="more">⋮ 共 17 轮，上下文里塞满逐页膨胀的原始数据</div>
+        </div>
+        <ul>
+          <li>17 次 LLM 往返，预算烧穿，任务没跑完</li>
+          <li>中间数据全部留在上下文，触发压缩、丢早期信息</li>
+          <li>大数求和靠心算/文本拼接，精度听天由命</li>
+        </ul>
+      </div>
+      <div class="vs">VS</div>
+      <div class="side new">
+        <h3>现在：一段代码</h3>
+        <div class="sub">一次 run_code：沙箱内整读 → BigInt 求和 → 校验式写回</div>
+        <div class="turns">
+          <div class="turn"><div class="bar" style="width:100%"></div><span class="lab">1 次调用 · 数据不出沙箱</span></div>
+        </div>
+        <ul>
+          <li>1 次工具调用完成全部搬运与计算</li>
+          <li>上下文里只有代码与结论，干净且可压缩</li>
+          <li>BigInt 全程精确：4,629,700,416,936,914,141（float64 会静默错成 …913,920）</li>
+          <li>写回经 host 回读校验，不谎报成功</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="kpi-row">
+      <div class="kpi"><b>17 → 1</b><span>LLM 往返轮次<br>（同一任务实测）</span></div>
+      <div class="kpi"><b>300k+ → 一次</b><span>token 预算<br>从烧穿到绰绰有余</span></div>
+      <div class="kpi"><b>0 字节</b><span>中间数据进入<br>对话上下文的体积</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ 03 技术方案 ═══ -->
+<section id="how">
+  <div class="wrap">
+    <div class="sec-no">03 · 技术方案</div>
+    <h2>怎么做：JS 引擎编译成 wasm，嵌进二进制</h2>
+    <p class="sec-lead">
+      不引入外部运行时、不引入 C 依赖、不引入 tokio——把 <b>QuickJS-ng 编译成 wasm</b> 直接嵌进
+      单二进制，由 <b>wasmtime 36</b> 以纯同步方式驱动。guest 从构造上就<b>没有网络和文件系统</b>，
+      想碰任何东西只能调宿主的既有工具。
+    </p>
+
+    <div class="stack">
+      <div class="layer llm">
+        <h3>LLM —— 决策层</h3>
+        <p>发出 <code>run_code</code> 工具调用（载荷是一段 JS）。用法指南放进内置 skill <code>run-code</code>，模型需要时自取，不常驻上下文。</p>
+      </div>
+      <div class="connector"><i>↓</i>tool_use { code }</div>
+
+      <div class="layer host">
+        <h3>宿主（纯 Rust）—— 闸门与装配层</h3>
+        <p>wasmtime 36 同步驱动；先过与外层同款的 hooks 闸门，再装配受限环境。</p>
+        <div class="hostgrid">
+          <div class="hostcell"><b>hooks 闸门</b>每次工具调用可拒/可改参，双哈希分记原始与实发</div>
+          <div class="hostcell"><b>四重限额</b>fuel 指令 / 墙钟 epoch / 线性内存 / 调用次数</div>
+          <div class="hostcell"><b>磁盘编译缓存</b>wasm 机器码落盘复用，冷编译 ~10s 只付一次</div>
+          <div class="hostcell"><b>两层开关</b>cargo feature × 运行期 code.enabled，默认全关</div>
+        </div>
+      </div>
+      <div class="connector"><i>↓</i>受限运行环境（嵌入式 quickjs.wasm）</div>
+
+      <div class="layer guest">
+        <h3>GUEST 沙箱 —— 执行层（能力构造性收敛）</h3>
+        <p>不是「拦住危险操作」，而是<b>根本没有那些能力</b>：无网络、无文件系统直访。一切出访都是回环调用宿主工具，过同一套闸门与审计。</p>
+        <div class="guestgrid">
+          <div class="guestcell"><b>⟳ tools.call("read_file", …)</b><br>回宿主既有工具执行（文件 / shell / MCP），JSON 往返，每次计数</div>
+          <div class="guestcell"><b>⟳ tools.budget()</b><br>随时查剩余燃料 / 墙钟 / 调用数 / token 配额</div>
+          <div class="guestcell"><b>prelude 三件套（清单封闭）</b><br><code>readAll</code> 整读 / <code>readLines</code> 行窗 / <code>writeVerified</code> 校验式写回</div>
+          <div class="guestcell"><b>guest 输出预算 2M</b><br>与模型展示预算解耦——整读大文件的数据落 JS 堆，不进对话</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ 04 执行流程 ═══ -->
+<section id="flow" style="background:var(--paper);border-top:1px solid var(--line);border-bottom:1px solid var(--line)">
+  <div class="wrap">
+    <div class="sec-no">04 · 执行流程</div>
+    <h2>一次 run_code 调用，agent 在做什么</h2>
+    <p class="sec-lead">从模型发出代码到结论回到对话，共 6 步；每一步都有明确的检查点和账本。</p>
+
+    <div class="steps">
+      <div class="step">
+        <div class="n">1</div>
+        <h4>模型发代码</h4>
+        <p><code>tool_use: run_code</code>，载荷是整段 JS——意图先被完整记录。</p>
+      </div>
+      <div class="step">
+        <div class="n">2</div>
+        <h4>宿主过闸门</h4>
+        <p>hooks 可拒绝/改参；原始输入记 <code>in_hash</code>，实发记 <code>in_hash_eff</code>。</p>
+      </div>
+      <div class="step">
+        <div class="n">3</div>
+        <h4>装配沙箱</h4>
+        <p>wasm 模块（缓存命中免编译）+ 四重限额 + prelude 三件套单行注入。</p>
+      </div>
+      <div class="step">
+        <div class="n">4</div>
+        <h4>沙箱内执行</h4>
+        <p><code>tools.call</code> 回环读数据、BigInt 精确计算；<code>console.log</code> 实时透出为事件。</p>
+      </div>
+      <div class="step">
+        <div class="n">5</div>
+        <h4>校验式写回</h4>
+        <p><code>writeVerified</code>：host 写盘后回读比对，不一致即报错，不谎报成功。</p>
+      </div>
+      <div class="step">
+        <div class="n">6</div>
+        <h4>结论回对话</h4>
+        <p>结构化 JSON 作 tool_result 进入下一轮；usage 折账、审计落盘。</p>
+      </div>
+    </div>
+
+    <div class="flow-note">
+      <b>失败同样诚实：</b>超时 / 燃料烧尽 / 栈溢出 / hooks 拒绝 / 参数非法——一律封装成结构化错误
+      <code>{kind, tool, retryable}</code>，作为普通 tool_result 回给模型。模型看得懂原因，可以改代码重试；
+      沙箱已烧的 token 照常入账，不藏账。
+    </div>
+  </div>
+</section>
+
+<!-- ═══ 05 得到什么 ═══ -->
+<section id="gain">
+  <div class="wrap">
+    <div class="sec-no">05 · 得到什么</div>
+    <h2>技术优势，逐条兑现</h2>
+    <p class="sec-lead"></p>
+    <div class="advs">
+      <div class="adv">
+        <h3>成本断崖式下降</h3>
+        <p>中间数据不进上下文：轮次 17→1，token 消耗从「烧穿 300k」到「一次调用绰绰有余」。上下文窗口只装意图与结论。</p>
+      </div>
+      <div class="adv">
+        <h3>安全是构造性的，不是补丁式的</h3>
+        <p>guest 无网络、无文件系统——不是运行期拦截，而是能力根本不存在。想做事只能过宿主闸门，每一次都可拒、可改、可审计。</p>
+      </div>
+      <div class="adv">
+        <h3>结果精确可信</h3>
+        <p>BigInt 纪律消灭 float64 静默失真；<code>writeVerified</code> 回读校验消灭「写了半截说成功」；失败返回结构化错误而非含糊文本。</p>
+      </div>
+      <div class="adv">
+        <h3>工程零负担</h3>
+        <p>wasm 资产嵌进单二进制，无外部运行时、无 C 依赖、无 tokio；musl 静态构建照常，体积代价 3.6 MiB；默认关闭，开启才付成本。</p>
+      </div>
+      <div class="adv">
+        <h3>全程可审计</h3>
+        <p>代码原文、结构化结果、双哈希（模型要什么 vs 实际跑什么）、console 日志、token 账单——全量落 <code>result.json</code>，可回放、可归因。</p>
+      </div>
+      <div class="adv">
+        <h3>行为有边界</h3>
+        <p>fuel / 墙钟 / 内存 / 调用数四重限额兜底，guest 还能用 <code>tools.budget()</code> 自查余量主动收敛——死循环与失控在构造上不可能。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <span>深入细节 → docs/run_code_design.md（v0.8）· docs/run_code_requirements.md</span>
+    <span>动手验证 → examples/run-code-demo/（一分钟端到端演示）</span>
+  </div>
+</footer>
+
+</body>
+</html>

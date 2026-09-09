@@ -1,0 +1,12 @@
+{
+  "provider": "openai",
+  "base_url": "REPLACE_WITH_TINYAGENT_DEMO_BASE_URL",
+  "api_key_env": "TINYAGENT_API_KEY",
+  "model": "REPLACE_WITH_TINYAGENT_DEMO_MODEL",
+  "max_tokens": 2048,
+  "workdir": "REPLACE_WITH_WORKDIR",
+  "tools": ["shell", "read_file", "write_file"],
+  "restrict_to_workdir": true,
+  "limits": { "max_turns": 10, "timeout_secs": 300 },
+  "code": { "enabled": true }
+}
