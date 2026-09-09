@@ -273,6 +273,38 @@ impl McpServerConfig {
     }
 }
 
+/// Skill disclosure policy for the built-in `run-code` skill
+/// (finetune_support_design FD-2). The declaration order IS the disclosure
+/// ordering — `Off < OnDemand < Eager` — so batch fragments merge with
+/// `Clamp::Tighten` (min): an untrusted fragment can only disclose LESS.
+/// `Default = OnDemand` keeps every unconfigured user byte-identical.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillInjection {
+    /// Built-in skill is not injected into the index; read_skill("run-code")
+    /// returns an explicit disabled error (tombstone). The slim tool
+    /// description is unchanged — factual constants still ride it.
+    Off,
+    /// Status quo: index entry in the system prompt, body on demand via
+    /// read_skill (D18).
+    #[default]
+    OnDemand,
+    /// Assembly-time: the skill body is additionally injected into history as
+    /// a synthetic tool_use/tool_result pair (fresh sessions only).
+    Eager,
+}
+
+impl SkillInjection {
+    /// Stable serde label for audit output (result.json / NDJSON anchors).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SkillInjection::Off => "off",
+            SkillInjection::OnDemand => "on_demand",
+            SkillInjection::Eager => "eager",
+        }
+    }
+}
+
 /// `run_code` tool configuration (design docs/run_code_design.md §9). Plain
 /// data living on every [`Config`] regardless of the `code` cargo feature, so
 /// configs round-trip identically on builds without it — the tool itself only
@@ -313,6 +345,19 @@ pub struct CodeConfig {
     pub fuel: u64,
     /// Result cap in CHARS (same unit as `limits.max_output_chars`).
     pub max_result_chars: usize,
+    /// Built-in `run-code` skill disclosure policy (finetune_support_design
+    /// FR-1). Assembly-time decision: a runtime `set_code_config` replace does
+    /// NOT re-inject or retract the skill (snapshot semantics, same precedent
+    /// as other host hot-updates not propagating to constructed snapshots).
+    pub skill_injection: SkillInjection,
+    /// Guest pre-execution static precheck (finetune_support_design FR-2).
+    /// Off by default (NFR-1: both finetune-support features require explicit
+    /// configuration); when on, code matching known doomed patterns is
+    /// rejected before Store instantiation with a precise message. An
+    /// EFFICIENCY feature, NOT a security mechanism — lexical scans can be
+    /// obfuscated past; the capability sandbox / deterministic stubs /
+    /// interception layer do not depend on it.
+    pub precheck: bool,
 }
 
 impl Default for CodeConfig {
@@ -326,6 +371,8 @@ impl Default for CodeConfig {
             timeout_secs: 120,
             fuel: 5_000_000_000,
             max_result_chars: 60_000,
+            skill_injection: SkillInjection::OnDemand,
+            precheck: false,
         }
     }
 }
@@ -683,6 +730,8 @@ pub struct PartialCodeConfig {
     pub timeout_secs: Option<u64>,
     pub fuel: Option<u64>,
     pub max_result_chars: Option<usize>,
+    pub skill_injection: Option<SkillInjection>,
+    pub precheck: Option<bool>,
 }
 
 impl CodeConfig {
@@ -699,6 +748,8 @@ impl CodeConfig {
             timeout_secs,
             fuel,
             max_result_chars,
+            skill_injection,
+            precheck,
         } = p;
         if let Some(v) = deny_paths {
             // Union — a fragment can only ADD denials. Sort+dedup (plain
@@ -728,6 +779,12 @@ impl CodeConfig {
         self.timeout_secs = Clamp::TightenOrInit.merge(self.timeout_secs, timeout_secs);
         self.fuel = Clamp::Tighten.merge(self.fuel, fuel);
         self.max_result_chars = Clamp::Tighten.merge(self.max_result_chars, max_result_chars);
+        // Disclosure/intervention knobs: a fragment may only narrow them —
+        // min under the declaration ordering Off < OnDemand < Eager (FD-2) and
+        // false < true for precheck. A fragment asking to disclose MORE than
+        // the trusted base is silently clamped to the base.
+        self.skill_injection = Clamp::Tighten.merge(self.skill_injection, skill_injection);
+        self.precheck = Clamp::Tighten.merge(self.precheck, precheck);
     }
 }
 
@@ -1437,5 +1494,69 @@ mod tests {
             serde_json::from_str(r#"{"code":{"timeout_secs":18446744073709551615}}"#).unwrap();
         cfg.apply(frag).unwrap();
         assert_eq!(cfg.code.timeout_secs, u64::MAX);
+    }
+
+    /// A-2 (finetune_support): disclosure/intervention knobs merge as min
+    /// under their orderings — a fragment can only narrow, never widen.
+    /// `skill_injection`: Off < OnDemand < Eager (declaration order);
+    /// `precheck`: false < true (a fragment may turn it OFF, never ON).
+    #[test]
+    fn code_fragment_skill_injection_and_precheck_clamp() {
+        // Defaults: unconfigured base keeps status quo (NFR-1).
+        let base: Config = serde_json::from_str(
+            r#"{"provider":"anthropic","api_key_env":"K","model":"m","inject_environment":false}"#,
+        )
+        .unwrap();
+        assert_eq!(base.code.skill_injection, SkillInjection::OnDemand);
+        assert!(!base.code.precheck);
+
+        // Fragment eager over base off → off (the A-2 headline case).
+        let mut cfg: Config = serde_json::from_str(
+            r#"{"provider":"anthropic","api_key_env":"K","model":"m",
+                "code":{"skill_injection":"off","precheck":true}}"#,
+        )
+        .unwrap();
+        let frag: PartialConfig =
+            serde_json::from_str(r#"{"code":{"skill_injection":"eager","precheck":false}}"#)
+                .unwrap();
+        cfg.apply(frag).unwrap();
+        assert_eq!(cfg.code.skill_injection, SkillInjection::Off);
+        assert!(!cfg.code.precheck, "fragment may only turn precheck off");
+
+        // Fragment wider than base is silently clamped to the base.
+        let mut cfg: Config = serde_json::from_str(
+            r#"{"provider":"anthropic","api_key_env":"K","model":"m",
+                "code":{"skill_injection":"on_demand"}}"#,
+        )
+        .unwrap();
+        let frag: PartialConfig =
+            serde_json::from_str(r#"{"code":{"skill_injection":"eager"}}"#).unwrap();
+        cfg.apply(frag).unwrap();
+        assert_eq!(
+            cfg.code.skill_injection,
+            SkillInjection::OnDemand,
+            "fragment may not widen disclosure"
+        );
+
+        // Tightening direction is legal: fragment off over base eager → off.
+        let mut cfg: Config = serde_json::from_str(
+            r#"{"provider":"anthropic","api_key_env":"K","model":"m",
+                "code":{"skill_injection":"eager","precheck":true}}"#,
+        )
+        .unwrap();
+        let frag: PartialConfig =
+            serde_json::from_str(r#"{"code":{"skill_injection":"off","precheck":false}}"#).unwrap();
+        cfg.apply(frag).unwrap();
+        assert_eq!(cfg.code.skill_injection, SkillInjection::Off);
+        assert!(!cfg.code.precheck);
+
+        // Serde labels are the stable audit vocabulary (as_str consumers:
+        // result.json / NDJSON).
+        let cfg: Config = serde_json::from_str(
+            r#"{"provider":"anthropic","api_key_env":"K","model":"m",
+                "code":{"skill_injection":"eager"}}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.code.skill_injection.as_str(), "eager");
     }
 }
