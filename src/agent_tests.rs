@@ -156,7 +156,11 @@ fn prune_replaces_old_large_results_and_keeps_pairs() {
         msgs.len(),
         "prune replaces blocks in place, never removes messages"
     );
-    assert_eq!(touched, 1);
+    assert_eq!(
+        touched,
+        vec![2],
+        "only the tool_result message (index 2) lost content"
+    );
     assert!(freed >= PRUNE_MINIMUM_CHARS);
     // Pairing intact: same tool_use_id, placeholder content, flags kept.
     let Block::ToolResult {
@@ -3350,6 +3354,134 @@ fn compact_between_runs_folds_reports_and_does_not_bill_run_totals() {
         Usage::default(),
         "idle compact cost must NOT fold into run totals (they reset per run)"
     );
+}
+
+#[test]
+fn compact_with_focus_hint_folds_like_plain_compact() {
+    // The host's focus hint (Claude Code's `/compact focus on X`) threads
+    // through to the summary prompt without changing the fold mechanics:
+    // same dropped/kept, same manual-trigger event, same host-owned billing.
+    // The hint's PROMPT content is covered by the with_focus_instructions
+    // unit test — Captured records request shape, not text.
+    let mut cfg = cfg_with(5, 0, 0);
+    cfg.limits.keep_recent_messages = 2;
+    let initial = vec![
+        user_text("task"),
+        Message::assistant(vec![Block::Text("a1".into())]),
+        user_text("u1"),
+        Message::assistant(vec![Block::Text("a2".into())]),
+        user_text("u2"),
+    ];
+    let (prov, state) = MockProvider::new(vec![mock::resp_text("SUMMARY", mock::mk_usage(3, 5))]);
+    let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+    let mut events = Vec::new();
+    let o = agent
+        .compact_with(
+            &mut |e| events.push(e),
+            Some("focus on the API changes; keep every endpoint name"),
+        )
+        .unwrap()
+        .expect("5-message history has a safe cut");
+    assert_eq!(o.dropped, 2);
+    assert_eq!(o.kept, 3);
+    assert_eq!(state.calls(), 1);
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::Compressed {
+            trigger: CompressTrigger::Manual,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn with_focus_instructions_appends_hint_only_when_nonempty() {
+    let base = summary_prompt("transcript", None);
+    assert_eq!(with_focus_instructions(&base, None), base);
+    assert_eq!(with_focus_instructions(&base, Some("   ")), base);
+    let with = with_focus_instructions(&base, Some("keep API details"));
+    assert!(with.starts_with(&base), "the hint appends, never rewrites");
+    assert!(with.contains("## Additional instructions from the host"));
+    assert!(with.contains("keep API details"));
+}
+
+#[test]
+fn compact_archives_dropped_middle_to_session() {
+    // Non-destructive compaction: the folded middle's ORIGINALS persist in
+    // the session file's archive section (stable ids along), so a host can
+    // audit or undo; the live history is the folded 3.
+    let mut cfg = cfg_with(5, 0, 0);
+    cfg.limits.keep_recent_messages = 2;
+    let dir = std::env::temp_dir().join(format!("ta-arch-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("s.json");
+    let initial = vec![
+        user_text("task"),
+        Message::assistant(vec![Block::Text("a1".into())]),
+        user_text("u1"),
+        Message::assistant(vec![Block::Text("a2".into())]),
+        user_text("u2"),
+    ];
+    let (prov, _state) = MockProvider::new(vec![mock::resp_text("SUMMARY", None)]);
+    let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+    agent.enable_session(path.clone());
+    let o = agent.compact(&mut |_| {}).unwrap().expect("folds");
+    assert_eq!(o.dropped, 2);
+    let (model, live, archive) = crate::session::load_with_archive(&path)
+        .unwrap()
+        .expect("session written");
+    assert_eq!(model, "m");
+    assert_eq!(live.len(), 3, "folded history");
+    assert_eq!(archive.len(), 2, "the dropped middle archived");
+    let archived_text: String = archive
+        .iter()
+        .flat_map(|m| {
+            m.content.iter().filter_map(|b| match b {
+                Block::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+        })
+        .collect();
+    assert!(archived_text.contains("a1") && archived_text.contains("u1"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn prune_archives_originals_to_session() {
+    // The prune rewrites tool results to placeholders in the LIVE history;
+    // the original oversized content lands in the archive verbatim.
+    let mut cfg = cfg_with(5, 0, 200);
+    cfg.limits.keep_recent_messages = 2;
+    let dir = std::env::temp_dir().join(format!("ta-prarch-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("s.json");
+    let mut initial = vec![user_text("task")];
+    initial.extend(big_tool_turn("t1", "shell", 30_000));
+    initial.push(user_text("u1"));
+    initial.push(Message::assistant(vec![Block::Text("a2".into())]));
+    initial.push(user_text("u2"));
+    let (prov, _state) = MockProvider::new(vec![mock::resp_text("final answer", None)]);
+    let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+    agent.enable_session(path.clone());
+    agent.run(&mut |_| {}).unwrap();
+    let (_, live, archive) = crate::session::load_with_archive(&path)
+        .unwrap()
+        .expect("session written");
+    // Live: placeholder; archive: the 30k original.
+    let Block::ToolResult { content, .. } = &live[2].content[0] else {
+        panic!("live tool result");
+    };
+    assert!(content.starts_with("[pruned tool output"));
+    assert_eq!(archive.len(), 1);
+    let Block::ToolResult { content: orig, .. } = &archive[0].content[0] else {
+        panic!("archived tool result");
+    };
+    assert_eq!(
+        orig.len(),
+        30_000,
+        "the original payload survives in the archive"
+    );
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]

@@ -96,7 +96,7 @@ agent.set_hooks(Arc::new(Policy));
 
 **工具能力标记**：自定义 `Tool` 还可用两个默认方法向 loop 声明能力——`concurrency()` 返回 `ToolConcurrency::Parallel` 即获得与内置 `task` 同款的同 turn 多调用并行执行（承诺可重入 + 轮询 `ctx.cancel`）；`available_to_subagent()` 返回 `false` 即退出子 agent 继承。路由按能力、不按名字，第三方工具与内置工具一视同仁。
 
-**常驻会话的热更新**（GUI 宿主场景）：CLI 的 config 在构建时定格，但宿主可以让一个 `Agent` 活整个会话、按需换挡——`set_model` / `set_reasoning_effort` / `set_max_tokens` / `set_max_context_tokens` 都是**纯字段替换**，下次请求生效，MCP 连接、工具装配、历史与 session 全不动（重建 Agent 要重跑 MCP 握手，实测可达秒级）。MCP server 集合也可热增删：`add_mcp_server(McpServerConfig)` / `remove_mcp_server(name)` / `tool_names()`（语义见[MCP 运行时热增删](#运行时热增删库-api)节）。`Agent::compact(&mut events)` 是压缩的**宿主主动入口**：轮次间调用即折叠历史（滚动摘要 + 安全切点 + 落盘 + `Compressed { trigger: "manual" }` 事件），返回 `dropped`/`kept`/摘要调用的 `usage`——这笔成本不进下一次 run 的账单（run 入口会重置总账），由宿主自行记账。这些方法的 `&mut self` 签名即顺序契约：run 持有借用，「轮次间调用」由借用检查器强制。注意 `task` 子 agent 持构造期 config 快照，不跟随换挡。
+**常驻会话的热更新**（GUI 宿主场景）：CLI 的 config 在构建时定格，但宿主可以让一个 `Agent` 活整个会话、按需换挡——`set_model` / `set_reasoning_effort` / `set_max_tokens` / `set_max_context_tokens` 都是**纯字段替换**，下次请求生效，MCP 连接、工具装配、历史与 session 全不动（重建 Agent 要重跑 MCP 握手，实测可达秒级）。MCP server 集合也可热增删：`add_mcp_server(McpServerConfig)` / `remove_mcp_server(name)` / `tool_names()`（语义见[MCP 运行时热增删](#运行时热增删库-api)节）。`Agent::compact(&mut events)` 是压缩的**宿主主动入口**：轮次间调用即折叠历史（滚动摘要 + 安全切点 + 落盘 + `Compressed { trigger: "manual" }` 事件），返回 `dropped`/`kept`/摘要调用的 `usage`——这笔成本不进下一次 run 的账单（run 入口会重置总账），由宿主自行记账；`compact_with(&mut events, Some("focus on …"))` 可附带**焦点指令**引导摘要侧重。这些方法的 `&mut self` 签名即顺序契约：run 持有借用，「轮次间调用」由借用检查器强制。注意 `task` 子 agent 持构造期 config 快照，不跟随换挡。
 
 run 结束后从 [`RunOutcome`](src/agent.rs)（或 `Agent::usage()` / `messages()` / `model()` getter）读回诚实的 token 账单与历史。`AgentEvent` 派生了 `Serialize`，绑定层可直接序列化成宿主语言的 dict / object。`Message` 带**稳定 id**（`id: Option<String>`，agent 在消息进入历史时铸造、跨 save/load 不变、压缩折叠不重排存活者）——往消息上挂宿主侧资产（图片卡 / 文件链接）时锚 id 而不是下标，压缩/truncate 后锚点不漂移。
 
@@ -616,28 +616,52 @@ API key 从 `api_key_env` 指定的环境变量读取，不写进配置文件。
 
 ### 上下文压缩
 
-长任务中历史消息会持续增长直至撞模型上下文上限。压缩有**两条触发路径**，共用同一套摘要逻辑：
+长任务中历史消息会持续增长直至撞模型上下文上限。压缩是**分层漏斗**——先零成本剪枝，再 LLM 摘要，
+三层触发路径共用后两层：
 
-1. **前馈（preflight）**——每轮调用前预估请求大小，超阈值就先压缩再用更短的历史发请求。阈值二选一：
-   - 设了 `max_context_tokens`（>0）：改用 token 估算（≈4 字符/token，另预留本回合 `max_tokens` 输出），
-     到窗口的 ~85% 就压。这是「按模型真实窗口压」，推荐。
+0. **剪枝（prune，LLM 摘要前的零成本闸门）**——保护窗（`keep_recent_messages`）之外的**旧工具结果**
+   是上下文的大头（实测可占 80%+）：超过 2000 字符的旧 `tool_result` 被替换为一行占位符
+   （`[pruned tool output, was N chars]`，`tool_use_id`/错误标志保留、图片载荷丢弃、todo 结果豁免），
+   配对关系天然完整，模型需要细节时可重跑工具。释放量不足 20000 字符不重写（避免为小收益打断
+   prompt cache 前缀）。preflight 超阈值先剪枝重估，常常就此够用、**一次摘要调用都不发**；溢出兜底
+   也先剪枝重试，仍溢出才走摘要强压。剪枝事件 `[context pruned: N messages …, M chars freed]`
+   单独透出（`--json` 为 `{"type":"pruned",…}`），被剪的原始消息进 session 归档（见下）。
+
+1. **前馈（preflight）**——每轮调用前预估请求大小，超阈值就走摘要压缩再用更短的历史发请求。阈值二选一：
+   - 设了 `max_context_tokens`（>0）：token 估算到窗口的 ~85% 就压（另预留本回合 `max_tokens` 输出）。
+     估算**优先锚定 provider 实测值**：上一轮响应报告的 prompt tokens（input + 缓存写 + 缓存读）
+     作为基线，只对之后新增的消息做 ≈4 字符/token 的增量估算——这修正了纯字符启发式对中文
+     低估 2~3 倍、preflight 过晚触发的问题。无锚点（首轮/恢复会话/历史被剪枝或折叠改写）时
+     回退全历史估算。这是「按模型真实窗口压」，推荐。
    - 未设（`0`，默认）：回退 `compress_threshold_chars`（默认 400k 字符 ≈100k tokens，`0` = 关闭）的字符启发式。
 2. **溢出（overflow）兜底**——**永远开启，与上面配置无关**。当 provider 返回「上下文过长」类错误
    （`context_length_exceeded` / `prompt is too long` / `maximum context length` 等，子串匹配错误体）
-   时，强制压缩一次并**重试该回合一次**；第二次仍溢出才当真错误上抛。这样即便前馈估算偏了、
-   或工具 schema / system prompt 占了大头，agent 也能自愈而不是整轮失败。
+   时，先剪枝重试，仍溢出则强制摘要压缩一次并**重试该回合一次**；第二次仍溢出才当真错误上抛。
+   这样即便前馈估算偏了、或工具 schema / system prompt 占了大头，agent 也能自愈而不是整轮失败。
 
-3. **宿主主动（manual）**——库用户在轮次间调 `Agent::compact()`（见「库 API」节）：GUI 的上下文
-   占用指示到 80%+ 时点一下即压，不等阈值也不赌溢出。摘要 usage 返回给宿主记账，不进下一次 run 的账单。
+3. **宿主主动（manual）**——库用户在轮次间调 `Agent::compact()` / `compact_with(events, Some("focus …"))`
+   （见「库 API」节，Python/Node 绑定同款 `compact(instructions?, on_event?)`）：GUI 的上下文
+   占用指示到 80%+ 时点一下即压，不等阈值也不赌溢出；焦点指令引导摘要侧重（如"重点保留 API 变更"）。
+   摘要 usage 返回给宿主记账，不进下一次 run 的账单。
 
-摘要质量上：模型把中段历史写成**结构化滚动摘要**（目标/进展/决策/改动文件/报错与解法/下一步），
-折叠进首条任务消息，只保留任务 + 最近 `keep_recent_messages` 条原文；后续压缩是**更新**这份摘要而非
-重摘要整个前缀。前缀过大时按消息边界**分块**摘要再合并，把单次压缩比控制在 ~6:1，保住路径/报错等细节。
-切割点选在 assistant 消息边界，保证 tool_use/tool_result 配对不被切断；压缩失败时告警一次并禁用本次
-运行的后续压缩（不中断任务，也不每轮重试刷屏）。运行日志与 TUI 系统行里的压缩事件带触发路径标注
-（`[context compressed (preflight): dropped N messages, M kept]` / `(overflow)` / `(manual)`，`--json` 的
-NDJSON 里则是额外的 `"trigger": "preflight"|"overflow"|"manual"` 字段），一眼区分是估算超阈值、溢出兜底
-还是宿主主动。
+摘要质量上：模型把中段历史写成**结构化滚动摘要**（目标/进展/决策/改动文件/报错与解法/下一步；关键
+路径/标识符/错误文本要求**逐字引用**，抑制多次压缩的累积漂移），折叠进首条任务消息，只保留任务 +
+最近 `keep_recent_messages` 条原文；后续压缩是**更新**这份摘要而非重摘要整个前缀。前缀过大时按消息
+边界**分块**摘要再合并，把单次压缩比控制在 ~6:1，保住路径/报错等细节。切割点选在 assistant 消息边界，
+保证 tool_use/tool_result 配对不被切断；压缩失败时告警一次并禁用本次运行的后续压缩（不中断任务，
+也不每轮重试刷屏）。
+
+**折叠后的保真**（对齐 Claude Code / Codex 的压缩后恢复）：随摘要一起折回头部的还有两样结构化内容——
+(a) **todo 清单**：`todo` 工具没有读取模式，模型对计划的唯一视图是最近一次 todo 结果的渲染清单，折叠
+吞掉它时按最新调用恢复（尾部仍持有活动清单时不重复注入）；(b) **中间用户消息原文**：被折叠区间的用户
+Text 块以 `[用户消息原文保留]` 块逐字并入头部（单条 2000 字符截断、总额 12000 字符 FIFO），用户指令
+不经摘要转述。运行日志与 TUI 系统行里的压缩事件带触发路径标注（`[context compressed (preflight):
+dropped N messages, M kept]` / `(overflow)` / `(manual)`，`--json` 的 NDJSON 里则是额外的
+`"trigger": "preflight"|"overflow"|"manual"` 字段），一眼区分是估算超阈值、溢出兜底还是宿主主动。
+
+**非破坏性与 session 归档**：压缩折叠与剪枝移出活历史的**原始消息**（带稳定 id）追加进 session 文件的
+`archive` 段（上限 4096 条 FIFO；`/clear` 保留归档），宿主可经 `session::load_with_archive` 读回做
+undo/审计；普通 `load` 不受影响，老版本 session 文件双向兼容（无归档键即空归档，空归档不写出该键）。
 
 压缩摘要请求自身的 token 用量也计入运行累计（`input_tokens` / `output_tokens`），
 成本数字与实际调用一致，不因压缩而漏报。

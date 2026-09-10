@@ -420,6 +420,52 @@ impl Task for RunTask {
     }
 }
 
+/// The async unit of work for `Agent#compact()`: the manual history fold runs
+/// off the JS thread (same rationale as [`RunTask`]); the outcome — `null`
+/// when nothing was compressible — resolves as a plain object.
+pub struct CompactTask {
+    /// Cloned from the live `Agent`.
+    pub agent: Arc<Mutex<ta::Agent>>,
+    /// Optional host focus hint for the summarizer.
+    pub instructions: Option<String>,
+    /// Optional streaming-event forwarder (`Compressed`/`Warning`).
+    pub on_event: Option<ThreadsafeFunction<Value, ErrorStrategy::Fatal>>,
+}
+
+impl Task for CompactTask {
+    type Output = Value;
+    type JsValue = Outcome;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let CompactTask {
+            agent,
+            instructions,
+            on_event,
+        } = self;
+        let mut a = agent.lock().map_err(|_| err("agent mutex poisoned"))?;
+        let outcome = a
+            .compact_with(
+                &mut |ev: ta::AgentEvent| {
+                    if let Some(tsfn) = on_event.as_ref() {
+                        if let Ok(v) = serde_json::to_value(&ev) {
+                            let _ = tsfn.call(v, ThreadsafeFunctionCallMode::NonBlocking);
+                        }
+                    }
+                },
+                instructions.as_deref(),
+            )
+            .map_err(err)?;
+        match outcome {
+            Some(o) => serde_json::to_value(&o).map_err(err),
+            None => Ok(Value::Null),
+        }
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(Outcome(output))
+    }
+}
+
 // ── CancelToken ──────────────────────────────────────────────────────────────
 
 /// A cancellation flag shared with the agent. Call `.cancel()` to interrupt a
@@ -567,6 +613,27 @@ impl Agent {
     ) -> AsyncTask<RunTask> {
         AsyncTask::new(RunTask {
             agent: self.inner.clone(),
+            on_event,
+        })
+    }
+
+    /// Manually compress the conversation history NOW (the idle-time fold):
+    /// summarize the middle via the LLM, fold it into the first message,
+    /// rewrite the session file. `instructions` is an optional focus hint for
+    /// the summarizer ("focus on the API changes"); `onEvent` receives the
+    /// `Compressed`/`Warning` events. Resolves with `{dropped, kept, usage}`
+    /// or `null` when nothing was compressible (history too short); rejects
+    /// on summary-request failure. The summary's cost is NOT part of the next
+    /// run's `usage()` — meter it from the returned `usage` yourself.
+    #[napi]
+    pub fn compact(
+        &self,
+        instructions: Option<String>,
+        on_event: Option<ThreadsafeFunction<Value, ErrorStrategy::Fatal>>,
+    ) -> AsyncTask<CompactTask> {
+        AsyncTask::new(CompactTask {
+            agent: self.inner.clone(),
+            instructions,
             on_event,
         })
     }

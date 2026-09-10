@@ -33,6 +33,8 @@ function writeConfig(t, mockUrl, opts = {}) {
       timeout_secs: opts.timeoutSecs ?? 30,
       max_output_chars: 20000,
       stream_idle_secs: opts.streamIdleSecs ?? 30,
+      // Undefined entries are dropped by JSON.stringify — opt-in only.
+      keep_recent_messages: opts.keepRecentMessages,
     },
   };
   const cfgPath = path.join(workdir, 'config.json');
@@ -237,6 +239,7 @@ function providerConfig(t, opts = {}) {
     tools: opts.tools ?? [],
     maxTurns: opts.maxTurns ?? 6,
     timeoutSecs: opts.timeoutSecs,
+    keepRecentMessages: opts.keepRecentMessages,
   });
 }
 
@@ -304,6 +307,41 @@ test('custom provider sees growing history across turns', async (t) => {
   await a.run();
 
   assert.deepStrictEqual(seen, [0, 1]);
+});
+
+test('compact(instructions?, onEvent?) folds the history between runs', async (t) => {
+  // Host-initiated fold: one summary call folds the middle, the outcome
+  // reports {dropped, kept, usage}, the Compressed event fires with trigger
+  // "Manual", and the optional focus instructions thread through. A history
+  // too short for keepRecentMessages resolves null.
+  const events = [];
+  const { cfgPath } = providerConfig(t, { keepRecentMessages: 2 });
+
+  const a = new Agent(cfgPath, {
+    provider: () => ({ text: 'SUMMARY', stop_reason: 'end_turn' }),
+  });
+  for (const msg of ['t1', 't2', 't3']) {
+    a.pushUser(msg);
+    await a.run();
+  }
+  // history: u1 a1 u2 a2 u3 a3 — 6 messages, safe cut at the trailing a3.
+  assert.strictEqual(a.messages().length, 6);
+
+  const outcome = await a.compact('focus on the API changes', (e) => events.push(e));
+  assert.strictEqual(outcome.dropped, 4);
+  assert.strictEqual(outcome.kept, 2);
+  assert.strictEqual(a.messages().length, 2);
+  const compressed = events.filter((e) => e && 'Compressed' in e).map((e) => e.Compressed);
+  assert.ok(compressed.length >= 1, 'Compressed event forwarded');
+  assert.strictEqual(compressed[0].trigger, 'Manual');
+
+  // Too short to fold: null, no summary call.
+  const b = new Agent(cfgPath, {
+    provider: () => ({ text: 'x', stop_reason: 'end_turn' }),
+  });
+  b.pushUser('one');
+  await b.run();
+  assert.strictEqual(await b.compact(), null);
 });
 
 test('custom provider emits the whole text as one delta', async (t) => {

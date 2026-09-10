@@ -476,6 +476,43 @@ impl Agent {
         Ok(bound.unbind())
     }
 
+    /// Manually compress the conversation history NOW (the idle-time fold):
+    /// summarize the middle via the LLM, fold it into the first message,
+    /// rewrite the session file. `instructions` is an optional focus hint for
+    /// the summarizer ("focus on the API changes"); `on_event` receives the
+    /// `Compressed`/`Warning` events. Returns the outcome dict
+    /// `{dropped, kept, usage}` or `None` when nothing was compressible
+    /// (history too short); raises on summary-request failure. Call between
+    /// runs (same reentrancy rules as `run`). The summary's cost is NOT part
+    /// of the next run's `usage()` — meter it from the returned `usage`.
+    #[pyo3(signature = (instructions=None, on_event=None))]
+    fn compact(
+        &self,
+        instructions: Option<&str>,
+        on_event: Option<PyObject>,
+        py: Python<'_>,
+    ) -> PyResult<PyObject> {
+        if IN_RUN.with(Cell::get) {
+            return Err(PyRuntimeError::new_err(
+                "Agent.compact() cannot be called reentrantly from an on_event/tool callback",
+            ));
+        }
+        let result = py.allow_threads(|| {
+            let mut agent = self.inner.lock().expect("agent mutex poisoned");
+            IN_RUN.with(|c| c.set(true));
+            let _flag = RunFlag; // RAII clear, panic-safe
+            agent.compact_with(&mut |ev| emit_event(&on_event, ev), instructions)
+        });
+        match result {
+            Ok(Some(outcome)) => {
+                let bound = pythonize(py, &outcome)?;
+                Ok(bound.unbind())
+            }
+            Ok(None) => Ok(py.None()),
+            Err(e) => Err(to_pyerr(e)),
+        }
+    }
+
     /// Conversation history as a list of message dicts.
     fn messages(&self, py: Python<'_>) -> PyResult<PyObject> {
         let msgs = self.with_agent(py, |a| a.messages().to_vec())?;

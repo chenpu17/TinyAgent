@@ -408,6 +408,13 @@ const SALVAGE_NUDGE_EMPTY: &str = "Your previous reply produced no visible \
      text before hitting the output-token limit (reasoning consumed the \
      budget). Reply now with minimal reasoning and a direct, concise answer.";
 
+/// Cap on the session archive (messages folded out of the live history by
+/// compression/pruning). Big enough for a very long session's paper trail;
+/// beyond it the OLDEST archived messages drop — the archive is an undo/audit
+/// aid, not an infinite log, and unbounded base64 images would bloat the
+/// session file without bound.
+const ARCHIVE_MAX_MESSAGES: usize = 4096;
+
 /// A real provider measurement the preflight estimate anchors to: the prompt
 /// size of the last main-chat request (input + cache-write + cache-read —
 /// all three axes made up the prompt the provider saw) and the history it
@@ -483,6 +490,12 @@ pub struct Agent {
     /// cost into the returned `RunError` when a run fails mid-way, letting a
     /// retry loop bill the failed attempt's burned tokens (honest cost).
     usage: Usage,
+    /// Messages folded out of the live history by compression/pruning, kept
+    /// for host-side undo/audit and persisted as the session file's `archive`
+    /// section (OpenCode's "hide, don't delete"). FIFO-capped at
+    /// [`ARCHIVE_MAX_MESSAGES`]. `/clear` keeps it — clearing starts a new
+    /// conversation, it does not burn the old one's paper trail.
+    session_archive: Vec<Message>,
     /// Real prompt size the provider reported for the last main-chat request,
     /// plus what it was measured against — the preflight compaction estimate
     /// anchors to it instead of the whole-history chars-per-token heuristic
@@ -622,6 +635,7 @@ impl Agent {
             next_msg_id,
             usage: Usage::default(),
             usage_anchor: None,
+            session_archive: Vec::new(),
             tool_schema_chars,
             #[cfg(feature = "code")]
             code_tool: None,
@@ -1076,13 +1090,27 @@ impl Agent {
         self.session_path = Some(path);
     }
 
+    /// Restore a session archive previously read via
+    /// [`session::load_with_archive`], so later saves keep appending to it —
+    /// resuming and compacting again would otherwise write a file whose
+    /// archive holds only the new fold's messages. No-op for hosts that don't
+    /// consume the archive.
+    pub fn set_session_archive(&mut self, archive: Vec<Message>) {
+        self.session_archive = archive;
+    }
+
     /// Persist the session, returning a warning message on failure instead of
     /// printing — the agent must never write to stderr itself (in TUI mode the
     /// worker thread shares the terminal with ratatui). Callers with an event
     /// channel forward it as `AgentEvent::Warning`.
     fn save_session(&self) -> Option<String> {
         if let Some(path) = &self.session_path {
-            if let Err(e) = crate::session::save(path, &self.model, &self.messages) {
+            if let Err(e) = crate::session::save_with_archive(
+                path,
+                &self.model,
+                &self.messages,
+                &self.session_archive,
+            ) {
                 return Some(format!("session save failed: {e:#}"));
             }
         }
@@ -1284,7 +1312,12 @@ impl Agent {
             // itself failed (compress_failed is set inside): warn through the
             // event stream — the host-facing compact propagates its Err instead,
             // which is why compress() doesn't warn on that path itself.
-            match self.compress(events, deadline, CompressTrigger::Preflight) {
+            match self.compress(
+                events,
+                deadline,
+                CompressTrigger::Preflight,
+                /* instructions: */ None,
+            ) {
                 Ok(Some(outcome)) => {
                     if let Some(u) = outcome.usage {
                         self.bill_chat(events, &u);
@@ -1389,7 +1422,12 @@ impl Agent {
                             // Err = the summary call failed (compress_failed
                             // set inside) — warn and fall through to the
                             // unrecoverable-overflow error below.
-                            match self.compress(events, deadline, CompressTrigger::Overflow) {
+                            match self.compress(
+                                events,
+                                deadline,
+                                CompressTrigger::Overflow,
+                                /* instructions: */ None,
+                            ) {
                                 Ok(Some(outcome)) => {
                                     if let Some(u) = outcome.usage {
                                         self.bill_chat(events, &u);
@@ -2090,6 +2128,14 @@ impl Agent {
     /// event fires through `events`. The size threshold does NOT apply — the
     /// caller IS the decision.
     ///
+    /// `instructions` is the host's focus hint (Claude Code's
+    /// `/compact focus on X`): free-form text appended to the summary prompt
+    /// telling the summarizer what to preserve with extra care ("focus on
+    /// the API changes"). `None`/empty folds with the stock prompt. It rides
+    /// the user prompt, not SUMMARY_SYSTEM — the system prompt is shared by
+    /// every summary call of every compaction, while the hint belongs to
+    /// this one fold.
+    ///
     /// Call this BETWEEN runs: the `&mut self` signature makes a concurrent
     /// `run` unrepresentable, so the compiler enforces the sequencing. A
     /// stale `cancel` flag from a previously-cancelled run is cleared at
@@ -2111,9 +2157,10 @@ impl Agent {
     /// every `run` entry, so folding it in would vanish at the next run. The
     /// HOST owns this cost (persist it, display it, meter it); it will not
     /// appear in the next `RunOutcome` or result.json.
-    pub fn compact(
+    pub fn compact_with(
         &mut self,
         events: &mut dyn FnMut(AgentEvent),
+        instructions: Option<&str>,
     ) -> Result<Option<CompressOutcome>> {
         // Fresh-attempt resets (see the doc). Order: clear the disable flag,
         // then cancel — a summary chat consults the flag live. Clearing here
@@ -2123,7 +2170,20 @@ impl Agent {
         self.clear_cancel();
         // No run deadline: summary_call falls back to its per-request
         // backstop (STREAM_BACKSTOP), so a stuck summary can't hang forever.
-        self.compress(events, /* deadline: */ None, CompressTrigger::Manual)
+        self.compress(
+            events,
+            /* deadline: */ None,
+            CompressTrigger::Manual,
+            instructions,
+        )
+    }
+
+    /// [`Agent::compact_with`] without a focus hint — the common fold.
+    pub fn compact(
+        &mut self,
+        events: &mut dyn FnMut(AgentEvent),
+    ) -> Result<Option<CompressOutcome>> {
+        self.compact_with(events, None)
     }
 
     /// Preflight "is the history over the compaction threshold?" — a token
@@ -2185,15 +2245,20 @@ impl Agent {
 
     /// One prune pass over the history (see [`compress::prune_tool_results`]):
     /// stale oversized tool results outside the `keep_recent_messages`
-    /// protection window become placeholders. Rewrites `self.messages`,
-    /// persists the session, reports through the event stream. Returns the
-    /// chars freed (`0` = nothing pruned). No LLM call, no billing.
+    /// protection window become placeholders. The ORIGINALS of every touched
+    /// message move into the session archive first (non-destructive on disk
+    /// even though the live history shrinks), `self.messages` is rewritten,
+    /// the session file persists, and the pass reports through the event
+    /// stream. Returns the chars freed (`0` = nothing pruned). No LLM call,
+    /// no billing.
     fn try_prune(&mut self, events: &mut dyn FnMut(AgentEvent)) -> usize {
         let Some((pruned, touched, freed)) =
             compress::prune_tool_results(&self.messages, self.limits.keep_recent_messages)
         else {
             return 0;
         };
+        let originals: Vec<Message> = touched.iter().map(|&i| self.messages[i].clone()).collect();
+        self.archive_messages(originals);
         self.messages = pruned;
         // History rewritten ⇒ the usage anchor (a real provider measurement
         // of a history that no longer exists) is void.
@@ -2202,10 +2267,24 @@ impl Agent {
             events(AgentEvent::Warning(w));
         }
         events(AgentEvent::Pruned {
-            messages: touched,
+            messages: touched.len(),
             chars_freed: freed,
         });
         freed
+    }
+
+    /// Append messages leaving the live history (compression fold / prune) to
+    /// the session archive, FIFO-capped. Ids ride along, so a host can anchor
+    /// undo/audit assets to the same stable ids the live history uses.
+    fn archive_messages<I: IntoIterator<Item = Message>>(&mut self, msgs: I) {
+        self.session_archive.extend(msgs);
+        let overflow = self
+            .session_archive
+            .len()
+            .saturating_sub(ARCHIVE_MAX_MESSAGES);
+        if overflow > 0 {
+            self.session_archive.drain(0..overflow);
+        }
     }
 
     /// Compress history if it's too large, summarizing the middle via the LLM
@@ -2235,6 +2314,7 @@ impl Agent {
         events: &mut dyn FnMut(AgentEvent),
         deadline: Option<Instant>,
         trigger: CompressTrigger,
+        instructions: Option<&str>,
     ) -> Result<Option<CompressOutcome>> {
         // Threshold gate. Overflow/Manual skip it — the provider just proved
         // the request too long, or the host asked for the fold explicitly.
@@ -2270,7 +2350,7 @@ impl Agent {
             None => return Ok(None),
         };
 
-        let (summary, sum_usage) = match self.summarize_prefix(cut, deadline) {
+        let (summary, sum_usage) = match self.summarize_prefix(cut, deadline, instructions) {
             Ok((s, u)) if !s.trim().is_empty() => (s, u),
             Ok((_empty, u)) => {
                 // The summary request ran (so compression "happened") even
@@ -2300,6 +2380,10 @@ impl Agent {
         };
 
         let dropped = cut - 1;
+        // The dropped middle's ORIGINALS move to the session archive (the
+        // head stays live in folded form, the tail verbatim).
+        let dropped_middle: Vec<Message> = self.messages[1..cut].to_vec();
+        self.archive_messages(dropped_middle);
         self.messages = compress::fold_summary(&self.messages, cut, &summary);
         // The folded history shares no measurement with the pre-fold one —
         // the anchor is void (same as after a prune).
@@ -2340,7 +2424,10 @@ impl Agent {
 
     /// Ask the LLM to summarize `messages[..cut]` into a compact running brief.
     /// Returns the summary text and the summed token usage across every summary
-    /// call (single, or per-chunk + combine).
+    /// call (single, or per-chunk + combine). `instructions` is the manual
+    /// compact's host focus hint — applied only to the FINAL summary call (in
+    /// the chunked path the per-chunk calls stay stock so the hint weights the
+    /// product, not every intermediate).
     ///
     /// Small/normal prefixes make ONE call with a proportional budget. A large
     /// prefix is split into message-aligned chunks (each ≤ SUMMARY_CHUNK_CHARS),
@@ -2354,6 +2441,7 @@ impl Agent {
         &self,
         cut: usize,
         deadline: Option<Instant>,
+        instructions: Option<&str>,
     ) -> Result<(String, Option<Usage>)> {
         let old_summary = compress::extract_running_summary(&self.messages);
         let lines = compress::window_lines(&self.messages, cut);
@@ -2373,7 +2461,10 @@ impl Agent {
             let transcript = lines.concat();
             let budget = compress::summary_budget(transcript_size).min(cap);
             self.summary_call(
-                &compress::summary_prompt(&transcript, old_summary.as_deref()),
+                &compress::with_focus_instructions(
+                    &compress::summary_prompt(&transcript, old_summary.as_deref()),
+                    instructions,
+                ),
                 budget,
                 deadline,
                 1,
@@ -2386,7 +2477,10 @@ impl Agent {
             // it directly with the running-summary update prompt.
             if chunks.len() == 1 {
                 return self.summary_call(
-                    &compress::summary_prompt(&chunks[0], old_summary.as_deref()),
+                    &compress::with_focus_instructions(
+                        &compress::summary_prompt(&chunks[0], old_summary.as_deref()),
+                        instructions,
+                    ),
                     compress::summary_budget(chunks[0].len()).min(cap),
                     deadline,
                     1,
@@ -2415,7 +2509,10 @@ impl Agent {
             }
             let budget = compress::summary_budget(combined.len()).min(cap);
             let (final_summary, u) = self.summary_call(
-                &compress::summary_prompt(&combined, old_summary.as_deref()),
+                &compress::with_focus_instructions(
+                    &compress::summary_prompt(&combined, old_summary.as_deref()),
+                    instructions,
+                ),
                 budget,
                 deadline,
                 n_calls,

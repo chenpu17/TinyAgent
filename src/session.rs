@@ -10,10 +10,28 @@ struct Session {
     version: u32,
     model: String,
     messages: Vec<Message>,
+    /// Messages folded out of the live history by compaction/pruning — kept
+    /// for host-side undo/audit (OpenCode's "hide, don't delete"). Optional so
+    /// pre-archive files load unchanged; the version stays 1 because the file
+    /// is a superset (older binaries ignore the unknown key).
+    #[serde(default)]
+    archive: Vec<Message>,
 }
+
+/// What a successful load returns: the model, the live history, and the
+/// archive of messages folded out of it (see [`save_with_archive`]).
+pub type LoadedSession = (String, Vec<Message>, Vec<Message>);
 
 /// Load a session file. Returns Ok(None) if the file does not exist.
 pub fn load(path: &Path) -> Result<Option<(String, Vec<Message>)>> {
+    Ok(load_with_archive(path)?.map(|(model, messages, _)| (model, messages)))
+}
+
+/// [`load`](fn.load.html) plus the archive section — messages folded out of
+/// the live history by compression/pruning, in fold order, carrying their
+/// stable ids. A host implementing undo/audit reads this; plain resume
+/// doesn't need it.
+pub fn load_with_archive(path: &Path) -> Result<Option<LoadedSession>> {
     let raw = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -44,7 +62,7 @@ pub fn load(path: &Path) -> Result<Option<(String, Vec<Message>)>> {
     }
     let mut messages = s.messages;
     repair_dangling_tool_use(&mut messages);
-    Ok(Some((s.model, messages)))
+    Ok(Some((s.model, messages, s.archive)))
 }
 
 /// Recover from a crash that left the session ending on an assistant message
@@ -87,6 +105,18 @@ fn repair_dangling_tool_use(messages: &mut Vec<Message>) {
 
 /// Atomically persist the conversation (write temp file, then rename).
 pub fn save(path: &Path, model: &str, messages: &[Message]) -> Result<()> {
+    save_with_archive(path, model, messages, &[])
+}
+
+/// [`save`](fn.save.html) with the archive section written alongside the
+/// live history. An empty archive serializes without the key — byte-identical
+/// to pre-archive files.
+pub fn save_with_archive(
+    path: &Path,
+    model: &str,
+    messages: &[Message],
+    archive: &[Message],
+) -> Result<()> {
     // Serialize by reference: no need to deep-clone the whole history (with
     // its base64 images and tool inputs) on every turn just to write it out.
     #[derive(Serialize)]
@@ -94,11 +124,14 @@ pub fn save(path: &Path, model: &str, messages: &[Message]) -> Result<()> {
         version: u32,
         model: &'a str,
         messages: &'a [Message],
+        #[serde(skip_serializing_if = "<[Message]>::is_empty")]
+        archive: &'a [Message],
     }
     let s = SessionRef {
         version: SESSION_VERSION,
         model,
         messages,
+        archive,
     };
     let bytes = serde_json::to_string_pretty(&s)?;
     // Reuse the hardened atomic write (fsync + temp cleanup) used for
@@ -178,6 +211,47 @@ mod tests {
         let (model, loaded) = load(&path).unwrap().unwrap();
         assert_eq!(model, "m1");
         assert_eq!(loaded.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn archive_roundtrip_and_legacy_compat() {
+        // The archive section is format-additive: files WITH it roundtrip
+        // (stable ids along), files WITHOUT it (pre-archive binaries) load
+        // with an empty archive, an empty archive serializes WITHOUT the key
+        // (byte-compatible with the old format), and plain `load` on an
+        // archived file just drops the archive it doesn't ask for.
+        let dir = std::env::temp_dir().join(format!("ta-arch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.json");
+
+        // Empty archive → no key in the file (old-format shape).
+        let live = vec![Message::user(vec![Block::Text("live".into())])];
+        save(&path, "m", &live).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !raw.contains("\"archive\""),
+            "empty archive omits the key: {raw}"
+        );
+
+        // Legacy file loads with an empty archive.
+        let (_, _, archive) = load_with_archive(&path).unwrap().unwrap();
+        assert!(archive.is_empty());
+
+        // Archived save roundtrips, ids verbatim.
+        let mut m = Message::assistant(vec![Block::Text("folded".into())]);
+        m.id = Some("m7".into());
+        save_with_archive(&path, "m", &live, &[m]).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"archive\""));
+        let (_, l, archive) = load_with_archive(&path).unwrap().unwrap();
+        assert_eq!(l.len(), 1);
+        assert_eq!(archive.len(), 1);
+        assert_eq!(archive[0].id.as_deref(), Some("m7"));
+
+        // Plain load on an archived file drops the archive section.
+        let (_, l) = load(&path).unwrap().unwrap();
+        assert_eq!(l.len(), 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -298,6 +298,10 @@ fn main() -> Result<()> {
     // ── Single-run mode (headless or TUI) ─────────────────────────────
     let mut initial: Vec<Message> = Vec::new();
     let mut resumed = false;
+    // Archive section of a resumed session (messages folded out of the live
+    // history by earlier compactions) — restored onto the agent below so this
+    // process's folds/prunes APPEND to it instead of overwriting it.
+    let mut resumed_archive: Vec<Message> = Vec::new();
     if cli.resume {
         let path = match session {
             Some(p) => p,
@@ -306,7 +310,7 @@ fn main() -> Result<()> {
             // fine and just skips writing.)
             None => bail!("--resume needs a session file, but --session none disables persistence"),
         };
-        if let Some((model, history)) = session::load(path)? {
+        if let Some((model, history, archive)) = session::load_with_archive(path)? {
             if model != cfg.model {
                 eprintln!(
                     "[warn] session model '{model}' differs from config model '{}'",
@@ -319,6 +323,7 @@ fn main() -> Result<()> {
                 cli.session.display()
             );
             initial = history;
+            resumed_archive = archive;
             resumed = true;
         } else {
             eprintln!("[warn] --resume given but no session file found; starting fresh");
@@ -417,6 +422,7 @@ fn main() -> Result<()> {
     if let Some(path) = session {
         agent.enable_session(path.to_path_buf());
     }
+    agent.set_session_archive(resumed_archive);
 
     if tui_mode {
         // Headless-only flags silently ignored in TUI: --json writes the NDJSON

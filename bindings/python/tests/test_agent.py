@@ -478,6 +478,46 @@ def test_custom_provider_concurrent_runs_release_gil(tmp_path):
     assert elapsed < 0.6, f"runs serialized (GIL not released?): {elapsed:.2f}s"
 
 
+def test_compact_between_runs_folds_reports_and_events(tmp_path):
+    """compact(instructions?, on_event?) is the host-initiated fold: one
+    summary call folds the middle, the outcome dict reports dropped/kept,
+    the Compressed event fires with trigger "manual", and the focus
+    instructions thread through without breaking the fold. A history too
+    short for keep_recent returns None."""
+    events = []
+
+    def provider(request):
+        return {"text": "SUMMARY", "stop_reason": "end_turn"}
+
+    def on_event(e):
+        events.append(e)
+
+    cfg = openai_config("http://unused", workdir=str(tmp_path))
+    cfg["limits"]["keep_recent_messages"] = 2
+    a = tiny_agent.Agent(cfg, provider=provider)
+    for msg in ("t1", "t2", "t3"):
+        a.push_user(msg)
+        a.run()
+    # history: u1 a1 u2 a2 u3 a3 — 6 messages, safe cut at the trailing a3.
+    assert len(a.messages()) == 6
+
+    outcome = a.compact("focus on the API changes", on_event)
+    assert outcome is not None
+    assert outcome["dropped"] == 4
+    assert outcome["kept"] == 2
+    # Folded head carries the summary; live history is head + trailing a3.
+    assert len(a.messages()) == 2
+    compressed = [e["Compressed"] for e in events
+                  if isinstance(e, dict) and "Compressed" in e]
+    assert compressed and compressed[0]["trigger"] == "Manual"
+
+    # Too short to fold: None, no summary call.
+    b = tiny_agent.Agent(cfg, provider=provider)
+    b.push_user("one")
+    b.run()
+    assert b.compact() is None
+
+
 def test_custom_provider_recovers_after_error(tmp_path):
     """A provider that throws on turn 1 fails the run honestly, but the agent's
     state isn't corrupted: turn 2 (after the provider stops failing) runs fine,

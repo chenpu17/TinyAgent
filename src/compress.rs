@@ -491,13 +491,15 @@ pub(crate) fn latest_todo_checklist(messages: &[Message]) -> Option<String> {
 ///   That cost is accepted because a prune only fires under context
 ///   pressure, where fitting the window outranks cache savings.
 ///
-/// Returns `(rewritten history, messages that lost content, chars freed)`,
-/// or `None` when the pass freed less than [`PRUNE_MINIMUM_CHARS`] — callers
-/// then fall through to the LLM summary path unchanged.
+/// Returns `(rewritten history, indices of messages that lost content, chars
+/// freed)`, or `None` when the pass freed less than [`PRUNE_MINIMUM_CHARS`] —
+/// callers then fall through to the LLM summary path unchanged. The indices
+/// (not just a count) let the caller archive the ORIGINAL messages before
+/// replacing them.
 pub(crate) fn prune_tool_results(
     messages: &[Message],
     protect_recent: usize,
-) -> Option<(Vec<Message>, usize, usize)> {
+) -> Option<(Vec<Message>, Vec<usize>, usize)> {
     let n = messages.len();
     // Short histories: the protection window covers everything.
     // saturating_sub mirrors find_safe_cut's pathological-keep_recent guard.
@@ -507,7 +509,7 @@ pub(crate) fn prune_tool_results(
     // tool_use ids whose results must survive verbatim (todo = plan view).
     let exempt = todo_use_ids(messages);
     let mut freed = 0usize;
-    let mut touched = 0usize;
+    let mut touched: Vec<usize> = Vec::new();
     let mut out = Vec::with_capacity(n);
     for (i, m) in messages.iter().enumerate() {
         // The original-task head and the protected recent window pass
@@ -538,7 +540,9 @@ pub(crate) fn prune_tool_results(
             *image = None;
             m_touched = true;
         }
-        touched += m_touched as usize;
+        if m_touched {
+            touched.push(i);
+        }
         out.push(m);
     }
     (freed >= PRUNE_MINIMUM_CHARS).then_some((out, touched, freed))
@@ -687,6 +691,21 @@ pub(crate) fn summary_prompt(body: &str, old_summary: Option<&str>) -> String {
              ## Current running summary\n{old}\n\n## Newer conversation\n{body}"
         ),
         _ => format!("Summarize this conversation transcript:\n\n{body}"),
+    }
+}
+
+/// Append the host's focus instructions (manual `compact_with`) to a summary
+/// prompt. `None`/blank passes the prompt through unchanged. Appended to the
+/// USER prompt rather than SUMMARY_SYSTEM on purpose: the system prompt is
+/// shared by every summary call of every compaction (and is cached provider-
+/// side), while the hint belongs to this one fold only.
+pub(crate) fn with_focus_instructions(prompt: &str, instructions: Option<&str>) -> String {
+    match instructions {
+        Some(i) if !i.trim().is_empty() => format!(
+            "{prompt}\n\n## Additional instructions from the host\n\
+             When writing the summary, pay special attention to the following:\n{i}"
+        ),
+        _ => prompt.to_string(),
     }
 }
 
