@@ -8,9 +8,11 @@ mod tui;
 // process-level shell: arg parsing, SIGINT, exit codes, and the optional TUI.
 pub(crate) use tiny_agent::{batch, build_agent, config, harness, provider, session, tools};
 // `agent` itself is only reached by the TUI (`crate::agent::…`); gate it so a
-// headless build doesn't warn about an unused re-export.
+// headless build doesn't warn about an unused re-export. The id helper below
+// is used unconditionally (resume id pre-minting), so it imports directly.
 #[cfg(feature = "tui")]
 pub(crate) use tiny_agent::agent;
+use tiny_agent::agent::numeric_id_suffix;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
@@ -356,7 +358,21 @@ fn main() -> Result<()> {
                 last.content.extend(blocks);
             }
         } else {
-            initial.push(Message::user(blocks));
+            let mut msg = Message::user(blocks);
+            // Pre-mint the id above every id in history AND archive: the
+            // agent's mint counter fills gaps by checking the live history
+            // only, so a resumed session would otherwise re-issue the ids of
+            // long-folded messages and collide with their archived
+            // originals. Pre-assigning here keeps the mint inside the agent
+            // unaware of the archive (assign_missing_ids keeps existing ids).
+            let floor = initial
+                .iter()
+                .chain(resumed_archive.iter())
+                .filter_map(|m| m.id.as_deref().and_then(numeric_id_suffix))
+                .max()
+                .unwrap_or(0);
+            msg.id = Some(format!("m{}", floor + 1));
+            initial.push(msg);
         }
     } else if !cli.image.is_empty() {
         bail!("--image requires a task (--task or config \"task\")");

@@ -1097,6 +1097,9 @@ impl Agent {
     /// consume the archive.
     pub fn set_session_archive(&mut self, archive: Vec<Message>) {
         self.session_archive = archive;
+        // Keep the mint counter ahead of the restored ids even though no
+        // archive_messages call happened in this process (see its doc).
+        self.bump_id_counter_past_archive();
     }
 
     /// Persist the session, returning a warning message on failure instead of
@@ -2142,6 +2145,14 @@ fn fresh_message_id(messages: &[Message], next: &mut u64) -> String {
     }
 }
 
+/// The numeric suffix of a minted `mN` id; anything else (host-supplied id,
+/// None) is None. Used to keep the mint counter ahead of the archive. Public
+/// so the CLI bin can pre-mint a resumed task's id above history + archive
+/// (see main.rs).
+pub fn numeric_id_suffix(id: &str) -> Option<u64> {
+    id.strip_prefix('m')?.parse().ok()
+}
+
 /// Assign ids to every id-less message (ingest point for constructed /
 /// resumed histories). Messages that already carry one — from a previous
 /// save, or supplied by the host — keep it untouched.
@@ -2318,14 +2329,49 @@ impl Agent {
     /// Append messages leaving the live history (compression fold / prune) to
     /// the session archive, FIFO-capped. Ids ride along, so a host can anchor
     /// undo/audit assets to the same stable ids the live history uses.
+    ///
+    /// Dedup by id, keeping the FIRST copy: a prune archives a message's
+    /// ORIGINAL and leaves a placeholder live, and a later fold of that same
+    /// message must not file the placeholder version next to the original —
+    /// the original is the one worth keeping.
+    ///
+    /// The id counter is pushed past every archived id: fresh mints fill gaps
+    /// by skipping collisions against the LIVE history only, so without this
+    /// a resumed session would re-issue the ids of long-folded messages and
+    /// collide with their archived originals.
     fn archive_messages<I: IntoIterator<Item = Message>>(&mut self, msgs: I) {
-        self.session_archive.extend(msgs);
+        for m in msgs {
+            let dup = m.id.as_deref().is_some_and(|id| {
+                self.session_archive
+                    .iter()
+                    .any(|a| a.id.as_deref() == Some(id))
+            });
+            if !dup {
+                self.session_archive.push(m);
+            }
+        }
         let overflow = self
             .session_archive
             .len()
             .saturating_sub(ARCHIVE_MAX_MESSAGES);
         if overflow > 0 {
             self.session_archive.drain(0..overflow);
+        }
+        self.bump_id_counter_past_archive();
+    }
+
+    /// Advance `next_msg_id` past every numeric id in the archive (see
+    /// [`archive_messages`]). Ids are host-suppliable strings; non-`mN`
+    /// shapes simply don't parse and are ignored.
+    fn bump_id_counter_past_archive(&mut self) {
+        let floor = self
+            .session_archive
+            .iter()
+            .filter_map(|m| m.id.as_deref().and_then(numeric_id_suffix))
+            .max()
+            .unwrap_or(0);
+        if floor > self.next_msg_id {
+            self.next_msg_id = floor;
         }
     }
 

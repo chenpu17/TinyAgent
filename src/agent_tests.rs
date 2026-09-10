@@ -3573,6 +3573,103 @@ fn prune_archives_originals_to_session() {
 }
 
 #[test]
+fn archive_dedups_placeholder_when_a_later_fold_drops_it() {
+    // Prune archives the ORIGINAL of a message whose placeholder stays live;
+    // when a later fold drops that same message, the placeholder version
+    // must NOT be filed next to the original — one id, one archived copy,
+    // and it's the richer original.
+    let mut cfg = cfg_with(5, 0, 30); // threshold so prune alone isn't enough
+    cfg.limits.keep_recent_messages = 2;
+    let dir = std::env::temp_dir().join(format!("ta-archdedup-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("s.json");
+    let mut initial = vec![user_text("task")];
+    initial.extend(big_tool_turn("t1", "shell", 30_000));
+    initial.push(user_text("u1"));
+    initial.push(Message::assistant(vec![Block::Text("a2".into())]));
+    initial.push(user_text("u2"));
+    let (prov, _state) = MockProvider::new(vec![
+        mock::resp_text("SUMMARY", None), // fold runs on top of the prune
+        mock::resp_text("final answer", None), // main on folded history
+    ]);
+    let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+    agent.enable_session(path.clone());
+    let mut events = Vec::new();
+    agent.run(&mut |e| events.push(e)).unwrap();
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::Pruned { .. })));
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::Compressed { .. })));
+    let (_, _, archive) = crate::session::load_with_archive(&path)
+        .unwrap()
+        .expect("session written");
+    let ids: Vec<&str> = archive.iter().filter_map(|m| m.id.as_deref()).collect();
+    assert_eq!(
+        ids.len(),
+        ids.iter().collect::<std::collections::HashSet<_>>().len(),
+        "no id filed twice: {ids:?}"
+    );
+    let trs: Vec<&String> = archive
+        .iter()
+        .flat_map(|m| {
+            m.content.iter().filter_map(|b| match b {
+                Block::ToolResult { content, .. } => Some(content),
+                _ => None,
+            })
+        })
+        .collect();
+    assert_eq!(trs.len(), 1, "the message archived exactly once");
+    assert_eq!(
+        trs[0].len(),
+        30_000,
+        "and it's the original, not the placeholder"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn resume_mint_never_reuses_archived_ids() {
+    // Fresh mints fill gaps by checking the LIVE history only; after a fold,
+    // those gaps are exactly the archived messages' ids. Restoring the
+    // archive must push the mint counter past it, so a post-resume
+    // push_user can't issue an id already owned by an archived original.
+    let mut cfg = cfg_with(5, 0, 0);
+    cfg.limits.keep_recent_messages = 2;
+    let initial = vec![
+        user_text("task"),
+        Message::assistant(vec![Block::Text("a1".into())]),
+        user_text("u1"),
+        Message::assistant(vec![Block::Text("a2".into())]),
+        user_text("u2"),
+    ];
+    let (prov, _state) = MockProvider::new(vec![mock::resp_text("SUMMARY", None)]);
+    let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+    let outcome = agent.compact(&mut |_| {}).unwrap().expect("folds");
+    assert_eq!(outcome.dropped, 2);
+    let live: Vec<Message> = agent.messages().to_vec();
+    // Simulate the resume path: new agent over the folded history, archive
+    // restored (as main.rs does via load_with_archive + set_session_archive).
+    let archive: Vec<Message> = agent.session_archive.clone();
+    assert_eq!(archive.len(), 2);
+    let (prov2, _s2) = MockProvider::new(vec![]);
+    let mut resumed = Agent::new(&cfg, Box::new(prov2), vec![], live, test_ctx());
+    resumed.set_session_archive(archive);
+    let _ = resumed.push_user(vec![Block::Text("next task".into())]);
+    let archived_ids: std::collections::HashSet<String> = resumed
+        .session_archive
+        .iter()
+        .filter_map(|m| m.id.clone())
+        .collect();
+    let new_id = resumed.messages().last().unwrap().id.clone().unwrap();
+    assert!(
+        !archived_ids.contains(&new_id),
+        "minted id {new_id} collides with an archived original ({archived_ids:?})"
+    );
+}
+
+#[test]
 fn compact_retries_when_reasoning_burns_the_whole_budget() {
     // TinyWorker acceptance #7: hybrid-thinking gateways (deepseek / glm)
     // bill reasoning_content against max_tokens; a long UPDATE-branch trace

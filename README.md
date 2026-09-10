@@ -665,6 +665,9 @@ dropped N messages, M kept]` / `(overflow)` / `(manual)`，`--json` 的 NDJSON �
 **非破坏性与 session 归档**：压缩折叠与剪枝移出活历史的**原始消息**（带稳定 id）追加进 session 文件的
 `archive` 段（上限 4096 条 FIFO；`/clear` 保留归档），宿主可经 `session::load_with_archive` 读回做
 undo/审计；普通 `load` 不受影响，老版本 session 文件双向兼容（无归档键即空归档，空归档不写出该键）。
+id 语义：折叠消息的 id 随原件迁入归档（离开活历史）；剪枝消息的**原件**与活历史中的占位符版本共享
+同一 id——宿主按 id 挂的资产仍指向那条消息（锚点不漂移），归档件是"它原来的内容"（按 id 可还原）；
+同 id 只归档一次（后到的占位符版本不重复入档）；resume 后新铸的 id 从不复用归档里已有的编号。
 
 压缩摘要请求自身的 token 用量也计入运行累计（`input_tokens` / `output_tokens`），
 成本数字与实际调用一致，不因压缩而漏报。
