@@ -375,6 +375,10 @@ fn event_json(ev: &AgentEvent) -> Value {
             // Additive field: existing consumers of dropped/kept are unaffected.
             json!({"type": "compressed", "dropped": *dropped, "kept": *kept, "trigger": how})
         }
+        AgentEvent::Pruned {
+            messages,
+            chars_freed,
+        } => json!({"type": "pruned", "messages": *messages, "chars_freed": *chars_freed}),
         AgentEvent::MaxTokensSalvage => json!({"type": "salvage"}),
         AgentEvent::Warning(w) => json!({"type": "warning", "message": w.clone()}),
         AgentEvent::TodoUpdate { todos } => {
@@ -817,6 +821,17 @@ impl<Out: Write, Err: Write> HumanRenderer<Out, Err> {
                 let _ = writeln!(
                     self.out,
                     "\n[context compressed ({how}): dropped {dropped} messages, {kept} kept]"
+                );
+                self.at_line_start = true;
+                self.current_sub_name = None;
+            }
+            AgentEvent::Pruned {
+                messages,
+                chars_freed,
+            } => {
+                let _ = writeln!(
+                    self.out,
+                    "\n[context pruned: {messages} messages lost stale tool output, {chars_freed} chars freed]"
                 );
                 self.at_line_start = true;
                 self.current_sub_name = None;

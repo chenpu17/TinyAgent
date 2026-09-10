@@ -129,6 +129,15 @@ pub enum AgentEvent {
         kept: usize,
         trigger: CompressTrigger,
     },
+    /// Stale oversized tool results were replaced with compact placeholders —
+    /// the pre-LLM context gate (no request billed). `messages` counts
+    /// messages that lost content, `chars_freed` the approximate reclaimed
+    /// size. tool_use/tool_result pairing is preserved; the model re-runs a
+    /// tool if it needs pruned details back.
+    Pruned {
+        messages: usize,
+        chars_freed: usize,
+    },
     /// The reply hit the output-token limit (`stop_reason: "max_tokens"`)
     /// and the agent appended its one-shot wrap-up turn
     /// (`Config::salvage_on_max_tokens`, default on) to salvage a usable
@@ -399,6 +408,31 @@ const SALVAGE_NUDGE_EMPTY: &str = "Your previous reply produced no visible \
      text before hitting the output-token limit (reasoning consumed the \
      budget). Reply now with minimal reasoning and a direct, concise answer.";
 
+/// A real provider measurement the preflight estimate anchors to: the prompt
+/// size of the last main-chat request (input + cache-write + cache-read —
+/// all three axes made up the prompt the provider saw) and the history it
+/// was measured against. Private — an internal calibration, not state a host
+/// reads.
+struct UsageAnchor {
+    prompt_tokens: u64,
+    /// `messages.len()` at request time. Validity check at the next preflight:
+    /// the history must have only GROWN since (appends). If the prefix changed
+    /// at all (normalize merge, in-place edit, prune/fold), the anchor is void
+    /// and the estimate falls back to the whole-history heuristic.
+    msg_count: usize,
+    /// `total_chars` of `messages[..msg_count]` at request time — catches
+    /// in-place growth (e.g. `push_user` merging blocks into the trailing
+    /// user message) that leaves the message COUNT unchanged.
+    prefix_chars: usize,
+    /// `system.as_ref().map(|s| s.len())` at request time. The anchor
+    /// deliberately SURVIVES run boundaries (TUI follow-ups are where it
+    /// pays), so a hot-swapped system prompt must void it instead.
+    system_chars: Option<usize>,
+    /// `tool_schema_chars` at request time — same rationale as `system_chars`
+    /// (MCP hot add/remove rebuilds the tool table between runs).
+    tool_schema_chars: usize,
+}
+
 pub struct Agent {
     provider: Box<dyn Provider>,
     /// The protocol family declared by the config ("anthropic" / "openai") —
@@ -449,6 +483,14 @@ pub struct Agent {
     /// cost into the returned `RunError` when a run fails mid-way, letting a
     /// retry loop bill the failed attempt's burned tokens (honest cost).
     usage: Usage,
+    /// Real prompt size the provider reported for the last main-chat request,
+    /// plus what it was measured against — the preflight compaction estimate
+    /// anchors to it instead of the whole-history chars-per-token heuristic
+    /// (which under-counts CJK 2–3× and would delay compaction until the
+    /// provider rejects the request). `None` until the first billed response;
+    /// voided whenever the measured history/prompt shape no longer matches
+    /// (prune/fold rewrite, system or tool-table hot-swap, prefix edit).
+    usage_anchor: Option<UsageAnchor>,
     /// Pre-serialized size of the tool definitions (name + description +
     /// schema JSON). Fixed at construction except for MCP hot add/remove,
     /// which rebuilds it via `refresh_tool_defs` — recomputing per turn would
@@ -579,6 +621,7 @@ impl Agent {
             compress_failed: false,
             next_msg_id,
             usage: Usage::default(),
+            usage_anchor: None,
             tool_schema_chars,
             #[cfg(feature = "code")]
             code_tool: None,
@@ -1136,7 +1179,10 @@ impl Agent {
         // session and the history would grow until it hit the model's limit.
         self.compress_failed = false;
         // Fresh usage totals per run (this Agent may be reused across runs —
-        // TUI follow-ups, harness retries).
+        // TUI follow-ups, harness retries). The usage anchor is deliberately
+        // NOT reset here: it survives run boundaries (its validity check
+        // compares against the current system prompt / tool table / history
+        // prefix, so a hot-swap voids it on use, not on entry).
         self.usage = Usage::default();
         // NOTE: cancel is deliberately NOT touched here. The old entry-point
         // `store(false)` silently dropped a stop signalled during the
@@ -1257,6 +1303,10 @@ impl Agent {
             // it lives in an inner block whose end releases that borrow before
             // the (mutable) compress call in the recovery arm.
             let mut overflow_recovered = false;
+            // History length at request time (post-normalize) — the reference
+            // point the usage anchor below is measured against. Assigned inside
+            // every loop iteration before any read.
+            let mut request_msg_count: usize;
             let mut resp = loop {
                 let r = {
                     // Safety net: fold any adjacent same-role messages (e.g. a
@@ -1266,6 +1316,7 @@ impl Agent {
                     // so re-running it after a compression-folded history (still
                     // strictly alternating) is a no-op.
                     normalize_adjacent(&mut self.messages);
+                    request_msg_count = self.messages.len();
 
                     let req = ChatRequest {
                         system: self.system.as_deref(),
@@ -1309,6 +1360,18 @@ impl Agent {
                 match r {
                     Ok(resp) => break resp,
                     Err(e) if !overflow_recovered && compress::is_context_overflow(&e) => {
+                        // Cheapest first: placeholder-prune stale tool output (no
+                        // LLM call). Idempotent — a later overflow finds nothing
+                        // left above the minimum and falls through to the summary
+                        // path below. Retry only when the estimate now fits (or no
+                        // threshold is configured, the provider being the only
+                        // oracle then); otherwise the retry would just re-prove
+                        // the overflow.
+                        if self.try_prune(events) > 0
+                            && self.over_compaction_threshold() != Some(true)
+                        {
+                            continue;
+                        }
                         // Need a compressible head and a non-failed compressor;
                         // checked in the body (not the guard) to keep `self`
                         // borrows out of the match guard.
@@ -1348,8 +1411,23 @@ impl Agent {
                     Err(e) => return Err(self.run_error(e, &records, turns, start.elapsed())),
                 }
             };
-            if let Some(u) = resp.usage {
-                self.bill_chat(events, &u);
+            if let Some(u) = &resp.usage {
+                self.bill_chat(events, u);
+                // Usage anchor for the next preflight estimate (see
+                // `estimate_input_tokens`): the provider's own count of the
+                // prompt it just processed, measured against the history as
+                // sent. All three input axes made up that prompt; output
+                // tokens did not.
+                self.usage_anchor = Some(UsageAnchor {
+                    prompt_tokens: u
+                        .input_tokens
+                        .saturating_add(u.cache_creation_input_tokens)
+                        .saturating_add(u.cache_read_input_tokens),
+                    msg_count: request_msg_count,
+                    prefix_chars: compress::total_chars(&self.messages[..request_msg_count]),
+                    system_chars: self.system.as_ref().map(|s| s.len()),
+                    tool_schema_chars: self.tool_schema_chars,
+                });
             }
 
             // A provider mid-stream error (Anthropic error event / read failure)
@@ -2048,6 +2126,88 @@ impl Agent {
         self.compress(events, /* deadline: */ None, CompressTrigger::Manual)
     }
 
+    /// Preflight "is the history over the compaction threshold?" — a token
+    /// estimate against `max_context_tokens` when configured, else the legacy
+    /// `compress_threshold_chars` heuristic. `None` when neither knob is set:
+    /// the caller can't estimate and must treat the provider's verdict (the
+    /// overflow error) as the only signal.
+    fn over_compaction_threshold(&self) -> Option<bool> {
+        if self.limits.max_context_tokens > 0 {
+            let est = self.estimate_input_tokens();
+            // Trip at COMPACT_UTILIZATION_PCT of the window, reserving room
+            // for this turn's max_tokens output — so we compact BEFORE the
+            // provider would reject an over-long request, not after. Compute
+            // on u64 with saturating_mul so an absurd configured value can't
+            // wrap (real windows are millions, far from overflow).
+            let cap = (self
+                .limits
+                .max_context_tokens
+                .saturating_mul(compress::COMPACT_UTILIZATION_PCT)
+                / 100) as usize;
+            Some(est + self.max_tokens as usize > cap)
+        } else if self.limits.compress_threshold_chars > 0 {
+            Some(compress::total_chars(&self.messages) > self.limits.compress_threshold_chars)
+        } else {
+            None
+        }
+    }
+
+    /// Estimated prompt tokens for the next request. Prefers the measured
+    /// base: the provider-reported prompt size of the last main-chat request
+    /// plus a chars-per-token estimate of only the messages appended since.
+    /// Falls back to the whole-history heuristic when no anchor exists (first
+    /// turn, resumed session, history rewritten by prune/compaction, provider
+    /// reports no usage) or when the prefix changed since the measurement —
+    /// both strictly conservative directions.
+    fn estimate_input_tokens(&self) -> usize {
+        if let Some(a) = &self.usage_anchor {
+            let valid = self.messages.len() >= a.msg_count
+                && compress::total_chars(&self.messages[..a.msg_count]) == a.prefix_chars
+                && self.system.as_ref().map(|s| s.len()) == a.system_chars
+                && self.tool_schema_chars == a.tool_schema_chars;
+            if valid {
+                let delta = compress::estimate_tokens(
+                    &self.messages[a.msg_count..],
+                    /* system: */ None,
+                    /* tool_schema_chars: */ 0,
+                );
+                return usize::try_from(a.prompt_tokens)
+                    .unwrap_or(usize::MAX)
+                    .saturating_add(delta);
+            }
+        }
+        compress::estimate_tokens(
+            &self.messages,
+            self.system.as_deref(),
+            self.tool_schema_chars,
+        )
+    }
+
+    /// One prune pass over the history (see [`compress::prune_tool_results`]):
+    /// stale oversized tool results outside the `keep_recent_messages`
+    /// protection window become placeholders. Rewrites `self.messages`,
+    /// persists the session, reports through the event stream. Returns the
+    /// chars freed (`0` = nothing pruned). No LLM call, no billing.
+    fn try_prune(&mut self, events: &mut dyn FnMut(AgentEvent)) -> usize {
+        let Some((pruned, touched, freed)) =
+            compress::prune_tool_results(&self.messages, self.limits.keep_recent_messages)
+        else {
+            return 0;
+        };
+        self.messages = pruned;
+        // History rewritten ⇒ the usage anchor (a real provider measurement
+        // of a history that no longer exists) is void.
+        self.usage_anchor = None;
+        if let Some(w) = self.save_session() {
+            events(AgentEvent::Warning(w));
+        }
+        events(AgentEvent::Pruned {
+            messages: touched,
+            chars_freed: freed,
+        });
+        freed
+    }
+
     /// Compress history if it's too large, summarizing the middle via the LLM
     /// and keeping only the head (+ folded summary) and recent tail. Failures
     /// degrade gracefully for the run loop (warn and continue uncompressed).
@@ -2082,28 +2242,13 @@ impl Agent {
         // max_context_tokens when set, else the legacy char heuristic.
         let force = !matches!(trigger, CompressTrigger::Preflight);
         if !force {
-            let over = if self.limits.max_context_tokens > 0 {
-                let est = compress::estimate_tokens(
-                    &self.messages,
-                    self.system.as_deref(),
-                    self.tool_schema_chars,
-                );
-                // Trip at COMPACT_UTILIZATION_PCT of the window, reserving room
-                // for this turn's max_tokens output — so we compact BEFORE the
-                // provider would reject an over-long request, not after. Compute
-                // on u64 with saturating_mul so an absurd configured value can't
-                // wrap (real windows are millions, far from overflow).
-                let cap = (self
-                    .limits
-                    .max_context_tokens
-                    .saturating_mul(compress::COMPACT_UTILIZATION_PCT)
-                    / 100) as usize;
-                est + self.max_tokens as usize > cap
-            } else {
-                let threshold = self.limits.compress_threshold_chars;
-                threshold > 0 && compress::total_chars(&self.messages) > threshold
-            };
-            if self.compress_failed || !over {
+            if self.compress_failed || self.over_compaction_threshold() != Some(true) {
+                return Ok(None);
+            }
+            // Cheap gate first: placeholder-prune stale oversized tool
+            // results and re-check — a history whose bulk is old tool output
+            // often fits again without a billed summary call.
+            if self.try_prune(events) > 0 && self.over_compaction_threshold() != Some(true) {
                 return Ok(None);
             }
         } else if self.compress_failed {
@@ -2156,6 +2301,9 @@ impl Agent {
 
         let dropped = cut - 1;
         self.messages = compress::fold_summary(&self.messages, cut, &summary);
+        // The folded history shares no measurement with the pre-fold one —
+        // the anchor is void (same as after a prune).
+        self.usage_anchor = None;
         // The fold constructs fresh messages (the summary carrier, and a fresh
         // user head when the history opens on an assistant) with no id; kept
         // head/tail messages carry theirs through the clone. Mint for the

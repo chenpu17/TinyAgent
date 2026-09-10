@@ -124,6 +124,131 @@ fn safe_cut_saturates_on_pathological_keep_recent() {
     assert_eq!(find_safe_cut(&msgs, usize::MAX), None);
 }
 
+// ─── Tool-result pruning (the pre-LLM context gate) ────────────────
+
+/// [assistant tool_use][user tool_result of `size` chars] for tool `name`.
+fn big_tool_turn(id: &str, name: &str, size: usize) -> Vec<Message> {
+    vec![
+        Message::assistant(vec![Block::ToolUse {
+            id: id.into(),
+            name: name.into(),
+            input: json!({}),
+        }]),
+        Message::user(vec![Block::ToolResult {
+            tool_use_id: id.into(),
+            content: "x".repeat(size),
+            image: None,
+            is_error: false,
+        }]),
+    ]
+}
+
+#[test]
+fn prune_replaces_old_large_results_and_keeps_pairs() {
+    // [task][big pair A][big pair B][…]: protect_recent=2 → only A's result
+    // (index 2) is prunable; B's (index 4) sits inside the protection window.
+    let mut msgs = vec![user_text("task")];
+    msgs.extend(big_tool_turn("ta", "shell", 25_000));
+    msgs.extend(big_tool_turn("tb", "shell", 25_000));
+    let (out, touched, freed) = prune_tool_results(&msgs, 2).expect("25k freed clears the minimum");
+    assert_eq!(
+        out.len(),
+        msgs.len(),
+        "prune replaces blocks in place, never removes messages"
+    );
+    assert_eq!(touched, 1);
+    assert!(freed >= PRUNE_MINIMUM_CHARS);
+    // Pairing intact: same tool_use_id, placeholder content, flags kept.
+    let Block::ToolResult {
+        tool_use_id,
+        content,
+        is_error,
+        image,
+    } = &out[2].content[0]
+    else {
+        panic!("result block survived");
+    };
+    assert_eq!(tool_use_id, "ta");
+    assert_eq!(content, "[pruned tool output, was 25000 chars]");
+    assert!(!*is_error);
+    assert!(image.is_none());
+    // The protected window passes through untouched.
+    let Block::ToolResult { content, .. } = &out[4].content[0] else {
+        panic!("protected result");
+    };
+    assert_eq!(content.len(), 25_000);
+    // And the tool_use side is verbatim — the model still knows the call
+    // happened and can re-run it for the details.
+    assert!(
+        matches!(&out[1].content[0], Block::ToolUse { id, .. } if id == "ta"),
+        "tool_use block untouched"
+    );
+}
+
+#[test]
+fn prune_exempts_todo_results() {
+    // The rendered todo checklist is the model's only live plan view — even
+    // an oversized one must survive (nothing else prunable → no rewrite).
+    let mut msgs = vec![user_text("task")];
+    msgs.extend(big_tool_turn("t1", "todo", 30_000));
+    msgs.push(user_text("tail1"));
+    msgs.push(Message::assistant(vec![Block::Text("done".into())]));
+    assert!(
+        prune_tool_results(&msgs, 2).is_none(),
+        "todo-only bulk: nothing prunable"
+    );
+}
+
+#[test]
+fn prune_requires_minimum_freed_chars() {
+    // A single 5k result is eligible but under the 20k minimum: rewriting
+    // history (and breaking the prompt-cache prefix) for peanuts is a loss.
+    let mut msgs = vec![user_text("task")];
+    msgs.extend(big_tool_turn("t1", "shell", 5_000));
+    msgs.push(user_text("tail1"));
+    msgs.push(Message::assistant(vec![Block::Text("done".into())]));
+    assert!(prune_tool_results(&msgs, 2).is_none());
+}
+
+#[test]
+fn prune_short_history_is_all_protected() {
+    let mut msgs = vec![user_text("task")];
+    msgs.extend(big_tool_turn("t1", "shell", 30_000));
+    assert!(
+        prune_tool_results(&msgs, 8).is_none(),
+        "n <= protect_recent: the window covers everything"
+    );
+}
+
+#[test]
+fn prune_drops_image_payloads() {
+    // Images are the most expensive per-token content; the payload drops
+    // with the text and counts toward the freed budget.
+    let mut msgs = vec![user_text("task")];
+    msgs.push(Message::assistant(vec![Block::ToolUse {
+        id: "t1".into(),
+        name: "load_image".into(),
+        input: json!({}),
+    }]));
+    msgs.push(Message::user(vec![Block::ToolResult {
+        tool_use_id: "t1".into(),
+        content: "loaded".repeat(600), // 3600 chars > PRUNE_MIN_RESULT_CHARS
+        image: Some(Box::new(Block::Image {
+            media_type: "image/png".into(),
+            data: "a".repeat(40_000),
+        })),
+        is_error: false,
+    }]));
+    msgs.push(user_text("tail"));
+    msgs.push(Message::assistant(vec![Block::Text("done".into())]));
+    let (out, _, freed) = prune_tool_results(&msgs, 2).expect("image payload counts as freed");
+    assert!(freed >= PRUNE_MINIMUM_CHARS);
+    let Block::ToolResult { image, .. } = &out[2].content[0] else {
+        panic!("result block");
+    };
+    assert!(image.is_none(), "image payload drops with the text");
+}
+
 #[test]
 fn fold_summary_empty_tail_is_legal() {
     // cut == messages.len() (keep_recent=0): the compressed history is
@@ -2873,6 +2998,166 @@ fn overflow_recovery_with_keep_recent_zero() {
     // The retried main request saw the folded 1-message history.
     let cap = state.captured();
     assert_eq!(cap[2].message_count, 1);
+}
+
+#[test]
+fn preflight_prune_can_replace_the_summary_call() {
+    // A history whose bulk is one stale 30k tool result: pruning alone gets
+    // it back under the char threshold, so the run must NOT bill a summary
+    // request — the cheap gate fires, the placeholder lands, the single main
+    // call proceeds on the pruned history.
+    let mut cfg = cfg_with(5, 0, 200);
+    cfg.limits.keep_recent_messages = 2;
+    let mut initial = vec![user_text("task")];
+    initial.extend(big_tool_turn("t1", "shell", 30_000));
+    initial.push(user_text("u1"));
+    initial.push(Message::assistant(vec![Block::Text("a2".into())]));
+    initial.push(user_text("u2"));
+    let (prov, state) = MockProvider::new(vec![mock::resp_text("final answer", None)]);
+    let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+    let mut events = Vec::new();
+    let o = agent.run(&mut |e| events.push(e)).unwrap();
+    assert_eq!(o.stop_reason, "end_turn");
+    assert_eq!(
+        state.calls(),
+        1,
+        "no summary call — the prune alone resolved the pressure"
+    );
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::Pruned {
+            messages: 1,
+            chars_freed
+        } if *chars_freed >= PRUNE_MINIMUM_CHARS
+    )));
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::Compressed { .. })));
+    // The placeholder is what the (only) request carried, and it persists.
+    let Block::ToolResult { content, .. } = &agent.messages()[2].content[0] else {
+        panic!("tool result block");
+    };
+    assert!(content.starts_with("[pruned tool output"));
+    // Pruning replaces blocks in place — the N:N pairing invariant holds on
+    // the request the provider actually saw.
+    let cap = state.captured();
+    assert_eq!(cap[0].tool_use_ids, cap[0].tool_result_ids);
+}
+
+#[test]
+fn preflight_prune_insufficient_still_summarizes() {
+    // Prune fired (≥ minimum freed) but the threshold is STILL exceeded →
+    // the LLM summary path runs on top: both events, summary + main calls,
+    // and the summarizer's transcript contains the placeholder, not the
+    // 30k dump it no longer needs to re-read.
+    let mut cfg = cfg_with(5, 0, 30);
+    cfg.limits.keep_recent_messages = 2;
+    let mut initial = vec![user_text("task")];
+    initial.extend(big_tool_turn("t1", "shell", 30_000));
+    initial.push(user_text("u1"));
+    initial.push(Message::assistant(vec![Block::Text("a2".into())]));
+    initial.push(user_text("u2"));
+    let (prov, state) = MockProvider::new(vec![
+        mock::resp_text("SUMMARY", None),      // summarize_prefix call
+        mock::resp_text("final answer", None), // main call on folded history
+    ]);
+    let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+    let mut events = Vec::new();
+    let o = agent.run(&mut |e| events.push(e)).unwrap();
+    assert_eq!(o.stop_reason, "end_turn");
+    assert_eq!(state.calls(), 2);
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::Pruned { .. })));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::Compressed {
+            trigger: CompressTrigger::Preflight,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn overflow_recovery_prefers_prune_over_summary() {
+    // No threshold configured (the provider is the only oracle): the first
+    // overflow prunes the stale 30k result and retries WITHOUT a summary
+    // call; the retried request succeeds on the placeholder history.
+    let mut cfg = cfg_with(5, 0, 0);
+    cfg.limits.keep_recent_messages = 2;
+    let mut initial = vec![user_text("task")];
+    initial.extend(big_tool_turn("t1", "shell", 30_000));
+    initial.push(user_text("u1"));
+    initial.push(Message::assistant(vec![Block::Text("a2".into())]));
+    initial.push(user_text("u2"));
+    let (prov, state) = MockProvider::new(vec![
+        MockTurn::Err("mock: maximum context length exceeded".into()),
+        mock::resp_text("final answer", None), // retried main call
+    ]);
+    let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+    let mut events = Vec::new();
+    let o = agent.run(&mut |e| events.push(e)).unwrap();
+    assert_eq!(o.stop_reason, "end_turn");
+    assert_eq!(state.calls(), 2, "prune + retry only — no summary call");
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::Pruned { .. })));
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::Compressed { .. })));
+    // The retried request still carried the whole history (prune replaces
+    // blocks in place; normalize_adjacent merged the two adjacent user
+    // messages 6→5 as always) with the N:N pairing intact.
+    let cap = state.captured();
+    assert_eq!(cap[1].message_count, 5);
+    assert_eq!(cap[1].tool_use_ids, cap[1].tool_result_ids);
+}
+
+#[test]
+fn preflight_estimates_from_provider_reported_usage() {
+    // chars/4 under-counts CJK ~2–3×, so a heuristic preflight trips too
+    // late on Chinese-heavy histories. After one real request the anchor
+    // (the provider's own prompt-token count) takes over: run 2's preflight
+    // sees est ≈ 10k tokens on a 3k-char history and compacts, where the
+    // heuristic would have said 750 and skipped.
+    let mut cfg = cfg_with(5, 0, 0);
+    cfg.limits.max_context_tokens = 10_000; // trip at 85% = 8500
+    cfg.limits.keep_recent_messages = 0;
+    let cjk = "汉".repeat(1_000); // 3000 bytes → heuristic est ≈ 750
+    let initial = vec![user_text(&cjk)];
+    let (prov, state) = MockProvider::new(vec![
+        mock::resp_text("r1", mock::mk_usage(10_000, 5)), // run 1: the provider measured the prompt at 10k tokens
+        mock::resp_text("SUMMARY", None), // run 2 preflight compacts on the anchored estimate
+        mock::resp_text("r2", None),      // run 2 main on the folded history
+    ]);
+    let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+    let mut events = Vec::new();
+    agent.run(&mut |e| events.push(e)).unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Compressed { .. })),
+        "run 1: heuristic estimate (750 + max_tokens) is under the cap — no compact"
+    );
+    // A follow-up turn (new run — the anchor must survive run boundaries,
+    // TUI follow-ups being exactly where it pays).
+    let _ = agent.push_user(vec![Block::Text("more".into())]);
+    let mut ev2 = Vec::new();
+    let o = agent.run(&mut |e| ev2.push(e)).unwrap();
+    assert_eq!(o.stop_reason, "end_turn");
+    assert_eq!(state.calls(), 3);
+    assert!(
+        ev2.iter().any(|e| matches!(
+            e,
+            AgentEvent::Compressed {
+                trigger: CompressTrigger::Preflight,
+                dropped: 2,
+                kept: 1,
+                ..
+            }
+        )),
+        "run 2: anchored estimate (10k measured + delta) trips the compaction"
+    );
 }
 
 #[test]

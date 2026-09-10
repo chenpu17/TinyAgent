@@ -1340,6 +1340,16 @@ fn ui_loop(
                             "[context compressed ({how}): dropped {dropped} messages, {kept} kept]"
                         )));
                     }
+                    AgentEvent::Pruned {
+                        messages,
+                        chars_freed,
+                    } => {
+                        streaming = false;
+                        thinking_stream = None;
+                        rows.push(Row::sys_info(format!(
+                            "[context pruned: {messages} messages lost stale tool output, {chars_freed} chars freed]"
+                        )));
+                    }
                     AgentEvent::Warning(w) => {
                         rows.push(Row::sys_warn(format!("[warn] {w}")));
                     }

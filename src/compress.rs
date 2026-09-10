@@ -157,6 +157,16 @@ fn count_in_window(win: &[u8]) -> Option<usize> {
     std::str::from_utf8(&win[start..j]).ok()?.parse().ok()
 }
 
+/// Tool results at or below this size are never pruned — placeholder churn on
+/// small outputs buys nothing (short results and most errors pass through
+/// untouched, so recent debugging context survives).
+pub(crate) const PRUNE_MIN_RESULT_CHARS: usize = 2_000;
+
+/// A prune pass must free at least this many chars to be worth rewriting the
+/// history for (which also breaks the provider prompt-cache prefix) —
+/// OpenCode's "only prune when it frees enough" gate.
+pub(crate) const PRUNE_MINIMUM_CHARS: usize = 20_000;
+
 /// A transcript larger than this is summarized in message-aligned chunks then
 /// combined, bounding the per-call compression ratio so detail isn't crushed
 /// (~6k tokens/chunk → a ~6:1 summary ratio). Approximate byte limit.
@@ -305,6 +315,104 @@ pub(crate) fn fold_summary(messages: &[Message], cut: usize, summary: &str) -> V
     compressed.push(head);
     compressed.extend_from_slice(&messages[cut..]);
     compressed
+}
+
+/// Replace stale oversized tool results with compact placeholders — the
+/// pre-LLM gate of context management (Claude Code "microcompaction" /
+/// OpenCode "prune"): a history whose bulk is old tool output shrinks
+/// without a single billed request.
+///
+/// Rules:
+/// - only messages OUTSIDE the protection window (the `protect_recent` most
+///   recent messages — same knob and semantics as [`find_safe_cut`]'s
+///   `keep_recent`) and past the original-task head (index 0) are touched;
+/// - only `ToolResult` blocks whose content exceeds
+///   [`PRUNE_MIN_RESULT_CHARS`] are replaced, by a one-line placeholder
+///   recording the original size. `tool_use_id`/`is_error` stay, so every
+///   tool_use keeps its paired result (the N:N contract providers enforce)
+///   and the model still knows the call happened — it just has to re-run
+///   the tool if it needs the details back;
+/// - an attached image payload drops with the text: images are the most
+///   expensive per-token content in the window;
+/// - `todo` tool results are exempt — the rendered checklist is the model's
+///   only live view of its plan (the tool has no read mode) and is already
+///   structurally bounded (~10.4k chars worst case);
+/// - pruning rewrites history, so the provider prompt-cache prefix breaks.
+///   That cost is accepted because a prune only fires under context
+///   pressure, where fitting the window outranks cache savings.
+///
+/// Returns `(rewritten history, messages that lost content, chars freed)`,
+/// or `None` when the pass freed less than [`PRUNE_MINIMUM_CHARS`] — callers
+/// then fall through to the LLM summary path unchanged.
+pub(crate) fn prune_tool_results(
+    messages: &[Message],
+    protect_recent: usize,
+) -> Option<(Vec<Message>, usize, usize)> {
+    let n = messages.len();
+    // Short histories: the protection window covers everything.
+    // saturating_sub mirrors find_safe_cut's pathological-keep_recent guard.
+    if n <= protect_recent {
+        return None;
+    }
+    // tool_use ids whose results must survive verbatim (todo = plan view).
+    let mut exempt: Vec<&str> = Vec::new();
+    for m in messages {
+        if m.role != Role::Assistant {
+            continue;
+        }
+        for b in &m.content {
+            if let Block::ToolUse { id, name, .. } = b {
+                if name == "todo" {
+                    exempt.push(id);
+                }
+            }
+        }
+    }
+    let mut freed = 0usize;
+    let mut touched = 0usize;
+    let mut out = Vec::with_capacity(n);
+    for (i, m) in messages.iter().enumerate() {
+        // The original-task head and the protected recent window pass
+        // through untouched.
+        if i == 0 || i + protect_recent >= n {
+            out.push(m.clone());
+            continue;
+        }
+        let mut m = m.clone();
+        let mut m_touched = false;
+        for b in &mut m.content {
+            let Block::ToolResult {
+                tool_use_id,
+                content,
+                image,
+                ..
+            } = b
+            else {
+                continue;
+            };
+            if content.len() <= PRUNE_MIN_RESULT_CHARS || exempt.contains(&tool_use_id.as_str()) {
+                continue;
+            }
+            let img = image.as_deref().map(image_payload_len).unwrap_or(0);
+            let placeholder = format!("[pruned tool output, was {} chars]", content.len());
+            freed += content.len().saturating_sub(placeholder.len()) + img;
+            *content = placeholder;
+            *image = None;
+            m_touched = true;
+        }
+        touched += m_touched as usize;
+        out.push(m);
+    }
+    (freed >= PRUNE_MINIMUM_CHARS).then_some((out, touched, freed))
+}
+
+/// Size an image payload contributes to the context — the raw base64 length,
+/// matching how [`total_chars`] counts images cheaply.
+fn image_payload_len(b: &Block) -> usize {
+    match b {
+        Block::Image { data, .. } => data.len(),
+        _ => 0,
+    }
 }
 
 /// Find a safe tail-start index. An assistant message is always a safe
