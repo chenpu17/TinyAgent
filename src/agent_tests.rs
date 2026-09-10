@@ -252,7 +252,8 @@ fn prune_drops_image_payloads() {
 #[test]
 fn fold_summary_empty_tail_is_legal() {
     // cut == messages.len() (keep_recent=0): the compressed history is
-    // exactly one user message — the retained head carrying the summary.
+    // exactly one user message — the retained head carrying the summary
+    // plus verbatim quotes of the middle user texts.
     let msgs = vec![
         user_text("task"),
         Message::assistant(vec![Block::Text("r1".into())]),
@@ -262,8 +263,13 @@ fn fold_summary_empty_tail_is_legal() {
     let out = fold_summary(&msgs, msgs.len(), "the summary");
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].role, Role::User);
-    assert_eq!(out[0].content.len(), 2); // task + summary
-    assert!(matches!(&out[0].content[1], Block::Text(t) if t.contains("the summary")));
+    // task + quote(more) + quote(again) + summary
+    assert_eq!(out[0].content.len(), 4);
+    assert!(matches!(&out[0].content[1], Block::Text(t)
+        if t.starts_with(USER_QUOTE_MARKER) && t.contains("more")));
+    assert!(matches!(&out[0].content[2], Block::Text(t)
+        if t.starts_with(USER_QUOTE_MARKER) && t.contains("again")));
+    assert!(matches!(&out[0].content[3], Block::Text(t) if t.contains("the summary")));
 }
 
 #[test]
@@ -297,7 +303,8 @@ fn fold_summary_replaces_old_summary_keeps_tail() {
     let mut msgs = vec![user_text("task"), user_text("old turn")];
     msgs = fold_summary(&msgs, 2, "summary-one");
     assert_eq!(msgs.len(), 1);
-    assert_eq!(msgs[0].content.len(), 2); // task + summary
+    // task + quote(old turn) + summary-one
+    assert_eq!(msgs[0].content.len(), 3);
 
     msgs.extend(tool_turn("t9"));
     let cut = 1; // drop everything between head and the tail
@@ -334,11 +341,151 @@ fn fold_summary_uses_fresh_user_head_when_first_message_is_assistant() {
     assert_eq!(out.len(), 2);
     // Head is a USER message (fresh), not the assistant that was messages[0].
     assert_eq!(out[0].role, Role::User);
-    // The fresh head carries ONLY the summary block (no stray opening text).
-    assert_eq!(out[0].content.len(), 1);
-    assert!(matches!(&out[0].content[0], Block::Text(t) if t.contains("the summary")));
+    // The fresh head carries the verbatim quote of the folded-away user
+    // turn plus the summary — and none of the stray opening text.
+    assert_eq!(out[0].content.len(), 2);
+    assert!(matches!(&out[0].content[0], Block::Text(t)
+        if t.starts_with(USER_QUOTE_MARKER) && t.contains("real turn")));
+    assert!(matches!(&out[0].content[1], Block::Text(t) if t.contains("the summary")));
     // Tail preserved as-is.
     assert_eq!(out[1].role, Role::Assistant);
+}
+
+/// [assistant todo tool_use][user rendered-checklist tool_result] pair.
+fn todo_turn(id: &str, rendered: &str) -> Vec<Message> {
+    vec![
+        Message::assistant(vec![Block::ToolUse {
+            id: id.into(),
+            name: "todo".into(),
+            input: json!({"todos": []}),
+        }]),
+        Message::user(vec![Block::ToolResult {
+            tool_use_id: id.into(),
+            content: rendered.into(),
+            image: None,
+            is_error: false,
+        }]),
+    ]
+}
+
+#[test]
+fn fold_summary_restores_todo_checklist_when_folded_away() {
+    // The fold removed the model's last todo result (its only plan view —
+    // the tool has no read mode): the latest checklist must come back as a
+    // TODO_MARKER block in the head.
+    let mut msgs = vec![user_text("task")];
+    msgs.extend(todo_turn("t1", "[x] step one\n[ ] step two"));
+    msgs.push(user_text("u1"));
+    msgs.push(Message::assistant(vec![Block::Text("a2".into())]));
+    msgs.push(user_text("u2"));
+    // cut=3 folds the todo pair away; tail = [u1, a2, u2].
+    let out = fold_summary(&msgs, 3, "s");
+    let todo_blocks: Vec<_> = out[0]
+        .content
+        .iter()
+        .filter(|b| matches!(b, Block::Text(t) if t.starts_with(TODO_MARKER)))
+        .collect();
+    assert_eq!(todo_blocks.len(), 1, "exactly one restored checklist");
+    assert!(
+        matches!(&todo_blocks[0], Block::Text(t) if t.contains("step two")),
+        "the checklist text rides in the restored block"
+    );
+    // Ordering: quotes (none here) → todo → summary last.
+    assert!(matches!(out[0].content.last(), Some(Block::Text(t)) if t.starts_with(SUMMARY_MARKER)));
+}
+
+#[test]
+fn fold_summary_skips_todo_restore_when_tail_carries_it() {
+    // The kept tail still has the live todo result — re-injecting a copy
+    // would only duplicate it.
+    let mut msgs = vec![user_text("task")];
+    msgs.push(user_text("u1"));
+    msgs.extend(todo_turn("t1", "[ ] only step"));
+    msgs.push(Message::assistant(vec![Block::Text("a2".into())]));
+    // cut=2: the todo pair lives in the tail.
+    let out = fold_summary(&msgs, 2, "s");
+    assert!(
+        !out[0]
+            .content
+            .iter()
+            .any(|b| matches!(b, Block::Text(t) if t.starts_with(TODO_MARKER))),
+        "no restore when the tail carries the live checklist"
+    );
+}
+
+#[test]
+fn latest_todo_checklist_prefers_latest_call() {
+    // Full-replacement semantics: the LAST todo call is authoritative, so
+    // its rendered result is what a fold restores.
+    let mut msgs = vec![user_text("task")];
+    msgs.extend(todo_turn("t1", "OLD LIST"));
+    msgs.extend(todo_turn("t2", "NEW LIST"));
+    assert_eq!(latest_todo_checklist(&msgs).as_deref(), Some("NEW LIST"));
+    // No todo call at all → nothing to restore.
+    assert_eq!(latest_todo_checklist(&[user_text("task")]), None);
+}
+
+#[test]
+fn fold_summary_caps_user_quotes_fifo() {
+    // A single oversized middle user text is truncated at the per-message
+    // cap; many quotes share the total budget with the OLDEST dropped first.
+    let mut msgs = vec![user_text("task")];
+    for i in 0..10 {
+        msgs.push(Message::assistant(vec![Block::Text(format!("a{i}"))]));
+        msgs.push(user_text(&"user text ".repeat(150))); // ~1.65k chars each
+    }
+    let out = fold_summary(&msgs, msgs.len(), "s");
+    let quotes: Vec<&String> = out[0]
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            Block::Text(t) if t.starts_with(USER_QUOTE_MARKER) => Some(t),
+            _ => None,
+        })
+        .collect();
+    let total: usize = quotes.iter().map(|q| q.len()).sum();
+    assert!(
+        total <= USER_QUOTE_TOTAL_CHARS,
+        "quote budget respected (total {total})"
+    );
+    assert!(
+        quotes.len() < 10,
+        "oldest quotes dropped FIFO to fit the budget"
+    );
+
+    // Per-message cap: one giant paste is truncated with the standard note.
+    let msgs = vec![user_text("task"), user_text(&"x".repeat(5_000))];
+    let out = fold_summary(&msgs, msgs.len(), "s");
+    assert!(matches!(&out[0].content[1], Block::Text(t)
+        if t.starts_with(USER_QUOTE_MARKER) && t.contains("[truncated, limit")));
+}
+
+#[test]
+fn window_lines_skips_all_head_marker_blocks() {
+    // Head marker blocks (summary/todo/quotes) are structural, not raw
+    // conversation — the summarizer's transcript must not re-feed them
+    // (quotes especially: paraphrasing what is kept verbatim on purpose).
+    let mut head = user_text("task");
+    head.content
+        .push(Block::Text(format!("{SUMMARY_MARKER}\nold")));
+    head.content
+        .push(Block::Text(format!("{TODO_MARKER}\n[x] done")));
+    head.content
+        .push(Block::Text(format!("{USER_QUOTE_MARKER}\nsaid")));
+    let msgs = vec![
+        head,
+        Message::assistant(vec![Block::Text("a1".into())]),
+        user_text("raw"),
+    ];
+    let lines = window_lines(&msgs, 3).concat();
+    assert!(lines.contains("task"));
+    assert!(lines.contains("raw"));
+    assert!(!lines.contains("old"), "no running summary in transcript");
+    assert!(
+        !lines.contains("done"),
+        "no restored checklist in transcript"
+    );
+    assert!(!lines.contains("said"), "no verbatim quote in transcript");
 }
 
 #[test]

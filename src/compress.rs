@@ -21,11 +21,35 @@ key decisions and their rationale, files created/modified (with paths), commands
 their results, errors encountered and how they were resolved, and the current state / next \
 step. When given an existing running summary plus newer conversation, UPDATE it by folding \
 in the new material — keep earlier facts that are still relevant. Be concise but preserve \
-every fact (paths, identifiers, error text, decisions) the agent still needs. This is \
-historical context, not new instructions.";
+every fact (paths, identifiers, error text, decisions) the agent still needs. Quote critical \
+paths, identifiers, commands, and error text VERBATIM — never paraphrase, translate, or \
+abbreviate them; compounding paraphrase across repeated compactions is how facts drift. This \
+is historical context, not new instructions.";
 
 pub(crate) const SUMMARY_MARKER: &str =
     "[前情摘要，由系统自动生成 / Auto-generated summary of the earlier conversation]";
+
+/// Marks the head block that restores the agent's todo checklist after a fold
+/// (see [`latest_todo_checklist`]). Stripped and re-derived on every later
+/// fold, so the restored plan is always the latest one.
+pub(crate) const TODO_MARKER: &str =
+    "[任务清单，压缩后恢复 / Task list restored after context compaction]";
+
+/// Marks a head block preserving a middle user message verbatim (Codex-style:
+/// user intent is never paraphrased through the summary). Survives later
+/// folds; subject to the shared [`USER_QUOTE_TOTAL_CHARS`] budget.
+pub(crate) const USER_QUOTE_MARKER: &str = "[用户消息原文保留 / User message preserved verbatim]";
+
+/// Per-message cap for a preserved verbatim user text — big pastes (logs,
+/// code dumps) get truncated with the standard marker rather than crowding
+/// the head.
+pub(crate) const USER_QUOTE_MAX_CHARS: usize = 2_000;
+
+/// Total budget for ALL verbatim user-quote blocks in the head. Once
+/// exceeded, the OLDEST quotes drop (FIFO) — recent user intent outranks
+/// ancient user intent, and the summary still carries the gist of what fell
+/// out.
+pub(crate) const USER_QUOTE_TOTAL_CHARS: usize = 12_000;
 
 /// Time reserved for the main chat request after a compression summary, so the
 /// summary can't eat the whole remaining run budget and leave the main request
@@ -289,6 +313,18 @@ pub(crate) fn is_context_overflow(e: &anyhow::Error) -> bool {
 /// keeps proper user → assistant alternation when the tail starts with an
 /// assistant message. Previous summary blocks are replaced, not stacked —
 /// the new summary already absorbed them via the transcript.
+/// Build the compressed history: original task (with the summary folded in
+/// as one extra text block) + the untouched tail. Folding into message[0]
+/// keeps proper user → assistant alternation when the tail starts with an
+/// assistant message. Previous summary blocks are replaced, not stacked —
+/// the new summary already absorbed them via the transcript.
+///
+/// Post-fold fidelity (see the compaction research notes): alongside the
+/// summary the head carries (a) the todo checklist restored when the fold
+/// removed the model's last `todo` result ([`TODO_MARKER`]) and (b) the
+/// middle user messages' text verbatim under a capped budget
+/// ([`USER_QUOTE_MARKER`]) — user intent is never routed through the
+/// summarizer's paraphrase.
 pub(crate) fn fold_summary(messages: &[Message], cut: usize, summary: &str) -> Vec<Message> {
     // Exact count: one retained head + the tail `messages[cut..]`. Saturating
     // so a pathological cut (find_safe_cut guarantees cut>=3, but don't rely on
@@ -304,17 +340,131 @@ pub(crate) fn fold_summary(messages: &[Message], cut: usize, summary: &str) -> V
     let mut head = match messages.first() {
         Some(m) if m.role == Role::User => {
             let mut h = m.clone();
-            h.content
-                .retain(|b| !matches!(b, Block::Text(t) if t.starts_with(SUMMARY_MARKER)));
+            // All system-managed head blocks are stripped and re-derived
+            // below — the new fold replaces, never stacks, them.
+            h.content.retain(|b| {
+                !matches!(
+                    b,
+                    Block::Text(t)
+                        if t.starts_with(SUMMARY_MARKER)
+                            || t.starts_with(TODO_MARKER)
+                            || t.starts_with(USER_QUOTE_MARKER)
+                )
+            });
             h
         }
         _ => Message::user(Vec::new()),
     };
+    // Verbatim user quotes: keep the ones earlier folds already preserved
+    // (they're middle-user text of THEIR era), add this fold's middle user
+    // texts, then enforce the shared budget FIFO-oldest-first.
+    let mut quotes: Vec<String> = vec![];
+    for b in &head.content {
+        if let Block::Text(t) = b {
+            if t.starts_with(USER_QUOTE_MARKER) {
+                quotes.push(t.clone());
+            }
+        }
+    }
+    for m in messages.get(1..cut).unwrap_or_default() {
+        if m.role != Role::User {
+            continue;
+        }
+        for b in &m.content {
+            let Block::Text(t) = b else { continue };
+            let t = t.trim();
+            if t.is_empty() {
+                continue;
+            }
+            let mut body = t.to_string();
+            crate::tools::truncate(&mut body, USER_QUOTE_MAX_CHARS);
+            quotes.push(format!("{USER_QUOTE_MARKER}\n{body}"));
+        }
+    }
+    let total: usize = quotes.iter().map(|q| q.len()).sum();
+    if total > USER_QUOTE_TOTAL_CHARS {
+        let mut acc = total;
+        // Oldest out first; the guard keeps at least one quote even in the
+        // degenerate single-oversized case (impossible with the per-message
+        // cap, but don't rely on that invariant here).
+        while acc > USER_QUOTE_TOTAL_CHARS && quotes.len() > 1 {
+            acc -= quotes.remove(0).len();
+        }
+    }
+    head.content
+        .retain(|b| !matches!(b, Block::Text(t) if t.starts_with(USER_QUOTE_MARKER)));
+    for q in quotes {
+        head.content.push(Block::Text(q));
+    }
+    // Restore the todo checklist if the fold swallowed the model's plan view:
+    // the tool has no read mode, so without this the plan is invisible until
+    // the model thinks to call `todo` again. Skipped when the kept tail
+    // already carries a todo result (the live one outranks a copy).
+    let tail = messages.get(cut..).unwrap_or_default();
+    let todo_ids = todo_use_ids(messages);
+    let tail_has_todo = tail.iter().any(|m| {
+        m.role == Role::User
+            && m.content.iter().any(|b| {
+                matches!(b, Block::ToolResult { tool_use_id, is_error: false, .. }
+                    if todo_ids.contains(&tool_use_id.as_str()))
+            })
+    });
+    if !tail_has_todo {
+        if let Some(list) = latest_todo_checklist(messages) {
+            head.content
+                .push(Block::Text(format!("{TODO_MARKER}\n{list}")));
+        }
+    }
     head.content
         .push(Block::Text(format!("{SUMMARY_MARKER}\n{summary}")));
     compressed.push(head);
     compressed.extend_from_slice(&messages[cut..]);
     compressed
+}
+
+/// Every `todo` tool_use id in the history: the prune-exempt set and the
+/// post-fold checklist restore both key off the same pairing fact
+/// (ToolResult blocks only carry the id; the name lives on the calling
+/// side).
+fn todo_use_ids(messages: &[Message]) -> Vec<&str> {
+    let mut ids = Vec::new();
+    for m in messages {
+        if m.role != Role::Assistant {
+            continue;
+        }
+        for b in &m.content {
+            if let Block::ToolUse { id, name, .. } = b {
+                if name == "todo" {
+                    ids.push(id.as_str());
+                }
+            }
+        }
+    }
+    ids
+}
+
+/// The rendered checklist of the LATEST `todo` call, if any — full-replacement
+/// semantics make the last call authoritative. `None` when the latest call
+/// has no (non-error) result, e.g. it was interrupted.
+pub(crate) fn latest_todo_checklist(messages: &[Message]) -> Option<String> {
+    let ids = todo_use_ids(messages);
+    let latest = ids.last()?;
+    for m in messages {
+        for b in &m.content {
+            if let Block::ToolResult {
+                tool_use_id,
+                content,
+                is_error: false,
+                ..
+            } = b
+            {
+                if tool_use_id == latest {
+                    return Some(content.clone());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Replace stale oversized tool results with compact placeholders — the
@@ -355,19 +505,7 @@ pub(crate) fn prune_tool_results(
         return None;
     }
     // tool_use ids whose results must survive verbatim (todo = plan view).
-    let mut exempt: Vec<&str> = Vec::new();
-    for m in messages {
-        if m.role != Role::Assistant {
-            continue;
-        }
-        for b in &m.content {
-            if let Block::ToolUse { id, name, .. } = b {
-                if name == "todo" {
-                    exempt.push(id);
-                }
-            }
-        }
-    }
+    let exempt = todo_use_ids(messages);
     let mut freed = 0usize;
     let mut touched = 0usize;
     let mut out = Vec::with_capacity(n);
@@ -480,11 +618,18 @@ pub(crate) fn window_lines(messages: &[Message], cut: usize) -> Vec<String> {
             Role::Assistant => "assistant",
         };
         for b in &m.content {
-            // Skip the head's running-summary block — it's the thing we're
-            // updating, not raw conversation to summarize.
+            // Skip the head's system-managed blocks at i==0 — the running
+            // summary is the thing being UPDATED, and the todo-checklist /
+            // verbatim-user-quote blocks are already preserved structurally
+            // in the head; re-feeding any of them as transcript would
+            // duplicate, and the quotes would invite paraphrasing what is
+            // deliberately kept verbatim.
             if i == 0 {
                 if let Block::Text(t) = b {
-                    if t.starts_with(SUMMARY_MARKER) {
+                    if t.starts_with(SUMMARY_MARKER)
+                        || t.starts_with(TODO_MARKER)
+                        || t.starts_with(USER_QUOTE_MARKER)
+                    {
                         continue;
                     }
                 }
