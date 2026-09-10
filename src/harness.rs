@@ -1556,6 +1556,14 @@ mod tests {
             trigger: CompressTrigger::Manual,
         });
         assert_eq!(v["trigger"], "manual");
+        // Pruned → {"type":"pruned","messages","chars_freed"}
+        let v = event_json(&AgentEvent::Pruned {
+            messages: 2,
+            chars_freed: 25017,
+        });
+        assert_eq!(v["type"], "pruned");
+        assert_eq!(v["messages"], 2);
+        assert_eq!(v["chars_freed"], 25017);
         // Warning → {"type":"warning","message":..}
         let v = event_json(&AgentEvent::Warning("careful".into()));
         assert_eq!(v["type"], "warning");

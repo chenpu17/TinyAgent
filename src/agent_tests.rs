@@ -3448,9 +3448,9 @@ fn compact_between_runs_folds_reports_and_does_not_bill_run_totals() {
 fn compact_with_focus_hint_folds_like_plain_compact() {
     // The host's focus hint (Claude Code's `/compact focus on X`) threads
     // through to the summary prompt without changing the fold mechanics:
-    // same dropped/kept, same manual-trigger event, same host-owned billing.
-    // The hint's PROMPT content is covered by the with_focus_instructions
-    // unit test — Captured records request shape, not text.
+    // same dropped/kept, same manual-trigger event, same host-owned billing
+    // — and the hint text verbatim rides the summarizer's user prompt
+    // (Captured.user_texts records what the summary call was fed).
     let mut cfg = cfg_with(5, 0, 0);
     cfg.limits.keep_recent_messages = 2;
     let initial = vec![
@@ -3480,6 +3480,19 @@ fn compact_with_focus_hint_folds_like_plain_compact() {
             ..
         }
     )));
+    let prompt = state.captured()[0].user_texts.concat();
+    assert!(
+        prompt.contains("## Additional instructions from the host"),
+        "the hint section header rides the prompt: {prompt:?}"
+    );
+    assert!(
+        prompt.contains("focus on the API changes"),
+        "the hint text rides the prompt verbatim: {prompt:?}"
+    );
+    assert!(
+        prompt.contains("Summarize this conversation transcript"),
+        "the base summary prompt is still intact ahead of the hint"
+    );
 }
 
 #[test]
