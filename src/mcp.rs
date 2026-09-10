@@ -364,6 +364,10 @@ impl StdioTransport {
             // 会 "program not found"。经 cmd /C 走 .cmd 解析（同 shell 工具的做法）。
             // kill 仍是 best-effort：非 unix 无 process group，Drop 只杀直接子进程
             // cmd.exe（Windows 既有行为，不变；整树回收需 Job Object，另案）。
+            // CREATE_NO_WINDOW：GUI 壳（windows_subsystem="windows"）自身无控制台，
+            // spawn 控制台子进程默认闪 conhost 黑框；压掉窗口，stdio 管道不受影响，
+            // node 孙进程继承隐藏控制台不会二次弹窗。
+            use std::os::windows::process::CommandExt;
             Command::new("cmd")
                 .arg("/C")
                 .arg(cmd)
@@ -372,6 +376,7 @@ impl StdioTransport {
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
+                .creation_flags(0x0800_0000)
                 .spawn()
         };
         let mut child =

@@ -9,6 +9,19 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc, Mutex};
 
+/// A GUI-subsystem parent (`windows_subsystem = "windows"`) has no console, so
+/// spawning a console child (git) allocates a fresh conhost window that
+/// flashes on every spawn. `CREATE_NO_WINDOW` suppresses the window while
+/// keeping the pipes intact. No-op elsewhere.
+fn no_window(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    cmd
+}
+
 /// Per-task workdir isolation for `--batch` (the `--isolate` flag).
 ///
 /// `none` (default) keeps today's semantics: all workers share base.workdir.
@@ -99,7 +112,7 @@ fn prepare_isolation(
             // whole repo, so a subdirectory workdir would present a different
             // file set than the task expects — reject rather than silently
             // misplace the task.
-            let out = std::process::Command::new("git")
+            let out = no_window(&mut std::process::Command::new("git"))
                 .args([
                     "-C",
                     &src.display().to_string(),
@@ -139,7 +152,7 @@ fn prepare_isolation(
             let mut last_err = String::new();
             let mut added = false;
             for attempt in 0..3u32 {
-                let out = std::process::Command::new("git")
+                let out = no_window(&mut std::process::Command::new("git"))
                     .args([
                         "-C",
                         &toplevel,
@@ -199,7 +212,7 @@ impl Drop for IsolationGuard {
             }
             IsolateMode::Git => {
                 let removed = self.src_repo.as_deref().is_some_and(|repo| {
-                    std::process::Command::new("git")
+                    no_window(&mut std::process::Command::new("git"))
                         .args([
                             "-C",
                             &repo.display().to_string(),

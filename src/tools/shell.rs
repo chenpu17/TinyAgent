@@ -70,12 +70,20 @@ impl Tool for Shell {
             }
             #[cfg(not(unix))]
             {
+                // A GUI-subsystem parent (`windows_subsystem = "windows"`) has
+                // no console, so a console child allocates a fresh conhost
+                // window that flashes on every spawn. CREATE_NO_WINDOW
+                // suppresses the window while keeping the pipes intact;
+                // grandchildren inherit the hidden console, so nothing
+                // flashes twice.
+                use std::os::windows::process::CommandExt;
                 Command::new("cmd")
                     .args(["/C", cmd])
                     .current_dir(&ctx.workdir)
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
+                    .creation_flags(0x0800_0000)
                     .spawn()
             }
         }
