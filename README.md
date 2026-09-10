@@ -636,8 +636,11 @@ API key 从 `api_key_env` 指定的环境变量读取，不写进配置文件。
    - 未设（`0`，默认）：回退 `compress_threshold_chars`（默认 400k 字符 ≈100k tokens，`0` = 关闭）的字符启发式。
 2. **溢出（overflow）兜底**——**永远开启，与上面配置无关**。当 provider 返回「上下文过长」类错误
    （`context_length_exceeded` / `prompt is too long` / `maximum context length` 等，子串匹配错误体）
-   时，先剪枝重试，仍溢出则强制摘要压缩一次并**重试该回合一次**；第二次仍溢出才当真错误上抛。
-   这样即便前馈估算偏了、或工具 schema / system prompt 占了大头，agent 也能自愈而不是整轮失败。
+   时，先剪枝重试，仍溢出则强制摘要压缩一次并**重试该回合一次**；小窗口场景下折叠后仍溢出
+   （保留尾部本身就超窗）时，再以**递减保护窗**（减半 → 只保最后一条）剪枝做最后一次重试；
+   用尽恢复预算仍溢出才当真错误上抛。这样即便前馈估算偏了、或工具 schema / system prompt 占了
+   大头，agent 也能自愈而不是整轮失败。摘要请求自身对**瞬态错误**（网络抖动/5xx）退避 ~1s 重试
+   一次，一次丢包不再废掉整个 run 的压缩。
 
 3. **宿主主动（manual）**——库用户在轮次间调 `Agent::compact()` / `compact_with(events, Some("focus …"))`
    （见「库 API」节，Python/Node 绑定同款 `compact(instructions?, on_event?)`）：GUI 的上下文

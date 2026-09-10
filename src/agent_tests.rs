@@ -3265,6 +3265,94 @@ fn overflow_recovery_prefers_prune_over_summary() {
 }
 
 #[test]
+fn summary_call_retries_one_transient_failure() {
+    // One lost packet on the summary request must NOT disable compression
+    // for the whole run (compress_failed gates every later fold AND the
+    // overflow recovery): after a ~1s backoff the summary retried once and
+    // the fold proceeds. Without the retry the mock would run out of script
+    // (no SUMMARY, no fold, no Compressed event).
+    let mut cfg = cfg_with(5, 0, 30);
+    cfg.limits.keep_recent_messages = 2;
+    let long = "x".repeat(40);
+    let initial = vec![
+        user_text(&long),
+        Message::assistant(vec![Block::Text("a1".into())]),
+        user_text("u1"),
+        Message::assistant(vec![Block::Text("a2".into())]),
+        user_text("u2"),
+    ];
+    let (prov, state) = MockProvider::new(vec![
+        MockTurn::Err("mock: connection reset by peer".into()), // transient blip
+        mock::resp_text("SUMMARY", None),                       // retried summary
+        mock::resp_text("final answer", None),                  // main call
+    ]);
+    let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+    let mut events = Vec::new();
+    let o = agent.run(&mut |e| events.push(e)).unwrap();
+    assert_eq!(o.stop_reason, "end_turn");
+    assert_eq!(state.calls(), 3, "blip + retried summary + main");
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::Compressed {
+            trigger: CompressTrigger::Preflight,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn overflow_backstop_prunes_the_protected_tail() {
+    // Small-window backstop: after the LLM fold's retry STILL overflows, the
+    // configured protection window guards exactly the tail that's too big.
+    // A descending window (half → floor 1) prunes the tail's oversized tool
+    // result to a placeholder (original archived) and retries once more.
+    let mut cfg = cfg_with(5, 0, 0);
+    cfg.limits.keep_recent_messages = 4;
+    let mut initial = vec![user_text("task")];
+    initial.push(Message::assistant(vec![Block::Text("a1".into())]));
+    initial.push(user_text("u1"));
+    initial.extend(big_tool_turn("t1", "shell", 30_000)); // tail pair
+    initial.push(Message::assistant(vec![Block::Text("a2".into())]));
+    initial.push(user_text("u2"));
+    let (prov, state) = MockProvider::new(vec![
+        MockTurn::Err("mock: maximum context length exceeded".into()), // req 1
+        mock::resp_text("SUMMARY", None),                              // forced compression call
+        MockTurn::Err("mock: maximum context length exceeded".into()), // retry still over
+        mock::resp_text("final answer", None),                         // backstop retry
+    ]);
+    let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+    let mut events = Vec::new();
+    let o = agent.run(&mut |e| events.push(e)).unwrap();
+    assert_eq!(o.stop_reason, "end_turn");
+    assert_eq!(state.calls(), 4);
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::Compressed {
+            trigger: CompressTrigger::Overflow,
+            ..
+        }
+    )));
+    // The backstop's prune fired on the protected tail (the first-aid pass
+    // at the configured window had nothing: the tail IS the window).
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::Pruned {
+            chars_freed,
+            ..
+        } if *chars_freed >= PRUNE_MINIMUM_CHARS
+    )));
+    // The live history now carries the placeholder; pairing intact.
+    let cap = state.captured();
+    assert_eq!(cap[3].tool_use_ids, cap[3].tool_result_ids);
+    let pruned = agent
+        .messages()
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .any(|b| matches!(b, Block::ToolResult { content, .. } if content.starts_with("[pruned tool output")));
+    assert!(pruned, "the tail's oversized result became a placeholder");
+}
+
+#[test]
 fn preflight_estimates_from_provider_reported_usage() {
     // chars/4 under-counts CJK ~2–3×, so a heuristic preflight trips too
     // late on Chinese-heavy histories. After one real request the anchor
@@ -3629,13 +3717,14 @@ fn compact_failure_errors_and_a_retry_attempt_is_fresh() {
     ];
     let (prov, state) = MockProvider::new(vec![
         MockTurn::Err("mock: summary endpoint down".into()),
+        MockTurn::Err("mock: summary endpoint down".into()), // transient retry fails too
         mock::resp_text("SUMMARY", None),
     ]);
     let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
     let err = agent.compact(&mut |_| {}).unwrap_err();
     assert!(err.to_string().contains("summary endpoint down"), "{err:#}");
     assert_eq!(agent.messages.len(), 5, "failed pass folds nothing");
-    assert_eq!(state.calls(), 1);
+    assert_eq!(state.calls(), 2, "blip + failed retry");
     // Second manual attempt is fresh (stale flag cleared at entry).
     let outcome = agent.compact(&mut |_| {}).unwrap();
     assert!(outcome.is_some(), "retry must not be swallowed");
@@ -4177,7 +4266,10 @@ fn compress_without_provider_usage_emits_no_zero_event() {
 #[test]
 fn compress_failure_degrades_gracefully() {
     // summarize_prefix errors → compress_failed set, NO Compressed event,
-    // the run continues uncompressed and still completes.
+    // the run continues uncompressed and still completes. TWO consecutive
+    // errors: the summary call retries one transient blip with backoff
+    // (see summary_call_retries_one_transient_failure), so the disable path
+    // needs the retry to fail too.
     let mut cfg = cfg_with(5, 0, 30);
     cfg.limits.keep_recent_messages = 2;
     let long = "x".repeat(40);
@@ -4190,6 +4282,7 @@ fn compress_failure_degrades_gracefully() {
     ];
     let (prov, _) = MockProvider::new(vec![
         MockTurn::Err("summary blew up".into()), // summarize_prefix fails
+        MockTurn::Err("summary blew up again".into()), // retry fails too
         mock::resp_text("answer anyway", None),  // main call proceeds uncompressed
     ]);
     let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
@@ -4734,6 +4827,7 @@ fn compress_chunk_failure_disables_for_run() {
     let (prov, state) = MockProvider::new(vec![
         mock::resp_text("SUMMARY", None),               // chunk 1 ok
         MockTurn::Err("chunk2 summary blew up".into()), // chunk 2 fails
+        MockTurn::Err("chunk2 summary blew up".into()), // transient retry fails too
         mock::resp_text("answer anyway", None),         // main proceeds uncompressed
     ]);
     let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
@@ -4749,7 +4843,7 @@ fn compress_chunk_failure_disables_for_run() {
     );
     let cap = state.captured();
     assert_eq!(
-        cap[2].message_count, 5,
+        cap[3].message_count, 5,
         "no fold → main sees the full history"
     );
 }

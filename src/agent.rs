@@ -1335,7 +1335,12 @@ impl Agent {
             // overflow is a real error. The request borrows &self.messages, so
             // it lives in an inner block whose end releases that borrow before
             // the (mutable) compress call in the recovery arm.
+            // Overflow recovery budget: ONE LLM force-compress and —
+            // independently — ONE descending-window prune backstop (see the
+            // recovery arm below). Two flags, not one: the backstop is the
+            // cheap second chance after the fold's retry still overflows.
             let mut overflow_recovered = false;
+            let mut prune_backstop_used = false;
             // History length at request time (post-normalize) — the reference
             // point the usage anchor below is measured against. Assigned inside
             // every loop iteration before any read.
@@ -1392,57 +1397,87 @@ impl Agent {
                 let before = self.messages.len();
                 match r {
                     Ok(resp) => break resp,
-                    Err(e) if !overflow_recovered && compress::is_context_overflow(&e) => {
-                        // Cheapest first: placeholder-prune stale tool output (no
-                        // LLM call). Idempotent — a later overflow finds nothing
-                        // left above the minimum and falls through to the summary
-                        // path below. Retry only when the estimate now fits (or no
-                        // threshold is configured, the provider being the only
-                        // oracle then); otherwise the retry would just re-prove
-                        // the overflow.
-                        if self.try_prune(events) > 0
-                            && self.over_compaction_threshold() != Some(true)
-                        {
-                            continue;
+                    // Overflow recovery (OpenCode semantics): the provider
+                    // rejected this request as too long for the context
+                    // window. Recovery budget = one LLM force-compress, and
+                    // after its retry still overflows, one descending-window
+                    // prune backstop. The budget checks read `self`, so they
+                    // live in the body — the match guard stays pure.
+                    Err(e) if compress::is_context_overflow(&e) => {
+                        if overflow_recovered && prune_backstop_used {
+                            return Err(self.run_error(e, &records, turns, start.elapsed()));
                         }
-                        // Need a compressible head and a non-failed compressor;
-                        // checked in the body (not the guard) to keep `self`
-                        // borrows out of the match guard.
-                        let can_compress = !self.compress_failed
-                            && compress::find_safe_cut(
-                                &self.messages,
-                                self.limits.keep_recent_messages,
-                            )
-                            .is_some();
-                        if can_compress {
-                            overflow_recovered = true;
-                            // The server proved it's too long: force one
-                            // compression regardless of the size threshold, and
-                            // fold its usage into the run totals (honest cost).
-                            // Err = the summary call failed (compress_failed
-                            // set inside) — warn and fall through to the
-                            // unrecoverable-overflow error below.
-                            match self.compress(
-                                events,
-                                deadline,
-                                CompressTrigger::Overflow,
-                                /* instructions: */ None,
-                            ) {
-                                Ok(Some(outcome)) => {
-                                    if let Some(u) = outcome.usage {
-                                        self.bill_chat(events, &u);
-                                    }
-                                }
-                                Ok(None) => {}
-                                Err(e) => events(AgentEvent::Warning(format!(
-                                    "context compression failed (disabled for this run): {e:#}"
-                                ))),
-                            }
-                            // Only retry if compression actually shrank the
-                            // history; otherwise there's nothing more we can do.
-                            if self.messages.len() < before {
+                        if !overflow_recovered {
+                            // Cheapest first: placeholder-prune stale tool output (no
+                            // LLM call). Idempotent — a later overflow finds nothing
+                            // left above the minimum and falls through to the summary
+                            // path below. Retry only when the estimate now fits (or no
+                            // threshold is configured, the provider being the only
+                            // oracle then); otherwise the retry would just re-prove
+                            // the overflow.
+                            if self.try_prune(events) > 0
+                                && self.over_compaction_threshold() != Some(true)
+                            {
                                 continue;
                             }
+                            // Need a compressible head and a non-failed compressor.
+                            let can_compress = !self.compress_failed
+                                && compress::find_safe_cut(
+                                    &self.messages,
+                                    self.limits.keep_recent_messages,
+                                )
+                                .is_some();
+                            if can_compress {
+                                overflow_recovered = true;
+                                // The server proved it's too long: force one
+                                // compression regardless of the size threshold, and
+                                // fold its usage into the run totals (honest cost).
+                                // Err = the summary call failed (compress_failed
+                                // set inside) — warn and fall through to the
+                                // unrecoverable-overflow error below.
+                                match self.compress(
+                                    events,
+                                    deadline,
+                                    CompressTrigger::Overflow,
+                                    /* instructions: */ None,
+                                ) {
+                                    Ok(Some(outcome)) => {
+                                        if let Some(u) = outcome.usage {
+                                            self.bill_chat(events, &u);
+                                        }
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => events(AgentEvent::Warning(format!(
+                                        "context compression failed (disabled for this run): {e:#}"
+                                    ))),
+                                }
+                                // Only retry if compression actually shrank the
+                                // history; otherwise there's nothing more we can do.
+                                if self.messages.len() < before {
+                                    continue;
+                                }
+                            }
+                            return Err(self.run_error(e, &records, turns, start.elapsed()));
+                        }
+                        // overflow_recovered && !prune_backstop_used: the FOLDED
+                        // history still overflows. With a small window the kept
+                        // TAIL alone can exceed it (keep_recent × a full-size
+                        // tool output each) — the fold removed the middle, the
+                        // tail stays, and the configured protection window
+                        // guards exactly that tail. Prune under a shrinking
+                        // window (half the configured one, then everything but
+                        // the very last message): pairing-safe placeholders,
+                        // originals archived, no LLM call — one last retry.
+                        let mut freed = 0;
+                        for protect in [self.limits.keep_recent_messages / 2, 1] {
+                            freed = self.try_prune_protect(events, protect);
+                            if freed > 0 {
+                                break;
+                            }
+                        }
+                        prune_backstop_used = true;
+                        if freed > 0 {
+                            continue;
                         }
                         return Err(self.run_error(e, &records, turns, start.elapsed()));
                     }
@@ -2243,17 +2278,24 @@ impl Agent {
         )
     }
 
-    /// One prune pass over the history (see [`compress::prune_tool_results`]):
-    /// stale oversized tool results outside the `keep_recent_messages`
-    /// protection window become placeholders. The ORIGINALS of every touched
-    /// message move into the session archive first (non-destructive on disk
-    /// even though the live history shrinks), `self.messages` is rewritten,
-    /// the session file persists, and the pass reports through the event
-    /// stream. Returns the chars freed (`0` = nothing pruned). No LLM call,
-    /// no billing.
+    /// One prune pass over the history with the configured protection window
+    /// (see [`compress::prune_tool_results`]): stale oversized tool results
+    /// outside the `keep_recent_messages` window become placeholders. Returns
+    /// the chars freed (`0` = nothing pruned). No LLM call, no billing.
     fn try_prune(&mut self, events: &mut dyn FnMut(AgentEvent)) -> usize {
+        self.try_prune_protect(events, self.limits.keep_recent_messages)
+    }
+
+    /// [`try_prune`] with an explicit protection window — the overflow
+    /// backstop shrinks it below the configured value when the kept tail
+    /// alone overflows a small window.
+    fn try_prune_protect(
+        &mut self,
+        events: &mut dyn FnMut(AgentEvent),
+        protect_recent: usize,
+    ) -> usize {
         let Some((pruned, touched, freed)) =
-            compress::prune_tool_results(&self.messages, self.limits.keep_recent_messages)
+            compress::prune_tool_results(&self.messages, protect_recent)
         else {
             return 0;
         };
@@ -2576,7 +2618,36 @@ impl Agent {
                 // empty-body retry below, provider-agnostically.)
                 reasoning_effort: None,
             };
-            let resp = self.provider.chat(&req, &mut |_| {})?;
+            // One transient retry (Codex-style backoff): a single lost
+            // packet/5xx on the summary request currently disables
+            // compression for the WHOLE run (compress_failed) — an expensive
+            // loss for one blip. Deterministic failures don't retry: a
+            // summary that itself overflows the window won't fit after 1s
+            // either, and a cancel flag already set means the user asked to
+            // stop. Cancel mid-request doesn't arrive as an Err at all
+            // (it maps to a stop_reason, handled below), so no cancel-shape
+            // sniffing here.
+            let mut request_attempt = 0u32;
+            let resp = loop {
+                match self.provider.chat(&req, &mut |_| {}) {
+                    Ok(r) => break r,
+                    Err(e) => {
+                        if request_attempt == 0
+                            && !compress::is_context_overflow(&e)
+                            && !self.cancelled()
+                        {
+                            request_attempt += 1;
+                            let flag = self.cancel_flag();
+                            crate::retry::sleep_cancelable(
+                                &flag,
+                                crate::retry::backoff(/* attempt: */ 0),
+                            );
+                            continue;
+                        }
+                        return Err(e);
+                    }
+                }
+            };
             spent = compress::merge_usage(spent, resp.usage);
             // parse_loop reports cancel/idle-timeout/truncation as Ok with a
             // non-end_turn stop_reason and PARTIAL, half-written blocks. Folding
