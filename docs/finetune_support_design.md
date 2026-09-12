@@ -8,7 +8,7 @@
 | 关联文档 | `docs/finetune_support_requirements.md` v0.2（需求规格，FR/NFR/A 编号在本文引用）；`docs/run_code_design.md`（既有设计，D 编号在本文引用）、`docs/run_code_requirements.md` |
 | 代码基线 | master @ 3c170b2（其后行号会漂移，以代码为准） |
 | 决策编号 | 本文 FD-n 独立编号；引用 run_code_design 的决策写 D-n |
-| 修订记录 | v0.1：首版。含一条设计阶段对需求文档的事实修正（FD-9：FR-2 检出表第三行的 `__tools_list`/`__budget` 是**可工作的内省拦截**而非 D11 排除集，检出集合收窄为 `{run_code, task, todo}`）——需求方数据侧以本文附录 A 文案为准；v0.2：M4 落码时补 A-3 溢出行的文案形状（附录 A-3 末尾，`等 N 处` 在逐处段落形态下的对应物）；v0.3：e2e 首跑抓出 FD-3 判定缺陷——「initial 为空」在 headless/batch 主路径永假（任务消息总在 initial 里，eager 永不注入），判定改为内容判定（历史已含 read_skill("run-code") 披露即跳过）+ 前置边界合并（对尾 user(tool_result) 与任务 user 按 append_user_turn 合并） |
+| 修订记录 | v0.1：首版。含一条设计阶段对需求文档的事实修正（FD-9：FR-2 检出表第三行的 `__tools_list`/`__budget` 是**可工作的内省拦截**而非 D11 排除集，检出集合收窄为 `{run_code, task, todo}`）——需求方数据侧以本文附录 A 文案为准；v0.2：M4 落码时补 A-3 溢出行的文案形状（附录 A-3 末尾，`等 N 处` 在逐处段落形态下的对应物）；v0.3：e2e 首跑抓出 FD-3 判定缺陷——「initial 为空」在 headless/batch 主路径永假（任务消息总在 initial 里，eager 永不注入），判定改为内容判定（历史已含 read_skill("run-code") 披露即跳过）+ 前置边界合并（对尾 user(tool_result) 与任务 user 按 append_user_turn 合并）；v0.4（2026-09-12，外部审核 #7）：`e.kind` 词表新增 `cancel`（宿主取消——host_call 入口在 cancel 置位后拒纳新调用，整个执行终止）。**增量变更，只加不改**：既有六类文案逐字不动，仅在该枚举行内插入 `cancel` 一项（skill 正文与附录 A 同源同步，微调数据可按增量补样本） |
 
 ---
 

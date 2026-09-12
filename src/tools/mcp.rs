@@ -52,13 +52,27 @@ impl Tool for McpTool {
         Some(&self.server)
     }
 
+    /// Lock-ordering note (#13 of the 2026-09 review): `run` and
+    /// `set_shutdown` share the client mutex, and `run` holds it for the
+    /// WHOLE call (request → sliced response wait). That means `set_shutdown`
+    /// (session end) can briefly block behind an in-flight call — which is
+    /// fine BY CONSTRUCTION: arming only happens at teardown, when the
+    /// frontend has already stopped issuing calls, and the one race window
+    /// (a call still in flight at quit) is closed by the run-level cancel —
+    /// the wait is sliced at 50ms, so the flag releases the lock long before
+    /// teardown's bounded join gives up. Do NOT "fix" this by taking a
+    /// finer-grained lock: serializing requests whole is what keeps the
+    /// stdio framing (one writer, id-matched reader) sound.
     fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         // Tolerate a poisoned lock: a panic while holding it leaves the client
         // state consistent (requests are serialized whole), and panicking here
         // would abort the process outright (release is panic="abort").
+        // `ctx.cancel` rides along so the response wait polls the run's
+        // cancel flag (50ms slices) — see `recv_cancelable`.
         let result = self.client.lock().unwrap_or_else(|e| e.into_inner()).call(
             "tools/call",
             json!({"name": self.wire_name, "arguments": input}),
+            ctx.cancel.as_deref(),
         )?;
 
         let mut text = String::new();

@@ -220,7 +220,12 @@ fn linker() -> Result<&'static Linker<HostCtx>> {
                         // an unbounded Vec AND an unbounded CodeLog event
                         // stream on default fuel).
                         let cost = line.chars().count() + 1;
-                        if d.logs_chars + cost > 2 * d.snap.max_result_chars {
+                        // saturating per the numeric-writer convention — a
+                        // config-driven max_result_chars near usize::MAX must
+                        // disable the cap, not wrap past it.
+                        if d.logs_chars.saturating_add(cost)
+                            > d.snap.max_result_chars.saturating_mul(2)
+                        {
                             d.logs_dropped += 1;
                             return;
                         }
@@ -554,6 +559,26 @@ fn host_call_tool(
         let d = caller.data_mut();
         if let Some(h) = d.halted.clone() {
             return envelope_err(caller, h.kind, Some(&name), Some(false), &h.why);
+        }
+        // Cancel — the host_call ENTRY half of the §13-5 entry gate: the
+        // epoch callback delivers the interrupt only at the next ~10ms check
+        // point, and a guest call STARTED inside that window would run a real
+        // inner tool for its full duration, past the documented boundary
+        // ("in-flight calls run to completion" promises calls already
+        // running, not new admissions). Latch the interrupt so `terminated`
+        // attributes the following trap to cancel. Terminal (retryable=false)
+        // — the whole execution is stopping, not this one call.
+        if d.interrupt.is_none()
+            && d.ctx
+                .cancel
+                .as_ref()
+                .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            d.interrupt = Some(Interrupt::Cancel);
+            let why = "run_code: cancelled (host cancel flag) — the sandbox \
+                       is halted for the rest of this execution"
+                .to_string();
+            return envelope_err(caller, "cancel", Some(&name), Some(false), &why);
         }
         if d.deadline.is_some_and(|w| Instant::now() >= w.at) && d.interrupt.is_none() {
             // Name the knob that actually bound the run (correctness-review
@@ -1309,9 +1334,11 @@ fn envelope_or_trap(caller: &mut Caller<'_, HostCtx>, is_ok: bool, payload: &str
 /// definitive, retrying the same call cannot help), "hooks" (before_tool
 /// Deny — definitive), "budget" (call limit latched; terminal for this
 /// execution, resets on the next run_code), "deadline" (wall clock;
-/// terminal), "unknown_tool" (definitive), "image" (the call RAN — the
-/// result just cannot be carried into the sandbox), "host" (envelope /
-/// pointer machinery). Plain tool failures use "tool" and deliberately
+/// terminal), "cancel" (the host's run-level cancel flag; terminal — the
+/// whole execution is stopping, not just this call), "unknown_tool"
+/// (definitive), "image" (the call RAN — the result just cannot be carried
+/// into the sandbox), "host" (envelope / pointer machinery). Plain tool
+/// failures use "tool" and deliberately
 /// OMIT `retryable`: the host cannot classify a tool's own error, and both
 /// hard values mislead (false suppresses legitimate retries, true retries
 /// deterministic failures) — the model keeps judging from the message.
@@ -2987,7 +3014,7 @@ return t.length;"#}),
     #[test]
     fn deep_recursion_terminates_with_attributed_error() {
         // quickjs-ng disables its own stack limit under __wasi__, so deep
-        // recursion bottoms out on wasmtime's 1.5 MiB wasm-stack cap as a
+        // recursion bottoms out on wasmtime's 384 KiB wasm-stack cap as a
         // trap — attributed via Trap::StackOverflow (§6 four-source flags),
         // not left as an opaque backtrace dump.
         let out = run_code(
@@ -4307,6 +4334,74 @@ return t.length;"#}),
         let meta = out.meta.expect("audit meta");
         assert_eq!(meta["call_count"], 0);
         assert_eq!(meta["fuel_used"], 0, "the guest never executed: {meta}");
+    }
+
+    /// 2026-09 review #7 — the host_call ENTRY half of the same gate: a cancel
+    /// that fires while the guest is EXECUTING (between host calls) used to
+    /// let the next `tools.call` start anyway — the epoch trap only lands at
+    /// the next ~10ms check point, and a call admitted in that window ran a
+    /// real inner tool to completion, past the documented "in-flight calls
+    /// run to completion" boundary (which promises calls already running, not
+    /// new admissions). Deterministic despite the epoch race: whether the
+    /// entry check refuses the second call or the trap beats the guest to it,
+    /// exactly ONE call is audited and the tombstone attributes cancel.
+    #[test]
+    fn host_call_entry_refuses_new_calls_after_cancel() {
+        use crate::tools::CallbackTool;
+        use std::sync::atomic::AtomicBool;
+        let flag = Arc::new(AtomicBool::new(false));
+        let trip = {
+            let flag = flag.clone();
+            CallbackTool::new(
+                ToolDef {
+                    name: "trip_cancel".into(),
+                    description: "flips the host cancel flag".into(),
+                    schema: json!({"type": "object"}),
+                },
+                move |_input: &Value, _ctx: &ToolCtx| {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    Ok(ToolOutput::text(String::from("flag set")))
+                },
+            )
+            .with_code_access()
+        };
+        let cfg: Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"K","model":"m","inject_environment":false,
+                "tools":["read_file"],"code":{"enabled":true}}"#,
+        )
+        .unwrap();
+        let tool = RunCodeTool::new(
+            &cfg,
+            Arc::new(RwLock::new(CodeConfig::default())),
+            &reqwest::blocking::Client::new(),
+            "k",
+            vec![],
+            vec![Arc::new(Box::new(trip) as Box<dyn Tool>)],
+        );
+        let dir = scratch();
+        let mut c = ctx(&dir);
+        c.cancel = Some(flag);
+        let out = tool
+            .run_with_emit(
+                &json!({"code": r#"
+                    tools.call("trip_cancel", {});
+                    tools.call("trip_cancel", {});
+                    return "both ran";
+                "#}),
+                &c,
+                &mut |_| {},
+            )
+            .unwrap();
+        let meta = out.meta.expect("audit meta");
+        assert_eq!(
+            meta["call_count"], 1,
+            "second call must not be admitted: {meta}"
+        );
+        assert!(
+            out.content.contains("cancelled (host cancel flag)"),
+            "tombstone must attribute the stop to cancel: {}",
+            out.content
+        );
     }
 
     /// correctness-review M-2: a `timeout_secs` near u64::MAX overflows the

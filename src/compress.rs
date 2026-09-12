@@ -553,11 +553,17 @@ pub(crate) fn prune_tool_results(
     (freed >= PRUNE_MINIMUM_CHARS).then_some((out, touched, freed))
 }
 
-/// Size an image payload contributes to the context — the raw base64 length,
-/// matching how [`total_chars`] counts images cheaply.
+/// Size an image payload contributes to the context — `data.len() / 100`,
+/// EXACTLY matching how [`total_chars`] counts images. The two must share one
+/// yardstick: `freed` feeds the same "did we shrink enough?" decisions the
+/// threshold gate makes with `total_chars`, so the old raw-`data.len()` count
+/// overstated an image's relief by ~100× — a 200 KB payload "freed" 200k
+/// chars while the window only got ~2k smaller, so prune declared victory,
+/// skipped the LLM summary, and the next turn re-triggered compression (and
+/// re-broke the prompt-cache prefix) on the still-oversized history.
 fn image_payload_len(b: &Block) -> usize {
     match b {
-        Block::Image { data, .. } => data.len(),
+        Block::Image { data, .. } => data.len() / 100,
         _ => 0,
     }
 }

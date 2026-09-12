@@ -153,6 +153,11 @@ fn prepare_isolation(
             let mut added = false;
             for attempt in 0..3u32 {
                 let out = no_window(&mut std::process::Command::new("git"))
+                    // Pin the locale: the retry gate below matches the English
+                    // "lock" substring in git's stderr, which a localized git
+                    // would translate away (then a transient lock contention
+                    // fails fast instead of retrying).
+                    .env("LC_ALL", "C")
                     .args([
                         "-C",
                         &toplevel,

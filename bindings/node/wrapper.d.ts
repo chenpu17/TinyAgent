@@ -103,20 +103,56 @@ export declare class CancelToken {
   isCancelled(): boolean;
 }
 
+/** Result of a manual compact(): dropped = messages folded into the summary,
+ *  kept = history length after, usage = the summary request's token cost
+ *  (null when the provider reported none). */
+export interface CompactOutcome {
+  dropped: number;
+  kept: number;
+  usage: Usage | null;
+}
+
 export declare class Agent {
   constructor(configPath: string, opts?: AgentOptions);
   /** Append a user message (text) to the conversation. */
   pushUser(text: string): void;
   /** Arm a CancelToken; its flag interrupts the next turn boundary. */
   setCancel(token: CancelToken): void;
+  /** Clear the cancel flag — the acceptance-point half of the cancel
+   *  contract: call when accepting a NEW task, never during a run (a stop
+   *  signalled mid-run must land). Throws while a run is in flight. */
+  clearCancel(): void;
   /** Run one turn. `onEvent` (if given) receives each AgentEvent. */
   run(onEvent?: (event: AgentEvent) => void): Promise<RunOutcome>;
+  /** Manually fold the history now. `instructions` is an optional focus
+   *  hint; resolves with the outcome, or null when nothing was compressible
+   *  (history too short); rejects on summary-request failure. The summary's
+   *  cost is NOT part of the next run's usage() — meter it from the returned
+   *  `usage` yourself. */
+  compact(
+    instructions?: string | null,
+    onEvent?: (event: AgentEvent) => void,
+  ): Promise<CompactOutcome | null>;
   /** Cumulative token usage of the current/latest run (4 axes). */
   usage(): Usage;
   /** Conversation history as a list of message objects. */
   messages(): unknown[];
   /** The model name this agent sends with each request. */
   model(): string;
+  /** Enable the sandboxed runCode tool for the next request. Requires the
+   *  module built with its `code` cargo feature (`npm run build -- --features
+   *  code`); otherwise rejects with a clear rebuild hint. Throws while a run
+   *  is in flight. */
+  enableCode(): void;
+  /** Remove runCode from the model's toolset (next request). Does not
+   *  interrupt an in-flight execution. Same feature requirement as
+   *  enableCode. */
+  disableCode(): void;
+  /** Atomically replace the WHOLE code config (switch + every limit / path
+   *  knob) from an object shaped like the config file's `"code"` section:
+   *  unknown keys reject, missing keys reset to their DEFAULTS (send the
+   *  full object to keep a knob). Takes effect for the next execution. */
+  setCodeConfig(cfg: object): void;
 }
 
 export declare function chat(

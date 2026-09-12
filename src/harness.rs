@@ -112,8 +112,10 @@ pub fn run(
 /// `sleep` is injected so unit tests run the retry loop without waiting on real
 /// backoff (the live path passes `std::thread::sleep`). The same `&mut Agent` is
 /// reused across attempts — a provider Err happens before any message is
-/// appended (the `?` is on `provider.chat`), and `agent.run` resets the cancel
-/// flag at entry, so a retry starts clean. Caveat: if compression fired on a
+/// appended (the `?` is on `provider.chat`), and `run()` never clears the
+/// cancel flag (v0.3.1 contract) — instead the ladder itself honours a cancel
+/// observed between attempts / during backoff (see below), so a stop
+/// signalled mid-ladder still lands. Caveat: if compression fired on a
 /// failed attempt it already folded the history (and saved the session), so the
 /// retry runs on the shorter history — safe and idempotent (it won't re-compress
 /// or double-bill), just not a perfect in-place restart. Token totals and the
@@ -254,6 +256,18 @@ pub(crate) fn run_with_retries(
             };
             let v = done_event_json(stop_reason, err);
             print_ndjson(&serde_json::to_string(&v).unwrap_or_else(|_| "{}".into()));
+        }
+    }
+    // Human mode had the same hole the synthetic done event above closed for
+    // json: with no --output, the retries-exhausted / unfixable-overflow /
+    // cancel-during-ladder exits produced a bare non-zero exit code with not
+    // one line of explanation. Say why on stderr — out-of-band chrome
+    // (ThinkingDelta discipline), so it never joins stdout's transcript;
+    // --output consumers still get this line while result.json carries the
+    // structured detail.
+    if !json {
+        if let Some(err) = &error {
+            eprintln!("{}", terminal_error_line(code, err));
         }
     }
     // Always produce a result artifact, even on failure: the previous `?` here
@@ -450,6 +464,21 @@ fn done_event_json(stop_reason: &str, error: &str) -> Value {
         "stop_reason": stop_reason,
         "error": error,
     })
+}
+
+/// The human-mode twin of [`done_event_json`]: the stderr line printed when
+/// the run died on the Err paths (retries exhausted / unfixable overflow /
+/// cancel during the ladder or backoff). `[cancel]` (not `[error]`) on a
+/// user-initiated stop so the tag can't be read as "something broke".
+/// Factored out like its json sibling so the default path's fix is
+/// unit-testable without capturing process stderr.
+fn terminal_error_line(code: i32, err: &str) -> String {
+    let tag = if code == EXIT_CANCELLED {
+        "cancel"
+    } else {
+        "error"
+    };
+    format!("[{tag}] {err}")
 }
 
 pub fn write_result(
@@ -1618,6 +1647,21 @@ mod tests {
         assert_eq!(v["type"], "done");
         assert_eq!(v["stop_reason"], "error");
         assert_eq!(v["error"], "provider 503");
+    }
+
+    #[test]
+    fn terminal_error_line_tags_error_and_cancel_distinctly() {
+        // The default (human, no --output) path's ONLY explanation of a dead
+        // run: the error must appear, and a user-initiated stop must read as
+        // [cancel], not [error].
+        assert_eq!(
+            terminal_error_line(EXIT_ERROR, "provider 503"),
+            "[error] provider 503"
+        );
+        assert_eq!(
+            terminal_error_line(EXIT_CANCELLED, "cancelled during retry backoff"),
+            "[cancel] cancelled during retry backoff"
+        );
     }
 
     #[test]

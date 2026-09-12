@@ -118,6 +118,15 @@ class Agent extends native.Agent {
   run(onEvent) {
     return super.run(wrapOnEvent(onEvent));
   }
+
+  // compact takes (instructions, onEvent) natively. WITHOUT this override the
+  // user's onEvent reached the event TSFN raw — and that TSFN is
+  // ErrorStrategy::Fatal, so a throw in the callback was an UNCATCHABLE
+  // process abort, the exact failure wrapOnEvent exists to prevent (#5 of
+  // the 2026-09 review: run was wrapped, compact missed).
+  compact(instructions, onEvent) {
+    return super.compact(instructions ?? null, wrapOnEvent(onEvent));
+  }
 }
 
 async function chat(configPath, message, opts = {}) {

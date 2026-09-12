@@ -227,7 +227,10 @@ fn prune_short_history_is_all_protected() {
 #[test]
 fn prune_drops_image_payloads() {
     // Images are the most expensive per-token content; the payload drops
-    // with the text and counts toward the freed budget.
+    // with the text and counts toward the freed budget — on the SAME /100
+    // yardstick `total_chars` uses for images (the raw-length count used to
+    // overstate an image's relief ~100×, letting prune "succeed" without
+    // actually fitting the window back under the threshold).
     let mut msgs = vec![user_text("task")];
     msgs.push(Message::assistant(vec![Block::ToolUse {
         id: "t1".into(),
@@ -236,10 +239,10 @@ fn prune_drops_image_payloads() {
     }]));
     msgs.push(Message::user(vec![Block::ToolResult {
         tool_use_id: "t1".into(),
-        content: "loaded".repeat(600), // 3600 chars > PRUNE_MIN_RESULT_CHARS
+        content: "x".repeat(25_000), // dominates the freed budget (> minimum)
         image: Some(Box::new(Block::Image {
             media_type: "image/png".into(),
-            data: "a".repeat(40_000),
+            data: "a".repeat(40_000), // counts as 400 freed (len / 100)
         })),
         is_error: false,
     }]));
@@ -247,6 +250,9 @@ fn prune_drops_image_payloads() {
     msgs.push(Message::assistant(vec![Block::Text("done".into())]));
     let (out, _, freed) = prune_tool_results(&msgs, 2).expect("image payload counts as freed");
     assert!(freed >= PRUNE_MINIMUM_CHARS);
+    // /100 yardstick pinned: the old raw-len accounting would report ~40k
+    // MORE freed than the window actually shrinks (≈65k vs ≈25.4k here).
+    assert!(freed < 26_000, "image freed must be len/100: {freed}");
     let Block::ToolResult { image, .. } = &out[2].content[0] else {
         panic!("result block");
     };
@@ -3125,6 +3131,51 @@ fn compress_folds_history_and_emits_event() {
     // The main (2nd) request saw the folded history: 3 messages.
     let cap = state.captured();
     assert_eq!(cap[1].message_count, 3);
+}
+
+#[test]
+fn failed_compress_still_bills_its_burned_summary_tokens() {
+    // Honest cost (#3, 2026-09 review): a summary request that dies mid-call
+    // (here: a non-end_turn stop_reason with usage already reported) still
+    // BILLED those tokens. They used to vanish — the bail dropped `spent`,
+    // and neither the run totals nor result.json ever saw them. The
+    // CompressError plumbing must fold them into the run via bill_chat.
+    let mut cfg = cfg_with(5, 0, 30);
+    cfg.limits.keep_recent_messages = 2;
+    let long = "x".repeat(40);
+    let initial = vec![
+        user_text(&long),
+        Message::assistant(vec![Block::Text("a1".into())]),
+        user_text("u1"),
+        Message::assistant(vec![Block::Text("a2".into())]),
+        user_text("u2"),
+    ];
+    let (prov, state) = MockProvider::new(vec![
+        // The summary call: partial text + usage reported, then a
+        // non-end_turn stop (the mid-stream death shape).
+        MockTurn::Ok(ChatResponse {
+            blocks: vec![Block::Text("half-written su".into())],
+            stop_reason: "refusal".into(),
+            usage: mock::mk_usage(77, 7),
+        }),
+        mock::resp_text("final answer", None), // main call, no usage
+    ]);
+    let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+    let mut events = Vec::new();
+    let o = agent.run(&mut |e| events.push(e)).unwrap();
+    assert_eq!(o.stop_reason, "end_turn");
+    assert_eq!(state.calls(), 2, "summary attempt + main call");
+    // The burned tokens landed in the run totals (the main call billed 0).
+    assert_eq!(o.input_tokens, 77, "burned summary input tokens billed");
+    assert_eq!(o.output_tokens, 7, "burned summary output tokens billed");
+    // ...and the failure was still surfaced (compress disabled for the run).
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Warning(w) if w.contains("context compression failed")
+        )),
+        "compress failure warns: {events:?}"
+    );
 }
 
 #[test]
@@ -6598,7 +6649,7 @@ fn normalize_tool_use_ids_mints_missing_and_renumbers_duplicates() {
             input: json!({}),
         },
     ];
-    normalize_tool_use_ids(&mut blocks);
+    normalize_tool_use_ids(&mut blocks, &[]);
     let ids: Vec<&str> = blocks
         .iter()
         .filter_map(|b| match b {
@@ -6616,6 +6667,108 @@ fn normalize_tool_use_ids_mints_missing_and_renumbers_duplicates() {
     sorted.sort_unstable();
     sorted.dedup();
     assert_eq!(sorted.len(), 4, "all ids distinct after repair: {ids:?}");
+}
+
+#[test]
+fn normalize_tool_use_ids_seeds_seen_from_history() {
+    // Cross-turn collision (pure form): history already carries
+    // `toolu_repair_0_0` from a previous repair; a new response with a broken
+    // id at the SAME block index must not re-mint that id — the deterministic
+    // `{i}_{n}` naming made `seen`-only-scans-current-response collide on the
+    // second broken turn, and the duplicate then rode every later request.
+    let history = vec![Message::assistant(vec![Block::ToolUse {
+        id: "toolu_repair_0_0".into(),
+        name: "shell".into(),
+        input: json!({}),
+    }])];
+    let mut blocks = vec![Block::ToolUse {
+        id: "".into(),
+        name: "shell".into(),
+        input: json!({}),
+    }];
+    normalize_tool_use_ids(&mut blocks, &history);
+    let Block::ToolUse { id, .. } = &blocks[0] else {
+        panic!("tool use block");
+    };
+    assert_eq!(id, "toolu_repair_0_1", "mint must dodge the historical id");
+    // A provider id repeated ACROSS turns is also a duplicate now: the copy
+    // gets renumbered against the history instead of sailing through.
+    let mut again = vec![Block::ToolUse {
+        id: "provider-1".into(),
+        name: "shell".into(),
+        input: json!({}),
+    }];
+    let history2 = vec![Message::assistant(vec![Block::ToolUse {
+        id: "provider-1".into(),
+        name: "shell".into(),
+        input: json!({}),
+    }])];
+    normalize_tool_use_ids(&mut again, &history2);
+    let Block::ToolUse { id, .. } = &again[0] else {
+        panic!("tool use block");
+    };
+    assert_eq!(id, "toolu_repair_0_0", "cross-turn duplicate is renumbered");
+}
+
+#[test]
+fn loop_two_broken_turns_mint_distinct_repair_ids() {
+    // Loop form of the same regression (#2, 2026-09 review): a gateway that
+    // omits the id two turns in a row used to mint the SAME
+    // `toolu_repair_0_0` in both turns — the history then carried a duplicate
+    // no later repair could fix (every later request 400s on Anthropic).
+    let cfg = cfg_with(5, 0, 0);
+    let echo = EchoTool::new("shell");
+    let (prov, state) = MockProvider::new(vec![
+        MockTurn::Ok(ChatResponse {
+            blocks: vec![Block::ToolUse {
+                id: "".into(),
+                name: "shell".into(),
+                input: json!({"command": "ls"}),
+            }],
+            stop_reason: "tool_use".into(),
+            usage: None,
+        }),
+        MockTurn::Ok(ChatResponse {
+            blocks: vec![Block::ToolUse {
+                id: "".into(),
+                name: "shell".into(),
+                input: json!({"command": "pwd"}),
+            }],
+            stop_reason: "tool_use".into(),
+            usage: None,
+        }),
+        mock::resp_text("done", None),
+    ]);
+    let initial = vec![user_text("run these")];
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(echo)],
+        initial,
+        test_ctx(),
+    );
+    let o = agent.run(&mut |_| {}).expect("run completes");
+    assert_eq!(o.stop_reason, "end_turn");
+    // The THIRD request carries both minted ids (turn 1's in history, turn
+    // 2's fresh) — they must be distinct and 1:1 paired with results.
+    let cap = state.captured();
+    let third = &cap[2];
+    let uses = third.tool_use_ids.clone();
+    assert_eq!(
+        uses.len(),
+        2,
+        "both turns' tool_use ids on request 3: {uses:?}"
+    );
+    assert!(
+        uses.iter().all(|i| i.starts_with("toolu_repair_")),
+        "both broken ids were minted: {uses:?}"
+    );
+    assert_ne!(uses[0], uses[1], "cross-turn mint collision: {uses:?}");
+    let mut results = third.tool_result_ids.clone();
+    let mut sorted = uses.clone();
+    sorted.sort_unstable();
+    results.sort_unstable();
+    assert_eq!(sorted, results, "N:N bijection across the two minted ids");
 }
 
 #[test]

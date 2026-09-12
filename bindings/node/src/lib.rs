@@ -297,13 +297,17 @@ impl ta::Provider for NodeProvider {
         on_event: &mut dyn FnMut(ta::provider::ChatEvent),
     ) -> anyhow::Result<ta::ChatResponse> {
         let id = NEXT_PROVIDER_ID.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = mpsc::channel();
-        pending_providers().lock().unwrap().insert(id, tx);
-
+        // Serialize BEFORE registering in the pending map: a request that
+        // fails to serialize must not strand a registry entry —
+        // resolveProvider never fires for a call that was never dispatched,
+        // and unlike the timeout path there's no other reclaimer (the same
+        // leak the timeout arm already guards against, on the rarer arm).
         let call = ProviderCall {
             id,
             request: provider_request_value(req)?,
         };
+        let (tx, rx) = mpsc::channel();
+        pending_providers().lock().unwrap().insert(id, tx);
         if self
             .tsfn
             .call(Ok(call), ThreadsafeFunctionCallMode::NonBlocking)

@@ -22,6 +22,9 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all --check
+      # run_code 三处同源契约（工具描述 / skill 正文 / 附录 A 指纹）：微调
+      # 数据依赖的面，漂移必须红灯而不是靠手工 --check（2026-09 审核 #8）。
+      - run: python3 scripts/sync_run_code_contract.py --check
 
   test:
     # 三平台 × 双 clippy 配置 + 测试。CLAUDE.md 约定两个 clippy 都要过：

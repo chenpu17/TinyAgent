@@ -80,6 +80,11 @@
   Esc）只置 cancel、不置 shutdown**，MCP server 不被杀。`Agent::set_cancel` **不再**向 tools 传播（删掉了
   那个 for 循环）；改这条链路别把 reaper 接回 cancel，也别给 `set_cancel` 加回 tools 传播。子 agent 共享父的
   MCP client（Arc-clone），父的 `set_shutdown` 已在共享 client 上 arm 了 reaper，子 agent 不必再调。
+  **轮内取消（2026-09 审核 #9）**：`McpTool::run` 把 `ctx.cancel` **随单次调用**传入传输层（不是 set_cancel
+  传播），stdio/SSE 的响应等待按 ≤50ms 薄片轮询（`recv_cancelable`）——Ctrl-C 在卡死 server 上不再等满
+  120s `CALL_TIMEOUT`；取消后 pending 槽由既有错误路径回收、迟到响应被 `pending_dispatch` 丢弃。HTTP 传输
+  仍是整段阻塞 POST（自带 CALL_TIMEOUT 总超时），无切片。`run`/`set_shutdown` 共享 client 锁的顺序依赖
+  （set_shutdown 可能短暂排在一个在飞调用后面，由切片轮询兜底）注释钉在 `tools/mcp.rs`。
 - **`serde_json::json!` 宏按所有权取值**：`From<&Value>` / `From<Option<_>>` 不存在。给宏传
   `&String`/`&Value` 要 `.clone()`；`Option<&str>` 要显式转成 `Value::Null` 或 `json!(s)`。
 - **Anthropic 不允许相邻两条 user 消息**（400）；且 N 个 `tool_use` 必须配 N 个 `tool_result`。

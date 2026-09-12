@@ -228,7 +228,9 @@
   `Err`**（`UpdateDeadline` 无 trap 变体；`set_fuel(0)` 是死路——运行中函数把 fuel 缓存在 wasm local、check 点才回写，
   实测 guest 跑过中断点 25s）；② epoch 检查只在 **wasm 循环头**发射、函数入口只初始化缓存 deadline——warm 平凡程序
   在单个 10ms tick 内跑完，故 cancel/deadline 必须**入口门⓪**（guest 启动前直接拒，fuel_used=0）+ epoch 回调 +
-  `host_call_tool` 入口 + 收尾裁决（含 `_initialize`/编译失败路径，quickjs stdlib init debug 下 >1s）**四点**；
+  `host_call_tool` 入口 + 收尾裁决（含 `_initialize`/编译失败路径，quickjs stdlib init debug 下 >1s）**四点**。
+  `host_call_tool` 入口自 2026-09 审核 #7 起**还查 cancel**：已置位即拒纳新调用并 latch `Interrupt::Cancel`
+  （"in-flight 跑完"承诺的是已在跑的调用，不含新纳——`e.kind` 词表随之增量加 `cancel`，走附录 A 修订）；
   ③ `max_wasm_stack` **384 KiB**（非 1.5 MiB）——开 epoch 插桩后深递归会先损坏 quickjs 无检查的内部递归状态
   （终态是不可归因的 OOB trap），384 KiB 让原生栈上限决定性赢得竞速、稳定归因 StackOverflow；④ wasmtime 按模块缓存
   机器码——冷首次执行 ~10s 懒编译（debug），**测试必须先 warm 模块再计时/再 spawn cancel 翻转线程**（翻转线程先于

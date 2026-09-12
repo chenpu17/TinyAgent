@@ -45,7 +45,7 @@ function responseRows(r) {
 - `writeVerified(path, content)` → 写入文本并逐字节读回校验（防截断/转写意外），不一致会 throw。重要的文本产出建议走它
 - `tools.budget()` → 剩余额度 `{calls_used, max_tool_calls, calls_left, wall_left_ms, wall_bound_by, fuel_left, tokens_left}`，查询本身免费。`tokens_left` 是 run 级 token 预算剩余（未设 `limits.max_total_tokens` 时为 null）。长批量开工前先查、循环里定期查，别等撞限才发现
 - 其余能力一律 `tools.call`；**调 MCP 工具前先 `tools.list()` 核对准确名字**——MCP 工具名长、分隔符易混（`_` 与 `__`），写错名字的失败调用也照扣额度，一批全错就是额度白烧。`tools.list()` 返回**对象数组** `[{name, description}]`（不是字符串数组），取名字用 `.map(t => t.name)`
-- 工具错误可 try/catch，异常带结构化字段：`e.kind`（`denied`=路径/权限拒绝、`hooks`=钩子拒绝、`budget`=调用额度、`deadline`=墙钟、`unknown_tool`=写错名字、`tool`=工具自身失败）、`e.tool`（调用名）。`e.retryable===false` 的类别重试无意义（改输入或跳过）；`tool` 类**不带** retryable（无法机判，读 message 自行判断）
+- 工具错误可 try/catch，异常带结构化字段：`e.kind`（`denied`=路径/权限拒绝、`hooks`=钩子拒绝、`budget`=调用额度、`deadline`=墙钟、`cancel`=宿主取消（整个执行终止，勿重试）、`unknown_tool`=写错名字、`tool`=工具自身失败）、`e.tool`（调用名）。`e.retryable===false` 的类别重试无意义（改输入或跳过）；`tool` 类**不带** retryable（无法机判，读 message 自行判断）
 
 ## read_file 的三种模式（tools.call 直调时按需选）
 1. **文本模式**（默认）：首行 `[文件名: 总行数 · 总字符 · complete|行区间 a-b]` 元数据，其后每行 `行号→tab` 前缀；带 limit 截断时末尾多一行 `... [line limit reached]`。需要解析内容时优先 readAll / readLines 或 json 模式，**不要手解析这个格式**

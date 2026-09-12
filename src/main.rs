@@ -250,7 +250,15 @@ fn main() -> Result<()> {
             // onto the base config would change ALL of them.
             bail!("--batch and --task are mutually exclusive (each task fragment defines its own task)");
         }
-        if cli.session.as_path() != std::path::Path::new(".tinyagent-session.json") {
+        // Same "differs from default" contract as the single-run checks
+        // below — but via the equivalent-spelling helper, not bare Path::eq:
+        // `./.tinyagent-session.json` is the default spelled out, and the
+        // `none` opt-out sentinel persists NOTHING (so there's no session
+        // semantics for batch to contradict). Both used to bail here — the
+        // sentinel especially: `--batch --session none` was rejected as a
+        // "custom session" even though it's the no-op spelling. A parent
+        // beyond ""/"." IS custom.
+        if !is_default_session(&cli.session) {
             // Batch tasks are independent fresh runs — session persistence has
             // nothing to resume, and per-task session files are not a thing.
             bail!("--batch and --session are mutually exclusive (batch tasks are independent fresh runs)");
@@ -433,18 +441,13 @@ fn main() -> Result<()> {
     } else {
         Vec::new()
     };
-    let client = provider::new_client(cfg.limits.timeout_secs);
-    let mut agent = build_agent(&cfg, initial, &client)?;
-    if let Some(path) = session {
-        agent.enable_session(path.to_path_buf());
-    }
-    agent.set_session_archive(resumed_archive);
-
+    // Headless-only flags silently ignored in TUI: --json writes the NDJSON
+    // stream and --output writes the result JSON (both happen in harness::run,
+    // the non-TUI branch), --retries has no loop to wire into (each TUI
+    // message is one run). Reject them BEFORE build_agent — it starts the
+    // MCP server subprocesses, and an always-bail combo like `--tui --json`
+    // was paying for their startup just to throw the flags error away.
     if tui_mode {
-        // Headless-only flags silently ignored in TUI: --json writes the NDJSON
-        // stream and --output writes the result JSON, both of which happen in
-        // harness::run (the non-TUI branch). Reject them rather than run a TUI
-        // session that never produces the promised output.
         if cli.json {
             bail!("--json only applies to headless (non-TUI) mode");
         }
@@ -453,11 +456,20 @@ fn main() -> Result<()> {
         }
         if cli.retries != 0 {
             // Each TUI message is a single run with its own (Esc/Ctrl-C)
-            // cancellation — there's no transient-retry loop to wire into, so a
-            // --retries value here would be silently ignored. Reject it rather
-            // than let the user think retries are in effect.
+            // cancellation — there's no transient-retry loop to wire into, so
+            // a --retries value here would be silently ignored. Reject it
+            // rather than let the user think retries are in effect.
             bail!("--retries only applies to headless (non-TUI) mode");
         }
+    }
+    let client = provider::new_client(cfg.limits.timeout_secs);
+    let mut agent = build_agent(&cfg, initial, &client)?;
+    if let Some(path) = session {
+        agent.enable_session(path.to_path_buf());
+    }
+    agent.set_session_archive(resumed_archive);
+
+    if tui_mode {
         #[cfg(feature = "tui")]
         {
             // Resume-aware: only an explicit --task is layered on top of
@@ -511,6 +523,26 @@ fn main() -> Result<()> {
 /// they had chosen a custom report path. A parent beyond ""/"." IS custom.
 fn is_default_report(p: &std::path::Path) -> bool {
     if p.file_name().and_then(|s| s.to_str()) != Some("report.json") {
+        return false;
+    }
+    matches!(
+        p.parent().and_then(|q| q.to_str()),
+        None | Some("") | Some(".")
+    )
+}
+
+/// True when the `--session` value leaves batch's semantics untouched: the
+/// DEFAULT `.tinyagent-session.json` (possibly via an explicit-but-equivalent
+/// spelling — `Path::eq` compares components, so `./x != x`; same
+/// normalization as [`is_default_report`]) or the `none` opt-out sentinel
+/// (persists nothing, so batch's "no session semantics" is already honored).
+/// Anything else is a custom target the user chose — reject it rather than
+/// silently ignore it.
+fn is_default_session(p: &std::path::Path) -> bool {
+    if p.as_os_str() == "none" {
+        return true;
+    }
+    if p.file_name().and_then(|s| s.to_str()) != Some(".tinyagent-session.json") {
         return false;
     }
     matches!(
@@ -664,7 +696,7 @@ fn missing_config_error(default: Option<&Path>) -> anyhow::Error {
 mod tests {
     use super::{
         choose_config_path, default_config_path_in, default_tui_mode, is_default_report,
-        session_target, TuiDefault,
+        is_default_session, session_target, TuiDefault,
     };
     use std::path::{Path, PathBuf};
 
@@ -684,6 +716,32 @@ mod tests {
             "sub/./report.json",
         ] {
             assert!(!is_default_report(Path::new(p)), "{p:?} is custom");
+        }
+    }
+
+    #[test]
+    fn is_default_session_accepts_sentinel_and_equivalent_spellings() {
+        // The batch gate used bare Path::eq against the default, so BOTH an
+        // explicit-but-equivalent spelling AND the `none` opt-out sentinel
+        // were rejected as "custom". Sentinel + equivalent defaults must pass;
+        // a real custom target must still fail.
+        for p in [
+            ".tinyagent-session.json",
+            "./.tinyagent-session.json",
+            "none",
+        ] {
+            assert!(
+                is_default_session(Path::new(p)),
+                "{p:?} leaves batch semantics untouched"
+            );
+        }
+        for p in [
+            "chat.json",
+            "out/.tinyagent-session.json",
+            ".tinyagent-session.json.bak",
+            "nonexistent/none",
+        ] {
+            assert!(!is_default_session(Path::new(p)), "{p:?} is custom");
         }
     }
 

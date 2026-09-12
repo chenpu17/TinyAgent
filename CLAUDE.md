@@ -38,6 +38,9 @@ cargo fmt --all                            # 格式化（CI 有 --check 门禁�
 默认关闭的 `code` **转发 feature**（`code = ["ta_core/code"]`）：编入后 `enable_code`/`disable_code`/
 `set_code_config`（Node 侧 camelCase）真实生效；未编入时三方法返回带重建提示的明确错误（设计 §8.6——
 避免给所有 wheel 强加 ~10MB wasmtime）。绑定测试 build-自适应（探测 wheel 是否带 feature，另一侧 skip）。
+**Node 侧增删/改名 native `Agent` 方法必须同步两件套**：`wrapper.js`（带 onEvent 的方法要套
+`wrapOnEvent`——native 事件 TSFN 是 Fatal 策略，裸透传用户回调 = 抛错即进程 abort）与 `wrapper.d.ts`
+类型声明；`tests/test_wrapper_sync.test.js` 以 native 原型为真值源钉住漂移。
 改了核心 provider/agent 后，两个绑定的测试都要跟着跑一遍回归；动了 run_code/装配则另跑
 `maturin develop --features code` + `npm run build:debug -- --features code` 的双构建。
 

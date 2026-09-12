@@ -53,6 +53,34 @@ pub struct CompressOutcome {
     pub usage: Option<Usage>,
 }
 
+/// A compression that FAILED but still burned tokens — the Err twin of
+/// [`CompressOutcome::usage`]. `summary_call` attaches every token its
+/// requests reported before dying (a mid-stream stop_reason failure keeps its
+/// merged `spent`; a provider `RunError` carries its own partial usage), so
+/// the caller can bill honestly instead of dropping the cost on the floor
+/// (the same discipline that folds failed attempts into `result.json`). The
+/// run loop folds `burned` into its totals via `bill_chat`; the host-facing
+/// `compact` surfaces the error as-is (Display delegates to `source`, so
+/// existing `{e}` formatting is unchanged) — the host has no ledger to bill,
+/// but the usage rides the anyhow chain for a binding to surface later.
+#[derive(Debug)]
+pub struct CompressError {
+    pub source: anyhow::Error,
+    /// Tokens burned by the summary request(s) before the failure.
+    pub burned: Option<Usage>,
+}
+
+impl std::fmt::Display for CompressError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.source, f)
+    }
+}
+impl std::error::Error for CompressError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 /// Events emitted during a run; frontends (headless printer / TUI) consume them.
 ///
 /// `Serialize` is derived so the Python / TypeScript bindings can hand each event
@@ -1327,9 +1355,19 @@ impl Agent {
                     }
                 }
                 Ok(None) => {}
-                Err(e) => events(AgentEvent::Warning(format!(
-                    "context compression failed (disabled for this run): {e:#}"
-                ))),
+                Err(ce) => {
+                    // Honest cost: the failed compression still billed its
+                    // summary request(s) — fold that into the run totals so
+                    // result.json doesn't undercount (the Err twin of the
+                    // Ok(Some) arm's outcome.usage billing above).
+                    if let Some(u) = &ce.burned {
+                        self.bill_chat(events, u);
+                    }
+                    events(AgentEvent::Warning(format!(
+                        "context compression failed (disabled for this run): {:#}",
+                        ce.source
+                    )));
+                }
             }
 
             // Overflow recovery (OpenCode semantics): if the provider rejects
@@ -1450,9 +1488,18 @@ impl Agent {
                                         }
                                     }
                                     Ok(None) => {}
-                                    Err(e) => events(AgentEvent::Warning(format!(
-                                        "context compression failed (disabled for this run): {e:#}"
-                                    ))),
+                                    Err(ce) => {
+                                        // Honest cost: same as the Preflight
+                                        // arm — bill the failed summary's
+                                        // burned tokens before warning.
+                                        if let Some(u) = &ce.burned {
+                                            self.bill_chat(events, u);
+                                        }
+                                        events(AgentEvent::Warning(format!(
+                                            "context compression failed (disabled for this run): {:#}",
+                                            ce.source
+                                        )));
+                                    }
                                 }
                                 // Only retry if compression actually shrank the
                                 // history; otherwise there's nothing more we can do.
@@ -1587,7 +1634,7 @@ impl Agent {
             // both with a 400). Normalizing here means history, the
             // `tool_uses` tuples collected below, and the tool_results
             // built from them all see one consistent id set.
-            normalize_tool_use_ids(&mut resp.blocks);
+            normalize_tool_use_ids(&mut resp.blocks, &self.messages);
             // Anchor id minted before the push (minting needs `&self.messages`
             // for the collision scan — impossible while the push borrows).
             let assistant_id = fresh_message_id(&self.messages, &mut self.next_msg_id);
@@ -2088,9 +2135,23 @@ fn normalize_adjacent(messages: &mut Vec<Message>) {
 /// `tool_uses` tuples collected from the same blocks, and the
 /// tool_results built from those tuples all agree. Minted ids live in a
 /// `toolu_repair_…` namespace and are checked against everything seen so
-/// the repair itself can't introduce a collision.
-fn normalize_tool_use_ids(blocks: &mut [Block]) {
+/// far — INCLUDING `history` — so the repair itself can't introduce a
+/// collision, across turns as well as within one response: the mint is
+/// deterministic (`toolu_repair_{block_index}_{n}`), so a gateway emitting
+/// a broken id two turns in a row used to re-mint the SAME fresh id both
+/// times, seeding the history with a duplicate no later repair could fix
+/// (every later request 400s until a fold rewrites the region).
+fn normalize_tool_use_ids(blocks: &mut [Block], history: &[Message]) {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for m in history {
+        for b in &m.content {
+            if let Block::ToolUse { id, .. } = b {
+                if !id.is_empty() {
+                    seen.insert(id.clone());
+                }
+            }
+        }
+    }
     for (i, b) in blocks.iter_mut().enumerate() {
         let Block::ToolUse { id, .. } = b else {
             continue;
@@ -2216,12 +2277,16 @@ impl Agent {
         self.clear_cancel();
         // No run deadline: summary_call falls back to its per-request
         // backstop (STREAM_BACKSTOP), so a stuck summary can't hang forever.
+        // The CompressError (if any) converts to anyhow here — Display
+        // delegates to its source, so the host-visible message is unchanged;
+        // `burned` stays downcastable on the chain for a binding to surface.
         self.compress(
             events,
             /* deadline: */ None,
             CompressTrigger::Manual,
             instructions,
         )
+        .map_err(anyhow::Error::new)
     }
 
     /// [`Agent::compact_with`] without a focus hint — the common fold.
@@ -2392,18 +2457,20 @@ impl Agent {
     ///   provider reported no usage (count nothing, emit no Usage event).
     ///   `dropped == 0` is the degenerate empty-summary pass (billed, nothing
     ///   folded, compression now disabled for the run);
-    /// - `Err` — the summary request itself failed. `compress_failed` is set
-    ///   (inside), but NO Warning is emitted here: the two callers disagree
-    ///   on the failure channel — the run loop reports it as an event, the
-    ///   host-facing `compact` propagates the `Err` — so emitting it here
-    ///   would double-report on one of them.
+    /// - `Err(CompressError)` — the summary request itself failed;
+    ///   `burned` carries whatever it billed first (see `CompressError`).
+    ///   `compress_failed` is set (inside), but NO Warning is emitted here:
+    ///   the two callers disagree on the failure channel — the run loop
+    ///   reports it as an event (and bills `burned`), the host-facing
+    ///   `compact` propagates the `Err` — so emitting it here would
+    ///   double-report on one of them.
     fn compress(
         &mut self,
         events: &mut dyn FnMut(AgentEvent),
         deadline: Option<Instant>,
         trigger: CompressTrigger,
         instructions: Option<&str>,
-    ) -> Result<Option<CompressOutcome>> {
+    ) -> std::result::Result<Option<CompressOutcome>, CompressError> {
         // Threshold gate. Overflow/Manual skip it — the provider just proved
         // the request too long, or the host asked for the fold explicitly.
         // Otherwise the trigger depends on config: a token estimate against
@@ -2515,7 +2582,10 @@ impl Agent {
     /// call (single, or per-chunk + combine). `instructions` is the manual
     /// compact's host focus hint — applied only to the FINAL summary call (in
     /// the chunked path the per-chunk calls stay stock so the hint weights the
-    /// product, not every intermediate).
+    /// product, not every intermediate). On failure the error carries ALL
+    /// tokens burned so far (earlier chunks + the dying call — see
+    /// [`CompressError`]), so a chunk 3 failure doesn't drop chunks 1-2's
+    /// billing on the floor.
     ///
     /// Small/normal prefixes make ONE call with a proportional budget. A large
     /// prefix is split into message-aligned chunks (each ≤ SUMMARY_CHUNK_CHARS),
@@ -2530,7 +2600,7 @@ impl Agent {
         cut: usize,
         deadline: Option<Instant>,
         instructions: Option<&str>,
-    ) -> Result<(String, Option<Usage>)> {
+    ) -> std::result::Result<(String, Option<Usage>), CompressError> {
         let old_summary = compress::extract_running_summary(&self.messages);
         let lines = compress::window_lines(&self.messages, cut);
         let transcript_size: usize = lines.iter().map(|l| l.len()).sum();
@@ -2578,12 +2648,23 @@ impl Agent {
             let mut usage = None;
             let mut chunk_summaries = Vec::with_capacity(chunks.len());
             for chunk in &chunks {
-                let (s, u) = self.summary_call(
+                let (s, u) = match self.summary_call(
                     &compress::summary_prompt(chunk, None),
                     compress::SUMMARY_CHUNK_BUDGET.min(cap),
                     deadline,
                     n_calls,
-                )?;
+                ) {
+                    Ok(v) => v,
+                    // Fold this chunk's burn ON TOP of the earlier chunks'
+                    // already-accounted usage (`usage` local) — all of it is
+                    // real billed cost of the failed compression.
+                    Err(e) => {
+                        return Err(CompressError {
+                            burned: compress::merge_usage(usage, e.burned),
+                            source: e.source,
+                        })
+                    }
+                };
                 usage = compress::merge_usage(usage, u);
                 chunk_summaries.push(s);
             }
@@ -2596,7 +2677,7 @@ impl Agent {
                 combined.push_str(&format!("\n[segment {}]\n{s}\n", i + 1));
             }
             let budget = compress::summary_budget(combined.len()).min(cap);
-            let (final_summary, u) = self.summary_call(
+            let (final_summary, u) = match self.summary_call(
                 &compress::with_focus_instructions(
                     &compress::summary_prompt(&combined, old_summary.as_deref()),
                     instructions,
@@ -2604,7 +2685,15 @@ impl Agent {
                 budget,
                 deadline,
                 n_calls,
-            )?;
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Err(CompressError {
+                        burned: compress::merge_usage(usage, e.burned),
+                        source: e.source,
+                    })
+                }
+            };
             usage = compress::merge_usage(usage, u);
             Ok((final_summary, usage))
         }
@@ -2613,13 +2702,14 @@ impl Agent {
     /// One summary chat call (no tools, no cache). `n_calls` shares the
     /// remaining run budget evenly across all summary calls of this compression
     /// so a multi-chunk summarize can't eat the main turn's time budget.
+    /// Failures leave as [`CompressError`] carrying whatever was billed first.
     fn summary_call(
         &self,
         prompt: &str,
         max_tokens: u32,
         deadline: Option<Instant>,
         n_calls: usize,
-    ) -> Result<(String, Option<Usage>)> {
+    ) -> std::result::Result<(String, Option<Usage>), CompressError> {
         let mut max_tokens = max_tokens;
         // Honest cost: a burned first attempt still bills, so usage merges
         // across attempts and the caller's ledger sees every request sent.
@@ -2690,7 +2780,17 @@ impl Agent {
                             );
                             continue;
                         }
-                        return Err(e);
+                        // Honest cost: a provider Err can still have burned
+                        // tokens (usage reported mid-stream, before the
+                        // error) — pull the RunError's usage out of the
+                        // chain and return it alongside `spent` instead of
+                        // dropping both on the floor (same discipline as the
+                        // failed-attempt folding in run_with_retries).
+                        let burned = compress::merge_usage(
+                            spent,
+                            e.downcast_ref::<RunError>().map(|r| r.usage),
+                        );
+                        return Err(CompressError { source: e, burned });
                     }
                 }
             };
@@ -2714,7 +2814,15 @@ impl Agent {
             match resp.stop_reason.as_str() {
                 "end_turn" | "max_tokens" => {}
                 other => {
-                    anyhow::bail!("summary request did not complete (stop_reason={other})")
+                    // `spent` was merged above — return it rather than bail it
+                    // away: a cancelled/interrupted summary still billed its
+                    // partial stream.
+                    return Err(CompressError {
+                        source: anyhow::anyhow!(
+                            "summary request did not complete (stop_reason={other})"
+                        ),
+                        burned: spent,
+                    });
                 }
             }
             let text = resp

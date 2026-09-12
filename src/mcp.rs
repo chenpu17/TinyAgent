@@ -10,7 +10,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const PROTOCOL_VERSION: &str = "2025-03-26";
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -93,7 +93,18 @@ pub struct McpToolInfo {
 /// One JSON-RPC message channel. Requests carry a client-generated id
 /// and return the message's `result` (or an error on JSON-RPC error).
 trait Transport: Send {
-    fn request(&mut self, id: u64, method: &str, params: Value) -> Result<Value>;
+    /// `cancel` is the run's per-turn cancel flag: transports with a
+    /// channel-wait (stdio / SSE) slice it into ≤50ms polls so a Ctrl-C
+    /// lands within ~50ms instead of after the full CALL_TIMEOUT — a wedged
+    /// server used to hold the turn hostage for 120s with no way to stop.
+    /// `None` = the startup handshake (no run in flight, nothing to cancel).
+    fn request(
+        &mut self,
+        id: u64,
+        method: &str,
+        params: Value,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Value>;
     fn notify(&mut self, method: &str, params: Value) -> Result<()>;
     /// Arm cancel-aware teardown. Default no-op; `StdioTransport` overrides it
     /// to spawn a reaper that kills the child process group on shutdown, so a
@@ -152,10 +163,11 @@ impl McpClient {
                 "capabilities": {},
                 "clientInfo": {"name": "tiny-agent", "version": env!("CARGO_PKG_VERSION")}
             }),
+            /* cancel: */ None,
         )?;
         client.notify("notifications/initialized", json!({}))?;
 
-        let tools = client.call("tools/list", json!({}))?;
+        let tools = client.call("tools/list", json!({}), /* cancel: */ None)?;
         Ok((client, bound_tools(tools)))
     }
 
@@ -171,10 +183,17 @@ impl McpClient {
         self.transport.notify(method, params)
     }
 
-    pub fn call(&mut self, method: &str, params: Value) -> Result<Value> {
+    /// `cancel` (the run's per-turn flag) is forwarded to the transport; see
+    /// [`Transport::request`] for the slice-poll contract.
+    pub fn call(
+        &mut self,
+        method: &str,
+        params: Value,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
-        self.transport.request(id, method, params)
+        self.transport.request(id, method, params, cancel)
     }
 }
 
@@ -318,6 +337,41 @@ fn pending_fail_all(pending: &Pending, detail: &str) {
 }
 
 // ─── stdio ──────────────────────────────────────────────────────────
+
+/// Wait for a response on `rx`, slicing the CALL_TIMEOUT into ≤50ms polls of
+/// the run's cancel flag (the shared wait core of the stdio / SSE transports).
+/// A Ctrl-C mid-wait bails within one slice instead of after the full 120s —
+/// the blocked `McpTool::run` was the run loop's only tool wait with no
+/// intra-turn cancel path. On bail the CALLER's error path reclaims the
+/// pending slot; the server's late response (if it ever arrives) finds no
+/// entry and is dropped by `pending_dispatch`, so an abandoned id can't
+/// corrupt the next call.
+fn recv_cancelable(
+    rx: &mpsc::Receiver<Value>,
+    method: &str,
+    cancel: Option<&AtomicBool>,
+) -> Result<Value> {
+    let deadline = Instant::now() + CALL_TIMEOUT;
+    loop {
+        let slice = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(50));
+        if slice.is_zero() {
+            bail!("MCP call '{method}' timed out or server died");
+        }
+        match rx.recv_timeout(slice) {
+            Ok(msg) => return Ok(msg),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    bail!("MCP call '{method}' cancelled");
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("MCP call '{method}' timed out or server died");
+            }
+        }
+    }
+}
 
 struct StdioTransport {
     child: std::process::Child,
@@ -491,23 +545,29 @@ fn spawn_reaper(
 }
 
 impl Transport for StdioTransport {
-    fn request(&mut self, id: u64, method: &str, params: Value) -> Result<Value> {
+    fn request(
+        &mut self,
+        id: u64,
+        method: &str,
+        params: Value,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Value> {
         let (tx, rx) = mpsc::channel();
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(id, tx);
-        // Reclaim the pending slot on any failure (write error or timeout):
-        // otherwise a flaky server that times out on every call leaks one
-        // map entry per call and grows without bound over a long session.
+        // Reclaim the pending slot on any failure (write error / timeout /
+        // cancel): otherwise a flaky server that times out on every call
+        // leaks one map entry per call and grows without bound over a long
+        // session. A cancelled call reclaims here too; the late response (if
+        // any) is dropped by pending_dispatch.
         let res = (|| -> Result<Value> {
             self.stdin
                 .write_all(frame(id, method, params).to_string().as_bytes())?;
             self.stdin.write_all(b"\n")?;
             self.stdin.flush()?;
-            let msg = rx
-                .recv_timeout(CALL_TIMEOUT)
-                .map_err(|_| anyhow!("MCP call '{method}' timed out or server died"))?;
+            let msg = recv_cancelable(&rx, method, cancel)?;
             extract_result(msg, method)
         })();
         if res.is_err() {
@@ -649,7 +709,19 @@ impl HttpTransport {
 }
 
 impl Transport for HttpTransport {
-    fn request(&mut self, id: u64, method: &str, params: Value) -> Result<Value> {
+    fn request(
+        &mut self,
+        id: u64,
+        method: &str,
+        params: Value,
+        // Cancel is accepted for signature parity but UNUSED here: the whole
+        // call is one blocking reqwest POST already bounded by the client's
+        // CALL_TIMEOUT total timeout — there is no channel wait to slice, and
+        // a blocking reqwest read cannot be interrupted mid-response (see
+        // SseTransport's Drop note). The stdio/SSE waits are the
+        // deadlock-shaped ones the 50ms slices exist for.
+        _cancel: Option<&AtomicBool>,
+    ) -> Result<Value> {
         let resp = self.post(&frame(id, method, params))?;
         if let Some(sid) = resp
             .headers()
@@ -857,7 +929,13 @@ impl SseTransport {
 }
 
 impl Transport for SseTransport {
-    fn request(&mut self, id: u64, method: &str, params: Value) -> Result<Value> {
+    fn request(
+        &mut self,
+        id: u64,
+        method: &str,
+        params: Value,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Value> {
         let (tx, rx) = mpsc::channel();
         self.pending
             .lock()
@@ -865,9 +943,7 @@ impl Transport for SseTransport {
             .insert(id, tx);
         let res = (|| -> Result<Value> {
             self.post(&frame(id, method, params))?;
-            let msg = rx
-                .recv_timeout(CALL_TIMEOUT)
-                .map_err(|_| anyhow!("MCP call '{method}' timed out or SSE stream died"))?;
+            let msg = recv_cancelable(&rx, method, cancel)?;
             extract_result(msg, method)
         })();
         if res.is_err() {
@@ -1095,6 +1171,70 @@ mod tests {
         // Cleanup: kill+reap the still-living child.
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[test]
+    fn recv_cancelable_bails_within_a_slice_when_cancel_set() {
+        // The intra-turn cancel path: a set flag must bail within ~one 50ms
+        // slice, NOT sit out the full 120s CALL_TIMEOUT (the old single
+        // recv_timeout made a wedged server hold the turn hostage).
+        let (_tx, rx) = mpsc::channel();
+        let cancel = AtomicBool::new(true);
+        let t0 = Instant::now();
+        let err = recv_cancelable(&rx, "tools/call", Some(&cancel)).unwrap_err();
+        assert!(err.to_string().contains("cancelled"), "err: {err}");
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "cancel must land within a slice, took {:?}",
+            t0.elapsed()
+        );
+    }
+
+    #[test]
+    fn recv_cancelable_returns_the_response_and_ignores_clear_flag() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(json!({"result": {"ok": true}})).unwrap();
+        let cancel = AtomicBool::new(false);
+        let msg = recv_cancelable(&rx, "tools/call", Some(&cancel)).unwrap();
+        assert_eq!(msg["result"]["ok"], true);
+        // And with no cancel flag at all (handshake shape).
+        let (tx2, rx2) = mpsc::channel();
+        tx2.send(json!({"result": 1})).unwrap();
+        assert_eq!(
+            recv_cancelable(&rx2, "initialize", None).unwrap()["result"],
+            1
+        );
+    }
+
+    /// Full stdio path: a server that never responds (a `sleep`) must stop
+    /// blocking within ~a slice of the cancel flag — this is the TUI
+    /// Ctrl-C-during-a-wedged-MCP-call scenario, end to end through the
+    /// transport (frame written, pending slot registered, then reclaimed).
+    #[cfg(unix)]
+    #[test]
+    fn stdio_request_unblocks_promptly_on_cancel() {
+        let cfg = McpServerConfig {
+            name: "sleep-server".into(),
+            command: Some("sleep".into()),
+            args: vec!["30".into()],
+            env: HashMap::new(),
+            url: None,
+            headers: HashMap::new(),
+            transport: None,
+        };
+        let mut t = StdioTransport::spawn(&cfg).expect("spawn sleep server");
+        let cancel = AtomicBool::new(true);
+        let t0 = Instant::now();
+        let err = t
+            .request(1, "tools/call", json!({"name": "x"}), Some(&cancel))
+            .unwrap_err();
+        assert!(err.to_string().contains("cancelled"), "err: {err}");
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "must unblock within ~a slice, took {:?}",
+            t0.elapsed()
+        );
+        // Drop kills the child (reaped there) — no orphan.
     }
 
     #[test]
