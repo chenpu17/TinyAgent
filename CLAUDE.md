@@ -97,6 +97,7 @@ cargo clippy -p tiny-agent-node
 - **todo + meta**：plan 从 records 派生不经压缩；`meta` 审计侧信道不进模型可见 content。
 - **Skill**：三级加载；name 必须等于父目录名；`read_skill`/`list_skill` 不在白名单、由 assemble 配套注入；子 agent 不继承。
 - **run_code**：两层开关默认全关；wasmtime 中断四点纪律（入口门/epoch 回调/host_call 入口/收尾裁决）；`max_wasm_stack` 384 KiB；测试必须先 warm 模块。
+- **run_code 触发文案**：规则明确 AND 剩余规模；`agentic-code.md` 为独立评测变体，原提示词不变；契约同步用 `python3 scripts/sync_run_code_contract.py --check`，交接见 `docs/run_code_routing_report.md`。
 - **run_code 微调支持**：`skill_injection` 三态（声明序=披露序，batch 收紧=min）装配期消费、热更不重注；`precheck` 调用期经 snapshot；检出集合只有 `{run_code, task, todo}`；拒答/墓碑文案即规格在 `docs/finetune_support_design.md` 附录 A，改文案先走其修订记录。
 - **guest I/O**：prelude 清单封闭（改 Prelude 必须同步描述 + 设计附录 A）；guest 输出预算不继承 `ctx.max_output_chars`（用 2M）。
 - **read_file 分页**：offset 跳行不花字节预算；json content 逐行保留原始行终止符；raw 默认窗口 3 字节对齐。

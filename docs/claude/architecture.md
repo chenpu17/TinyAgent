@@ -277,7 +277,7 @@
   （musl/无 HOME 行为不可控）；目录失败**优雅降级为无缓存**，绝不阻塞沙箱。A/B 墙钟里 debug 每进程 ~10s
   懒编译从此只付一次（改此路径记得 musl 冒烟在 CI 覆盖）。
 - **描述瘦身 + 内置 skill（v2 P2，设计 D18）**：run_code 描述只留身份/环境/**封闭助手清单**/返回纪律/
-  技能指针（889 字符，`slim_description_*` 测试钉 ≤1200 上限；含【数值】段——Number 是 float64、
+  技能指针（≤1200 字符，`slim_description_*` 测试钉上限；含【数值】段——Number 是 float64、
   超 2^53 静默失真、移植 Python 整数算术一律 BigInt 字面量，bench scriptout 实证 float64 直译答 816≠1048），深契约（read_file 三模式、字节保真复制、
   示例）移进内置 skill `run-code`（见 skills 条目的 embedded 机制）。**描述、skill 正文、设计附录 A 三处
   同源同步**——附录 A 由源码程序化再生成，改 prelude/助手清单/read_file 契约时三处一起动。附修：read_file
@@ -287,6 +287,7 @@
   另一 fidelity 修复（A/B 首跑抓到）：json content **逐行保留原始行终止符**（含每页末行 \n 与 CRLF，
   不再「strip 后 join("\n")」——那会丢末行换行、归一 CRLF，按换行计数每文件少 1）；prelude
   readAll 页间改 `join("")`（页自带终止符，join("\n") 会在页界注入空行）。
+- **run_code 触发文案 v1/v2**：描述/teaser/技能入口按“规则明确 AND 剩余有规模”引导模型，探查后可换轨、仅续做未完成项；无 host 计数触发。`examples/prompts/agentic-code.md` 独立变体允许大清单存变量/文件，基线 `agentic.md` 不变。`scripts/sync_run_code_contract.py --write/--check` 同步设计附录与评测指纹；v2 在技能前置 JSON 信封解析与成本纪律，系统提示词/teaser 不变；效果与版本差异见 `docs/run_code_routing_v2.md`。
 - **run_code 微调支持（M1-M4，设计/需求 `docs/finetune_support_design.md` / `docs/finetune_support_requirements.md`）**：
   两个 CodeConfig 新字段服务 MiniCPM 契约内化微调——`skill_injection: SkillInjection` 三态
   （`Off < OnDemand < Eager`，**声明序=披露序**，derive Ord；默认 OnDemand）与 `precheck: bool`

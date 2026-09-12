@@ -911,6 +911,12 @@ GUI 可渲染"正在构造调用…"（headless 终端不重复打印——完�
 （`skill_injection`/`precheck` 的装配时值），NDJSON 模式首行打印同内容——bench 复盘可归因轨迹
 出自哪种披露/预检配置。
 
+**代码编排提示词（可选）**：`examples/prompts/agentic-code.md` 在原参考纪律上增加
+“规则明确且剩余有规模”的选择规则，支持探查后换轨与大清单保存在变量/文件中。
+仅在 `run_code` 可用时，将文件第一个 `---` 后的正文设为 `system_prompt`；不会自动加载。
+`agentic.md` 保持原样供 no-code/历史对照。新版描述与技能会随重新编译进入 code 臂，
+请按 [落地报告](docs/run_code_routing_report.md) 固定文案、提示词与二进制指纹，分批验证效果。
+
 **沙箱内环境**：纯同步 ES2023——无 async/Promise/timer/`import`/`fetch`，`Date.now`/`Math.random`
 不可用（评测可复现）。API 五个：`tools.call(name, args)`（失败 throw、可 try/catch 后继续，异常带
 结构化字段 `e.kind`/`e.tool`/`e.retryable`——`denied`/`hooks`/`budget`/`deadline`/`unknown_tool`
