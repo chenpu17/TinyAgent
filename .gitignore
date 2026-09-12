@@ -10,3 +10,4 @@
 /测试模型.md
 *.swp
 *.swo
+__pycache__/

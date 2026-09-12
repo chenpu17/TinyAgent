@@ -1,0 +1,82 @@
+{
+  "contract": "run-code-routing-v1",
+  "arm": "ta-code-routing-v1-aw",
+  "model": "glm-5.3-flash",
+  "repeats": 1,
+  "results": [
+    {
+      "task": "awlikesong",
+      "verdict": "PASS",
+      "official_checks": 5,
+      "checks_passed": 5,
+      "cheat_flags": [],
+      "turns": 17,
+      "total_tokens": 528996,
+      "uncached_input": 35121,
+      "output_tokens": 7347,
+      "client_seconds": 222.7,
+      "outer_tool_calls": 22,
+      "read_skill_calls": 1,
+      "first_skill_outer_ordinal": 8,
+      "run_code_calls": 8,
+      "first_code_outer_ordinal": 10,
+      "failed_code_calls": 0,
+      "inner_tool_calls": 296,
+      "mcp_calls": 284,
+      "inner_errors": [
+        "delete_file"
+      ],
+      "old_on_demand_medians": {
+        "n": 3,
+        "pass": 3,
+        "turns": 16,
+        "total_tokens": 690720,
+        "uncached_input": 46652,
+        "output_tokens": 18036,
+        "client_seconds": 358.3,
+        "outer_tool_calls": 118,
+        "mcp_calls": 115
+      },
+      "total_tokens_delta_percent": -23.4,
+      "client_seconds_delta_percent": -37.8,
+      "uncached_input_delta_percent": -24.7,
+      "output_tokens_delta_percent": -59.3
+    },
+    {
+      "task": "awclean",
+      "verdict": "PASS",
+      "official_checks": 6,
+      "checks_passed": 6,
+      "cheat_flags": [],
+      "turns": 10,
+      "total_tokens": 334140,
+      "uncached_input": 40070,
+      "output_tokens": 11574,
+      "client_seconds": 331.1,
+      "outer_tool_calls": 16,
+      "read_skill_calls": 1,
+      "first_skill_outer_ordinal": 5,
+      "run_code_calls": 2,
+      "first_code_outer_ordinal": 11,
+      "failed_code_calls": 1,
+      "inner_tool_calls": 30,
+      "mcp_calls": 41,
+      "inner_errors": [],
+      "old_on_demand_medians": {
+        "n": 3,
+        "pass": 3,
+        "turns": 11,
+        "total_tokens": 332912,
+        "uncached_input": 16927,
+        "output_tokens": 7226,
+        "client_seconds": 145.4,
+        "outer_tool_calls": 36,
+        "mcp_calls": 34
+      },
+      "total_tokens_delta_percent": 0.4,
+      "client_seconds_delta_percent": 127.7,
+      "uncached_input_delta_percent": 136.7,
+      "output_tokens_delta_percent": 60.2
+    }
+  ]
+}

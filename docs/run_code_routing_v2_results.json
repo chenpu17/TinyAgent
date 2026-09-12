@@ -1,0 +1,51 @@
+{
+  "task": "awclean",
+  "model": "glm-5.3-flash",
+  "repeats_per_version": 1,
+  "versions": [
+    {
+      "version": "v1",
+      "verdict": "PASS",
+      "official_checks": 6,
+      "checks_passed": 6,
+      "cheat_flags": [],
+      "turns": 10,
+      "total_tokens": 334140,
+      "uncached_input": 40070,
+      "output_tokens": 11574,
+      "client_seconds": 331.1,
+      "code_calls": 2,
+      "code_errors": 1,
+      "code_chars": 9403,
+      "outer_tools": 16,
+      "inner_tools": 30,
+      "mcp_calls": 41
+    },
+    {
+      "version": "v2",
+      "verdict": "PASS",
+      "official_checks": 6,
+      "checks_passed": 6,
+      "cheat_flags": [],
+      "turns": 10,
+      "total_tokens": 313449,
+      "uncached_input": 38620,
+      "output_tokens": 8397,
+      "client_seconds": 276.1,
+      "code_calls": 3,
+      "code_errors": 0,
+      "code_chars": 5595,
+      "outer_tools": 16,
+      "inner_tools": 33,
+      "mcp_calls": 40
+    }
+  ],
+  "v2_vs_v1_percent": {
+    "total_tokens": -6.2,
+    "uncached_input": -3.6,
+    "output_tokens": -27.4,
+    "client_seconds": -16.6,
+    "code_chars": -40.5
+  },
+  "limits": "Single-run iteration; not a contemporaneous controlled repeated experiment."
+}

@@ -1,0 +1,46 @@
+{
+  "task": "awclean",
+  "repeats_per_version": 1,
+  "results": [
+    {
+      "version": "v2",
+      "verdict": "PASS",
+      "checks_passed": 6,
+      "official_checks": 6,
+      "cheat_flags": [],
+      "turns": 10,
+      "total_tokens": 313449,
+      "uncached_input": 38620,
+      "output_tokens": 8397,
+      "client_seconds": 276.1,
+      "run_code_calls": 3,
+      "code_errors": 0,
+      "code_chars": 5595,
+      "inner_tool_calls": 33
+    },
+    {
+      "version": "v3",
+      "verdict": "PASS",
+      "checks_passed": 6,
+      "official_checks": 6,
+      "cheat_flags": [],
+      "turns": 11,
+      "total_tokens": 322689,
+      "uncached_input": 34233,
+      "output_tokens": 10632,
+      "client_seconds": 258.7,
+      "run_code_calls": 5,
+      "code_errors": 1,
+      "code_chars": 12968,
+      "inner_tool_calls": 40
+    }
+  ],
+  "v3_vs_v2_percent": {
+    "total_tokens": 2.9,
+    "uncached_input": -11.4,
+    "output_tokens": 26.6,
+    "client_seconds": -6.3,
+    "code_chars": 131.8
+  },
+  "decision": "Archive v3; restore v2 prompt. No demonstrated reduction in model turns."
+}
