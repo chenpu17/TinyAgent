@@ -2023,23 +2023,23 @@ impl Tool for RunCodeTool {
         // prelude/description/skill.md change together.
         ToolDef {
             name: "run_code".into(),
-            description: r#"在进程内 JS 沙箱（QuickJS，纯同步 ES2023）中执行代码：适合循环 / 批量 / 多步数据处理 / 大文件加工，一次调用完成本来要几十轮 read_file+shell 折腾的编排。单个工具调用就能完成的事不要用本工具；一条 shell 管道能做的优先 shell；需要在自己回复里记住大量中间数据才能完成的，就该用代码。
+            description: r#"在进程内 JS 沙箱（QuickJS，同步 ES2023）编排 MCP/API 分页、批量操作和大文件处理。规则已明确，剩余仍有跨页/大量对象的同构调用或大量中间数据处理时，先 read_skill({"skill":"run-code"})，再用代码承接。可先直接探查接口，拿到结果后重判；只续做未完成部分。整个剩余任务一次工具调用或一条可用 shell 管道即可完成时直接做；小集合或逐项需语义判断时不必用代码。不能仅凭“所有/批量”触发。
 
-【环境】无 async/await、Promise、timer、import/fetch；无网络与文件系统直访（读写经工具调用）；Date.now 与 Math.random 不可用；工具调用次数（每次执行独立计满，超了分批续跑）/ 内存 / 执行时长有上限，超限强制终止。
+【环境】无 async/await、Promise、timer、import/fetch、网络与文件系统直访（读写经工具）；Date.now/Math.random 不可用。调用次数/内存/时长有限，超限终止；调用额度每次重计，超了分批续跑。
 
 【API】
 - 内置助手（前导函数，直接可用；此外没有别的内置助手）：readAll(path) 整读文本（约 200 万字符内一次读完）、readLines(path) 行数组、writeVerified(path, content) 字节保真写（写后读回校验）
-- tools.call(工具名, 参数对象)：调用本会话可用工具（含 MCP；不含 task/todo/run_code 自身），失败 throw 可 try/catch；返回值能解析为 JSON 则为对象/数组。失败的调用（含写错工具名）也扣调用额度
-- tools.list()：调 MCP 工具前先调它核对准确名字——MCP 工具名长、分隔符易混（`_` 与 `__`），凭记忆写错会白烧额度；console.log(...)：调试输出，实时显示并随结果返回
+- tools.call(工具名, 参数对象)：调本会话工具（含 MCP，不含 task/todo/run_code），失败 throw 可 catch。JSON 自动解析但不解包：{response:[...]} 取 .response；循环前确认形状。失败调用也扣额度
+- tools.list()：调 MCP 前先核对准确名字（`_` 与 `__` 易混），返回 [{name, description}]；console.log(...)：调试输出，实时显示并随结果返回
 - tools.budget()：查剩余额度（次数/墙钟/燃料/token）——长批量前查、循环里定期查
 - copy_bytes(src,dst)（经 tools.call）：host 流式字节保真复制文件（不经 JS 字符串）
 - 工具错误可 catch 且带 e.kind（denied/hooks/budget/deadline/unknown_tool/tool）；retryable=false 类重试无意义
 
 【返回】return 的值经 JSON 序列化作为工具结果。必须返回紧凑摘要（统计数字、文件路径、少量样例行）；大数据写文件后返回路径，禁止把数据本体放进返回值。
 
-【数值】Number 是 float64：整数乘法/累加一超过 2^53 即静默失真。移植 Python 等语言的整数算术（计数器、LCG、哈希、大数）一律用 BigInt 字面量（123456789n、2n**31n），详见 run-code 技能。
+【数值】Number 是 float64，整数乘法/累加超过 2^53 会静默失真。移植 Python 等整数算术（计数器、LCG、哈希、大数）用 BigInt 字面量（123456789n、2n**31n）。
 
-read_file 三种模式（text / format:"json" / raw）、字节保真复制、分页细节与完整示例：用 read_skill 加载技能 run-code——写非平凡代码前先读它。"#
+read_file 三模式（text / format:"json" / raw）、字节保真复制及分页校验示例见 run-code；写非平凡代码前先读。"#
                 .into(),
             schema: json!({
                 "type": "object",

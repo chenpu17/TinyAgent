@@ -1,10 +1,36 @@
 ---
 name: run-code
-description: run_code 沙箱完整用法——read_file 三种模式、copy_bytes 字节保真复制、大文件整读/分页聚合、批量校验闭环、返回值纪律与典型示例
+description: MCP/API 分页、批量操作、大文件处理：规则明确且剩余仍有跨页/大量对象的同构调用或大量中间数据时，先 read_skill({"skill":"run-code"}) 再用代码承接。探查接口后重判，只续做未完成部分。整个剩余任务一次调用/可用 shell 管道能完成则直接做；小集合、逐项语义判断不必用代码，不能仅凭“所有/批量”触发。含同步 JS 契约与校验示例。
 allowed-tools: run_code read_file write_file
 ---
 
 # run_code 沙箱完整用法
+
+## 先确认返回形状，再展开循环
+`tools.call` 只做 JSON 解析，**不会自动去掉业务信封**。直接调用显示 `{response: [...]}` 时，代码也必须取 `.response`，不能对整个对象用 `.map` 或当数组。不同端点可能不同；先看实际返回及 schema，不按工具名字猜。
+
+已确认某组端点返回“数组或 response 数组”时，可定义以下**局部函数（不是内置 helper）**；缺字段/错误对象必须报错，不能用 `|| []` 把解析失败变成空页。其他端点按自己的契约取 `.items` 等字段；分页终止另按接口规则判断。
+```js
+// response-array-example: tests execute this exact block in QuickJS.
+function responseRows(r) {
+  if (Array.isArray(r)) return r;
+  if (r && typeof r === "object" && Array.isArray(r.response)) return r.response;
+  throw new Error("expected array or response array; inspect tool result");
+}
+```
+已有直接探查的响应足以确认形状就复用该证据。仍不明确时用短小的只读代码返回类型、字段名、数组长度及必要样例，确认后再展开长流程；无需为了“检查形状”固定多加一次调用。不要打印凭证。
+
+## 何时加载 / 何时换轨
+- **同时满足才承接**：筛选、参数构造和校验规则已明确；剩余仍有跨页/大量对象的同构调用，或大量中间数据需要处理。后续主要改变游标、页码或对象 ID，是可写循环的信号。大文件聚合、跨文件 join 也适用。
+- **可先探查再判断**：接口或返回形状未知时先直接查；看见规模、分页信息、目标集合后，重新选择剩余流程的执行方式，不因已经直接调用过就继续逐条搬运。无需等到失败或上下文接近耗尽。
+- **不用的边界针对整个剩余任务**：一次工具调用或一条可用 shell 管道即可做完，就直接完成；小集合可直接批量调用。逐项还需模型理解不同内容时，先保留语义判断，只把规则稳定的子流程交给代码。用户说“所有/批量”本身不是规模证据。
+- **换轨不重做**：迁移已确认的谓词、目标 ID、游标、已完成项和失败项；只处理剩余部分。状态不确定时先重新查询，不能盲目重放修改。每次 run_code 的 JS 变量不跨调用保留，续批状态须显式传入或写文件。
+- **先计划再执行**：先在回复中明确实体层级、AND/OR 谓词和边界案例；大清单在变量/文件里构造并在修改前检查集合与计数。规则无歧义且操作已授权时，可在同次代码中检查后执行，随后返回计数、少量样例及已落盘路径。新集合仍需模型判断或用户确认时，先返回计划，判断或确认后再执行。不要为了列清单把所有中间数据搬回对话。
+
+## 编排成本与校验范围
+- 只写当前任务需要的短流程，不照抄整套示例框架。已取得的少量完整数据可直接带入；大量数据通过代码收集，避免在自然语言和代码间反复转写。只因迁移到代码不必重查已确认、仍有效的数据；数据不完整或可能变化时重新查询。
+- `console.log` 和 `return` 都进入结果；只报计数、异常和少量样例，不打印完整 KEEP/ACT 集合。续批、恢复或任务要求才保存文件；局部变量可承载单次流程。清理文件必须使用实际可用工具，不能猜 `delete_file`。
+- 最终校验须独立读取真实状态，比较目标与保留集合。若完整分页列表已提供所需字段，可一次集合比较验证，不再对同一状态逐项查询；字段不足才补查。代码已完成这项校验且无后续写入/新疑点时，直接使用其验证摘要，不在外层再查一遍。不能只比较数量，不能用操作成功响应代替状态读回。
 
 ## 环境
 - 纯同步 JS（QuickJS，ES2023）：无 async/await、Promise、setTimeout、import/require、fetch
@@ -47,30 +73,79 @@ return { copied: "dst.bin" };
 write_file 的 `content`（文本）与 `content_b64`（base64 字节）二选一，不可同传。
 
 ## 批量操作纪律（计划—执行—校验闭环）
-多删、漏删、漏页几乎都源于"没数数就动手"。批量任务（批量删除/修改/点赞/导出…）固定走这个模板，**数量不一致就显式 throw**，不要返回"处理完成"：
+先明确实体层级和 AND/OR 谓词，再完整收集、去重、分出 KEEP / ACT ON，最后执行和独立读回。不能用“目标数减失败数”冒充成功计数；工具未抛异常也不代表业务成功。
+
+下面是**虚构接口的示意配方，不是内置工具**。先用 `tools.list()` 核对真实名称，再根据实际 schema/探查结果改参数、响应解析和分页终止规则。示例任务为“删除已归档且未点赞的条目”，即 `archived === true && liked === false`；假定无并发修改、读取即时一致，单批能装进额度和内存。三个示意接口约定如下：
+- `mcp_list_items({cursor, limit})` → `{items: [{id: 非空字符串, archived: 布尔, liked: 布尔}], next_cursor: 字符串或null}`。只有显式 null 表示完整结束，空页不代替终止标志；跨页可重复，但同一 ID 内容须一致。
+- `mcp_delete({id})` → `{ok: 布尔}`。false 表示确定未删除；异常或其他响应表示结果不确定，必须先查状态，不能盲目重试。
+- `mcp_get_item({id})` → `{item: 条目或null}`。null 表示确实不存在，不能把缺字段或权限错误当作不存在。
+
+实际任务先外化谓词与计划摘要；若还需审核新收集的集合，先执行收集部分并返回计数、样例和计划路径，下一次再恢复计划执行。下面演示已明确规则且获授权的一批；计划/日志路径须按任务隔离，不能覆盖别的批次。
 ```js
-// 1) 先收集并去重目标，记录目标数
-const seen = new Set(), targets = [];
-for (let page = 1; ; page++) {              // 2) 分页拉全：显式传 limit，拉到空页为止
-  const r = tools.call("mcp_list_items", { page: page, limit: 100 });
-  if (!r.items || r.items.length === 0) break;
-  for (const it of r.items)
-    if (!seen.has(it.id)) { seen.add(it.id); targets.push(it); }
+// batch-audit-example: tests execute this exact block in QuickJS.
+const names = tools.list().map(t => t.name);
+for (const n of ["mcp_list_items", "mcp_delete", "mcp_get_item"])
+  if (!names.includes(n)) throw new Error("adapt example tool name: " + n);
+function validItem(it) {
+  return it && typeof it.id === "string" && it.id.length > 0 &&
+    typeof it.archived === "boolean" && typeof it.liked === "boolean";
 }
-// 3) 执行，逐条记账（成功/失败分开）
-const failed = [];
-for (const t of targets) {
-  try { tools.call("mcp_delete", { id: t.id }); }
-  catch (e) { if (e.kind === "denied" || e.kind === "unknown_tool") throw e; failed.push({ id: t.id, why: String(e.message) }); }
+function sameItem(a, b) {
+  return validItem(b) && a.id === b.id &&
+    a.archived === b.archived && a.liked === b.liked;
 }
-// 4) 校验闭环：目标数 == 成功数 + 失败数，缺一不可
-const okCount = targets.length - failed.length;
-if (okCount + failed.length !== targets.length) throw new Error("audit mismatch");
-// 5) 返回摘要（目标/成功/失败），失败清单给样例
-return { targets: targets.length, ok: okCount, failed: failed.length,
-         failed_sample: failed.slice(0, 5).map(f => f.id) };
+const before = new Map(), cursors = new Set();
+let cursor = null;
+while (true) {
+  const r = tools.call("mcp_list_items", {cursor, limit: 100});
+  if (!r || !Array.isArray(r.items) ||
+      !(r.next_cursor === null ||
+        (typeof r.next_cursor === "string" && r.next_cursor.length > 0)))
+    throw new Error("invalid page response");
+  for (const it of r.items) {
+    if (!validItem(it)) throw new Error("invalid item");
+    if (before.has(it.id) && !sameItem(before.get(it.id), it))
+      throw new Error("inconsistent duplicate");
+    before.set(it.id, it);
+  }
+  if (r.next_cursor === null) break;
+  if (cursors.has(r.next_cursor)) throw new Error("pagination did not advance");
+  cursors.add(r.next_cursor);
+  cursor = r.next_cursor;
+}
+const keep = [], targets = [];
+for (const it of before.values())
+  (it.archived && !it.liked ? targets : keep).push(it.id);
+// 先落盘计划；按实际剩余额度预算每次修改/日志与所有初始条目的读回。
+writeVerified("batch-plan.json", JSON.stringify({keep, targets}));
+if (tools.budget().calls_left < targets.length * 2 + before.size)
+  throw new Error("plan saved: batch-plan.json; split before mutation");
+const succeeded = [], failed = [];
+for (const id of targets) {
+  const r = tools.call("mcp_delete", {id});
+  if (!r || typeof r.ok !== "boolean") throw new Error("uncertain action result: " + id);
+  (r.ok ? succeeded : failed).push(id);
+  tools.call("write_file", {path: "batch-progress.json",
+    content: JSON.stringify({succeeded, failed})});
+}
+const accounted = new Set([...succeeded, ...failed]);
+if (succeeded.length + failed.length !== targets.length ||
+    accounted.size !== targets.length || targets.some(id => !accounted.has(id)))
+  throw new Error("action accounting mismatch");
+// 读回所有初始条目：成功删除必须消失，KEEP 和确定失败项必须原样保留。
+const removed = new Set(succeeded);
+for (const [id, original] of before) {
+  const r = tools.call("mcp_get_item", {id});
+  if (!r || !(r.item === null || validItem(r.item)))
+    throw new Error("invalid verification response: " + id);
+  if (removed.has(id) ? r.item !== null : !sameItem(original, r.item))
+    throw new Error("final state mismatch: " + id);
+}
+return {complete: failed.length === 0, verified: true, targets: targets.length,
+  kept: keep.length, succeeded: succeeded.length, failed: failed.length,
+  failed_sample: failed.slice(0, 5), plan: "batch-plan.json"};
 ```
-要点：目标集合先**去重**（跨源/跨页会重复）；分页**显式传 limit**（默认页大小小得离谱——曾实测默认 5 漏掉第 6 条）；每批开工前 `tools.budget()` 对一下额度装不装得下，装不下就分批落盘续跑。
+`verified:true` 只说明读回与已记账结果一致；`complete:false` 仍有未完成项，必须继续处理或诚实报告。执行异常/中断时，计划和最后一次成功落盘的进度只作恢复线索；最后一次调用可能已生效但没记账，先查状态再续做。真实 API 若存在最终一致性、非幂等动作或并发写入，应采用该 API 支持的版本/快照/幂等与校验机制，不能照搬示例假设。大批次要为分页、执行、日志和校验一并预算并分批保存状态，不得边删除边按会移位的页码收集目标。
 
 ## 返回值纪律
 代码作为函数体执行，`return` 的值经 JSON 序列化作为工具结果。必须返回**紧凑摘要**（统计数字、文件路径、少量样例行）；大数据写文件后返回路径引用，禁止把数据本体放进返回值——返回值与 console 日志共享尺寸上限，超限时截日志保返回值，数据本体照样会被截。
@@ -85,7 +160,8 @@ for (let i = 0; i < 100000; i++) {
 }
 return { last: state.toString() };
 ```
-### 聚合工具返回的分页数据
+### 聚合已完整取得的工具数据
+以下仅演示聚合：假定查询结果已确认完整且不超过 LIMIT；若响应仍有分页/截断信号，先按真实接口契约拉全，不能把 LIMIT 当成总量。
 ```js
 const page = tools.call("mcp_sql_query", { sql: "SELECT name, amount FROM orders LIMIT 5000" });
 const total = {};
@@ -116,9 +192,3 @@ for (const n of names) {
 }
 return { checked: names.length, bad };
 ```
-
-## 何时用 / 何时不用
-- **用**：数据装不进对话（大文件 readAll 后聚合/过滤/统计，只 return 摘要——不要自己逐页读进对话再心算）；几十个文件的批量校验/改写/重组；跨文件关联（join）、按规则分组、JSON 嵌套处理（代码经 JSON 直传，无 shell 转义烦恼）
-- **不用**：单个工具调用就能完成的事（读/写一个文件、跑一条命令）；十来个小文件的简单同构修改（直接多次工具调用更省更稳）；一条 shell 管道能做的（排序/去重/求和/单遍过滤——shell 可用时优先 shell）
-- 判断口诀：如果需要在自己回复里记住大量中间数据才能完成，就该用代码
-- 可能失败的外部调用用 try/catch 包住，失败时 return 已完成部分的进度摘要

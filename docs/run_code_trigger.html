@@ -134,8 +134,8 @@
   <div class="wrap">
     <div class="kicker">TINYAGENT · RUN_CODE</div>
     <h1>run_code 什么时候会<em>被触发</em>？</h1>
-    <p>绝大多数任务里它不会被触发。没有程序化触发器——触发与否是模型按任务形状做的判断，
-       规则全部写在它每次都能读到的工具描述与技能里。这张图整理「看得见之后」的完整决策面。</p>
+    <p>没有程序化触发器——模型根据已知规则与剩余工作规模选择执行方式。
+       工具描述和技能简介常驻，完整技能按需加载；本图说明候选决策规则，效果仍需评测。</p>
     <div class="premise">前置假设（本图不展开）：<b>cargo feature 已编入 · code.enabled = true · 顶层 agent</b>（task 子 agent 看不到 run_code）</div>
   </div>
 </header>
@@ -145,15 +145,15 @@
     <div class="sec-no">01 · 谁在决定</div>
     <h2>没有触发器，只有模型的判断</h2>
     <p class="sec-lead">代码里不存在任何「满足 X 就自动启用 run_code」的规则。每一轮对话，
-      模型都能看到 run_code 的工具描述，用不用它，是模型对每个任务做的<b>逐任务决策</b>。
-      系统能做的是把「什么该用、什么不该用」的判别标准写在模型必然读到的三个信号面里。</p>
+      模型都能看到 run_code 的工具描述；探查结果揭示规模时，应重判<b>剩余流程</b>。
+      系统能做的是把「什么该用、什么不该用」的判别标准写在模型可见的三个信号面里。</p>
     <div class="who">
       <div class="card">
         <h3>三个引导信号面</h3>
         <ul>
-          <li><b>工具描述</b>（~889 字符）：随每次请求的工具 schema 下发——身份、环境、封闭的助手清单、返回纪律、「何时用/何时不用」的口诀都在这。</li>
-          <li><b>内置技能简介</b>：技能名 <code>run-code</code> + 一行描述常驻 system prompt，不占对话历史、压缩不掉。</li>
-          <li><b>技能正文</b>：深契约（read_file 三模式、字节保真复制、批量闭环模板、BigInt 纪律）不进 schema，模型写非平凡代码前被引导 <code>read_skill</code> 按需加载。</li>
+          <li><b>工具描述</b>（≤1200 字符）：随每次请求的工具 schema 下发——身份、环境、封闭的助手清单、返回纪律、「何时用/何时不用」的判据都在这。</li>
+          <li><b>内置技能简介</b>：技能名 <code>run-code</code> + 触发式简介常驻 system prompt（≤1024 字符），提示何时加载。</li>
+          <li><b>技能正文</b>：深契约（read_file 三模式、字节保真复制、批量闭环模板、BigInt 纪律）不进 schema，识别到合适的剩余流程后经 <code>read_skill</code> 加载，包含迁移进度与批量校验纪律。</li>
         </ul>
       </div>
       <div class="card">
@@ -161,8 +161,8 @@
         <p>描述瘦身是因为工具 schema 每次请求都要付 token——把「什么时候用」的判断依据放进描述，
            模型每一次做决策时都拿着同一份规则；细节则移到可压缩、可回收的技能正文。
            描述、技能正文、设计文档附录 A 三处同源同步，改动必须三处一起动。</p>
-        <div class="keybox">判别口诀（原文写死在描述里）：<br>
-          <b>「如果需要在自己回复里记住大量中间数据才能完成，就该用代码。」</b></div>
+        <div class="keybox">双条件：<br>
+          <b>规则已明确，且剩余仍有跨页/大量对象的同构调用或大量中间数据处理。</b></div>
       </div>
     </div>
   </div>
@@ -171,14 +171,14 @@
 <section style="padding-top:8px">
   <div class="wrap">
     <div class="sec-no">02 · 决策树</div>
-    <h2>多数任务走左边，少数任务走右边</h2>
-    <p class="sec-lead">左边是<b>默认路径</b>：能一步完成、能一条管道完成、数据量小——都不该惊动沙箱。
-      右边的共同特征是<b>中间数据的规模或步骤的数量超出了对话上下文适合承载的范围</b>。</p>
+    <h2>按整个剩余任务选择执行方式</h2>
+    <p class="sec-lead">先直接探查未知接口，拿到规模与返回形状后重判。右边须同时满足<b>规则稳定与剩余规模</b>；
+      “所有/批量”不是规模证据。独立调用的并发与代码内依赖调用的串行并不冲突。</p>
 
     <div class="tree">
       <div class="root">
         <div class="t">模型收到一个任务（run_code 可见）</div>
-        <div class="s">每一轮都重新判断一次：这个任务的最佳承载方式是什么？</div>
+        <div class="s">开工时及探查揭示规模后重判：剩余流程适合直接调用还是代码？</div>
       </div>
       <div class="stem"></div>
       <div class="branch-bar"><span class="right"></span></div>
@@ -186,23 +186,23 @@
 
         <div class="branch no">
           <div class="branch-head">
-            <div class="t">不触发 ← 绝大多数任务</div>
-            <div class="s">描述明确写「不要用本工具」的情形</div>
+            <div class="t">直接完成 / 继续探查</div>
+            <div class="s">以整个剩余任务为判断范围</div>
           </div>
           <div class="leaf">
             <span class="tag">单步可完成</span>
-            <h4>单个工具调用就能做完</h4>
+            <h4>整个剩余任务一次调用能做完</h4>
             <p>读/写一个文件、改一处代码、跑一条命令——直接调 <code>read_file</code> / <code>edit_file</code> / <code>shell</code>，更省更稳。</p>
           </div>
           <div class="leaf">
             <span class="tag">管道可完成</span>
-            <h4>一条 shell 管道能做</h4>
-            <p>排序、去重、求和、单遍过滤——shell 可用时优先 shell，不开沙箱。</p>
+            <h4>一条可用 shell 管道能做完整任务</h4>
+            <p>排序、去重、求和、过滤——shell 必须实际能访问数据源；MCP-only API 不能假设可经 shell 调用。</p>
           </div>
           <div class="leaf">
             <span class="tag">小规模同构</span>
-            <h4>十来个小文件的简单修改</h4>
-            <p>直接多次工具调用反而更直观可控，沙箱的编排价值体现不出来。</p>
+            <h4>小集合或逐项仍需语义判断</h4>
+            <p>小集合可直接批量调用；逐项语义判断留给模型，仅把规则稳定的子流程交给代码。</p>
           </div>
           <div class="leaf">
             <span class="tag">无工具需求</span>
@@ -213,13 +213,13 @@
 
         <div class="branch yes">
           <div class="branch-head">
-            <div class="t">触发 → 中间数据装不进对话</div>
-            <div class="s">一次沙箱执行替代几十轮工具来回</div>
+            <div class="t">加载技能 → 代码承接剩余流程</div>
+            <div class="s">规则明确 AND 剩余有规模；不设触发次数阈值</div>
           </div>
           <div class="leaf">
             <span class="tag">循环 / 批量</span>
-            <h4>几十~几百次同类调用</h4>
-            <p>分页拉全再逐条删除/修改/点赞；几十个文件的批量校验、改写、重组。循环写在 JS 里，不再一轮一轮等模型发指令。</p>
+            <h4>跨页 / 大集合中的同构调用</h4>
+            <p>后续主要改变游标、页码或对象 ID；先加载技能，再写循环。换轨时带入谓词、游标、已完成项，只续做未完成部分。</p>
           </div>
           <div class="leaf">
             <span class="tag">大文件加工</span>
@@ -233,16 +233,17 @@
           </div>
           <div class="leaf">
             <span class="tag">批量闭环</span>
-            <h4>先数数 → 批量执行 → 校验对账</h4>
-            <p>「计划—执行—校验」闭环：目标去重、逐条记账、数量不齐显式报错。单次 200 次调用额度装不下时，按引导分批落盘续跑。</p>
+            <h4>确定集合 → 执行记账 → 状态读回</h4>
+            <p>大清单留在变量/文件，修改前检查集合与计数；需进一步判断或确认时先返回计划。执行后重查实际状态与保留集合；预算不足时分批持久化，状态不明的修改先查后重试。</p>
           </div>
         </div>
 
       </div>
 
       <div class="mantra">
-        一句话总结：<b>单步能完成就不用、一条管道能做就不用、要背大量中间数据就该用。</b>
-        run_code 的价值不是替代既有工具，而是把「几十轮 read_file + shell 来回折腾」压缩成一次沙箱执行——省的是 token 和轮次。
+        <b>规则明确且剩余有规模，就加载技能并让代码承接；整个剩余任务可直接完成时直接做。</b>
+        code 专用提示词变体见 <code>examples/prompts/agentic-code.md</code>；原 <code>agentic.md</code> 保留作对照。
+        收益以正确率、模型往返与 token 联合验证，不能把沙箱内部 API 调用当成消失。
       </div>
     </div>
   </div>

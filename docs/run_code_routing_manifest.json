@@ -1,0 +1,26 @@
+{
+  "contract_version": "run-code-routing-v2",
+  "hash_algorithm": "sha256",
+  "files": {
+    "examples/prompts/agentic.md": "ffda2b99649344b5cdee1386c0c14612009beea3446a48a375bd6e0291f5d866",
+    "examples/prompts/agentic-code.md": "311e24100f52676a24763cd119351ae32b4e28ab27a07f2b8bfa887840737201",
+    "src/tools/run_code.rs": "8145505e6e164008e37188e569863d5355820e99ca0ef1598cdd11914301000b",
+    "src/tools/run_code_skill.md": "8b07300fc55d55b295b9dccd4673cfae98be18d715b576c76abc147e1d8eb184",
+    "src/tools/skill.rs": "20a2bf64ea6975b5fae1f212dcb5abdbe6429a547aa326a36416dbe21da53a3e",
+    "docs/finetune_support_design.md": "19bda6048cf240b143c8aa19d7b1cbd833179116fe19a43d2fdec90cc2f82e84"
+  },
+  "prompt_bodies": {
+    "examples/prompts/agentic.md": "d95ebc578717a06be44cf0ad1e10770212456eaba1d7489f00ac79eee4c86325",
+    "examples/prompts/agentic-code.md": "966b4e0612585e138f112e1d9d5f52977e2c350af034c19828363ae142e55583"
+  },
+  "description": {
+    "chars": 1198,
+    "sha256": "6b5284bcc61e4162ac2d837c00af2e3c13aac687ad55e791d5fc50253465d250"
+  },
+  "teaser": {
+    "chars": 186,
+    "sha256": "517614084b8bd3a6d4dc4caa4791706c629743345b7f0613a96c52cbba7e3a5c"
+  },
+  "tool_schema_sha256": "5b3f1b33e6566f016571ca227808dea3a3f4adc117a79a8c4284bf457ea1e2c3",
+  "prelude_source_sha256": "9274477c464797c4c9cecb346a0e327e2fe384d5616af393c3a8b020162a98ae"
+}
