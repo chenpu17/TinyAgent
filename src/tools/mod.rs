@@ -546,17 +546,21 @@ pub(crate) fn resolve(ctx: &ToolCtx, path: &str) -> Result<PathBuf> {
 /// TOCTOU-hardened version (openat / `O_NOFOLLOW` directory-fd walk) would need
 /// platform-specific code on Windows and is out of scope for this threat model.
 /// No path beyond this size can open on ANY supported OS — unix PATH_MAX
-/// caps a syscall path at 4096 bytes, Windows `\\?\` at 32767 UTF-16 chars
-/// (so >32 KiB also implies >16383 components). Past it the string is a
-/// payload, not a filename, and [`confined_to`]'s deepest-existing-ancestor
-/// walk below would pay one canonicalize per component for nothing: each
-/// failed call is µs-scale on unix but ~100µs+ on Windows filter drivers
-/// (60k segments measured 10.7s there; sec-review M-2 shape, surfaced by
-/// the Windows E2E run). The cap sits one step ABOVE the Windows hard limit
-/// so no openable path anywhere changes behavior — only payload strings
-/// bail before the walk. Length only (never `components()`, an extra O(n)
-/// scan) — `OsStr::len` is a stored field read.
-const MAX_ANYOS_PATH_BYTES: usize = 32 * 1024;
+/// caps a syscall path at 4096 bytes, Windows `\\?\` at 32767 UTF-16 units.
+/// Mind the unit mismatch: that limit is UTF-16 code units, while
+/// `OsStr::len()` (the check below) is WTF-8 bytes; a BMP char is ≤3 bytes
+/// per unit and an astral char 4 bytes per TWO units, so the byte length of
+/// a maximally long Windows path is bounded by 32767×3 = 98301 bytes. Past
+/// that bound the string is a payload, not a filename, and
+/// [`confined_to`]'s deepest-existing-ancestor walk below would pay one
+/// canonicalize per component for nothing: each failed call is µs-scale on
+/// unix but ~100µs+ on Windows filter drivers (60k segments measured 10.7s
+/// there; sec-review M-2 shape, surfaced by the Windows E2E run). The cap
+/// sits one step ABOVE the Windows hard limit so no openable path anywhere
+/// changes behavior — only payload strings bail before the walk. Length
+/// only (never `components()`, an extra O(n) scan) — `OsStr::len` is a
+/// stored field read.
+const MAX_ANYOS_PATH_BYTES: usize = 96 * 1024;
 
 pub(crate) fn confined_to(root: &Path, full: &Path, label: &str) -> Result<PathBuf> {
     if full.as_os_str().len() > MAX_ANYOS_PATH_BYTES {

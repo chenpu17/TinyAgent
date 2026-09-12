@@ -337,9 +337,24 @@ pub(crate) fn fold_summary(messages: &[Message], cut: usize, summary: &str) -> V
     // fresh empty user head then, rather than grafting it onto an assistant.
     // `first()` (not `[0]`): this is pub(crate) and a caller handing in an
     // empty slice must get the fresh-head fallback, not an index panic.
-    let mut head = match messages.first() {
+    let (mut head, mut quotes) = match messages.first() {
         Some(m) if m.role == Role::User => {
             let mut h = m.clone();
+            // Quotes preserved by earlier folds must survive this fold too
+            // ("Survives later folds", see the USER_QUOTE_* consts) — collect
+            // them BEFORE the strip below. Scanning the stripped clone could
+            // never find them: the strip removes USER_QUOTE_MARKER blocks, so
+            // the old scan was dead code and second folds silently dropped
+            // the previous era's verbatim quotes. Era order matters: old
+            // quotes first, so the FIFO budget below evicts the OLDEST.
+            let old: Vec<String> = h
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    Block::Text(t) if t.starts_with(USER_QUOTE_MARKER) => Some(t.clone()),
+                    _ => None,
+                })
+                .collect();
             // All system-managed head blocks are stripped and re-derived
             // below — the new fold replaces, never stacks, them.
             h.content.retain(|b| {
@@ -351,21 +366,13 @@ pub(crate) fn fold_summary(messages: &[Message], cut: usize, summary: &str) -> V
                             || t.starts_with(USER_QUOTE_MARKER)
                 )
             });
-            h
+            (h, old)
         }
-        _ => Message::user(Vec::new()),
+        _ => (Message::user(Vec::new()), Vec::new()),
     };
     // Verbatim user quotes: keep the ones earlier folds already preserved
     // (they're middle-user text of THEIR era), add this fold's middle user
     // texts, then enforce the shared budget FIFO-oldest-first.
-    let mut quotes: Vec<String> = vec![];
-    for b in &head.content {
-        if let Block::Text(t) = b {
-            if t.starts_with(USER_QUOTE_MARKER) {
-                quotes.push(t.clone());
-            }
-        }
-    }
     for m in messages.get(1..cut).unwrap_or_default() {
         if m.role != Role::User {
             continue;
@@ -391,8 +398,6 @@ pub(crate) fn fold_summary(messages: &[Message], cut: usize, summary: &str) -> V
             acc -= quotes.remove(0).len();
         }
     }
-    head.content
-        .retain(|b| !matches!(b, Block::Text(t) if t.starts_with(USER_QUOTE_MARKER)));
     for q in quotes {
         head.content.push(Block::Text(q));
     }

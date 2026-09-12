@@ -456,7 +456,7 @@ impl Task for CompactTask {
             )
             .map_err(err)?;
         match outcome {
-            Some(o) => serde_json::to_value(&o).map_err(err),
+            Some(o) => serde_json::to_value(o).map_err(err),
             None => Ok(Value::Null),
         }
     }

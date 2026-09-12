@@ -465,6 +465,64 @@ fn fold_summary_caps_user_quotes_fifo() {
 }
 
 #[test]
+fn fold_summary_second_fold_keeps_old_era_quotes() {
+    // Two folds, two eras: quotes preserved by fold #1 must survive fold #2
+    // ("Survives later folds" is the whole point of re-collecting them from
+    // the head). The collection used to scan the already-stripped head clone,
+    // where it could never match — era-1 quotes silently vanished on the
+    // second fold.
+    let mut msgs = vec![user_text("task")];
+    msgs.push(user_text("first era question"));
+    msgs.push(Message::assistant(vec![Block::Text("a1".into())]));
+    msgs.push(user_text("another first era question"));
+    // Fold #1 swallows everything (empty tail): head + quotes only.
+    let out1 = fold_summary(&msgs, msgs.len(), "era-1 summary");
+    assert_eq!(
+        out1[0]
+            .content
+            .iter()
+            .filter(|b| matches!(b, Block::Text(t) if t.starts_with(USER_QUOTE_MARKER)))
+            .count(),
+        2,
+        "first fold keeps both middle user texts verbatim"
+    );
+    // Era 2 stacks on the folded head, then folds again.
+    let mut msgs2 = out1;
+    msgs2.push(user_text("second era question"));
+    let out2 = fold_summary(&msgs2, msgs2.len(), "era-2 summary");
+    let quotes: Vec<&String> = out2[0]
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            Block::Text(t) if t.starts_with(USER_QUOTE_MARKER) => Some(t),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        quotes.len(),
+        3,
+        "era-1 quotes survive fold #2, the era-2 quote joins them"
+    );
+    // Era order: oldest first — the FIFO budget evicts across eras correctly.
+    assert!(quotes[0].contains("first era question"));
+    assert!(quotes[1].contains("another first era question"));
+    assert!(quotes[2].contains("second era question"));
+    // The new fold replaces, never stacks: exactly one summary, last block.
+    assert_eq!(
+        out2[0]
+            .content
+            .iter()
+            .filter(|b| matches!(b, Block::Text(t) if t.starts_with(SUMMARY_MARKER)))
+            .count(),
+        1
+    );
+    assert!(
+        matches!(out2[0].content.last(), Some(Block::Text(t)) if t.starts_with(SUMMARY_MARKER)),
+        "summary stays the closing head block"
+    );
+}
+
+#[test]
 fn window_lines_skips_all_head_marker_blocks() {
     // Head marker blocks (summary/todo/quotes) are structural, not raw
     // conversation — the summarizer's transcript must not re-feed them
