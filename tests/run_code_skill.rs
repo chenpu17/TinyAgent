@@ -139,7 +139,9 @@ fn execute(scenario: Scenario) -> (ToolOutput, State) {
         budget: None,
         deadline: None,
     };
-    let skill = include_str!("../src/tools/run_code_skill.md");
+    // Windows checkouts may carry CRLF (core.autocrlf); anchor the split on
+    // LF so recipe extraction works regardless of the file's EOL on disk.
+    let skill = include_str!("../src/tools/run_code_skill.md").replace("\r\n", "\n");
     let code = skill
         .split("```js\n// batch-audit-example:")
         .nth(1)
@@ -275,7 +277,7 @@ fn response_recipe_unwraps_json_without_treating_invalid_results_as_empty_pages(
         vec![],
         vec![Arc::new(Box::new(callback) as Box<dyn Tool>)],
     );
-    let skill = include_str!("../src/tools/run_code_skill.md");
+    let skill = include_str!("../src/tools/run_code_skill.md").replace("\r\n", "\n");
     let recipe = skill
         .split("```js\n// response-array-example:")
         .nth(1)
