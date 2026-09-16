@@ -307,6 +307,9 @@ fn run_subagent(
             // prompt-cache hit (input/output zero) must still be billed.
             if re.usage.total() > 0 {
                 out.usage = Some(re.usage);
+                // Same as the success path: the child billed its own chats
+                // into the inherited counter before erroring.
+                out.usage_in_shared_budget = true;
             }
             // Audit trace even on failure: "how far did the child get" is the
             // first question when a parallel `task` fails, and it lives only in
@@ -356,7 +359,11 @@ fn outcome_to_output(o: &RunOutcome, name: &str, max_output_chars: usize) -> Too
         // so don't flag is_error — the prefix note above tells the parent what
         // happened. Only a provider Err (handled in run_subagent) is_error=true.
         is_error: false,
+        // The child's chats billed into the shared counter as they ran
+        // (run_as_subagent inherits ctx.budget) — the parent's fold must take
+        // the totals WITHOUT re-sharing into the counter.
         usage: Some(usage),
+        usage_in_shared_budget: true,
         meta: Some(meta),
     }
 }

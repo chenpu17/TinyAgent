@@ -92,6 +92,7 @@ fn python_ret_to_tooloutput(bound: &Bound<'_, PyAny>) -> anyhow::Result<ta::Tool
         is_error: r.is_error,
         image: None,
         usage: None,
+        usage_in_shared_budget: false,
         meta: None,
     })
 }

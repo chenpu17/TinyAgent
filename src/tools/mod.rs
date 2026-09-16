@@ -109,6 +109,19 @@ impl BudgetGate {
         }
     }
 
+    /// Saturating share of `total` billed tokens into the counter — the
+    /// budget half of billing a chat (or a leaf tool's self-reported usage;
+    /// see [`ToolOutput::usage_in_shared_budget`]). fetch_update (not
+    /// fetch_add): a wrapping add could roll a huge lying counter back to a
+    /// small value and dodge the gate.
+    pub fn share(&self, total: u64) {
+        let _ = self.used.fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |v| Some(v.saturating_add(total)),
+        );
+    }
+
     /// Remaining headroom, saturating: between a turn's billing and the next
     /// turn-boundary gate check the counter may legitimately sit ABOVE the
     /// cap (the gate stops the NEXT turn, it never kills the running one) —
@@ -129,6 +142,17 @@ pub struct ToolOutput {
     /// child run's usage so sub-agent cost is counted honestly in the parent's
     /// totals (and surfaces via AgentEvent::Usage / result.json).
     pub usage: Option<Usage>,
+    /// Whether `usage` was ALREADY shared into the run's budget counter
+    /// (`ToolCtx::budget`) by the producer itself. True only for the `task`
+    /// sub-agent tool: its child bills every chat into the inherited counter
+    /// while it runs, so the parent's fold must skip the counter half (a
+    /// double add would halve the fleet's effective budget). Any other tool
+    /// reporting usage — e.g. a host `CallbackTool` metering an upstream API —
+    /// leaves this false: that spend entered no counter anywhere, so the
+    /// agent's fold shares it (the counter half of `bill_chat`) instead of
+    /// silently exempting it from `max_total_tokens` (external review P2-3:
+    /// tool-reported usage used to bill the totals but never touch the gate).
+    pub usage_in_shared_budget: bool,
     /// Structured audit metadata for the result file, NOT shown to the model —
     /// the model only sees `content`. Currently used by the `task` sub-agent to
     /// attach a compact trace (turns / tools used / token subtotal / stop
@@ -145,6 +169,7 @@ impl ToolOutput {
             image: None,
             is_error: false,
             usage: None,
+            usage_in_shared_budget: false,
             meta: None,
         }
     }
@@ -155,6 +180,7 @@ impl ToolOutput {
             image: None,
             is_error: true,
             usage: None,
+            usage_in_shared_budget: false,
             meta: None,
         }
     }

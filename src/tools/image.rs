@@ -76,6 +76,7 @@ impl Tool for LoadImage {
             image: Some(block),
             is_error: false,
             usage: None,
+            usage_in_shared_budget: false,
             meta: None,
         })
     }

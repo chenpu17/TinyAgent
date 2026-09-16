@@ -598,6 +598,23 @@ pub fn run(
                     // — we don't hard-interrupt a running agent here (sharing one
                     // cancel flag across workers would race with agent::run()'s
                     // entry reset); a second Ctrl-C force-exits via _exit(130).
+                    // Terminal state → its own results file too (external
+                    // review P2-5): empty model/provider/start mirror the
+                    // TaskReport's "not applicable" empties.
+                    write_terminal_result(
+                        &results_dir,
+                        &name,
+                        "cancelled",
+                        "cancelled by user (not started)",
+                        0,
+                        None,
+                        &harness::ResultMeta {
+                            model: String::new(),
+                            provider: String::new(),
+                            started_at: String::new(),
+                            code: None,
+                        },
+                    );
                     TaskReport {
                         name,
                         success: false,
@@ -638,7 +655,28 @@ pub fn run(
                         )
                     })) {
                         Ok(r) => r,
-                        Err(payload) => panic_report(&name, &payload),
+                        Err(payload) => {
+                            // Terminal state → its own results file (external
+                            // review P2-5): a panic mid-run leaves whatever the
+                            // in-flight attempt last wrote; stamp the panic so
+                            // results/<name>.json matches report.json. Attempts
+                            // unknown from the payload — 0 with this note.
+                            write_terminal_result(
+                                &results_dir,
+                                &name,
+                                "panic",
+                                &format!("worker panic: {}", panic_message(&payload)),
+                                0,
+                                None,
+                                &harness::ResultMeta {
+                                    model: String::new(),
+                                    provider: String::new(),
+                                    started_at: crate::harness::now_rfc3339(),
+                                    code: None,
+                                },
+                            );
+                            panic_report(&name, &payload)
+                        }
                     }
                 };
                 eprintln!(
@@ -742,10 +780,11 @@ fn run_one_attempt(
     started_at: &str,
 ) -> TaskReport {
     let start = std::time::Instant::now();
-    // `usage` is the token cost to bill this report. bad_task / setup_error burn
-    // nothing (zero, turns=0); the transient-error path bills the accumulated
-    // cost across attempts (passed in from the caller after `acc.add_failed`),
-    // including the turns those failed attempts actually completed.
+    // `usage` is the token cost to bill this report. bad_task burns nothing
+    // (zero, turns=0); setup_error bills the accumulated cost when it hits a
+    // RETRY (earlier attempts ran for real); the transient-error path bills
+    // the accumulated cost across attempts (passed in from the caller after
+    // `acc.add_failed`), including the turns those failed attempts completed.
     let bad = |stop: &str, msg: String, usage: &crate::provider::Usage, turns: u32| TaskReport {
         name: name.into(),
         success: false,
@@ -762,29 +801,62 @@ fn run_one_attempt(
         model: base.model.clone(),
         started_at: started_at.to_string(),
     };
-    let zero = crate::provider::Usage::default();
+    // bad_task / setup_error are terminal BEFORE the agent runs, so besides
+    // the report entry they must also land their own results file — otherwise
+    // a stale record from a prior invocation of this output dir (or an
+    // earlier attempt) reads as the task's outcome while report.json says
+    // bad_task (external review P2-5). Attempt 1 reaches here with `acc`
+    // untouched (all zeros — nothing has run); a RETRY reaching here (the
+    // rebuild failed: env var gone, MCP down) must still bill what the
+    // earlier attempts really burned — tokens, tool calls, attempt count
+    // (external re-review P2: this used to write zeros, wiping attempt 1's
+    // record from results/<name>.json). Inheriting `acc` / `attempt_no`
+    // unconditionally gives both: zeros exactly when nothing ran.
+    let early = |stop: &str, msg: String| {
+        let model = if attempt_no > 1 {
+            // Same derivation as the backoff-cancel path in run_one: base +
+            // partial is exactly what the earlier attempts ran.
+            partial.model.clone().unwrap_or_else(|| base.model.clone())
+        } else {
+            // Nothing ran under an applied fragment — BASE model.
+            base.model.clone()
+        };
+        write_terminal_result(
+            results_dir,
+            name,
+            stop,
+            &msg,
+            attempt_no,
+            Some(&*acc),
+            &harness::ResultMeta {
+                model: model.clone(),
+                provider: base.provider.as_str().to_string(),
+                started_at: started_at.to_string(),
+                code: None,
+            },
+        );
+        let mut r = bad(stop, msg, &acc.usage, acc.turns);
+        r.model = model;
+        r
+    };
 
     let mut cfg = base.clone();
     if let Some(field) = partial.forbidden_batch_override() {
-        return bad(
+        return early(
             "bad_task",
             format!(
                 "task file must not override '{field}' (only task/system_prompt/model/max_tokens/\
                  limits/reasoning_effort/inject_environment/code are overridable in batch mode)"
             ),
-            &zero,
-            0,
         );
     }
     if let Err(e) = cfg.apply(partial.clone()) {
-        return bad("bad_task", format!("{e:#}"), &zero, 0);
+        return early("bad_task", format!("{e:#}"));
     }
     if cfg.task.is_none() {
-        return bad(
+        return early(
             "bad_task",
             "task file did not set \"task\" and base config has none".into(),
-            &zero,
-            0,
         );
     }
 
@@ -799,12 +871,7 @@ fn run_one_attempt(
     let mut agent = match crate::build_agent(&cfg, initial, client) {
         Ok(a) => a,
         Err(e) => {
-            return bad(
-                "setup_error",
-                format!("agent setup failed: {e:#}"),
-                &zero,
-                0,
-            )
+            return early("setup_error", format!("agent setup failed: {e:#}"));
         }
     };
     // Arm MCP shutdown-reaper on the Ctrl-C flag: a second Ctrl-C exits the
@@ -926,19 +993,59 @@ fn run_one_attempt(
 /// so the retry gate (and any external tooling keying on stop_reason) treats
 /// it as non-transient. No tokens/turns are known — the panic aborted the
 /// task before accounting; elapsed time is lost with the unwinding stack.
-fn panic_report(name: &str, payload: &(dyn std::any::Any + Send)) -> TaskReport {
-    let msg = payload
+/// Write results/<name>.json for a terminal state that did NOT come out of
+/// run_one_attempt's normal completion paths (those write their own record
+/// with full attribution). This is the SINGLE exit point for every other
+/// terminal TaskReport — a cancel during retry backoff, a bad_task, a
+/// setup_error (first attempt or a failed retry rebuild), a never-started
+/// task, a worker panic — so
+/// report.json and results/<name>.json can never disagree about a task's
+/// final state. Before this, those paths left the last attempt's (or a prior
+/// invocation's) record on disk: report.json said cancelled while the results
+/// file still said error, and anything reading results/*.json was misled
+/// (external review P2-5). A write failure only warns — the batch's own
+/// result (report.json) must not die on a per-task artifact.
+fn write_terminal_result(
+    results_dir: &Path,
+    name: &str,
+    stop_reason: &str,
+    error: &str,
+    attempts: usize,
+    acc: Option<&RunCost>,
+    meta: &harness::ResultMeta,
+) {
+    if let Err(e) = harness::write_result(
+        &results_dir.join(format!("{name}.json")),
+        None,
+        Some(error),
+        attempts,
+        stop_reason,
+        acc,
+        meta,
+    ) {
+        eprintln!("[warn] {name}: failed to write result file: {e:#}");
+    }
+}
+
+/// Extract a panic payload's message (&str / String payloads carry one;
+/// anything else falls back to a generic label instead of panicking inside
+/// panic handling).
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
         .downcast_ref::<&str>()
         .map(|s| s.to_string())
         .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "unknown panic".into());
+        .unwrap_or_else(|| "unknown panic".into())
+}
+
+fn panic_report(name: &str, payload: &(dyn std::any::Any + Send)) -> TaskReport {
     TaskReport {
         name: name.into(),
         success: false,
         stop_reason: "panic".into(),
         turns: 0,
         elapsed_secs: 0.0,
-        error: Some(format!("worker panic: {msg}")),
+        error: Some(format!("worker panic: {}", panic_message(payload))),
         input_tokens: 0,
         output_tokens: 0,
         cache_creation_input_tokens: 0,
@@ -960,6 +1067,10 @@ fn run_one(
     cancel: &Arc<std::sync::atomic::AtomicBool>,
 ) -> TaskReport {
     let start = std::time::Instant::now();
+    // Task-level start (shared by every attempt) for the attribution stamp —
+    // hoisted above the isolation block so the setup_error path stamps the
+    // same task-start instant as attempts would.
+    let started_at = crate::harness::now_rfc3339();
     // Per-task workdir isolation: prepared ONCE per task (not per attempt) so
     // a retry sees its predecessor's on-disk side effects — matching today's
     // shared-workdir semantics, where attempt 2 runs in the same tree attempt 1
@@ -969,19 +1080,38 @@ fn run_one(
         Err(e) => {
             // Isolation setup failures are DETERMINISTIC (not a repo, unwritable
             // temp, missing git): report setup_error, no retry, no partial cost.
+            let msg = format!("isolation setup failed: {e:#}");
+            // Terminal state → its own results file, or a stale record from a
+            // prior invocation of this output dir reads as the task's outcome
+            // (external review P2-5). Nothing ran, so attribute to the base
+            // model/provider and zero cost.
+            write_terminal_result(
+                results_dir,
+                name,
+                "setup_error",
+                &msg,
+                0,
+                None,
+                &harness::ResultMeta {
+                    model: base.model.clone(),
+                    provider: base.provider.as_str().to_string(),
+                    started_at: started_at.clone(),
+                    code: None,
+                },
+            );
             return TaskReport {
                 name: name.into(),
                 success: false,
                 stop_reason: "setup_error".into(),
                 turns: 0,
                 elapsed_secs: start.elapsed().as_secs_f64(),
-                error: Some(format!("isolation setup failed: {e:#}")),
+                error: Some(msg),
                 input_tokens: 0,
                 output_tokens: 0,
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 0,
                 model: base.model.clone(),
-                started_at: crate::harness::now_rfc3339(),
+                started_at,
             };
         }
     };
@@ -1000,8 +1130,6 @@ fn run_one(
     // attempt, so each failed attempt's tokens/tools can only be recovered via
     // the RunError it returns — accumulate here and fold into the final result.
     let mut acc = RunCost::default();
-    // Task-level start (shared by every attempt) for the attribution stamp.
-    let started_at = crate::harness::now_rfc3339();
     let mut report = run_one_attempt(
         base,
         name,
@@ -1029,6 +1157,28 @@ fn run_one(
         // sleep — otherwise the next run_one_attempt runs a full task the user
         // wanted to abort, and only the gate on the NEXT task stops the batch.
         if crate::retry::sleep_cancelable(cancel.as_ref(), backoff) {
+            // Terminal state → rewrite the per-task results file too: it still
+            // holds the last attempt's "error" record, which would contradict
+            // the cancelled report.json entry (external review P2-5: exit 130,
+            // report.json cancelled, results/<name>.json stale error). The
+            // accumulated cost carries the failed attempts' real spend; the
+            // model attribute is the fragment's override when it set one
+            // (run_one's report entry can't recover it, but the applied config
+            // is exactly base + partial, so it's derivable here).
+            write_terminal_result(
+                results_dir,
+                name,
+                "cancelled",
+                "cancelled by user during retry backoff",
+                attempt + 1,
+                Some(&acc),
+                &harness::ResultMeta {
+                    model: partial.model.clone().unwrap_or_else(|| base.model.clone()),
+                    provider: base.provider.as_str().to_string(),
+                    started_at: started_at.clone(),
+                    code: None,
+                },
+            );
             report = TaskReport {
                 name: name.into(),
                 success: false,
@@ -1419,13 +1569,19 @@ mod tests {
         assert!(tasks.iter().all(|t| !t.success));
         assert!(tasks.iter().all(|t| t.stop_reason == "cancelled"));
         assert!(tasks.iter().all(|t| t.turns == 0));
-        // No per-task result files were written (tasks never ran).
+        // Every terminal task also lands its own result file — single exit
+        // point (external review P2-5): a never-started task used to leave
+        // whatever a prior invocation of this output dir wrote, which read as
+        // the task's outcome while report.json said cancelled. The record is
+        // a zero-attempt cancelled stub.
         let results_dir = dir.join("results");
-        assert_eq!(
-            std::fs::read_dir(&results_dir).unwrap().count(),
-            0,
-            "cancelled tasks must not write result files"
-        );
+        for name in ["a", "b"] {
+            let raw = std::fs::read_to_string(results_dir.join(format!("{name}.json")))
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(v["stop_reason"].as_str().unwrap(), "cancelled", "{raw}");
+            assert_eq!(v["attempts"].as_u64().unwrap(), 0, "{raw}");
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1718,6 +1874,178 @@ mod tests {
             "failed run bills the model that actually ran"
         );
         assert_eq!(tasks[0].stop_reason, "error");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cancel_during_retry_backoff_rewrites_the_result_file() {
+        // External review P2-5: cancelling during retry backoff used to update
+        // only the in-memory TaskReport (report.json → cancelled) while
+        // results/<name>.json kept the failed attempt's "error" record —
+        // anything reading the per-task file was misled. The terminal state
+        // must land in BOTH places.
+        let dir = std::env::temp_dir().join(format!("ta-batch-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("t.json"), r#"{"task":"x"}"#).unwrap();
+
+        std::env::set_var("TA_BATCH_CANCEL_KEY", "dummy");
+        let base: Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"TA_BATCH_CANCEL_KEY","model":"m","base_url":"http://127.0.0.1:9"}"#,
+        )
+        .unwrap();
+        let report = dir.join("report.json");
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Attempt 1 dies instantly (connection refused → transient error);
+        // backoff(0) is 0.75–1.25s, so a flip at 300ms lands mid-backoff —
+        // sleep_cancelable honors it within ~100ms.
+        let flipper = {
+            let cancel = cancel.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                cancel.store(true, Ordering::Relaxed);
+            })
+        };
+
+        let code = run(&base, &dir, 1, &report, 1, false, IsolateMode::None, cancel).unwrap();
+        flipper.join().unwrap();
+        assert_eq!(code, 130, "cancelled batch exits 130");
+
+        let tasks = read_prior_tasks(&report).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].stop_reason, "cancelled");
+
+        // The per-task file must AGREE with the report: cancelled with the
+        // failed attempt's stop_reason, not a stale "error".
+        let raw = std::fs::read_to_string(dir.join("results").join("t.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            v["stop_reason"].as_str().unwrap(),
+            "cancelled",
+            "results file: {raw}"
+        );
+        assert_eq!(v["attempts"].as_u64().unwrap(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn retry_setup_failure_keeps_prior_attempt_cost() {
+        // 2026-09 external re-review P2: a transient attempt-1 failure
+        // followed by a RETRY whose agent rebuild fails (the api key env var
+        // disappeared mid-backoff) used to write a zero-cost setup_error
+        // terminal record, wiping attempt 1's real tokens / tool calls /
+        // attempt count from BOTH results/<name>.json and report.json.
+        //
+        // Two-phase mock: request 1 = OpenAI SSE with a tool_use + usage
+        // frame (100/10); the agent runs the tool, sends the follow-up, and
+        // request 2 is dropped on the floor (transport error → transient
+        // RunError carrying attempt 1's cost into `acc`). The env var is
+        // removed 300ms in — mid-backoff(0) (0.75–1.25s), before attempt 2's
+        // build_agent reads it → setup_error on the retry.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        std::thread::spawn(move || {
+            let mut served = false;
+            for stream in listener.incoming() {
+                let mut stream = match stream {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let _body = read_http_body(&stream);
+                if !served {
+                    served = true;
+                    let payload = concat!(
+                        "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"x.txt\\\"}\"}}]}}]}\n\n",
+                        "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n\n",
+                        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":10}}\n\n",
+                        "data: [DONE]\n\n",
+                    );
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        payload.len(),
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(payload.as_bytes());
+                    let _ = stream.flush();
+                }
+                // Request 2+: serve nothing and let the connection close —
+                // a transport error the loop surfaces as a transient
+                // RunError (stop_reason "error" → retried by run_one).
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("ta-batch-retrysetup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("t.json"), r#"{"task":"x"}"#).unwrap();
+
+        std::env::set_var("TA_BATCH_RETRYSETUP_KEY", "dummy");
+        let base: Config = serde_json::from_str(&format!(
+            r#"{{"provider":"openai","api_key_env":"TA_BATCH_RETRYSETUP_KEY","model":"m","tools":["read_file"],"base_url":"{}"}}"#,
+            url
+        ))
+        .unwrap();
+        let report = dir.join("report.json");
+        // 300ms in: attempt 1 (two local requests + one tool run, single-digit
+        // ms) has long finished and backoff(0) is still sleeping; attempt 2
+        // has not built its agent yet.
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(300));
+            std::env::remove_var("TA_BATCH_RETRYSETUP_KEY");
+        });
+
+        let code = run(
+            &base,
+            &dir,
+            1,
+            &report,
+            1,
+            false,
+            IsolateMode::None,
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(code, 1, "setup_error on the retry → batch exit 1");
+
+        let tasks = read_prior_tasks(&report).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].stop_reason, "setup_error");
+        assert_eq!(
+            tasks[0].input_tokens, 100,
+            "attempt 1's tokens must survive the retry's setup failure"
+        );
+        assert_eq!(tasks[0].output_tokens, 10);
+        assert!(tasks[0].turns >= 1, "attempt 1 completed a turn");
+
+        // The per-task file must carry the SAME honest cost plus the attempt
+        // count — this is the record a CI reads for tool_calls/summary.
+        let raw = std::fs::read_to_string(dir.join("results").join("t.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            v["stop_reason"].as_str().unwrap(),
+            "setup_error",
+            "results file: {raw}"
+        );
+        assert_eq!(
+            v["attempts"].as_u64().unwrap(),
+            2,
+            "the retry happened: {raw}"
+        );
+        assert_eq!(
+            v["input_tokens"].as_u64().unwrap(),
+            100,
+            "results file: {raw}"
+        );
+        assert_eq!(
+            v["output_tokens"].as_u64().unwrap(),
+            10,
+            "results file: {raw}"
+        );
+        assert!(
+            v["tool_calls"].as_array().is_some_and(|a| !a.is_empty()),
+            "attempt 1's read_file call must survive: {raw}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

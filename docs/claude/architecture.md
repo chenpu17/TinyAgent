@@ -19,6 +19,12 @@
   cancel 标志，所以**每个流式请求必带 per-request timeout 兜底**（`STREAM_BACKSTOP`，10min；有 run budget
   时改用剩余预算）——否则半开连接会让 reader 线程在 caller 已放弃（idle/cancel）后无限挂住（线程+连接泄漏）。
   reqwest blocking 没有 idle-read timeout，per-request total cap 是唯一能保证 reader 退出的手段。
+  **SSE 内存三层限额**（`SseReader`，外部评审 P2-6——时间兜底不是字节兜底，快网关在超时窗内可灌任意量）：
+  单行 `SSE_LINE_MAX`（16 MiB）→ 单事件聚合 `SSE_EVENT_MAX`（4×行帽，防无空行终止的 `data:` 行无限拼接）
+  → 单响应累计 `SSE_TOTAL_MAX`（64 MiB，防无数小事件累加；消费端拼装文本正由这些 payload 构成，故同时
+  封顶留存内存）；`CancellableSse` 的通道是 `sync_channel(16)`——生产快于消费（宿主事件回调慢，如绑定
+  的跨线程 round-trip）时 send 阻塞产生 TCP 背压，而非无界排队。限额可注入（`next_data_with`）便于小值
+  单测；新增流式读取路径照抄同款三层。
 - **两个 provider** 共享 `parse_loop` 与 `Message`/`Block` 类型：`provider/openai.rs`（兼容协议，
   覆盖 DeepSeek/vLLM/Ollama）与 `provider/anthropic.rs`（原生）。两者都解析 token 用量
   （OpenAI 走 `stream_options.include_usage` + `choices:[]` 末块；Anthropic 走
@@ -91,9 +97,13 @@
   共享花费计数器（`ToolCtx::budget: Option<Arc<AtomicU64>>`，每次顶层 run 换新——与 usage 每 run
   重置对齐；`run_as_subagent` 经 `child_ctx` 继承同一个），**父与每个在飞 `task` 子 agent 的闸门读的
   都是它**——并行子 agent 集体触顶，不再各自烧满一份预算后 join 才被发现。写入端：**直接 chat 走
-  `bill_chat`**（`fetch_update` 饱和累加 + 本地 fold），覆盖轮次 chat 与压缩摘要两个账单；**工具账单
-  （子 agent `ToolOutput.usage` 折进父 totals）走普通 `fold_usage`、绝不进计数器**——子 agent 运行期
-  已自己记过直接花费，父再记一次会把有效预算砍半（有测试钉住）。闸门超限以 `stop_reason:
+  `bill_chat`**（`fetch_update` 饱和累加 + 本地 fold，计数器半边抽成 `BudgetGate::share`），覆盖轮次 chat
+  与压缩摘要两个账单；**工具账单（`ToolOutput.usage` 折进父 totals）按 `usage_in_shared_budget` 标记
+  分流**——`task` 子 agent 置 true（子 agent 运行期已把自己的直接 chat 花费记进继承的计数器，父再记一次
+  会把有效预算砍半），父 fold 只进 totals 不进计数器；其余任何上报 usage 的工具（宿主 CallbackTool
+  计量上游 API 等）默认 false——那笔花费没进过任何计数器，fold 时由 agent 代为 `share_budget` 进闸门
+  （外部评审 P2-3：此前一律不进计数器，工具花费只进账单不进闸门，预算可被绕过）。run_code 的 guest
+  内层调用在内层 fold 点就地 `share`（混合来源聚合后统一置 true 上报）。闸门超限以 `stop_reason:
   "budget_exceeded"`（exit 125）停；turn 边界语义同 `timeout_secs`——顶破上限的那轮照常跑完
   （工具执行、assistant 入历史），闸门只拒开下一轮，配对不破。batch task 片段只能收紧（更小值），
   0 视为"无上限"被忽略。它和 `max_turns`/`timeout` 是 loop 的三个 turn 边界停止条件。
@@ -128,6 +138,16 @@
   只在 `agent_tests.rs::hot_add_remove_mcp_server_live`（`#[ignore]`，本地 python3 起
   `examples/mcp_echo.py`，`cargo test hot_add_remove -- --ignored --nocapture`；末尾 pgrep 断言 child
   零残留）；hermetic 用例只钉路由/错误形状/无变异三件事。
+- **MCP SSE endpoint 同源闸门（`mcp.rs::resolve_endpoint`）**：旧式 HTTP+SSE transport 的 `endpoint`
+  事件决定带凭据（配置 headers，如 Authorization）的 POST 目标，所以必须是 SSE URL 同源——否则被攻破的
+  server 可把认证 POST 重定向到攻击者/内网（SSRF）。**检查与发送共用同一个解析器**：`resolve_endpoint`
+  用 `reqwest::Url::parse + join` 解析（即 reqwest 实际 fetch 用的 WHATWG `url` 规则）、比较
+  `abs.origin() == base.origin()`，返回的 `Url` 原样存进 `SseTransport::post_url` 再发——「检查什么就发
+  什么」。外部评审 P1 曾绕过手写字符串版 origin 切分：`http://evil\@trusted:3000/x` 按纯文本看是
+  userinfo+`trusted:3000`（同源放行），但 WHATWG 把 http/https 里的 `\` 当 `/`，实际发给 `evil`、
+  路径 `/@trusted:3000/x`——任何手写 origin 切分（`find('/')`、rsplit('@')、默认端口剥除……）都可能
+  与真解析器分歧（IDNA、百分号编码 host、userinfo 边角），别再写字符串版；回归测试钉住反斜杠混淆
+  与网络路径变体（`endpoint_resolution_rejects_parser_confusion_bypasses`）。
 - **子 agent（`task` 工具，`tools/subagent.rs`）**：主 agent 把聚焦子任务交给一个全新子 agent
   （独立历史 + 独立 turn 预算，`SUBAGENT_MAX_TURNS=25` 封顶），只把最终摘要作 tool 结果返回。
   **同 turn 多个 `task` 调用并行**：`agent.rs` 的工具执行分两遍——叶子工具（shell/read_file/…）
@@ -231,6 +251,10 @@
   `host_call_tool` 入口 + 收尾裁决（含 `_initialize`/编译失败路径，quickjs stdlib init debug 下 >1s）**四点**。
   `host_call_tool` 入口自 2026-09 审核 #7 起**还查 cancel**：已置位即拒纳新调用并 latch `Interrupt::Cancel`
   （"in-flight 跑完"承诺的是已在跑的调用，不含新纳——`e.kind` 词表随之增量加 `cancel`，走附录 A 修订）；
+  **外部复审 P1 补丁：cancel 臂必须与 deadline 臂同构同时 latch `halted`**——入口拒绝对 guest 是
+  JS **可捕获**异常，旧代码只 latch `interrupt`、重试再入时 `interrupt.is_none()` 守卫直接跳过 cancel
+  检查、被捕获后重试的调用真跑了内层工具（直到 ~10ms epoch trap）；latch halted 后停机检查拒绝一切
+  后续调用（epoch 路径投递的是不可捕获 wasm trap、guest 已死，无此洞）；
   ③ `max_wasm_stack` **384 KiB**（非 1.5 MiB）——开 epoch 插桩后深递归会先损坏 quickjs 无检查的内部递归状态
   （终态是不可归因的 OOB trap），384 KiB 让原生栈上限决定性赢得竞速、稳定归因 StackOverflow；④ wasmtime 按模块缓存
   机器码——冷首次执行 ~10s 懒编译（debug），**测试必须先 warm 模块再计时/再 spawn cancel 翻转线程**（翻转线程先于
@@ -269,7 +293,13 @@
   `available_to_subagent()` 便车（两条退出面解耦）；文件四件套/shell/`McpTool` 显式 true——
   **McpTool 漏覆写 = AppWorld 机制整体断**。宿主 extra_tools 经 `SharedTool`（Arc 同实例）进注册表、
   `CallbackTool::with_code_access()` 逐工具授权；guest-only 原语 `copy_bytes`（host 流式字节保真复制，
-  策略面在拦截层 copy 臂：src 读规则/dst 写规则）注册在 retain 之后。错误封套带结构化字段
+  策略面在拦截层 copy 臂：src 读规则/dst 写规则）注册在 retain 之后。**拦截层的符号链接走查按原始
+  拼写逐组件进行**（外部复审 P1：内核在 write 时才解析、`..` 只在解析完前面的组件后生效——
+  `link/../x` 的真实写位置经 `link` 逃出 workdir；旧实现先词法折叠 `..` 把 `link` 从走查里抹掉，
+  策略层看到干净路径。现行两段式：词法折叠只做"折叠后在 workdir 外"的快速筛，随后按原始拼写
+  Normal 推进即查 symlink、ParentDir 弹栈——无 symlink 组件时词法形 == 解析形，workdir_relative
+  的词法回退不变式由此成立；工具最终写的就是原始拼写，检查与写入才用同一解析结果）。
+  错误封套带结构化字段
   `kind/tool/retryable`（glue 附到 Error 上；`tool` 类刻意不给 retryable——host 无法机判；
   **args 解析失败也是 `host` 类结构化错误而非静默 `{}`**——`parse_guest_args`，v0.8，对称于坏指针；
   shipped glue 恒发合法 JSON，该路径仅限绕过 JS 包装直戳 import 的 guest，模型可见词汇表不变），
@@ -343,6 +373,14 @@
   `write_result` 的 None 分支（`write_result(..., Some(&acc))`）写入 token + tool_calls，而不是清零；batch 的
   `TaskReport` 同样带 4 个 token 字段，失败任务的 report.json 照计 acc（`run_one_attempt` 的 Err 路径用 `&acc.usage`，
   取消路径亦然）。`RunCost::add_failed`/`fold_into` 是共用的累加原语。改重试/返回类型/写结果文件的人要保住这条。
+  **batch 终态落盘单出口**（`batch::write_terminal_result`，外部评审 P2-5）：不经 `run_one_attempt`
+  正常完成的终态（退避中取消、bad_task/setup_error 早退、未启动即取消、worker panic）**也必须写
+  `results/<name>.json`**——否则 report.json 说 cancelled 而 results 里留着上一次尝试（或上一轮运行）
+  的 error 记录，读 per-task 文件的下游被误导。新增终态路径一律走这个出口，别只改内存 TaskReport。
+  **早退 `early` 一律继承 `acc`/`attempt_no`**（外部复审 P2：重试轮的 agent 重建失败——env 中途消失、
+  MCP 起不来——曾把零成本 setup_error 写进 results/<name>.json，抹掉第 1 轮真实烧掉的 token/工具
+  调用/尝试数；第 1 轮到达此处时 `acc` 天然全零，无条件继承两种情形都对；model 归因在 attempt>1
+  时走 `partial.model` 派生，与退避取消路径同款）。
 - **headless Ctrl-C** 走 `signal.rs`：首次按 Ctrl-C 翻 cancel 标志（流式 ≤200ms 内断，照常写
   `result.json`，exit 130），二次立即退 130。**unix** 用 `signal(SIGINT, …)`，handler 只碰 lock-free
   原子 + `libc::_exit`（async-signal-safe）；**Windows** 用 `SetConsoleCtrlHandler`（kernel32 FFI，

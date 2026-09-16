@@ -578,6 +578,18 @@ fn host_call_tool(
             let why = "run_code: cancelled (host cancel flag) — the sandbox \
                        is halted for the rest of this execution"
                 .to_string();
+            // Halt the sandbox too (external re-review P1): this error is
+            // JS-CATCHABLE, and a guest that catches it and retries re-enters
+            // with `interrupt` already latched — the old `interrupt.is_none()`
+            // guard then SKIPPED the cancel check and the retried call ran a
+            // real inner tool until the next ~10ms epoch trap. Same shape as
+            // the deadline arm below: latch interrupt (attribution) AND
+            // halted (admission refusal) together, so any already-latched
+            // interrupt state rejects every subsequent call.
+            d.halted = Some(HaltState {
+                kind: "cancel",
+                why: why.clone(),
+            });
             return envelope_err(caller, "cancel", Some(&name), Some(false), &why);
         }
         if d.deadline.is_some_and(|w| Instant::now() >= w.at) && d.interrupt.is_none() {
@@ -738,6 +750,19 @@ fn host_call_tool(
         });
         // Honest cost fold (FR-10): inner tool usage bills to this run via
         // the shared saturating merge (compress.rs) — no local re-implementation.
+        // Leaf-reported usage (usage_in_shared_budget=false — e.g. a host
+        // callback tool metering an upstream API) is shared into the budget
+        // counter HERE, at the innermost fold: run_code reports the aggregate
+        // upward with the flag set (everything in it is now counter-shared),
+        // and inner `task` children's spend was already shared by their own
+        // chats — so nothing double-counts on the way up.
+        if let Some(u) = &output.usage {
+            if !output.usage_in_shared_budget {
+                if let Some(g) = &d.ctx.budget {
+                    g.share(u.total());
+                }
+            }
+        }
         if let Some(merged) =
             crate::compress::merge_usage(Some(std::mem::take(&mut d.usage)), output.usage)
         {
@@ -1036,26 +1061,72 @@ const MAX_REL_SEGMENTS: usize = 256;
 
 /// Does the write target traverse a symlink component under the workdir?
 /// Iterative — depth is bounded by the path guards and never guest-controlled
-/// recursion. Paths that lexical-collapse outside the workdir return false:
-/// the outside-workdir rule rejects them right after, no walk needed.
+/// recursion. Two-stage judgment:
+///
+/// 1. Lexical screen: fold the spelling and bail early when it collapses
+///    outside the workdir (the outside-workdir rule rejects those right
+///    after — no walk needed).
+/// 2. Symlink walk on the ORIGINAL spelling, component by component
+///    (external re-review P1): the kernel applies `..` only AFTER resolving
+///    the component in front of it — `link/../x` resolves THROUGH `link`,
+///    and the tool writes the original spelling, so that is what the
+///    kernel actually does at write time. The old code folded `..` FIRST,
+///    which erases `link` from the walk and shows the policy layer a clean
+///    path while the real write escapes. Walking original order —
+///    push-and-check on Normal, pop on ParentDir — rejects a symlink in any
+///    original position; every component that survives its check is a real
+///    directory, so a lexical pop matches the kernel's resolution, and with
+///    no symlink components the lexical form IS the resolved form (the
+///    invariant workdir_relative's lexical fallback relies on).
 fn write_traverses_symlink(workdir_canon: &Path, path: &str) -> bool {
     let full = lexical_normalize(&absolutize(workdir_canon, path));
-    let Ok(rel) = full.strip_prefix(workdir_canon) else {
-        return false;
-    };
-    // Payload paths (sec-review M-2): the walk below pays one symlink_metadata
-    // per segment — µs-scale on unix, ~100µs+ on Windows filter drivers (60k
-    // segments measured 12s there). Over-limit rels are denied fail-closed by
-    // the workdir_relative length check right after regardless, so skipping
-    // the walk only saves the doomed syscalls, never flips a decision.
-    if rel.as_os_str().len() > MAX_REL_PATH_BYTES || rel.components().count() > MAX_REL_SEGMENTS {
+    if full.strip_prefix(workdir_canon).is_err() {
         return false;
     }
+    // Payload paths (sec-review M-2): the walk below pays one symlink_metadata
+    // per segment — µs-scale on unix, ~100µs+ on Windows filter drivers (60k
+    // segments measured 12s there). Over-limit spellings are denied
+    // fail-closed by workdir_relative's length check right after regardless,
+    // so skipping the walk only saves the doomed syscalls, never flips a
+    // decision. Guard the ORIGINAL spelling: it is what drives the walk.
+    if path.len() > MAX_REL_PATH_BYTES {
+        return false;
+    }
+    let orig = Path::new(path);
+    let rel: &Path = if orig.is_absolute() {
+        // Absolute spellings reaching here lexical-collapse inside the
+        // workdir, so their prefix must literally BE the canonical workdir
+        // (spellings like "/x/../w/y" whose front differs collapse back
+        // onto it — strip_prefix sees the front and fails, nothing to walk:
+        // the kernel-truth canonicalize in workdir_relative below judges
+        // those). The remainder walks exactly like a relative spelling.
+        match orig.strip_prefix(workdir_canon) {
+            Ok(r) => r,
+            Err(_) => return false,
+        }
+    } else {
+        orig
+    };
+    if rel.components().count() > MAX_REL_SEGMENTS {
+        return false;
+    }
+    use std::path::Component;
     let mut cur = workdir_canon.to_path_buf();
     for comp in rel.components() {
-        cur.push(comp.as_os_str());
-        if std::fs::symlink_metadata(&cur).is_ok_and(|m| m.file_type().is_symlink()) {
-            return true;
+        match comp {
+            Component::Normal(c) => {
+                cur.push(c);
+                if std::fs::symlink_metadata(&cur).is_ok_and(|m| m.file_type().is_symlink()) {
+                    return true;
+                }
+            }
+            Component::ParentDir => {
+                cur.pop();
+            }
+            Component::CurDir => {}
+            // Absolute originals were relativized above; relative spellings
+            // carry no prefix/root components.
+            Component::Prefix(_) | Component::RootDir => {}
         }
     }
     false
@@ -1441,14 +1512,20 @@ function readLines(path) {
 }
 function writeVerified(path, content) {
     tools.call("write_file", {path: path, content: content});
-    var expect = __ta_b64(__ta_utf8(content)), off = 0;
+    var bytes = __ta_utf8(content), expect = __ta_b64(bytes), off = 0;
     var CH = 1399995;
     for (;;) {
         var r = tools.call("read_file", {path: path, raw: true, offset: off, limit: CH});
         if (!r || typeof r !== "object" || typeof r.content_b64 !== "string") throw new Error("writeVerified: unexpected read_file output");
         var seg = expect.substr((off / 3) * 4, r.content_b64.length);
         if (r.content_b64 !== seg) throw new Error("writeVerified: read-back mismatch in " + path + " at byte " + off + " — the file on disk differs from what was written");
-        if (!r.truncated) return "verified " + content.length + " chars to " + path;
+        if (!r.truncated) {
+            // EOF alone is NOT success: a SHORTER file (a hooks rewrite, a
+            // partial write) reads back as a matching prefix, so the slice
+            // compare above passes — only the total-length check catches it.
+            if (off + r.bytes_read !== bytes.length) throw new Error("writeVerified: length mismatch in " + path + " — expected " + bytes.length + " bytes on disk, read back " + (off + r.bytes_read));
+            return "verified " + content.length + " chars to " + path;
+        }
         off += r.bytes_read;
     }
 }
@@ -1728,6 +1805,7 @@ impl RunCodeTool {
             return ToolOutput {
                 is_error: true,
                 usage: None,
+                usage_in_shared_budget: false,
                 content: format!("[run_code] terminated: {why}"),
                 image: None,
                 // Same audit shape as the in-flight path: zero calls, zero
@@ -1934,7 +2012,11 @@ impl RunCodeTool {
         );
         ToolOutput {
             is_error: rc != 0,
+            // Aggregated inner-call spend: every token of it was shared into
+            // the budget counter at the inner fold point (see host_call's
+            // FR-10 fold), so the parent's fold takes totals only.
             usage: (usage.total() > 0).then_some(usage),
+            usage_in_shared_budget: true,
             content,
             image: None,
             meta: Some(meta),
@@ -2013,7 +2095,10 @@ impl RunCodeTool {
         );
         ToolOutput {
             is_error: true,
+            // Same as the success path: the aggregate was counter-shared at
+            // the inner fold points before the trap.
             usage: (usage.total() > 0).then_some(usage),
+            usage_in_shared_budget: true,
             content,
             image: None,
             meta: Some(meta),
@@ -3880,6 +3965,70 @@ return t.length;"#}),
         );
     }
 
+    /// 2026-09 external re-review P1: the symlink walk used to fold `..`
+    /// FIRST, which erases the symlink from the path it inspects —
+    /// `link/../x` handed the policy layer a clean lexical form ("x",
+    /// inside the workdir) while the kernel resolves the actual WRITE
+    /// through `link` first and the file lands OUTSIDE. The walk must
+    /// follow the ORIGINAL spelling: push-and-check each Normal component,
+    /// pop on ParentDir. Also pins the no-false-positive side (`..` past a
+    /// real directory stays writable) and the copy_bytes dst arm (same
+    /// shared check).
+    #[cfg(unix)]
+    #[test]
+    fn write_via_symlink_dotdot_escape_rejected() {
+        let outer = std::env::temp_dir().join(format!("ta-run-code-esc-{}", std::process::id()));
+        std::fs::create_dir_all(outer.join("sub")).unwrap();
+        let dir = outer.join("inside");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        std::os::unix::fs::symlink(outer.join("sub"), dir.join("link")).unwrap();
+        std::fs::write(dir.join("src.bin"), "payload").unwrap();
+        let out = tool_with_tools(CodeConfig::default(), r#"["read_file","write_file"]"#)
+            .run_with_emit(
+                &json!({"code": r#"
+                    let esc, cp, ok;
+                    try { tools.call("write_file", {path: "link/../escaped.txt", content: "pwn"}); esc = "wrote"; }
+                    catch (e) { esc = String(e); }
+                    try { tools.call("copy_bytes", {src: "src.bin", dst: "link/../escaped.bin"}); cp = "copied"; }
+                    catch (e) { cp = String(e); }
+                    try { tools.call("write_file", {path: "real/../ok.txt", content: "fine"}); ok = "wrote"; }
+                    catch (e) { ok = String(e); }
+                    return {esc: esc.slice(0, 80), cp: cp.slice(0, 80), ok: ok};"#}),
+                &ctx(&dir),
+                &mut |_| {},
+            )
+            .unwrap();
+        let r = serde_json::from_str::<Value>(&out.content).unwrap_or(json!(null));
+        assert!(!out.is_error, "{}", out.content);
+        assert!(
+            r["esc"].as_str().unwrap_or("").contains("symlink"),
+            "the write escape must be refused and name the symlink: {}",
+            out.content
+        );
+        assert!(
+            r["cp"].as_str().unwrap_or("").contains("symlink"),
+            "the copy_bytes dst escape must be refused too: {}",
+            out.content
+        );
+        assert!(
+            !outer.join("escaped.txt").exists() && !outer.join("escaped.bin").exists(),
+            "nothing may land outside via link/.."
+        );
+        // No false positive: `..` past a REAL directory component is plain
+        // spelling noise, the original-spelling walk must not reject it.
+        assert_eq!(
+            r["ok"],
+            json!("wrote"),
+            "real-dir .. must stay writable: {}",
+            out.content
+        );
+        assert!(
+            dir.join("ok.txt").exists(),
+            "the benign write must have landed"
+        );
+    }
+
     /// Sec-review M-2: a ~500k-segment guest path is a payload, not a
     /// filename — it must cost neither host stack (recursive glob matcher)
     /// nor time. Reads fall through and fail at the tool; writes are denied.
@@ -4404,6 +4553,93 @@ return t.length;"#}),
         );
     }
 
+    /// 2026-09 external re-review P1 — the CAUGHT-exception half of the entry
+    /// gate: the entry rejection is a JS-catchable error, and the old gate
+    /// re-checked the host flag only while `interrupt` was still None — a
+    /// guest that caught the rejection and retried re-entered with
+    /// `interrupt` latched, the cancel arm SKIPPED, and the retried call ran
+    /// a real inner tool until the ~10ms epoch trap. The fix latches
+    /// `halted` alongside `interrupt` (same shape as the deadline arm), so
+    /// the halt check refuses every post-catch retry. Deterministic despite
+    /// the epoch race: whether the halt check refuses each retried call or
+    /// the epoch trap beats the guest to it, only the ONE pre-cancel call is
+    /// ever admitted — the loop counts refusals so a fast guest that finishes
+    /// before the first tick is accepted too.
+    #[test]
+    fn caught_cancel_exception_does_not_admit_retried_calls() {
+        use crate::tools::CallbackTool;
+        use std::sync::atomic::AtomicBool;
+        let flag = Arc::new(AtomicBool::new(false));
+        let trip = {
+            let flag = flag.clone();
+            CallbackTool::new(
+                ToolDef {
+                    name: "trip_cancel".into(),
+                    description: "flips the host cancel flag".into(),
+                    schema: json!({"type": "object"}),
+                },
+                move |_input: &Value, _ctx: &ToolCtx| {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    Ok(ToolOutput::text(String::from("flag set")))
+                },
+            )
+            .with_code_access()
+        };
+        let cfg: Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"K","model":"m","inject_environment":false,
+                "tools":["read_file"],"code":{"enabled":true}}"#,
+        )
+        .unwrap();
+        let tool = RunCodeTool::new(
+            &cfg,
+            Arc::new(RwLock::new(CodeConfig::default())),
+            &reqwest::blocking::Client::new(),
+            "k",
+            vec![],
+            vec![Arc::new(Box::new(trip) as Box<dyn Tool>)],
+        );
+        let dir = scratch();
+        let mut c = ctx(&dir);
+        c.cancel = Some(flag);
+        let out = tool
+            .run_with_emit(
+                &json!({"code": r#"
+                    tools.call("trip_cancel", {});
+                    var refused = 0;
+                    for (var i = 0; i < 50; i++) {
+                        try { tools.call("trip_cancel", {}); }
+                        catch (e) { refused++; }
+                    }
+                    return "refused=" + refused;
+                "#}),
+                &c,
+                &mut |_| {},
+            )
+            .unwrap();
+        let meta = out.meta.expect("audit meta");
+        assert_eq!(
+            meta["call_count"], 1,
+            "no retried call may be admitted after the caught cancel: {meta}"
+        );
+        if out.is_error {
+            // The epoch trap caught the loop mid-flight — the tombstone must
+            // attribute it to cancel, not to a guest error.
+            assert!(
+                out.content.contains("cancelled (host cancel flag)"),
+                "trap must attribute to cancel: {}",
+                out.content
+            );
+        } else {
+            // The guest finished the whole loop before the first epoch tick —
+            // every one of the 50 retries must have been refused.
+            assert!(
+                out.content.contains("refused=50"),
+                "guest completed: every retry must be refused: {}",
+                out.content
+            );
+        }
+    }
+
     /// correctness-review M-2: a `timeout_secs` near u64::MAX overflows the
     /// clock on naive `now + Duration` — it must degrade to "no wall clock"
     /// (checked_add, mirroring agent.rs's limits.timeout_secs discipline and
@@ -4850,6 +5086,63 @@ return t.length;"#}),
             b"tail-no-newline"
         );
         assert_eq!(std::fs::read(dir.join("b.txt")).unwrap(), b"line1\nline2\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A Hooks layer that truncates every write_file body to 3 bytes — the
+    /// external-review P2-2 repro shape. writeVerified's read-back used to
+    /// prefix-match the shortened file (read the whole file → not truncated →
+    /// the expected-prefix slice compares equal) and return
+    /// "verified 6 chars" with is_error=false; only a total-length check at
+    /// EOF catches a SHORTER-than-written file.
+    #[test]
+    fn prelude_write_verified_rejects_hook_shortened_write() {
+        use crate::hooks::{Hooks, ToolDecision};
+
+        struct TruncateTo3;
+        impl Hooks for TruncateTo3 {
+            fn before_tool(
+                &self,
+                tool: &str,
+                input: &Value,
+                _ctx: &crate::tools::ToolCtx,
+            ) -> ToolDecision {
+                if tool == "write_file" {
+                    if let Some(c) = input.get("content").and_then(|v| v.as_str()) {
+                        if c.len() > 3 {
+                            let mut v = input.clone();
+                            v["content"] = Value::String(c[..3].to_string());
+                            return ToolDecision::Modify(v);
+                        }
+                    }
+                }
+                ToolDecision::Allow
+            }
+        }
+
+        let dir = scratch();
+        let mut guest_ctx = ctx(&dir);
+        guest_ctx.hooks = Some(std::sync::Arc::new(TruncateTo3));
+        let out = tool_with_tools(CodeConfig::default(), r#"["read_file","write_file"]"#)
+            .run_with_emit(
+                &json!({"code": r#"return writeVerified("a.txt", "abcdef");"#}),
+                &guest_ctx,
+                &mut |_| {},
+            )
+            .unwrap();
+        // The hook DID rewrite the file to the 3-byte prefix; the helper must
+        // refuse to call that verified instead of blessing the prefix.
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"abc");
+        assert!(
+            out.is_error,
+            "shortened write must not verify: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("length mismatch"),
+            "expected the length check to fire, got: {}",
+            out.content
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

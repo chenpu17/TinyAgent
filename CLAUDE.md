@@ -86,15 +86,16 @@ cargo clippy -p tiny-agent-node
 ## 架构要点索引（详录：`docs/claude/architecture.md`）
 
 - **bin + lib 双 target**：改 lib 内部不动 bin；`crate::` 在 lib 内指 lib.rs 根。
-- **同步模型**：`reqwest::blocking`，无 tokio；每个流式请求必带 per-request timeout 兜底防 reader 线程泄漏。
+- **同步模型**：`reqwest::blocking`，无 tokio；每个流式请求必带 per-request timeout 兜底防 reader 线程泄漏。SSE 内存三层限额（单行/单事件聚合/单响应累计）+ 有界背压通道，新增流式读取照抄。
 - **思考/工具参数增量透出**：只发事件、永不进 `text`/`blocks`；新增流式透出项照同款纪律抄。
 - **`reasoning_effort` 按字符串原样透传**，不做枚举校验；anthropic 走独立顶层 `output_config`，别用裸顶层字段。
 - **PDF 文档块**：新 Block 变体照四层接入点清单（anthropic / openai 显式报错 / compress 三处 / tui）；token 预估按页×3000。
 - **压缩**：`find_safe_cut` 空尾是合法切点；`summary_call` 空正文（思考烧穿）预算加倍重试一次，effort 恒 `None`。
 - **`salvage_on_max_tokens`**：max_tokens 截断且无 tool_use 时一次性 wrap-up nudge；带 tool_use 不 salvage。
-- **token 预算闸门**：run 级共享计数器父子同读；工具账单（子 agent 折回）绝不进计数器。
+- **token 预算闸门**：run 级共享计数器父子同读；工具账单按 `ToolOutput::usage_in_shared_budget` 分流——子 agent（已自计）只折 totals，其余工具的 usage 由 fold 代入计数器。
 - **宿主热更新面**：`set_model` 等不传播给已构造的子 agent 快照（既定决策）；`compact()` 成本绝不进 `self.usage`。
 - **MCP 热增删**：撞名 = Err + 回滚；热增路径不打印；子 agent 与 run_code registry 都不感知（快照语义）。
+- **MCP SSE 同源闸门**：endpoint 解析与 POST 发送共用 `reqwest::Url`（真解析器）——别写字符串版 origin 切分，反斜杠混淆可绕过。
 - **子 agent（task）**：按 `Tool::concurrency()`/`available_to_subagent()` 能力标记路由，无名字黑名单；共享父 MCP、预算与 cancel。
 - **Hooks**：Deny 落 `Slot::Ran(error)` 不占 Cancelled；Modify 只换执行输入、审计留原始输入；`--resume` 不带走 hooks。
 - **todo + meta**：plan 从 records 派生不经压缩；`meta` 审计侧信道不进模型可见 content。
@@ -105,7 +106,8 @@ cargo clippy -p tiny-agent-node
 - **guest I/O**：prelude 清单封闭（改 Prelude 必须同步描述 + 设计附录 A）；guest 输出预算不继承 `ctx.max_output_chars`（用 2M）。
 - **read_file 分页**：offset 跳行不花字节预算；json content 逐行保留原始行终止符；raw 默认窗口 3 字节对齐。
 - **env 注入 system prompt**：唯一收敛点在 `Agent::new`（子 agent 也过）；改 assemble 注入会漏子 agent。
-- **retry 诚实成本**：失败轮的 usage/tool_calls 经 `RunCost` 落进 result.json，不清零。
+- **retry 诚实成本**：失败轮的 usage/tool_calls 经 `RunCost` 落进 result.json，不清零；batch 不经 run_one_attempt 的终态一律走 `write_terminal_result` 单出口落盘（`early` 早退也继承 `acc`/`attempt_no`——重试轮 setup 失败不清零前轮真实成本）。
+- **run_code 路径拦截**：符号链接走查按**原始拼写**逐组件进行（先折叠 `..` 会把 `link` 抹掉、`link/../x` 逃逸）；词法折叠只做 workdir 外快速筛。cancel/deadline 入口拒绝都同时 latch `interrupt`+`halted`（可捕获异常被 guest 捕获重试时，停机检查拒纳）。
 - **headless Ctrl-C**：首次翻 cancel 优雅收尾（exit 130），二次硬退；批量模式 worker gate 同款。
 - **消息稳定 id**：ingest 点分配（非构造时）；`next_msg_id` 不随 `clear_messages` 重置。
 - **TUI**：inline viewport + scrollback 提交模型；新增"在飞行"必须同步 holdback/inflight/LiveRow 三件套；新暗色元素用 `dim_fg()`。

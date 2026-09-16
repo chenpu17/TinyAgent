@@ -755,6 +755,9 @@ impl Tool for BillTool {
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 0,
             }),
+            // Leaf stand-in (default false): a plain tool reporting usage that
+            // entered no counter anywhere — the agent's fold must share it.
+            usage_in_shared_budget: false,
             meta: None,
         })
     }
@@ -838,6 +841,10 @@ impl Tool for TaskTool {
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 0,
             }),
+            // Faithful to the real `task` tool: the child's chats billed into
+            // the shared counter while it ran, so the parent's fold must take
+            // the totals WITHOUT re-sharing.
+            usage_in_shared_budget: true,
             meta: None,
         })
     }
@@ -2881,11 +2888,38 @@ fn run_installs_a_fleet_budget_counter_and_resets_it_per_run() {
 
 #[test]
 fn tool_billed_usage_does_not_double_count_in_the_fleet_counter() {
-    // The tool-billed fold (a `task` child's ToolOutput.usage landing in
-    // the parent's totals) must stay OUT of the shared counter: the child
-    // already shared its direct chat spend while it ran, so adding the
-    // fold here too would double-count and halve the fleet's effective
-    // budget. Own totals (o.input_tokens) still include the billed usage.
+    // The tool-billed fold splits on ToolOutput::usage_in_shared_budget.
+    // `true` (the `task` tool's case: the child billed its own chats into the
+    // inherited counter while it ran) folds into the parent's TOTALS without
+    // re-sharing — a double add would halve the fleet's effective budget.
+    let mut cfg = cfg_with(99, 0, 0);
+    cfg.limits.max_total_tokens = 1_000;
+    let (prov, _) = MockProvider::new(vec![
+        mock::resp_tool("a", "task", json!({"label": "x"}), mock::mk_usage(40, 0)),
+        mock::resp_text("done", mock::mk_usage(10, 0)),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(TaskTool)],
+        vec![user_text("hi")],
+        test_ctx(),
+    );
+    let o = agent.run(&mut |_| {}).unwrap();
+    // Accounting total = both chats (40+10) + the child's billed input 100.
+    assert_eq!(o.input_tokens, 150);
+    // Fleet counter = direct chats ONLY (40+10); TaskTool's 110 models a
+    // child that already shared its spend into the counter itself.
+    let counter = agent.ctx.budget.clone().expect("counter installed");
+    assert_eq!(counter.used.load(Ordering::Relaxed), 50);
+}
+
+#[test]
+fn leaf_tool_billed_usage_shares_into_the_fleet_counter() {
+    // `usage_in_shared_budget=false` (the default: a host CallbackTool or any
+    // non-subagent tool reporting usage) — that spend entered no counter
+    // anywhere, so the agent's fold shares it. It used to bill the totals yet
+    // stay invisible to the max_total_tokens gate (external review P2-3).
     let mut cfg = cfg_with(99, 0, 0);
     cfg.limits.max_total_tokens = 1_000;
     let (prov, _) = MockProvider::new(vec![
@@ -2900,12 +2934,71 @@ fn tool_billed_usage_does_not_double_count_in_the_fleet_counter() {
         test_ctx(),
     );
     let o = agent.run(&mut |_| {}).unwrap();
-    // Accounting total = both chats (40+10) + the tool's billed 111.
+    // Totals unchanged by the flag: both chats' input (40+10) + the tool's
+    // billed 111 input / 22 output.
     assert_eq!(o.input_tokens, 161);
-    // Fleet counter = direct chats ONLY (40+10); BillTool's 111 is a
-    // child-spend stand-in that "already counted itself" elsewhere.
+    assert_eq!(o.output_tokens, 22);
+    // Fleet counter now sees the leaf tool's spend too: 40 + 10 + 111 + 22.
     let counter = agent.ctx.budget.clone().expect("counter installed");
-    assert_eq!(counter.used.load(Ordering::Relaxed), 50);
+    assert_eq!(
+        counter.used.load(Ordering::Relaxed),
+        183,
+        "leaf-reported usage must count against the budget gate"
+    );
+}
+
+#[test]
+fn leaf_tool_usage_trips_the_budget_gate() {
+    // The external-review P2-3 repro: max_total_tokens=5, turn 1's chat costs
+    // 2 and the custom tool reports 100 — the tool spend MUST be visible to
+    // the turn-boundary gate, stopping the run with budget_exceeded instead
+    // of starting turn 2 (previously the gate saw only the 2).
+    let mut cfg = cfg_with(99, 0, 0);
+    cfg.limits.max_total_tokens = 5;
+    let (prov, state) = MockProvider::new(vec![
+        mock::resp_tool("a", "bill", json!({}), mock::mk_usage(2, 0)),
+        mock::resp_text("done", None), // turn 2, must never run
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(LeafHundredBillTool)],
+        vec![user_text("hi")],
+        test_ctx(),
+    );
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o.stop_reason, "budget_exceeded");
+    assert_eq!(o.turns, 1);
+    assert_eq!(state.calls(), 1, "no second chat call past the cap");
+    // Honest billing either way: 2 (chat) + 100 (tool) folded into totals.
+    assert_eq!(o.input_tokens, 102);
+}
+
+/// BillTool variant for the gate repro: reports exactly 100 input tokens.
+struct LeafHundredBillTool;
+impl Tool for LeafHundredBillTool {
+    fn def(&self) -> ToolDef {
+        ToolDef {
+            name: "bill".into(),
+            description: "reports 100 tokens".into(),
+            schema: json!({"type": "object", "properties": {}}),
+        }
+    }
+    fn run(&self, _input: &Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+        Ok(ToolOutput {
+            content: "billed".into(),
+            image: None,
+            is_error: false,
+            usage: Some(crate::provider::Usage {
+                input_tokens: 100,
+                output_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            }),
+            usage_in_shared_budget: false,
+            meta: None,
+        })
+    }
 }
 
 #[test]

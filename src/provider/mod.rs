@@ -339,6 +339,22 @@ pub fn new_client(run_timeout_secs: u64) -> reqwest::blocking::Client {
 /// Same value/shape as mcp's MCP_LINE_MAX.
 const SSE_LINE_MAX: usize = 16 * 1024 * 1024;
 
+/// Hard cap on ONE aggregated SSE event: several `data:` lines joined (per
+/// spec) before the blank-line dispatch. The per-line cap alone doesn't stop
+/// a gateway streaming endless SMALL `data:` lines with no terminating blank
+/// line — the join buffer grows without bound. Same value/shape as mcp's
+/// MCP_EVENT_MAX.
+const SSE_EVENT_MAX: usize = 4 * SSE_LINE_MAX;
+
+/// Hard cap on the CUMULATIVE payload bytes ONE streaming response may
+/// deliver. Real responses are bounded by max_tokens (well under a MiB of
+/// text); a hostile or broken gateway streaming small events forever (past
+/// the idle timeout — data keeps flowing — within the per-request time cap)
+/// used to grow the consumer's assembled response without bound. Also bounds
+/// what the bounded reader channel (below) can ever hold: the reader stops
+/// at the cap, so queued bytes ≤ total sent ≤ this cap (+ one over event).
+const SSE_TOTAL_MAX: usize = 64 * 1024 * 1024;
+
 /// Read one line (with its `\n`) into `buf`, bounded by `max`. Returns bytes
 /// pushed (0 = clean EOF). Chunked `fill_buf`/`consume` — no per-byte reads —
 /// mirroring mcp's `read_capped_line`; the cap is a parameter so tests can
@@ -381,12 +397,16 @@ fn read_line_capped<R: BufRead>(
 /// Handles lines split across read boundaries and ignores comments/keep-alives.
 pub(crate) struct SseReader<R: Read> {
     reader: BufReader<R>,
+    /// Cumulative payload bytes dispatched so far (this stream), for the
+    /// [`SSE_TOTAL_MAX`] cap. SseReader is per-request, so the counter is too.
+    total: usize,
 }
 
 impl<R: Read> SseReader<R> {
     pub fn new(inner: R) -> Self {
         Self {
             reader: BufReader::new(inner),
+            total: 0,
         }
     }
 
@@ -399,6 +419,16 @@ impl<R: Read> SseReader<R> {
     /// "successful" response). The `SseSource` impl maps this to
     /// `StreamAbort::StreamError`.
     pub fn next_data(&mut self) -> std::io::Result<Option<String>> {
+        self.next_data_with(SSE_EVENT_MAX, SSE_TOTAL_MAX)
+    }
+
+    /// Cap-pluggable core (the real caps are 64/64 MiB — impractical to
+    /// allocate in a unit test; same pattern as `read_line_capped`).
+    fn next_data_with(
+        &mut self,
+        event_max: usize,
+        total_max: usize,
+    ) -> std::io::Result<Option<String>> {
         let mut line: Vec<u8> = Vec::new();
         // C20: the old reader returned on the FIRST `data:` line, so a
         // gateway legally splitting one JSON payload across several `data:`
@@ -407,6 +437,29 @@ impl<R: Read> SseReader<R> {
         // the blank line, and EOF flushes a pending buffer (a stream ending
         // right after `data: x` with no trailing blank line still yields x).
         let mut data_lines: Vec<String> = Vec::new();
+        // Join the buffered lines and enforce the cumulative-response cap.
+        // Factored out because BOTH dispatch paths (blank line + EOF flush)
+        // must check the total — the consumer's assembled response is built
+        // from exactly these payload bytes, so this caps retained memory,
+        // not just traffic.
+        let finish =
+            |data_lines: Vec<String>, total: &mut usize| -> std::io::Result<Option<String>> {
+                let payload = data_lines.join("\n");
+                *total = total.saturating_add(payload.len());
+                if *total > total_max {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "SSE stream exceeded the {total_max}-byte cumulative response cap \
+                             (runaway gateway output?)"
+                        ),
+                    ));
+                }
+                Ok(Some(payload))
+            };
+        // Bytes aggregated into the pending event so far (+1 per line for the
+        // join separator, so the bound matches what the join allocates).
+        let mut aggregated: usize = 0;
         loop {
             line.clear();
             // P2-13: bounded line read — `read_line` would grow without limit
@@ -416,7 +469,7 @@ impl<R: Read> SseReader<R> {
                     if data_lines.is_empty() {
                         return Ok(None);
                     }
-                    return Ok(Some(data_lines.join("\n")));
+                    return finish(data_lines, &mut self.total);
                 }
                 Ok(_) => {
                     let line = std::str::from_utf8(&line)
@@ -436,13 +489,27 @@ impl<R: Read> SseReader<R> {
                         // separator after the colon), not all whitespace —
                         // the payload owns any further indentation.
                         let payload = data.strip_prefix(' ').unwrap_or(data);
+                        aggregated = aggregated.saturating_add(payload.len() + 1);
+                        // Bound runaway aggregation: a gateway streaming
+                        // data: lines without a terminating blank line would
+                        // grow the pending event unbounded (each line is
+                        // line-capped, but their COUNT is not).
+                        if aggregated > event_max {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!(
+                                    "SSE event exceeded {event_max} bytes without a blank-line \
+                                     terminator (runaway or malicious gateway)"
+                                ),
+                            ));
+                        }
                         data_lines.push(payload.to_string());
                     } else if trimmed.is_empty() {
                         // Blank line = event boundary. Only a non-empty
                         // buffer dispatches (the blank line AFTER a
                         // dispatched event — the usual `\n\n` — is a no-op).
                         if !data_lines.is_empty() {
-                            return Ok(Some(data_lines.join("\n")));
+                            return finish(std::mem::take(&mut data_lines), &mut self.total);
                         }
                     }
                     // event:, id:, comment (`: …`) and unknown fields are
@@ -528,7 +595,14 @@ impl CancellableSse {
         // the underlying read failed. An IO error is sent before the worker
         // drops the sender, so the receiver distinguishes a failed read from a
         // clean stream end (Disconnected) instead of masking both as EOF.
-        let (tx, rx) = mpsc::channel::<std::result::Result<String, String>>();
+        //
+        // BOUNDED (external review P2-6): an unbounded channel let a fast or
+        // broken gateway outpace a slow consumer (e.g. a host event callback
+        // doing cross-thread round-trips) and queue the whole response in
+        // memory. send() now blocks once the buffer fills — backpressure that
+        // propagates through TCP — and the cumulative cap in SseReader bounds
+        // what can ever be queued; the capacity only paces bursts.
+        let (tx, rx) = mpsc::sync_channel::<std::result::Result<String, String>>(16);
         thread::Builder::new()
             .name("sse-reader".into())
             .spawn(move || {
@@ -644,6 +718,61 @@ mod tests {
         assert_eq!(r.next_data().unwrap().as_deref(), Some("{\"first\":1}"));
         assert_eq!(r.next_data().unwrap().as_deref(), Some("[DONE]"));
         assert_eq!(r.next_data().unwrap(), None);
+    }
+
+    #[test]
+    fn sse_reader_rejects_runaway_event_aggregation() {
+        // External review P2-6: each line is SSE_LINE_MAX-capped, but a
+        // gateway streaming many small `data:` lines with NO blank-line
+        // terminator used to grow the pending event without bound. The event
+        // cap errors instead. Tiny injected cap (the real SSE_EVENT_MAX is
+        // 64 MiB — impractical to allocate in a test), same pattern as
+        // read_line_capped's test.
+        let cap = 32;
+        let mut raw: Vec<u8> = Vec::new();
+        // 8 lines × 8 bytes each = 64 > cap(32); each line is well under any
+        // per-line bound, so only the aggregation check can catch it.
+        for _ in 0..8 {
+            raw.extend_from_slice(b"data: 1234\n");
+        }
+        let mut r = SseReader::new(&raw[..]);
+        let err = r.next_data_with(cap, SSE_TOTAL_MAX).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("exceeded"), "{msg}");
+        assert!(msg.contains("blank-line"), "{msg}");
+        // A single small event still reads fine under the same cap.
+        let mut r = SseReader::new(b"data: ok\n\n".as_ref());
+        assert_eq!(
+            r.next_data_with(cap, SSE_TOTAL_MAX).unwrap().as_deref(),
+            Some("ok")
+        );
+    }
+
+    #[test]
+    fn sse_reader_rejects_cumulative_response_overrun() {
+        // External review P2-6: many well-formed SMALL events must not add up
+        // without bound either — the cumulative cap bounds both the traffic
+        // and the consumer's assembled response (built from exactly these
+        // payload bytes). Events 1–2 fit under the tiny injected total cap;
+        // event 3 crosses it and errors instead of dispatching.
+        let total_cap = 8;
+        let raw = b"data: aaa\n\ndata: bbb\n\ndata: ccc\n\n";
+        let mut r = SseReader::new(&raw[..]);
+        assert_eq!(
+            r.next_data_with(SSE_EVENT_MAX, total_cap)
+                .unwrap()
+                .as_deref(),
+            Some("aaa")
+        );
+        assert_eq!(
+            r.next_data_with(SSE_EVENT_MAX, total_cap)
+                .unwrap()
+                .as_deref(),
+            Some("bbb")
+        );
+        let err = r.next_data_with(SSE_EVENT_MAX, total_cap).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("cumulative"), "{msg}");
     }
 
     #[test]

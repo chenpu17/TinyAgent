@@ -4,7 +4,7 @@
   "files": {
     "examples/prompts/agentic.md": "ffda2b99649344b5cdee1386c0c14612009beea3446a48a375bd6e0291f5d866",
     "examples/prompts/agentic-code.md": "311e24100f52676a24763cd119351ae32b4e28ab27a07f2b8bfa887840737201",
-    "src/tools/run_code.rs": "32a124366e579d4731525e791dacc3aa7be5aa1be505c555324aaace07dfbe19",
+    "src/tools/run_code.rs": "696ebe96e4c8962e22c1c340c79d5b3ce7b2915469db13d89a9ad0c38df7703d",
     "src/tools/run_code_skill.md": "274161f8a65fa3b171fae4f47b88a96758ade00b0a039d11692dd5c92d8833a3",
     "src/tools/skill.rs": "20a2bf64ea6975b5fae1f212dcb5abdbe6429a547aa326a36416dbe21da53a3e",
     "docs/finetune_support_design.md": "7dba7d1261a51158ee8c0bed34615f2672461419635624f8dd2464f8e3e92c6e"
@@ -22,5 +22,5 @@
     "sha256": "517614084b8bd3a6d4dc4caa4791706c629743345b7f0613a96c52cbba7e3a5c"
   },
   "tool_schema_sha256": "5b3f1b33e6566f016571ca227808dea3a3f4adc117a79a8c4284bf457ea1e2c3",
-  "prelude_source_sha256": "9274477c464797c4c9cecb346a0e327e2fe384d5616af393c3a8b020162a98ae"
+  "prelude_source_sha256": "d9a488bf2e17c39338336dd190c500f44d3f38a14657facbcd984d9ff21af723"
 }

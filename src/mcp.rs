@@ -776,7 +776,12 @@ impl Transport for HttpTransport {
 
 struct SseTransport {
     client: reqwest::blocking::Client,
-    post_url: String,
+    /// The verified POST target as a PARSED Url — the same object that passed
+    /// the same-origin check in [`resolve_endpoint`] is what gets sent, so no
+    /// string-level re-parse can ever disagree with what was checked (the
+    /// external-review P1 fix: reqwest re-parses a String through the WHATWG
+    /// `url` rules, which differ from any hand-rolled origin split).
+    post_url: reqwest::Url,
     headers: HashMap<String, String>,
     pending: Pending,
     /// Signals the reader thread to stop at its next loop iteration.
@@ -811,7 +816,7 @@ impl SseTransport {
             req = req.header(k, v);
         }
         // The GET is a long-lived stream; drive it on a reader thread.
-        let (endpoint_tx, endpoint_rx) = mpsc::channel::<Option<String>>();
+        let (endpoint_tx, endpoint_rx) = mpsc::channel::<Option<reqwest::Url>>();
         let pending = pending_new();
         let shutdown = Arc::new(AtomicBool::new(false));
         let reader = {
@@ -912,7 +917,9 @@ impl SseTransport {
     fn post(&self, body: &Value) -> Result<()> {
         let mut req = self
             .client
-            .post(&self.post_url)
+            // clone: Url by value (reqwest's IntoUrl covers Url, not &Url) —
+            // the fetched target stays byte-identical to the checked one.
+            .post(self.post_url.clone())
             .header("content-type", "application/json");
         for (k, v) in &self.headers {
             req = req.header(k, v);
@@ -1033,58 +1040,33 @@ fn read_sse_event<R: BufRead>(
     }
 }
 
-/// scheme://authority of a URL (no path/query), or None if it has none.
-/// The scheme and host are lowercased and the scheme's default port stripped,
-/// so `http://H` and `http://h:80` compare equal as the same origin.
-fn origin_of(url: &str) -> Option<String> {
-    let i = url.find("://")?;
-    let scheme = url[..i].to_ascii_lowercase();
-    let after = &url[i + 3..];
-    let end = after.find('/').unwrap_or(after.len());
-    let authority = &after[..end];
-    // Drop userinfo (anything before the last '@') before comparing hosts.
-    let host_port = authority.rsplit('@').next().unwrap_or(authority);
-    Some(format!(
-        "{scheme}://{}",
-        normalize_host_port(host_port, &scheme)
-    ))
-}
-
-/// Lowercase the host and drop the scheme's default port so equivalent
-/// origins compare equal.
-fn normalize_host_port(hp: &str, scheme: &str) -> String {
-    let hp = hp.to_ascii_lowercase();
-    if let Some((host, port)) = hp.rsplit_once(':') {
-        if let Ok(p) = port.parse::<u16>() {
-            let default = if scheme == "https" { 443 } else { 80 };
-            return if p == default {
-                host.to_string()
-            } else {
-                format!("{host}:{p}")
-            };
-        }
-    }
-    hp
-}
-
-/// Resolve the endpoint event payload against the SSE URL. A relative path is
-/// joined to the SSE origin; an absolute (or network-path `//`) endpoint is
-/// accepted only if it shares the SSE URL's origin — otherwise a compromised
-/// server could redirect the authenticated POST (config headers, e.g.
-/// Authorization) to an attacker or internal address (SSRF).
-fn resolve_endpoint(sse_url: &str, endpoint: &str) -> Result<String> {
-    let sse_origin =
-        origin_of(sse_url).ok_or_else(|| anyhow!("invalid SSE URL (no origin): {sse_url}"))?;
-    let abs = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-        endpoint.to_string()
-    } else if let Some(rest) = endpoint.strip_prefix("//") {
-        // network-path reference: borrow the SSE URL's scheme.
-        let scheme = sse_url.split("://").next().unwrap_or("https");
-        format!("{scheme}://{rest}")
-    } else {
-        format!("{sse_origin}{endpoint}")
-    };
-    if origin_of(&abs).as_deref() == Some(sse_origin.as_str()) {
+/// Resolve the endpoint event payload against the SSE URL, refusing anything
+/// that lands on another origin. The check and the eventual fetch go through
+/// the SAME parser — `reqwest::Url` (the `url` crate's WHATWG rules, which is
+/// what `client.post` uses internally) — so what was compared is exactly what
+/// is sent; the returned Url is stored as-is and never re-parsed from a
+/// string.
+///
+/// Why not a hand-rolled origin split (the pre-P1 code): string logic sees
+/// `http://evil.example\@trusted:3000/x` as userinfo + host `trusted:3000`
+/// (same origin → approved), but WHATWG treats `\` as `/` in special schemes,
+/// so reqwest actually fetched `evil.example` with path `/@trusted:3000/x` —
+/// the configured Authorization header walked off-origin (SSRF). Any other
+/// parser-vs-string divergence (IDNA, percent-encoded hosts, userinfo edge
+/// cases) is covered by the same parse-what-you-send rule. A compromised
+/// server could otherwise redirect the authenticated POST (config headers) to
+/// an attacker or internal address.
+fn resolve_endpoint(sse_url: &str, endpoint: &str) -> Result<reqwest::Url> {
+    let base =
+        reqwest::Url::parse(sse_url).map_err(|e| anyhow!("invalid SSE URL {sse_url}: {e}"))?;
+    // WHATWG join covers all three endpoint shapes a legacy SSE server sends:
+    // absolute (`http://…`), network-path (`//host/…`, borrows the base
+    // scheme) and relative (`/path`, `?q`). Malformed input (control chars,
+    // invalid port, …) is a join error — surfaced, never guessed around.
+    let abs = base
+        .join(endpoint)
+        .with_context(|| format!("invalid MCP SSE endpoint {endpoint:?}"))?;
+    if abs.origin() == base.origin() {
         Ok(abs)
     } else {
         bail!(
@@ -1300,20 +1282,67 @@ mod tests {
     fn endpoint_resolution() {
         // Relative path resolves against the SSE origin.
         assert_eq!(
-            resolve_endpoint("http://h:3000/sse", "/messages?s=1").unwrap(),
+            resolve_endpoint("http://h:3000/sse", "/messages?s=1")
+                .unwrap()
+                .as_str(),
             "http://h:3000/messages?s=1"
         );
         // Same-origin absolute URL is accepted.
         assert_eq!(
-            resolve_endpoint("http://h:3000/sse", "http://h:3000/x").unwrap(),
+            resolve_endpoint("http://h:3000/sse", "http://h:3000/x")
+                .unwrap()
+                .as_str(),
             "http://h:3000/x"
         );
-        // Host case and the scheme's default port are normalized, so these
-        // legitimately-same-origin endpoints are NOT false-refused.
+        // Network-path reference borrows the SSE URL's scheme (same host → ok,
+        // other host → refused).
+        assert_eq!(
+            resolve_endpoint("http://h:3000/sse", "//h:3000/x")
+                .unwrap()
+                .as_str(),
+            "http://h:3000/x"
+        );
+        assert!(resolve_endpoint("http://h:3000/sse", "//other/x").is_err());
+        // Userinfo does not change the origin (host is what's compared).
+        assert!(resolve_endpoint("http://h:3000/sse", "http://u:p@h:3000/x").is_ok());
+        // Host case and the scheme's default port are normalized by the WHATWG
+        // parser, so these legitimately-same-origin endpoints are not refused.
         assert!(resolve_endpoint("http://Host:3000/sse", "http://host:3000/x").is_ok());
         assert!(resolve_endpoint("http://h/sse", "http://h:80/x").is_ok());
         // Cross-origin absolute URL is refused (SSRF guard).
         assert!(resolve_endpoint("http://h:3000/sse", "http://other/x").is_err());
+        // Malformed endpoints are errors, not best-effort guesses.
+        assert!(resolve_endpoint("http://h:3000/sse", "http://[").is_err());
+    }
+
+    #[test]
+    fn endpoint_resolution_rejects_parser_confusion_bypasses() {
+        // External-review P1: a hand-rolled origin split read
+        // `http://evil.example\@trusted:3000/x` as userinfo `evil.example\` +
+        // host `trusted:3000` → same origin → approved; WHATWG treats `\` as
+        // `/` in special schemes, so the authenticated POST actually went to
+        // `evil.example` with path `/@trusted:3000/x`. With the check and the
+        // fetch sharing one parser, the confusion string now resolves to the
+        // ATTACKER host and fails the origin compare.
+        assert!(resolve_endpoint(
+            "http://trusted:3000/sse",
+            "http://evil.example\\@trusted:3000/x"
+        )
+        .is_err());
+        // The mirrored shape is harmless, not a bypass: `trusted:3000\@evil…`
+        // parses to host trusted:3000 (backslash starts the PATH
+        // `/@evil.example/x`) — the POST stays on-origin.
+        assert!(resolve_endpoint(
+            "http://trusted:3000/sse",
+            "http://trusted:3000\\@evil.example/x"
+        )
+        .is_ok());
+        // A leading-backslash RELATIVE reference (`\path`) joins as a path on
+        // the base origin (WHATWG's backslash-as-slash rule applies inside
+        // authorities, not to the join entry state) — same host, harmless;
+        // the network-path forms (`//…`) are covered above.
+        assert!(resolve_endpoint("http://h:3000/sse", "\\evil.example/x").is_ok());
+        assert!(resolve_endpoint("http://h:3000/sse", "\\h:3000/x").is_ok());
     }
 
     #[test]

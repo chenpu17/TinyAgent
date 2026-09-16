@@ -1042,24 +1042,27 @@ impl Agent {
         });
     }
 
+    /// Share one chat's spend into the run-wide counter (`ToolCtx::budget` —
+    /// see the gate in `run_impl`). The counter half of [`Self::bill_chat`],
+    /// split out so the tool-billed fold can share WITHOUT double-adding a
+    /// `task` child's already-shared spend.
+    fn share_budget(&self, total: u64) {
+        if let Some(g) = &self.ctx.budget {
+            g.share(total);
+        }
+    }
+
     /// Bill one of THIS agent's own chat requests: share the spend into the
     /// run-wide counter (`ToolCtx::budget` — see the gate in `run_impl`), then
     /// fold into the local totals + emit. Used by the three direct-chat sites
-    /// (main turn chat, preflight + forced-compression summaries). NOT for
-    /// tool-billed usage: a `task` child already shared its own direct spend
-    /// while running, so the parent's accounting fold must stay counter-free
-    /// (a double add would halve the fleet's effective budget).
+    /// (main turn chat, preflight + forced-compression summaries). NOT
+    /// wholesale for tool-billed usage: a `task` child already shared its own
+    /// direct spend while running, so the parent's accounting fold must stay
+    /// counter-free for it (a double add would halve the fleet's effective
+    /// budget) — see the [`ToolOutput::usage_in_shared_budget`] split at the
+    /// fold site.
     fn bill_chat(&mut self, events: &mut dyn FnMut(AgentEvent), u: &Usage) {
-        if let Some(g) = &self.ctx.budget {
-            // fetch_update (not fetch_add): saturating per the numeric-writer
-            // convention — a wrapping add could roll a huge lying counter back
-            // to a small value and dodge the budget gate.
-            let _ = g
-                .used
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    Some(v.saturating_add(u.total()))
-                });
-        }
+        self.share_budget(u.total());
         self.fold_usage(events, u);
     }
 
@@ -1917,12 +1920,22 @@ impl Agent {
                         is_error: true,
                     }),
                     Slot::Ran(output) => {
-                        // Plain fold_usage (NOT bill_chat): tool-billed usage
-                        // is a `task` child's spend, which the child already
-                        // shared into the fleet counter while it ran — adding
-                        // it here too would double-count and halve the
-                        // effective budget.
+                        // Tool-billed usage always folds into the run totals
+                        // (billing is honest regardless of source); the shared
+                        // counter gets it only when the producer did NOT
+                        // already share while running. `task` children set
+                        // usage_in_shared_budget (their own chats billed into
+                        // the inherited counter — re-adding here would halve
+                        // the fleet budget); any other tool reporting usage
+                        // (a host CallbackTool metering an upstream API) never
+                        // entered a counter, so the fold shares it now —
+                        // previously that spend billed the totals yet was
+                        // invisible to the max_total_tokens gate (external
+                        // review P2-3).
                         if let Some(u) = output.usage {
+                            if !output.usage_in_shared_budget {
+                                self.share_budget(u.total());
+                            }
                             self.fold_usage(events, &u);
                         }
                         records.push(ToolCallRecord {

@@ -126,6 +126,56 @@ pub struct ToolResult {
     pub is_error: bool,
 }
 
+/// Wait ceiling for a JS round-trip: the deadline's remaining time, capped by
+/// the 120s backstop; no deadline = the backstop alone. An ALREADY-EXPIRED
+/// deadline yields ZERO (fail fast) — `checked_duration_since` returns None
+/// for it, which the old code read as "no deadline" and re-granted a fresh
+/// 120s window to every callback dispatched after the budget ran out
+/// (external review P2-4).
+fn callback_wait_ceiling(deadline: Option<Instant>) -> Duration {
+    match deadline.and_then(|d| d.checked_duration_since(Instant::now())) {
+        Some(rem) => rem.min(Duration::from_secs(JS_CALLBACK_TIMEOUT_SECS)),
+        // Some(deadline) whose remainder computed None = in the past.
+        None if deadline.is_some() => Duration::ZERO,
+        None => Duration::from_secs(JS_CALLBACK_TIMEOUT_SECS),
+    }
+}
+
+/// Slice granularity for the interruptible callback wait: bounds how long
+/// after a cancel flip the blocked round-trip actually gives up. Mirrors the
+/// core's CancellableSse POLL_SLICE.
+const CALLBACK_POLL_SLICE: Duration = Duration::from_millis(200);
+
+/// Blocking wait for the JS side to resolve `rx`, bounded by `wait` overall
+/// but polled in [`CALLBACK_POLL_SLICE`] slices so a cancel flip is honored
+/// within ~one slice instead of blocking out the whole (possibly 120s)
+/// ceiling — the ToolConcurrency contract expects tools to observe
+/// `ctx.cancel` mid-call.
+fn recv_interruptible(
+    rx: &mpsc::Receiver<ToolResult>,
+    wait: Duration,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> std::result::Result<ToolResult, ()> {
+    let end = Instant::now() + wait;
+    loop {
+        if let Some(c) = cancel {
+            if c.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(());
+            }
+        }
+        let now = Instant::now();
+        if now >= end {
+            return Err(());
+        }
+        match rx.recv_timeout((end - now).min(CALLBACK_POLL_SLICE)) {
+            Ok(r) => return Ok(r),
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            // Disconnected without a send: no resolver is ever coming.
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err(()),
+        }
+    }
+}
+
 /// Turn each JS tool `{ name, description, schema, run }` into a `CallbackTool`
 /// whose closure drives the TSFN round-trip. Called on the JS thread (the
 /// `Function`s are taken from JS and converted to `ThreadsafeFunction`s here,
@@ -162,6 +212,14 @@ fn build_extra_tools(env: Env, tools: Option<Vec<Object>>) -> Result<Vec<Box<dyn
         };
         let tool = ta::CallbackTool::new(def, move |input: &Value, ctx: &ta::ToolCtx| {
             let id = NEXT_TOOL_ID.fetch_add(1, Ordering::Relaxed);
+            // Check BEFORE dispatching: a run deadline that already expired
+            // must fail the call outright — dispatching anyway would hand JS a
+            // request whose result can only be dropped (the wait is ZERO).
+            if ctx.deadline.is_some_and(|d| d <= Instant::now()) {
+                return Err(anyhow::anyhow!(
+                    "tool \"{name}\": run deadline already exhausted"
+                ));
+            }
             let (tx, rx) = mpsc::channel();
             pending_tools().lock().unwrap().insert(id, tx);
 
@@ -178,30 +236,35 @@ fn build_extra_tools(env: Env, tools: Option<Vec<Object>>) -> Result<Vec<Box<dyn
             // thread is free (the run() caller awaits it), so the wrapped run
             // resolves the channel promptly. When the run set a wall-clock
             // budget (limits.timeout_secs), the tool ctx carries its deadline —
-            // the wait is then the REMAINDER (capped by the backstop), so a
-            // never-returning JS tool can't outlive the run budget. Same shape
-            // as the custom-provider wait below.
-            let wait = ctx
-                .deadline
-                .and_then(|d| d.checked_duration_since(Instant::now()))
-                .filter(|d| *d < Duration::from_secs(JS_CALLBACK_TIMEOUT_SECS))
-                .unwrap_or(Duration::from_secs(JS_CALLBACK_TIMEOUT_SECS));
+            // the wait is then the REMAINDER (capped by the backstop, ZERO and
+            // failing fast once it expires), so a never-returning JS tool can't
+            // outlive the run budget. Same shape as the custom-provider wait
+            // below.
+            let wait = callback_wait_ceiling(ctx.deadline);
             // Round UP for the message: a sub-second budget remainder would
             // otherwise read as "within 0s".
             let wait_secs = wait.as_secs() + u64::from(wait.subsec_millis() > 0);
-            match rx.recv_timeout(wait) {
+            match recv_interruptible(&rx, wait, ctx.cancel.as_deref()) {
                 Ok(r) => Ok(ta::ToolOutput {
                     content: r.content,
                     is_error: r.is_error,
                     image: None,
                     usage: None,
+                    usage_in_shared_budget: false,
                     meta: None,
                 }),
                 Err(_) => {
                     pending_tools().lock().unwrap().remove(&id);
-                    Err(anyhow::anyhow!(
-                        "tool \"{name}\": JS callback did not resolve within {wait_secs}s"
-                    ))
+                    let why = if ctx
+                        .cancel
+                        .as_ref()
+                        .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+                    {
+                        "cancelled".to_string()
+                    } else {
+                        format!("JS callback did not resolve within {wait_secs}s")
+                    };
+                    Err(anyhow::anyhow!("tool \"{name}\": {why}"))
                 }
             }
         });
@@ -826,5 +889,77 @@ impl Task for ChatRunTask {
 
     fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
         Ok(Outcome(output))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wait_ceiling_distinguishes_unbudgeted_from_expired() {
+        // No deadline → the 120s backstop.
+        assert_eq!(
+            callback_wait_ceiling(None),
+            Duration::from_secs(JS_CALLBACK_TIMEOUT_SECS)
+        );
+        // Far-future deadline → capped by the backstop, not the remainder.
+        assert_eq!(
+            callback_wait_ceiling(Some(Instant::now() + Duration::from_secs(3_600))),
+            Duration::from_secs(JS_CALLBACK_TIMEOUT_SECS)
+        );
+        // Near deadline → the (sub-120s) remainder itself.
+        let ceiling = callback_wait_ceiling(Some(Instant::now() + Duration::from_secs(2)));
+        assert!(ceiling > Duration::from_secs(1) && ceiling <= Duration::from_secs(2));
+        // EXPIRED deadline → zero (fail fast). checked_duration_since returns
+        // None here; the old code mistook that None for "no deadline" and
+        // granted a fresh 120s window (external review P2-4).
+        assert_eq!(
+            callback_wait_ceiling(Some(Instant::now() - Duration::from_secs(1))),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn recv_interruptible_honors_cancel_within_a_slice() {
+        let (tx, rx) = mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // A never-resolving JS side, a 120s ceiling, and a cancel that flips
+        // after 300ms: the wait must give up within ~one poll slice of the
+        // flip, not block out the ceiling.
+        let flip = {
+            let cancel = cancel.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            })
+        };
+        let started = Instant::now();
+        let out = recv_interruptible(
+            &rx,
+            Duration::from_secs(JS_CALLBACK_TIMEOUT_SECS),
+            Some(&cancel),
+        );
+        assert!(out.is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "cancel must interrupt the wait, took {:?}",
+            started.elapsed()
+        );
+        flip.join().unwrap();
+        drop(tx);
+    }
+
+    #[test]
+    fn recv_interruptible_returns_the_resolution() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(ToolResult {
+            content: "ok".into(),
+            is_error: false,
+        })
+        .unwrap();
+        let out = recv_interruptible(&rx, Duration::from_secs(5), None).unwrap();
+        assert_eq!(out.content, "ok");
+        assert!(!out.is_error);
     }
 }

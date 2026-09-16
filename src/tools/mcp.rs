@@ -130,6 +130,7 @@ impl Tool for McpTool {
             image,
             is_error: result["isError"].as_bool().unwrap_or(false),
             usage: None,
+            usage_in_shared_budget: false,
             meta: None,
         })
     }
