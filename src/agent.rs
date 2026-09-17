@@ -1224,12 +1224,16 @@ impl Agent {
     /// point — including before this call — is honoured. A run started with
     /// cancel already set returns immediately from the loop-head check:
     /// `stop_reason == "cancelled"`, zero turns, zero provider requests.
-    /// The party that ACCEPTS a new task (the TUI's input handler, a retry
-    /// ladder between attempts, an embedding host's send-message path) is
-    /// responsible for clearing a stale cancel at acceptance time via
+    /// The party that ACCEPTS a new task (the TUI's input handler, `compact`
+    /// at its entry, an embedding host's send-message path) is responsible
+    /// for clearing a stale cancel at acceptance time via
     /// [`Agent::clear_cancel`] — the acceptor is the only one who knows the
     /// previous run truly ended, and its acceptance point may sit well before
-    /// this call (an embedder's lazy build can take seconds).
+    /// this call (an embedder's lazy build can take seconds). A retry ladder
+    /// is deliberately NOT on this list: a cancel observed between attempts
+    /// is TERMINAL for the ladder (`EXIT_CANCELLED`, see
+    /// `harness::run_with_retries`) — clearing it there would revive a run
+    /// the user already vetoed.
     pub fn run(&mut self, events: &mut dyn FnMut(AgentEvent)) -> Result<RunOutcome, RunError> {
         self.run_impl(events, /* top_level */ true)
     }
@@ -1260,10 +1264,12 @@ impl Agent {
     /// accepts a NEW task clears any stale stop left over from the previous
     /// one, at the moment of acceptance. Call this from the same place the
     /// host marks the session "running" (the TUI does it when submitting a
-    /// user message; `run_with_retries` between attempts; `compact` at its
-    /// entry; an embedding host in its send-message path). Only meaningful
-    /// between runs — during a run the flag must stay untouched so a stop
-    /// request lands.
+    /// user message; `compact` at its entry; an embedding host in its
+    /// send-message path). A retry ladder does NOT clear between attempts —
+    /// a cancel observed there is terminal (`EXIT_CANCELLED`), not residue:
+    /// clearing it would revive a run the user vetoed (see
+    /// `harness::run_with_retries`). Only meaningful between runs — during a
+    /// run the flag must stay untouched so a stop request lands.
     pub fn clear_cancel(&self) {
         if let Some(c) = &self.cancel {
             c.store(false, Ordering::Relaxed);
@@ -2305,6 +2311,25 @@ fn append_user_turn(messages: &mut Vec<Message>, blocks: Vec<Block>) {
     }
 }
 
+/// Per-request timeout for one summary chat call: the caller's even share of
+/// either the remaining run budget (minus [`compress::COMPRESS_RESERVE`]) or,
+/// without a run budget, of the [`STREAM_BACKSTOP`] leak guard. Both branches
+/// floor at 1s — a base64-heavy history chunked into more pieces than the
+/// budget has seconds would otherwise shrink each share below one second (a
+/// zero Duration is an instant timeout: the summary fails before the request
+/// is even sent), exactly when compression is most needed. Same 1s-floor
+/// convention as `clamp_child_timeout`; the no-deadline branch originally
+/// missed it (external re-review).
+fn summary_timeout_share(deadline: Option<Instant>, n_calls: usize) -> Duration {
+    let budget = match deadline {
+        Some(d) => d
+            .saturating_duration_since(Instant::now())
+            .saturating_sub(compress::COMPRESS_RESERVE),
+        None => STREAM_BACKSTOP,
+    };
+    (budget / (n_calls as u32)).max(Duration::from_secs(1))
+}
+
 /// Mint a message id that isn't already used in `messages`. The counter alone
 /// would suffice for a fresh agent, but a RESUMED history carries ids minted
 /// by an earlier process whose counter started over — scan for collisions and
@@ -2842,25 +2867,12 @@ impl Agent {
                 tools: &[],
                 model: &self.model,
                 max_tokens,
-                // Even share of (remaining − reserve) across all summary calls, so
-                // a multi-chunk compression can't starve the main chat that follows
-                // in the same turn.
-                per_request_timeout: Some(match deadline {
-                    Some(d) => {
-                        let remaining = d
-                            .saturating_duration_since(Instant::now())
-                            .saturating_sub(compress::COMPRESS_RESERVE);
-                        // Floor at 1s: with the deadline nearly exhausted the even
-                        // share rounds to ~0, and a zero Duration is an instant
-                        // timeout — the summary would fail before the request is
-                        // even sent. Same 1s-floor convention as
-                        // clamp_child_timeout.
-                        (remaining / (n_calls as u32)).max(Duration::from_secs(1))
-                    }
-                    // No run budget: the summary calls still get a per-request
-                    // cap (the reader-thread leak backstop), evenly shared.
-                    None => STREAM_BACKSTOP / (n_calls as u32),
-                }),
+                // Even share of the remaining run budget (minus the reserve)
+                // — or of the STREAM_BACKSTOP leak guard without one —
+                // across all summary calls, floored at 1s so a huge chunk
+                // count can't shrink a share into an instant timeout (see
+                // summary_timeout_share).
+                per_request_timeout: Some(summary_timeout_share(deadline, n_calls)),
                 cancel: self.cancel_flag(),
                 // The summary is one-off: the next compression summarizes a
                 // different transcript, so a cache breakpoint would only ever pay

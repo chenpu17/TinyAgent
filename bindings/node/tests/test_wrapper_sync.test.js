@@ -33,6 +33,34 @@ function declaredAgentMethods() {
     .filter((k) => k !== 'constructor'); // the ctor line matches too; both sides skip it
 }
 
+/** The declared Agent methods whose signature takes an `onEvent` callback.
+ *  Derived from wrapper.d.ts on every run — NOT hardcoded — so adding a
+ *  third onEvent-bearing native method fails the wrap test below until
+ *  wrapper.js actually wraps it. A hardcoded list was exactly the blind
+ *  spot: nothing forced a new entry onto it (external review #7). */
+function methodsTakingOnEvent() {
+  const dts = fs.readFileSync(path.join(__dirname, '..', 'wrapper.d.ts'), 'utf8');
+  const m = dts.match(/export declare class Agent \{([\s\S]*?)\n\}/);
+  assert.ok(m, 'wrapper.d.ts must contain `export declare class Agent { … }`');
+  const body = m[1];
+  const starts = [...body.matchAll(/^ {2}([A-Za-z_$][\w$]*)\s*[<(]/gm)].filter(
+    (x) => x[1] !== 'constructor',
+  );
+  return starts
+    .map((s) => {
+      // A signature may span lines (compact(…)); it ends at the first line
+      // starting a new member or a doc comment at class-member indent
+      // (exactly two spaces) — continuation params are indented deeper, and
+      // stopping at doc comments keeps the NEXT method's prose (which may
+      // mention onEvent) out of this signature's span.
+      const rest = body.slice(s.index);
+      const end = rest.search(/\n {2}(?:\/\*\*|[A-Za-z_$])/);
+      return { name: s[1], sig: end === -1 ? rest : rest.slice(0, end) };
+    })
+    .filter((x) => /\bonEvent\b/.test(x.sig))
+    .map((x) => x.name);
+}
+
 test('wrapper.d.ts declares every native Agent method (no prototype drift)', () => {
   const declared = new Set(declaredAgentMethods());
   const missing = nativeAgentMethods().filter((k) => !declared.has(k));
@@ -55,7 +83,14 @@ test('wrapper.js wraps every method that takes onEvent (Fatal TSFN protection)',
   // run() and compact() hand a user callback to an ErrorStrategy::Fatal
   // event TSFN — the wrapper MUST override them (wrapOnEvent) so a throwing
   // callback degrades to a stderr log instead of an uncatchable abort.
-  for (const k of ['run', 'compact']) {
+  // The list is DERIVED from wrapper.d.ts (methodsTakingOnEvent), not
+  // hardcoded: a new onEvent-bearing method must fail here until wrapped.
+  const expected = methodsTakingOnEvent();
+  assert.ok(
+    expected.includes('run') && expected.includes('compact'),
+    `derivation regression: expected at least run+compact, got [${expected}]`,
+  );
+  for (const k of expected) {
     assert.strictEqual(typeof wrapper.Agent.prototype[k], 'function', `wrapper.Agent.${k} exists`);
     assert.notStrictEqual(
       wrapper.Agent.prototype[k],

@@ -1359,10 +1359,10 @@ fn ui_loop(
                         cache_creation_input_tokens,
                         cache_read_input_tokens,
                     } => {
-                        in_tokens += input_tokens;
-                        out_tokens += output_tokens;
-                        cache_create += cache_creation_input_tokens;
-                        cache_read += cache_read_input_tokens;
+                        in_tokens = in_tokens.saturating_add(input_tokens);
+                        out_tokens = out_tokens.saturating_add(output_tokens);
+                        cache_create = cache_create.saturating_add(cache_creation_input_tokens);
+                        cache_read = cache_read.saturating_add(cache_read_input_tokens);
                         // Per-request values, not cumulative: overwrite. The
                         // prompt side is input + both cache buckets (Anthropic
                         // splits cached tokens out of input_tokens; OpenAI
@@ -1542,7 +1542,13 @@ fn ui_loop(
         let stream_open = streaming || sub_streaming_name.is_some() || thinking_stream.is_some();
         let pending_end = commit_pending_end(&rows, committed, stream_open);
         if committed < pending_end {
-            let width = term.size().map(|s| s.width).unwrap_or(80) as usize;
+            // Same 120-col readability cap as the live viewport
+            // (content_width): committing at the FULL terminal width
+            // re-wrapped every finalized row the moment it left the live
+            // zone — a visible reflow jump on >120-col terminals, where the
+            // live view had rendered at 120 and the scrollback commit
+            // suddenly went wider (external re-review).
+            let width = content_width(term.size().map(|s| s.width).unwrap_or(80));
             commit_rows(
                 term,
                 &rows[committed..pending_end],
@@ -1948,6 +1954,15 @@ fn ui_loop(
                                         out_tokens = 0;
                                         cache_create = 0;
                                         cache_read = 0;
+                                        // Status-bar state follows the
+                                        // cleared history: a stale ctx% or
+                                        // plan done/total segment would
+                                        // otherwise linger until the next
+                                        // Usage / TodoUpdate event happens
+                                        // to overwrite it (external
+                                        // re-review).
+                                        ctx_tokens = 0;
+                                        plan.clear();
                                         // Send before claiming success. If the worker is gone
                                         // (panicked mid-run in a debug build, or tearing down)
                                         // the send fails and the agent-side history is NOT

@@ -2075,6 +2075,32 @@ fn streaming_request_carries_timeout_backstop_without_run_deadline() {
 }
 
 #[test]
+fn summary_timeout_share_floors_both_branches_at_one_second() {
+    // External re-review: the no-deadline branch divided STREAM_BACKSTOP by
+    // the chunk count WITHOUT the 1s floor the deadline branch had — a
+    // base64-heavy history chunked into more pieces than the budget has
+    // seconds pushed each summary call's share under one second (a zero
+    // Duration is an instant timeout), exactly when compression was most
+    // needed. Extracted as a pure function so the floor is testable without
+    // constructing a multi-million-char history.
+    use std::time::{Duration, Instant};
+    assert_eq!(summary_timeout_share(None, 1), STREAM_BACKSTOP);
+    assert_eq!(
+        summary_timeout_share(None, 10_000),
+        Duration::from_secs(1),
+        "no-deadline branch must floor at 1s regardless of chunk count"
+    );
+    let far = Instant::now() + Duration::from_secs(3600);
+    assert_eq!(
+        summary_timeout_share(Some(far), 10_000),
+        Duration::from_secs(1)
+    );
+    // A far deadline with few calls keeps a generous share — the floor only
+    // binds when the division would go below it.
+    assert!(summary_timeout_share(Some(far), 2) > Duration::from_secs(60));
+}
+
+#[test]
 fn run_as_subagent_does_not_reset_a_set_cancel_flag() {
     // The `task` sub-agent's child shares the parent's cancel Arc. Since the
     // cancel-ownership contract change NO entry point clears the flag (see

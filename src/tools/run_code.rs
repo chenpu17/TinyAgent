@@ -4441,9 +4441,16 @@ return t.length;"#}),
 
     /// Test 9 (image outputs, milestone gap per arch-review #6): a tool
     /// returning an image reports an explicit error envelope to the guest —
-    /// binaries cannot ride the JSON channel.
+    /// binaries cannot ride the JSON channel. The image-bearing tool is a
+    /// host CallbackTool that OPTS INTO the guest registry
+    /// (`with_code_access`): `load_image` itself never does (top-level-only
+    /// by design), so allow-listing it — as an earlier revision of this test
+    /// did — only exercised the "unknown tool: load_image" error whose text
+    /// happens to contain "image"; the real branch below ran zero times
+    /// (external re-review: false-green test).
     #[test]
     fn image_output_is_an_explicit_error() {
+        use crate::tools::CallbackTool;
         let dir = scratch();
         // Canonical 1×1 transparent PNG.
         const PNG: &[u8] = &[
@@ -4453,11 +4460,47 @@ return t.length;"#}),
             0x9C, 0x62, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
             0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
         ];
-        std::fs::write(dir.join("p.png"), PNG).unwrap();
-        let out = tool_with_tools(CodeConfig::default(), r#"["read_file","load_image"]"#)
+        let img_tool = CallbackTool::new(
+            ToolDef {
+                name: "host_image".into(),
+                description: "host callback that returns an image".into(),
+                schema: json!({"type": "object", "properties": {
+                    "path": {"type": "string"}
+                }}),
+            },
+            move |_input: &Value, _ctx: &ToolCtx| {
+                use base64::Engine as _;
+                Ok(ToolOutput {
+                    content: "[image loaded]".into(),
+                    image: Some(crate::provider::Block::Image {
+                        media_type: "image/png".into(),
+                        data: base64::engine::general_purpose::STANDARD.encode(PNG),
+                    }),
+                    is_error: false,
+                    usage: None,
+                    usage_in_shared_budget: false,
+                    meta: None,
+                })
+            },
+        )
+        .with_code_access();
+        let cfg: Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"K","model":"m","inject_environment":false,
+                "tools":["read_file"],"code":{"enabled":true}}"#,
+        )
+        .unwrap();
+        let tool = RunCodeTool::new(
+            &cfg,
+            Arc::new(RwLock::new(CodeConfig::default())),
+            &reqwest::blocking::Client::new(),
+            "k",
+            vec![],
+            vec![Arc::new(Box::new(img_tool) as Box<dyn Tool>)],
+        );
+        let out = tool
             .run_with_emit(
                 &json!({"code": r#"
-                    try { tools.call("load_image", {path: "p.png"}); return {carried: true}; }
+                    try { tools.call("host_image", {path: "p.png"}); return {carried: true}; }
                     catch (e) { return {carried: false, msg: String(e)}; }"#}),
                 &ctx(&dir),
                 &mut |_| {},
@@ -4465,10 +4508,55 @@ return t.length;"#}),
             .unwrap();
         let ok = serde_json::from_str::<Value>(&out.content).unwrap_or(json!(null));
         assert_eq!(ok["carried"], json!(false), "{}", out.content);
+        // The REAL branch's message (run_code's transport-level refusal), not
+        // "unknown tool" noise that merely contains "image".
         assert!(
-            ok["msg"].as_str().unwrap_or("").contains("image"),
+            ok["msg"].as_str().unwrap_or("").contains("cannot carry"),
             "the error must say why: {}",
             out.content
+        );
+    }
+
+    /// Write half of the A-8 boundary (the read half — `cat .env` passing
+    /// through — is pinned by A-8 itself): the path-interception layer binds
+    /// to the 4 file tools (and copy_bytes) ONLY. `shell` is deliberately
+    /// un-intercepted (D13: the layer guards model MISREADS, not hostile
+    /// guests), so its writes — redirects included — bypass fs_write_dirs and
+    /// the write-side symlink refusal. This test PINS that bypass so the
+    /// write side is as explicit as the read side; the hostile-guest remedies
+    /// stay restrict_to_workdir / hooks Deny / dropping shell from `tools`.
+    #[test]
+    fn shell_writes_bypass_the_file_tool_write_policy_a8() {
+        let dir = scratch();
+        // Non-empty fs_write_dirs → file-tool writes are confined to it.
+        let code = CodeConfig {
+            fs_write_dirs: vec!["allowed".into()],
+            ..CodeConfig::default()
+        };
+        let out = tool_with_tools(code, r#"["read_file","write_file","shell"]"#)
+            .run_with_emit(
+                &json!({"code": r#"
+                    var refused = false;
+                    try { tools.call("write_file", {path: "out.txt", content: "x"}); }
+                    catch (e) { refused = true; }
+                    tools.call("shell", {command: "echo via-shell > out.txt"});
+                    return {refused: refused};"#}),
+                &ctx(&dir),
+                &mut |_| {},
+            )
+            .unwrap();
+        let ok = serde_json::from_str::<Value>(&out.content).unwrap_or(json!(null));
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(
+            ok["refused"],
+            json!(true),
+            "write_file outside fs_write_dirs must be refused"
+        );
+        let wrote = std::fs::read_to_string(dir.join("out.txt"));
+        assert_eq!(
+            wrote.as_deref().unwrap_or_default().trim(),
+            "via-shell",
+            "shell's redirect write must NOT be intercepted (A-8 write side)"
         );
     }
 
