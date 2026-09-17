@@ -167,13 +167,22 @@ fn ensure_ticker() {
         // no guest execution to deliver interrupts into anyway.
         let Ok(engine) = engine() else { return };
         let engine = engine.clone();
-        std::thread::Builder::new()
+        // Same degradation class as the engine arm above: thread CREATION
+        // failure is resource exhaustion, and under release panic="abort" an
+        // .expect here took down the whole process — the exact inconsistency
+        // the graceful engine path exists to avoid (external re-review). Skip
+        // arming with a stderr note instead: fuel/mem still bound the guest,
+        // only the epoch (wall-clock) interruption is lost.
+        if std::thread::Builder::new()
             .name("code-epoch-ticker".into())
             .spawn(move || loop {
                 engine.increment_epoch();
                 std::thread::sleep(std::time::Duration::from_millis(10));
             })
-            .expect("spawn epoch ticker");
+            .is_err()
+        {
+            eprintln!("run_code: epoch-ticker thread failed to spawn — wall-clock interruption disabled (fuel/mem limits still active)");
+        }
     });
 }
 

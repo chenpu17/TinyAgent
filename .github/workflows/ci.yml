@@ -24,7 +24,11 @@ jobs:
       - run: cargo fmt --all --check
       # run_code 三处同源契约（工具描述 / skill 正文 / 附录 A 指纹）：微调
       # 数据依赖的面，漂移必须红灯而不是靠手工 --check（2026-09 审核 #8）。
+      # 交叉核对 README code 配置表与 CodeConfig::default（防单侧漂移）。
       - run: python3 scripts/sync_run_code_contract.py --check
+      # README 代码结构树：行数从源文件实时生成，手工维护曾偏差 2–5× 并漏列
+      # 整个模块（外审 P1）——生成物漂移红灯。
+      - run: python3 scripts/gen_structure.py --check
 
   test:
     # 三平台 × 双 clippy 配置 + 测试。CLAUDE.md 约定两个 clippy 都要过：
@@ -66,6 +70,9 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --features code --all-targets -- -D warnings
+      # 第四个 clippy 配置：tui×code 交叉面（TUI 的 CodeLog 渲染、/code 命令、
+      # set_code_* 交互）在任一单 feature 配置里都不可见（外审：CI 盲区）。
+      - run: cargo clippy --features tui,code --all-targets -- -D warnings
       - run: cargo test --features code,mock
 
   python-binding:
@@ -97,6 +104,15 @@ jobs:
       # compiling; the behavioral tests for it run against a --features code
       # build locally — the compile gate is the cheap CI equivalent.
       - run: cargo clippy -p tiny-agent-py --features code --all-targets -- -D warnings
+      # ...and the BEHAVIORAL tests too (enable_code flips the tool table,
+      # set_code_config rejects unknown keys): the clippy gate can't see a
+      # feature that compiles but no-ops. Second wheel in the same venv;
+      # tests are build-adaptive, so this round runs the code suite.
+      - run: |
+          . .venv/bin/activate
+          cd bindings/python
+          maturin develop --features code
+          python -m pytest tests/ -q
 
   node-binding:
     runs-on: ubuntu-latest
@@ -118,6 +134,12 @@ jobs:
       - run: cargo clippy -p tiny-agent-node --all-targets -- -D warnings
       # `code` forwarding feature compile gate (same rationale as the python job).
       - run: cargo clippy -p tiny-agent-node --features code --all-targets -- -D warnings
+      # Behavioral round for the same feature (see python job): rebuild the
+      # .node with --features code so the build-adaptive code tests run.
+      - run: |
+          cd bindings/node
+          npm run build:debug -- --features code
+          npm test
 
   musl:
     # 移植性冒烟：musl 静态构建是"嵌入式低配 Linux"定位的核心交付物，
@@ -131,10 +153,46 @@ jobs:
       - run: rustup target add x86_64-unknown-linux-musl
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --release --target x86_64-unknown-linux-musl
+      # 二进制级冒烟：--version --json 是为 CI 断言设计的机器可读面（README
+      # 构建节）。此前 CI 只 build 从不 exec——「编得过但跑不起来」的静态产物
+      # 正是每次 tag 发出去的东西（外审）。白构建 features 必须为空。
+      - run: |
+          BIN=./target/x86_64-unknown-linux-musl/release/tiny-agent
+          "$BIN" --version --json | python3 -c '
+          import json, sys
+          v = json.load(sys.stdin)
+          assert not v["features"], f"plain build carries features: {v}"
+          print("plain build features:", v["features"])
+          '
       # code 变体冒烟：wasmtime+cranelift 纯 Rust 静态链接（quickjs.wasm 资产
       # 已嵌入、构建不碰 C 工具链，设计 D1）——"嵌入式低配 Linux + 沙箱"是
       # 核心交付组合，随每次 push 确认它仍编得出静态 ELF。
       - run: cargo build --release --target x86_64-unknown-linux-musl --features code
+      # code 变体的 features 必须恰为 ["code"]（无 tui——musl 产物定位无头）。
+      - run: |
+          BIN=./target/x86_64-unknown-linux-musl/release/tiny-agent
+          "$BIN" --version --json | python3 -c '
+          import json, sys
+          v = json.load(sys.stdin)
+          assert v["features"] == ["code"], f"code build features wrong: {v}"
+          print("code build features:", v["features"])
+          '
+
+  msrv:
+    # rust-version 门禁（Cargo.toml 的 1.85）：默认（headless）构建在钉住的
+    # MSRV 工具链上必须 check 通过——此前全 job 跟 stable 漂，新 stable 收紧
+    # lint 时无代码改动的提交也会突然红灯，用户也无从知道自己机器够不够。
+    # 只 check 默认 feature：tui/code 的更高地板（1.88/1.86）由 ratatui /
+    # wasmtime 自身的 rust-version 强制，cargo 会给明确报错。
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.85.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check
 
   audit:
     # cargo-audit：RustSec 公告库扫描依赖树。依赖面小（reqwest + serde +

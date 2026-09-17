@@ -1,0 +1,17 @@
+# 依赖更新 PR：cargo-audit（ci.yml 的 audit job）只在 advisory 出现时红灯，
+# 不会主动开升级 PR——dependabot 补上这块。cargo 是全 workspace 单锁文件
+# （根 + 双绑定），npm 只在 bindings/node。
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: npm
+    directory: /bindings/node
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

@@ -286,9 +286,12 @@ max_tool_calls 封顶；墙钟前置后忙循环至少被 timeout 封顶，且 g
   `**/.netrc`、`.aws/**`、`**/.aws/**`（v0.5 红队低-3：原清单漏嵌套目录下的
   `.aws`）。glob 语义的测试向量进 §13-6。
 - **fs_write_dirs**：仅 write_file/edit_file 受限；匹配同款规范化相对路径；
-  batch 合并语义见 §9。
+  batch 合并语义见 §9。`shell` 的写入（重定向 / 命令内置写）不经此层与
+  写侧 symlink 拒绝——同 A-8 的既定边界，读写两侧均有钉住测试
+  （写侧：`shell_writes_bypass_the_file_tool_write_policy_a8`）。
 - **诚实声明（写入 NFR-1 与 README）**：deny_paths 防模型**误读**、不防**恶意
-  guest**——shell 在白名单时（默认如此）`cat .env` 全量绕过；敌对场景的正解是
+  guest**——shell 在白名单时（默认如此）`cat .env` 全量绕过（写侧同理：重定向
+  写入不经 fs_write_dirs 与写侧 symlink 拒绝，测试已钉住）；敌对场景的正解是
   hooks 对 shell Deny 或从 `tools` 去 shell。补验收 A-8 钉住此边界。
 
 ## 8. 组件设计

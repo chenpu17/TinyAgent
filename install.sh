@@ -14,8 +14,13 @@ PREFIX="${PREFIX:-$HOME/.local}"
 BINDIR="$PREFIX/bin"
 BIN="$BINDIR/tiny-agent"
 
-echo "[install] building release (features=tui)…"
-( cd "$SCRIPT_DIR" && cargo build --release --features tui )
+# Default to the full desktop combo (TUI + run_code sandbox) — install.sh is
+# the desktop path, and a TUI binary without run_code sends users to rebuild
+# the moment they flip code.enabled on. Trim with TA_FEATURES (e.g.
+# TA_FEATURES="tui" for the pre-0.3.x shape, "" for headless-only).
+FEATURES="${TA_FEATURES:-tui,code}"
+echo "[install] building release (features=${FEATURES})…"
+( cd "$SCRIPT_DIR" && cargo build --release --features "${FEATURES}" )
 
 mkdir -p "$BINDIR"
 install -m 755 "$SCRIPT_DIR/target/release/tiny-agent" "$BIN"

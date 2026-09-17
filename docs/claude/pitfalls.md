@@ -100,11 +100,11 @@
   所有；`store(true)` 全库无自动复位，`agent::run()` **也不清**（旧入口 `store(false)` 已删——它会把
   宿主受理窗口内（懒构建可达数秒~15s）按下的停止当残留误清，用户停止被静默丢弃）。预置 true 的 run
   在循环首检即返回：`cancelled`、turns==0、零 provider 请求。清残留的主体责任在**受理新任务的一方**：
-  `Agent::clear_cancel()`（pub，绑定层 `clear_cancel`/`clearCancel` 已透出）。库内四个受理点：TUI
-  `run_once`（每条提交输入/初始 auto-run）、`harness::run_with_retries` attempt 间（cancel = 梯子终态，
-  不重试——消掉旧「隐式复活」）、`batch` 重试梯（同款 attempt 间判定；batch agent 本就不装 cancel flag，
-  行为零变化）、`compact()` 入口。**破坏面**：嵌入方「set_cancel + 复用 agent 多轮」漏改的症状是每轮
-  秒回 cancelled（确定可见、`turns==0` 可机判），不是静默。测试组：`run_with_preset_cancel_returns…` /
+  `Agent::clear_cancel()`（pub，绑定层 `clear_cancel`/`clearCancel` 已透出）。**破坏面**：嵌入方「set_cancel + 复用 agent 多轮」漏改的症状是每轮
+  秒回 cancelled（确定可见、`turns==0` 可机判），不是静默。库内**真正调用** `clear_cancel` 的只有两处：TUI
+  `run_once`（每条提交输入/初始 auto-run）与 `compact()` 入口；`harness::run_with_retries` / `batch`
+  重试梯的 attempt 间判定是**终态出口**——cancel → `EXIT_CANCELLED`，不重试**也不清**（清了即复活
+  用户已否决的 run；batch agent 本就不装 cancel flag，行为零变化）。测试组：`run_with_preset_cancel_returns…` /
   `run_does_not_clear…` / `clear_cancel_lets_the_next_run_proceed` /
   `parallel_children_both_honour…` / `single_run_cancel_during_failed_attempt…` + 绑定两侧回归。
 - **批量任务片段只能覆盖** `task`/`system_prompt`/`model`/`max_tokens`/`limits`；安全字段

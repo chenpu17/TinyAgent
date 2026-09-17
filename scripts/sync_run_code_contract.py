@@ -16,10 +16,52 @@ import re
 ROOT = Path(__file__).resolve().parents[1]
 APPENDIX = "## 附录 A：LLM 可见契约"
 MANIFEST = ROOT / "docs/run_code_routing_manifest.json"
+README_SPEC = ROOT / "README.md"
+SPEC_BEGIN_RE = re.compile(r"<!-- BEGIN CODE CONFIG SPEC[^>]*-->\n")
+SPEC_END = "<!-- END CODE CONFIG SPEC -->"
 
 
 def sha(data):
     return hashlib.sha256(data).hexdigest()
+
+
+def readme_spec_section():
+    """The README's code-config block (JSON example + field table), kept
+    between BEGIN/END CODE CONFIG SPEC markers."""
+    text = README_SPEC.read_text(encoding="utf-8")
+    m = SPEC_BEGIN_RE.search(text)
+    if not m or SPEC_END not in text:
+        raise SystemExit("README.md is missing the CODE CONFIG SPEC markers.")
+    return text[m.end():text.index(SPEC_END)]
+
+
+def cross_check_readme_spec(section):
+    """Fail when README's spec block and config.rs's CodeConfig::default
+    disagree on the numeric knobs — the drift direction the file-hash alone
+    can't see (changing config.rs touches no hashed file). Runs in BOTH
+    --write and --check modes."""
+    src = (ROOT / "src/config.rs").read_text(encoding="utf-8")
+    dm = re.search(r"impl Default for CodeConfig \{(.*?)\n\}", src, re.S)
+    if not dm:
+        raise SystemExit("config.rs: `impl Default for CodeConfig` not found (extractor drift)")
+    body = dm.group(1)
+
+    def field(name):
+        fm = re.search(rf"\b{name}:\s*([0-9_]+)", body)
+        if not fm:
+            raise SystemExit(f"config.rs: CodeConfig default field {name} not found")
+        return int(fm.group(1).replace("_", ""))
+
+    for name in ("max_tool_calls", "mem_mb", "timeout_secs", "fuel", "max_result_chars"):
+        value = field(name)
+        # README may spell 5_000_000_000 as 5e9 in the prose column.
+        spellings = [str(value)] + (["5e9"] if value == 5_000_000_000 else [])
+        if not any(s in section for s in spellings):
+            raise SystemExit(
+                f"README code-config spec is stale: {name} default is {value} in "
+                f"config.rs but the README section carries none of {spellings}. "
+                "Update the README block (or revert config.rs), then re-run."
+            )
 
 
 def main():
@@ -78,6 +120,12 @@ def main():
     for p in paths[:2]:
         body = (ROOT / p).read_text(encoding="utf-8").split("\n---\n", 1)[1].strip()
         manifest["prompt_bodies"][p] = sha(body.encode("utf-8"))
+    # README's code-config block: cross-check defaults against config.rs and
+    # pin the section's hash (section-scoped so unrelated README edits — e.g.
+    # the generated structure tree — don't churn the manifest).
+    spec = readme_spec_section()
+    cross_check_readme_spec(spec)
+    manifest["readme_code_spec"] = {"sha256": sha(spec.encode("utf-8"))}
     expected_manifest = json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
 
     if args.write:

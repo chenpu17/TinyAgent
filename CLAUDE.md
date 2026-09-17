@@ -15,16 +15,21 @@ cargo test --features tui,mock             # 单测（含 TUI 输入/渲染逻�
 cargo clippy --features tui --all-targets  # lint TUI 版
 cargo clippy --all-targets                # lint headless 版
 cargo clippy --features code --all-targets # lint code 版（run_code.rs 在 feature 后）
+cargo clippy --features tui,code --all-targets # lint 交叉组合（CI 第四配置：TUI 的 code 渲染 / set_code_* 交互面）
 cargo test --features code,mock            # run_code 沙箱套件（改 run_code.rs 必跑）
 cargo fmt --all                            # 格式化（CI 有 --check 门禁，改完代码必跑）
 ```
 
-每次改完**三个 clippy 配置都要跑**（headless / tui / code）：`#[cfg(feature)]` 后的代码，
+每次改完**四个 clippy 配置都要跑**（headless / tui / code / tui,code 交叉）：`#[cfg(feature)]` 后的代码，
 不带该 feature 的构建与 clippy 都看不到——单跑一两个会漏。TUI 代码在 `tui` 后；
-`run_code.rs` 与 `agent.rs` 的 `set_code_*` 在 `code` 后。CI 里三个 clippy 都带 `-D warnings`，
+`run_code.rs` 与 `agent.rs` 的 `set_code_*` 在 `code` 后；tui 与 code 的**交叉面**
+（TUI 的 CodeLog 渲染、`/code` 命令）只在第四配置可见。CI 里四个 clippy 都带 `-D warnings`，
 本地跑出任何黄字即等于红灯。**`cargo fmt --all` 同理**（CI 的 fmt job 对全 workspace
 `--check`，含双绑定 crate；存量 305 处漂移已在一个纯格式 commit 清零，该 commit 记在
-`.git-blame-ignore-revs`，`git blame` 配 ignoreRevsFile 后可跳过）。
+`.git-blame-ignore-revs`，`git blame` 配 ignoreRevsFile 后可跳过）。CI fmt job 还带两个
+文档同步门禁：`scripts/sync_run_code_contract.py --check`（含 README code 配置表与
+`CodeConfig::default` 的交叉核对）和 `scripts/gen_structure.py --check`（README 代码结构树
+行数从源文件实时生成）——动了对应内容记得 `--write` 再提交。
 **测试命令必带 `--features mock` 才真正跑到 `tests/lib_api.rs`**：该文件整体门在
 `#![cfg(feature = "mock")]` 后（`provider::mock` 是 `cfg(any(test, feature = "mock"))`，
 而集成测试编译时 lib 不带 `cfg(test)`），不带 mock 的 `cargo test` 把它编成 **0 个测试
@@ -74,8 +79,10 @@ cargo clippy -p tiny-agent-node
 - **改 `agent.rs` 核心路径必须配套 loop 测试**（`agent_tests.rs` + `provider/mock.rs` 脚本化 Provider，
   不连网）——别只靠 mock server 跑一遍就提交。
 - **数值写端一律 `saturating_add`**（usage / RunCost / merge_usage / batch 汇总所有 `+=`）。
-- **cancel 契约：`run()` 永不清标志，受理方（TUI run_once / harness / batch / compact）调
-  `clear_cancel()` 清残留**——别给任何 run 入口加回清残留。
+- **cancel 契约：`run()` 永不清标志。`clear_cancel()` 只在「受理新任务」时刻调用——库内调用点仅
+  TUI 提交输入与 `compact()` 入口（绑定宿主的发消息路径同理）**；重试梯（harness/batch）attempt 间
+  观察到 cancel 是 **EXIT_CANCELLED 终态**（不重试、也不清——清了即复活用户已否决的 run）。
+  别给任何 run 入口加回清残留。
 - **新增"消息进历史"入口必须补 id 分配点**（漏了宿主锚点拿到 `None`）。
 - **`ToolOutput`/`ToolCallRecord`/`ToolCtx` 加字段要同步全部字面量构造点**（含两个绑定）。
 - **`Config::apply` 的 `PartialConfig`/`PartialLimits` 解构是刻意穷尽的（无 `..`）**——新字段不分类

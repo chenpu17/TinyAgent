@@ -16,5 +16,11 @@
   },
   "devDependencies": {
     "@napi-rs/cli": "^2.18.0"
-  }
+  },
+  "files": [
+    "wrapper.js",
+    "wrapper.d.ts",
+    "index.js",
+    "index.d.ts"
+  ]
 }
