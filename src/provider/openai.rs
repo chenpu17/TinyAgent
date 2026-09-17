@@ -308,14 +308,27 @@ impl Provider for OpenAi {
                         .post(&body, req.per_request_timeout)
                         .context("retry after adjusting request for 400 failed")?;
                 }
-                None => bail!("OpenAI-compatible API error 400: {text}"),
+                None => {
+                    // Structured status + historical display text
+                    // (see ApiStatusError).
+                    return Err(super::ApiStatusError::new(
+                        400,
+                        format!("OpenAI-compatible API error 400: {text}"),
+                    )
+                    .into());
+                }
             }
         }
 
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().unwrap_or_default();
-            bail!("OpenAI-compatible API error {status}: {text}");
+            // Structured status + historical display text (see ApiStatusError).
+            return Err(super::ApiStatusError::new(
+                status.as_u16(),
+                format!("OpenAI-compatible API error {status}: {text}"),
+            )
+            .into());
         }
         // The gateway accepted the (possibly adjusted) body — now the applied
         // fixes are proven to be about field acceptance, persist them.

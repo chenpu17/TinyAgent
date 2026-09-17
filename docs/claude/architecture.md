@@ -297,8 +297,13 @@
   拼写逐组件进行**（外部复审 P1：内核在 write 时才解析、`..` 只在解析完前面的组件后生效——
   `link/../x` 的真实写位置经 `link` 逃出 workdir；旧实现先词法折叠 `..` 把 `link` 从走查里抹掉，
   策略层看到干净路径。现行两段式：词法折叠只做"折叠后在 workdir 外"的快速筛，随后按原始拼写
-  Normal 推进即查 symlink、ParentDir 弹栈——无 symlink 组件时词法形 == 解析形，workdir_relative
-  的词法回退不变式由此成立；工具最终写的就是原始拼写，检查与写入才用同一解析结果）。
+  Normal 推进即查 symlink、ParentDir 弹栈——无 symlink 组件时词法形 == 解析形；工具最终写的就是
+  原始拼写，检查与写入才用同一解析结果）。**绝对拼写从文件系统根锚定走查**（第二轮 P1：旧实现
+  对原始拼写 strip_prefix(workdir)，字面前缀不同的 `/outside/../<workdir>/link/../x` 折叠回 workdir
+  内却整个跳过走查）；**workdir_relative 对不存在目标的回退也不再是纯词法折叠**——canonicalize
+  最深已存在祖先（原始拼写，经 symlink 与 `..` 的内核真实解析）再词法拼接余下组件
+  （`resolve_via_existing_ancestor`）；祖先链在 `..` 前断（`missing/../file`）时才退回词法折叠，
+  该拼写由工具层自己回答（ENOENT 或建父目录），绝不变成策略拒答。
   错误封套带结构化字段
   `kind/tool/retryable`（glue 附到 Error 上；`tool` 类刻意不给 retryable——host 无法机判；
   **args 解析失败也是 `host` 类结构化错误而非静默 `{}`**——`parse_guest_args`，v0.8，对称于坏指针；

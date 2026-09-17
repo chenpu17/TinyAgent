@@ -25,6 +25,16 @@ pub enum MockTurn {
         frags: Vec<String>,
     },
     Err(String),
+    /// An injected STRUCTURED error (e.g. `ApiStatusError`): unlike
+    /// `Err(String)` the error type survives the anyhow chain, so
+    /// `RunError`'s failure taxonomy (is_transient) can see it.
+    ErrAny(anyhow::Error),
+    /// Sleep, then fail — a turn that consumes wall-clock budget before
+    /// erroring, for the "request fails past the run deadline" path.
+    ErrAfter {
+        delay: std::time::Duration,
+        error: anyhow::Error,
+    },
 }
 
 /// What a `chat()` call saw — enough to assert the loop's structural
@@ -214,6 +224,11 @@ impl Provider for MockProvider {
                 })
             }
             MockTurn::Err(msg) => Err(anyhow!(msg)),
+            MockTurn::ErrAny(e) => Err(e),
+            MockTurn::ErrAfter { delay, error } => {
+                std::thread::sleep(delay);
+                Err(error)
+            }
         }
     }
 }

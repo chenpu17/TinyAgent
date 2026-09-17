@@ -9,6 +9,34 @@ pub mod mock;
 pub use anthropic::Anthropic;
 pub use openai::OpenAi;
 
+/// A provider's HTTP rejection carrying a MACHINE-READABLE status next to the
+/// historical display text. `Display` keeps the exact "… API error <status>:
+/// <body>" wording hosts and tests already match on; the structured `status`
+/// lets `agent::RunError`'s failure taxonomy tell an unfixable 4xx (auth,
+/// permission, bad body) from a transient 429/5xx without string matching
+/// (external re-review P2).
+#[derive(Debug)]
+pub struct ApiStatusError {
+    pub status: u16,
+    message: String,
+}
+
+impl ApiStatusError {
+    /// `message` is the full historical display text (the providers build it
+    /// as "<Name> API error <status>: <body>"); `status` is its u16 form.
+    pub fn new(status: u16, message: String) -> Self {
+        Self { status, message }
+    }
+}
+
+impl std::fmt::Display for ApiStatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ApiStatusError {}
+
 use crate::config::{Config, ProviderKind};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};

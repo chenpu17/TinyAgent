@@ -14,8 +14,13 @@
     **重入即死锁**（P1-2 教训）：回调里再调 agent 方法会 GIL↔Mutex 互等——run 期间的
     agent 方法调用经 `IN_RUN` thread-local 判定，报 "agent is running" 而非挂死；
     两个线程各自调方法也要靠 with_agent 的锁排队，别绕过它直拿 mutex。
-  - **Node**（`bindings/node`）：`run()` 是 `AsyncTask`（libuv worker 线程，**无 tokio**），事件经
-    `ThreadsafeFunction` 回主线程。自定义 JS 工具是 **TSFN round-trip**：agent 线程把 `{id,args}` 经 TSFN
+  - **Node**（`bindings/node`）：`run()`/`compact()`/`chat()` 在**专属 `std::thread`** 上跑同步核心（**无
+    tokio**），Promise 经 napi `JsDeferred`（`Send`，任意线程可 settle）结算，事件经 `ThreadsafeFunction`
+    回主线程。**绝不改回 napi `AsyncTask`/libuv 池**（外部评审教训）：agent 线程会阻塞等 JS 工具/provider
+    round-trip，而被包装的 JS 回调把自己的异步活（`fs.promises`、timer、Promise continuation）也排进同一
+    libuv 池——并发 run 数 ≥ 池线程数（默认 4）时全员互等死锁；专属线程与 `UV_THREADPOOL_SIZE` 解耦。
+    线程用 8 MiB 栈（对齐原 libuv worker 默认）并经 `catch_unwind` 兜底——panic 也 settle Promise
+    （release 是 `panic = "abort"`，仅 debug 有效）。自定义 JS 工具是 **TSFN round-trip**：agent 线程把 `{id,args}` 经 TSFN
     派给 JS、阻塞 `mpsc` 等结果；JS（`wrapper.js` 把 `run(args)` 包成 `(err,req)` 形状）调完用户函数后调
     导出的 `resolveTool(id, result)`，经全局 `PENDING_TOOLS: i64→Sender` 注册表唤醒 worker（120s
     `recv_timeout` 兜底）。**JS 主线程在 `run()` 期间必须空闲**（调用方 `await`），否则 TSFN 回调排不进
@@ -118,8 +123,13 @@
   悄悄丢过覆盖），禁止为"省事"加回 `..`。同理 `Config::apply` 顶层的 `PartialConfig`
   解构也是穷尽的。
 - **批量 `--retries` 只重试 transient**（`stop_reason == "error"`），指数退避 1..32s 封顶；
-  `bad_task`/`max_turns` 等确定性失败不重试。`--failed` 重跑失败子集后**合并**进完整报告
-  （未重跑的历史成功项原样保留）。
+  `bad_task`/`max_turns` 等确定性失败不重试。transient 判定是 `RunError` 上的小型分类
+  （`is_transient`，单跑梯与 batch 共用）：provider HTTP 拒绝带结构化状态码（`ApiStatusError`，
+  Display 仍是历史文案）——401/403/404/400/422 为确定性 `request_error` 不重试，429/5xx 与
+  未识别错误（网络抖动、自定义 provider）保持 transient；run 截止后失败的请求按 `timeout`
+  （exit 124）归属、不进梯子。**重试 = 整任务从头重放**（每次重试新建 Agent），前轮工具副作用
+  不回滚、只照实累计账单——副作用型任务需幂等或别开 `--retries`。`--failed` 重跑失败子集后
+  **合并**进完整报告（未重跑的历史成功项原样保留）。
 - **batch workdir 隔离（`--isolate none|copy|git`，`batch::IsolateMode`）**：`none` 默认共享
   workdir（jobs>1 打 ⚠）；`copy` 每任务拷贝（排除 `target`/`node_modules`/`.git`/`results`），符号
   链接**自包含策略**（`copy_entry`）：源树内相对链接复刻 / 绝对在内拷内容 / 出根（绝对或 `..` 逃逸）

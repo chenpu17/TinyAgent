@@ -279,14 +279,29 @@ impl Tool for ReadFile {
                     break;
                 }
             }
+            // Strip EXACTLY the terminator `term` identified above — not every
+            // trailing CR/LF. trim_end_matches(['\r','\n']) ate content chars:
+            // "a\r\r\n" lost the \r before the CRLF and an EOF "b\r" lost its
+            // trailing \r, so json-mode readAll() silently dropped bytes while
+            // reporting truncated=false (external re-review P2).
+            let strip_term = |s: &str| -> String {
+                let stripped = if term == "\r\n" {
+                    s.strip_suffix("\r\n").unwrap_or(s)
+                } else if term == "\n" {
+                    s.strip_suffix('\n').unwrap_or(s)
+                } else {
+                    s
+                };
+                stripped.to_string()
+            };
             let mut line = match std::str::from_utf8(&buf) {
-                Ok(s) => s.trim_end_matches(['\r', '\n']).to_string(),
+                Ok(s) => strip_term(s),
                 // The cap split a multi-byte char: deliver the valid prefix
                 // (valid_up_to is a char boundary by definition) instead of
                 // failing the read.
-                Err(e) if byte_capped => String::from_utf8_lossy(&buf[..e.valid_up_to()])
-                    .trim_end_matches(['\r', '\n'])
-                    .to_string(),
+                Err(e) if byte_capped => {
+                    strip_term(&String::from_utf8_lossy(&buf[..e.valid_up_to()]))
+                }
                 // Strict UTF-8 for a genuinely invalid file under the cap is
                 // a real error — not silent lossy replacement.
                 Err(_) => {
@@ -1147,6 +1162,24 @@ mod tests {
         assert!(v2["content"].as_str().unwrap().starts_with("row-11\n"));
         // Final page carries the file's closing newline too.
         assert!(v2["content"].as_str().unwrap().ends_with("row-25\n"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_file_json_mode_preserves_stray_cr_bytes() {
+        // External re-review P2: trim_end_matches(['\r','\n']) ate CONTENT
+        // chars — the \r before a CRLF and a trailing \r at EOF — while
+        // reporting truncated=false. Only the one identified terminator may
+        // be stripped per line.
+        let dir = std::env::temp_dir().join(format!("ta-json-cr-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("cr.txt"), "a\r\r\nb\r").unwrap();
+        let out = ReadFile
+            .run(&json!({"path": "cr.txt", "format": "json"}), &ctx_in(&dir))
+            .unwrap();
+        let v: Value = serde_json::from_str(&out.content).unwrap();
+        assert_eq!(v["content"], "a\r\r\nb\r");
+        assert_eq!(v["truncated"], false);
         fs::remove_dir_all(&dir).ok();
     }
 

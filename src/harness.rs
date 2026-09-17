@@ -149,6 +149,11 @@ pub(crate) fn run_with_retries(
     // terminal NDJSON event and result.json then say "context_overflow"
     // (matching batch's report vocabulary) instead of the generic "error".
     let mut failed_overflow = false;
+    // External re-review P2: set when the run died on a DETERMINISTIC request
+    // rejection (auth/permission/unfixable body — RunError::is_transient ==
+    // false): no backoff ladder, and the terminal vocabulary says
+    // "request_error" (again matching batch) instead of the generic "error".
+    let mut failed_request = false;
     // NFR-3 audit anchor (finetune_support): when the run_code sandbox was
     // enabled at assembly, open the stream with the skill_injection/precheck
     // decision so a bench rerun can attribute trajectories without result.json.
@@ -168,7 +173,7 @@ pub(crate) fn run_with_retries(
             );
         }
     }
-    let (code, outcome, error) = loop {
+    let (mut code, outcome, error) = loop {
         let result = agent.run(&mut |ev| {
             if json {
                 emit_json(&ev);
@@ -193,6 +198,15 @@ pub(crate) fn run_with_retries(
                 // to fail identically.
                 if re.is_context_overflow() {
                     failed_overflow = true;
+                    break (EXIT_ERROR, None, Some(format!("{re:#}")));
+                }
+                // Same determinism argument as the overflow above: a 401/403/
+                // 404/unfixable-400 resent after backoff fails identically —
+                // it just costs the backoff and a duplicate request (external
+                // re-review P2: a fixed-401 service was being hit twice under
+                // --retries 1).
+                if !re.is_transient() {
+                    failed_request = true;
                     break (EXIT_ERROR, None, Some(format!("{re:#}")));
                 }
                 if attempt <= retries {
@@ -251,6 +265,8 @@ pub(crate) fn run_with_retries(
                 "cancelled"
             } else if failed_overflow {
                 "context_overflow"
+            } else if failed_request {
+                "request_error"
             } else {
                 "error"
             };
@@ -276,7 +292,8 @@ pub(crate) fn run_with_retries(
     if let Some(path) = output_path {
         // When there's no outcome, record WHY: a cancel (exit 130) is
         // "cancelled", an unfixable context overflow is "context_overflow"
-        // (matching batch's report vocabulary), anything else is "error".
+        // (matching batch's report vocabulary), a deterministic request
+        // rejection is "request_error" (ditto), anything else is "error".
         // Otherwise result.json would claim "error" for a user-initiated
         // cancel, disagreeing with the exit code and the NDJSON terminal
         // event (both already say "cancelled").
@@ -284,15 +301,20 @@ pub(crate) fn run_with_retries(
             "cancelled"
         } else if failed_overflow {
             "context_overflow"
+        } else if failed_request {
+            "request_error"
         } else {
             "error"
         };
         let mut meta = ResultMeta::from_agent(agent);
         meta.started_at = started;
-        // A failed artifact write must not swallow the run's exit code: 130 /
-        // 125 / 124 say what actually happened, and degrading them to 1 would
-        // lie about a cancelled / timed-out run to CI. Warn-and-continue,
-        // matching batch's write-failure policy.
+        // A failed artifact write must not swallow a FAILED run's exit code:
+        // 130 / 125 / 124 say what actually happened, and degrading them to 1
+        // would lie about a cancelled / timed-out run to CI. But a SUCCESSFUL
+        // run whose result never lands must not exit 0 either — CI would read
+        // a missing or STALE result.json and pass on outdated data (external
+        // re-review P2). Batch marks the task failed in the same situation;
+        // single-run matches by degrading only the success code to EXIT_ERROR.
         if let Err(e) = write_result(
             path,
             outcome.as_ref(),
@@ -303,6 +325,9 @@ pub(crate) fn run_with_retries(
             &meta,
         ) {
             eprintln!("[warn] failed to write {}: {e:#}", path.display());
+            if code == 0 {
+                code = EXIT_ERROR;
+            }
         } else if !json {
             eprintln!("result written to {}", path.display());
         }
@@ -1152,6 +1177,114 @@ mod tests {
         assert!(es.contains("\"success\": false"));
         assert!(es.contains("provider 503"));
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A mock-backed agent serving the given scripted turns, plus the shared
+    /// state handle (request counting).
+    fn mock_agent_turns(
+        turns: Vec<crate::provider::mock::MockTurn>,
+    ) -> (Agent, std::sync::Arc<crate::provider::mock::MockState>) {
+        use crate::provider::mock::MockProvider;
+        use crate::provider::{Block, Message};
+        let cfg: crate::config::Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"MOCK_API_KEY","model":"m","inject_environment":false}"#,
+        )
+        .unwrap();
+        let (prov, state) = MockProvider::new(turns);
+        let agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![],
+            vec![Message::user(vec![Block::Text("go".into())])],
+            crate::tools::ToolCtx {
+                workdir: std::env::current_dir().unwrap(),
+                max_output_chars: 1000,
+                restrict_to_workdir: false,
+                cancel: None,
+                shell_timeout_secs: 120,
+                hooks: None,
+                subagent: None,
+                budget: None,
+                deadline: None,
+            },
+        );
+        (agent, state)
+    }
+
+    /// A mock-backed agent that answers one plain end_turn text turn.
+    fn mock_agent() -> Agent {
+        mock_agent_turns(vec![crate::provider::mock::resp_text(
+            "done",
+            crate::provider::mock::mk_usage(1, 1),
+        )])
+        .0
+    }
+
+    #[test]
+    fn non_retryable_api_error_skips_retry_ladder() {
+        // External re-review P2: a fixed-401 service was being hit once per
+        // retry step. A deterministic request rejection must fail ONCE —
+        // no backoff ladder (is_transient == false), exit EXIT_ERROR.
+        let (mut agent, state) = mock_agent_turns(vec![crate::provider::mock::MockTurn::ErrAny(
+            crate::provider::ApiStatusError::new(
+                401,
+                "OpenAI-compatible API error 401: bad key".into(),
+            )
+            .into(),
+        )]);
+        let code = run_with_retries(&mut agent, None, false, 3, |_| {}).unwrap();
+        assert_eq!(code, EXIT_ERROR);
+        assert_eq!(state.calls(), 1, "a 401 must not be retried");
+    }
+
+    #[test]
+    fn transient_api_error_uses_retry_ladder() {
+        // The other half of the taxonomy: 503 stays transient — retried once
+        // under --retries 1, then the run succeeds.
+        use crate::provider::mock;
+        let (mut agent, state) = mock_agent_turns(vec![
+            mock::MockTurn::ErrAny(
+                crate::provider::ApiStatusError::new(
+                    503,
+                    "OpenAI-compatible API error 503: overloaded".into(),
+                )
+                .into(),
+            ),
+            mock::resp_text("recovered", mock::mk_usage(1, 1)),
+        ]);
+        let code = run_with_retries(&mut agent, None, false, 1, |_| {}).unwrap();
+        assert_eq!(code, 0, "transient failure must be retried to success");
+        assert_eq!(state.calls(), 2);
+    }
+
+    #[test]
+    fn successful_run_with_unwritable_result_path_exits_nonzero() {
+        // External re-review P2: a run that SUCCEEDED but whose result.json
+        // cannot be written must not exit 0 — CI would read a missing/stale
+        // artifact and pass on outdated data. (Failed runs keep their own
+        // 130/124/125/1 codes.)
+        let dir = std::env::temp_dir().join(format!("ta-hwf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut agent = mock_agent();
+        // Point --output AT A DIRECTORY: the artifact write cannot succeed.
+        let code = run_with_retries(&mut agent, Some(&dir), false, 0, |_| {}).unwrap();
+        assert_eq!(
+            code, EXIT_ERROR,
+            "success + unwritable result must degrade to EXIT_ERROR"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn successful_run_with_writable_result_path_exits_zero() {
+        let dir = std::env::temp_dir().join(format!("ta-hwf-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("result.json");
+        let mut agent = mock_agent();
+        let code = run_with_retries(&mut agent, Some(&path), false, 0, |_| {}).unwrap();
+        assert_eq!(code, 0);
+        assert!(path.exists(), "result.json must be written");
         std::fs::remove_dir_all(&dir).ok();
     }
 

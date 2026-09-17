@@ -336,6 +336,25 @@ impl RunError {
     pub fn is_context_overflow(&self) -> bool {
         crate::compress::is_context_overflow(&self.source)
     }
+
+    /// Coarse retry taxonomy (external re-review P2), shared by the
+    /// single-run ladder and batch: false for DETERMINISTIC request
+    /// rejections a resent request cannot fix — auth/permission (401/403),
+    /// not-found (404), unfixable body (400/422) — true for transient
+    /// failures worth the backoff ladder: rate limit (429), 5xx, network
+    /// connect/timeout/reset, and anything unrecognized (the pre-taxonomy
+    /// behavior, kept as the safe default for custom providers).
+    ///
+    /// Context overflow is judged separately ([`Self::is_context_overflow`])
+    /// — it has its own gate and label in both retry drivers.
+    pub fn is_transient(&self) -> bool {
+        for cause in self.source.chain() {
+            if let Some(se) = cause.downcast_ref::<crate::provider::ApiStatusError>() {
+                return se.status == 429 || se.status >= 500;
+            }
+        }
+        true
+    }
 }
 
 /// Serialize the structured cost fields (usage / tool_calls / turns / elapsed)
@@ -1313,7 +1332,10 @@ impl Agent {
         let mut stuck_stop = false;
         let mut stop_reason: String;
 
-        loop {
+        // Labeled: the per-turn overflow-retry loop below is itself a `loop`
+        // (its `break resp` yields the ChatResponse), so exiting the TURN loop
+        // from inside a chat-error arm needs an explicit target.
+        'turns: loop {
             if self.cancelled() {
                 stop_reason = "cancelled".into();
                 break;
@@ -1561,7 +1583,21 @@ impl Agent {
                         }
                         return Err(self.run_error(e, &records, turns, start.elapsed()));
                     }
-                    Err(e) => return Err(self.run_error(e, &records, turns, start.elapsed())),
+                    Err(e) => {
+                        // A request that only fails once the run's wall clock
+                        // is gone died because the budget ran out in practice
+                        // — its per-request timeout WAS the deadline
+                        // remainder. Give the run the deadline vocabulary
+                        // (clean "timeout" stop_reason, exit 124, transcript
+                        // intact) instead of a generic provider error that
+                        // would climb the retry ladder (external re-review
+                        // P2). A pre-deadline failure keeps its real error.
+                        if deadline.is_some_and(|d| Instant::now() >= d) {
+                            stop_reason = "timeout".into();
+                            break 'turns;
+                        }
+                        return Err(self.run_error(e, &records, turns, start.elapsed()));
+                    }
                 }
             };
             if let Some(u) = &resp.usage {

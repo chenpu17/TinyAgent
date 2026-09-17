@@ -1,10 +1,17 @@
 //! Node.js / TypeScript bindings for TinyAgent — `import { chat, Agent } from 'tiny-agent'`.
 //!
 //! Exposes the agent loop, streaming events, cancel, and honest token usage to
-//! JavaScript. The blocking `run()` runs inside a napi `AsyncTask` on a libuv
-//! worker thread (no tokio — the core stays synchronous, like the Python
-//! binding's `py.allow_threads`); events cross back to the JS main thread via a
-//! `ThreadsafeFunction`.
+//! JavaScript. The blocking `run()` runs on a dedicated `std::thread` per call
+//! (no tokio — the core stays synchronous, like the Python binding's
+//! `py.allow_threads`) and settles the returned Promise via a napi deferred;
+//! events cross back to the JS main thread via a `ThreadsafeFunction`. A
+//! dedicated thread — NOT napi's `AsyncTask` on the shared libuv pool: a run
+//! blocks that thread waiting on JS tool/provider round-trips, and the wrapped
+//! JS callbacks schedule their own async work (fs, timers, Promises) onto the
+//! same pool — with as many concurrent runs as the pool has threads (default
+//! 4) every worker is blocked waiting on callbacks whose own pool work can
+//! never be scheduled: a deadlock. Dedicated threads scale independently of
+//! `UV_THREADPOOL_SIZE` (external review finding).
 //!
 //! serde ↔ JS goes through `serde_json::Value` (napi's `serde-json` feature
 //! gives it `ToNapiValue`): outcomes, events, and usage are converted to a
@@ -30,6 +37,7 @@ use std::time::{Duration, Instant};
 
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction, ThreadsafeFunctionCallMode};
+use napi::{JsDeferred, JsObject};
 use napi_derive::napi;
 use serde_json::Value;
 
@@ -54,13 +62,14 @@ fn code_feature_missing() -> Error {
     )
 }
 
-// ── AsyncTask return wrapper ─────────────────────────────────────────────────
+// ── deferred-Promise resolution wrapper ──────────────────────────────────────
 
-/// Carries a serde `Value` through napi's `AsyncTask` return path. The task's
-/// `JsValue` must implement both `ToNapiValue` *and* `TypeName`; `serde_json::
-/// Value` has the former (via the `serde-json` feature) but not the latter, so
-/// this thin wrapper supplies `TypeName` and delegates the JS materialization
-/// unchanged. The JS side sees the raw outcome object — no extra nesting.
+/// Carries a serde `Value` through napi's deferred-Promise resolution path.
+/// The deferred's resolver closure returns `Env -> Result<Data>` where `Data:
+/// ToNapiValue + TypeName`; `serde_json::Value` has the former (via the
+/// `serde-json` feature) but not the latter, so this thin wrapper supplies
+/// `TypeName` and delegates the JS materialization unchanged. The JS side
+/// sees the raw outcome object — no extra nesting.
 pub struct Outcome(pub Value);
 
 impl TypeName for Outcome {
@@ -432,104 +441,74 @@ fn build_provider(env: Env, provider: Option<Object>) -> Result<Option<Box<dyn t
     Ok(Some(Box::new(NodeProvider { tsfn })))
 }
 
-// ── run task: drives one agent.run() on a libuv worker thread ────────────────
+// ── agent work on dedicated threads (NOT the libuv pool) ─────────────────────
+//
+// `run`/`compact`/`chat` drive the synchronous core agent on a freshly spawned
+// `std::thread` and settle the returned Promise via napi's `JsDeferred` (Send —
+// resolvable from any thread). They must NOT run as a napi `AsyncTask`: the
+// agent thread blocks in the JS tool/provider round-trips above, and the
+// wrapped JS callbacks schedule their own async work (fs.promises, timers,
+// promise continuations) onto the shared libuv worker pool those same
+// AsyncTasks occupy — `min(runs, UV_THREADPOOL_SIZE)` (default 4) concurrent
+// runs exhaust the pool and every blocked run waits on callbacks whose pool
+// work can never be scheduled: a total deadlock. Dedicated threads cost one
+// OS thread per in-flight run and scale independently of the pool size.
 
-/// The async unit of work for `Agent#run()`. `compute` runs off the JS thread
-/// (so the event loop stays free to receive event callbacks); the outcome is
-/// converted to a `serde_json::Value` and materialized as a JS object in
-/// `resolve`. (`chat()` uses [`ChatRunTask`], the same shape with a config path
-/// instead of a pre-built agent.)
-pub struct RunTask {
-    /// Cloned from the live `Agent`. `Arc<Mutex>` so the task can take `&mut`
-    /// on the worker thread without moving the agent out of its JS wrapper.
-    pub agent: Arc<Mutex<ta::Agent>>,
-    /// Optional streaming-event forwarder; called for each `AgentEvent`.
-    pub on_event: Option<ThreadsafeFunction<Value, ErrorStrategy::Fatal>>,
-}
+/// The resolver shape every agent Promise settles with: materialize the
+/// pre-serialized outcome `Value` as a JS object on the JS thread.
+type AgentResolver = Box<dyn FnOnce(Env) -> Result<Outcome>>;
 
-impl Task for RunTask {
-    type Output = Value;
-    type JsValue = Outcome;
-
-    fn compute(&mut self) -> Result<Self::Output> {
-        let RunTask { agent, on_event } = self;
-        let mut a = agent.lock().map_err(|_| err("agent mutex poisoned"))?;
-
-        // Forward each event to JS as a serde Value; napi turns it into a plain
-        // object (the externally-tagged AgentEvent shape, e.g. { TextDelta: ".." }).
-        let outcome = a
-            .run(&mut |ev: ta::AgentEvent| {
-                if let Some(tsfn) = on_event.as_ref() {
-                    if let Ok(v) = serde_json::to_value(&ev) {
-                        let _ = tsfn.call(v, ThreadsafeFunctionCallMode::NonBlocking);
-                    }
-                }
-            })
-            .map_err(|e: ta::RunError| {
-                // Surface the structured cost a failed run burned, not just the
-                // Display message — the binding previously dropped usage /
-                // tool_calls / turns / elapsed, contradicting the core library's
-                // "honest cost" design (CLAUDE.md "重试诚实成本"). Serialize
-                // RunError (manual Serialize impl) to a JSON string so JS callers
-                // can JSON.parse(err.message) to read e.g. .usage.input_tokens;
-                // the `error` field carries the human-readable message.
-                match serde_json::to_string(&e) {
-                    Ok(json) => Error::from_reason(json),
-                    Err(_) => err(&e),
-                }
-            })?;
-
-        serde_json::to_value(&outcome).map_err(err)
-    }
-
-    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
-        Ok(Outcome(output))
+/// Surface the structured cost a failed run burned, not just the Display
+/// message — the binding previously dropped usage / tool_calls / turns /
+/// elapsed, contradicting the core library's "honest cost" design (CLAUDE.md
+/// "重试诚实成本"). Serialize RunError (manual Serialize impl) to a JSON string
+/// so JS callers can JSON.parse(err.message) to read e.g. .usage.input_tokens;
+/// the `error` field carries the human-readable message.
+fn run_error_to_napi(e: &ta::RunError) -> Error {
+    match serde_json::to_string(e) {
+        Ok(json) => Error::from_reason(json),
+        Err(_) => err(e),
     }
 }
 
-/// The async unit of work for `Agent#compact()`: the manual history fold runs
-/// off the JS thread (same rationale as [`RunTask`]); the outcome — `null`
-/// when nothing was compressible — resolves as a plain object.
-pub struct CompactTask {
-    /// Cloned from the live `Agent`.
-    pub agent: Arc<Mutex<ta::Agent>>,
-    /// Optional host focus hint for the summarizer.
-    pub instructions: Option<String>,
-    /// Optional streaming-event forwarder (`Compressed`/`Warning`).
-    pub on_event: Option<ThreadsafeFunction<Value, ErrorStrategy::Fatal>>,
-}
-
-impl Task for CompactTask {
-    type Output = Value;
-    type JsValue = Outcome;
-
-    fn compute(&mut self) -> Result<Self::Output> {
-        let CompactTask {
-            agent,
-            instructions,
-            on_event,
-        } = self;
-        let mut a = agent.lock().map_err(|_| err("agent mutex poisoned"))?;
-        let outcome = a
-            .compact_with(
-                &mut |ev: ta::AgentEvent| {
-                    if let Some(tsfn) = on_event.as_ref() {
-                        if let Ok(v) = serde_json::to_value(&ev) {
-                            let _ = tsfn.call(v, ThreadsafeFunctionCallMode::NonBlocking);
-                        }
-                    }
-                },
-                instructions.as_deref(),
-            )
-            .map_err(err)?;
-        match outcome {
-            Some(o) => serde_json::to_value(o).map_err(err),
-            None => Ok(Value::Null),
+/// Spawn `work` on a dedicated thread and wire its result into `deferred`:
+/// Ok(value) resolves, Err rejects, and a PANIC rejects too (debug builds —
+/// release is `panic = "abort"`, where no unwinding happens at all) so the
+/// JS side is never left with an unsettled Promise. The 8 MiB stack matches
+/// the libuv worker default the AsyncTask shape used to run on, keeping
+/// headroom for deep JSON (de)serialization and provider call chains.
+fn spawn_agent_work<F>(deferred: JsDeferred<Outcome, AgentResolver>, work: F)
+where
+    F: FnOnce() -> Result<Value> + Send + 'static,
+{
+    // Park the deferred behind a slot so it can be recovered and REJECTED if
+    // thread creation itself fails — `Builder::spawn` drops the closure on
+    // error, and a dropped JsDeferred settles nothing (no Drop impl), which
+    // would strand the Promise forever.
+    let slot: Arc<Mutex<Option<JsDeferred<Outcome, AgentResolver>>>> =
+        Arc::new(Mutex::new(Some(deferred)));
+    let worker_slot = slot.clone();
+    let spawned = std::thread::Builder::new()
+        .name("tiny-agent-run".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            let deferred = worker_slot
+                .lock()
+                .unwrap()
+                .take()
+                .expect("deferred settled exactly once");
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+                Ok(Ok(v)) => deferred.resolve(Box::new(move |_env| Ok(Outcome(v)))),
+                Ok(Err(e)) => deferred.reject(e),
+                Err(_) => deferred.reject(err("agent worker thread panicked")),
+            }
+        });
+    if let Err(e) = spawned {
+        // Thread creation failed (resource exhaustion): settle the Promise
+        // rather than stranding it.
+        if let Some(d) = slot.lock().unwrap().take() {
+            d.reject(err(format!("failed to spawn agent worker thread: {e}")));
         }
-    }
-
-    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
-        Ok(Outcome(output))
     }
 }
 
@@ -576,12 +555,12 @@ impl Default for CancelToken {
 // ── Agent ────────────────────────────────────────────────────────────────────
 
 /// Busy error for a sync method called while `run()` is in flight. The run
-/// holds the agent mutex on its libuv worker thread for the whole duration;
-/// BLOCKING the JS main thread on that lock would freeze the event loop the
-/// run itself depends on (TSFN event/tool/provider callbacks dispatch there —
-/// a blocked loop means the run can never finish: a deadlock in all but
-/// name). try_lock + an immediate, explanatory error is the only safe shape.
-/// After the awaited run() resolves, the methods work again.
+/// holds the agent mutex on its dedicated worker thread for the whole
+/// duration; BLOCKING the JS main thread on that lock would freeze the event
+/// loop the run itself depends on (TSFN event/tool/provider callbacks dispatch
+/// there — a blocked loop means the run can never finish: a deadlock in all
+/// but name). try_lock + an immediate, explanatory error is the only safe
+/// shape. After the awaited run() resolves, the methods work again.
 fn agent_busy() -> Error {
     err(
         "Agent.run() is active: sync methods (pushUser, setCancel, usage, \
@@ -676,12 +655,28 @@ impl Agent {
     #[napi]
     pub fn run(
         &self,
+        env: Env,
         on_event: Option<ThreadsafeFunction<Value, ErrorStrategy::Fatal>>,
-    ) -> AsyncTask<RunTask> {
-        AsyncTask::new(RunTask {
-            agent: self.inner.clone(),
-            on_event,
-        })
+    ) -> Result<JsObject> {
+        let (deferred, promise) = env.create_deferred::<Outcome, AgentResolver>()?;
+        let agent = self.inner.clone();
+        spawn_agent_work(deferred, move || {
+            let mut a = agent.lock().map_err(|_| err("agent mutex poisoned"))?;
+            // Forward each event to JS as a serde Value; napi turns it into a
+            // plain object (the externally-tagged AgentEvent shape, e.g.
+            // { TextDelta: ".." }).
+            let outcome = a
+                .run(&mut |ev: ta::AgentEvent| {
+                    if let Some(tsfn) = on_event.as_ref() {
+                        if let Ok(v) = serde_json::to_value(&ev) {
+                            let _ = tsfn.call(v, ThreadsafeFunctionCallMode::NonBlocking);
+                        }
+                    }
+                })
+                .map_err(|e| run_error_to_napi(&e))?;
+            serde_json::to_value(&outcome).map_err(err)
+        });
+        Ok(promise)
     }
 
     /// Manually compress the conversation history NOW (the idle-time fold):
@@ -695,14 +690,32 @@ impl Agent {
     #[napi]
     pub fn compact(
         &self,
+        env: Env,
         instructions: Option<String>,
         on_event: Option<ThreadsafeFunction<Value, ErrorStrategy::Fatal>>,
-    ) -> AsyncTask<CompactTask> {
-        AsyncTask::new(CompactTask {
-            agent: self.inner.clone(),
-            instructions,
-            on_event,
-        })
+    ) -> Result<JsObject> {
+        let (deferred, promise) = env.create_deferred::<Outcome, AgentResolver>()?;
+        let agent = self.inner.clone();
+        spawn_agent_work(deferred, move || {
+            let mut a = agent.lock().map_err(|_| err("agent mutex poisoned"))?;
+            let outcome = a
+                .compact_with(
+                    &mut |ev: ta::AgentEvent| {
+                        if let Some(tsfn) = on_event.as_ref() {
+                            if let Ok(v) = serde_json::to_value(&ev) {
+                                let _ = tsfn.call(v, ThreadsafeFunctionCallMode::NonBlocking);
+                            }
+                        }
+                    },
+                    instructions.as_deref(),
+                )
+                .map_err(err)?;
+            match outcome {
+                Some(o) => serde_json::to_value(o).map_err(err),
+                None => Ok(Value::Null),
+            }
+        });
+        Ok(promise)
     }
 
     /// Cumulative token usage of the current/latest run (4 axes), as an object.
@@ -806,62 +819,29 @@ pub fn chat(
     tools: Option<Vec<Object>>,
     provider: Option<Object>,
     api_key: Option<String>,
-) -> Result<AsyncTask<ChatRunTask>> {
+) -> Result<JsObject> {
     let extra = build_extra_tools(env, tools)?;
     // Build the provider TSFN on the JS thread (env); the trait object is Send
-    // and threads safely into the worker task.
+    // and threads safely into the worker thread.
     let prov = build_provider(env, provider)?;
-    Ok(AsyncTask::new(ChatRunTask {
-        config_path,
-        message,
-        api_key,
-        on_event,
-        tools: extra,
-        provider: prov,
-    }))
-}
-
-/// chat() builds its agent on the worker thread (config + key resolved there),
-/// so it uses its own task rather than [`RunTask`] (which assumes a pre-built
-/// agent). Same Value-bridged outcome + event forwarding; carries any injected
-/// tools through to the worker thread.
-pub struct ChatRunTask {
-    pub config_path: String,
-    pub message: String,
-    pub api_key: Option<String>,
-    pub on_event: Option<ThreadsafeFunction<Value, ErrorStrategy::Fatal>>,
-    pub tools: Vec<Box<dyn ta::Tool>>,
-    /// A custom provider (TSFN built on the JS thread), or None to build the
-    /// configured openai/anthropic provider from the config on the worker.
-    pub provider: Option<Box<dyn ta::Provider>>,
-}
-
-impl Task for ChatRunTask {
-    type Output = Value;
-    type JsValue = Outcome;
-
-    fn compute(&mut self) -> Result<Self::Output> {
-        let cfg = ta::Config::load(Path::new(&self.config_path)).map_err(err)?;
-        let api_key = match &self.api_key {
-            Some(k) => k.clone(),
-            None => match &self.provider {
+    let (deferred, promise) = env.create_deferred::<Outcome, AgentResolver>()?;
+    spawn_agent_work(deferred, move || {
+        let cfg = ta::Config::load(Path::new(&config_path)).map_err(err)?;
+        let api_key = match api_key {
+            Some(k) => k,
+            None => match &prov {
                 Some(_) => String::new(),
                 None => cfg.api_key().map_err(err)?,
             },
         };
         let client = ta::provider::new_client(cfg.limits.timeout_secs);
-        // Move the tools + provider out of `&mut self` (the builders take them
-        // by value); they're spent once the agent owns them.
-        let tools = std::mem::take(&mut self.tools);
-        let provider = self.provider.take();
-        let mut agent = match provider {
-            Some(p) => ta::build_agent_with_provider(&cfg, p, Vec::new(), &client, tools, &api_key),
-            None => ta::build_agent_with(&cfg, Vec::new(), &client, tools, &api_key),
+        let mut agent = match prov {
+            Some(p) => ta::build_agent_with_provider(&cfg, p, Vec::new(), &client, extra, &api_key),
+            None => ta::build_agent_with(&cfg, Vec::new(), &client, extra, &api_key),
         }
         .map_err(err)?;
-        agent.push_user(vec![ta::Block::Text(self.message.clone())]);
+        agent.push_user(vec![ta::Block::Text(message)]);
 
-        let on_event = &self.on_event;
         let outcome = agent
             .run(&mut |ev: ta::AgentEvent| {
                 if let Some(tsfn) = on_event.as_ref() {
@@ -870,26 +850,11 @@ impl Task for ChatRunTask {
                     }
                 }
             })
-            .map_err(|e: ta::RunError| {
-                // Surface the structured cost a failed run burned, not just the
-                // Display message — the binding previously dropped usage /
-                // tool_calls / turns / elapsed, contradicting the core library's
-                // "honest cost" design (CLAUDE.md "重试诚实成本"). Serialize
-                // RunError (manual Serialize impl) to a JSON string so JS callers
-                // can JSON.parse(err.message) to read e.g. .usage.input_tokens;
-                // the `error` field carries the human-readable message.
-                match serde_json::to_string(&e) {
-                    Ok(json) => Error::from_reason(json),
-                    Err(_) => err(&e),
-                }
-            })?;
+            .map_err(|e| run_error_to_napi(&e))?;
 
         serde_json::to_value(&outcome).map_err(err)
-    }
-
-    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
-        Ok(Outcome(output))
-    }
+    });
+    Ok(promise)
 }
 
 #[cfg(test)]

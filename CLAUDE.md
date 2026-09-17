@@ -107,7 +107,7 @@ cargo clippy -p tiny-agent-node
 - **read_file 分页**：offset 跳行不花字节预算；json content 逐行保留原始行终止符；raw 默认窗口 3 字节对齐。
 - **env 注入 system prompt**：唯一收敛点在 `Agent::new`（子 agent 也过）；改 assemble 注入会漏子 agent。
 - **retry 诚实成本**：失败轮的 usage/tool_calls 经 `RunCost` 落进 result.json，不清零；batch 不经 run_one_attempt 的终态一律走 `write_terminal_result` 单出口落盘（`early` 早退也继承 `acc`/`attempt_no`——重试轮 setup 失败不清零前轮真实成本）。
-- **run_code 路径拦截**：符号链接走查按**原始拼写**逐组件进行（先折叠 `..` 会把 `link` 抹掉、`link/../x` 逃逸）；词法折叠只做 workdir 外快速筛。cancel/deadline 入口拒绝都同时 latch `interrupt`+`halted`（可捕获异常被 guest 捕获重试时，停机检查拒纳）。
+- **run_code 路径拦截**：符号链接走查按**原始拼写**逐组件进行（先折叠 `..` 会把 `link` 抹掉、`link/../x` 逃逸）；绝对拼写**从根锚定**走查（字面前缀非 workdir 的折叠拼写不再跳过）；不存在目标经**最深已存在祖先 canonicalize** 判定（不再纯词法回退）。cancel/deadline 入口拒绝都同时 latch `interrupt`+`halted`（可捕获异常被 guest 捕获重试时，停机检查拒纳）。
 - **headless Ctrl-C**：首次翻 cancel 优雅收尾（exit 130），二次硬退；批量模式 worker gate 同款。
 - **消息稳定 id**：ingest 点分配（非构造时）；`next_msg_id` 不随 `clear_messages` 重置。
 - **TUI**：inline viewport + scrollback 提交模型；新增"在飞行"必须同步 holdback/inflight/LiveRow 三件套；新暗色元素用 `dim_fg()`。
@@ -122,7 +122,7 @@ cargo clippy -p tiny-agent-node
 - **`serde_json::json!` 宏按所有权取值**：`&String`/`&Value` 要 clone，`Option<&str>` 显式转。
 - **Anthropic 不允许相邻 user**：新 user 入口走 `append_user_turn`；tool_use/tool_result 必须 N:N 配对。
 - **batch 覆盖白名单**：安全字段覆盖即 `bad_task`；limits 逐字段由 `Clamp` 三变体声明，`shell_timeout_secs` 是唯一 Replace。
-- **batch `--retries` 只重试 transient**（`stop_reason == "error"`）；`stop_reason` 词汇含 `panic`（catch_unwind 兜底）。
+- **batch `--retries` 只重试 transient**（`stop_reason == "error"`；分类在 `RunError::is_transient`，单跑梯共用——4xx 非 429 为确定性 `request_error` 不重试，run 截止后失败的请求按 `timeout`/124 归属）；**重试=整任务重放**，前轮副作用不回滚；`stop_reason` 词汇含 `panic`（catch_unwind 兜底）。
 - **batch workdir 隔离**：`copy` 符号链接自包含策略；`git` 要 repo 根（macOS /tmp symlink 需 canonicalize 比较）。
 - **OpenAI 400 回退**：三条 fix 各管一个字段，record-on-success（只记最终 2xx 的修复），learned fixes 不落盘。
 - **流中途错误形状**：返回 Ok + 尾附 `[stream error]` 标记 + 已上报 usage——别 bail（会丢 usage 破坏失败计费）。

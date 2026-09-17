@@ -107,7 +107,7 @@ test('cancel interrupts the in-flight run', async (t) => {
   a.setCancel(tok);
 
   // Flip cancel from a timer (the JS main thread is free during the awaited
-  // run, which executes on a libuv worker thread).
+  // run, which executes on a dedicated worker thread).
   setTimeout(() => tok.cancel(), 300);
 
   const out = await a.run();
@@ -405,9 +405,10 @@ test('custom provider cancel takes effect after the call', async (t) => {
 });
 
 test('custom provider: async providers run concurrently via the event loop', async (t) => {
-  // Two agents running simultaneously: their run() calls overlap on libuv
-  // worker threads, and — because the provider is ASYNC — its callback yields
-  // the main thread at the first `await` (the TSFN call returns a promise napi
+  // Two agents running simultaneously: their run() calls execute on dedicated
+  // worker threads (NOT the shared libuv pool — see the concurrency test
+  // below), and — because the provider is ASYNC — its callback yields the
+  // main thread at the first `await` (the TSFN call returns a promise napi
   // doesn't block on). So both sleeps run concurrently in the event loop, just
   // like the Python binding's GIL-released sleeping provider. The property
   // under test: no TSFN/worker deadlock under concurrent use, AND the two
@@ -435,6 +436,36 @@ test('custom provider: async providers run concurrently via the event loop', asy
   // Concurrent: 2×120ms serialized would be ≈240ms; overlapped ≈120ms.
   // 200ms separates them with margin for timer coarseness / worker handoff.
   assert.ok(elapsed < 200, `expected concurrent (<200ms), got ${elapsed}ms — serialized?`);
+});
+
+test('more concurrent runs than libuv pool threads do not deadlock', async (t) => {
+  // External-review regression: run() used to execute as a napi AsyncTask ON
+  // the shared libuv worker pool (default 4 threads). Each running agent
+  // blocks its worker waiting for the JS provider round-trip, and the wrapped
+  // provider's own async work (here: fs.promises, itself a libuv-pool
+  // consumer) must be scheduled onto the SAME pool — with 4+ concurrent runs
+  // every pool thread was blocked waiting on callbacks whose pool work could
+  // never run: a total deadlock. Runs now execute on dedicated std::threads,
+  // so 6 (> pool size) concurrent runs with pool-consuming providers must all
+  // complete.
+  const { cfgPath } = providerConfig(t);
+  const N = 6; // > UV_THREADPOOL_SIZE default of 4
+  const make = () => new Agent(cfgPath, {
+    provider: async () => {
+      // Pool-consuming work inside the provider callback — the resource the
+      // deadlocked design starved.
+      await fs.promises.readFile(cfgPath);
+      return { text: 'ok', stop_reason: 'end_turn' };
+    },
+  });
+  const runOne = async () => {
+    const a = make();
+    a.pushUser('hi');
+    return (await a.run()).final_text;
+  };
+
+  const results = await Promise.all(Array.from({ length: N }, runOne));
+  assert.deepStrictEqual(results, Array.from({ length: N }, () => 'ok'));
 });
 
 test('custom provider recovers after an error', async (t) => {
@@ -487,16 +518,19 @@ test('custom provider passes through non-end-turn stop_reason', async (t) => {
 test('custom provider wait is bounded by the run budget, not just the 120s backstop', async (t) => {
   // A provider that never resolves + timeout_secs=1: the request carries the
   // run's remaining budget as its per-request timeout, and the worker's wait
-  // for the JS callback must honor it — run() rejects in ~1s instead of
-  // hanging until the 120s backstop.
+  // for the JS callback must honor it — the run ends as stop_reason "timeout"
+  // in ~1s (a deadline-past request failure is attributed to the budget, per
+  // the core's honest timeout classification) instead of hanging until the
+  // 120s backstop.
   const { cfgPath } = providerConfig(t, { timeoutSecs: 1 });
   const a = new Agent(cfgPath, {
     provider: () => new Promise(() => {}), // never settles
   });
   a.pushUser('hi');
   const started = Date.now();
-  await assert.rejects(a.run(), /did not resolve within 1s/);
+  const out = await a.run();
   const elapsed = Date.now() - started;
+  assert.strictEqual(out.stop_reason, 'timeout');
   assert.ok(elapsed < 10_000, `failed fast (~1s), took ${elapsed}ms`);
 });
 

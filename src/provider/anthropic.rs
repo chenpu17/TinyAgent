@@ -4,7 +4,7 @@ use super::{
     Block, CancellableSse, ChatEvent, ChatRequest, ChatResponse, Message, Provider, Role,
     SseSource, StreamAbort, ToolDef, Usage,
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
 pub struct Anthropic {
@@ -174,7 +174,12 @@ impl Provider for Anthropic {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().unwrap_or_default();
-            bail!("Anthropic API error {status}: {text}");
+            // Structured status + historical display text (see ApiStatusError).
+            return Err(super::ApiStatusError::new(
+                status.as_u16(),
+                format!("Anthropic API error {status}: {text}"),
+            )
+            .into());
         }
 
         let mut sse = CancellableSse::new(resp, req.cancel.clone(), self.idle)?;

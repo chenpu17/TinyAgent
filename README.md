@@ -299,18 +299,23 @@ tiny-agent --config examples/chat.json --tui
 
 ### `--retries N`：transient 失败重试
 
-只重试 **transient** 失败（`stop_reason == "error"`：provider / 网络错误，如连接被拒、5xx），
+只重试 **transient** 失败（`stop_reason == "error"`：网络抖动、429、5xx 等），
 指数退避 `1/2/4/8/16/32s`（封顶 32s）。**不重试**确定性失败——重跑也不会变：
 
 | stop_reason | 含义 | 是否重试 |
 |---|---|---|
-| `error` | provider/网络错误（transient） | ✅ |
+| `error` | transient provider/网络错误（连接被拒、429、5xx、请求超时） | ✅ |
+| `request_error` | 确定性请求拒绝（401/403/404/400 等，重发同样被拒） | ❌ |
 | `context_overflow` | 上下文溢出且强制压缩未能救回（确定性） | ❌ |
 | `bad_task` | 任务片段非法（禁用字段 / 缺 task / JSON 错） | ❌ |
 | `max_turns_reached` / `max_tokens` | 模型跑满上限 | ❌ |
 | `budget_exceeded` | 累计 token 触顶 `limits.max_total_tokens` | ❌ |
 | `panic` | 任务在 worker 里 panic，被兜成失败条目（见下） | ❌ |
 | `end_turn` | 正常完成 | ❌（已成功） |
+
+**重试语义 = 整任务从头重放**：每次重试用全新 Agent 重跑完整任务，前一轮已发生的副作用
+（写文件、发请求等工具动作）**不回滚、不续接**——账单照实累计，但非幂等工具会重复执行。
+对"追加文件""提交订单"这类有副作用的任务，要么保证任务幂等，要么不要开 `--retries`。
 
 `panic` 仅 debug / CI 构建会出现（worker 用 `catch_unwind` 兜住、整批照常完
 成）；release 是 `panic="abort"`，进程当场退出、不落 report。
@@ -332,10 +337,14 @@ tiny-agent --config examples/harness.json --batch examples/tasks --failed --retr
 
 ### 单跑瞬态重试
 
-`--retries N` 在**单跑 headless** 模式同样生效：`agent.run` 返回 `Err`（provider/网络/超时，即 transient
-失败）时按指数退避（1/2/4/8/16/32s 封顶）原地重试，最多 N 次额外尝试；确定性结局（`end_turn` /
-`max_turns` / `cancelled` / `timeout` / `budget_exceeded`）是 `Ok`，**不重试**。退出码与无重试时一致（成功 0、失败 1），
-`result.json` 的 `attempts` 字段记录实际运行次数（`>1` 即发生过重试）。`--json` 模式每次重试前另吐一行
+`--retries N` 在**单跑 headless** 模式同样生效：`agent.run` 返回 transient `Err`（网络抖动、429、
+5xx）时按指数退避（1/2/4/8/16/32s 封顶）原地重试，最多 N 次额外尝试；确定性失败**不重试**——
+`end_turn` / `max_turns` / `cancelled` / `timeout` / `budget_exceeded` 是 `Ok`，`context_overflow` 与
+`request_error`（401/403/404/400 等确定性请求拒绝）直接以 exit 1 收场。请求失败发生在 run 截止
+（`limits.timeout_secs`）之后时按 `timeout`（exit 124）归属，不进重试梯。与 batch 相同，重试是**整任务
+重放**：前轮工具副作用不回滚（账单照实累计），副作用型任务需自行保证幂等。退出码与无重试时一致
+（成功 0、失败 1），`result.json` 的 `attempts` 字段记录实际运行次数（`>1` 即发生过重试）。`--json`
+模式每次重试前另吐一行
 `{"type":"retry","attempt":N,"max":M,"backoff_secs":B,"error":"..."}` 方便管道跟进。
 
 ```sh
@@ -780,7 +789,10 @@ TinyAgent 的定位是**可审计、可无人值守的 agent 执行单元**—�
   `cache_read_input_tokens` 是 prompt 缓存写/读累计（Anthropic 两者都报，OpenAI 只报读）。`input_tokens`
   只含未缓存部分，真实计费输入需加上缓存写 1.25× / 读 0.1×（见上文 Prompt caching）
 - agent.run 返回 `Err`（如 provider 503）时仍会写结果文件：`{"success": false, "stop_reason": "error", "error": "..."}`；
-  不可救的上下文溢出（强制压缩未能救回）记 `stop_reason: "context_overflow"`（不进瞬态重试，exit code 仍为 1），与 batch report 同口径
+  不可救的上下文溢出（强制压缩未能救回）记 `stop_reason: "context_overflow"`，确定性请求拒绝
+  （401/403/404/400 等）记 `"request_error"`（两者都不进瞬态重试，exit code 仍为 1），与 batch report 同口径
+- 结果文件本身写失败（如 `--output` 指向目录）：运行**成功**时退出码降为 1（避免 CI 读到缺失/陈旧的
+  result.json 却看到 0）；运行本就失败（取消/超时等）时保留原退出码
 
 进程 exit code：
 

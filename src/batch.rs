@@ -940,9 +940,15 @@ fn run_one_attempt(
             // TRANSIENT summary failure (compress_failed) stacks on top of a
             // real overflow, a retry might have saved the run — we label it
             // deterministic anyway rather than pay N×(1+2+4…s) of backoff
-            // on every genuine overflow.
+            // on every genuine overflow. External re-review P2 adds the
+            // "request_error" arm: a deterministic request rejection
+            // (auth/permission/unfixable body — RunError::is_transient ==
+            // false) is likewise skipped by the "error"-only retry gate, and
+            // CI reads the distinction straight off the report.
             let stop = if re.is_context_overflow() {
                 "context_overflow"
+            } else if !re.is_transient() {
+                "request_error"
             } else {
                 "error"
             };
@@ -2124,6 +2130,132 @@ mod tests {
         let tasks = read_prior_tasks(&report).unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].stop_reason, "context_overflow");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Loopback mock that rejects EVERY request with a fixed status line and
+    /// JSON error body, counting requests (the fixed-rejection twin of
+    /// overflow_400_mock for the retry-taxonomy tests).
+    fn fixed_status_mock(
+        status_line: &'static str,
+        payload: &'static str,
+    ) -> (String, Arc<Mutex<usize>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let count_c = count.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = match stream {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let _body = read_http_body(&stream);
+                *count_c.lock().unwrap() += 1;
+                let head = format!(
+                    "HTTP/1.1 {status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    payload.len(),
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(payload.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (url, count)
+    }
+
+    #[test]
+    fn request_error_is_not_retried_in_batch() {
+        // External re-review P2: a fixed-401 service was hit once per retry
+        // step. A deterministic request rejection must fail ONCE, labeled
+        // "request_error" (skipped by the "error"-only retry gate), in well
+        // under the first backoff second.
+        let (url, count) = fixed_status_mock(
+            "401 Unauthorized",
+            r#"{"error":{"message":"invalid api key","type":"authentication_error"}}"#,
+        );
+        let dir = std::env::temp_dir().join(format!("ta-batch-401-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("t.json"), r#"{"task":"x"}"#).unwrap();
+        std::env::set_var("TA_BATCH_401_KEY", "dummy");
+        let base: Config = serde_json::from_str(&format!(
+            r#"{{"provider":"openai","api_key_env":"TA_BATCH_401_KEY","model":"m","base_url":"{}"}}"#,
+            url
+        ))
+        .unwrap();
+        let report = dir.join("report.json");
+
+        let start = std::time::Instant::now();
+        let code = run(
+            &base,
+            &dir,
+            1,
+            &report,
+            3,
+            false,
+            IsolateMode::None,
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(code, 1);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "no backoff ladder; took {:?}",
+            start.elapsed()
+        );
+        assert_eq!(
+            *count.lock().unwrap(),
+            1,
+            "exactly one request — a 401 must not be retried"
+        );
+        let tasks = read_prior_tasks(&report).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].stop_reason, "request_error");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn transient_5xx_still_retried_in_batch() {
+        // The other taxonomy half: 503 stays transient — under --retries 1
+        // the task is attempted TWICE (and still fails, so "error").
+        let (url, count) = fixed_status_mock(
+            "503 Service Unavailable",
+            r#"{"error":{"message":"overloaded","type":"server_error"}}"#,
+        );
+        let dir = std::env::temp_dir().join(format!("ta-batch-503-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("t.json"), r#"{"task":"x"}"#).unwrap();
+        std::env::set_var("TA_BATCH_503_KEY", "dummy");
+        let base: Config = serde_json::from_str(&format!(
+            r#"{{"provider":"openai","api_key_env":"TA_BATCH_503_KEY","model":"m","base_url":"{}"}}"#,
+            url
+        ))
+        .unwrap();
+        let report = dir.join("report.json");
+
+        let code = run(
+            &base,
+            &dir,
+            1,
+            &report,
+            1,
+            false,
+            IsolateMode::None,
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(code, 1);
+        assert_eq!(
+            *count.lock().unwrap(),
+            2,
+            "a transient 503 must be retried exactly once under --retries 1"
+        );
+        let tasks = read_prior_tasks(&report).unwrap();
+        assert_eq!(tasks[0].stop_reason, "error");
 
         std::fs::remove_dir_all(&dir).ok();
     }

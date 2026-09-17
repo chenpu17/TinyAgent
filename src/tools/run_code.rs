@@ -1035,13 +1035,26 @@ fn absolutize(workdir: &Path, path: &str) -> PathBuf {
 /// or is too long/deep to be a real path (see [`MAX_REL_PATH_BYTES`] —
 /// reads then fall through to the tool and fail naturally, writes are
 /// denied). Canonicalize first (resolving symlinks that EXIST); on failure
-/// (target not there yet — the normal write case) fall back to lexical
-/// normalization, which still collapses `./` and `a/../`.
+/// (target not there yet — the normal write case) resolve the deepest
+/// EXISTING ancestor of the ORIGINAL spelling and append the remainder
+/// ([`resolve_via_existing_ancestor`]) — kernel-truth, unlike the previous
+/// pure-lexical fallback, which collapsed `link/..` away on paper and judged
+/// `/outside/../<workdir>/link/../x` as INSIDE while the kernel wrote it
+/// outside (external re-review P1).
 fn workdir_relative(workdir_canon: &Path, path: &str) -> Option<String> {
     let full = absolutize(workdir_canon, path);
     let canon = match full.canonicalize() {
         Ok(c) => c,
-        Err(_) => lexical_normalize(&full),
+        Err(_) => {
+            // Payload guard BEFORE the ancestor walk: over-long spellings end
+            // up denied (writes) / pass-through-then-ENOENT (reads) either
+            // way — bound the one-canonicalize-per-level walk first
+            // (sec-review M-2 shape).
+            if path.len() > MAX_REL_PATH_BYTES {
+                return None;
+            }
+            resolve_via_existing_ancestor(&full).unwrap_or_else(|| lexical_normalize(&full))
+        }
     };
     let rel = canon.strip_prefix(workdir_canon).ok()?;
     let rel = rel.to_string_lossy().replace('\\', "/");
@@ -1049,6 +1062,42 @@ fn workdir_relative(workdir_canon: &Path, path: &str) -> Option<String> {
         return None;
     }
     Some(rel)
+}
+
+/// Kernel-truth resolution for a path whose tail does not exist yet (the
+/// normal write case): canonicalize the deepest EXISTING ancestor of the
+/// ORIGINAL spelling — resolving every symlink and `..` on the way, exactly
+/// as the kernel will at write time — then append the not-yet-existing
+/// remainder lexically. The remainder can hold no `..`: `file_name()` of a
+/// `..`-terminated path is `None`, and that case bails to the caller's
+/// lexical fallback — preserving the old behavior for `missing/../file`
+/// spellings, which the tool layer answers (ENOENT or parent creation),
+/// never a policy refusal.
+///
+/// `None` also past [`MAX_REL_SEGMENTS`] stripped components: deeper tails
+/// are denied by `workdir_relative`'s segment check regardless, so the walk
+/// stops before a guest-controlled depth turns it into a syscall-per-level
+/// stall.
+fn resolve_via_existing_ancestor(full: &Path) -> Option<PathBuf> {
+    let mut ancestor: &Path = full;
+    let mut rest: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        match ancestor.canonicalize() {
+            Ok(mut resolved) => {
+                for comp in rest.iter().rev() {
+                    resolved.push(comp);
+                }
+                return Some(resolved);
+            }
+            Err(_) => {
+                if rest.len() >= MAX_REL_SEGMENTS {
+                    return None;
+                }
+                rest.push(ancestor.file_name()?.to_os_string());
+                ancestor = ancestor.parent()?;
+            }
+        }
+    }
 }
 
 /// No real path resolves longer/deeper than this: PATH_MAX (4096) bounds
@@ -1075,9 +1124,18 @@ const MAX_REL_SEGMENTS: usize = 256;
 ///    path while the real write escapes. Walking original order —
 ///    push-and-check on Normal, pop on ParentDir — rejects a symlink in any
 ///    original position; every component that survives its check is a real
-///    directory, so a lexical pop matches the kernel's resolution, and with
-///    no symlink components the lexical form IS the resolved form (the
-///    invariant workdir_relative's lexical fallback relies on).
+///    directory, so a lexical pop matches the kernel's resolution.
+///
+/// Absolute spellings walk ANCHORED AT THE FILESYSTEM ROOT (second external
+/// P1): the old code `strip_prefix`'d the original absolute spelling and gave
+/// up when its literal front differed from the canonical workdir — but
+/// `/outside/../<workdir>/link/../x` collapses back inside (passing the
+/// screen above) while never spelling the workdir as its literal prefix, so
+/// the `link` it traverses went unchecked. Root-anchored walking covers every
+/// spelling the screen admits: a component above the workdir in such a
+/// spelling is either a real directory (lexical pop == kernel pop) or itself
+/// a symlink — a resolution we cannot reason about lexically, which is
+/// exactly what this layer refuses.
 fn write_traverses_symlink(workdir_canon: &Path, path: &str) -> bool {
     let full = lexical_normalize(&absolutize(workdir_canon, path));
     if full.strip_prefix(workdir_canon).is_err() {
@@ -1093,26 +1151,19 @@ fn write_traverses_symlink(workdir_canon: &Path, path: &str) -> bool {
         return false;
     }
     let orig = Path::new(path);
-    let rel: &Path = if orig.is_absolute() {
-        // Absolute spellings reaching here lexical-collapse inside the
-        // workdir, so their prefix must literally BE the canonical workdir
-        // (spellings like "/x/../w/y" whose front differs collapse back
-        // onto it — strip_prefix sees the front and fails, nothing to walk:
-        // the kernel-truth canonicalize in workdir_relative below judges
-        // those). The remainder walks exactly like a relative spelling.
-        match orig.strip_prefix(workdir_canon) {
-            Ok(r) => r,
-            Err(_) => return false,
-        }
-    } else {
-        orig
-    };
-    if rel.components().count() > MAX_REL_SEGMENTS {
+    if orig.components().count() > MAX_REL_SEGMENTS {
         return false;
     }
     use std::path::Component;
-    let mut cur = workdir_canon.to_path_buf();
-    for comp in rel.components() {
+    // Relative spellings anchor at the canonical workdir; absolute ones at
+    // the filesystem root (see the fn doc — a literal strip_prefix of the
+    // original spelling misses `x/../<workdir>/…` spellings entirely).
+    let mut cur = if orig.is_absolute() {
+        PathBuf::new()
+    } else {
+        workdir_canon.to_path_buf()
+    };
+    for comp in orig.components() {
         match comp {
             Component::Normal(c) => {
                 cur.push(c);
@@ -1124,17 +1175,22 @@ fn write_traverses_symlink(workdir_canon: &Path, path: &str) -> bool {
                 cur.pop();
             }
             Component::CurDir => {}
-            // Absolute originals were relativized above; relative spellings
-            // carry no prefix/root components.
-            Component::Prefix(_) | Component::RootDir => {}
+            // Rebuild the absolute anchor: the Windows prefix ("C:") then the
+            // root — pushing MAIN_SEPARATOR onto the empty/prefix-only buffer
+            // yields "/" / "C:\". Neither the root nor a canonical workdir
+            // prefix is itself a symlink, so not checking them loses nothing.
+            Component::Prefix(p) => cur.push(p.as_os_str()),
+            Component::RootDir => cur.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
         }
     }
     false
 }
 
-/// Lexical `.`/`..` collapse WITHOUT symlink resolution — used only when the
-/// target doesn't exist yet, where there is nothing to resolve. `..` past
-/// the root saturates (parts simply run empty — a no-op), matching the
+/// Lexical `.`/`..` collapse WITHOUT symlink resolution — used for the
+/// escape-detection screen and as `workdir_relative`'s fallback-of-last-
+///-resort (an ancestor chain whose not-yet-existing component precedes a
+/// `..`, where the real write fails ENOENT regardless). `..` past the root
+/// saturates (parts simply run empty — a no-op), matching the
 /// escape-detection above (a path that lexical-collapses outside the
 /// workdir fails `strip_prefix` → outside).
 ///
@@ -4027,6 +4083,120 @@ return t.length;"#}),
             dir.join("ok.txt").exists(),
             "the benign write must have landed"
         );
+    }
+
+    /// 2026-09 external re-review P1 (follow-up): an ABSOLUTE spelling whose
+    /// literal front is NOT the canonical workdir but which collapses back
+    /// inside — `<outside>/../<workdir>/link/../escaped.txt` — used to skip
+    /// the symlink walk entirely (the original-spelling strip_prefix failed)
+    /// and was then judged "inside" by workdir_relative's pure-lexical
+    /// fallback, while the kernel resolved the WRITE through `link` and
+    /// landed it outside. Root-anchored walking + deepest-existing-ancestor
+    /// resolution close both halves. Also pins the no-false-positive side
+    /// (same collapse shape popping only REAL dirs stays writable) and the
+    /// `missing/../file` fallback (interception stays out of the way; the
+    /// kernel's ENOENT reports it).
+    #[cfg(unix)]
+    #[test]
+    fn write_via_absolute_spelling_collapse_escape_rejected() {
+        let outer = std::env::temp_dir().join(format!("ta-run-code-abs-{}", std::process::id()));
+        std::fs::create_dir_all(outer.join("sub")).unwrap();
+        let dir = outer.join("inside");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink(outer.join("sub"), dir.join("link")).unwrap();
+        // Absolute spellings must be built from the CANONICAL paths — the
+        // policy layer compares against the canonical workdir, so spellings
+        // through an unresolved prefix (macOS /var → /private/var) were
+        // always "outside" refusals, before and after this fix.
+        let dir_canon = dir.canonicalize().unwrap();
+        let outer_canon = outer.canonicalize().unwrap();
+        // Absolute, literal front outside the workdir, collapses inside —
+        // and traverses the symlink mid-spelling. (`sub/..` pops back to the
+        // shared parent, then the spelling continues into the workdir —
+        // exactly the report's `outside/../work/link/../escaped.txt` shape.)
+        let esc = format!(
+            "{}/sub/../inside/link/../escaped.txt",
+            outer_canon.display()
+        );
+        // Same collapse shape, but every popped component is a REAL dir.
+        let ok = format!("{}/sub/../inside/real_ok.txt", outer_canon.display());
+        // A `..` behind a NOT-YET-EXISTING component: canonicalize fails and
+        // the ancestor walk bails (file_name of a `..`-terminated path is
+        // None) to the lexical fallback — the interception must NOT turn this
+        // into a policy refusal; what happens next is the tool's own business
+        // (write_file creates parents, so this one lands inside the workdir).
+        let hole = format!("{}/missing/../hole.txt", dir_canon.display());
+        let code = format!(
+            r#"
+            let esc, ok, hole;
+            try {{ tools.call("write_file", {{path: {esc:?}, content: "pwn"}}); esc = "wrote"; }}
+            catch (e) {{ esc = String(e); }}
+            try {{ tools.call("write_file", {{path: {ok:?}, content: "fine"}}); ok = "wrote"; }}
+            catch (e) {{ ok = String(e); }}
+            try {{ tools.call("write_file", {{path: {hole:?}, content: "x"}}); hole = "wrote"; }}
+            catch (e) {{ hole = String(e); }}
+            return {{esc: esc.slice(0, 120), ok: ok.slice(0, 120), hole: hole.slice(0, 120)}};"#
+        );
+        let out = tool_with_tools(CodeConfig::default(), r#"["read_file","write_file"]"#)
+            .run_with_emit(&json!({"code": code}), &ctx(&dir), &mut |_| {})
+            .unwrap();
+        let r = serde_json::from_str::<Value>(&out.content).unwrap_or(json!(null));
+        assert!(!out.is_error, "{}", out.content);
+        assert!(
+            r["esc"].as_str().unwrap_or("").contains("symlink"),
+            "the absolute-spelling escape must be refused and name the symlink: {}",
+            out.content
+        );
+        assert!(
+            !outer.join("escaped.txt").exists(),
+            "nothing may land outside via the collapse spelling"
+        );
+        assert_eq!(
+            r["ok"],
+            json!("wrote"),
+            "real-dir collapse spellings must stay writable: {}",
+            out.content
+        );
+        assert!(dir.join("real_ok.txt").exists(), "the benign write landed");
+        let hole = r["hole"].as_str().unwrap_or("");
+        assert!(
+            !hole.contains("symlink") && !hole.contains("limited to the working"),
+            "missing/../file must NOT be a policy refusal (kernel ENOENT instead): {hole}"
+        );
+        std::fs::remove_dir_all(&outer).ok();
+    }
+
+    /// workdir_relative's nonexistent-target fallback must be KERNEL-TRUTH:
+    /// `link/../x` resolves THROUGH the symlink (deepest-existing-ancestor
+    /// canonicalize), so the judgment is "outside" — the pure-lexical
+    /// fallback it replaced called the same spelling "x" (inside).
+    /// `missing/../x` keeps the lexical fallback (the ancestor walk cannot
+    /// resolve a not-yet-existing component in front of `..`).
+    #[cfg(unix)]
+    #[test]
+    fn workdir_relative_resolves_missing_target_kernel_truthfully() {
+        let outer = std::env::temp_dir().join(format!("ta-run-code-wr-{}", std::process::id()));
+        std::fs::create_dir_all(outer.join("sub")).unwrap();
+        let dir = outer.join("inside");
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        std::os::unix::fs::symlink(outer.join("sub"), dir.join("link")).unwrap();
+        let canon = dir.canonicalize().unwrap();
+        assert_eq!(
+            workdir_relative(&canon, "link/../x.txt"),
+            None,
+            "link/../x resolves outside: must be judged outside"
+        );
+        assert_eq!(
+            workdir_relative(&canon, "real/../x.txt"),
+            Some("x.txt".to_string()),
+            "real-dir .. still collapses inside"
+        );
+        assert_eq!(
+            workdir_relative(&canon, "missing/../x.txt"),
+            Some("x.txt".to_string()),
+            "missing-component .. keeps the lexical fallback"
+        );
+        std::fs::remove_dir_all(&outer).ok();
     }
 
     /// Sec-review M-2: a ~500k-segment guest path is a payload, not a

@@ -3116,6 +3116,80 @@ fn max_total_tokens_zero_means_no_cap() {
 }
 
 #[test]
+fn request_error_past_deadline_ends_run_as_timeout() {
+    // External re-review P2: timeout_secs=1 and the in-flight request dies
+    // once the budget is gone (its per-request timeout WAS the deadline
+    // remainder) — the run must end as a clean "timeout" (exit 124
+    // downstream, transcript intact), not a generic provider error that
+    // climbs the retry ladder.
+    let cfg = cfg_with(5, 1, 0);
+    let (prov, _) = MockProvider::new(vec![MockTurn::ErrAfter {
+        delay: std::time::Duration::from_millis(1200),
+        error: anyhow::anyhow!("request to API failed: operation timed out"),
+    }]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("hi")],
+        test_ctx(),
+    );
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o.stop_reason, "timeout");
+    assert_eq!(o.turns, 1);
+}
+
+#[test]
+fn api_status_error_retry_taxonomy() {
+    // The RunError classification both retry drivers share: deterministic
+    // 4xx rejections are NOT transient (no backoff ladder), 429/5xx and
+    // unrecognized errors stay transient (the pre-taxonomy default).
+    let classify = |status: u16| {
+        RunError {
+            source: crate::provider::ApiStatusError::new(
+                status,
+                format!("X API error {status}: nope"),
+            )
+            .into(),
+            usage: Usage::default(),
+            tool_calls: vec![],
+            turns: 1,
+            elapsed: std::time::Duration::ZERO,
+        }
+        .is_transient()
+    };
+    for s in [400, 401, 403, 404, 422] {
+        assert!(!classify(s), "{s} must be deterministic");
+    }
+    for s in [429, 500, 502, 503] {
+        assert!(classify(s), "{s} must stay transient");
+    }
+    // The classification sees the structured status THROUGH anyhow context
+    // wrapping (the providers' .context("request … failed") send paths).
+    let api_err: anyhow::Error =
+        crate::provider::ApiStatusError::new(401, "X API error 401: nope".into()).into();
+    let wrapped = RunError {
+        // anyhow::Error's inherent .context — no trait import needed.
+        source: api_err.context("request to API failed"),
+        usage: Usage::default(),
+        tool_calls: vec![],
+        turns: 1,
+        elapsed: std::time::Duration::ZERO,
+    };
+    assert!(!wrapped.is_transient(), "chain walk must find the status");
+    // Unrecognized errors (network blips from custom providers, etc.) keep
+    // the pre-taxonomy retryable default.
+    let plain = RunError {
+        source: anyhow::anyhow!("connection reset by peer"),
+        usage: Usage::default(),
+        tool_calls: vec![],
+        turns: 1,
+        elapsed: std::time::Duration::ZERO,
+    };
+    assert!(plain.is_transient());
+}
+
+#[test]
 fn timeout_zero_means_no_timeout() {
     // Guards the elapsed()>=0 trap: with timeout_secs=0 the run must
     // proceed normally instead of timing out before its first turn.
