@@ -436,6 +436,28 @@ const SALVAGE_NUDGE_EMPTY: &str = "Your previous reply produced no visible \
      text before hitting the output-token limit (reasoning consumed the \
      budget). Reply now with minimal reasoning and a direct, concise answer.";
 
+/// 打转护栏（OpenHands Stuck Detector 的思路，裁剪到 ReAct 循环）：同一个
+/// （工具名 + 规范化参数）连续执行到 [`STUCK_NUDGE_AT`] 次，把纠偏提示追加进
+/// 该次的 tool_result 历史块（UI 事件与 result.json 的 records 保持原样），
+/// 给模型一次自愈机会；累计到 [`STUCK_STOP_AT`] 次仍不换法，则本轮工具结果
+/// 落进历史后以 `stop_reason = "stuck_loop"` 收尾。任何一次不同的调用都会
+/// 重置计数——换工具 / 换参数 / 中间插入别的操作都算有进展，因此健康的
+/// 重试节奏（edit → test → edit）永不误伤。轮数帽只数次数，分不清「慢而
+/// 稳」和「原地打转」；轮帽放松（GUI 交互会话放到千级）后，这道护栏才是
+/// 防失控烧钱的主力（Codex CLI 无打转保护出现过 9 小时压缩死循环）。
+const STUCK_NUDGE_AT: u32 = 3;
+const STUCK_STOP_AT: u32 = 6;
+
+/// 纠偏提示（对模型的一次性警告，随第 N 次重复的 tool_result 下发）。
+fn stuck_nudge(n: u32) -> String {
+    format!(
+        "\n\n[system notice] This identical tool call (same name and arguments) \
+         has now run {n} times in a row. Repeating it cannot produce a different \
+         result. Change the approach: adjust the arguments, pick a different \
+         tool, or stop and explain the situation to the user."
+    )
+}
+
 /// Cap on the session archive (messages folded out of the live history by
 /// compression/pruning). Big enough for a very long session's paper trail;
 /// beyond it the OLDEST archived messages drop — the archive is an undo/audit
@@ -1284,6 +1306,11 @@ impl Agent {
         let mut salvage_used = false;
         let mut final_text = String::new();
         let mut records: Vec<ToolCallRecord> = Vec::new();
+        // 打转检测状态：上一个实际执行的 (工具名, 规范化参数) 与其连续重复
+        // 次数（见 STUCK_NUDGE_AT / STUCK_STOP_AT 的护栏说明）。
+        let mut stuck_key: Option<(String, String)> = None;
+        let mut stuck_len: u32 = 0;
+        let mut stuck_stop = false;
         let mut stop_reason: String;
 
         loop {
@@ -1950,9 +1977,25 @@ impl Agent {
                             is_error: output.is_error,
                             content: output.content.clone(),
                         });
+                        // 打转计数只统计真正执行的调用；nudge 只追加进历史
+                        // 块——ToolResult 事件与 records 保持原样输出
+                        let key = (name.clone(), canon_input(input));
+                        if stuck_key.as_ref() == Some(&key) {
+                            stuck_len += 1;
+                        } else {
+                            stuck_key = Some(key);
+                            stuck_len = 1;
+                        }
+                        let mut content = output.content.clone();
+                        if stuck_len == STUCK_NUDGE_AT {
+                            content.push_str(&stuck_nudge(stuck_len));
+                        }
+                        if stuck_len >= STUCK_STOP_AT {
+                            stuck_stop = true;
+                        }
                         results.push(Block::ToolResult {
                             tool_use_id: id.clone(),
-                            content: output.content.clone(),
+                            content,
                             image: output.image.clone().map(Box::new),
                             is_error: output.is_error,
                         });
@@ -1967,6 +2010,12 @@ impl Agent {
             self.messages.push(results_msg);
             if let Some(w) = self.save_session() {
                 events(AgentEvent::Warning(w));
+            }
+            // 打转硬停：历史以本轮 tool_results 收口（N:N 配对完整），下一轮
+            // 请求不再发出——与 max_turns_reached 同款的轮边界语义
+            if stuck_stop {
+                stop_reason = "stuck_loop".into();
+                break;
             }
         }
 
@@ -2138,6 +2187,29 @@ fn normalize_adjacent(messages: &mut Vec<Message>) {
         }
     }
     *messages = out;
+}
+
+/// 打转检测的调用键：把 tool input 递归排序对象键后序列化。serde_json 开了
+/// preserve_order（对象保持插入序），裸 `to_string` 会因模型重发同参调用时
+/// 的键序抖动把同一次调用误判成不同调用，护栏失效——比较前必须规范化。
+fn canon_input(v: &Value) -> String {
+    match v {
+        Value::Object(map) => {
+            let mut pairs: Vec<(String, String)> =
+                map.iter().map(|(k, val)| (k.clone(), canon_input(val))).collect();
+            pairs.sort_by(|a, b| a.0.cmp(&b.0));
+            let inner: Vec<String> = pairs
+                .into_iter()
+                .map(|(k, s)| format!("{}:{s}", serde_json::to_string(&k).unwrap_or_default()))
+                .collect();
+            format!("{{{}}}", inner.join(","))
+        }
+        Value::Array(arr) => {
+            let inner: Vec<String> = arr.iter().map(canon_input).collect();
+            format!("[{}]", inner.join(","))
+        }
+        other => other.to_string(),
+    }
 }
 
 /// Repair tool_use ids before an assistant message enters history: a

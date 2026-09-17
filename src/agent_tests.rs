@@ -2809,6 +2809,99 @@ fn max_turns_caps_the_loop() {
 }
 
 #[test]
+fn stuck_loop_nudges_then_stops() {
+    // 同一 (工具, 参数) 连续执行：第 3 次的 tool_result 历史块里出现纠偏提示
+    // （仅历史块，records/事件保持原样），累计到第 6 次后以 stuck_loop 收尾
+    // ——第 7 轮请求不得发出。
+    let cfg = cfg_with(99, 0, 0);
+    let mut turns: Vec<mock::MockTurn> = (0..6)
+        .map(|i| mock::resp_tool(&format!("t{i}"), "echo", json!({"q": "same"}), None))
+        .collect();
+    turns.push(mock::resp_text("never reached", None));
+    let (prov, state) = MockProvider::new(turns);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(EchoTool::new("echo"))],
+        vec![user_text("loop")],
+        test_ctx(),
+    );
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o.stop_reason, "stuck_loop");
+    assert_eq!(o.turns, 6);
+    assert_eq!(state.calls(), 6, "第 7 轮请求不得发出");
+    // nudge 只进第 3 次的 tool_result 历史块，一次即可
+    let results: Vec<String> = agent
+        .messages()
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .filter_map(|b| match b {
+            Block::ToolResult { content, .. } => Some(content.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 6);
+    assert!(!results[1].contains("system notice"));
+    assert!(results[2].contains("system notice"), "第 3 次必须带纠偏提示");
+    assert!(!results[3].contains("system notice"), "提示一次即可，不得每轮重复");
+}
+
+#[test]
+fn stuck_streak_resets_on_changed_calls() {
+    // 交替两组不同参数不算打转（只有「连续原样重复」才累计）：跑满 9 轮后
+    // 正常 end_turn——护栏不得误伤健康的换法重试节奏。
+    let cfg = cfg_with(99, 0, 0);
+    let mut turns: Vec<mock::MockTurn> = (0..9)
+        .map(|i| {
+            let q = if i % 2 == 0 { "x" } else { "y" };
+            mock::resp_tool(&format!("t{i}"), "echo", json!({ "q": q }), None)
+        })
+        .collect();
+    turns.push(mock::resp_text("done", None));
+    let (prov, state) = MockProvider::new(turns);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(EchoTool::new("echo"))],
+        vec![user_text("loop")],
+        test_ctx(),
+    );
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o.stop_reason, "end_turn");
+    assert_eq!(state.calls(), 10);
+}
+
+#[test]
+fn stuck_detection_ignores_key_order() {
+    // serde_json 开了 preserve_order：同参不同键序的裸 to_string 不同。
+    // 规范化（递归排序键）后必须视为同一次调用——交替两种键序照样累计到
+    // stuck_loop，否则模型换个键序就能绕过护栏。
+    let cfg = cfg_with(99, 0, 0);
+    let mut turns: Vec<mock::MockTurn> = (0..6)
+        .map(|i| {
+            let input = if i % 2 == 0 {
+                json!({"a": 1, "b": 2})
+            } else {
+                json!({"b": 2, "a": 1})
+            };
+            mock::resp_tool(&format!("t{i}"), "echo", input, None)
+        })
+        .collect();
+    turns.push(mock::resp_text("never reached", None));
+    let (prov, state) = MockProvider::new(turns);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(EchoTool::new("echo"))],
+        vec![user_text("loop")],
+        test_ctx(),
+    );
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o.stop_reason, "stuck_loop");
+    assert_eq!(state.calls(), 6);
+}
+
+#[test]
 fn max_total_tokens_caps_the_loop_with_budget_exceeded() {
     // max_total_tokens=100: turn 1 streams a tool_use whose usage totals
     // 110, pushing the accumulated spend past the cap. The cap is checked

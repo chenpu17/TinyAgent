@@ -1490,6 +1490,8 @@ mod tests {
         assert_eq!(exit_code_for("cancelled"), 130);
         assert_eq!(exit_code_for("max_turns_reached"), 1);
         assert_eq!(exit_code_for("max_tokens"), 1);
+        // stuck_loop 走默认臂（确定性失败，不重试、exit 1）
+        assert_eq!(exit_code_for("stuck_loop"), 1);
     }
 
     #[test]
