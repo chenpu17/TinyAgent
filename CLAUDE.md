@@ -149,4 +149,6 @@ cargo clippy -p tiny-agent-node
   （测试体在 `agent_tests.rs`），比 mock server 更快、断言更准。新增/改动 loop 行为优先在这里加用例。
 - **TUI 视觉验证**：用 ratatui `TestBackend` 抓 cell grid 做断言（见 `tui::tests`）；端到端交互用
   pty 脚本驱动（项目里惯用 `/tmp/ta-verify/` 放临时 mock + pty 脚本，跑完即删）。**不要只靠
-  "看起来对"**——改了渲染/光标/markdown 要真抓屏或单测断言验证。
+  "看起来对"**——改了渲染/光标/markdown 要真抓屏或单测断言验证。pty 驱动两个坑：裸 pty 必须
+  应答 crossterm 的 `\x1b[6n` 光标查询（回 `\x1b[<行>;<列>R`，否则启动即 "cursor position
+  could not be read" 退出）；带补全弹窗的斜杠命令要**双回车**（第一个 Enter 被弹窗吃掉当选择）。
