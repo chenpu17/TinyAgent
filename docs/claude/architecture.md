@@ -156,7 +156,11 @@
   `Tool::concurrency() == ToolConcurrency::Parallel`（`SubAgent` 覆写为 Parallel），loop 里没有任何
   `"task"` 字面量分流——第三方工具声明 Parallel 即获同款 fan-out（义务见「容易踩的坑」）。子 agent 的
   token 用量经 `ToolOutput::usage` 折进主 run 累计（失败也照计已完成轮次）。事件实时转发，裹成
-  `AgentEvent::SubAgent{name}` 区分并行的几个。
+  `AgentEvent::SubAgent{name}` 区分并行的几个。**fan-out 有波次上限与有界漏斗**（2026-09 外审 P2）：
+  runnable 按 `MAX_PARALLEL_TOOL_WORKERS=8` 分波，波内才保证"全 spawn 后再 join"；每波事件走
+  `sync_channel(256)` 有界转发——快子 agent 洪峰时 worker 的 emit 会**阻塞**（背压）而不是把父进程
+  内存撑爆，父线程同一 scope 内专职 drain，不会死锁。审批门（gate-before-spawn）逐调用复查 cancel、
+  spawn 前再查一次，gate 窗口内落下的 cancel 让整批不启动（槽位保持 Cancelled 合成）。
   **不可递归**：子 agent 的工具白名单是**全量构建后按 `Tool::available_to_subagent()` retain**
   （`child_tools()`，同样不按名字滤）——`task`（防递归）与 `todo`（计划归父）在 trait 里覆写 false，
   第三方工具可自主退出。**在默认白名单**（`config::default_tools`
@@ -173,6 +177,13 @@
   无绕过）；`ToolCtx::subagent` 以名字标注子 agent 身份供钩子区分。**关键语义**：Deny 产出
   `is_error` 结果照常入记录/配对，**不占 `Slot::Cancelled`**（那是取消专用——被拒调用要进审计账，
   被取消的不进）；Modify 只换**执行**输入，审计链（records/`ToolCall` 事件）永远保留模型原始输入；
+  **gate→执行检查点**（2026-09 外审 P2）：`before_tool` 可以无限期挂起（审批 UI 等人），等待期落下的
+  cancel 若不复查就会出现"run 报 cancelled、被批准的工具却照跑"——`ctx_cancelled()` 在 gate 返回后、
+  执行前复查（`execute_tool_call` / 并行批 spawn 前 / run_code 内层三处共用），顺序路径产出
+  `[cancelled by user]` 错误槽且 `after_tool` 以 `executed=false` 收尾（与 Deny 同形）；并行路径整批
+  不启动、槽位保持 Cancelled 合成（此时 before 已发过而 after 不会发——一个未配对 before，同
+  run_code deny 层的既有审计形状）；run_code 内层复用入口闸同款墓碑文案（`CANCEL_HALTED_WHY`，
+  kind `cancel`，附录 A v0.5 记录新增触发点）。
   顶层闸门在父线程 spawn 前**串行**把关，子 agent 自身闸门跑在各自 worker 线程（兄弟真并发，实现方
   须自行线程安全——`Send + Sync` 只保证传对象内存安全）；压缩摘要请求**不**透出；`--resume` 重建的
   agent 需重挂（层活在实例上、不进 session 文件）。本期绑定不透出 hooks（backlog P3）。

@@ -104,9 +104,16 @@
   秒回 cancelled（确定可见、`turns==0` 可机判），不是静默。库内**真正调用** `clear_cancel` 的只有两处：TUI
   `run_once`（每条提交输入/初始 auto-run）与 `compact()` 入口；`harness::run_with_retries` / `batch`
   重试梯的 attempt 间判定是**终态出口**——cancel → `EXIT_CANCELLED`，不重试**也不清**（清了即复活
-  用户已否决的 run；batch agent 本就不装 cancel flag，行为零变化）。测试组：`run_with_preset_cancel_returns…` /
+  用户已否决的 run；batch agent 本就不装 cancel flag，行为零变化）。**gate→执行检查点**（2026-09
+  外审 P2）：`before_tool` 审批等待可以无限期，窗口内落下的 cancel 若不复查就出现"run 报
+  cancelled、被批准的工具照跑"——`agent::ctx_cancelled()` 在 gate 返回后、执行前复查，三处
+  dispatch（`execute_tool_call` / 并行批 spawn 前 / run_code 内层）共用；顺序路径产出
+  `[cancelled by user]` 错误槽 + `after_tool(executed=false)`，并行路径整批不启动（槽位 Cancelled
+  合成），run_code 内层复用 `CANCEL_HALTED_WHY` 墓碑。测试组：`run_with_preset_cancel_returns…` /
   `run_does_not_clear…` / `clear_cancel_lets_the_next_run_proceed` /
-  `parallel_children_both_honour…` / `single_run_cancel_during_failed_attempt…` + 绑定两侧回归。
+  `parallel_children_both_honour…` / `single_run_cancel_during_failed_attempt…` /
+  `cancel_during_approval_gate_does_not_execute_{sequential_tool,parallel_batch}` +
+  绑定两侧回归。
 - **批量任务片段只能覆盖** `task`/`system_prompt`/`model`/`max_tokens`/`limits`；安全字段
   （`provider`/`base_url`/`api_key_env`/`workdir`/`tools`/`restrict_to_workdir`/`mcp_servers`）
   禁止覆盖（`config::forbidden_batch_override`），覆盖即 `bad_task` 失败、不执行。
@@ -166,11 +173,20 @@
   必再失败，apply 即记会让此后每轮主动发改名后的字段、反复触发不可修复的 400。改这段别把落账挪回
   apply 时刻。**learned fixes 只活在 provider 实例内存**：每 run 重建、不落盘、跨进程/绑定不共享
   （刻意——落盘引入跨 run 毒化面）；同一网关新 run 会重新学，每类 400 多一次试错往返。
+  **重发共享同一绝对截止时间**（2026-09 外审 P2）：`chat()` 入口把 `per_request_timeout` 折成
+  `Instant` 截止，每轮 400-重发只花 `remaining()`——旧实现每次 `post` 都拿满原始额度，1s 预算实测
+  两个 ~700ms 响应照样"成功"（超时 1.44s）。重发前另查 cancel：等待 400 往返期间用户已取消时不再
+  发新请求（Err 交上层重试梯按 EXIT_CANCELLED 收尾）。改这段别把 `remaining()` 换回
+  `req.per_request_timeout`。
 - **流中途错误的诚实成本形状（两 provider 对齐，改流解析必读）**：openai 与 anthropic 的
   `parse_loop` 对读失败（`StreamError`）与 `{"error":…}` 事件都返回 `Ok` + 尾附一条
   `[stream error] …` 标记文本块 + `stop_reason:"stream_error"` + **已上报的 usage**——
   agent.rs 的 stream_error 提取路径据此把前缀转成可重试 `RunError` 并计费。新增流错误路径照这个
-  形状，**别 bail!**（会丢掉网关可能已发的 usage，破坏"失败也计费"契约）。Anthropic 另有
+  形状，**别 bail!**（会丢掉网关可能已发的 usage，破坏"失败也计费"契约）。**截止已过时按
+  `timeout` 归属**（2026-09 外审 P2）：Ok+stream_error 也要过 Err 臂同款的 deadline 判定——
+  否则 deadline 到点触发的读超时会以可重试 Err 爬重试梯（实测 1 次重试 = 2 个请求 / ~2.8s /
+  双倍账单、exit 1 而非 124）；转为 `stop_reason:"timeout"` 终态时 usage 已在上一行 bill 过，
+  不再额外处理。Anthropic 另有
   `saw_usage` 标记：流里完全没有 usage 帧时 usage 返回 `None` 而非 `Some(全零)`——下游按
   Some/None 区分"计了 0"与"用量未知"，OpenAI 侧 usage 本就是 `Option` 天然满足。
 - **`harness::atomic_write` 的临时文件用 `create_new(true)`（O_EXCL）**：tmp 名

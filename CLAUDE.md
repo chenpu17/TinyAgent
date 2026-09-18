@@ -46,6 +46,9 @@ cargo fmt --all                            # 格式化（CI 有 --check 门禁�
 **Node 侧增删/改名 native `Agent` 方法必须同步两件套**：`wrapper.js`（带 onEvent 的方法要套
 `wrapOnEvent`——native 事件 TSFN 是 Fatal 策略，裸透传用户回调 = 抛错即进程 abort）与 `wrapper.d.ts`
 类型声明；`tests/test_wrapper_sync.test.js` 以 native 原型为真值源钉住漂移。
+`tests/test_packaging.test.js` 是打包验收门（`npm pack` → 独立目录安装 → 加载 + mock 调用一遍），
+守 `package.json` 的 `files` 白名单——tarball 只带本地平台的 `*.node`，跨平台 npm 分发
+（optionalDependencies 拆包）仍是未做的发布决策。
 改了核心 provider/agent 后，两个绑定的测试都要跟着跑一遍回归；动了 run_code/装配则另跑
 `maturin develop --features code` + `npm run build:debug -- --features code` 的双构建。
 
@@ -104,7 +107,7 @@ cargo clippy -p tiny-agent-node
 - **MCP 热增删**：撞名 = Err + 回滚；热增路径不打印；子 agent 与 run_code registry 都不感知（快照语义）。
 - **MCP SSE 同源闸门**：endpoint 解析与 POST 发送共用 `reqwest::Url`（真解析器）——别写字符串版 origin 切分，反斜杠混淆可绕过。
 - **子 agent（task）**：按 `Tool::concurrency()`/`available_to_subagent()` 能力标记路由，无名字黑名单；共享父 MCP、预算与 cancel。
-- **Hooks**：Deny 落 `Slot::Ran(error)` 不占 Cancelled；Modify 只换执行输入、审计留原始输入；`--resume` 不带走 hooks。
+- **Hooks**：Deny 落 `Slot::Ran(error)` 不占 Cancelled；Modify 只换执行输入、审计留原始输入；`--resume` 不带走 hooks。审批等待期落下的 cancel 在 **gate→执行检查点**（`ctx_cancelled`，execute_tool_call / 并行 spawn 前 / run_code 内层共用）拒绝执行。
 - **todo + meta**：plan 从 records 派生不经压缩；`meta` 审计侧信道不进模型可见 content。
 - **Skill**：三级加载；name 必须等于父目录名；`read_skill`/`list_skill` 不在白名单、由 assemble 配套注入；子 agent 不继承。
 - **run_code**：两层开关默认全关；wasmtime 中断四点纪律（入口门/epoch 回调/host_call 入口/收尾裁决）；`max_wasm_stack` 384 KiB；测试必须先 warm 模块。
@@ -131,8 +134,8 @@ cargo clippy -p tiny-agent-node
 - **batch 覆盖白名单**：安全字段覆盖即 `bad_task`；limits 逐字段由 `Clamp` 三变体声明，`shell_timeout_secs` 是唯一 Replace。
 - **batch `--retries` 只重试 transient**（`stop_reason == "error"`；分类在 `RunError::is_transient`，单跑梯共用——4xx 非 429 为确定性 `request_error` 不重试，run 截止后失败的请求按 `timeout`/124 归属）；**重试=整任务重放**，前轮副作用不回滚；`stop_reason` 词汇含 `panic`（catch_unwind 兜底）。
 - **batch workdir 隔离**：`copy` 符号链接自包含策略；`git` 要 repo 根（macOS /tmp symlink 需 canonicalize 比较）。
-- **OpenAI 400 回退**：三条 fix 各管一个字段，record-on-success（只记最终 2xx 的修复），learned fixes 不落盘。
-- **流中途错误形状**：返回 Ok + 尾附 `[stream error]` 标记 + 已上报 usage——别 bail（会丢 usage 破坏失败计费）。
+- **OpenAI 400 回退**：三条 fix 各管一个字段，record-on-success（只记最终 2xx 的修复），learned fixes 不落盘；整次 `chat()` 共用一个绝对截止时间（重发只花剩余额度），重发前查 cancel。
+- **流中途错误形状**：返回 Ok + 尾附 `[stream error]` 标记 + 已上报 usage——别 bail（会丢 usage 破坏失败计费）；run 截止已过时按 `timeout`/124 终态归属（不进重试梯）。
 - **`atomic_write` 用 `create_new(true)`**：别改回可预测单名（符号链接预置攻击面）；NDJSON 走 `print_ndjson` 别用 `println!`。
 - **`--session none` 是字面量哨兵**，与 `--resume` 互斥。
 - **MCP 工具名**：只消毒展示名，wire 名不动；`validate_tool_names` 在 assemble 末尾、之后别再 push 工具。

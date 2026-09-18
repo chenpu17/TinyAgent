@@ -1634,6 +1634,17 @@ impl Agent {
             // "重试诚实成本"). Earlier this path bailed inside the provider,
             // dropping the usage Anthropic had already billed.
             if resp.stop_reason == "stream_error" {
+                // Same deadline vocabulary as the Err arm of the request loop
+                // (external re-review P2): a stream that only died once the
+                // run's wall clock is gone must end as a clean "timeout"
+                // (exit 124, partial usage already billed above, transcript
+                // intact) — NOT a retryable stream error that would replay
+                // the whole task on a fresh budget. A pre-deadline stream
+                // error keeps the retryable Err below.
+                if deadline.is_some_and(|d| Instant::now() >= d) {
+                    stop_reason = "timeout".into();
+                    break 'turns;
+                }
                 let msg = resp
                     .blocks
                     .iter()
@@ -1891,10 +1902,13 @@ impl Agent {
             // Its implementor has signed up for reentrancy + cancel polling
             // (see ToolConcurrency::Parallel). Cancel: gate before spawning (a
             // cancel that hit during the inline pass, or one already set,
-            // marks the batch cancelled and skips it); in-flight workers
-            // self-terminate via the shared cancel flag they inherit,
-            // returning partial/cancelled results rather than synthesised ones.
-            // Hooks: after the announce, each call passes `before_tool` —
+            // marks the batch cancelled and skips it), re-checked PER CALL
+            // between the approval gates and once more before the first spawn
+            // — a cancel landing during an approval wait skips the batch too
+            // (external re-review P2); in-flight workers self-terminate via
+            // the shared cancel flag they inherit, returning partial/
+            // cancelled results rather than synthesised ones. Hooks: after
+            // the announce, each call passes `before_tool` —
             // serially, on this thread, before ANY worker spawns (approval
             // decisions never race); denied calls never spawn.
             if !parallel_slots.is_empty() && !batch_cancelled && !self.cancelled() {
@@ -1918,6 +1932,15 @@ impl Agent {
                 let mut runnable: Vec<(usize, String, Value)> =
                     Vec::with_capacity(parallel_slots.len());
                 for &i in &parallel_slots {
+                    // Cancel checkpoint, per call (external re-review P2): the
+                    // approval gates below can each wait unboundedly long, so
+                    // re-check between gates — a cancel that landed during an
+                    // earlier approval ends the gating here. Slots that were
+                    // never gated keep their Cancelled placeholder (N:N
+                    // synthesis below).
+                    if self.cancelled() {
+                        break;
+                    }
                     let name = &tool_uses[i].1;
                     let input = &tool_uses[i].2;
                     match gate_tool_call(&self.ctx, name, input) {
@@ -1934,45 +1957,76 @@ impl Agent {
                         }
                     }
                 }
-                let (tx, rx) = std::sync::mpsc::channel::<AgentEvent>();
-                let tools = &self.tools;
-                let defs = &self.tool_defs;
-                let ctx = &self.ctx;
-                std::thread::scope(|s| {
-                    // Spawn every runnable worker BEFORE joining any, so they
-                    // run concurrently. Each owns its input/name + a sender
-                    // clone, and only ever touches `tx` (never `events`).
-                    let mut handles: Vec<std::thread::ScopedJoinHandle<ToolOutput>> =
-                        Vec::with_capacity(runnable.len());
-                    for (_, name, input) in &runnable {
-                        let name = name.clone();
-                        let input = input.clone();
-                        let tx = tx.clone();
-                        handles.push(s.spawn(move || {
-                            let mut emit = |ev: AgentEvent| {
-                                let _ = tx.send(ev);
-                            };
-                            run_tool(tools, defs, &name, &input, ctx, &mut emit)
-                        }));
+                // Second checkpoint before anything spawns: a cancel that
+                // landed during the LAST gate skips the whole batch — approved
+                // but unstarted calls keep their Cancelled slots (cancel =
+                // stop STARTING work; already-running workers self-terminate
+                // via the shared flag per the Parallel contract). Control
+                // still falls through to the assembly pass below — the
+                // announced calls need their synthesized results.
+                if !self.cancelled() && !runnable.is_empty() {
+                    // Waves cap concurrent workers (MAX_PARALLEL_TOOL_WORKERS):
+                    // the model can emit dozens of `task` calls in one turn and
+                    // one-thread-per-call would fan out unboundedly. Events funnel
+                    // through a BOUNDED channel per wave (sync_channel) — a flood
+                    // from a fast sub-agent blocks its emit instead of ballooning
+                    // memory when the parent's consumer is slow (backpressure).
+                    // Within a wave every worker still spawns before any joins, so
+                    // the drain loop below interleaves their events live.
+                    const MAX_PARALLEL_TOOL_WORKERS: usize = 8;
+                    for wave in runnable.chunks(MAX_PARALLEL_TOOL_WORKERS) {
+                        let (tx, rx) = std::sync::mpsc::sync_channel::<AgentEvent>(256);
+                        let tools = &self.tools;
+                        let defs = &self.tool_defs;
+                        let ctx = &self.ctx;
+                        std::thread::scope(|s| {
+                            // Spawn every wave worker BEFORE joining any, so they
+                            // run concurrently. Each owns its input/name + a
+                            // sender clone, and only ever touches `tx` (never
+                            // `events`).
+                            let mut handles: Vec<std::thread::ScopedJoinHandle<ToolOutput>> =
+                                Vec::with_capacity(wave.len());
+                            for (_, name, input) in wave {
+                                let name = name.clone();
+                                let input = input.clone();
+                                let tx = tx.clone();
+                                handles.push(s.spawn(move || {
+                                    let mut emit = |ev: AgentEvent| {
+                                        // Blocks when the funnel is full — the
+                                        // drain loop in this same scope is the
+                                        // only consumer, so it always unwinds.
+                                        let _ = tx.send(ev);
+                                    };
+                                    run_tool(tools, defs, &name, &input, ctx, &mut emit)
+                                }));
+                            }
+                            drop(tx); // workers hold the last clones; rx ends when they drop
+                                      // Forward child events to the parent sink as they arrive
+                                      // (interleaved across parallel sub-agents, told apart by name).
+                            while let Ok(ev) = rx.recv() {
+                                events(ev);
+                            }
+                            // Join in spawn order (= parallel block order): notify
+                            // hooks with the ORIGINAL input (from tool_uses, never
+                            // the Modify replacement), then place each result at
+                            // its ordinal.
+                            for (pos, h) in handles.into_iter().enumerate() {
+                                let output = h.join().unwrap_or_else(|_| {
+                                    ToolOutput::error("parallel tool worker panicked")
+                                });
+                                let (i, _, _) = wave[pos];
+                                notify_tool_after(
+                                    ctx,
+                                    &tool_uses[i].1,
+                                    &tool_uses[i].2,
+                                    &output,
+                                    true,
+                                );
+                                slots[i] = Slot::Ran(Box::new(output));
+                            }
+                        });
                     }
-                    drop(tx); // workers hold the last clones; rx ends when they drop
-                              // Forward child events to the parent sink as they arrive
-                              // (interleaved across parallel sub-agents, told apart by name).
-                    while let Ok(ev) = rx.recv() {
-                        events(ev);
-                    }
-                    // Join in spawn order (= parallel block order): notify
-                    // hooks with the ORIGINAL input (from tool_uses, never the
-                    // Modify replacement), then place each result at its ordinal.
-                    for (pos, h) in handles.into_iter().enumerate() {
-                        let output = h
-                            .join()
-                            .unwrap_or_else(|_| ToolOutput::error("parallel tool worker panicked"));
-                        let (i, _, _) = runnable[pos];
-                        notify_tool_after(ctx, &tool_uses[i].1, &tool_uses[i].2, &output, true);
-                        slots[i] = Slot::Ran(Box::new(output));
-                    }
-                });
+                }
             }
 
             // Assemble results in block order: a result block for every tool_use
@@ -2094,9 +2148,25 @@ pub(crate) fn gate_tool_call(ctx: &ToolCtx, name: &str, input: &Value) -> ToolDe
     }
 }
 
+/// Cancel checkpoint at the gate→execution boundary (external re-review
+/// P2): true when the run's cancel flag is installed and set. `before_tool`
+/// can deliberate for an unbounded time (an approval UI waiting on a human),
+/// so a cancel that lands in that window must be re-checked BEFORE the tool
+/// runs — otherwise the run's final state says "cancelled" while the
+/// approved tool still executed. Used by [`execute_tool_call`], the parallel
+/// batch's spawn gate, and `run_code`'s inner dispatch so every dispatch
+/// path shares one checkpoint. Relaxed load: a few ms of visibility lag is
+/// irrelevant next to the ~10ms interrupt granularity elsewhere.
+pub(crate) fn ctx_cancelled(ctx: &ToolCtx) -> bool {
+    ctx.cancel
+        .as_ref()
+        .is_some_and(|c| c.load(Ordering::Relaxed))
+}
+
 /// Hooks after-notification for a finished tool call. `input` is always the
-/// ORIGINAL (never a `Modify` replacement); `executed` is false only for a
-/// denied call (which still gets its error output reported).
+/// ORIGINAL (never a `Modify` replacement); `executed` is false for a denied
+/// call and for one skipped by the gate→execution cancel checkpoint (both
+/// still get their error output reported).
 pub(crate) fn notify_tool_after(
     ctx: &ToolCtx,
     name: &str,
@@ -2188,6 +2258,17 @@ pub(crate) fn execute_tool_call(
         decision => {
             // Allow → original input; Modify → replacement. The audit trail
             // (records, ToolCall events) keeps the ORIGINAL in both cases.
+            // Cancel checkpoint (external re-review P2): a cancel that landed
+            // while the gate deliberated (an approval wait) must not still
+            // execute the tool. The caller's Cancelled-slot synthesis uses the
+            // same "[cancelled by user]" text, so history, events, and audit
+            // all agree the call never ran; `after_tool` fires with
+            // executed=false like a Deny.
+            if ctx_cancelled(ctx) {
+                let output = ToolOutput::error("[cancelled by user]");
+                notify_tool_after(ctx, name, input, &output, false);
+                return output;
+            }
             let effective: &Value = match &decision {
                 ToolDecision::Modify(v) => v,
                 _ => input,

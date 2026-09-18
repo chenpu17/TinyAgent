@@ -21,6 +21,7 @@
     "wrapper.js",
     "wrapper.d.ts",
     "index.js",
-    "index.d.ts"
+    "index.d.ts",
+    "*.node"
   ]
 }

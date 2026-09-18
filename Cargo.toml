@@ -2,12 +2,15 @@
 name = "tiny-agent"
 version = "0.3.0"
 edition = "2021"
-# MSRV floor of the DEFAULT (headless) build, set by the dependency chain
-# (clap 4.6 = 1.85; reqwest 1.64 / serde_json 1.71 / libc 1.65 sit below it).
-# Optional features need more and are enforced by their own deps' rust-version:
-# `tui` → 1.88 (ratatui 0.30), `code` → 1.86 (wasmtime 36). CI's msrv job
-# pins this floor with a cargo +1.85 check.
-rust-version = "1.85"
+# MSRV floor of the DEFAULT (headless) build, set by the dependency chain:
+# the LOCKED icu_* 2.2.0 family (reqwest → url → idna → idna_adapter) needs
+# 1.86, above every other default-tree crate (clap 4.6 = 1.85; reqwest 1.64
+# / serde_json 1.71 / libc 1.65 sit below). Optional features need more and
+# are enforced by their own deps' rust-version: `tui` → 1.88 (ratatui 0.30),
+# `code` → 1.86 (wasmtime 36). CI's msrv job pins this floor with a
+# `cargo +1.86 check --locked` — the lockfile, not the resolver-of-the-day,
+# is what users actually build.
+rust-version = "1.86"
 description = "A minimal single-binary AI agent: one JSON config, two modes (headless / TUI)"
 license = "MIT"
 

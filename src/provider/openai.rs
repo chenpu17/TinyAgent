@@ -275,6 +275,18 @@ impl Provider for OpenAi {
             Self::apply_learned(&mut body, &learned);
         }
 
+        // The per-request timeout is a BUDGET for the whole chat() call, not
+        // a fresh allowance per HTTP round-trip (external re-review P2): a
+        // 400-diagnose-resend that reuses the original timeout could exceed
+        // the caller's budget by up to 3× (each resend getting a full window
+        // while the run deadline marches on). One absolute deadline; every
+        // resend below spends only what remains of it.
+        let chat_deadline = req
+            .per_request_timeout
+            .map(|t| std::time::Instant::now() + t);
+        let remaining =
+            || chat_deadline.map(|d| d.saturating_duration_since(std::time::Instant::now()));
+
         let mut resp = self.post(&body, req.per_request_timeout)?;
 
         // A 400 may name a field this gateway doesn't accept (newer reasoning
@@ -302,10 +314,18 @@ impl Provider for OpenAi {
             let text = resp.text().unwrap_or_default();
             match Self::diagnose_400(&text, &body) {
                 Some(fix) => {
+                    // Cancel checkpoint before the resend (external re-review
+                    // P2): the 400 round-trip may have outlived the user's
+                    // patience — don't start another HTTP request the caller
+                    // already vetoed. The run-level retry ladder treats the
+                    // resulting Err + set flag as EXIT_CANCELLED.
+                    if req.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        anyhow::bail!("request cancelled while adjusting for a 400");
+                    }
                     Self::apply_fix(&mut body, fix);
                     applied.push(fix);
                     resp = self
-                        .post(&body, req.per_request_timeout)
+                        .post(&body, remaining())
                         .context("retry after adjusting request for 400 failed")?;
                 }
                 None => {
@@ -1374,6 +1394,139 @@ mod tests {
         assert!(
             received[2].get("max_tokens").is_none(),
             "turn 2 body should NOT carry the old max_tokens key"
+        );
+    }
+
+    /// External re-review P2: the 400-diagnose-resend loop must spend ONE
+    /// absolute deadline for the whole chat() call. A mock that takes 700ms
+    /// to answer the first request with a fixable 400 and 600ms to answer
+    /// the adjusted request with success: with the budget set to 1s the
+    /// resend has only ~300ms left and must time out — the pre-fix code
+    /// handed every post a fresh `per_request_timeout` and reported success
+    /// ~1.3s into a 1s budget.
+    #[test]
+    fn fix_resend_spends_the_same_budget_not_a_fresh_one() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests_c = requests.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = match stream {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let body = read_http_body(&stream);
+                // Count at receipt, not after the delayed response: the
+                // timed-out resend aborts client-side while the mock is
+                // still sleeping, and the assertion must not race it.
+                requests_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let is_400 = body.contains("\"max_tokens\"");
+                let (status, ct, payload, delay): (&str, &str, &str, u64) = if is_400 {
+                    (
+                        "400 Bad Request",
+                        "application/json",
+                        r#"{"error":{"message":"Unrecognized request argument: max_tokens","type":"invalid_request_error"}}"#,
+                        700,
+                    )
+                } else {
+                    (
+                        "200 OK",
+                        "text/event-stream",
+                        concat!(
+                            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"}}]}\n\n",
+                            "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n",
+                            "data: [DONE]\n\n",
+                        ),
+                        600,
+                    )
+                };
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+                let head = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: {ct}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    payload.len(),
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(payload.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("reqwest client");
+        let provider = OpenAi::new(client, url, "k", std::time::Duration::from_secs(30));
+        let m = vec![Message::user(vec![Block::Text("one".into())])];
+        let req = ChatRequest {
+            system: None,
+            messages: &m,
+            tools: &[],
+            model: "m",
+            max_tokens: 100,
+            per_request_timeout: Some(std::time::Duration::from_secs(1)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            cache: true,
+            reasoning_effort: None,
+        };
+        let started = std::time::Instant::now();
+        let r = provider.chat(&req, &mut |_| {});
+        assert!(
+            r.is_err(),
+            "the resend must inherit the spent budget, not a fresh 1s window"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1250),
+            "total wall clock must stay inside the 1s budget (+margin): {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the 400 and the timed-out resend"
+        );
+    }
+
+    /// The cancel checkpoint before the 400 resend: a cancel that arrived
+    /// while the 400 round-trip was in flight aborts instead of starting
+    /// another HTTP request (the run-level ladder treats the Err + flag as
+    /// EXIT_CANCELLED). Cancel is set before chat() so the first post still
+    /// runs (posts don't poll the flag) — deterministic, no race.
+    #[test]
+    fn fix_resend_aborts_when_cancelled_during_the_400() {
+        let (url, bodies) = max_tokens_400_mock();
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("reqwest client");
+        let provider = OpenAi::new(client, url, "k", std::time::Duration::from_secs(30));
+        let m = vec![Message::user(vec![Block::Text("one".into())])];
+        let req = ChatRequest {
+            system: None,
+            messages: &m,
+            tools: &[],
+            model: "m",
+            max_tokens: 100,
+            per_request_timeout: Some(std::time::Duration::from_secs(10)),
+            cancel: Arc::new(AtomicBool::new(true)),
+            cache: true,
+            reasoning_effort: None,
+        };
+        let err = match provider.chat(&req, &mut |_| {}) {
+            Err(e) => e,
+            Ok(_) => panic!("chat must abort instead of resending after cancel"),
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cancelled while adjusting"),
+            "error must name the cancel: {msg}"
+        );
+        assert_eq!(
+            bodies.lock().unwrap().len(),
+            1,
+            "exactly the 400 request — no resend after cancel"
         );
     }
 

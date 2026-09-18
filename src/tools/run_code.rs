@@ -36,7 +36,7 @@ use serde_json::{json, Value};
 use sha2::Digest;
 use wasmtime::{Caller, Engine, Extern, Linker, Memory, Module, ResourceLimiter, Store, TypedFunc};
 
-use crate::agent::{gate_tool_call, notify_tool_after, run_tool, AgentEvent};
+use crate::agent::{ctx_cancelled, gate_tool_call, notify_tool_after, run_tool, AgentEvent};
 use crate::config::{CodeConfig, Config};
 use crate::hooks::ToolDecision;
 use crate::provider::{ToolDef, Usage};
@@ -55,6 +55,12 @@ const TOOLS_LIST_NAME: &str = "__tools_list";
 /// class as [`TOOLS_LIST_NAME`] (no gate/audit/quota), so checking the
 /// budget never spends it.
 const BUDGET_NAME: &str = "__budget";
+/// Guest-visible tombstone for "cancel observed, the sandbox is halting" —
+/// shared by the host_call ENTRY gate (§13-5) and the post-hooks-gate cancel
+/// checkpoint so the copy stays single-sourced (LLM-visible copy is spec;
+/// see docs/finetune_support_design.md appendix A).
+const CANCEL_HALTED_WHY: &str =
+    "run_code: cancelled (host cancel flag) — the sandbox is halted for the rest of this execution";
 
 /// Sub-agent identity tag for guest-originated tool calls (design D14): hooks
 /// can tell "called from run_code" apart from top-level and `task` calls. The
@@ -584,9 +590,7 @@ fn host_call_tool(
                 .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
         {
             d.interrupt = Some(Interrupt::Cancel);
-            let why = "run_code: cancelled (host cancel flag) — the sandbox \
-                       is halted for the rest of this execution"
-                .to_string();
+            let why = CANCEL_HALTED_WHY.to_string();
             // Halt the sandbox too (external re-review P1): this error is
             // JS-CATCHABLE, and a guest that catches it and retries re-enters
             // with `interrupt` already latched — the old `interrupt.is_none()`
@@ -731,18 +735,39 @@ fn host_call_tool(
                 notify_tool_after(&d.ctx, &name, &args, &output, false);
                 (output, "hooks")
             }
-            _ => match intercept_file_paths(&name, &effective, &d.snap, &d.workdir_canon) {
-                // Rejected by the deny/fs layer: still an audited, event-
-                // paired call — but NOT a hooks decision, so `after_tool`
-                // does not fire (its `executed=false` is reserved for
-                // `before_tool` Deny, per the Hooks contract).
-                Some(err) => (ToolOutput::error(err), "denied"),
-                None => {
-                    let output = run_tool(&d.tools, &d.defs, &name, &effective, &d.ctx, emit);
-                    notify_tool_after(&d.ctx, &name, &args, &output, true);
-                    (output, if known { "tool" } else { "unknown_tool" })
+            _ => {
+                // Cancel checkpoint between the hooks gate and execution
+                // (external re-review P2): the §13-5 entry gate at the top of
+                // host_call runs BEFORE before_tool, so a cancel landing
+                // while the gate deliberated (an approval wait) would still
+                // run the inner tool. Same tombstone vocabulary as the entry
+                // gate, but no latch here — the guest's next call hits the
+                // entry gate (or the epoch trap within ~10ms) and latches
+                // interrupt+halted as usual. The call was already announced
+                // above, so the pair completes: audited, event-paired,
+                // "cancel" envelope (retryable=false — the whole execution is
+                // stopping, not just this call).
+                if ctx_cancelled(&d.ctx) {
+                    let output = ToolOutput::error(CANCEL_HALTED_WHY.to_string());
+                    notify_tool_after(&d.ctx, &name, &args, &output, false);
+                    (output, "cancel")
+                } else {
+                    match intercept_file_paths(&name, &effective, &d.snap, &d.workdir_canon) {
+                        // Rejected by the deny/fs layer: still an audited,
+                        // event-paired call — but NOT a hooks decision, so
+                        // `after_tool` does not fire (its `executed=false`
+                        // is reserved for `before_tool` Deny and gate-time
+                        // cancel, per the Hooks contract).
+                        Some(err) => (ToolOutput::error(err), "denied"),
+                        None => {
+                            let output =
+                                run_tool(&d.tools, &d.defs, &name, &effective, &d.ctx, emit);
+                            notify_tool_after(&d.ctx, &name, &args, &output, true);
+                            (output, if known { "tool" } else { "unknown_tool" })
+                        }
+                    }
                 }
-            },
+            }
         };
         (output, in_hash_eff, class)
     };
@@ -4817,6 +4842,91 @@ return t.length;"#}),
             out.content.contains("cancelled (host cancel flag)"),
             "tombstone must attribute the stop to cancel: {}",
             out.content
+        );
+    }
+
+    /// 2026-09 external re-review P2 — the GATE→EXECUTION half: the §13-5
+    /// entry gate runs BEFORE before_tool, so a cancel that lands while the
+    /// hooks gate is deliberating (a host approval dialog waiting on a
+    /// human) used to let the just-approved inner tool run anyway — the
+    /// sandbox "ran cancelled" with real side effects. The checkpoint
+    /// re-checks the flag between the gate and the run; the tombstone
+    /// vocabulary matches the entry gate's (CANCEL_HALTED_WHY, kind
+    /// "cancel"). Deterministic: the hook sets the flag on the same thread
+    /// that then evaluates the checkpoint.
+    #[test]
+    fn gate_cancel_checkpoint_refuses_inner_call_after_approval_wait() {
+        use crate::hooks::Hooks;
+        use crate::tools::CallbackTool;
+        use std::sync::atomic::AtomicBool;
+
+        struct SetCancelThenAllow(Arc<AtomicBool>);
+        impl Hooks for SetCancelThenAllow {
+            fn before_tool(
+                &self,
+                _name: &str,
+                _input: &Value,
+                _ctx: &ToolCtx,
+            ) -> crate::hooks::ToolDecision {
+                self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+                crate::hooks::ToolDecision::Allow
+            }
+        }
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let ran = Arc::new(AtomicBool::new(false));
+        let side_effect = {
+            let ran = ran.clone();
+            CallbackTool::new(
+                ToolDef {
+                    name: "writer".into(),
+                    description: "must never execute under this test".into(),
+                    schema: json!({"type": "object"}),
+                },
+                move |_input: &Value, _ctx: &ToolCtx| {
+                    ran.store(true, std::sync::atomic::Ordering::Relaxed);
+                    Ok(ToolOutput::text(String::from("ran")))
+                },
+            )
+            .with_code_access()
+        };
+        let cfg: Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"K","model":"m","inject_environment":false,
+                "tools":["read_file"],"code":{"enabled":true}}"#,
+        )
+        .unwrap();
+        let tool = RunCodeTool::new(
+            &cfg,
+            Arc::new(RwLock::new(CodeConfig::default())),
+            &reqwest::blocking::Client::new(),
+            "k",
+            vec![],
+            vec![Arc::new(Box::new(side_effect) as Box<dyn Tool>)],
+        );
+        let dir = scratch();
+        let mut c = ctx(&dir);
+        c.cancel = Some(flag.clone());
+        c.hooks = Some(Arc::new(SetCancelThenAllow(flag)));
+        let out = tool
+            .run_with_emit(
+                &json!({"code": r#"tools.call("writer", {}); return "unreachable";"#}),
+                &c,
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::Relaxed),
+            "the just-approved call must not run after cancel"
+        );
+        assert!(
+            out.content.contains("cancelled (host cancel flag)"),
+            "tombstone must match the entry-gate vocabulary: {}",
+            out.content
+        );
+        let meta = out.meta.expect("audit meta");
+        assert_eq!(
+            meta["call_count"], 1,
+            "the refused call is still audited: {meta}"
         );
     }
 

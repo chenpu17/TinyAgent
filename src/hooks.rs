@@ -98,13 +98,17 @@ pub enum ToolDecision {
 ///   tool" error (executed = "reached the run attempt", not "tool exists").
 ///   Same for a Parallel worker that PANICKED: the loop synthesizes an error
 ///   output for it and reports `executed = true` — a third flavour of
-///   "attempted but failed" alongside tool Err results (only a `before_tool`
-///   Deny reports `executed = false`).
+///   "attempted but failed" alongside tool Err results (`executed = false`
+///   is reported only for a `before_tool` Deny and for a call skipped
+///   because the run's cancel flag landed while the gate was deliberating
+///   — the gate→execution checkpoint re-checks cancel so an approval wait
+///   cannot still execute the tool it approved).
 /// - One more pairing gap, from `run_code`'s own interception layer (code
 ///   feature): a call the sandbox's deny_paths / fs_write_dirs rules reject
 ///   passes `before_tool` (Allow) but never reaches `after_tool` — the
 ///   rejection is a sandbox policy decision, not a hooks one, so
-///   `executed = false` stays reserved for `before_tool` Deny. Audit-style
+///   `executed = false` stays reserved for `before_tool` Deny (and gate-time
+///   cancel). Audit-style
 ///   hooks that pair before/after counts will see these as unmatched
 ///   `before_tool`s; the rejection itself lands in the sandbox's `meta`
 ///   audit trace.

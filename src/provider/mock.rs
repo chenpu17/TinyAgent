@@ -35,6 +35,14 @@ pub enum MockTurn {
         delay: std::time::Duration,
         error: anyhow::Error,
     },
+    /// Sleep, then return a successful response — the Ok-shaped twin of
+    /// `ErrAfter` (e.g. a `stop_reason: "stream_error"` ChatResponse that
+    /// only materializes once the run's wall clock is gone), for the
+    /// deadline-attribution check on the stream-error path.
+    OkAfter {
+        delay: std::time::Duration,
+        resp: ChatResponse,
+    },
 }
 
 /// What a `chat()` call saw — enough to assert the loop's structural
@@ -228,6 +236,10 @@ impl Provider for MockProvider {
             MockTurn::ErrAfter { delay, error } => {
                 std::thread::sleep(delay);
                 Err(error)
+            }
+            MockTurn::OkAfter { delay, resp } => {
+                std::thread::sleep(delay);
+                Ok(resp)
             }
         }
     }

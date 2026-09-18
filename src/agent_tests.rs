@@ -1835,6 +1835,113 @@ fn hooks_parallel_batch_gates_all_calls_in_block_order() {
     assert_eq!(hooks.calls(), expected);
 }
 
+/// A hooks layer that sets the run's cancel flag INSIDE `before_tool`, then
+/// Allows — the external re-review P2 repro: an approval dialog that was
+/// still open when the user hit Esc. The gate returns "run it" while the run
+/// has already committed to stopping; the gate→execution checkpoint must
+/// catch the contradiction.
+struct CancelDuringApproval {
+    flag: Arc<AtomicBool>,
+    after: std::sync::Mutex<Vec<String>>,
+}
+impl Hooks for CancelDuringApproval {
+    fn before_tool(&self, _tool: &str, _input: &Value, _ctx: &ToolCtx) -> ToolDecision {
+        self.flag.store(true, Ordering::Relaxed);
+        ToolDecision::Allow
+    }
+    fn after_tool(&self, tool: &str, _input: &Value, output: &ToolOutput, executed: bool) {
+        self.after
+            .lock()
+            .unwrap()
+            .push(format!("{tool}:{executed}:{}", output.content));
+    }
+}
+
+#[test]
+fn cancel_during_approval_gate_does_not_execute_sequential_tool() {
+    // The inline path: gate (sets cancel) → Allow → checkpoint refuses. The
+    // tool never runs, the slot carries the same "[cancelled by user]" text
+    // the Cancelled-slot synthesis uses, `after_tool` reports executed=false
+    // (Deny symmetry), and the run ends "cancelled" — no turn-2 request.
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, _) = MockProvider::new(vec![
+        mock::resp_tool("t1", "danger", json!({"cmd": "x"}), None),
+        mock::resp_text("never reached", None),
+    ]);
+    let ran = Arc::new(AtomicBool::new(false));
+    let flag = Arc::new(AtomicBool::new(false));
+    let hooks = Arc::new(CancelDuringApproval {
+        flag: flag.clone(),
+        after: std::sync::Mutex::new(Vec::new()),
+    });
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(EchoTool::tracking("danger", ran.clone()))],
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    agent.set_hooks(hooks.clone());
+    agent.set_cancel(flag);
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert!(
+        !ran.load(Ordering::Relaxed),
+        "an Allowed call must not execute once cancel landed"
+    );
+    assert_eq!(o.stop_reason, "cancelled");
+    assert_eq!(
+        agent.trailing_tool_result_contents(),
+        vec!["[cancelled by user]"],
+        "the slot reports the cancel vocabulary, N:N intact"
+    );
+    assert_eq!(
+        *hooks.after.lock().unwrap(),
+        vec!["danger:false:[cancelled by user]".to_string()],
+        "after_tool fires with executed=false, Deny symmetry"
+    );
+}
+
+#[test]
+fn cancel_during_approval_gate_does_not_execute_parallel_batch() {
+    // The batch path: the gate loop approves the only Parallel call while
+    // setting cancel — the pre-spawn checkpoint must skip the whole batch.
+    // The slot keeps the Cancelled synthesis (no record, no worker), and
+    // unlike the inline path there is NO after_tool (the batch never
+    // started — an unmatched before, same audit shape the Hooks doc's
+    // run_code edge describes).
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, _) = MockProvider::new(vec![
+        mock::resp_tool("p1", "task", json!({"label": "p"}), None),
+        mock::resp_text("never reached", None),
+    ]);
+    let flag = Arc::new(AtomicBool::new(false));
+    let hooks = Arc::new(CancelDuringApproval {
+        flag: flag.clone(),
+        after: std::sync::Mutex::new(Vec::new()),
+    });
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(TaskTool)],
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    agent.set_hooks(hooks.clone());
+    agent.set_cancel(flag);
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o.stop_reason, "cancelled");
+    assert!(o.tool_calls.is_empty(), "the batch never ran");
+    assert_eq!(
+        agent.trailing_tool_result_contents(),
+        vec!["[cancelled by user]"],
+        "Cancelled-slot synthesis keeps N:N pairing"
+    );
+    assert!(
+        hooks.after.lock().unwrap().is_empty(),
+        "no worker ran, so no after_tool"
+    );
+}
+
 #[test]
 fn hooks_mixed_turn_gates_leaves_first_then_batch_in_block_order() {
     // A MIXED turn pins the documented non-global gate order: every
@@ -5540,6 +5647,44 @@ fn stream_error_stop_reason_maps_to_run_error_with_usage() {
         (err.usage.input_tokens, err.usage.output_tokens),
         (1500, 7),
         "stream_error partial usage must be billed in RunError"
+    );
+}
+
+#[test]
+fn stream_error_past_deadline_ends_run_as_timeout() {
+    // External re-review P2: the Ok-shaped stream failure (stop_reason
+    // "stream_error") that only materializes once the run's wall clock is
+    // gone must take the SAME deadline vocabulary as the Err arm
+    // (request_error_past_deadline_ends_run_as_timeout): clean "timeout"
+    // stop_reason (exit 124 downstream), partial usage billed, and — the
+    // point of the fix — NOT a retryable Err that would replay the whole
+    // task on a fresh budget (measured 2 requests / ~2.8s with one retry
+    // before the fix).
+    let cfg = cfg_with(5, 1, 0);
+    let (prov, _) = MockProvider::new(vec![MockTurn::OkAfter {
+        delay: std::time::Duration::from_millis(1200),
+        resp: ChatResponse {
+            blocks: vec![Block::Text("[stream error] operation timed out".into())],
+            stop_reason: "stream_error".into(),
+            usage: mock::mk_usage(1500, 7),
+        },
+    }]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("hi")],
+        test_ctx(),
+    );
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o.stop_reason, "timeout");
+    assert_eq!(o.turns, 1);
+    // The partial usage survived the vocabulary switch: billed in the
+    // outcome, not dropped by the timeout conversion.
+    assert_eq!(
+        (o.input_tokens, o.output_tokens),
+        (1500, 7),
+        "stream_error-at-deadline partial usage must stay billed"
     );
 }
 

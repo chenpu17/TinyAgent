@@ -179,9 +179,11 @@ jobs:
           '
 
   msrv:
-    # rust-version 门禁（Cargo.toml 的 1.85）：默认（headless）构建在钉住的
+    # rust-version 门禁（Cargo.toml 的 1.86）：默认（headless）构建在钉住的
     # MSRV 工具链上必须 check 通过——此前全 job 跟 stable 漂，新 stable 收紧
     # lint 时无代码改动的提交也会突然红灯，用户也无从知道自己机器够不够。
+    # 地板由锁文件决定（icu_* 2.2.0 = 1.86，见 Cargo.toml 注释），故带
+    # --locked：校验的是用户实际拿到的依赖组合，而不是解析器当天挑的版本。
     # 只 check 默认 feature：tui/code 的更高地板（1.88/1.86）由 ratatui /
     # wasmtime 自身的 rust-version 强制，cargo 会给明确报错。
     runs-on: ubuntu-latest
@@ -190,9 +192,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.85.0
+          toolchain: 1.86.0
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check
+      - run: cargo check --locked
 
   audit:
     # cargo-audit：RustSec 公告库扫描依赖树。依赖面小（reqwest + serde +

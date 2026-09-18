@@ -183,6 +183,10 @@ cd bindings/node && npm install && npm run build   # 生成 .node + wrapper.js
 npm test                                            # 离线测试（node --test，对进程内 SSE mock）
 ```
 
+> 分发边界：`npm pack` 产出的 tarball 只带**打包机的平台**二进制（`files` 含 `*.node`），本机/
+> 同架构离线分发可用；跨平台 npm 发布（optionalDependencies 按平台拆包 + CI 矩阵构建）尚未建设。
+> `tests/test_packaging.test.js` 是验收门：pack → 独立目录安装 → 加载 + mock 调用一遍全链路。
+
 ```javascript
 const { chat, Agent } = require('tiny-agent');
 
@@ -846,7 +850,7 @@ GUI 可渲染"正在构造调用…"（headless 终端不重复打印——完�
 `task` 是一个子 agent 工具：主 agent 把一个聚焦的子任务交给一个全新的子 agent（自己的消息历史、自己的 turn 预算），子 agent 跑完后只把**最终摘要**作为 tool 结果返回——主 agent 的上下文不会被子 agent 的中间过程撑大。
 
 - **输入**：`{ "name": "身份标识", "description": "简短说明", "prompt": "完整自包含的指令" }`（`name` 与 `prompt` 必填，`description` 可选、信息性）。`name` 是这个子 agent 的身份，所有转发出来的事件都用它打标签。
-- **同 turn 多调用并行**：主 agent 在**一个** assistant turn 里发出多个 `task` 调用时，它们会**并行**跑（每个一个线程，借线程池 scope），各自的事件经 mpsc 漏斗实时转发进主 run 的事件流——所以多个子 agent 协同工作时，输出是交错流式出现的。结果仍按原始块序拼回（N:N 配对不变）。叶子工具（`shell`/`read_file`/…）保持顺序执行，只有 `task` 并行，避免在文件/进程上引入新的竞态。
+- **同 turn 多调用并行**：主 agent 在**一个** assistant turn 里发出多个 `task` 调用时，它们会**并行**跑（每个一个线程，按 8 个一波封顶，借线程池 scope），各自的事件经有界 mpsc 漏斗（背压）实时转发进主 run 的事件流——所以多个子 agent 协同工作时，输出是交错流式出现的。结果仍按原始块序拼回（N:N 配对不变）。叶子工具（`shell`/`read_file`/…）保持顺序执行，只有 `task` 并行，避免在文件/进程上引入新的竞态。
 - **事件可见**：子 agent 的流式过程（文本增量 / tool 调用 / tool 结果）**实时转发**进主 run 的事件流，每条都裹上 `name` 身份——headless 的 `--json` 输出形如 `{"type":"subagent","name":..,"event":<子事件>}`，TUI 里子 agent 的输出也带 `[name]` 前缀。并行多个子 agent 时，靠 `name` 区分交错的事件。
 - **成本诚实计入**：每个子 agent 的 token 用量折进主 run 的累计，并照常发 `usage` 事件 / 写进 `result.json`（并行的几个各自计入）。
 - **审计 trace（`meta`）**：`result.json` 里每个 `task` 条目另带一个 `meta` 字段——子 agent 的轮数、用过哪些工具（按名计数）、token 小计、stop_reason 的紧凑记录。**不进模型可见的 tool result**（主上下文只收摘要，保持清爽），仅供审计并行工作。失败子 agent 也带 `meta`（`stop_reason: "error"`），看得出"跑到哪一步倒了"。
@@ -1139,17 +1143,17 @@ src/
 ├── config.rs      ( 1562)  # 配置解析 + 任务片段合并 + 批量覆盖白名单
 ├── provider/  # LLM 后端
 │   ├── mod.rs         (  930)  # 共享 Message/Block、SSE reader、CancellableSse
-│   ├── openai.rs      ( 1492)  # OpenAI 兼容（include_usage；400 回退：max_tokens→max_completion_tokens / 丢 stream_options）
+│   ├── openai.rs      ( 1645)  # OpenAI 兼容（include_usage；400 回退：max_tokens→max_completion_tokens / 丢 stream_options）
 │   ├── anthropic.rs   ( 1102)  # Anthropic 原生（message_start/message_delta usage）
-│   └── mock.rs        (  284)  # 测试用脚本化 Provider（cfg(any(test, feature="mock"))）
-├── agent.rs       ( 2916)  # 核心 loop + usage 累计 + cancel + 上下文压缩（前馈/溢出双触发 + 滚动分块摘要）+ 相邻消息归一 + 同 turn 多 task 并行
-├── agent_tests.rs ( 7488)  # 核心 loop 回归测试（provider::mock 脚本化，不连网）
+│   └── mock.rs        (  296)  # 测试用脚本化 Provider（cfg(any(test, feature="mock"))）
+├── agent.rs       ( 2996)  # 核心 loop + usage 累计 + cancel + 上下文压缩（前馈/溢出双触发 + 滚动分块摘要）+ 相邻消息归一 + 同 turn 多 task 并行
+├── agent_tests.rs ( 7633)  # 核心 loop 回归测试（provider::mock 脚本化，不连网）
 ├── compress.rs    (  791)  # 压缩引擎（find_safe_cut / 分块摘要 / saturating usage 合并）
 ├── retry.rs       (  158)  # batch --retries / 单跑瞬态重试共用的指数退避（±25% jitter 防 lockstep）
 ├── signal.rs      (  114)  # headless SIGINT → cancel（首次优雅 / 二次硬退 130）
 ├── session.rs     (  382)  # 会话持久化（原子写 + archive 折叠）
 ├── skills.rs      ( 1015)  # 三级技能加载（内置 / 用户目录 / 项目）
-├── hooks.rs       (  149)  # hooks 闸门（Deny / Modify / 审计）
+├── hooks.rs       (  153)  # hooks 闸门（Deny / Modify / 审计）
 ├── tools/  # 工具集：内置工具 + MCP 包装 + task 子 agent + run_code（feature code）
 │   ├── mod.rs         (  788)  # Tool trait + ToolCtx + CallbackTool/SharedTool + build 白名单组装
 │   ├── shell.rs       (  920)  # shell 工具
@@ -1160,7 +1164,7 @@ src/
 │   ├── mcp.rs         (  468)  # MCP 工具包装（sanitize_name + wire_name 分发）
 │   ├── subagent.rs    (  915)  # task 子 agent 工具（独立上下文 + turn 封顶；不可递归）
 │   ├── todo.rs        (  306)  # todo 工具（任务计划，全量替换；plan 落 result.json）
-│   └── run_code.rs    ( 5448)  # run_code 工具（feature code）：QuickJS-in-wasm 沙箱——epoch/fuel/mem 限额、路径拦截、hooks 闸门、审计 meta（双哈希）
+│   └── run_code.rs    ( 5558)  # run_code 工具（feature code）：QuickJS-in-wasm 沙箱——epoch/fuel/mem 限额、路径拦截、hooks 闸门、审计 meta（双哈希）
 ├── mcp.rs         ( 1422)  # MCP 客户端（stdio / Streamable HTTP / 旧版 SSE）
 ├── batch.rs       ( 2773)  # 批量任务 + --retries/--failed + 报告合并
 ├── harness.rs     ( 1960)  # headless 模式 + result.json + NDJSON + exit code
