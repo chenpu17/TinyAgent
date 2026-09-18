@@ -107,7 +107,7 @@ cargo clippy -p tiny-agent-node
 - **MCP 热增删**：撞名 = Err + 回滚；热增路径不打印；子 agent 与 run_code registry 都不感知（快照语义）。
 - **MCP SSE 同源闸门**：endpoint 解析与 POST 发送共用 `reqwest::Url`（真解析器）——别写字符串版 origin 切分，反斜杠混淆可绕过。
 - **子 agent（task）**：按 `Tool::concurrency()`/`available_to_subagent()` 能力标记路由，无名字黑名单；共享父 MCP、预算与 cancel。
-- **Hooks**：Deny 落 `Slot::Ran(error)` 不占 Cancelled；Modify 只换执行输入、审计留原始输入；`--resume` 不带走 hooks。审批等待期落下的 cancel 在 **gate→执行检查点**（`ctx_cancelled`，execute_tool_call / 并行 spawn 前 / run_code 内层共用）拒绝执行。
+- **Hooks**：Deny 落 `Slot::Ran(error)` 不占 Cancelled；Modify 只换执行输入、审计留原始输入；`--resume` 不带走 hooks。审批等待期落下的 cancel 在 **gate→执行检查点**（`ctx_cancelled`，execute_tool_call / 并行 spawn 前 / run_code 内层共用）拒绝执行；并行批另有**每波开波前 + worker 进工具体前**两道复查，已 announce 未运行的调用装配段补发取消 ToolResult（事件配平）；并行批的 `sync_channel` 必须在 scope 闭包**内**创建（回调 panic 时 `rx` 随 unwind 销毁才不死锁）。
 - **todo + meta**：plan 从 records 派生不经压缩；`meta` 审计侧信道不进模型可见 content。
 - **Skill**：三级加载；name 必须等于父目录名；`read_skill`/`list_skill` 不在白名单、由 assemble 配套注入；子 agent 不继承。
 - **run_code**：两层开关默认全关；wasmtime 中断四点纪律（入口门/epoch 回调/host_call 入口/收尾裁决）；`max_wasm_stack` 384 KiB；测试必须先 warm 模块。

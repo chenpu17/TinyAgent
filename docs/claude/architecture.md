@@ -161,6 +161,15 @@
   `sync_channel(256)` 有界转发——快子 agent 洪峰时 worker 的 emit 会**阻塞**（背压）而不是把父进程
   内存撑爆，父线程同一 scope 内专职 drain，不会死锁。审批门（gate-before-spawn）逐调用复查 cancel、
   spawn 前再查一次，gate 窗口内落下的 cancel 让整批不启动（槽位保持 Cancelled 合成）。
+  **波次间与 worker 预检**（2026-09 外审第三轮 P2）：每波开波前复查 cancel（上一波里落下的 cancel
+  不再启动下一波）；worker 在线程里、进工具体前再查一次——已批准未启动的调用返回 None，join 侧补成
+  顺序检查点同款 `[cancelled by user]` 错误槽 + `after_tool(executed=false)`。**panic 防死锁**：通道在
+  scope 闭包**内**创建（`rx` 是闭包局部量）——宿主事件回调 panic（panic=unwind 宿主）时 drain 循环
+  unwind 即销毁 `rx`，worker 的 send 开始失败、scope 的 join-all 得以完成；若 `rx` 借自闭包外则
+  worker 永远堵在满漏斗上、join 永远等它——死锁。另有 `CancelOnUnwind` 守卫在 unwind 时翻共享 cancel
+  让在飞 worker 快速收尾，而不是把注定作废的一波跑到完。**事件配平**：已 announce（gate 前全量宣告）
+  后因 gate/波次 cancel 未运行的调用，装配段补发 `[cancelled by user]` 的 ToolResult 事件——消费者
+  不会看到无闭合的 ToolCall；从未 announce 的槽位（内联短路、整批被闸掉）保持事件静默。
   **不可递归**：子 agent 的工具白名单是**全量构建后按 `Tool::available_to_subagent()` retain**
   （`child_tools()`，同样不按名字滤）——`task`（防递归）与 `todo`（计划归父）在 trait 里覆写 false，
   第三方工具可自主退出。**在默认白名单**（`config::default_tools`

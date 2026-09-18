@@ -109,10 +109,17 @@
   cancelled、被批准的工具照跑"——`agent::ctx_cancelled()` 在 gate 返回后、执行前复查，三处
   dispatch（`execute_tool_call` / 并行批 spawn 前 / run_code 内层）共用；顺序路径产出
   `[cancelled by user]` 错误槽 + `after_tool(executed=false)`，并行路径整批不启动（槽位 Cancelled
-  合成），run_code 内层复用 `CANCEL_HALTED_WHY` 墓碑。测试组：`run_with_preset_cancel_returns…` /
+  合成），run_code 内层复用 `CANCEL_HALTED_WHY` 墓碑。**波次间 + worker 预检**（第三轮 P2）：
+  并行批按 8/波，每波开波前复查 cancel、worker 进工具体前再查（返回 None → join 补
+  错误槽 + after(executed=false)）。**回调 panic 防死锁**：并行批的 `sync_channel` 必须在
+  `thread::scope` 闭包**内**创建——`rx` 借自闭包外时，drain 循环里宿主回调 panic 的 unwind
+  不销毁 `rx`，worker 堵死满漏斗、join-all 死锁；闭包内创建 + `CancelOnUnwind` 守卫翻 cancel
+  收尾。测试组：`run_with_preset_cancel_returns…` /
   `run_does_not_clear…` / `clear_cancel_lets_the_next_run_proceed` /
   `parallel_children_both_honour…` / `single_run_cancel_during_failed_attempt…` /
-  `cancel_during_approval_gate_does_not_execute_{sequential_tool,parallel_batch}` +
+  `cancel_during_approval_gate_does_not_execute_{sequential_tool,parallel_batch}` /
+  `cancel_between_waves_never_starts_the_next_wave` /
+  `parallel_event_sink_panic_unwinds_instead_of_deadlocking` +
   绑定两侧回归。
 - **批量任务片段只能覆盖** `task`/`system_prompt`/`model`/`max_tokens`/`limits`；安全字段
   （`provider`/`base_url`/`api_key_env`/`workdir`/`tools`/`restrict_to_workdir`/`mcp_servers`）

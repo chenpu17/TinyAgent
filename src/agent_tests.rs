@@ -1928,7 +1928,22 @@ fn cancel_during_approval_gate_does_not_execute_parallel_batch() {
     );
     agent.set_hooks(hooks.clone());
     agent.set_cancel(flag);
-    let o = agent.run(&mut |_| {}).unwrap();
+    // Events are collected too: the batch announced its ToolCall before the
+    // gates ran, so the cancel-synthesized slot owes the stream a matching
+    // ToolResult — a consumer must never see an unclosed pair (external
+    // re-review P2).
+    let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen2 = seen.clone();
+    let o = agent
+        .run(&mut move |ev| {
+            let tag = match &ev {
+                AgentEvent::ToolCall { .. } => "call",
+                AgentEvent::ToolResult { .. } => "result",
+                _ => "other",
+            };
+            seen2.lock().unwrap().push(tag.into());
+        })
+        .unwrap();
     assert_eq!(o.stop_reason, "cancelled");
     assert!(o.tool_calls.is_empty(), "the batch never ran");
     assert_eq!(
@@ -1940,6 +1955,187 @@ fn cancel_during_approval_gate_does_not_execute_parallel_batch() {
         hooks.after.lock().unwrap().is_empty(),
         "no worker ran, so no after_tool"
     );
+    let seen = seen.lock().unwrap();
+    let calls = seen.iter().filter(|t| *t == "call").count();
+    let results = seen.iter().filter(|t| *t == "result").count();
+    assert_eq!(
+        (calls, results),
+        (1, 1),
+        "the announced ToolCall got its cancel ToolResult: {seen:?}"
+    );
+}
+
+/// A Parallel stand-in that flips the shared cancel flag the moment its tool
+/// body runs, and counts how many bodies ran — exercises the wave-boundary
+/// cancel checkpoint (external re-review P2): with 9 calls and an 8-wide
+/// wave, the cancel tripped during wave 1 must keep wave 2 (call #9) from
+/// ever starting.
+struct CancellingTaskTool {
+    flag: Arc<AtomicBool>,
+    runs: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl Tool for CancellingTaskTool {
+    fn def(&self) -> ToolDef {
+        ToolDef {
+            name: "task".into(),
+            description: "test parallel tool that trips cancel mid-wave".into(),
+            schema: json!({"type": "object", "properties": {"label": {"type": "string"}}}),
+        }
+    }
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Parallel
+    }
+    fn run(&self, _input: &Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+        self.runs.fetch_add(1, Ordering::Relaxed);
+        self.flag.store(true, Ordering::Relaxed);
+        Ok(ToolOutput::text("ok"))
+    }
+}
+
+/// Nine tool_use blocks in ONE turn (id t0..t8) — one more than the wave cap.
+fn nine_task_turn() -> MockTurn {
+    MockTurn::Ok(ChatResponse {
+        blocks: (0..9)
+            .map(|k| Block::ToolUse {
+                id: format!("t{k}"),
+                name: "task".into(),
+                input: json!({"label": k}),
+            })
+            .collect(),
+        stop_reason: "tool_use".into(),
+        usage: None,
+    })
+}
+
+#[test]
+fn cancel_between_waves_never_starts_the_next_wave() {
+    // 9 parallel calls, wave cap 8 → 2 waves. Wave-1 workers trip cancel from
+    // inside the tool body; the wave-start checkpoint must keep wave 2 from
+    // spawning (before the fix, call #9 still entered the tool and the run
+    // then reported cancelled). How many wave-1 workers pass the worker-side
+    // pre-check is racy by design — the only hard bounds are 1..=8.
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, _) = MockProvider::new(vec![nine_task_turn(), mock::resp_text("unreached", None)]);
+    let flag = Arc::new(AtomicBool::new(false));
+    let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(CancellingTaskTool {
+            flag: flag.clone(),
+            runs: runs.clone(),
+        })],
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    agent.set_cancel(flag);
+    let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen2 = seen.clone();
+    let o = agent
+        .run(&mut move |ev| {
+            let tag = match &ev {
+                AgentEvent::ToolCall { .. } => "call",
+                AgentEvent::ToolResult { .. } => "result",
+                _ => "other",
+            };
+            seen2.lock().unwrap().push(tag.into());
+        })
+        .unwrap();
+    assert_eq!(o.stop_reason, "cancelled");
+    let n = runs.load(Ordering::Relaxed);
+    assert!(
+        (1..9).contains(&n),
+        "wave 2 must never start: expected 1..=8 tool bodies, got {n}"
+    );
+    let seen = seen.lock().unwrap();
+    let calls = seen.iter().filter(|t| *t == "call").count();
+    let results = seen.iter().filter(|t| *t == "result").count();
+    assert_eq!(
+        (calls, results),
+        (9, 9),
+        "every announced call closed — ran or cancel-synthesized: {seen:?}"
+    );
+}
+
+/// A Parallel tool flooding the event funnel (more events than the bounded
+/// channel holds) — the host sink panics on the first one, reproducing the
+/// external re-review P2 deadlock: with the receiver borrowed from outside
+/// the scope, workers blocked on the full funnel forever.
+struct FloodTool;
+impl Tool for FloodTool {
+    fn def(&self) -> ToolDef {
+        ToolDef {
+            name: "task".into(),
+            description: "test parallel tool flooding the event funnel".into(),
+            schema: json!({"type": "object", "properties": {"label": {"type": "string"}}}),
+        }
+    }
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Parallel
+    }
+    fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        self.run_with_emit(input, ctx, &mut |_| {})
+    }
+    fn run_with_emit(
+        &self,
+        _input: &Value,
+        _ctx: &ToolCtx,
+        emit: &mut dyn FnMut(AgentEvent),
+    ) -> Result<ToolOutput> {
+        for k in 0..3000 {
+            emit(AgentEvent::SubAgent {
+                name: "flood".into(),
+                event: Box::new(AgentEvent::TextDelta(format!("chunk-{k}"))),
+            });
+        }
+        Ok(ToolOutput::text("flooded"))
+    }
+}
+
+#[test]
+fn parallel_event_sink_panic_unwinds_instead_of_deadlocking() {
+    // Host callback panics on the first flooded event while workers keep
+    // sending. The scope must unwind (receiver dropped as a closure local +
+    // cancel guard), not hang on the full funnel. A watchdog turns a
+    // regression back into a test failure instead of a hung suite.
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, _) = MockProvider::new(vec![
+        MockTurn::Ok(ChatResponse {
+            blocks: (0..2)
+                .map(|k| Block::ToolUse {
+                    id: format!("t{k}"),
+                    name: "task".into(),
+                    input: json!({"label": k}),
+                })
+                .collect(),
+            stop_reason: "tool_use".into(),
+            usage: None,
+        }),
+        mock::resp_text("unreached", None),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(FloodTool)],
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut sink = |ev: AgentEvent| {
+                if matches!(ev, AgentEvent::SubAgent { .. }) {
+                    panic!("host event callback blew up");
+                }
+            };
+            let _ = agent.run(&mut sink);
+        }));
+        let _ = done_tx.send(r.is_err());
+    });
+    match done_rx.recv_timeout(Duration::from_secs(20)) {
+        Ok(panicked) => assert!(panicked, "the host panic must propagate"),
+        Err(_) => panic!("deadlock: workers still blocked on the event funnel"),
+    }
 }
 
 #[test]
