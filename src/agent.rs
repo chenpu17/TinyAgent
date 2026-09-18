@@ -2403,8 +2403,10 @@ fn normalize_adjacent(messages: &mut Vec<Message>) {
 fn canon_input(v: &Value) -> String {
     match v {
         Value::Object(map) => {
-            let mut pairs: Vec<(String, String)> =
-                map.iter().map(|(k, val)| (k.clone(), canon_input(val))).collect();
+            let mut pairs: Vec<(String, String)> = map
+                .iter()
+                .map(|(k, val)| (k.clone(), canon_input(val)))
+                .collect();
             pairs.sort_by(|a, b| a.0.cmp(&b.0));
             let inner: Vec<String> = pairs
                 .into_iter()

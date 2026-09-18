@@ -1146,14 +1146,14 @@ src/
 │   ├── openai.rs      ( 1645)  # OpenAI 兼容（include_usage；400 回退：max_tokens→max_completion_tokens / 丢 stream_options）
 │   ├── anthropic.rs   ( 1102)  # Anthropic 原生（message_start/message_delta usage）
 │   └── mock.rs        (  296)  # 测试用脚本化 Provider（cfg(any(test, feature="mock"))）
-├── agent.rs       ( 3082)  # 核心 loop + usage 累计 + cancel + 上下文压缩（前馈/溢出双触发 + 滚动分块摘要）+ 相邻消息归一 + 同 turn 多 task 并行
-├── agent_tests.rs ( 7829)  # 核心 loop 回归测试（provider::mock 脚本化，不连网）
+├── agent.rs       ( 3154)  # 核心 loop + usage 累计 + cancel + 上下文压缩（前馈/溢出双触发 + 滚动分块摘要）+ 相邻消息归一 + 同 turn 多 task 并行
+├── agent_tests.rs ( 7922)  # 核心 loop 回归测试（provider::mock 脚本化，不连网）
 ├── compress.rs    (  791)  # 压缩引擎（find_safe_cut / 分块摘要 / saturating usage 合并）
 ├── retry.rs       (  158)  # batch --retries / 单跑瞬态重试共用的指数退避（±25% jitter 防 lockstep）
 ├── signal.rs      (  114)  # headless SIGINT → cancel（首次优雅 / 二次硬退 130）
 ├── session.rs     (  382)  # 会话持久化（原子写 + archive 折叠）
 ├── skills.rs      ( 1015)  # 三级技能加载（内置 / 用户目录 / 项目）
-├── hooks.rs       (  153)  # hooks 闸门（Deny / Modify / 审计）
+├── hooks.rs       (  154)  # hooks 闸门（Deny / Modify / 审计）
 ├── tools/  # 工具集：内置工具 + MCP 包装 + task 子 agent + run_code（feature code）
 │   ├── mod.rs         (  788)  # Tool trait + ToolCtx + CallbackTool/SharedTool + build 白名单组装
 │   ├── shell.rs       (  920)  # shell 工具
@@ -1167,7 +1167,7 @@ src/
 │   └── run_code.rs    ( 5558)  # run_code 工具（feature code）：QuickJS-in-wasm 沙箱——epoch/fuel/mem 限额、路径拦截、hooks 闸门、审计 meta（双哈希）
 ├── mcp.rs         ( 1422)  # MCP 客户端（stdio / Streamable HTTP / 旧版 SSE）
 ├── batch.rs       ( 2773)  # 批量任务 + --retries/--failed + 报告合并
-├── harness.rs     ( 1960)  # headless 模式 + result.json + NDJSON + exit code
+├── harness.rs     ( 1962)  # headless 模式 + result.json + NDJSON + exit code
 └── tui.rs         ( 7405)  # TUI（feature tui）：内联流式渲染（对话进原生 scrollback）/ InputBuffer 多行输入 / 斜杠命令+补全 / markdown 渲染 / bracketed paste
 ```
 <!-- END CODE STRUCTURE -->

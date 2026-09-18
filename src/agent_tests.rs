@@ -3171,8 +3171,14 @@ fn stuck_loop_nudges_then_stops() {
         .collect();
     assert_eq!(results.len(), 6);
     assert!(!results[1].contains("system notice"));
-    assert!(results[2].contains("system notice"), "第 3 次必须带纠偏提示");
-    assert!(!results[3].contains("system notice"), "提示一次即可，不得每轮重复");
+    assert!(
+        results[2].contains("system notice"),
+        "第 3 次必须带纠偏提示"
+    );
+    assert!(
+        !results[3].contains("system notice"),
+        "提示一次即可，不得每轮重复"
+    );
 }
 
 #[test]
