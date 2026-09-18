@@ -102,13 +102,14 @@ pub enum ToolDecision {
 ///   is reported only for a `before_tool` Deny and for a call skipped
 ///   because the run's cancel flag landed while the gate was deliberating
 ///   — the gate→execution checkpoint re-checks cancel so an approval wait
-///   cannot still execute the tool it approved).
+///   cannot still execute the tool it approved — or, in the parallel batch,
+///   while an approved worker was still waiting to start its tool body).
 /// - One more pairing gap, from `run_code`'s own interception layer (code
 ///   feature): a call the sandbox's deny_paths / fs_write_dirs rules reject
 ///   passes `before_tool` (Allow) but never reaches `after_tool` — the
 ///   rejection is a sandbox policy decision, not a hooks one, so
 ///   `executed = false` stays reserved for `before_tool` Deny (and gate-time
-///   cancel). Audit-style
+///   cancel, including the parallel worker's pre-body re-check). Audit-style
 ///   hooks that pair before/after counts will see these as unmatched
 ///   `before_tool`s; the rejection itself lands in the sandbox's `meta`
 ///   audit trace.
