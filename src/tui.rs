@@ -355,6 +355,14 @@ fn render_context_report(
 ) -> String {
     const BAR_WIDTH: u64 = 14;
     const PER_CATEGORY_TOOLS: usize = 5;
+    // Label column: the longest standing label is "skill content" (13) —
+    // a narrower pad lets long labels push the tokens column out of
+    // alignment (external re-review #1). Tool names are identifiers that
+    // can exceed any sane column (MCP display names run long), so those
+    // truncate with "…" instead of drifting; the column-alignment test
+    // pins both widths.
+    const LABEL_COL: usize = 13;
+    const TOOL_COL: usize = 24;
     let total = bd.total_tokens;
     // Percent with one decimal over a 0-safe denominator, u64 all the way
     // (the ×1000 trick keeps the layout arithmetic integer and saturating).
@@ -369,21 +377,23 @@ fn render_context_report(
     };
     let section = |out: &mut String, label: &str, tokens: u64| {
         out.push_str(&format!(
-            "  {:<10} {:>7}  {:>5}.{}%  {}\n",
+            "  {:<lw$} {:>7}  {:>5}.{}%  {}\n",
             label,
             fmt_tokens(tokens),
             pct_milli(tokens) / 10,
             pct_milli(tokens) % 10,
             bar(tokens),
+            lw = LABEL_COL,
         ));
     };
     let sub = |out: &mut String, label: &str, tokens: u64| {
         out.push_str(&format!(
-            "    {:<10} {:>7}  {:>5}.{}%\n",
+            "    {:<lw$} {:>7}  {:>5}.{}%\n",
             label,
             fmt_tokens(tokens),
             pct_milli(tokens) / 10,
             pct_milli(tokens) % 10,
+            lw = LABEL_COL,
         ));
     };
 
@@ -418,10 +428,20 @@ fn render_context_report(
         let mut entries: Vec<&crate::context_report::ToolEntry> = cat.tools.iter().collect();
         entries.sort_by(|a, b| b.tokens.cmp(&a.tokens).then(a.name.cmp(&b.name)));
         for e in entries.iter().take(PER_CATEGORY_TOOLS) {
+            // Fit long identifiers (MCP display names) to the column —
+            // chars, not bytes, so the "…" stays a single column unit.
+            let name = if e.name.chars().count() > TOOL_COL {
+                let mut t: String = e.name.chars().take(TOOL_COL - 1).collect();
+                t.push('…');
+                t
+            } else {
+                e.name.clone()
+            };
             s.push_str(&format!(
-                "      {:<16} {:>7}\n",
-                e.name,
-                fmt_tokens(e.tokens)
+                "      {:<tw$} {:>7}\n",
+                name,
+                fmt_tokens(e.tokens),
+                tw = TOOL_COL
             ));
         }
         if entries.len() > PER_CATEGORY_TOOLS {
@@ -451,9 +471,7 @@ fn render_context_report(
         let used_pct = total.saturating_mul(100) / max_context_tokens;
         let free = max_context_tokens.saturating_sub(total);
         // Round window numbers read cleaner without a trailing ".0".
-        let max_s = fmt_tokens(max_context_tokens)
-            .replace(".0k", "k")
-            .replace(".0M", "M");
+        let max_s = fmt_tokens_round(max_context_tokens);
         s.push_str(&format!(
             "window: {}% of {} max_context_tokens ({} free)\n",
             used_pct,
@@ -3778,6 +3796,15 @@ fn fmt_tokens(n: u64) -> String {
     }
 }
 
+/// fmt_tokens for a ROUND configured size: "256k" reads cleaner than
+/// "256.0k", so drop a trailing ".0" on the denominator only — live
+/// measured numerators keep their decimal (e.g. "54.7k"). Shared by the
+/// status bar's ctx segment and /context's window line so the two cannot
+/// drift apart.
+fn fmt_tokens_round(n: u64) -> String {
+    fmt_tokens(n).replace(".0k", "k").replace(".0M", "M")
+}
+
 /// Format the status bar's context-window segment: `ctx 54.7k` when the
 /// model's window size is unknown (limits.max_context_tokens unset), or
 /// `ctx 21% (54.7k/256.0k)` when it is configured. The color grades with
@@ -3802,12 +3829,8 @@ fn fmt_ctx(ctx_tokens: u64, max_context_tokens: u64) -> Option<(String, Style)> 
     } else {
         dim_fg()
     };
-    // The window size is a round configured number — "256k" reads cleaner
-    // than "256.0k", so drop a trailing ".0" on the denominator only (the
-    // live numerator keeps its decimal, e.g. "54.7k").
-    let max_s = fmt_tokens(max_context_tokens)
-        .replace(".0k", "k")
-        .replace(".0M", "M");
+    // The window size is a round configured number — see fmt_tokens_round.
+    let max_s = fmt_tokens_round(max_context_tokens);
     Some((
         format!("ctx {}% ({}/{})", pct, fmt_tokens(ctx_tokens), max_s),
         Style::default().fg(fg),
@@ -5540,6 +5563,79 @@ mod tests {
         assert!(shell.contains("620"), "shell tokens: {shell}");
         // window: 12345/200000 → 6% used, free ≈ 187.7k.
         assert!(s.contains("window: 6% of 200k max_context_tokens"), "{s}");
+        assert!(s.contains("(187.7k free)"), "free value shown: {s}");
+    }
+
+    #[test]
+    fn render_context_report_columns_align() {
+        // The pre-fix {:<10}/{:<16} pads let the longest standing labels
+        // ("skill content" = 13) and long MCP names push the tokens column
+        // out of alignment while every label still passed a contains()
+        // check. Pin the layout: for every data row the column just past
+        // the label/name field is the separator space, and the 7-wide
+        // tokens field is flush against its right edge. Char-based, since
+        // the truncation ellipsis is multi-byte.
+        use crate::context_report as cr;
+        let mut bd = sample_breakdown();
+        bd.tools.mcp.tools.push(cr::ToolEntry {
+            name: "mcp_github_create_issue".into(),
+            tokens: 300,
+        });
+        bd.messages.by_kind.skill_content = 77; // the 13-char label row
+        let s = render_context_report(&bd, 0);
+        for line in s.lines() {
+            let indent = line.len() - line.trim_start_matches(' ').len();
+            if indent == 0 || line.trim_start_matches(' ').starts_with('…') {
+                continue; // header / window / overflow rows carry no columns
+            }
+            let (col, kind) = match indent {
+                2 => (13, "section"),
+                4 => (13, "sub"),
+                6 => (24, "tool"),
+                _ => panic!("unexpected indent {indent}: {line:?}"),
+            };
+            let at = |i: usize| line.chars().nth(i).unwrap_or(' ');
+            assert_eq!(
+                at(indent + col),
+                ' ',
+                "{kind} separator column spilled into: {line:?}"
+            );
+            assert_ne!(
+                at(indent + col + 7),
+                ' ',
+                "{kind} tokens not flush right: {line:?}"
+            );
+        }
+        // The 23-char name fits; a longer one truncates with "…" to exactly
+        // the column width instead of drifting.
+        assert!(s.contains("mcp_github_create_issue"), "{s}");
+        let mut long = bd;
+        long.tools.mcp.tools[0].name = "mcp_github_create_pull_request_review_comment".into();
+        let s = render_context_report(&long, 0);
+        let row = s
+            .lines()
+            .find(|l| l.contains("mcp_github_create"))
+            .expect("truncated row present");
+        assert!(row.contains('…'), "truncated: {row}");
+        assert_eq!(row.trim_end().chars().count(), 6 + 24 + 1 + 7);
+    }
+
+    #[test]
+    fn render_context_report_lists_top_five_then_overflow() {
+        // The per-category cap lists the five biggest and counts the rest —
+        // the "… +N more" branch had no coverage before.
+        use crate::context_report as cr;
+        let mut bd = sample_breakdown();
+        for i in 0..3 {
+            bd.tools.builtin.tools.push(cr::ToolEntry {
+                name: format!("extra_{i}"),
+                tokens: 10 + i,
+            });
+        }
+        let s = render_context_report(&bd, 0);
+        assert!(s.contains("… +2 more"), "overflow count: {s}");
+        assert!(s.contains("extra_2"), "5th largest listed: {s}");
+        assert!(!s.contains("extra_0"), "7th largest hidden: {s}");
     }
 
     #[test]

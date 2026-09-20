@@ -571,12 +571,11 @@ impl Default for CancelToken {
 /// but name). try_lock + an immediate, explanatory error is the only safe
 /// shape. After the awaited run() resolves, the methods work again.
 fn agent_busy() -> Error {
-    err(
-        "Agent.run() is active: sync methods (pushUser, setCancel, usage, \
-        contextBreakdown, messages, model, enableCode/disableCode/setCodeConfig) must \
+    err("Agent.run() is active: sync methods (pushUser, setCancel, \
+        clearCancel, usage, contextBreakdown, messages, model, \
+        enableCode/disableCode/setCodeConfig) must \
         not be called until the awaited run() resolves — calling them while a run is \
-        in flight would freeze the JS event loop the run depends on",
-    )
+        in flight would freeze the JS event loop the run depends on")
 }
 
 /// A multi-turn agent. Construct from a config file path, optionally with an

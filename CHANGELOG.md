@@ -5,6 +5,20 @@
 
 ## [Unreleased]
 
+### Added
+
+- **上下文构成查询 `context_breakdown()`（4278d8e，跨核心 + 双绑定 + TUI）**：新公共 API——外部宿主可查询
+  下一请求上下文的估算 token 构成与占比：`system` 三段（env 头 / 用户 base / skill 简介）、工具 schema 四类
+  （`builtin`/`mcp`/`skill`/`custom`，经 `Tool` trait 新默认方法 `origin()` 归类，含逐工具明细）、消息历史
+  八分型（`user_text`/`assistant_text`/`tool_use`/`tool_result`/`image`/`document`/`skill_content`/`other`；
+  无 thinking 桶——思考是纯事件流永不进 history）。一切数字是估算口径（`compress::estimate_tokens` 同款
+  yardstick），**与 Usage 实测刻意不混流**（`usage()` 仍是计费权威）；有有效 usage 锚点时透出
+  `calibration`（实测/估算的 scale 均匀缩放，锚点失效即回 `None` 纯启发式）。未校准时
+  `system+tools+messages == total == estimate_tokens(全量)` 严格成立（单趟 running-floor 整除分摊）。
+  透出面：Rust `Agent::context_breakdown()`、Python `context_breakdown()`（跨线程阻塞等锁）、Node
+  `contextBreakdown()`（run 中立即报错，wrapper.d.ts 类型同步）、TUI `/context` 命令（busy 时禁用，同
+  `/clear`）。
+
 ### Changed（破坏性）
 
 - **`Hooks::after_tool` 签名增加第 5 参 `ctx: &ToolCtx`**：与 `before_tool` 的 ctx 对称——审计点靠
@@ -16,6 +30,12 @@
 
 ### Fixed
 
+- **零 prompt 的 usage 不再写锚点（a3f858e，外部复审发现）**：输入三轴全零的 usage 对象（野见：OpenAI
+  兼容 relay 缺 `usage.prompt_tokens`、Anthropic 协议网关发 `{input_tokens:0}`）此前照写 usage 锚点，把
+  `scale` 钉死 0.0——`context_breakdown()` 报"已校准的全零"（TUI 渲染 `calibrated ×0.00` + 100% free），
+  压缩预检 `estimate_input_tokens` 也退化成 0+delta 低估，一个垃圾输入毒化两个消费者。现在零 prompt
+  视为网关未报 usage，两个消费者都保守回退纯启发式；输出 token 计费不受影响。回归测试
+  `zero_prompt_usage_writes_no_anchor`（修复前红灯复现）。
 - **外部复审第五轮（b6ee977，每项带回归测试）**：
   - **P1 batch 隔离目录防符号链接预置**：`ta-batch-{task}-{pid}-{n}` 名字可预测，多用户共享 /tmp
     下可按名预置 symlink，`create_dir_all` 的"已存在"检查穿透符号链接 stat 而照常成功——整个

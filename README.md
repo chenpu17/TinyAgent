@@ -162,7 +162,7 @@ print(a.run(on_event=lambda e: print(e))["final_text"])
 
 `run()` 同步阻塞但**释放 GIL**（`py.allow_threads`），长网络等待期间其他 Python 线程可跑；事件回调用 `with_gil` 短暂重获。
 
-**上下文构成**：`a.context_breakdown()` 返回下一请求上下文的估算 token 分解 dict（`system` 三段 / `tools` 四类 / `messages.by_kind` 分型 / `total_tokens` / `calibration`，键 snake_case）——宿主画上下文占比视图的数据源；语义见库 API 节[上下文构成查询](#库-api程序化调用)，与 `usage()` 同款 busy 契约。
+**上下文构成**：`a.context_breakdown()` 返回下一请求上下文的估算 token 分解 dict（`system` 三段 / `tools` 四类 / `messages.by_kind` 分型 / `total_tokens` / `calibration`，键 snake_case）——宿主画上下文占比视图的数据源；语义见库 API 节[上下文构成查询](#库-api程序化调用)，与 `usage()` 同款 busy 契约（run 中跨线程调用阻塞等锁直至 run 结束、同线程回调重入报错——与 Node 侧的立即报错相反）。
 
 **自定义 provider 回调**：传 `provider=` 一个 Python callable，整个替换内置 HTTP provider（不连网、不要 key）。callable 收 `{system, messages, tools, model, max_tokens}`，返回 `str`（=纯文本）或 `{text, stop_reason?, usage?}`：
 
@@ -1178,6 +1178,6 @@ src/
 ├── mcp.rs            ( 1422)  # MCP 客户端（stdio / Streamable HTTP / 旧版 SSE）
 ├── batch.rs          ( 3035)  # 批量任务 + --retries/--failed + 报告合并
 ├── harness.rs        ( 1962)  # headless 模式 + result.json + NDJSON + exit code
-└── tui.rs            ( 7696)  # TUI（feature tui）：内联流式渲染（对话进原生 scrollback）/ InputBuffer 多行输入 / 斜杠命令+补全 / markdown 渲染 / bracketed paste
+└── tui.rs            ( 7792)  # TUI（feature tui）：内联流式渲染（对话进原生 scrollback）/ InputBuffer 多行输入 / 斜杠命令+补全 / markdown 渲染 / bracketed paste
 ```
 <!-- END CODE STRUCTURE -->
