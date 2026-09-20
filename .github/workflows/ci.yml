@@ -75,6 +75,22 @@ jobs:
       - run: cargo clippy --features tui,code --all-targets -- -D warnings
       - run: cargo test --features code,mock
 
+  e2e:
+    # 场景化端到端门（离线、零密钥）：内置 SSE 场景 mock + 真实 CLI/HTTP
+    # 栈，覆盖打转护栏（stuck_loop 硬停 / 进展不误停 / nudge 只进历史不进
+    # 事件流）、单轮 10 路并行 task fan-out（8/波上限 + N:N 配平 +
+    # 请求数精确核算）、SIGINT 优雅取消（exit 130）。脚本化 MockProvider
+    # 单测覆盖进程内 loop 不变量，这个 job 守它们到不了的「真栈」层
+    # （CLI 解析、SSE 解码、进程信号）。单平台：场景无平台差异。
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build
+      - run: python3 scripts/e2e_scenarios.py
+
   python-binding:
     # 绑定测试只在 ubuntu 跑：绑定层从未在 Windows 验证过（三次 Windows
     # 修复全是核心代码），先不做 continue-on-error 的虚假信心，等手动

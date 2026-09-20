@@ -1980,12 +1980,17 @@ impl Agent {
                     }
                 }
                 // Second checkpoint before anything spawns: a cancel that
-                // landed during the LAST gate skips the whole batch — approved
-                // but unstarted calls keep their Cancelled slots (cancel =
-                // stop STARTING work; already-running workers self-terminate
-                // via the shared flag per the Parallel contract). Control
-                // still falls through to the assembly pass below — the
-                // announced calls need their synthesized results.
+                // landed during the LAST gate skips the whole batch. Approved
+                // but unstarted calls don't stay Cancelled — the placeholder
+                // loop after the waves converts them to the same recorded
+                // after_tool(executed=false) shape the worker pre-body
+                // checkpoint uses, so a passed gate never leaves an unmatched
+                // before_tool (external re-review P3). (Cancel = stop
+                // STARTING work; already-running workers self-terminate via
+                // the shared flag per the Parallel contract.) Control still
+                // falls through to the assembly pass below — the announced
+                // calls need their synthesized results.
+                let mut spawned = 0usize;
                 if !self.cancelled() && !runnable.is_empty() {
                     // Waves cap concurrent workers (MAX_PARALLEL_TOOL_WORKERS):
                     // the model can emit dozens of `task` calls in one turn and
@@ -2002,7 +2007,7 @@ impl Agent {
                     const MAX_PARALLEL_TOOL_WORKERS: usize = 8;
                     for wave in runnable.chunks(MAX_PARALLEL_TOOL_WORKERS) {
                         if self.cancelled() {
-                            break; // later waves keep Cancelled slots (synthesized below)
+                            break; // later waves get the placeholder loop below
                         }
                         let tools = &self.tools;
                         let defs = &self.tool_defs;
@@ -2110,7 +2115,23 @@ impl Agent {
                                 }
                             }
                         });
+                        spawned += wave.len();
                     }
+                }
+                // Approved-but-never-started calls (cancel at the pre-spawn
+                // checkpoint or between waves): their before_tool already
+                // fired — possibly after an approval wait — so they owe the
+                // audit trail the same recorded after_tool(executed=false)
+                // placeholder the worker pre-body checkpoint produces. Model-
+                // visible output is unchanged (the assembly pass was already
+                // synthesizing this exact ToolResult for announced slots);
+                // only records / hook pairing gain the entry. Never-gated
+                // calls (gate-loop break) keep their Cancelled slot: no
+                // before_tool fired, so there is nothing to pair.
+                for &(i, ref name, _) in &runnable[spawned..] {
+                    let output = ToolOutput::error("[cancelled by user]");
+                    notify_tool_after(&self.ctx, name, &tool_uses[i].2, &output, false);
+                    slots[i] = Slot::Ran(Box::new(output));
                 }
             }
 

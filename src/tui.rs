@@ -4957,8 +4957,9 @@ mod tests {
         ] {
             assert!(is_normal_stop(normal), "{normal} should be silent");
         }
-        // Abnormal stops DO get a warn row.
-        for abnormal in ["max_tokens", "length", "error", "unknown", ""] {
+        // Abnormal stops DO get a warn row — including the stuck-loop
+        // guardrail's `stuck_loop` (a terminated run the user should see).
+        for abnormal in ["max_tokens", "length", "error", "unknown", "", "stuck_loop"] {
             assert!(!is_normal_stop(abnormal), "{abnormal} should be shown");
         }
     }

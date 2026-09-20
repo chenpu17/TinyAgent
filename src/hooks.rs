@@ -103,7 +103,12 @@ pub enum ToolDecision {
 ///   because the run's cancel flag landed while the gate was deliberating
 ///   — the gate→execution checkpoint re-checks cancel so an approval wait
 ///   cannot still execute the tool it approved — or, in the parallel batch,
-///   while an approved worker was still waiting to start its tool body).
+///   for an approved call that never started its tool body: the worker's
+///   pre-body re-check, the pre-spawn checkpoint, and the wave-start
+///   checkpoint all convert it to the same recorded
+///   `after_tool(executed = false)` placeholder, so a passed gate never
+///   leaves an unmatched `before_tool`. Calls the gate loop never reached
+///   (cancel mid-gating) have no `before_tool` and stay unrecorded.)
 /// - One more pairing gap, from `run_code`'s own interception layer (code
 ///   feature): a call the sandbox's deny_paths / fs_write_dirs rules reject
 ///   passes `before_tool` (Allow) but never reaches `after_tool` — the

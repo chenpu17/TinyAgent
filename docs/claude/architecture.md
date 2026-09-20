@@ -100,7 +100,13 @@
   （`execute_tool_call` 新增 `effective_out` 出参 + 并行 gate Modify 臂落 `effective_inputs`），
   审批层改写成分页的调用不共键。**无 stuck_stop 闩锁**：轮尾直读当前连续计数——同轮第 7 次换法
   即自动解除停止。**取消优先**：轮尾先查 cancel 再查打转，同轮内落下的取消报 cancelled/130。
-  已知盲区（刻意，宁漏勿滥）：结果嵌时间戳/随机 id 的真打转逃逸检测；image 差异不进键。
+  已知盲区（刻意取舍，两个方向都有）：**漏检侧**——结果嵌时间戳/随机 id 的真打转逃逸检测；
+  **误杀侧**——静态文本轮询（curl 恒错、探测输出恒定）与「进展只在 image 里」的截图类轮询：
+  结果指纹恒定即同键，真无进展与「进展不进键」无法区分，6 连硬停（nudge 已提示模型换探测
+  方式，属护栏本意的边界）；数字拼写不归一（1 vs 1.0）只影响漏检侧。run_code 内层
+  host_call_tool 不经装配段、不计入打转（有 fuel/epoch 兜底）。**同轮语义**：单轮内 6 连
+  重复直达硬停——模型在该轮发出全部调用时尚未看到任何结果，nudge 写进历史块也等不到下一
+  次请求，同轮场景 nudge 名义存在、无自愈窗口（一轮承诺 6 次相同调用本身即退化形态）。
   计数跨轮持久、随 run 重置；`Cancelled` 槽不计数（未执行）。测试组 7 个：
   nudge→停 / 换参重置 / 键序不敏感 / 进展结果不误停 / Modify 生效参数 / 同轮换法解停 /
   取消优先。
@@ -202,9 +208,10 @@
   **gate→执行检查点**（2026-09 外审 P2）：`before_tool` 可以无限期挂起（审批 UI 等人），等待期落下的
   cancel 若不复查就会出现"run 报 cancelled、被批准的工具却照跑"——`ctx_cancelled()` 在 gate 返回后、
   执行前复查（`execute_tool_call` / 并行批 spawn 前 / run_code 内层三处共用），顺序路径产出
-  `[cancelled by user]` 错误槽且 `after_tool` 以 `executed=false` 收尾（与 Deny 同形）；并行路径整批
-  不启动、槽位保持 Cancelled 合成（此时 before 已发过而 after 不会发——一个未配对 before，同
-  run_code deny 层的既有审计形状）；run_code 内层复用入口闸同款墓碑文案（`CANCEL_HALTED_WHY`，
+  `[cancelled by user]` 错误槽且 `after_tool` 以 `executed=false` 收尾（与 Deny 同形）；并行路径
+  同款统一（2026-09 复审 P3 修复）：已过 gate 但因 pre-spawn/波间检查点未启动的调用由占位循环转成
+  `Slot::Ran` 错误槽——进 records 且 `after_tool(executed=false)`，**过的 gate 不再留下未配对
+  before**；只有 gate 循环本身被 cancel 打断、从未过闸的调用保持 `Slot::Cancelled`（无 before 可配）。run_code 内层复用入口闸同款墓碑文案（`CANCEL_HALTED_WHY`，
   kind `cancel`，附录 A v0.5 记录新增触发点）。
   顶层闸门在父线程 spawn 前**串行**把关，子 agent 自身闸门跑在各自 worker 线程（兄弟真并发，实现方
   须自行线程安全——`Send + Sync` 只保证传对象内存安全）；压缩摘要请求**不**透出；`--resume` 重建的

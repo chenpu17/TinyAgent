@@ -1905,10 +1905,10 @@ fn cancel_during_approval_gate_does_not_execute_sequential_tool() {
 fn cancel_during_approval_gate_does_not_execute_parallel_batch() {
     // The batch path: the gate loop approves the only Parallel call while
     // setting cancel — the pre-spawn checkpoint must skip the whole batch.
-    // The slot keeps the Cancelled synthesis (no record, no worker), and
-    // unlike the inline path there is NO after_tool (the batch never
-    // started — an unmatched before, same audit shape the Hooks doc's
-    // run_code edge describes).
+    // The approved call gets the placeholder loop's recorded
+    // after_tool(executed=false) slot (its before_tool fired, so the audit
+    // trail must close the pair — external re-review P3): same shape as the
+    // inline gate checkpoint, no worker ever ran.
     let cfg = cfg_with(5, 0, 0);
     let (prov, _) = MockProvider::new(vec![
         mock::resp_tool("p1", "task", json!({"label": "p"}), None),
@@ -1945,15 +1945,18 @@ fn cancel_during_approval_gate_does_not_execute_parallel_batch() {
         })
         .unwrap();
     assert_eq!(o.stop_reason, "cancelled");
-    assert!(o.tool_calls.is_empty(), "the batch never ran");
+    assert_eq!(o.tool_calls.len(), 1, "the approved call is recorded");
+    assert_eq!(o.tool_calls[0].output, "[cancelled by user]");
+    assert!(o.tool_calls[0].is_error);
     assert_eq!(
         agent.trailing_tool_result_contents(),
         vec!["[cancelled by user]"],
-        "Cancelled-slot synthesis keeps N:N pairing"
+        "placeholder synthesis keeps N:N pairing"
     );
-    assert!(
-        hooks.after.lock().unwrap().is_empty(),
-        "no worker ran, so no after_tool"
+    assert_eq!(
+        *hooks.after.lock().unwrap(),
+        vec!["task:false:[cancelled by user]".to_string()],
+        "a passed gate never leaves an unmatched before_tool"
     );
     let seen = seen.lock().unwrap();
     let calls = seen.iter().filter(|t| *t == "call").count();
@@ -2055,6 +2058,17 @@ fn cancel_between_waves_never_starts_the_next_wave() {
         (9, 9),
         "every announced call closed — ran or cancel-synthesized: {seen:?}"
     );
+    // Audit unification (external re-review P3): call #9 was approved by the
+    // gate but never started (wave-2 cancel checkpoint) — it still lands in
+    // the records as an executed=false-style placeholder, so every announced
+    // + gated call is accounted for.
+    assert_eq!(
+        o.tool_calls.len(),
+        9,
+        "8 wave-1 slots (ran or pre-body-cancelled) + 1 wave-2 placeholder"
+    );
+    assert_eq!(o.tool_calls[8].output, "[cancelled by user]");
+    assert!(o.tool_calls[8].is_error);
 }
 
 /// A Parallel tool flooding the event funnel (more events than the bounded

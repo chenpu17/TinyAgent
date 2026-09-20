@@ -352,7 +352,7 @@ tiny-agent --config examples/harness.json --batch examples/tasks --failed --retr
 
 `--retries N` 在**单跑 headless** 模式同样生效：`agent.run` 返回 transient `Err`（网络抖动、429、
 5xx）时按指数退避（1/2/4/8/16/32s 封顶）原地重试，最多 N 次额外尝试；确定性失败**不重试**——
-`end_turn` / `max_turns` / `cancelled` / `timeout` / `budget_exceeded` 是 `Ok`，`context_overflow` 与
+`end_turn` / `max_turns` / `cancelled` / `timeout` / `budget_exceeded` / `stuck_loop` 是 `Ok`，`context_overflow` 与
 `request_error`（401/403/404/400 等确定性请求拒绝）直接以 exit 1 收场。请求失败发生在 run 截止
 （`limits.timeout_secs`）之后时按 `timeout`（exit 124）归属，不进重试梯。与 batch 相同，重试是**整任务
 重放**：前轮工具副作用不回滚（账单照实累计），副作用型任务需自行保证幂等。退出码与无重试时一致
@@ -1147,14 +1147,14 @@ src/
 │   ├── openai.rs      ( 1645)  # OpenAI 兼容（include_usage；400 回退：max_tokens→max_completion_tokens / 丢 stream_options）
 │   ├── anthropic.rs   ( 1102)  # Anthropic 原生（message_start/message_delta usage）
 │   └── mock.rs        (  296)  # 测试用脚本化 Provider（cfg(any(test, feature="mock"))）
-├── agent.rs       ( 3200)  # 核心 loop + usage 累计 + cancel + 上下文压缩（前馈/溢出双触发 + 滚动分块摘要）+ 相邻消息归一 + 同 turn 多 task 并行
-├── agent_tests.rs ( 8099)  # 核心 loop 回归测试（provider::mock 脚本化，不连网）
+├── agent.rs       ( 3221)  # 核心 loop + usage 累计 + cancel + 上下文压缩（前馈/溢出双触发 + 滚动分块摘要）+ 相邻消息归一 + 同 turn 多 task 并行
+├── agent_tests.rs ( 8113)  # 核心 loop 回归测试（provider::mock 脚本化，不连网）
 ├── compress.rs    (  791)  # 压缩引擎（find_safe_cut / 分块摘要 / saturating usage 合并）
 ├── retry.rs       (  158)  # batch --retries / 单跑瞬态重试共用的指数退避（±25% jitter 防 lockstep）
 ├── signal.rs      (  114)  # headless SIGINT → cancel（首次优雅 / 二次硬退 130）
 ├── session.rs     (  382)  # 会话持久化（原子写 + archive 折叠）
 ├── skills.rs      ( 1015)  # 三级技能加载（内置 / 用户目录 / 项目）
-├── hooks.rs       (  154)  # hooks 闸门（Deny / Modify / 审计）
+├── hooks.rs       (  159)  # hooks 闸门（Deny / Modify / 审计）
 ├── tools/  # 工具集：内置工具 + MCP 包装 + task 子 agent + run_code（feature code）
 │   ├── mod.rs         (  788)  # Tool trait + ToolCtx + CallbackTool/SharedTool + build 白名单组装
 │   ├── shell.rs       (  920)  # shell 工具
@@ -1169,6 +1169,6 @@ src/
 ├── mcp.rs         ( 1422)  # MCP 客户端（stdio / Streamable HTTP / 旧版 SSE）
 ├── batch.rs       ( 2782)  # 批量任务 + --retries/--failed + 报告合并
 ├── harness.rs     ( 1962)  # headless 模式 + result.json + NDJSON + exit code
-└── tui.rs         ( 7405)  # TUI（feature tui）：内联流式渲染（对话进原生 scrollback）/ InputBuffer 多行输入 / 斜杠命令+补全 / markdown 渲染 / bracketed paste
+└── tui.rs         ( 7406)  # TUI（feature tui）：内联流式渲染（对话进原生 scrollback）/ InputBuffer 多行输入 / 斜杠命令+补全 / markdown 渲染 / bracketed paste
 ```
 <!-- END CODE STRUCTURE -->
