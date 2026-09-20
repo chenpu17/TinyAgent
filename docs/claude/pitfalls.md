@@ -287,6 +287,12 @@
   → `context_breakdown().calibration` 回 `None`（纯启发式口径）——post-run 主 chat 会重新锚定，这是
   既有语义的顺延。测试"失效"路径用**手动 `compact()`**（run 后锚点在、compact 折叠后锚点失配；
   preflight 压缩后紧跟的主 chat 会立刻重锚，测不出失配窗口）。
+- **零 prompt 的 usage 不是测量，不写锚点**（agent.rs 锚点写点）：真实请求不可能零输入
+  （system + 至少一条 user 消息必有成本），输入三轴全零的 usage 对象 = 网关没报 prompt usage
+  （野见的 relay 缺 `usage.prompt_tokens`、Anthropic 协议网关发 `{input_tokens:0}`）。若照写锚点，
+  `scale = 0/raw = 0.0` → `context_breakdown` 报"已校准的全零"（TUI 渲染 `calibrated ×0.00` +
+  `window: 100% free`），既有 `estimate_input_tokens` 也退化成 0+delta——一个垃圾输入毒化两个消费者。
+  守卫别只盖 `raw == 0` 一端；`zero_prompt_usage_writes_no_anchor` 钉住（输出 token 照常计费不受影响）。
 - **lib_api 里别断言"空 workdir ⇒ 无技能"**：`resolve_skill_dirs` 还会读机器级全局技能目录
   （`~/.config/tinyagent/skills`），开发机上装了技能的与干净的 CI 跑出不同结果——环境依赖的断言
   是移植性地雷。"无 intro"语义用直接 `Agent::new`（不经装配）来测。

@@ -8612,6 +8612,47 @@ fn context_breakdown_calibrates_after_billed_run() {
 }
 
 #[test]
+fn zero_prompt_usage_writes_no_anchor() {
+    // A usage object whose input axes are all zero is a gateway that did
+    // NOT report prompt usage (seen in the wild: relays omitting
+    // usage.prompt_tokens, Anthropic-protocol gateways sending
+    // {input_tokens: 0}). Zero prompt tokens is impossible for a real
+    // request; treating it as a measurement pinned the anchor scale to
+    // 0.0 — a "calibrated" all-zero breakdown — and degraded
+    // estimate_input_tokens to 0 + delta. Skip the anchor instead: the
+    // pull stays pure-heuristic and the preflight estimate falls back to
+    // the raw estimate. Output tokens still bill honestly.
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, state) = MockProvider::new(vec![mock::resp_text("done", mock::mk_usage(0, 5))]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("a real prompt with some content")],
+        test_ctx(),
+    );
+    agent.run(&mut |_| {}).unwrap();
+    assert_eq!(state.calls(), 1);
+
+    assert!(
+        agent.usage_anchor.is_none(),
+        "zero prompt usage must not pin an anchor"
+    );
+    let bd = agent.context_breakdown();
+    assert!(bd.calibration.is_none());
+    assert!(
+        bd.total_tokens > 0,
+        "heuristic estimate, not the scaled-zero lie"
+    );
+    assert_eq!(
+        bd.system.tokens + bd.tools.tokens + bd.messages.tokens,
+        bd.total_tokens
+    );
+    // Billing is untouched by the anchor decision.
+    assert_eq!(agent.usage().output_tokens, 5);
+}
+
+#[test]
 fn calibration_voids_on_fold() {
     // A manual compact rewrites the history without a main-chat re-anchor:
     // the anchor's prefix no longer matches and the breakdown falls back to

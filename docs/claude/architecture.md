@@ -472,7 +472,9 @@
   原语 `compress::block_chars`/`block_pdf_tokens` 是 total_chars/estimate_tokens 与分解共用的单点
   （新 Block 变体在此编译期强制决策，context_report 的分型 match 同样穷尽、`other` 是显式兜底目的地
   而非 wildcard）。**校准**：`UsageAnchor` 加 `scale: f64`（锚点写点顺手算
-  `raw=estimate_tokens(同前缀)`，`scale=prompt/raw`，raw==0→1.0），`live_anchor()`（estimate_input_tokens
+  `raw=estimate_tokens(同前缀)`，`scale=prompt/raw`，raw==0→1.0；**输入三轴全零的 usage 不写锚点**——
+  零 prompt 对真实请求不可能，照写会把 scale 钉 0 成"已校准的全零"，详录见 pitfalls），`live_anchor()`
+  （estimate_input_tokens
   四条件校验的抽取复用）有效时全分量 ×scale 并透出 `Calibration{measured_prompt_tokens, scale}`——
   **均匀缩放本身是启发式**（假设估算误差在各成分间比例相近，CJK 低估类成立）；prune/fold/热增删/
   前缀改写使锚点失效 → calibration 自动回 None。**归因流**：env 头长度在 `try_new` 内（`system_with_env`

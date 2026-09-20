@@ -1710,23 +1710,33 @@ impl Agent {
                     .input_tokens
                     .saturating_add(u.cache_creation_input_tokens)
                     .saturating_add(u.cache_read_input_tokens);
-                let raw = compress::estimate_tokens(
-                    &self.messages[..request_msg_count],
-                    self.system.as_deref(),
-                    self.tool_schema_chars,
-                );
-                self.usage_anchor = Some(UsageAnchor {
-                    prompt_tokens,
-                    msg_count: request_msg_count,
-                    prefix_chars: compress::total_chars(&self.messages[..request_msg_count]),
-                    system_chars: self.system.as_ref().map(|s| s.len()),
-                    tool_schema_chars: self.tool_schema_chars,
-                    scale: if raw == 0 {
-                        1.0
-                    } else {
-                        prompt_tokens as f64 / raw as f64
-                    },
-                });
+                // Zero prompt tokens is impossible for a real request
+                // (system + at least one user message always cost
+                // something) — an all-zero input-axis usage object is a
+                // gateway that did NOT report prompt usage. Treating it as
+                // a measurement pins `scale` to 0.0 (a "calibrated"
+                // all-zero breakdown) and degrades the preflight estimate
+                // to 0 + delta. Skip the anchor: both consumers fall back
+                // to the heuristic. Output tokens still bill above.
+                if prompt_tokens > 0 {
+                    let raw = compress::estimate_tokens(
+                        &self.messages[..request_msg_count],
+                        self.system.as_deref(),
+                        self.tool_schema_chars,
+                    );
+                    self.usage_anchor = Some(UsageAnchor {
+                        prompt_tokens,
+                        msg_count: request_msg_count,
+                        prefix_chars: compress::total_chars(&self.messages[..request_msg_count]),
+                        system_chars: self.system.as_ref().map(|s| s.len()),
+                        tool_schema_chars: self.tool_schema_chars,
+                        scale: if raw == 0 {
+                            1.0
+                        } else {
+                            prompt_tokens as f64 / raw as f64
+                        },
+                    });
+                }
             }
 
             // A provider mid-stream error (Anthropic error event / read failure)

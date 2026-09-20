@@ -501,7 +501,8 @@ impl Agent {
     ///      | None}`. Every number is an ESTIMATE (chars/4 yardstick), not a
     /// provider measurement — `usage()` stays the billing authority;
     /// `calibration` is non-None only while a measured anchor is still valid.
-    /// Read-only, busy-errors while `run()` is in flight (same as `usage`).
+    /// Read-only; calling during `run()` waits until the run ends (other
+    /// thread) or errors on same-thread reentry (same as `usage`).
     fn context_breakdown(&self, py: Python<'_>) -> PyResult<PyObject> {
         let bd = self.with_agent(py, |a| a.context_breakdown())?;
         let bound = pythonize(py, &bd)?;
