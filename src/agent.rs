@@ -456,14 +456,20 @@ const SALVAGE_NUDGE_EMPTY: &str = "Your previous reply produced no visible \
      budget). Reply now with minimal reasoning and a direct, concise answer.";
 
 /// 打转护栏（OpenHands Stuck Detector 的思路，裁剪到 ReAct 循环）：同一个
-/// （工具名 + 规范化参数）连续执行到 [`STUCK_NUDGE_AT`] 次，把纠偏提示追加进
-/// 该次的 tool_result 历史块（UI 事件与 result.json 的 records 保持原样），
-/// 给模型一次自愈机会；累计到 [`STUCK_STOP_AT`] 次仍不换法，则本轮工具结果
-/// 落进历史后以 `stop_reason = "stuck_loop"` 收尾。任何一次不同的调用都会
-/// 重置计数——换工具 / 换参数 / 中间插入别的操作都算有进展，因此健康的
-/// 重试节奏（edit → test → edit）永不误伤。轮数帽只数次数，分不清「慢而
-/// 稳」和「原地打转」；轮帽放松（GUI 交互会话放到千级）后，这道护栏才是
-/// 防失控烧钱的主力（Codex CLI 无打转保护出现过 9 小时压缩死循环）。
+/// （工具名 + 规范化**生效**参数 + **结果指纹**）连续出现到
+/// [`STUCK_NUDGE_AT`] 次，把纠偏提示追加进该次的 tool_result 历史块（UI 事件
+/// 与 result.json 的 records 保持原样），给模型一次自愈机会；轮次收尾时连续
+/// 计数仍 ≥ [`STUCK_STOP_AT`]，则以 `stop_reason = "stuck_loop"` 收尾。
+/// **进展感知**（2026-09 外审第四轮 P2）：键里带结果指纹——同一调用只要
+/// 结果不同（状态轮询 10%→60%）就算有进展、计数重置，只有"同参同果"才是
+/// 原地打转；键用 hook Modify 后的**生效参数**而非原始参数——审批层改写
+/// 成分页/不同目标的调用不复用同一键。已知盲区（刻意接受）：结果里嵌时间戳
+/// /随机 id 的真打转会逃逸检测（宁漏勿滥，误停比漏停贵）；image 差异不进键
+/// （结果指纹只看文本 content + is_error）。任何一次不同键的调用都会重置
+/// 计数——换工具 / 换参数 / 结果有进展都算，因此健康的重试节奏
+/// （edit → test → edit）永不误伤。轮数帽只数次数，分不清「慢而稳」和
+/// 「原地打转」；轮帽放松（GUI 交互会话放到千级）后，这道护栏才是防失控
+/// 烧钱的主力（Codex CLI 无打转保护出现过 9 小时压缩死循环）。
 const STUCK_NUDGE_AT: u32 = 3;
 const STUCK_STOP_AT: u32 = 6;
 
@@ -1331,11 +1337,13 @@ impl Agent {
         let mut salvage_used = false;
         let mut final_text = String::new();
         let mut records: Vec<ToolCallRecord> = Vec::new();
-        // 打转检测状态：上一个实际执行的 (工具名, 规范化参数) 与其连续重复
-        // 次数（见 STUCK_NUDGE_AT / STUCK_STOP_AT 的护栏说明）。
-        let mut stuck_key: Option<(String, String)> = None;
+        // 打转检测状态：上一个已决调用的（工具名, 规范化生效参数, 结果指纹）
+        // 与其连续重复次数（见 STUCK_NUDGE_AT / STUCK_STOP_AT 的护栏说明）。
+        // 没有 stuck_stop 闩锁——轮尾直接读 stuck_len，任何不同键的调用重置
+        // 计数即自动解除停止条件（外审第四轮 P2：闩锁曾让同轮第 7 次换法
+        // 仍被停）。
+        let mut stuck_key: Option<(String, String, u64)> = None;
         let mut stuck_len: u32 = 0;
-        let mut stuck_stop = false;
         let mut stop_reason: String;
 
         // Labeled: the per-turn overflow-retry loop below is itself a `loop`
@@ -1843,6 +1851,12 @@ impl Agent {
                 Ran(Box<ToolOutput>),
             }
             let mut slots: Vec<Slot> = (0..tool_uses.len()).map(|_| Slot::Cancelled).collect();
+            // Hook-Modify replacements, per ordinal (None = ran with the
+            // original input). The stuck detector keys on the EFFECTIVE input
+            // (external re-review P2): an approval layer rewriting each call to
+            // a different page/target must not share one stuck key.
+            let mut effective_inputs: Vec<Option<Value>> =
+                (0..tool_uses.len()).map(|_| None).collect();
             // Ordinals of Parallel-capable calls deferred to the parallel batch.
             let mut parallel_slots: Vec<usize> = Vec::new();
             let mut batch_cancelled = false;
@@ -1885,6 +1899,7 @@ impl Agent {
                             name,
                             input,
                             &mut fwd,
+                            &mut effective_inputs[i],
                         )
                     };
                     slots[i] = Slot::Ran(Box::new(output));
@@ -1959,6 +1974,7 @@ impl Agent {
                             runnable.push((i, name.clone(), input.clone()));
                         }
                         ToolDecision::Modify(v) => {
+                            effective_inputs[i] = Some(v.clone());
                             runnable.push((i, name.clone(), v));
                         }
                     }
@@ -2158,9 +2174,14 @@ impl Agent {
                             is_error: output.is_error,
                             content: output.content.clone(),
                         });
-                        // 打转计数只统计真正执行的调用；nudge 只追加进历史
-                        // 块——ToolResult 事件与 records 保持原样输出
-                        let key = (name.clone(), canon_input(input));
+                        // 打转计数：键 =（工具名, 规范化生效参数, 结果指纹）——
+                        // 同参不同果（轮询有进展）不同键、自动重置；nudge 只
+                        // 追加进历史块——ToolResult 事件与 records 保持原样输出
+                        let key = (
+                            name.clone(),
+                            canon_input(effective_inputs[i].as_ref().unwrap_or(input)),
+                            stuck_result_hash(output),
+                        );
                         if stuck_key.as_ref() == Some(&key) {
                             stuck_len += 1;
                         } else {
@@ -2170,9 +2191,6 @@ impl Agent {
                         let mut content = output.content.clone();
                         if stuck_len == STUCK_NUDGE_AT {
                             content.push_str(&stuck_nudge(stuck_len));
-                        }
-                        if stuck_len >= STUCK_STOP_AT {
-                            stuck_stop = true;
                         }
                         results.push(Block::ToolResult {
                             tool_use_id: id.clone(),
@@ -2192,9 +2210,16 @@ impl Agent {
             if let Some(w) = self.save_session() {
                 events(AgentEvent::Warning(w));
             }
-            // 打转硬停：历史以本轮 tool_results 收口（N:N 配对完整），下一轮
-            // 请求不再发出——与 max_turns_reached 同款的轮边界语义
-            if stuck_stop {
+            // 轮尾终止判定：取消优先于打转硬停（外审第四轮 P2——本轮内落下
+            // 的 cancel 必须报 "cancelled"/exit 130，不能被 stuck_loop 抢走）；
+            // 打转直接读当前连续计数（无闩锁）——历史以本轮 tool_results 收口
+            // （N:N 配对完整），下一轮请求不再发出，与 max_turns_reached 同款
+            // 的轮边界语义。
+            if self.cancelled() {
+                stop_reason = "cancelled".into();
+                break;
+            }
+            if stuck_len >= STUCK_STOP_AT {
                 stop_reason = "stuck_loop".into();
                 break;
             }
@@ -2326,6 +2351,7 @@ pub(crate) fn execute_tool_call(
     name: &str,
     input: &Value,
     emit: &mut dyn FnMut(AgentEvent),
+    effective_out: &mut Option<Value>,
 ) -> ToolOutput {
     emit(AgentEvent::ToolCall {
         name: name.to_string(),
@@ -2358,6 +2384,11 @@ pub(crate) fn execute_tool_call(
                 ToolDecision::Modify(v) => v,
                 _ => input,
             };
+            // Report a Modify replacement so the caller's stuck detector keys
+            // on what ACTUALLY ran, not the model's original arguments.
+            if let ToolDecision::Modify(v) = &decision {
+                *effective_out = Some(v.clone());
+            }
             let output = run_tool(tools, defs, name, effective, ctx, emit);
             notify_tool_after(ctx, name, input, &output, true);
             output
@@ -2420,6 +2451,19 @@ fn canon_input(v: &Value) -> String {
         }
         other => other.to_string(),
     }
+}
+
+/// 打转键的结果指纹：文本 content + is_error 的散列。同一调用给出**不同**
+/// 结果（状态轮询的进度在推进）即视为有进展、连续计数重置——只有
+/// 「同参 + 同果」才算原地打转（外审第四轮 P2：此前只比名字与参数，
+/// 10%→60% 的健康轮询被误判 stuck_loop）。指纹不涵盖 image 内容（刻意，
+/// 见护栏说明的已知盲区）。
+fn stuck_result_hash(output: &ToolOutput) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    output.is_error.hash(&mut h);
+    output.content.hash(&mut h);
+    h.finish()
 }
 
 /// Repair tool_use ids before an assistant message enters history: a

@@ -154,7 +154,10 @@
   跨 attempt 复用**（重试看得到前次落盘，与共享语义一致）；`IsolationGuard` Drop 清理（copy
   remove_dir_all；git `worktree remove --force` 失败回退 remove_dir_all，孤儿用 `git worktree
   prune` 回收——release `panic=abort` 下 Drop 不保证）。产物随目录丢弃是**评测语义**（审计面是
-  result.json/report.json）。jobs>1 ⚠ 只在 isolate==None 时打。
+  result.json/report.json）。jobs>1 ⚠ 只在 isolate==None 时打。**隔离测试的任务名必须测试内
+  唯一**：沙箱目录命名是 `ta-batch-<任务名>-<pid>-<n>`，任何按前缀统计共享 temp 目录的断言
+  （如 leftover 清理检查）都会被同进程并发跑的另一个 batch 测试的在飞沙箱干扰（外审第四轮
+  实遇：并行首跑挂、串行复跑绿）——任务名带测试专属前缀（如 `isocleana`）再断言。
 - **批量 Ctrl-C 是 worker gate，不中断在跑任务**：`batch::run` 的 worker 在**起任务前**检查共享
   cancel 标志，命中则标 `cancelled` 跳过（首个命中的 worker 打一次性契约警告）；在跑的任务照常跑完
   （"收敛"）。**例外（A5，既定取舍）**：每个 agent 都用 `set_shutdown` 挂了同一个 flag 的 reaper——首次

@@ -2435,8 +2435,14 @@ mod tests {
         std::fs::write(workdir.join("seed.txt"), "seed").unwrap();
         let dir = root.join("tasks");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a.json"), r#"{"task":"do a"}"#).unwrap();
-        std::fs::write(dir.join("b.json"), r#"{"task":"do b"}"#).unwrap();
+        // Unique task names: the sandbox dirs are named ta-batch-<task>-<pid>-*
+        // and the leftover assertion below greps the SHARED temp dir by that
+        // prefix — with generic names like "a", another batch test running
+        // concurrently in the same process (cargo test is multi-threaded)
+        // leaks its in-flight sandboxes into our count (external re-review:
+        // parallel first run failed here, serial rerun passed).
+        std::fs::write(dir.join("isocleana.json"), r#"{"task":"do a"}"#).unwrap();
+        std::fs::write(dir.join("isocleanb.json"), r#"{"task":"do b"}"#).unwrap();
 
         std::env::set_var("TA_BATCH_ISO_KEY", "dummy");
         // json! (not format!-into-from_str): a Windows temp path carries
@@ -2473,14 +2479,17 @@ mod tests {
             !workdir.join("out.txt").exists(),
             "isolated write must not leak into the source workdir"
         );
-        // Sandbox cleanup: no ta-batch-* temp dirs left behind.
+        // Sandbox cleanup: no ta-batch-* temp dirs left behind. Both prefixes
+        // are unique to THIS test (see the task-file comment above), so a
+        // concurrently running batch test can no longer trip the count.
         let leftover = std::fs::read_dir(std::env::temp_dir())
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with(&format!("ta-batch-a-{}", std::process::id()))
+                let n = e.file_name().to_string_lossy().into_owned();
+                ["isocleana", "isocleanb"]
+                    .iter()
+                    .any(|t| n.starts_with(&format!("ta-batch-{t}-{}", std::process::id())))
             })
             .count();
         assert_eq!(leftover, 0, "isolation temp dirs must be cleaned up");

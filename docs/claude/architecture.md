@@ -91,6 +91,19 @@
   **数值写端一律 saturating**：usage 累计 / RunCost / merge_usage / trace_meta / batch 汇总的 `+=`
   全部是 `saturating_add`（读端 `Usage::total()` 本就饱和）——新增累加点照做，谎报 u64::MAX 不 panic
   （debug）也不回绕躲预算闸门（release）。
+  **打转护栏（stuck_loop）**：装配段对 `Slot::Ran` 的调用按（工具名, `canon_input` 规范化**生效**
+  参数, 结果指纹=`stuck_result_hash`(is_error+content)）三连键计数连续重复：第 `STUCK_NUDGE_AT`=3
+  次往该次 tool_result **历史块**追加纠偏提示（ToolResult 事件与 records 原样，UI/result.json 不
+  污染）；轮尾连续计数仍 ≥ `STUCK_STOP_AT`=6 则以 `stop_reason="stuck_loop"` 收尾（N:N 完整、
+  轮边界语义同 max_turns_reached、exit 默认臂 1 不重试）。**进展感知**（2026-09 外审第四轮）：
+  键带结果指纹——同参不同果（轮询 10%→60%）即重置；键用 hook Modify 后的生效参数
+  （`execute_tool_call` 新增 `effective_out` 出参 + 并行 gate Modify 臂落 `effective_inputs`），
+  审批层改写成分页的调用不共键。**无 stuck_stop 闩锁**：轮尾直读当前连续计数——同轮第 7 次换法
+  即自动解除停止。**取消优先**：轮尾先查 cancel 再查打转，同轮内落下的取消报 cancelled/130。
+  已知盲区（刻意，宁漏勿滥）：结果嵌时间戳/随机 id 的真打转逃逸检测；image 差异不进键。
+  计数跨轮持久、随 run 重置；`Cancelled` 槽不计数（未执行）。测试组 7 个：
+  nudge→停 / 换参重置 / 键序不敏感 / 进展结果不误停 / Modify 生效参数 / 同轮换法解停 /
+  取消优先。
   **溢出确定性**：溢出逃逸失败后的溢出错误经 `RunError::is_context_overflow()` 判定为确定性——单跑
   `run_with_retries` 与 batch（stop_reason `context_overflow`，run_one 只重试 `"error"`）都不再进退避。
 - **token 预算闸门（fleet 级）**（`limits.max_total_tokens`，0=不限）：`Agent::run` 入口安装 run 级

@@ -3236,6 +3236,177 @@ fn stuck_detection_ignores_key_order() {
     assert_eq!(state.calls(), 6);
 }
 
+/// 状态轮询工具：参数恒定，但每次返回不同进度——「同参不同果」是有进展，
+/// 不得计入打转（外审第四轮 P2 复现：10%→60% 仍被 stuck_loop 强杀）。
+struct PollTool {
+    n: std::sync::atomic::AtomicUsize,
+}
+impl Tool for PollTool {
+    fn def(&self) -> ToolDef {
+        ToolDef {
+            name: "poll".into(),
+            description: "test polling tool with progressing output".into(),
+            schema: json!({"type": "object", "properties": {}}),
+        }
+    }
+    fn run(&self, _input: &Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+        let k = self.n.fetch_add(1, Ordering::Relaxed) + 1;
+        Ok(ToolOutput::text(format!("progress {k}0%")))
+    }
+}
+
+#[test]
+fn stuck_detection_treats_progressing_results_as_progress() {
+    let cfg = cfg_with(99, 0, 0);
+    let mut turns: Vec<mock::MockTurn> = (0..6)
+        .map(|i| mock::resp_tool(&format!("t{i}"), "poll", json!({"job": 42}), None))
+        .collect();
+    turns.push(mock::resp_text("done", None));
+    let (prov, state) = MockProvider::new(turns);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(PollTool {
+            n: std::sync::atomic::AtomicUsize::new(0),
+        })],
+        vec![user_text("watch the job")],
+        test_ctx(),
+    );
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o.stop_reason, "end_turn", "有进展的轮询不得误判打转");
+    assert_eq!(state.calls(), 7);
+}
+
+/// 每次审批都把参数改成不同页码（生效参数不同、原始参数恒定、输出恒
+/// "ok"）——外审第四轮 P2 复现：按原始参数计数会误停；护栏必须键在
+/// Modify 后的生效参数上。
+struct ModifyPager {
+    n: std::sync::atomic::AtomicUsize,
+}
+impl Hooks for ModifyPager {
+    fn before_tool(&self, _tool: &str, _input: &Value, _ctx: &ToolCtx) -> ToolDecision {
+        let k = self.n.fetch_add(1, Ordering::Relaxed) + 1;
+        ToolDecision::Modify(json!({"page": k}))
+    }
+}
+
+#[test]
+fn stuck_detection_keys_on_modify_effective_input() {
+    let cfg = cfg_with(99, 0, 0);
+    let mut turns: Vec<mock::MockTurn> = (0..6)
+        .map(|i| mock::resp_tool(&format!("t{i}"), "echo", json!({"page": 0}), None))
+        .collect();
+    turns.push(mock::resp_text("done", None));
+    let (prov, state) = MockProvider::new(turns);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(EchoTool::new("echo"))],
+        vec![user_text("page through")],
+        test_ctx(),
+    );
+    agent.set_hooks(Arc::new(ModifyPager {
+        n: std::sync::atomic::AtomicUsize::new(0),
+    }));
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(
+        o.stop_reason, "end_turn",
+        "生效参数逐次不同（hook 改写）不得误判打转"
+    );
+    assert_eq!(state.calls(), 7);
+}
+
+#[test]
+fn stuck_stop_clears_when_a_later_call_in_the_same_turn_differs() {
+    // 同一轮 6 次相同调用 + 第 7 次换参：旧实现的 stuck_stop 闩锁在第 6 次
+    // 置位后不再随重置清除，第 7 次的自愈救不回来（外审第四轮 P2）。轮尾
+    // 直接读当前连续计数后，第 7 次把计数重置为 1 → 不停，正常进入总结轮。
+    let cfg = cfg_with(99, 0, 0);
+    let mut blocks: Vec<Block> = (0..6)
+        .map(|i| Block::ToolUse {
+            id: format!("t{i}"),
+            name: "echo".into(),
+            input: json!({"q": "same"}),
+        })
+        .collect();
+    blocks.push(Block::ToolUse {
+        id: "t6".into(),
+        name: "echo".into(),
+        input: json!({"q": "different"}),
+    });
+    let (prov, state) = MockProvider::new(vec![
+        MockTurn::Ok(ChatResponse {
+            blocks,
+            stop_reason: "tool_use".into(),
+            usage: None,
+        }),
+        mock::resp_text("summary", None),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(EchoTool::new("echo"))],
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o.stop_reason, "end_turn", "同轮换法必须解除打转停止");
+    assert_eq!(state.calls(), 2);
+}
+
+/// 第 N 次执行时翻取消标志的工具——复现「打转硬停覆盖取消」（外审第四轮
+/// P2）：第 6 次调用让连续计数到顶、同时用户取消落下，终止原因必须是
+/// cancelled（exit 130），不是 stuck_loop（exit 1）。
+struct CancelOnNth {
+    n: std::sync::atomic::AtomicUsize,
+    at: usize,
+    flag: Arc<AtomicBool>,
+}
+impl Tool for CancelOnNth {
+    fn def(&self) -> ToolDef {
+        ToolDef {
+            name: "echo".into(),
+            description: "test tool tripping cancel on its Nth run".into(),
+            schema: json!({"type": "object", "properties": {}}),
+        }
+    }
+    fn run(&self, _input: &Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+        if self.n.fetch_add(1, Ordering::Relaxed) + 1 == self.at {
+            self.flag.store(true, Ordering::Relaxed);
+        }
+        Ok(ToolOutput::text("ok"))
+    }
+}
+
+#[test]
+fn stuck_loop_does_not_override_a_cancel_that_landed_in_the_turn() {
+    let cfg = cfg_with(99, 0, 0);
+    let mut turns: Vec<mock::MockTurn> = (0..6)
+        .map(|i| mock::resp_tool(&format!("t{i}"), "echo", json!({"q": "same"}), None))
+        .collect();
+    turns.push(mock::resp_text("never reached", None));
+    let (prov, state) = MockProvider::new(turns);
+    let flag = Arc::new(AtomicBool::new(false));
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(CancelOnNth {
+            n: std::sync::atomic::AtomicUsize::new(0),
+            at: 6,
+            flag: flag.clone(),
+        })],
+        vec![user_text("loop")],
+        test_ctx(),
+    );
+    agent.set_cancel(flag);
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(
+        o.stop_reason, "cancelled",
+        "取消必须优先于打转硬停（harness 130 映射依赖 stop_reason）"
+    );
+    assert_eq!(state.calls(), 6);
+}
+
 #[test]
 fn max_total_tokens_caps_the_loop_with_budget_exceeded() {
     // max_total_tokens=100: turn 1 streams a tool_use whose usage totals

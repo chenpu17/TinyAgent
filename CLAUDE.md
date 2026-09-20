@@ -102,6 +102,7 @@ cargo clippy -p tiny-agent-node
 - **PDF 文档块**：新 Block 变体照四层接入点清单（anthropic / openai 显式报错 / compress 三处 / tui）；token 预估按页×3000。
 - **压缩**：`find_safe_cut` 空尾是合法切点；`summary_call` 空正文（思考烧穿）预算加倍重试一次，effort 恒 `None`。
 - **`salvage_on_max_tokens`**：max_tokens 截断且无 tool_use 时一次性 wrap-up nudge；带 tool_use 不 salvage。
+- **打转护栏**：键 =（工具名， canon 生效参数， 结果指纹），同参不同果即进展、不计数；第 3 次 nudge 进历史块、第 6 次 `stuck_loop` 收尾；无闩锁（轮尾直读当前连续计数），轮尾 cancel 优先于 stuck_loop。
 - **token 预算闸门**：run 级共享计数器父子同读；工具账单按 `ToolOutput::usage_in_shared_budget` 分流——子 agent（已自计）只折 totals，其余工具的 usage 由 fold 代入计数器。
 - **宿主热更新面**：`set_model` 等不传播给已构造的子 agent 快照（既定决策）；`compact()` 成本绝不进 `self.usage`。
 - **MCP 热增删**：撞名 = Err + 回滚；热增路径不打印；子 agent 与 run_code registry 都不感知（快照语义）。

@@ -322,6 +322,7 @@ tiny-agent --config examples/chat.json --tui
 | `bad_task` | 任务片段非法（禁用字段 / 缺 task / JSON 错） | ❌ |
 | `max_turns_reached` / `max_tokens` | 模型跑满上限 | ❌ |
 | `budget_exceeded` | 累计 token 触顶 `limits.max_total_tokens` | ❌ |
+| `stuck_loop` | 打转护栏：同参同果的相同调用连续 6 次（第 3 次先在下发的 tool_result 里附纠偏提示，给一次自愈机会；结果有进展或参数不同即重置） | ❌ |
 | `panic` | 任务在 worker 里 panic，被兜成失败条目（见下） | ❌ |
 | `end_turn` | 正常完成 | ❌（已成功） |
 
@@ -1146,8 +1147,8 @@ src/
 │   ├── openai.rs      ( 1645)  # OpenAI 兼容（include_usage；400 回退：max_tokens→max_completion_tokens / 丢 stream_options）
 │   ├── anthropic.rs   ( 1102)  # Anthropic 原生（message_start/message_delta usage）
 │   └── mock.rs        (  296)  # 测试用脚本化 Provider（cfg(any(test, feature="mock"))）
-├── agent.rs       ( 3154)  # 核心 loop + usage 累计 + cancel + 上下文压缩（前馈/溢出双触发 + 滚动分块摘要）+ 相邻消息归一 + 同 turn 多 task 并行
-├── agent_tests.rs ( 7922)  # 核心 loop 回归测试（provider::mock 脚本化，不连网）
+├── agent.rs       ( 3200)  # 核心 loop + usage 累计 + cancel + 上下文压缩（前馈/溢出双触发 + 滚动分块摘要）+ 相邻消息归一 + 同 turn 多 task 并行
+├── agent_tests.rs ( 8099)  # 核心 loop 回归测试（provider::mock 脚本化，不连网）
 ├── compress.rs    (  791)  # 压缩引擎（find_safe_cut / 分块摘要 / saturating usage 合并）
 ├── retry.rs       (  158)  # batch --retries / 单跑瞬态重试共用的指数退避（±25% jitter 防 lockstep）
 ├── signal.rs      (  114)  # headless SIGINT → cancel（首次优雅 / 二次硬退 130）
@@ -1166,7 +1167,7 @@ src/
 │   ├── todo.rs        (  306)  # todo 工具（任务计划，全量替换；plan 落 result.json）
 │   └── run_code.rs    ( 5558)  # run_code 工具（feature code）：QuickJS-in-wasm 沙箱——epoch/fuel/mem 限额、路径拦截、hooks 闸门、审计 meta（双哈希）
 ├── mcp.rs         ( 1422)  # MCP 客户端（stdio / Streamable HTTP / 旧版 SSE）
-├── batch.rs       ( 2773)  # 批量任务 + --retries/--failed + 报告合并
+├── batch.rs       ( 2782)  # 批量任务 + --retries/--failed + 报告合并
 ├── harness.rs     ( 1962)  # headless 模式 + result.json + NDJSON + exit code
 └── tui.rs         ( 7405)  # TUI（feature tui）：内联流式渲染（对话进原生 scrollback）/ InputBuffer 多行输入 / 斜杠命令+补全 / markdown 渲染 / bracketed paste
 ```
