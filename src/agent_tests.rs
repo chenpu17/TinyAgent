@@ -1842,10 +1842,12 @@ fn hooks_parallel_batch_gates_all_calls_in_block_order() {
 /// catch the contradiction.
 struct CancelDuringApproval {
     flag: Arc<AtomicBool>,
+    gates: Arc<std::sync::atomic::AtomicUsize>,
     after: std::sync::Mutex<Vec<String>>,
 }
 impl Hooks for CancelDuringApproval {
     fn before_tool(&self, _tool: &str, _input: &Value, _ctx: &ToolCtx) -> ToolDecision {
+        self.gates.fetch_add(1, Ordering::Relaxed);
         self.flag.store(true, Ordering::Relaxed);
         ToolDecision::Allow
     }
@@ -1872,6 +1874,7 @@ fn cancel_during_approval_gate_does_not_execute_sequential_tool() {
     let flag = Arc::new(AtomicBool::new(false));
     let hooks = Arc::new(CancelDuringApproval {
         flag: flag.clone(),
+        gates: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         after: std::sync::Mutex::new(Vec::new()),
     });
     let mut agent = Agent::new(
@@ -1917,6 +1920,7 @@ fn cancel_during_approval_gate_does_not_execute_parallel_batch() {
     let flag = Arc::new(AtomicBool::new(false));
     let hooks = Arc::new(CancelDuringApproval {
         flag: flag.clone(),
+        gates: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         after: std::sync::Mutex::new(Vec::new()),
     });
     let mut agent = Agent::new(
@@ -2074,8 +2078,13 @@ fn cancel_between_waves_never_starts_the_next_wave() {
 /// A Parallel tool flooding the event funnel (more events than the bounded
 /// channel holds) — the host sink panics on the first one, reproducing the
 /// external re-review P2 deadlock: with the receiver borrowed from outside
-/// the scope, workers blocked on the full funnel forever.
-struct FloodTool;
+/// the scope, workers blocked on the full funnel forever. `saw_cancel` pins
+/// the CancelOnUnwind guard: without it nothing would ever set the shared
+/// flag, and in-flight workers would flood all 3000 iterations into the
+/// void instead of winding down.
+struct FloodTool {
+    saw_cancel: Arc<AtomicBool>,
+}
 impl Tool for FloodTool {
     fn def(&self) -> ToolDef {
         ToolDef {
@@ -2093,7 +2102,7 @@ impl Tool for FloodTool {
     fn run_with_emit(
         &self,
         _input: &Value,
-        _ctx: &ToolCtx,
+        ctx: &ToolCtx,
         emit: &mut dyn FnMut(AgentEvent),
     ) -> Result<ToolOutput> {
         for k in 0..3000 {
@@ -2101,6 +2110,10 @@ impl Tool for FloodTool {
                 name: "flood".into(),
                 event: Box::new(AgentEvent::TextDelta(format!("chunk-{k}"))),
             });
+            if ctx_cancelled(ctx) {
+                self.saw_cancel.store(true, Ordering::Relaxed);
+                break;
+            }
         }
         Ok(ToolOutput::text("flooded"))
     }
@@ -2111,7 +2124,10 @@ fn parallel_event_sink_panic_unwinds_instead_of_deadlocking() {
     // Host callback panics on the first flooded event while workers keep
     // sending. The scope must unwind (receiver dropped as a closure local +
     // cancel guard), not hang on the full funnel. A watchdog turns a
-    // regression back into a test failure instead of a hung suite.
+    // regression back into a test failure instead of a hung suite. The
+    // saw_cancel assertion pins the guard itself: delete the CancelOnUnwind
+    // struct and this test still unwinds (rx drop unblocks the sends) but
+    // no worker ever observes a cancel.
     let cfg = cfg_with(5, 0, 0);
     let (prov, _) = MockProvider::new(vec![
         MockTurn::Ok(ChatResponse {
@@ -2127,13 +2143,18 @@ fn parallel_event_sink_panic_unwinds_instead_of_deadlocking() {
         }),
         mock::resp_text("unreached", None),
     ]);
+    let saw_cancel = Arc::new(AtomicBool::new(false));
     let mut agent = Agent::new(
         &cfg,
         Box::new(prov),
-        vec![Box::new(FloodTool)],
+        vec![Box::new(FloodTool {
+            saw_cancel: saw_cancel.clone(),
+        })],
         vec![user_text("go")],
         test_ctx(),
     );
+    // The guard writes through ctx.cancel — install a flag or it no-ops.
+    agent.set_cancel(Arc::new(AtomicBool::new(false)));
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2150,6 +2171,244 @@ fn parallel_event_sink_panic_unwinds_instead_of_deadlocking() {
         Ok(panicked) => assert!(panicked, "the host panic must propagate"),
         Err(_) => panic!("deadlock: workers still blocked on the event funnel"),
     }
+    assert!(
+        saw_cancel.load(Ordering::Relaxed),
+        "the unwind guard must trip the shared cancel so in-flight workers wind down"
+    );
+}
+
+/// A Parallel tool whose body panics on demand — pins the join arm that
+/// converts a panicked worker into an error slot instead of losing the
+/// batch (test-audit gap: deleting the `unwrap_or_else` arm used to keep
+/// the whole suite green).
+struct PanicOnMarkTool;
+impl Tool for PanicOnMarkTool {
+    fn def(&self) -> ToolDef {
+        ToolDef {
+            name: "task".into(),
+            description: "test parallel tool that panics on a marked input".into(),
+            schema: json!({"type": "object", "properties": {"label": {"type": "string"}}}),
+        }
+    }
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Parallel
+    }
+    fn run(&self, input: &Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+        let label = input["label"].as_str().unwrap_or("?");
+        if label == "boom" {
+            panic!("worker body blew up");
+        }
+        Ok(ToolOutput::text(format!("ok-{label}")))
+    }
+}
+
+#[test]
+fn parallel_worker_panic_becomes_an_error_slot_and_siblings_survive() {
+    // 3 parallel calls in one turn; the middle worker's body panics. The
+    // run must complete: the panicked call lands as an is_error slot, both
+    // siblings join normally, and N:N history + records stay complete.
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, _) = MockProvider::new(vec![
+        MockTurn::Ok(ChatResponse {
+            blocks: ["a", "boom", "c"]
+                .iter()
+                .enumerate()
+                .map(|(k, label)| Block::ToolUse {
+                    id: format!("t{k}"),
+                    name: "task".into(),
+                    input: json!({"label": label}),
+                })
+                .collect(),
+            stop_reason: "tool_use".into(),
+            usage: None,
+        }),
+        mock::resp_text("done", None),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(PanicOnMarkTool)],
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o.stop_reason, "end_turn");
+    assert_eq!(o.tool_calls.len(), 3, "every announced call is recorded");
+    assert_eq!(o.tool_calls[0].output, "ok-a");
+    assert!(!o.tool_calls[0].is_error);
+    assert_eq!(o.tool_calls[1].output, "parallel tool worker panicked");
+    assert!(o.tool_calls[1].is_error);
+    assert_eq!(o.tool_calls[2].output, "ok-c");
+    let tool_msg = agent
+        .messages()
+        .iter()
+        .find(|m| {
+            m.content
+                .iter()
+                .any(|b| matches!(b, Block::ToolResult { .. }))
+        })
+        .expect("the tool_result user message");
+    let contents: Vec<&str> = tool_msg
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            Block::ToolResult { content, .. } => Some(content.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        contents,
+        vec!["ok-a", "parallel tool worker panicked", "ok-c"],
+        "N:N pairing intact across a panicked worker"
+    );
+}
+
+#[test]
+fn cancel_landed_mid_gate_loop_skips_the_remaining_gates() {
+    // 2 parallel calls in one turn; cancel lands inside call #1's approval.
+    // The per-call gate checkpoint must keep call #2 from ever reaching
+    // before_tool (no approval prompt for a run that is already stopping).
+    // Call #1 — approved but never started — becomes the recorded
+    // placeholder; call #2 — never gated — stays Cancelled: no record and
+    // no after_tool, but (announced) still gets its synthesized ToolResult
+    // event. Deleting the gate loop's `if self.cancelled() { break; }` used
+    // to keep the suite green (test-audit gap).
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, _) = MockProvider::new(vec![
+        MockTurn::Ok(ChatResponse {
+            blocks: (0..2)
+                .map(|k| Block::ToolUse {
+                    id: format!("t{k}"),
+                    name: "task".into(),
+                    input: json!({"label": k}),
+                })
+                .collect(),
+            stop_reason: "tool_use".into(),
+            usage: None,
+        }),
+        mock::resp_text("unreached", None),
+    ]);
+    let flag = Arc::new(AtomicBool::new(false));
+    let gates = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hooks = Arc::new(CancelDuringApproval {
+        flag: flag.clone(),
+        gates: gates.clone(),
+        after: std::sync::Mutex::new(Vec::new()),
+    });
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(TaskTool)],
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    agent.set_hooks(hooks.clone());
+    agent.set_cancel(flag);
+    let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen2 = seen.clone();
+    let o = agent
+        .run(&mut move |ev| {
+            let tag = match &ev {
+                AgentEvent::ToolCall { .. } => "call",
+                AgentEvent::ToolResult { .. } => "result",
+                _ => "other",
+            };
+            seen2.lock().unwrap().push(tag.into());
+        })
+        .unwrap();
+    assert_eq!(o.stop_reason, "cancelled");
+    assert_eq!(
+        gates.load(Ordering::Relaxed),
+        1,
+        "call #2 must never reach its gate once cancel landed"
+    );
+    assert_eq!(
+        o.tool_calls.len(),
+        1,
+        "only the approved call is recorded (placeholder)"
+    );
+    assert_eq!(o.tool_calls[0].output, "[cancelled by user]");
+    assert_eq!(
+        *hooks.after.lock().unwrap(),
+        vec!["task:false:[cancelled by user]".to_string()],
+        "the approved call gets after_tool(executed=false); the never-gated one gets nothing"
+    );
+    let seen = seen.lock().unwrap();
+    let calls = seen.iter().filter(|t| *t == "call").count();
+    let results = seen.iter().filter(|t| *t == "result").count();
+    assert_eq!(
+        (calls, results),
+        (2, 2),
+        "both announced calls closed — placeholder + Cancelled synthesis: {seen:?}"
+    );
+}
+
+/// A turn of `n` identical Parallel `task` calls (same input → same
+/// output), for the stuck-detector-in-the-batch-path tests.
+fn identical_task_turn(n: usize, label: &str) -> MockTurn {
+    MockTurn::Ok(ChatResponse {
+        blocks: (0..n)
+            .map(|k| Block::ToolUse {
+                id: format!("t{k}"),
+                name: "task".into(),
+                input: json!({"label": label}),
+            })
+            .collect(),
+        stop_reason: "tool_use".into(),
+        usage: None,
+    })
+}
+
+#[test]
+fn stuck_detection_counts_parallel_batch_calls() {
+    // 6 identical Parallel calls in ONE turn: the assembly-pass counter must
+    // treat batch slots exactly like inline repeats — turn-end stuck stop.
+    // (All seven pre-existing stuck tests drive the sequential path only.)
+    let cfg = cfg_with(10, 0, 0);
+    let (prov, _) = MockProvider::new(vec![
+        identical_task_turn(6, "same"),
+        mock::resp_text("unreached", None),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(TaskTool)],
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o.stop_reason, "stuck_loop");
+    assert_eq!(o.turns, 1, "stopped at the first turn boundary");
+    assert_eq!(o.tool_calls.len(), 6, "all six calls ran and are recorded");
+}
+
+#[test]
+fn stuck_detection_parallel_batch_resets_on_a_differing_call() {
+    // 5 identical Parallel calls + a 6th with a different input, all in one
+    // batch: the streak breaks inside the batch, the run completes normally.
+    let cfg = cfg_with(10, 0, 0);
+    let mut turn = identical_task_turn(5, "same");
+    if let MockTurn::Ok(resp) = &mut turn {
+        resp.blocks.push(Block::ToolUse {
+            id: "t5".into(),
+            name: "task".into(),
+            input: json!({"label": "other"}),
+        });
+    }
+    let (prov, _) = MockProvider::new(vec![turn, mock::resp_text("done", None)]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(TaskTool)],
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(
+        o.stop_reason, "end_turn",
+        "a differing call breaks the streak"
+    );
+    assert_eq!(o.tool_calls.len(), 6);
 }
 
 #[test]
