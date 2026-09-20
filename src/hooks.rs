@@ -153,6 +153,12 @@ pub trait Hooks: Send + Sync {
     /// sandbox). Attribution CANNOT be recovered from call order: parallel
     /// siblings genuinely interleave, so the per-call ctx is the only
     /// reliable source tag. Default no-op.
+    ///
+    /// BREAKING vs 0.3.x: the `ctx` parameter is new. An implementation
+    /// still using the old 4-parameter signature compiles (it degenerates
+    /// into an inherent method) but SILENTLY stops overriding this trait
+    /// method — the default no-op takes over and the hook fires no more.
+    /// Migration: append `ctx: &ToolCtx` to the parameter list.
     fn after_tool(
         &self,
         tool: &str,

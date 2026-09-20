@@ -5,7 +5,51 @@
 
 ## [Unreleased]
 
+### Changed（破坏性）
+
+- **`Hooks::after_tool` 签名增加第 5 参 `ctx: &ToolCtx`**：与 `before_tool` 的 ctx 对称——审计点靠
+  `ctx.subagent` 归因调用来源（顶层 / `task` 子 agent / `run_code` 沙箱），并行兄弟真并发下调用序
+  关联不可靠，per-call ctx 是唯一可靠的来源标签（趁绑定尚未透出 hooks 的窗口期落此破坏性改动）。
+  **迁移**：已有实现参数表追加 `, _ctx: &ToolCtx`。**注意此变更是静默失效型**：旧签名的
+  `fn after_tool` 实现在升级后不再是 trait 方法实现（编译照过、降级为 inherent 方法），trait 默认
+  no-op 接管——钩子悄悄停止触发，升级后务必核对审计输出仍在。
+
 ### Fixed
+
+- **外部复审第五轮（b6ee977，每项带回归测试）**：
+  - **P1 batch 隔离目录防符号链接预置**：`ta-batch-{task}-{pid}-{n}` 名字可预测，多用户共享 /tmp
+    下可按名预置 symlink，`create_dir_all` 的"已存在"检查穿透符号链接 stat 而照常成功——整个
+    workdir（含 `.env` 等 COPY_EXCLUDE 拦不住的秘密）被拷进攻击者目录、任务在攻击者可控路径执行。
+    改 `create_isolation_dir`：裸 `create_dir`（mkdir(2) 不 dereference 末组件，任何预置条目一律
+    `AlreadyExists`）+ 计数重试 + 8 连碰撞响亮失败，与 `atomic_write` 的 O_EXCL 纪律对齐；git
+    模式先自建空目录再 `worktree add`（git 接受已存在的空目录），失败路径不泄漏目录。
+  - **hooks-Deny 文案过 `tools::truncate`**（三处 Deny 点：顺序 gate / 并行 gate / run_code 内层）：
+    宿主拒绝理由是模型可见 is_error 文本、可任意长，与 run_tool 对 MCP 错误串同款输出预算。
+  - **canon_input 数值统一 f64 归一**：`1` 与 `1.0` 字面不同语义相同，provider/gateway 重发同参
+    调用时数值类型抖动会拆键——打转护栏漏检；超 2^53 整数精度损失只折指纹区分度（宁漏检不误杀）。
+  - **单个坏 JSON 任务文件不再中止整批**：per-task `bad_task` 经 `write_terminal_result` 单出口
+    落盘 + 预置进 report 流（与 forbidden 覆盖同哲学），好任务照跑，`--failed` 同规则过滤。
+  - **预算闸门 cap 单源**：turn 边界比较读 `BudgetGate::cap`，自身 limits 快照只能 `min` 收紧——
+    子 agent 快照一旦与父 cap 分叉，比较快照会让 fleet 预算被静默放大。
+  - **数值纪律补齐**：over_compaction 阈值 `usize::try_from`（32 位 musl 不再截断翻转比较）、
+    compress prune 的 `freed` 全饱和累加。
+  - **绑定诚实成本**：两绑定 `compact` 失败以 JSON 信封透出 `CompressError::burned`（py
+    `json.loads(e.args[0])` / node `JSON.parse(err.message)`，照 run 错误路径）；`CompressError`
+    进门面导出。绑定 crate 头补 GIL 死挂无看门狗警告（node 有 120s backstop、python 没有）、
+    构造期 MCP 同步已知限制、hooks/热更面未透出属刻意范围决策。d.ts `ToolCall` 补 `meta?`、
+    enableCode 措辞（同步方法 throw 非 reject）、py 文档 `elapsed` 字段名三处漂移修正。
+  - **P3 卫生**：`ToolConcurrency` 去 `non_exhaustive`（生产侧枚举，对齐卫生规则）、SkillSource
+    归类注释、CallbackTool 恒 Sequential 文档化（语言边界回调做不了重入承诺）、`--resume` 不带
+    hooks 补契约测试、`merge_reports` 保同名重复条目（旧 HashMap 折叠静默丢条目）、on_chat_request
+    无 cancel 复查文档化。顺手修两个 cancel 测试共用 scratch 根互相干扰的既有假红。
+- **外部复审第五轮测试轮（1120b17）**：补并行批异常臂四个变异死区测试（worker panic 臂 /
+  CancelOnUnwind 守卫 / gate 间逐调用检查点 / stuck×并行批），每个均以「临时改坏产品代码 → 新测试
+  变红 → 还原」验证真实杀灭能力。
+- **并行批「已过闸未启动」调用统一占位（c83c666）**：因 pre-spawn/波间检查点未启动的并行调用从
+  `Slot::Cancelled` 转为与 worker pre-body 检查点同形的 `Slot::Ran` 记录占位（进 records +
+  `after_tool(executed=false)`）——过闸调用不再留下未配对 before；gate 循环内补逐调用 cancel 复查。
+  配套**场景 e2e 套件进 CI**（`scripts/e2e_scenarios.py`：线程化 SSE mock 驱动真实 CLI/HTTP 栈，
+  13 项断言覆盖打转护栏三行为 / 单轮 10 路并行 fan-out / SIGINT exit 130）。
 
 - **压缩摘要空正文自愈（思考网关）**：混合思考网关（deepseek / glm 系）把 reasoning_content 计入
   max_tokens 预算，summary_call 不发 `reasoning_effort`（刻意——见下）时这类网关落默认思考档，
