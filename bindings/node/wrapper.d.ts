@@ -16,6 +16,9 @@ export interface ToolCall {
   /** The tool's textual result (what it returned). */
   output: string;
   is_error: boolean;
+  /** Audit side-channel the tool may attach (never model-visible content) —
+   *  present only when the tool set one. */
+  meta?: unknown;
 }
 
 export interface RunOutcome {
@@ -141,8 +144,8 @@ export declare class Agent {
   model(): string;
   /** Enable the sandboxed runCode tool for the next request. Requires the
    *  module built with its `code` cargo feature (`npm run build -- --features
-   *  code`); otherwise rejects with a clear rebuild hint. Throws while a run
-   *  is in flight. */
+   *  code`); otherwise throws with a clear rebuild hint (synchronous method —
+   *  no Promise to reject). Throws while a run is in flight. */
   enableCode(): void;
   /** Remove runCode from the model's toolset (next request). Does not
    *  interrupt an in-flight execution. Same feature requirement as

@@ -540,7 +540,11 @@ pub(crate) fn prune_tool_results(
             }
             let img = image.as_deref().map(image_payload_len).unwrap_or(0);
             let placeholder = format!("[pruned tool output, was {} chars]", content.len());
-            freed += content.len().saturating_sub(placeholder.len()) + img;
+            // saturating on both terms, per the whole-codebase numeric
+            // discipline (a hostile/huge tool result must not wrap `freed`).
+            freed = freed
+                .saturating_add(content.len().saturating_sub(placeholder.len()))
+                .saturating_add(img);
             *content = placeholder;
             *image = None;
             m_touched = true;

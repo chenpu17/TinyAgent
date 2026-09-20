@@ -15,6 +15,21 @@
 //! explanatory RuntimeError by a thread-local in-run flag instead of a
 //! silent `std::sync::Mutex` self-deadlock.
 //!
+//! Callback / GIL caveat (no watchdog): every event / tool / provider
+//! callback re-acquires the GIL, and the run thread waits for it to return
+//! — a host callback that BLOCKS on something which itself needs the GIL
+//! (e.g. `Thread.join()` on a thread running Python code, or acquiring a
+//! lock the GIL-bound side holds) deadhangs the process with no timeout
+//! (the Node binding's TSFN path has a 120s backstop; Python has none).
+//! Keep callbacks non-blocking; never join GIL-dependent threads from one.
+//!
+//! Scope note: the hooks interception layer (`set_hooks`), the `set_model` /
+//! limits hot-update family, and MCP hot add/remove are deliberately NOT
+//! exposed here (minimal-surface v0.3 decision — Rust hosts get them via the
+//! core crate; binding-side hooks exposure is a future milestone, and the
+//! `after_tool` signature already carries `&ToolCtx` so it can land without
+//! another breaking change).
+//!
 //! `ta` is the Rust core library `tiny_agent` (package `tiny-agent`, aliased
 //! here because this crate's own lib name — the Python import — is *also*
 //! `tiny_agent`).
@@ -448,7 +463,7 @@ impl Agent {
     /// Run one turn (until end_turn / max_turns / cancel / error). `on_event`
     /// is called for each `AgentEvent` (text deltas, tool calls, usage, …) with
     /// the event as a dict. Returns the `RunOutcome` as a dict
-    /// (final_text, turns, stop_reason, tool_calls, *_tokens, elapsed_secs).
+    /// (final_text, turns, stop_reason, tool_calls, *_tokens, elapsed).
     ///
     /// The lock is acquired and the whole run happens with the GIL released;
     /// callbacks re-acquire it per call (`emit_event` / tool closures). A
@@ -510,7 +525,22 @@ impl Agent {
                 Ok(bound.unbind())
             }
             Ok(None) => Ok(py.None()),
-            Err(e) => Err(to_pyerr(e)),
+            Err(e) => {
+                // Same honest-cost envelope as the run path (outcome_to_py):
+                // the summary cost a failed compact burned rides the error
+                // chain (CompressError::burned) instead of hitting the floor.
+                // JSON-string message — callers `json.loads(e.args[0])` and
+                // meter .burned exactly like a failed run's .usage. `burned`
+                // is null when the failure carried no usage (e.g. a host
+                // provider callback that simply raised).
+                let payload = serde_json::json!({
+                    "error": e.to_string(),
+                    "burned": e
+                        .downcast_ref::<ta::CompressError>()
+                        .and_then(|ce| ce.burned),
+                });
+                Err(PyRuntimeError::new_err(payload.to_string()))
+            }
         }
     }
 

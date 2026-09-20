@@ -145,14 +145,30 @@ pub trait Hooks: Send + Sync {
     }
 
     /// Observe a finished tool call: the ORIGINAL input the model sent (never
-    /// a `Modify` replacement), the produced output, and whether it executed
-    /// (`false` only when [`Hooks::before_tool`] denied it). Default no-op.
-    fn after_tool(&self, tool: &str, input: &Value, output: &ToolOutput, executed: bool) {
-        let _ = (tool, input, output, executed);
+    /// a `Modify` replacement), the produced output, whether it executed
+    /// (`false` only when [`Hooks::before_tool`] denied it), and the
+    /// execution context — mirror of [`Hooks::before_tool`]'s `ctx`, so an
+    /// audit log can attribute the call to its source
+    /// ([`ToolCtx::subagent`]: top-level, a `task` child, or the `run_code`
+    /// sandbox). Attribution CANNOT be recovered from call order: parallel
+    /// siblings genuinely interleave, so the per-call ctx is the only
+    /// reliable source tag. Default no-op.
+    fn after_tool(
+        &self,
+        tool: &str,
+        input: &Value,
+        output: &ToolOutput,
+        executed: bool,
+        ctx: &ToolCtx,
+    ) {
+        let _ = (tool, input, output, executed, ctx);
     }
 
     /// Observe each outgoing main-turn chat request (read-only). Default
-    /// no-op.
+    /// no-op. NB: a cancel that lands DURING the callback does not abort
+    /// this request — the observation point has no cancel re-check; the
+    /// flag is honored at the next turn boundary (deliberate: the request
+    /// is already committed by the time the observer returns).
     fn on_chat_request(&self, req: &ChatRequest) {
         let _ = req;
     }

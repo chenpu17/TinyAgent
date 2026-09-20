@@ -88,6 +88,10 @@ cargo clippy -p tiny-agent-node
   别给任何 run 入口加回清残留。
 - **新增"消息进历史"入口必须补 id 分配点**（漏了宿主锚点拿到 `None`）。
 - **`ToolOutput`/`ToolCallRecord`/`ToolCtx` 加字段要同步全部字面量构造点**（含两个绑定）。
+- **错误路径也是账单面**：绑定侧失败要透出结构化成本——run 的 `RunError` 与 compact 的
+  `CompressError::burned`（2026-09 起两绑定都以 JSON 错误信封透出，py `json.loads(e.args[0])` /
+  node `JSON.parse(err.message)`）；`Hooks::after_tool` 带 `ctx: &ToolCtx`（破坏性改动，趁绑定
+  未透出 hooks 落的）——新增钩子点/错误出口照同款「成本与归因不落地」纪律检查。
 - **`Config::apply` 的 `PartialConfig`/`PartialLimits` 解构是刻意穷尽的（无 `..`）**——新字段不分类
   即编译错误，禁止为省事加回 `..`。
 - **LLM 可见文案即规格**：run_code 预检拒答/墓碑文案在 `docs/finetune_support_design.md` 附录 A
@@ -102,13 +106,13 @@ cargo clippy -p tiny-agent-node
 - **PDF 文档块**：新 Block 变体照四层接入点清单（anthropic / openai 显式报错 / compress 三处 / tui）；token 预估按页×3000。
 - **压缩**：`find_safe_cut` 空尾是合法切点；`summary_call` 空正文（思考烧穿）预算加倍重试一次，effort 恒 `None`。
 - **`salvage_on_max_tokens`**：max_tokens 截断且无 tool_use 时一次性 wrap-up nudge；带 tool_use 不 salvage。
-- **打转护栏**：键 =（工具名， canon 生效参数， 结果指纹），同参不同果即进展、不计数；第 3 次 nudge 进历史块、第 6 次 `stuck_loop` 收尾；无闩锁（轮尾直读当前连续计数），轮尾 cancel 优先于 stuck_loop。
-- **token 预算闸门**：run 级共享计数器父子同读；工具账单按 `ToolOutput::usage_in_shared_budget` 分流——子 agent（已自计）只折 totals，其余工具的 usage 由 fold 代入计数器。
+- **打转护栏**：键 =（工具名， canon 生效参数， 结果指纹），同参不同果即进展、不计数；canon 数值统一经 f64 归一（1 与 1.0 同键）；第 3 次 nudge 进历史块、第 6 次 `stuck_loop` 收尾；无闩锁（轮尾直读当前连续计数），轮尾 cancel 优先于 stuck_loop。
+- **token 预算闸门**：run 级共享计数器父子同读；turn 边界比较的 cap 以 `BudgetGate::cap` 为单源（自身 limits 快照只能收紧）；工具账单按 `ToolOutput::usage_in_shared_budget` 分流——子 agent（已自计）只折 totals，其余工具的 usage 由 fold 代入计数器。
 - **宿主热更新面**：`set_model` 等不传播给已构造的子 agent 快照（既定决策）；`compact()` 成本绝不进 `self.usage`。
 - **MCP 热增删**：撞名 = Err + 回滚；热增路径不打印；子 agent 与 run_code registry 都不感知（快照语义）。
 - **MCP SSE 同源闸门**：endpoint 解析与 POST 发送共用 `reqwest::Url`（真解析器）——别写字符串版 origin 切分，反斜杠混淆可绕过。
 - **子 agent（task）**：按 `Tool::concurrency()`/`available_to_subagent()` 能力标记路由，无名字黑名单；共享父 MCP、预算与 cancel。
-- **Hooks**：Deny 落 `Slot::Ran(error)` 不占 Cancelled；Modify 只换执行输入、审计留原始输入；`--resume` 不带走 hooks。审批等待期落下的 cancel 在 **gate→执行检查点**（`ctx_cancelled`，execute_tool_call / 并行 spawn 前 / run_code 内层共用）拒绝执行；并行批另有**每波开波前 + worker 进工具体前**两道复查，已 announce 未运行的调用装配段补发取消 ToolResult（事件配平）；已过 gate 但因 pre-spawn/波间检查点未启动的调用统一转 `Slot::Ran` 占位（进 records + `after_tool(executed=false)`，过的 gate 不留未配对 before——gate 循环被打断、从未过闸的才保持 Cancelled）；并行批的 `sync_channel` 必须在 scope 闭包**内**创建（回调 panic 时 `rx` 随 unwind 销毁才不死锁）。
+- **Hooks**：Deny 落 `Slot::Ran(error)` 不占 Cancelled，Deny 文案过 `tools::truncate`（ctx 预算）；`after_tool` 带 `ctx: &ToolCtx`（与 before 对称，审计归因 `ctx.subagent`）；Modify 只换执行输入、审计留原始输入；`--resume` 不带走 hooks。审批等待期落下的 cancel 在 **gate→执行检查点**（`ctx_cancelled`，execute_tool_call / 并行 spawn 前 / run_code 内层共用）拒绝执行；并行批另有**每波开波前 + worker 进工具体前**两道复查，已 announce 未运行的调用装配段补发取消 ToolResult（事件配平）；已过 gate 但因 pre-spawn/波间检查点未启动的调用统一转 `Slot::Ran` 占位（进 records + `after_tool(executed=false)`，过的 gate 不留未配对 before——gate 循环被打断、从未过闸的才保持 Cancelled）；并行批的 `sync_channel` 必须在 scope 闭包**内**创建（回调 panic 时 `rx` 随 unwind 销毁才不死锁）。
 - **todo + meta**：plan 从 records 派生不经压缩；`meta` 审计侧信道不进模型可见 content。
 - **Skill**：三级加载；name 必须等于父目录名；`read_skill`/`list_skill` 不在白名单、由 assemble 配套注入；子 agent 不继承。
 - **run_code**：两层开关默认全关；wasmtime 中断四点纪律（入口门/epoch 回调/host_call 入口/收尾裁决）；`max_wasm_stack` 384 KiB；测试必须先 warm 模块。
@@ -134,7 +138,7 @@ cargo clippy -p tiny-agent-node
 - **Anthropic 不允许相邻 user**：新 user 入口走 `append_user_turn`；tool_use/tool_result 必须 N:N 配对。
 - **batch 覆盖白名单**：安全字段覆盖即 `bad_task`；limits 逐字段由 `Clamp` 三变体声明，`shell_timeout_secs` 是唯一 Replace。
 - **batch `--retries` 只重试 transient**（`stop_reason == "error"`；分类在 `RunError::is_transient`，单跑梯共用——4xx 非 429 为确定性 `request_error` 不重试，run 截止后失败的请求按 `timeout`/124 归属）；**重试=整任务重放**，前轮副作用不回滚；`stop_reason` 词汇含 `panic`（catch_unwind 兜底）。
-- **batch workdir 隔离**：`copy` 符号链接自包含策略；`git` 要 repo 根（macOS /tmp symlink 需 canonicalize 比较）。
+- **batch workdir 隔离**：沙箱目录 `create_dir`（非 `_all`）+ 计数重试拒绝符号链接预置（与 atomic_write 的 O_EXCL 同款纪律，git 模式先自建空目录再 worktree add）；`copy` 符号链接自包含策略；`git` 要 repo 根（macOS /tmp symlink 需 canonicalize 比较）；单个坏 JSON 任务文件是 per-task `bad_task` 不中止整批；merge_reports 保同名重复条目。
 - **OpenAI 400 回退**：三条 fix 各管一个字段，record-on-success（只记最终 2xx 的修复），learned fixes 不落盘；整次 `chat()` 共用一个绝对截止时间（重发只花剩余额度），重发前查 cancel。
 - **流中途错误形状**：返回 Ok + 尾附 `[stream error]` 标记 + 已上报 usage——别 bail（会丢 usage 破坏失败计费）；run 截止已过时按 `timeout`/124 终态归属（不进重试梯）。
 - **`atomic_write` 用 `create_new(true)`**：别改回可预测单名（符号链接预置攻击面）；NDJSON 走 `print_ndjson` 别用 `println!`。

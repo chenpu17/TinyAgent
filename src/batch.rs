@@ -62,6 +62,54 @@ impl std::str::FromStr for IsolateMode {
 /// part of the task's environment.
 const COPY_EXCLUDE: [&str; 4] = ["target", "node_modules", ".git", "results"];
 
+/// Name counter for isolation dirs — process-wide so concurrent batch
+/// workers (and tests) never fight over the same slot.
+static ISO_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Create a fresh isolation dir `ta-batch-{task}-{pid}-{n}` under `base`.
+/// Same O_EXCL discipline as `harness::atomic_write`: the pid + counter
+/// name is unique between concurrent workers but NOT unpredictable — a
+/// hostile `/tmp` can pre-place a symlink at the exact predicted name —
+/// so the defense comes from plain `create_dir` (`mkdir(2)`), which never
+/// dereferences the final path component and fails `AlreadyExists` on ANY
+/// pre-existing entry, symlinks included. `create_dir_all` would stat
+/// THROUGH such a symlink and "succeed" at creating the sandbox inside the
+/// attacker's directory (task secrets copied in, task executed on the
+/// attacker-controlled path). On collision the counter advances; 8
+/// consecutive strikes (pid reuse + stale entries) fail loudly.
+fn create_isolation_dir(
+    counter: &std::sync::atomic::AtomicU64,
+    base: &std::path::Path,
+    task_name: &str,
+) -> Result<std::path::PathBuf> {
+    let safe: String = task_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    for _ in 0..8 {
+        let n = counter.fetch_add(1, Ordering::Relaxed);
+        let cand = base.join(format!("ta-batch-{safe}-{}-{n}", std::process::id()));
+        match std::fs::create_dir(&cand) {
+            Ok(()) => return Ok(cand),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("cannot create isolation dir {}", cand.display()))
+            }
+        }
+    }
+    bail!(
+        "no free isolation dir name for task {task_name:?} under {} (8 collisions)",
+        base.display()
+    )
+}
+
 /// Prepare a task's isolated workdir. Returns `Ok(None)` for `IsolateMode::None`
 /// (no isolation, nothing to clean). The returned guard removes the directory
 /// on Drop — including panic unwinds in debug builds. Under release
@@ -79,27 +127,9 @@ fn prepare_isolation(
         Some(w) => w.clone(),
         None => std::env::current_dir().context("cannot determine current directory")?,
     };
-    let tmp = {
-        // Same pid + counter trick as harness::atomic_write: unique between
-        // concurrent workers and unpredictable against symlink pre-placement.
-        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let safe: String = task_name
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        std::env::temp_dir().join(format!("ta-batch-{safe}-{}-{n}", std::process::id()))
-    };
     match mode {
         IsolateMode::Copy => {
-            std::fs::create_dir_all(&tmp)
-                .with_context(|| format!("cannot create isolation dir {}", tmp.display()))?;
+            let tmp = create_isolation_dir(&ISO_COUNTER, &std::env::temp_dir(), task_name)?;
             copy_dir_filtered(&src, &tmp)?;
             Ok(Some(IsolationGuard {
                 mode,
@@ -143,6 +173,13 @@ fn prepare_isolation(
                     src.display()
                 );
             }
+            // Create the sandbox dir ourselves before handing it to git:
+            // `create_dir`'s refusal to dereference a pre-placed symlink
+            // (see the helper) then covers this mode too — letting
+            // `worktree add` create the path itself would check the task
+            // out through a predicted-name symlink into an attacker-chosen
+            // directory. git accepts an existing EMPTY directory.
+            let tmp = create_isolation_dir(&ISO_COUNTER, &std::env::temp_dir(), task_name)?;
             // Lock contention (index.lock / config.lock held by a concurrent
             // git process on this repo) is the one TRANSIENT failure mode of
             // `worktree add` — and setup_error in batch is otherwise
@@ -181,6 +218,8 @@ fn prepare_isolation(
                 ));
             }
             if !added {
+                // The empty dir is ours now — don't leak it on failure.
+                let _ = std::fs::remove_dir(&tmp);
                 bail!("git worktree add failed: {last_err}");
             }
             Ok(Some(IsolationGuard {
@@ -464,17 +503,31 @@ pub fn run(
         bail!("no *.json task files in {}", dir.display());
     }
 
-    // Parse all task fragments up front (fail fast on bad input).
+    // Parse all task fragments up front. A file that can't be read or
+    // parsed is a per-task deterministic problem — the same class as a
+    // forbidden override (bad_task), so it must not abort the whole batch
+    // and take every good task down with it (external review): one typo'd
+    // fragment used to DoS the entire run before a single task started.
+    // Collected here, accounted after the results dir exists via the same
+    // single-exit write_terminal_result every other pre-run failure uses.
     let mut tasks: Vec<(String, PartialConfig)> = Vec::new();
+    let mut bad_json: Vec<(String, String)> = Vec::new();
     for f in files {
-        let raw = std::fs::read_to_string(&f)?;
-        let partial: PartialConfig = serde_json::from_str(&raw)
-            .with_context(|| format!("invalid task file: {}", f.display()))?;
         let name = f
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "task".into());
-        tasks.push((name, partial));
+        let raw = match std::fs::read_to_string(&f) {
+            Ok(r) => r,
+            Err(e) => {
+                bad_json.push((name, format!("cannot read task file: {e}")));
+                continue;
+            }
+        };
+        match serde_json::from_str(&raw) {
+            Ok(partial) => tasks.push((name, partial)),
+            Err(e) => bad_json.push((name, format!("invalid task file: {e}"))),
+        }
     }
 
     // --failed: re-run only tasks that failed in the prior report (at the same
@@ -498,6 +551,10 @@ pub fn run(
             .filter(|t| t.success && !failed_names.contains(&t.name))
             .count();
         tasks.retain(|(name, _)| failed_names.contains(name));
+        // Bad parses filter by the same rule: a fragment that no longer
+        // parses but wasn't in the prior failed set was a prior success —
+        // leave it out like any other skipped task.
+        bad_json.retain(|(name, _)| failed_names.contains(name));
         eprintln!(
             "batch --failed: re-running {} failed task(s); {} prior success(es) kept in report",
             tasks.len(),
@@ -520,6 +577,45 @@ pub fn run(
         .unwrap_or(Path::new("."))
         .join("results");
     std::fs::create_dir_all(&results_dir)?;
+    // Account the bad fragments: terminal result file (same single exit as
+    // every other pre-run failure) + a TaskReport seeded into the report
+    // mutex so report.json and the summary count them. Zero turns, zero
+    // cost, empty attribution — the task never reached apply/build, the
+    // same "not applicable" shape the not-started-cancelled entries use.
+    let bad_reports: Vec<TaskReport> = bad_json
+        .iter()
+        .map(|(name, err)| {
+            eprintln!("[warn] {name}: {err} (marked bad_task; other tasks continue)");
+            write_terminal_result(
+                &results_dir,
+                name,
+                "bad_task",
+                err,
+                0,
+                None,
+                &harness::ResultMeta {
+                    model: String::new(),
+                    provider: String::new(),
+                    started_at: String::new(),
+                    code: None,
+                },
+            );
+            TaskReport {
+                name: name.clone(),
+                success: false,
+                stop_reason: "bad_task".into(),
+                turns: 0,
+                elapsed_secs: 0.0,
+                error: Some(err.clone()),
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                model: String::new(),
+                started_at: String::new(),
+            }
+        })
+        .collect();
 
     // One HTTP client (connection pool) shared by all tasks. Its timeout is
     // the BASE limit: a task fragment can only TIGHTEN timeout (config merges
@@ -559,7 +655,9 @@ pub fn run(
 
     let (tx, rx) = mpsc::channel::<(String, PartialConfig)>();
     let rx = Mutex::new(rx);
-    let reports: Mutex<Vec<TaskReport>> = Mutex::new(Vec::new());
+    // Seeded with the bad-parse reports so they flow through the same
+    // merge/sort/summary machinery as every other task's report.
+    let reports: Mutex<Vec<TaskReport>> = Mutex::new(bad_reports);
 
     // Worker Mutexes tolerate poisoning (.unwrap_or_else(into_inner), matching
     // mcp.rs): a panic while holding `rx`/`reports` unwinds out of the scope
@@ -1256,12 +1354,26 @@ fn failed_names_from_report(path: &Path) -> Result<Vec<String>> {
 /// record); everything else from `prior` — the successes we didn't re-run — is
 /// kept verbatim. Result is sorted by name.
 fn merge_reports(prior: Vec<TaskReport>, fresh: &[TaskReport]) -> Vec<TaskReport> {
-    let mut by_name: std::collections::HashMap<String, TaskReport> =
-        prior.into_iter().map(|t| (t.name.clone(), t)).collect();
+    // Overlay by name, keeping EVERY prior entry: a hand-edited or
+    // cross-directory prior report can carry duplicate names, and the old
+    // HashMap fold silently dropped every duplicate but the last (external
+    // review P3). Each duplicate is still overlaid by a same-named fresh
+    // entry; entries are position-independent after the final sort.
+    let mut out = prior;
     for t in fresh {
-        by_name.insert(t.name.clone(), t.clone());
+        // Overlay EVERY same-named prior entry (a duplicate prior should not
+        // keep a stale result beside its overlaid twin).
+        let mut matched = false;
+        for p in out.iter_mut() {
+            if p.name == t.name {
+                *p = t.clone();
+                matched = true;
+            }
+        }
+        if !matched {
+            out.push(t.clone());
+        }
     }
-    let mut out: Vec<_> = by_name.into_values().collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
 }
@@ -1418,6 +1530,28 @@ mod tests {
         r.cache_creation_input_tokens = cc;
         r.cache_read_input_tokens = cr;
         r
+    }
+
+    #[test]
+    fn merge_reports_keeps_duplicate_named_prior_entries() {
+        // A prior report can carry duplicate names (hand-edited, or written
+        // from two task dirs). The overlay must keep EVERY entry and overlay
+        // each by name — the old HashMap fold silently dropped all but the
+        // last duplicate (external review P3).
+        let prior = vec![tr("a", true), tr("a", true), tr("b", true)];
+        let fresh = vec![tr("a", false)];
+        let out = merge_reports(prior, &fresh);
+        assert_eq!(out.len(), 3, "no entry silently dropped");
+        assert_eq!(
+            out.iter().filter(|t| t.name == "a").count(),
+            2,
+            "both duplicate-named priors survive"
+        );
+        assert!(
+            out.iter().all(|t| t.name != "a" || !t.success),
+            "every same-named prior is overlaid by the fresh result"
+        );
+        assert!(out.iter().any(|t| t.name == "b" && t.success));
     }
 
     #[test]
@@ -1843,6 +1977,62 @@ mod tests {
     }
 
     #[test]
+    fn one_bad_task_file_does_not_abort_the_batch() {
+        // External review: a single unreadable/unparseable fragment used to
+        // `?` out of run() before ANY task started — one typo'd file DoS'd
+        // every good task in the directory. Now it lands as its own bad_task
+        // terminal entry (results file + report row, the same per-task
+        // philosophy as a forbidden override) and the rest proceeds.
+        // Cancel-gate the run so no provider is needed: the good task
+        // becomes a not-started cancelled entry, the broken one bad_task.
+        let dir = std::env::temp_dir().join(format!("ta-batch-badjson-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("good.json"), r#"{"task":"ok"}"#).unwrap();
+        std::fs::write(dir.join("broken.json"), r#"{"task": not json}"#).unwrap();
+
+        let base: Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"MOCK_API_KEY","model":"m"}"#,
+        )
+        .unwrap();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(true)); // gate everything
+
+        let report = dir.join("report.json");
+        let code = run(&base, &dir, 1, &report, 0, false, IsolateMode::None, cancel).unwrap();
+        assert_eq!(code, 130, "cancel still dominates the exit code");
+
+        let tasks = read_prior_tasks(&report).unwrap();
+        assert_eq!(
+            tasks.len(),
+            2,
+            "both files accounted; no abort, no silent skip"
+        );
+        let by: std::collections::HashMap<String, TaskReport> =
+            tasks.into_iter().map(|t| (t.name.clone(), t)).collect();
+        assert_eq!(by["broken"].stop_reason, "bad_task");
+        assert!(
+            by["broken"]
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("invalid task file"),
+            "error carries the parse failure"
+        );
+        assert_eq!(by["good"].stop_reason, "cancelled");
+        // The per-task results file mirrors the report row (single-exit
+        // write_terminal_result): anything reading results/*.json agrees
+        // with report.json about the task's final state.
+        let raw =
+            std::fs::read_to_string(dir.join("results").join("broken.json")).unwrap_or_default();
+        assert!(
+            raw.contains("bad_task"),
+            "results/broken.json carries the terminal state, got: {raw}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn failed_task_attributes_to_fragment_model() {
         // C2: a task fragment overriding `model` must own report.json's
         // attribution even when the run FAILS — the error path used to stamp
@@ -1890,8 +2080,11 @@ mod tests {
         // only the in-memory TaskReport (report.json → cancelled) while
         // results/<name>.json kept the failed attempt's "error" record —
         // anything reading the per-task file was misled. The terminal state
-        // must land in BOTH places.
-        let dir = std::env::temp_dir().join(format!("ta-batch-cancel-{}", std::process::id()));
+        // must land in BOTH places. Distinct scratch root from the other
+        // cancel tests: they clean/create by exact path, and a shared
+        // `ta-batch-cancel-{pid}` root made two concurrently-running tests
+        // wipe and double-write each other's results/.
+        let dir = std::env::temp_dir().join(format!("ta-batch-rewrite-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("t.json"), r#"{"task":"x"}"#).unwrap();
@@ -2545,6 +2738,66 @@ mod tests {
         );
         drop(guard);
         assert!(!iso.exists(), "guard Drop removes the sandbox");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn isolation_dir_refuses_symlink_preplacement() {
+        // Predicted-name symlink pre-placement: `create_dir_all` would stat
+        // through the link into the attacker's directory and "succeed"; the
+        // helper's plain `create_dir` must refuse (AlreadyExists) and take
+        // the next counter slot instead. A dedicated counter keeps the
+        // candidate names deterministic regardless of test order.
+        let root = std::env::temp_dir().join(format!("ta-batch-pre-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let victim = root.join("attacker");
+        std::fs::create_dir(&victim).unwrap();
+        let preset = root.join(format!("ta-batch-task-{}-0", std::process::id()));
+        std::os::unix::fs::symlink(&victim, &preset).unwrap();
+
+        let counter = std::sync::atomic::AtomicU64::new(0);
+        let got = create_isolation_dir(&counter, &root, "task").unwrap();
+        assert_ne!(
+            got, preset,
+            "must not hand the attacker's dir back as the sandbox"
+        );
+        assert_eq!(
+            got,
+            root.join(format!("ta-batch-task-{}-1", std::process::id())),
+            "collision advances the counter"
+        );
+        assert!(
+            std::fs::symlink_metadata(&got).unwrap().is_dir(),
+            "returned path is a real dir, not a link"
+        );
+        assert!(
+            std::fs::read_dir(&victim).unwrap().next().is_none(),
+            "nothing may be written through the pre-placed symlink"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn isolation_dir_fails_loudly_after_sustained_collisions() {
+        // All 8 candidate names taken: refusing (Err) is correct — falling
+        // back to a predictable non-counted name would reopen the
+        // pre-placement window the helper exists to close.
+        let root = std::env::temp_dir().join(format!("ta-batch-full-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for n in 0..8u64 {
+            std::fs::create_dir(root.join(format!("ta-batch-task-{}-{n}", std::process::id())))
+                .unwrap();
+        }
+        let counter = std::sync::atomic::AtomicU64::new(0);
+        assert!(
+            create_isolation_dir(&counter, &root, "task").is_err(),
+            "8 collisions must give up loudly, not fall back to a guessable name"
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }

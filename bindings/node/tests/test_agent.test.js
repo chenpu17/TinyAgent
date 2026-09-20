@@ -344,6 +344,34 @@ test('compact(instructions?, onEvent?) folds the history between runs', async (t
   assert.strictEqual(await b.compact(), null);
 });
 
+test('compact failure rejects with the burned-cost JSON envelope', async (t) => {
+  // Honest cost on the error path (same envelope a failed run rejects
+  // with): the summary cost a failed compact burned surfaces as JSON the
+  // caller reads via JSON.parse(err.message).burned — null when the
+  // failure carried no usage (a host provider that simply threw), never
+  // silently dropped on the floor.
+  let n = 0;
+  const { cfgPath } = providerConfig(t, { keepRecentMessages: 2 });
+  const a = new Agent(cfgPath, {
+    provider: () => {
+      n += 1;
+      if (n > 3) throw new Error('summary backend down');
+      return { text: `r${n}`, stop_reason: 'end_turn' };
+    },
+  });
+  for (const msg of ['t1', 't2', 't3']) {
+    a.pushUser(msg);
+    await a.run();
+  }
+  await assert.rejects(a.compact(), (err) => {
+    const payload = JSON.parse(err.message);
+    assert.ok(payload.error.includes('summary backend down'), `error text: ${payload.error}`);
+    assert.ok('burned' in payload, 'cost envelope must be present');
+    assert.strictEqual(payload.burned, null);
+    return true;
+  });
+});
+
 test('custom provider emits the whole text as one delta', async (t) => {
   // Non-streaming v1: the full text arrives as a single TextDelta event.
   const events = [];

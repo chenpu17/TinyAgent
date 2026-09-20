@@ -1389,13 +1389,21 @@ impl Agent {
                 // children fetch_add as they go, so a parallel batch trips the
                 // cap collectively instead of each child independently burning
                 // a full budget while the parent waits at the join), else our
-                // own totals (hand-built ctx in tests / budget unset).
-                let spent = self
-                    .ctx
-                    .budget
-                    .as_ref()
-                    .map_or_else(|| self.usage.total(), |g| g.used.load(Ordering::Relaxed));
-                if spent >= self.limits.max_total_tokens {
+                // own totals (hand-built ctx in tests / budget unset). The cap
+                // side is single-sourced from the gate the same way: the gate
+                // was armed with the fleet's max_total_tokens, and our own
+                // limits snapshot may only TIGHTEN it (a future child-scoped
+                // budget) — comparing the fleet counter against the snapshot
+                // instead would silently unbound the fleet the day a child's
+                // snapshot diverges from the parent's cap.
+                let (spent, cap) = match self.ctx.budget.as_ref() {
+                    Some(g) => (
+                        g.used.load(Ordering::Relaxed),
+                        g.cap.min(self.limits.max_total_tokens),
+                    ),
+                    None => (self.usage.total(), self.limits.max_total_tokens),
+                };
+                if spent >= cap {
                     stop_reason = "budget_exceeded".into();
                     break;
                 }
@@ -1966,6 +1974,11 @@ impl Agent {
                     let input = &tool_uses[i].2;
                     match gate_tool_call(&self.ctx, name, input) {
                         ToolDecision::Deny(reason) => {
+                            // Same output budget as any tool error (run_tool's
+                            // MCP path): a host's deny reason is model-visible
+                            // is_error text and can be arbitrarily long.
+                            let mut reason = reason;
+                            crate::tools::truncate(&mut reason, self.ctx.max_output_chars);
                             let output = ToolOutput::error(reason);
                             notify_tool_after(&self.ctx, name, input, &output, false);
                             slots[i] = Slot::Ran(Box::new(output));
@@ -2083,6 +2096,16 @@ impl Agent {
                             for (pos, h) in handles.into_iter().enumerate() {
                                 let (i, _, _) = wave[pos];
                                 let output = h.join().unwrap_or_else(|_| {
+                                    // Usage note (external review, known
+                                    // divergence): a sub-agent that panicked
+                                    // mid-run has already billed its chats
+                                    // into the SHARED fleet counter, but the
+                                    // ToolOutput carrying its usage died with
+                                    // the thread — so result.json totals never
+                                    // see it. Counter-vs-totals can disagree
+                                    // for a panicked parallel child; recovering
+                                    // the partial usage would need a side
+                                    // channel out of the panicking thread.
                                     Some(ToolOutput::error("parallel tool worker panicked"))
                                 });
                                 match output {
@@ -2306,7 +2329,7 @@ pub(crate) fn notify_tool_after(
     executed: bool,
 ) {
     if let Some(h) = &ctx.hooks {
-        h.after_tool(name, input, output, executed);
+        h.after_tool(name, input, output, executed, ctx);
     }
 }
 
@@ -2382,7 +2405,11 @@ pub(crate) fn execute_tool_call(
     // the caller STILL records (N:N pairing + honest audit log) — the
     // reserved-for-cancel slot semantics live in the caller, not here.
     match gate_tool_call(ctx, name, input) {
-        ToolDecision::Deny(reason) => {
+        ToolDecision::Deny(mut reason) => {
+            // Same output budget as any tool error (run_tool's MCP path): a
+            // host's deny reason is model-visible is_error text and can be
+            // arbitrarily long.
+            crate::tools::truncate(&mut reason, ctx.max_output_chars);
             let output = ToolOutput::error(reason);
             notify_tool_after(ctx, name, input, &output, false);
             output
@@ -2470,6 +2497,15 @@ fn canon_input(v: &Value) -> String {
             let inner: Vec<String> = arr.iter().map(canon_input).collect();
             format!("[{}]", inner.join(","))
         }
+        // 数值统一经 f64 归一：provider/gateway 重发同参调用时数值类型会
+        // 抖动（一处给 1、另一处给 1.0，字面不同、语义相同），裸
+        // `to_string` 会把它们判成不同参数、打转漏检。f64 格式化对两者
+        // 输出同一个 "1"；超过 2^53 的整数在此有精度损失，只影响指纹
+        // 区分度（不同大数折叠为同键 → 宁漏检、不误杀）。
+        Value::Number(n) => n
+            .as_f64()
+            .map(|f| f.to_string())
+            .unwrap_or_else(|| n.to_string()),
         other => other.to_string(),
     }
 }
@@ -2688,13 +2724,19 @@ impl Agent {
             // for this turn's max_tokens output — so we compact BEFORE the
             // provider would reject an over-long request, not after. Compute
             // on u64 with saturating_mul so an absurd configured value can't
-            // wrap (real windows are millions, far from overflow).
-            let cap = (self
-                .limits
-                .max_context_tokens
-                .saturating_mul(compress::COMPACT_UTILIZATION_PCT)
-                / 100) as usize;
-            Some(est + self.max_tokens as usize > cap)
+            // wrap (real windows are millions, far from overflow). The usize
+            // conversion goes through try_from, never `as` — on the 32-bit
+            // musl build a plain cast would truncate a big configured window
+            // into a tiny `cap` and flip the comparison.
+            let cap = usize::try_from(
+                self.limits
+                    .max_context_tokens
+                    .saturating_mul(compress::COMPACT_UTILIZATION_PCT)
+                    / 100,
+            )
+            .unwrap_or(usize::MAX);
+            let out_room = usize::try_from(self.max_tokens).unwrap_or(usize::MAX);
+            Some(est.saturating_add(out_room) > cap)
         } else if self.limits.compress_threshold_chars > 0 {
             Some(compress::total_chars(&self.messages) > self.limits.compress_threshold_chars)
         } else {

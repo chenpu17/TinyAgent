@@ -98,18 +98,20 @@
   轮边界语义同 max_turns_reached、exit 默认臂 1 不重试）。**进展感知**（2026-09 外审第四轮）：
   键带结果指纹——同参不同果（轮询 10%→60%）即重置；键用 hook Modify 后的生效参数
   （`execute_tool_call` 新增 `effective_out` 出参 + 并行 gate Modify 臂落 `effective_inputs`），
-  审批层改写成分页的调用不共键。**无 stuck_stop 闩锁**：轮尾直读当前连续计数——同轮第 7 次换法
+  审批层改写成分页的调用不共键。**canon 数值经 f64 归一**（2026-09 外审）：`1` 与 `1.0` 字面不同、
+  语义相同，provider/gateway 重发同参调用时数值类型抖动会拆键漏检——所有 Number 统一走 `as_f64()`
+  格式化（超 2^53 整数精度损失只折指纹区分度，方向是宁漏检不误杀）。**无 stuck_stop 闩锁**：轮尾直读当前连续计数——同轮第 7 次换法
   即自动解除停止。**取消优先**：轮尾先查 cancel 再查打转，同轮内落下的取消报 cancelled/130。
   已知盲区（刻意取舍，两个方向都有）：**漏检侧**——结果嵌时间戳/随机 id 的真打转逃逸检测；
   **误杀侧**——静态文本轮询（curl 恒错、探测输出恒定）与「进展只在 image 里」的截图类轮询：
   结果指纹恒定即同键，真无进展与「进展不进键」无法区分，6 连硬停（nudge 已提示模型换探测
-  方式，属护栏本意的边界）；数字拼写不归一（1 vs 1.0）只影响漏检侧。run_code 内层
+  方式，属护栏本意的边界）。run_code 内层
   host_call_tool 不经装配段、不计入打转（有 fuel/epoch 兜底）。**同轮语义**：单轮内 6 连
   重复直达硬停——模型在该轮发出全部调用时尚未看到任何结果，nudge 写进历史块也等不到下一
   次请求，同轮场景 nudge 名义存在、无自愈窗口（一轮承诺 6 次相同调用本身即退化形态）。
-  计数跨轮持久、随 run 重置；`Cancelled` 槽不计数（未执行）。测试组 7 个：
+  计数跨轮持久、随 run 重置；`Cancelled` 槽不计数（未执行）。测试组 8 个：
   nudge→停 / 换参重置 / 键序不敏感 / 进展结果不误停 / Modify 生效参数 / 同轮换法解停 /
-  取消优先。
+  取消优先 / 数值拼写归一。
   **溢出确定性**：溢出逃逸失败后的溢出错误经 `RunError::is_context_overflow()` 判定为确定性——单跑
   `run_with_retries` 与 batch（stop_reason `context_overflow`，run_one 只重试 `"error"`）都不再进退避。
 - **token 预算闸门（fleet 级）**（`limits.max_total_tokens`，0=不限）：`Agent::run` 入口安装 run 级
@@ -122,7 +124,10 @@
   会把有效预算砍半），父 fold 只进 totals 不进计数器；其余任何上报 usage 的工具（宿主 CallbackTool
   计量上游 API 等）默认 false——那笔花费没进过任何计数器，fold 时由 agent 代为 `share_budget` 进闸门
   （外部评审 P2-3：此前一律不进计数器，工具花费只进账单不进闸门，预算可被绕过）。run_code 的 guest
-  内层调用在内层 fold 点就地 `share`（混合来源聚合后统一置 true 上报）。闸门超限以 `stop_reason:
+  内层调用在内层 fold 点就地 `share`（混合来源聚合后统一置 true 上报）。**cap 单源**（2026-09 外审）：
+  turn 边界的比较读 `BudgetGate::cap`（装闸时的 fleet 上限），自身 `limits.max_total_tokens` 快照只能
+  把它**收紧**（`min`）——子 agent 快照一旦与父 cap 分叉，比较快照会让 fleet 预算被静默放大
+  （`budget_gate_cap_outranks_a_looser_limits_snapshot` 钉住）。闸门超限以 `stop_reason:
   "budget_exceeded"`（exit 125）停；turn 边界语义同 `timeout_secs`——顶破上限的那轮照常跑完
   （工具执行、assistant 入历史），闸门只拒开下一轮，配对不破。batch task 片段只能收紧（更小值），
   0 视为"无上限"被忽略。它和 `max_turns`/`timeout` 是 loop 的三个 turn 边界停止条件。
@@ -204,7 +209,9 @@
   显式安装才生效。**子 agent 经 `child_ctx()` Arc-clone 继承同一层**（顶层拒绝 = 子 agent 内也拒绝，
   无绕过）；`ToolCtx::subagent` 以名字标注子 agent 身份供钩子区分。**关键语义**：Deny 产出
   `is_error` 结果照常入记录/配对，**不占 `Slot::Cancelled`**（那是取消专用——被拒调用要进审计账，
-  被取消的不进）；Modify 只换**执行**输入，审计链（records/`ToolCall` 事件）永远保留模型原始输入；
+  被取消的不进）；**Deny 文案过 `tools::truncate`（ctx.max_output_chars）**（2026-09 外审）：宿主拒绝
+  理由是模型可见 is_error 文本、可任意长，与 run_tool 对 MCP 错误串同款预算（三处 Deny 点：顺序
+  gate / 并行 gate / run_code 内层）；Modify 只换**执行**输入，审计链（records/`ToolCall` 事件）永远保留模型原始输入；
   **gate→执行检查点**（2026-09 外审 P2）：`before_tool` 可以无限期挂起（审批 UI 等人），等待期落下的
   cancel 若不复查就会出现"run 报 cancelled、被批准的工具却照跑"——`ctx_cancelled()` 在 gate 返回后、
   执行前复查（`execute_tool_call` / 并行批 spawn 前 / run_code 内层三处共用），顺序路径产出
@@ -215,7 +222,11 @@
   kind `cancel`，附录 A v0.5 记录新增触发点）。
   顶层闸门在父线程 spawn 前**串行**把关，子 agent 自身闸门跑在各自 worker 线程（兄弟真并发，实现方
   须自行线程安全——`Send + Sync` 只保证传对象内存安全）；压缩摘要请求**不**透出；`--resume` 重建的
-  agent 需重挂（层活在实例上、不进 session 文件）。本期绑定不透出 hooks（backlog P3）。
+  agent 需重挂（层活在实例上、不进 session 文件，`session_save_load_does_not_carry_hooks` 钉住）。
+  **`after_tool` 带 `ctx: &ToolCtx`**（2026-09 外审，趁绑定未透出 hooks 的窗口期落的破坏性改动）：
+  与 `before_tool` 的 ctx 镜像对称——审计点靠 `ctx.subagent` 归因来源（顶层/task/沙箱），并行兄弟
+  真并发下调用序关联不可靠，per-call ctx 是唯一可靠的来源标签。本期绑定不透出 hooks（backlog P3，
+  两绑定 crate 头已明示该范围决策）。
 - **任务计划（`todo` 工具，`tools/todo.rs`）+ 审计 `meta` 通道**：`todo` 是无状态工具（`&self`，与 shell 同），
   **全量替换语义**（每次发完整计划，TodoWrite 式）。两条关键设计：① **`plan` 从 tool-call 日志派生，不经压缩**——
   `agent::extract_plan` 取 `records`（`Vec<ToolCallRecord>`，独立于 `self.messages`）里最后一条非 error 的 `todo` 调用的

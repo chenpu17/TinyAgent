@@ -139,8 +139,6 @@ impl Tool for SubAgent {
             .as_str()
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| anyhow::anyhow!("task requires a non-empty `prompt`"))?;
-        // `description` is accepted but informational; `name` is the identity
-        // that tags this sub-agent's forwarded events.
 
         // Child config: sub-agent persona + a capped turn budget.
         let mut child_cfg = self.cfg.clone();

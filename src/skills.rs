@@ -29,6 +29,8 @@ use std::path::{Path, PathBuf};
 /// built-in skill — full `SKILL.md` text, no sidecars). Disk entries win on a
 /// name clash: a user's `.tinyagent/skills/<name>/` overrides the built-in,
 /// so the shipped guide is never a cage.
+/// Core-produced (the loader constructs it; hosts never match on it) —
+/// deliberately NOT `#[non_exhaustive]`, per the `AgentEvent` hygiene rule.
 #[derive(Clone, Debug)]
 pub enum SkillSource {
     Dir(PathBuf),

@@ -196,10 +196,11 @@ impl ToolOutput {
 /// marker, NOT by tool name — a third-party tool opting into `Parallel` gets
 /// the same fan-out the built-in `task` tool does.
 ///
-/// `#[non_exhaustive]`: variants may be added later; external `match`es must
-/// keep a wildcard arm.
+/// Producer-side enum (tool authors CONSTRUCT it from `concurrency()`; only
+/// the core consumes/matches it) — deliberately NOT `#[non_exhaustive]`, per
+/// the `AgentEvent` hygiene rule: constructors must not be forced into
+/// wildcard arms. New variants are still possible (semver-minor).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum ToolConcurrency {
     /// Calls run one at a time, in block order. The default: correct for any
     /// tool whose per-call side effects could race (files, shells, ...).
@@ -375,6 +376,13 @@ pub trait Tool: Send + Sync {
 /// bindings can name the same signature if they ever expose it directly.
 pub type ToolFn = Box<dyn Fn(&Value, &ToolCtx) -> Result<ToolOutput> + Send + Sync>;
 
+/// Host-injected tool from a plain closure — the shape both language
+/// bindings use for custom tools. Deliberately ALWAYS `Sequential` (the
+/// default [`Tool::concurrency`]): the bindings' callbacks round-trip a
+/// language boundary (Python re-acquires the GIL and the agent lock; Node
+/// crosses a TSFN), and "safe to reenter" is a promise that closure
+/// signature cannot make. A genuinely reentrant, cancel-polling parallel
+/// tool should implement [`Tool`] directly in Rust.
 pub struct CallbackTool {
     def: ToolDef,
     func: ToolFn,

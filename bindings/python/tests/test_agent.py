@@ -518,6 +518,35 @@ def test_compact_between_runs_folds_reports_and_events(tmp_path):
     assert b.compact() is None
 
 
+def test_compact_failure_surfaces_burned_cost_as_json(tmp_path):
+    """A compact whose summary call fails raises with the honest-cost JSON
+    envelope (the same shape a failed run raises): json.loads(e.args[0])
+    yields {error, burned}. burned is null here — a host provider that
+    simply raised carries no usage — but the envelope must exist: the
+    summary cost used to hit the floor entirely."""
+    calls = {"n": 0}
+
+    def provider(request):
+        calls["n"] += 1
+        if calls["n"] > 3:
+            raise RuntimeError("summary backend down")
+        return {"text": f"r{calls['n']}", "stop_reason": "end_turn"}
+
+    cfg = openai_config("http://unused", workdir=str(tmp_path))
+    cfg["limits"]["keep_recent_messages"] = 2
+    a = tiny_agent.Agent(cfg, provider=provider)
+    for msg in ("t1", "t2", "t3"):
+        a.push_user(msg)
+        a.run()
+
+    with pytest.raises(RuntimeError) as ei:
+        a.compact()
+    payload = json.loads(str(ei.value))
+    assert "summary backend down" in payload["error"]
+    assert "burned" in payload, "cost envelope must be present"
+    assert payload["burned"] is None
+
+
 def test_custom_provider_recovers_after_error(tmp_path):
     """A provider that throws on turn 1 fails the run honestly, but the agent's
     state isn't corrupted: turn 2 (after the provider stops failing) runs fine,

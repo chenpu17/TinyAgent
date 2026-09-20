@@ -150,14 +150,25 @@
   跳过 + 告警——副本里不允许有通往原树的路（绝对链接指回原 workdir 会把并行任务重新耦合到共享
   目录），包含判定复用 `tools::confined_to`，自引用解引链深度封顶 64；
   `git` 每任务 `worktree add --detach`（要求 workdir 是 repo 根，canonicalize 比较——macOS
-  `/tmp`→`/private/tmp` symlink 会让字符串比较误拒；否则 `setup_error` 不重试）。**per-task、
+  `/tmp`→`/private/tmp` symlink 会让字符串比较误拒；否则 `setup_error` 不重试）。
+  **沙箱目录创建必须 `create_dir`（非 `_all`）+ 计数重试**（2026-09 外审 P1）：名字
+  `ta-batch-<任务名>-<pid>-<n>` 可预测，多用户共享 /tmp 可按名预置 symlink；`create_dir_all` 的
+  "已存在"检查会**穿透符号链接 stat** 而照常成功——整个 workdir（含 `.env` 等 COPY_EXCLUDE 拦不住
+  的秘密）被拷进攻击者目录、任务在攻击者可控路径执行。`create_dir`（裸 mkdir(2)）不 dereference
+  末组件、预置路径一律 `AlreadyExists`，与 `harness::atomic_write` 的 O_EXCL 同款纪律；git 模式同样
+  **先自建空目录再让 worktree add 填充**（git 接受已存在的空目录）。另：**单个坏 JSON 任务文件是
+  per-task `bad_task`、不中止整批**（2026-09 外审，与 forbidden 覆盖同哲学）——坏解析经
+  `write_terminal_result` 单出口落 results 文件 + 预置进 report 流，好任务照跑。
+  **per-task、
   跨 attempt 复用**（重试看得到前次落盘，与共享语义一致）；`IsolationGuard` Drop 清理（copy
   remove_dir_all；git `worktree remove --force` 失败回退 remove_dir_all，孤儿用 `git worktree
   prune` 回收——release `panic=abort` 下 Drop 不保证）。产物随目录丢弃是**评测语义**（审计面是
   result.json/report.json）。jobs>1 ⚠ 只在 isolate==None 时打。**隔离测试的任务名必须测试内
   唯一**：沙箱目录命名是 `ta-batch-<任务名>-<pid>-<n>`，任何按前缀统计共享 temp 目录的断言
   （如 leftover 清理检查）都会被同进程并发跑的另一个 batch 测试的在飞沙箱干扰（外审第四轮
-  实遇：并行首跑挂、串行复跑绿）——任务名带测试专属前缀（如 `isocleana`）再断言。
+  实遇：并行首跑挂、串行复跑绿）——任务名带测试专属前缀（如 `isocleana`）再断言；**scratch 根
+  目录同理**——两个 cancel 测试曾共用 `ta-batch-cancel-<pid>` 根互相清/写对方 results 而双双
+  假红（2026-09 外审期间实遇），每个测试用独立根名。
 - **批量 Ctrl-C 是 worker gate，不中断在跑任务**：`batch::run` 的 worker 在**起任务前**检查共享
   cancel 标志，命中则标 `cancelled` 跳过（首个命中的 worker 打一次性契约警告）；在跑的任务照常跑完
   （"收敛"）。**例外（A5，既定取舍）**：每个 agent 都用 `set_shutdown` 挂了同一个 flag 的 reaper——首次

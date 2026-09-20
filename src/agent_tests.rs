@@ -1402,7 +1402,14 @@ impl Hooks for CaptureHooks {
             None => ToolDecision::Allow,
         }
     }
-    fn after_tool(&self, tool: &str, _input: &Value, output: &ToolOutput, executed: bool) {
+    fn after_tool(
+        &self,
+        tool: &str,
+        _input: &Value,
+        output: &ToolOutput,
+        executed: bool,
+        _ctx: &ToolCtx,
+    ) {
         self.calls.lock().unwrap().push(format!(
             "after:{tool}:{executed}:{err}:{content}",
             err = output.is_error,
@@ -1495,6 +1502,80 @@ fn hooks_deny_leaf_records_error_result_and_continues() {
     .map(|s| s.to_string())
     .collect();
     assert_eq!(hooks.calls(), expected);
+}
+
+#[test]
+fn hooks_deny_reason_respects_the_output_budget() {
+    // External review: a host's deny reason is model-visible is_error text
+    // and can be arbitrarily long — run_tool truncates MCP error strings to
+    // ctx.max_output_chars for exactly this reason, but the three Deny
+    // sites (sequential gate, parallel gate, run_code inner gate) used to
+    // pass the reason through verbatim. A 5000-char denial must come back
+    // truncated with the omission marker, in records AND the pairing
+    // tool_result the model reads.
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, _) = MockProvider::new(vec![
+        mock::resp_tool("t1", "danger", json!({}), mock::mk_usage(5, 5)),
+        mock::resp_text("final", None),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(EchoTool::new("danger"))],
+        vec![user_text("go")],
+        test_ctx(), // max_output_chars = 1000
+    );
+    let long_reason = "x".repeat(5000);
+    agent.set_hooks(Arc::new(CaptureHooks::deny("danger", &long_reason)));
+    let mut events = Vec::new();
+    let o = agent.run(&mut |e| events.push(e)).unwrap();
+
+    assert!(o.tool_calls[0].is_error);
+    let out = &o.tool_calls[0].output;
+    assert!(
+        out.contains("[truncated, limit 1000 chars]"),
+        "deny reason must be truncated to the ctx budget, got {} chars",
+        out.chars().count()
+    );
+    assert!(out.chars().count() < 1100, "nowhere near the original 5000");
+}
+
+#[test]
+fn session_save_load_does_not_carry_hooks() {
+    // The hooks layer lives on the Agent instance, never in the session
+    // file (hooks.rs Edges: an agent rebuilt from --resume does NOT carry
+    // hooks over). Pin the contract end to end: a set_hooks'd agent that
+    // saves + reloads through the real session API yields a rebuilt agent
+    // with NO hooks — resume cannot accidentally inherit a policy, and
+    // re-installing is on the caller.
+    let cfg = cfg_with(2, 0, 0);
+    let (prov, _) = MockProvider::new(vec![mock::resp_text("hi", None)]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("x")],
+        test_ctx(),
+    );
+    assert!(agent.ctx.hooks.is_none(), "assembly leaves hooks unset");
+    agent.set_hooks(Arc::new(CaptureHooks::new()));
+    assert!(agent.ctx.hooks.is_some());
+
+    // Save + rebuild exactly like the --resume path: fresh agent, the
+    // session file's messages handed back in.
+    let path = std::env::temp_dir().join(format!("ta-hooks-resume-{}.json", std::process::id()));
+    crate::session::save(&path, "m", agent.messages()).unwrap();
+    drop(agent);
+    let (_, msgs) = crate::session::load(&path)
+        .unwrap()
+        .expect("saved session loads");
+    let (prov2, _) = MockProvider::new(vec![mock::resp_text("y", None)]);
+    let rebuilt = Agent::new(&cfg, Box::new(prov2), vec![], msgs, test_ctx());
+    assert!(
+        rebuilt.ctx.hooks.is_none(),
+        "resume rebuild carries NO hooks — set_hooks again is on the caller"
+    );
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
@@ -1851,7 +1932,14 @@ impl Hooks for CancelDuringApproval {
         self.flag.store(true, Ordering::Relaxed);
         ToolDecision::Allow
     }
-    fn after_tool(&self, tool: &str, _input: &Value, output: &ToolOutput, executed: bool) {
+    fn after_tool(
+        &self,
+        tool: &str,
+        _input: &Value,
+        output: &ToolOutput,
+        executed: bool,
+        _ctx: &ToolCtx,
+    ) {
         self.after
             .lock()
             .unwrap()
@@ -3712,6 +3800,62 @@ fn max_total_tokens_caps_the_loop_with_budget_exceeded() {
     // The turn that crossed the cap still bills its usage honestly.
     assert_eq!(o.input_tokens, 80);
     assert_eq!(o.output_tokens, 30);
+}
+
+#[test]
+fn budget_gate_cap_outranks_a_looser_limits_snapshot() {
+    // Single-sourcing the fleet cap from the gate (external review: the
+    // comparison used the agent's own limits snapshot): a sub-agent run
+    // whose snapshot is LOOSER than the inherited gate's cap must stop at
+    // the gate — today children inherit the parent's number verbatim so the
+    // two can't diverge, but the first future child-scoped/clamped budget
+    // would silently unbound the fleet if the snapshot won. The gate is
+    // pre-armed past its cap (sibling/parent spend), so the run must refuse
+    // to start turn 1 at all. run_as_subagent keeps the inherited gate
+    // (a top-level run installs a fresh one from its own limits).
+    let mut cfg = cfg_with(99, 0, 0);
+    cfg.limits.max_total_tokens = 10_000; // snapshot far looser than the gate
+    let (prov, state) = MockProvider::new(vec![mock::resp_text("done", mock::mk_usage(5, 5))]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(EchoTool::new("echo"))],
+        vec![user_text("hi")],
+        test_ctx(),
+    );
+    let gate = BudgetGate::new(100);
+    gate.share(150); // fleet already past its cap
+    agent.ctx.budget = Some(gate);
+    let o = agent.run_as_subagent(&mut |_| {}).unwrap();
+    assert_eq!(o.stop_reason, "budget_exceeded");
+    assert_eq!(o.turns, 0);
+    assert_eq!(state.calls(), 0, "refused to start turn 1 at all");
+}
+
+#[test]
+fn canon_input_normalizes_numeric_spelling() {
+    // External review: 1 and 1.0 serialized differently (u64 vs f64 literal)
+    // used to produce DIFFERENT stuck-detection keys — a provider/gateway
+    // jittering the numeric type across retries of the same call would slip
+    // past the guardrail entirely. Canonicalization routes every number
+    // through f64 so both spellings key identically.
+    assert_eq!(
+        canon_input(&json!({"n": 1})),
+        canon_input(&json!({"n": 1.0})),
+        "int/float spelling of the same value must key identically"
+    );
+    assert_eq!(
+        canon_input(&json!([2, 3.0])),
+        canon_input(&json!([2.0, 3])),
+        "nested arrays normalize the same way"
+    );
+    // Distinct values still key apart (the normalization must not collapse
+    // everything into one bucket).
+    assert_ne!(canon_input(&json!({"n": 1})), canon_input(&json!({"n": 2})));
+    assert_ne!(
+        canon_input(&json!({"n": 1})),
+        canon_input(&json!({"n": 1.5}))
+    );
 }
 
 #[test]

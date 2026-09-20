@@ -22,6 +22,15 @@
 //! `ta` is the Rust core library `tiny_agent` (package `tiny-agent`, aliased
 //! here because this crate's own lib name — the npm import — is *also*
 //! `tiny-agent`).
+//!
+//! Known limitation (constructor): `new Agent(cfg, ...)` synchronously
+//! assembles tools — including spawning and handshaking every configured MCP
+//! server — on the JS main thread. `chat()` deliberately moved that work off
+//! the main thread; the constructor has not (yet). With slow MCP servers the
+//! event loop freezes for seconds at construction. Scope note in the same
+//! breath: hooks (`set_hooks`), the `setModel` family, and MCP hot
+//! add/remove are deliberately NOT exposed here (minimal-surface v0.3
+//! decision; Rust hosts get them via the core crate).
 
 // napi's `#[napi]` attribute macro can trip clippy's `useless_conversion` on
 // `Result` returns the same way pyo3's macros do. Scoped to this pure-binding
@@ -709,7 +718,20 @@ impl Agent {
                     },
                     instructions.as_deref(),
                 )
-                .map_err(err)?;
+                .map_err(|e| {
+                    // Same honest-cost envelope as run_error_to_napi: the
+                    // summary cost a failed compact burned (CompressError::
+                    // burned, riding the anyhow chain) surfaces as JSON the
+                    // caller reads via JSON.parse(err.message).burned — null
+                    // when the failure carried no usage.
+                    let payload = serde_json::json!({
+                        "error": e.to_string(),
+                        "burned": e
+                            .downcast_ref::<ta::CompressError>()
+                            .and_then(|ce| ce.burned),
+                    });
+                    napi::Error::from_reason(payload.to_string())
+                })?;
             match outcome {
                 Some(o) => serde_json::to_value(o).map_err(err),
                 None => Ok(Value::Null),

@@ -730,7 +730,10 @@ fn host_call_tool(
         };
         let known = d.defs.iter().any(|t| t.name == name);
         let (output, class) = match decision {
-            ToolDecision::Deny(reason) => {
+            ToolDecision::Deny(mut reason) => {
+                // Same output budget as any tool error: a host's deny reason
+                // is model-visible is_error text and can be arbitrarily long.
+                crate::tools::truncate(&mut reason, d.ctx.max_output_chars);
                 let output = ToolOutput::error(reason);
                 notify_tool_after(&d.ctx, &name, &args, &output, false);
                 (output, "hooks")
@@ -4327,7 +4330,14 @@ return t.length;"#}),
             fn before_tool(&self, tool: &str, _i: &Value, _c: &ToolCtx) -> ToolDecision {
                 ToolDecision::Deny(format!("no {tool} for you"))
             }
-            fn after_tool(&self, _t: &str, _i: &Value, _o: &ToolOutput, executed: bool) {
+            fn after_tool(
+                &self,
+                _t: &str,
+                _i: &Value,
+                _o: &ToolOutput,
+                executed: bool,
+                _ctx: &ToolCtx,
+            ) {
                 self.afters.lock().unwrap().push(executed);
             }
         }
