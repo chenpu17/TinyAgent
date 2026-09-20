@@ -1,4 +1,4 @@
-use super::{resolve, truncate, Tool, ToolCtx, ToolOutput};
+use super::{resolve, truncate, Tool, ToolCtx, ToolOrigin, ToolOutput};
 use crate::provider::ToolDef;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -81,6 +81,10 @@ fn scan_totals(full: &std::path::Path) -> std::io::Result<Totals> {
 pub struct ReadFile;
 
 impl Tool for ReadFile {
+    fn origin(&self) -> ToolOrigin {
+        ToolOrigin::Builtin
+    }
+
     /// Guest-registry opt-in (run_code's `tools.call` surface) — the file
     /// tools are the sandbox's built-in I/O substrate.
     fn available_to_code(&self) -> bool {
@@ -499,6 +503,10 @@ fn read_file_json(
 pub struct WriteFile;
 
 impl Tool for WriteFile {
+    fn origin(&self) -> ToolOrigin {
+        ToolOrigin::Builtin
+    }
+
     /// Guest-registry opt-in (run_code's `tools.call` surface) — the file
     /// tools are the sandbox's built-in I/O substrate.
     fn available_to_code(&self) -> bool {
@@ -566,6 +574,10 @@ impl Tool for WriteFile {
 pub struct EditFile;
 
 impl Tool for EditFile {
+    fn origin(&self) -> ToolOrigin {
+        ToolOrigin::Builtin
+    }
+
     /// Guest-registry opt-in (run_code's `tools.call` surface) — the file
     /// tools are the sandbox's built-in I/O substrate.
     fn available_to_code(&self) -> bool {
@@ -693,6 +705,10 @@ impl Tool for EditFile {
 pub struct ListDir;
 
 impl Tool for ListDir {
+    fn origin(&self) -> ToolOrigin {
+        ToolOrigin::Builtin
+    }
+
     /// Guest-registry opt-in (run_code's `tools.call` surface) — the file
     /// tools are the sandbox's built-in I/O substrate.
     fn available_to_code(&self) -> bool {

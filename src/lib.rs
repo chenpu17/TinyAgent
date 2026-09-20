@@ -27,6 +27,7 @@ pub mod agent;
 pub mod batch;
 pub mod compress;
 pub mod config;
+pub mod context_report;
 pub mod harness;
 pub mod hooks;
 pub mod mcp;
@@ -42,12 +43,17 @@ pub use agent::{
     RunError, RunOutcome, TodoItem, ToolCallRecord,
 };
 pub use config::{CodeConfig, Config, Limits, McpServerConfig};
+pub use context_report::{
+    Calibration, ContextBreakdown, MessageKinds, MessagesBreakdown, SystemBreakdown, ToolCategory,
+    ToolEntry, ToolsBreakdown,
+};
 pub use hooks::{Hooks, ToolDecision};
 pub use provider::{
     Block, ChatRequest, ChatResponse, Message, Provider, Role, SimpleChatResponse, ToolDef, Usage,
 };
 pub use tools::{
-    load_document_block, BudgetGate, CallbackTool, Tool, ToolConcurrency, ToolCtx, ToolOutput,
+    load_document_block, BudgetGate, CallbackTool, Tool, ToolConcurrency, ToolCtx, ToolOrigin,
+    ToolOutput,
 };
 // The sandboxed JS tool only exists behind `--features code`; its CONFIG is
 // plain data and unconditional (above) so configs parse on any build.
@@ -89,6 +95,10 @@ pub fn build_agent_with(
     extra_tools: Vec<Box<dyn tools::Tool>>,
     api_key: &str,
 ) -> anyhow::Result<Agent> {
+    // The pre-assembly system-prompt length, for context_breakdown's base /
+    // skill-intro attribution. Captured BEFORE `assemble` — its returned cfg
+    // clone shadows this one and carries the appended skill intro.
+    let skill_base = cfg.system_prompt.as_ref().map(|s| s.len()).unwrap_or(0);
     let (tool_list, ctx, cfg, code, eager) = assemble(cfg, client, extra_tools, api_key)?;
     // FR-1 eager skill injection (FD-3 + e2e 修订)：内容判定——已在历史中
     // 披露过（eager 会话 resume / 真实 read_skill 调用）则不重注；headless
@@ -101,6 +111,9 @@ pub fn build_agent_with(
         initial,
         ctx,
     )?;
+    // Narrow the attribution to the user's own prompt (assembly window —
+    // between try_new and return, no concurrency).
+    agent.set_skill_intro_base(skill_base);
     code.install(&mut agent);
     Ok(agent)
 }
@@ -125,10 +138,14 @@ pub fn build_agent_with_provider(
     extra_tools: Vec<Box<dyn tools::Tool>>,
     api_key: &str,
 ) -> anyhow::Result<Agent> {
+    // Same pre-assembly capture as `build_agent_with` (its cfg gets shadowed
+    // by assemble's intro-augmented clone).
+    let skill_base = cfg.system_prompt.as_ref().map(|s| s.len()).unwrap_or(0);
     let (tool_list, ctx, cfg, code, eager) = assemble(cfg, client, extra_tools, api_key)?;
     // Same FR-1 rule as build_agent_with (FD-3 + e2e 修订).
     let initial = prepend_eager_pair(eager, initial);
     let mut agent = Agent::try_new(&cfg, provider, tool_list, initial, ctx)?;
+    agent.set_skill_intro_base(skill_base);
     code.install(&mut agent);
     Ok(agent)
 }

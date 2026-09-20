@@ -492,6 +492,22 @@ impl Agent {
         Ok(bound.unbind())
     }
 
+    /// Estimated token composition of the NEXT request's context:
+    /// `{"system": {"env", "base", "skill_intro", "tokens"},
+    ///    "tools": {"builtin"/"mcp"/"skill"/"custom": {"tokens", "tools":
+    ///      [{"name", "tokens"}]}, "tokens"},
+    ///    "messages": {"tokens", "by_kind": {"user_text", …}},
+    ///    "total_tokens", "calibration": {"measured_prompt_tokens", "scale"}
+    ///      | None}`. Every number is an ESTIMATE (chars/4 yardstick), not a
+    /// provider measurement — `usage()` stays the billing authority;
+    /// `calibration` is non-None only while a measured anchor is still valid.
+    /// Read-only, busy-errors while `run()` is in flight (same as `usage`).
+    fn context_breakdown(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let bd = self.with_agent(py, |a| a.context_breakdown())?;
+        let bound = pythonize(py, &bd)?;
+        Ok(bound.unbind())
+    }
+
     /// Manually compress the conversation history NOW (the idle-time fold):
     /// summarize the middle via the LLM, fold it into the first message,
     /// rewrite the session file. `instructions` is an optional focus hint for

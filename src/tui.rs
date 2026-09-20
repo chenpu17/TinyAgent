@@ -220,6 +220,11 @@ enum SlashCmd {
     Limits,
     Tools,
     System,
+    /// `/context` — the estimated token composition of the next request's
+    /// context (system / tools / messages by kind, calibrated when an anchor
+    /// is live). Worker-side query (the agent lives there), rendered by the
+    /// UI from the returned `ContextBreakdown`.
+    Context,
     Help,
     /// `/quit` (or `/exit`): leave the TUI. Always quits, even mid-run — the
     /// quit path cancels the in-flight turn and tears down. Esc in idle no
@@ -266,6 +271,7 @@ fn classify(trimmed: &str) -> SlashCmd {
         "limits" if !stray_arg => SlashCmd::Limits,
         "tools" if !stray_arg => SlashCmd::Tools,
         "system" if !stray_arg => SlashCmd::System,
+        "context" if !stray_arg => SlashCmd::Context,
         "help" if !stray_arg => SlashCmd::Help,
         "quit" | "exit" if !stray_arg => SlashCmd::Quit,
         _ => SlashCmd::Unknown(rest.to_string()),
@@ -323,17 +329,143 @@ fn slash_reply(cmd: &SlashCmd, cfg: &Config) -> String {
         }
         SlashCmd::Unknown(name) => format!("[unknown command: /{name} — try /help]"),
         // Message/Clear never reach here; empty keeps the match exhaustive.
-        // Export/Out and Clear have their own side-effecting arms in the key
-        // handler.
+        // Export/Out, Context and Clear have their own side-effecting arms in
+        // the key handler (Context asks the worker for the breakdown).
         SlashCmd::Message
         | SlashCmd::Clear
         | SlashCmd::Export(_)
         | SlashCmd::Out(_)
+        | SlashCmd::Context
         | SlashCmd::Quit => String::new(),
     }
 }
 
 // ── Slash-command completion popup ────────────────────────────────────
+
+/// Render `/context`'s report from a breakdown snapshot. Pure given
+/// (breakdown, window) so the tests drive it with hand-built literals. Every
+/// number is an ESTIMATE on the compress yardstick (see context_report's
+/// module docs); the header line states which register the numbers are in —
+/// `calibrated ×s` when a measured anchor is live, `uncalibrated heuristic`
+/// otherwise. Per-tool lines are capped per category (sorted by tokens,
+/// display-only copy — the breakdown itself keeps tool-list order).
+fn render_context_report(
+    bd: &crate::context_report::ContextBreakdown,
+    max_context_tokens: u64,
+) -> String {
+    const BAR_WIDTH: u64 = 14;
+    const PER_CATEGORY_TOOLS: usize = 5;
+    let total = bd.total_tokens;
+    // Percent with one decimal over a 0-safe denominator, u64 all the way
+    // (the ×1000 trick keeps the layout arithmetic integer and saturating).
+    let pct_milli = |x: u64| x.saturating_mul(1000) / total.max(1);
+    let bar = |x: u64| {
+        let n = (pct_milli(x).saturating_mul(BAR_WIDTH) / 1000) as usize;
+        if n == 0 {
+            "·".to_string()
+        } else {
+            "#".repeat(n)
+        }
+    };
+    let section = |out: &mut String, label: &str, tokens: u64| {
+        out.push_str(&format!(
+            "  {:<10} {:>7}  {:>5}.{}%  {}\n",
+            label,
+            fmt_tokens(tokens),
+            pct_milli(tokens) / 10,
+            pct_milli(tokens) % 10,
+            bar(tokens),
+        ));
+    };
+    let sub = |out: &mut String, label: &str, tokens: u64| {
+        out.push_str(&format!(
+            "    {:<10} {:>7}  {:>5}.{}%\n",
+            label,
+            fmt_tokens(tokens),
+            pct_milli(tokens) / 10,
+            pct_milli(tokens) % 10,
+        ));
+    };
+
+    let mut s = String::new();
+    match bd.calibration {
+        Some(c) => s.push_str(&format!(
+            "context (estimated): {} tok · calibrated ×{:.2} (anchor: measured prompt {} tok)\n",
+            fmt_tokens(total),
+            c.scale,
+            fmt_tokens(c.measured_prompt_tokens),
+        )),
+        None => s.push_str(&format!(
+            "context (estimated): {} tok · uncalibrated heuristic (chars/4; no measurement yet)\n",
+            fmt_tokens(total),
+        )),
+    }
+    section(&mut s, "system", bd.system.tokens);
+    sub(&mut s, "env header", bd.system.env);
+    sub(&mut s, "base", bd.system.base);
+    sub(&mut s, "skill intro", bd.system.skill_intro);
+
+    section(&mut s, "tools", bd.tools.tokens);
+    for (label, cat) in [
+        ("builtin", &bd.tools.builtin),
+        ("mcp", &bd.tools.mcp),
+        ("skill", &bd.tools.skill),
+        ("custom", &bd.tools.custom),
+    ] {
+        sub(&mut s, label, cat.tokens);
+        // Display-only copy, sorted by size — the breakdown itself keeps
+        // tool-list order (same as /tools reports it).
+        let mut entries: Vec<&crate::context_report::ToolEntry> = cat.tools.iter().collect();
+        entries.sort_by(|a, b| b.tokens.cmp(&a.tokens).then(a.name.cmp(&b.name)));
+        for e in entries.iter().take(PER_CATEGORY_TOOLS) {
+            s.push_str(&format!(
+                "      {:<16} {:>7}\n",
+                e.name,
+                fmt_tokens(e.tokens)
+            ));
+        }
+        if entries.len() > PER_CATEGORY_TOOLS {
+            s.push_str(&format!(
+                "      … +{} more\n",
+                entries.len() - PER_CATEGORY_TOOLS
+            ));
+        }
+    }
+
+    section(&mut s, "messages", bd.messages.tokens);
+    let k = &bd.messages.by_kind;
+    for (label, tokens) in [
+        ("user text", k.user_text),
+        ("assistant", k.assistant_text),
+        ("tool use", k.tool_use),
+        ("tool results", k.tool_result),
+        ("images", k.image),
+        ("documents", k.document),
+        ("skill content", k.skill_content),
+        ("other", k.other),
+    ] {
+        sub(&mut s, label, tokens);
+    }
+
+    if max_context_tokens > 0 {
+        let used_pct = total.saturating_mul(100) / max_context_tokens;
+        let free = max_context_tokens.saturating_sub(total);
+        // Round window numbers read cleaner without a trailing ".0".
+        let max_s = fmt_tokens(max_context_tokens)
+            .replace(".0k", "k")
+            .replace(".0M", "M");
+        s.push_str(&format!(
+            "window: {}% of {} max_context_tokens ({} free)\n",
+            used_pct,
+            max_s,
+            fmt_tokens(free),
+        ));
+    } else {
+        s.push_str("window: no max_context_tokens configured\n");
+    }
+    // Multi-line, rendered by its row as-is (same as /help's listing).
+    s
+}
 
 /// One slash command as the completion popup shows it. KEEP IN SYNC with
 /// `classify` above — that match is the actual command set; this table only
@@ -344,7 +476,7 @@ struct SlashSpec {
     desc: &'static str,
 }
 
-const SLASH_COMMANDS: [SlashSpec; 9] = [
+const SLASH_COMMANDS: [SlashSpec; 10] = [
     SlashSpec {
         name: "clear",
         arg_hint: "",
@@ -379,6 +511,11 @@ const SLASH_COMMANDS: [SlashSpec; 9] = [
         name: "system",
         arg_hint: "",
         desc: "the active system prompt",
+    },
+    SlashSpec {
+        name: "context",
+        arg_hint: "",
+        desc: "context window composition (estimated tokens)",
     },
     SlashSpec {
         name: "help",
@@ -733,15 +870,20 @@ enum UiMsg {
     Event(AgentEvent),
     Error(String),
     RunFinished,
+    /// `/context`: the worker's `context_breakdown()` snapshot, rendered by
+    /// the UI loop (which owns the config the window line reads).
+    Context(crate::context_report::ContextBreakdown),
 }
 
 /// Control or text input from the UI to the worker thread. `None` on the
 /// channel means "quit" (Esc / idle Ctrl-C); `Some(Text)` is a user message;
 /// `Some(Clear)` is the `/clear` command, which the worker applies to the
-/// agent's history without running a turn.
+/// agent's history without running a turn; `Some(Context)` asks for the
+/// breakdown snapshot (read-only, no turn).
 enum Input {
     Text(String),
     Clear,
+    Context,
 }
 
 /// On drop, signals worker completion so the quit path can wait a bounded
@@ -975,6 +1117,11 @@ pub fn run(
                     if let Some(w) = agent.clear_messages() {
                         let _ = out_tx.send(UiMsg::Event(AgentEvent::Warning(w)));
                     }
+                }
+                Input::Context => {
+                    // Read-only snapshot; the anchor-derived calibration is
+                    // computed under the worker's exclusive hold of the agent.
+                    let _ = out_tx.send(UiMsg::Context(agent.context_breakdown()));
                 }
             }
         }
@@ -1530,6 +1677,15 @@ fn ui_loop(
                         &mut thinking,
                     );
                 }
+                UiMsg::Context(bd) => {
+                    // Read-only report: no busy/streaming state is touched —
+                    // the command is refused while running anyway, so this
+                    // lands in an idle gap.
+                    rows.push(Row::sys_info(render_context_report(
+                        &bd,
+                        cfg.limits.max_context_tokens,
+                    )));
+                }
             }
         }
 
@@ -1977,6 +2133,26 @@ fn ui_loop(
                                                  history not cleared]",
                                             )
                                         });
+                                    }
+                                    SlashCmd::Context if busy => {
+                                        // Same refusal as /clear: the worker
+                                        // doesn't pump in_rx inside a run, so
+                                        // queueing would only make the report
+                                        // arrive after the run looking frozen;
+                                        // an honest "disabled while running"
+                                        // is better.
+                                        input.drain_to_string();
+                                        rows.push(Row::sys_warn(
+                                            "[busy — /context is disabled while running]",
+                                        ));
+                                    }
+                                    SlashCmd::Context => {
+                                        input.drain_to_string();
+                                        if in_tx.send(Some(Input::Context)).is_err() {
+                                            rows.push(Row::sys_error(
+                                                "[worker stopped — context report unavailable]",
+                                            ));
+                                        }
                                     }
                                     SlashCmd::Quit => {
                                         // /quit (or /exit): leave the TUI. Works
@@ -5250,7 +5426,7 @@ mod tests {
             "help should be multiline: {help:?}"
         );
         for cmd in [
-            "/clear", "/export", "/model", "/limits", "/tools", "/system", "/help",
+            "/clear", "/export", "/model", "/limits", "/tools", "/system", "/context", "/help",
         ] {
             assert!(
                 help.lines().any(|l| l.contains(cmd)),
@@ -5259,6 +5435,119 @@ mod tests {
         }
         // Indented one-command-per-line layout.
         assert!(help.lines().any(|l| l.starts_with("  /export")));
+    }
+
+    /// Hand-built breakdown for the render tests — numbers chosen so the
+    /// sections, bars, percentages and the window line all have something
+    /// to show.
+    fn sample_breakdown() -> crate::context_report::ContextBreakdown {
+        use crate::context_report as cr;
+        let tool = |name: &str, tokens: u64| cr::ToolEntry {
+            name: name.into(),
+            tokens,
+        };
+        cr::ContextBreakdown {
+            system: cr::SystemBreakdown {
+                env: 122,
+                base: 898,
+                skill_intro: 214,
+                tokens: 1234,
+            },
+            tools: cr::ToolsBreakdown {
+                builtin: cr::ToolCategory {
+                    tokens: 1800,
+                    tools: vec![
+                        tool("shell", 620),
+                        tool("read_file", 540),
+                        tool("task", 352),
+                        tool("todo", 288),
+                    ],
+                },
+                mcp: cr::ToolCategory {
+                    tokens: 500,
+                    tools: vec![tool("mcp_fetch", 500)],
+                },
+                skill: cr::ToolCategory {
+                    tokens: 200,
+                    tools: vec![tool("read_skill", 120), tool("list_skill", 80)],
+                },
+                custom: cr::ToolCategory::default(),
+                tokens: 2500,
+            },
+            messages: cr::MessagesBreakdown {
+                tokens: 8611,
+                by_kind: cr::MessageKinds {
+                    user_text: 1200,
+                    assistant_text: 1000,
+                    tool_use: 411,
+                    tool_result: 5000,
+                    image: 1000,
+                    document: 0,
+                    skill_content: 0,
+                    other: 0,
+                },
+            },
+            total_tokens: 12345,
+            calibration: None,
+        }
+    }
+
+    #[test]
+    fn render_context_report_calibration_and_window_states() {
+        let mut bd = sample_breakdown();
+        let s = render_context_report(&bd, 0);
+        assert!(
+            s.contains("uncalibrated heuristic (chars/4; no measurement yet)"),
+            "header: {s:?}"
+        );
+        assert!(
+            s.contains("window: no max_context_tokens configured"),
+            "window line omitted: {s:?}"
+        );
+        bd.calibration = Some(crate::context_report::Calibration {
+            measured_prompt_tokens: 10_000,
+            scale: 1.83,
+        });
+        let s = render_context_report(&bd, 0);
+        assert!(s.contains("calibrated ×1.83"), "header: {s:?}");
+        assert!(s.contains("10.0k tok)"), "anchor size shown: {s:?}");
+    }
+
+    #[test]
+    fn render_context_report_sections_tools_and_window() {
+        let bd = sample_breakdown();
+        let s = render_context_report(&bd, 200_000);
+        for label in [
+            "system",
+            "env header",
+            "base",
+            "skill intro",
+            "tools",
+            "builtin",
+            "mcp",
+            "skill",
+            "custom",
+            "messages",
+            "user text",
+            "tool results",
+            "images",
+            "skill content",
+        ] {
+            assert!(s.contains(label), "missing {label}:\n{s}");
+        }
+        // Per-tool lines are present, biggest-first within the category.
+        let shell = s.lines().find(|l| l.contains("shell")).expect("shell line");
+        assert!(shell.contains("620"), "shell tokens: {shell}");
+        // window: 12345/200000 → 6% used, free ≈ 187.7k.
+        assert!(s.contains("window: 6% of 200k max_context_tokens"), "{s}");
+    }
+
+    #[test]
+    fn slash_context_rejects_a_stray_arg() {
+        assert_eq!(
+            classify("/context now"),
+            SlashCmd::Unknown("context now".into())
+        );
     }
 
     // ── Slash-command completion popup ─────────────────────────────────
@@ -6670,6 +6959,7 @@ mod tests {
         assert_eq!(classify("/limits"), SlashCmd::Limits);
         assert_eq!(classify("/tools"), SlashCmd::Tools);
         assert_eq!(classify("/system"), SlashCmd::System);
+        assert_eq!(classify("/context"), SlashCmd::Context);
         assert_eq!(classify("/help"), SlashCmd::Help);
         assert_eq!(classify("/quit"), SlashCmd::Quit);
         assert_eq!(classify("/exit"), SlashCmd::Quit); // alias

@@ -40,7 +40,7 @@ use crate::agent::{ctx_cancelled, gate_tool_call, notify_tool_after, run_tool, A
 use crate::config::{CodeConfig, Config};
 use crate::hooks::ToolDecision;
 use crate::provider::{ToolDef, Usage};
-use crate::tools::{mcp, SharedTool, Tool, ToolConcurrency, ToolCtx, ToolOutput};
+use crate::tools::{mcp, SharedTool, Tool, ToolConcurrency, ToolCtx, ToolOrigin, ToolOutput};
 
 /// The sandbox guest: quickjs-ng + glue (see module doc). Embedded so the
 /// binary is self-contained — no filesystem dependency at run time.
@@ -2217,6 +2217,10 @@ fn read_memory_string(
 }
 
 impl Tool for RunCodeTool {
+    fn origin(&self) -> ToolOrigin {
+        ToolOrigin::Builtin
+    }
+
     fn def(&self) -> ToolDef {
         // Slim description (v2 P2): the description rides in EVERY request's
         // tool schema, so it carries identity + environment + the CLOSED

@@ -272,3 +272,21 @@
   ["now"]()`）放行，运行时确定性桩照抛——别把它当安全层依赖。拒答/墓碑文案是微调数据的规格
   （`docs/finetune_support_design.md` 附录 A），改一个字都要先走设计稿修订记录。
 
+- **context_breakdown 的等和不变量靠单趟 running-floor，不是各段独立 /4**（context_report.rs）：
+  `estimate_tokens` 对**总和**做一次整除，分解要严格等和就必须按固定顺序一遍累计、每段领
+  `floor(acc_after/4)-floor(acc_before/4)` 的商差。各段独立 `chars/4` 再求和会间歇性差 1-2 token
+  （短段还会捡前段的余数——2 字符段跟在 19≡3(mod 4) 段后能领到 1），`uncalibrated_total_equals_
+  estimate_tokens` 测试是刻意钉子，红了别"修测试"。同坑：精确断言某桶数值时要按同一套 floor 语义
+  推期望（或用"总量-其它桶"反推），别拿朴素 `chars/4` 当期望值。
+- **`skill_intro_base_chars` 默认值是 `cfg.system_prompt.len()` 不是 0**：语义是"env 之后全是 base，
+  其后才是简介"，只有 assemble 路径经 `set_skill_intro_base` 收窄。默认 0 的读法（"没有 base"）会把
+  直接 `try_new` / 子 agent 的整个用户 system prompt 错归 skill_intro 段——`env_attribution_splits_
+  env_from_base` 测试钉的是默认语义。另记：`build_agent*` 里取 `skill_base` 必须在调 `assemble`
+  **之前**（assemble 返回的 cfg 克隆带简介，会遮蔽原名）。
+- **锚点失效即校准退化，不是 bug**：fold/prune/MCP 热增删/前缀改写都会让 `live_anchor()` 四条件失配
+  → `context_breakdown().calibration` 回 `None`（纯启发式口径）——post-run 主 chat 会重新锚定，这是
+  既有语义的顺延。测试"失效"路径用**手动 `compact()`**（run 后锚点在、compact 折叠后锚点失配；
+  preflight 压缩后紧跟的主 chat 会立刻重锚，测不出失配窗口）。
+- **lib_api 里别断言"空 workdir ⇒ 无技能"**：`resolve_skill_dirs` 还会读机器级全局技能目录
+  （`~/.config/tinyagent/skills`），开发机上装了技能的与干净的 CI 跑出不同结果——环境依赖的断言
+  是移植性地雷。"无 intro"语义用直接 `Agent::new`（不经装配）来测。

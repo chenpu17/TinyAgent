@@ -1,5 +1,5 @@
 use super::file::MAX_LIST_ENTRIES;
-use super::{confined_to, truncate, Tool, ToolCtx, ToolOutput};
+use super::{confined_to, truncate, Tool, ToolCtx, ToolOrigin, ToolOutput};
 use crate::provider::ToolDef;
 use crate::skills::SkillIndex;
 use anyhow::Context;
@@ -55,6 +55,10 @@ impl ReadSkill {
 }
 
 impl Tool for ReadSkill {
+    fn origin(&self) -> ToolOrigin {
+        ToolOrigin::Skill
+    }
+
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "read_skill".into(),
@@ -235,6 +239,10 @@ impl ListSkill {
 }
 
 impl Tool for ListSkill {
+    fn origin(&self) -> ToolOrigin {
+        ToolOrigin::Skill
+    }
+
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "list_skill".into(),

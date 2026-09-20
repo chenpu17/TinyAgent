@@ -7,12 +7,15 @@ mod tui;
 // them as `crate::agent::…` — keeps resolving unchanged. The binary is only the
 // process-level shell: arg parsing, SIGINT, exit codes, and the optional TUI.
 pub(crate) use tiny_agent::{batch, build_agent, config, harness, provider, session, tools};
-// `agent` itself is only reached by the TUI (`crate::agent::…`); gate it so a
-// headless build doesn't warn about an unused re-export. The id helper below
-// is used unconditionally (resume id pre-minting), so it imports directly.
+// `agent` and `context_report` are only reached by the TUI
+// (`crate::agent::…` / `crate::context_report::…`); gate them so a headless
+// build doesn't warn about unused re-exports. The id helper below is used
+// unconditionally (resume id pre-minting), so it imports directly.
 #[cfg(feature = "tui")]
 pub(crate) use tiny_agent::agent;
 use tiny_agent::agent::numeric_id_suffix;
+#[cfg(feature = "tui")]
+pub(crate) use tiny_agent::context_report;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;

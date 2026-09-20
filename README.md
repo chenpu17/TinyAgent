@@ -106,7 +106,9 @@ agent.set_hooks(Arc::new(Policy));
 
 **常驻会话的热更新**（GUI 宿主场景）：CLI 的 config 在构建时定格，但宿主可以让一个 `Agent` 活整个会话、按需换挡——`set_model` / `set_reasoning_effort` / `set_max_tokens` / `set_max_context_tokens` 都是**纯字段替换**，下次请求生效，MCP 连接、工具装配、历史与 session 全不动（重建 Agent 要重跑 MCP 握手，实测可达秒级）。MCP server 集合也可热增删：`add_mcp_server(McpServerConfig)` / `remove_mcp_server(name)` / `tool_names()`（语义见[MCP 运行时热增删](#运行时热增删库-api)节）。`Agent::compact(&mut events)` 是压缩的**宿主主动入口**：轮次间调用即折叠历史（滚动摘要 + 安全切点 + 落盘 + `Compressed { trigger: "manual" }` 事件），返回 `dropped`/`kept`/摘要调用的 `usage`——这笔成本不进下一次 run 的账单（run 入口会重置总账），由宿主自行记账；`compact_with(&mut events, Some("focus on …"))` 可附带**焦点指令**引导摘要侧重。这些方法的 `&mut self` 签名即顺序契约：run 持有借用，「轮次间调用」由借用检查器强制。注意 `task` 子 agent 持构造期 config 快照，不跟随换挡。
 
-run 结束后从 [`RunOutcome`](src/agent.rs)（或 `Agent::usage()` / `messages()` / `model()` getter）读回诚实的 token 账单与历史。`AgentEvent` 派生了 `Serialize`，绑定层可直接序列化成宿主语言的 dict / object。`Message` 带**稳定 id**（`id: Option<String>`，agent 在消息进入历史时铸造、跨 save/load 不变、压缩折叠不重排存活者）——往消息上挂宿主侧资产（图片卡 / 文件链接）时锚 id 而不是下标，压缩/truncate 后锚点不漂移。
+run 结束后从 [`RunOutcome`](src/agent.rs)（或 `Agent::usage()` / `messages()` / `model()` / `context_breakdown()` getter）读回诚实的 token 账单与历史。`AgentEvent` 派生了 `Serialize`，绑定层可直接序列化成宿主语言的 dict / object。`Message` 带**稳定 id**（`id: Option<String>`，agent 在消息进入历史时铸造、跨 save/load 不变、压缩折叠不重排存活者）——往消息上挂宿主侧资产（图片卡 / 文件链接）时锚 id 而不是下标，压缩/truncate 后锚点不漂移。
+
+**上下文构成查询**（`Agent::context_breakdown()`，拉取式只读、不发请求）：把**下一次请求的上下文**按来源拆出 token **估算**量——system prompt 三段（env 头 / 用户 system / skill 简介）、工具 schema 四类（builtin / mcp / skill / custom，类内逐工具列名与占用）、消息历史按类型聚合（用户文本 / 助手文本 / 工具调用参数 / 工具结果 / 图片 / PDF / `read_skill` 加载的 skill 正文），外加总量。所有数字都是**估算**（与压缩 preflight 同一套 ≈4 字符/token + PDF 页×3000 启发式），**不是 provider 实测**——记账权威永远是 `Usage` 事件 / `usage()`；估算与实测刻意不混流，所以这是查询方法而非事件。有存活的测量锚点（上一轮带 usage 的主 chat）时返回 `calibration: { measured_prompt_tokens, scale }`，全部分量已按锚点实测/估算比值均匀缩放（本身仍是启发式，修正中文低估一类系统性偏差）。压缩折叠 / MCP 热增删 / 前缀改写会使锚点失效，`calibration` 自动回到 `null`（纯启发式口径）。返回的 `ContextBreakdown` 派生了 `Serialize`，绑定层直接给宿主 dict / object（键 snake_case）；自家 TUI 的 `/context` 命令就是它的第一个消费端。
 
 **取消契约**（`set_cancel` / `clear_cancel`）：cancel 是**电平标志、归嵌入方所有**，`run()` 永不清除——run 期间任何时刻置位都有效；带着已置位的 cancel 启动 run 会立即返回（`stop_reason: "cancelled"`、`turns: 0`、零请求零 token）。清残留的主体责任在**受理新任务的一方**：`set_cancel` 装好共享 `Arc<AtomicBool>` 后，在受理点（标记会话 running 的同一处）调 `clear_cancel()`——受理点可能远早于 `run()`（懒构建可达数秒），让内核在 run 入口清会把窗口内用户的停止误当残留吞掉。内置调用点已按此契约工作：TUI 在提交每条输入时清、重试梯把取消视为终态不重试、`compact()` 入口清。绑定层同款：`clear_cancel()`（Python）/ `clearCancel()`（Node）。
 
@@ -160,6 +162,8 @@ print(a.run(on_event=lambda e: print(e))["final_text"])
 
 `run()` 同步阻塞但**释放 GIL**（`py.allow_threads`），长网络等待期间其他 Python 线程可跑；事件回调用 `with_gil` 短暂重获。
 
+**上下文构成**：`a.context_breakdown()` 返回下一请求上下文的估算 token 分解 dict（`system` 三段 / `tools` 四类 / `messages.by_kind` 分型 / `total_tokens` / `calibration`，键 snake_case）——宿主画上下文占比视图的数据源；语义见库 API 节[上下文构成查询](#库-api程序化调用)，与 `usage()` 同款 busy 契约。
+
 **自定义 provider 回调**：传 `provider=` 一个 Python callable，整个替换内置 HTTP provider（不连网、不要 key）。callable 收 `{system, messages, tools, model, max_tokens}`，返回 `str`（=纯文本）或 `{text, stop_reason?, usage?}`：
 
 ```python
@@ -208,6 +212,8 @@ console.log((await a.run(ev => console.log(ev))).final_text);
 ```
 
 `run()` 是 `Promise`——agent loop 在 libuv worker 线程跑（**无 tokio**），事件经 `ThreadsafeFunction` 回主线程；自定义 JS 工具经 TSFN round-trip（agent 线程触发 JS → JS 调 `resolveTool(id, result)` 唤醒 worker）。
+
+**上下文构成**：`a.contextBreakdown()` 同步返回下一请求上下文的估算 token 分解对象（形状见 `wrapper.d.ts` 的 `ContextBreakdown`；键 snake_case 与 Rust serde 一致）——宿主画上下文占比视图的数据源；语义见库 API 节，busy 契约与 `usage()` 同款（run 中调用立即报错，不冻结事件循环）。
 
 **自定义 provider 回调**：传 `provider:` 一个函数（或 `{ chat }` 对象），整个替换内置 HTTP provider（不连网、不要 key）。收 `{system, messages, tools, model, max_tokens}`，返回 `string`（=纯文本）或 `{text, stop_reason?, usage?}`：
 
@@ -395,8 +401,8 @@ tiny-agent --config examples/harness.json --task "跑测试" --retries 3 --outpu
 
 运行中（running）输入框保持可编辑：可以继续打字，`Enter` 会把消息排队——live 区显示暗色的
 `❯ … · queued` 占位行，输入框标题同步显示队列长度；当前轮结束后最老的
-占位行换成真实消息并自动发送；`Ctrl-C` 取消当前轮会**连同排队消息一起丢弃**；`/clear` 在运行中禁用，
-其余斜杠命令（`/export`、`/out`、`/model`、`/limits`、`/tools`、`/system`、`/help`，以及退出用的 `/quit` / `/exit`）照常可用。
+占位行换成真实消息并自动发送；`Ctrl-C` 取消当前轮会**连同排队消息一起丢弃**；`/clear` 与 `/context` 在运行中禁用
+（`/context` 要向持有 agent 的 worker 线程查询），其余斜杠命令（`/export`、`/out`、`/model`、`/limits`、`/tools`、`/system`、`/help`，以及退出用的 `/quit` / `/exit`）照常可用。
 
 **原生选择 / 滚动 / 搜索**：已定稿的对话（你的消息、助手回复、工具调用与结果、系统行）都在终端
 scrollback 里，是真正的终端文本——鼠标拖选即选中原文，复制走终端自身机制（macOS 上选中即复制）；
@@ -442,6 +448,7 @@ length / error 等）才显示警告。工具输出里的 ANSI 颜色序列（�
 | `/export [path]` | 导出对话到文件（无路径时复制到剪贴板） |
 | `/out [n]` | 重印第 n 新的工具结果全文（默认最新一条；错误结果同样可展开） |
 | `/model` `/limits` `/tools` `/system` | 只读查看当前配置 |
+| `/context` | 上下文构成报表（估算 token：system 三段 / 工具四类 / 消息分型 + 校准状态与窗口余量） |
 | `/help` | 命令列表 |
 
 取消机制：`Ctrl-C` 在流式 chunk 间（≤200ms）生效，取消后可继续发下一条——内核 `run()` 不清停止标志（电平契约，嵌入方在受理点负责清），TUI 在提交每条新输入时自动清掉上一轮的残留停止。
@@ -654,7 +661,8 @@ API key 从 `api_key_env` 指定的环境变量读取，不写进配置文件。
      估算**优先锚定 provider 实测值**：上一轮响应报告的 prompt tokens（input + 缓存写 + 缓存读）
      作为基线，只对之后新增的消息做 ≈4 字符/token 的增量估算——这修正了纯字符启发式对中文
      低估 2~3 倍、preflight 过晚触发的问题。无锚点（首轮/恢复会话/历史被剪枝或折叠改写）时
-     回退全历史估算。这是「按模型真实窗口压」，推荐。
+     回退全历史估算。这是「按模型真实窗口压」，推荐。锚点同款校准也驱动 `context_breakdown()`
+     的 `calibration`（见库 API 节），可用它观察压缩前后的构成变化。
    - 未设（`0`，默认）：回退 `compress_threshold_chars`（默认 400k 字符 ≈100k tokens，`0` = 关闭）的字符启发式。
 2. **溢出（overflow）兜底**——**永远开启，与上面配置无关**。当 provider 返回「上下文过长」类错误
    （`context_length_exceeded` / `prompt is too long` / `maximum context length` 等，子串匹配错误体）
@@ -1139,36 +1147,37 @@ release 下 panic 不触发 `Drop`——调试 destructors（如 TUI 终端还�
 <!-- BEGIN CODE STRUCTURE (generated by scripts/gen_structure.py) -->
 ```text
 src/
-├── main.rs        (  927)  # CLI 入口 + 组装（build_agent）+ --session none
-├── lib.rs         (  517)  # 库根：build_agent* / assemble 装配（工具表、ToolCtx、code 安装、技能注入）
-├── config.rs      ( 1562)  # 配置解析 + 任务片段合并 + 批量覆盖白名单
+├── main.rs           (  930)  # CLI 入口 + 组装（build_agent）+ --session none
+├── lib.rs            (  534)  # 库根：build_agent* / assemble 装配（工具表、ToolCtx、code 安装、技能注入）
+├── config.rs         ( 1562)  # 配置解析 + 任务片段合并 + 批量覆盖白名单
 ├── provider/  # LLM 后端
-│   ├── mod.rs         (  930)  # 共享 Message/Block、SSE reader、CancellableSse
-│   ├── openai.rs      ( 1645)  # OpenAI 兼容（include_usage；400 回退：max_tokens→max_completion_tokens / 丢 stream_options）
-│   ├── anthropic.rs   ( 1102)  # Anthropic 原生（message_start/message_delta usage）
-│   └── mock.rs        (  296)  # 测试用脚本化 Provider（cfg(any(test, feature="mock"))）
-├── agent.rs       ( 3263)  # 核心 loop + usage 累计 + cancel + 上下文压缩（前馈/溢出双触发 + 滚动分块摘要）+ 相邻消息归一 + 同 turn 多 task 并行
-├── agent_tests.rs ( 8516)  # 核心 loop 回归测试（provider::mock 脚本化，不连网）
-├── compress.rs    (  795)  # 压缩引擎（find_safe_cut / 分块摘要 / saturating usage 合并）
-├── retry.rs       (  158)  # batch --retries / 单跑瞬态重试共用的指数退避（±25% jitter 防 lockstep）
-├── signal.rs      (  114)  # headless SIGINT → cancel（首次优雅 / 二次硬退 130）
-├── session.rs     (  382)  # 会话持久化（原子写 + archive 折叠）
-├── skills.rs      ( 1017)  # 三级技能加载（内置 / 用户目录 / 项目）
-├── hooks.rs       (  175)  # hooks 闸门（Deny / Modify / 审计）
+│   ├── mod.rs            (  930)  # 共享 Message/Block、SSE reader、CancellableSse
+│   ├── openai.rs         ( 1645)  # OpenAI 兼容（include_usage；400 回退：max_tokens→max_completion_tokens / 丢 stream_options）
+│   ├── anthropic.rs      ( 1102)  # Anthropic 原生（message_start/message_delta usage）
+│   └── mock.rs           (  296)  # 测试用脚本化 Provider（cfg(any(test, feature="mock"))）
+├── agent.rs          ( 3359)  # 核心 loop + usage 累计 + cancel + 上下文压缩（前馈/溢出双触发 + 滚动分块摘要）+ 相邻消息归一 + 同 turn 多 task 并行
+├── agent_tests.rs    ( 8782)  # 核心 loop 回归测试（provider::mock 脚本化，不连网）
+├── compress.rs       (  810)  # 压缩引擎（find_safe_cut / 分块摘要 / saturating usage 合并 + block 级计费原语）
+├── context_report.rs (  785)  # 上下文构成分解（ContextBreakdown 估算口径：system 三段 / 工具四类 / 消息分型 + 锚点校准）
+├── retry.rs          (  158)  # batch --retries / 单跑瞬态重试共用的指数退避（±25% jitter 防 lockstep）
+├── signal.rs         (  114)  # headless SIGINT → cancel（首次优雅 / 二次硬退 130）
+├── session.rs        (  382)  # 会话持久化（原子写 + archive 折叠）
+├── skills.rs         ( 1017)  # 三级技能加载（内置 / 用户目录 / 项目）
+├── hooks.rs          (  181)  # hooks 闸门（Deny / Modify / 审计）
 ├── tools/  # 工具集：内置工具 + MCP 包装 + task 子 agent + run_code（feature code）
-│   ├── mod.rs         (  796)  # Tool trait + ToolCtx + CallbackTool/SharedTool + build 白名单组装
-│   ├── shell.rs       (  920)  # shell 工具
-│   ├── file.rs        ( 1322)  # read_file / write_file / edit_file / list_dir
-│   ├── image.rs       (   83)  # load_image 工具
-│   ├── document.rs    (  100)  # PDF → Block::Document 加载（库 API load_document_block）
-│   ├── skill.rs       (  777)  # read_skill / list_skill（不在白名单，由装配注入）
-│   ├── mcp.rs         (  468)  # MCP 工具包装（sanitize_name + wire_name 分发）
-│   ├── subagent.rs    (  913)  # task 子 agent 工具（独立上下文 + turn 封顶；不可递归）
-│   ├── todo.rs        (  306)  # todo 工具（任务计划，全量替换；plan 落 result.json）
-│   └── run_code.rs    ( 5568)  # run_code 工具（feature code）：QuickJS-in-wasm 沙箱——epoch/fuel/mem 限额、路径拦截、hooks 闸门、审计 meta（双哈希）
-├── mcp.rs         ( 1422)  # MCP 客户端（stdio / Streamable HTTP / 旧版 SSE）
-├── batch.rs       ( 3035)  # 批量任务 + --retries/--failed + 报告合并
-├── harness.rs     ( 1962)  # headless 模式 + result.json + NDJSON + exit code
-└── tui.rs         ( 7406)  # TUI（feature tui）：内联流式渲染（对话进原生 scrollback）/ InputBuffer 多行输入 / 斜杠命令+补全 / markdown 渲染 / bracketed paste
+│   ├── mod.rs            (  830)  # Tool trait + ToolCtx + CallbackTool/SharedTool + build 白名单组装
+│   ├── shell.rs          (  924)  # shell 工具
+│   ├── file.rs           ( 1338)  # read_file / write_file / edit_file / list_dir
+│   ├── image.rs          (   87)  # load_image 工具
+│   ├── document.rs       (  100)  # PDF → Block::Document 加载（库 API load_document_block）
+│   ├── skill.rs          (  785)  # read_skill / list_skill（不在白名单，由装配注入）
+│   ├── mcp.rs            (  472)  # MCP 工具包装（sanitize_name + wire_name 分发）
+│   ├── subagent.rs       (  917)  # task 子 agent 工具（独立上下文 + turn 封顶；不可递归）
+│   ├── todo.rs           (  310)  # todo 工具（任务计划，全量替换；plan 落 result.json）
+│   └── run_code.rs       ( 5572)  # run_code 工具（feature code）：QuickJS-in-wasm 沙箱——epoch/fuel/mem 限额、路径拦截、hooks 闸门、审计 meta（双哈希）
+├── mcp.rs            ( 1422)  # MCP 客户端（stdio / Streamable HTTP / 旧版 SSE）
+├── batch.rs          ( 3035)  # 批量任务 + --retries/--failed + 报告合并
+├── harness.rs        ( 1962)  # headless 模式 + result.json + NDJSON + exit code
+└── tui.rs            ( 7696)  # TUI（feature tui）：内联流式渲染（对话进原生 scrollback）/ InputBuffer 多行输入 / 斜杠命令+补全 / markdown 渲染 / bracketed paste
 ```
 <!-- END CODE STRUCTURE -->

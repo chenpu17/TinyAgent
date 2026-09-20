@@ -8514,3 +8514,269 @@ fn run_code_switch_face_none_branch() {
         );
     }
 }
+
+// ── context_breakdown: composition, calibration, attribution ─────────────
+//
+// The breakdown's own arithmetic (running-floor partition, per-bucket sums)
+// is pinned in context_report.rs's unit tests; these cover the AGENT side —
+// where the parts come from (fields, anchor, tool table) and the anchor's
+// lifecycle around runs and folds.
+
+#[test]
+fn context_breakdown_uncalibrated_matches_estimate() {
+    // Before any billed run there is no anchor: pure heuristic, parts sum
+    // to EXACTLY estimate_tokens over the same (messages, system, tools).
+    let cfg = cfg_with(5, 0, 0);
+    let initial = vec![
+        user_text(&"中文历史内容估算".repeat(30)),
+        Message::assistant(vec![Block::Text("reply text".into())]),
+    ];
+    let agent = Agent::new(
+        &cfg,
+        Box::new(MockProvider::new(vec![]).0),
+        vec![],
+        initial,
+        test_ctx(),
+    );
+    let bd = agent.context_breakdown();
+    assert!(bd.calibration.is_none(), "no billed run yet");
+    let expected = crate::compress::estimate_tokens(
+        &agent.messages,
+        agent.system.as_deref(),
+        agent.tool_schema_chars,
+    ) as u64;
+    assert_eq!(bd.total_tokens, expected);
+    assert_eq!(
+        bd.system.tokens + bd.tools.tokens + bd.messages.tokens,
+        expected
+    );
+    // The two text kinds carry the whole (text-only) history.
+    assert_eq!(
+        bd.messages.by_kind.user_text + bd.messages.by_kind.assistant_text,
+        bd.messages.tokens
+    );
+    // cfg_with has inject_environment=false and no system prompt: the whole
+    // system section is empty.
+    assert_eq!(bd.system.tokens, 0);
+}
+
+#[test]
+fn context_breakdown_calibrates_after_billed_run() {
+    // CJK-heavy history: chars/4 under-counts it, so the anchor's measured/
+    // estimated scale exceeds 1 and the breakdown's components scale past
+    // their raw estimates. The anchor survives the run boundary (a follow-up
+    // push_user keeps the prefix intact — that's the TUI's main use).
+    let cfg = cfg_with(5, 0, 0);
+    let cjk = "中文内容估算校准锚点".repeat(150); // 1200 chars → ~300 raw est
+    let (prov, state) = MockProvider::new(vec![mock::resp_text("done", mock::mk_usage(10_000, 5))]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text(&cjk)],
+        test_ctx(),
+    );
+    agent.run(&mut |_| {}).unwrap();
+    assert_eq!(state.calls(), 1);
+
+    // The anchor's raw denominator is the PREFIX AS REQUESTED (the initial
+    // user message), not the post-run history — recompute it that way.
+    let anchor = agent.usage_anchor.as_ref().expect("anchor written");
+    let raw_prefix = crate::compress::estimate_tokens(
+        &agent.messages[..anchor.msg_count],
+        agent.system.as_deref(),
+        agent.tool_schema_chars,
+    ) as u64;
+    let bd = agent.context_breakdown();
+    let cal = bd.calibration.expect("billed run leaves a live anchor");
+    assert_eq!(cal.measured_prompt_tokens, 10_000);
+    assert!(
+        cal.scale > 1.0,
+        "chars/4 under-counts CJK, scale={}",
+        cal.scale
+    );
+    assert_eq!(cal.scale, 10_000.0 / raw_prefix as f64);
+    // The scaled total towers over the raw estimate (that's the point of
+    // calibrating) and still splits across the three sections.
+    assert!(
+        bd.total_tokens > raw_prefix * 5,
+        "scaled={}, raw={}",
+        bd.total_tokens,
+        raw_prefix
+    );
+    assert_eq!(cal.scale, anchor.scale);
+
+    // Follow-up message: prefix unchanged → anchor (and calibration) stays.
+    agent.push_user(vec![Block::Text("one more".into())]);
+    assert!(agent.context_breakdown().calibration.is_some());
+}
+
+#[test]
+fn calibration_voids_on_fold() {
+    // A manual compact rewrites the history without a main-chat re-anchor:
+    // the anchor's prefix no longer matches and the breakdown falls back to
+    // the pure heuristic (calibration None), still summing exactly.
+    let mut cfg = cfg_with(5, 0, 0);
+    cfg.limits.keep_recent_messages = 2;
+    let initial = vec![
+        user_text("task one with enough body to summarize meaningfully"),
+        Message::assistant(vec![Block::Text("did one".into())]),
+        user_text("task two with enough body to summarize meaningfully"),
+        Message::assistant(vec![Block::Text("did two".into())]),
+        user_text("task three with enough body to summarize meaningfully"),
+        Message::assistant(vec![Block::Text("did three".into())]),
+        user_text("latest question"),
+    ];
+    let (prov, state) = MockProvider::new(vec![
+        mock::resp_text("done", mock::mk_usage(500, 1)),
+        mock::resp_text("SUMMARY", mock::mk_usage(300, 1)),
+    ]);
+    let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+    agent.run(&mut |_| {}).unwrap();
+    assert!(agent.context_breakdown().calibration.is_some());
+
+    let out = agent
+        .compact(&mut |_| {})
+        .unwrap()
+        .expect("history compressible");
+    assert!(out.dropped > 0);
+    assert_eq!(state.calls(), 2);
+    let bd = agent.context_breakdown();
+    assert!(bd.calibration.is_none(), "fold rewrote the prefix");
+    let expected = crate::compress::estimate_tokens(
+        &agent.messages,
+        agent.system.as_deref(),
+        agent.tool_schema_chars,
+    ) as u64;
+    assert_eq!(bd.total_tokens, expected);
+}
+
+#[test]
+fn tool_origin_buckets_and_hot_remove() {
+    // The four origin buckets each hold their tools; an MCP hot-remove
+    // rebuilds the table, empties the mcp bucket, and (tool_schema_chars
+    // changed) voids any anchor — here just the raw re-sum.
+    let cfg = cfg_with(5, 0, 0);
+    let echo = crate::tools::CallbackTool::new(
+        ToolDef {
+            name: "echo".into(),
+            description: "test callback".into(),
+            schema: serde_json::json!({"type": "object"}),
+        },
+        |_, _| Ok(ToolOutput::text("ok")),
+    );
+    let (index, _) = crate::skills::scan(&[]);
+    let tools: Vec<Box<dyn Tool>> = vec![
+        Box::new(echo) as Box<dyn Tool>,
+        Box::new(FakeOriginMcpTool),
+        Box::new(crate::tools::ReadSkill::new(index.clone())),
+        Box::new(crate::tools::ListSkill::new(index)),
+    ];
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(MockProvider::new(vec![]).0),
+        tools,
+        vec![],
+        test_ctx(),
+    );
+    let names = |bd: &crate::context_report::ContextBreakdown, b: &str| -> Vec<String> {
+        let cat = match b {
+            "builtin" => &bd.tools.builtin,
+            "mcp" => &bd.tools.mcp,
+            "skill" => &bd.tools.skill,
+            _ => &bd.tools.custom,
+        };
+        cat.tools.iter().map(|t| t.name.clone()).collect()
+    };
+    let bd = agent.context_breakdown();
+    assert_eq!(names(&bd, "custom"), ["echo"]);
+    assert_eq!(names(&bd, "mcp"), ["fake_mcp"]);
+    assert_eq!(names(&bd, "skill"), ["read_skill", "list_skill"]);
+    assert!(names(&bd, "builtin").is_empty());
+
+    agent.remove_mcp_server("fake_server").unwrap();
+    let bd = agent.context_breakdown();
+    assert!(
+        bd.tools.mcp.tools.is_empty(),
+        "hot remove emptied the bucket"
+    );
+    assert_eq!(names(&bd, "skill"), ["read_skill", "list_skill"]);
+    // The remaining buckets still sum against the live tool table.
+    assert_eq!(
+        bd.tools.tokens,
+        bd.tools.builtin.tokens
+            + bd.tools.mcp.tokens
+            + bd.tools.skill.tokens
+            + bd.tools.custom.tokens
+    );
+}
+
+/// A minimal tool that claims the MCP origin + server the hot-remove path
+/// routes by (capability-marker style, like the real McpTool).
+#[derive(Default)]
+struct FakeOriginMcpTool;
+
+impl Tool for FakeOriginMcpTool {
+    fn def(&self) -> ToolDef {
+        ToolDef {
+            name: "fake_mcp".into(),
+            description: "fake".into(),
+            schema: serde_json::json!({"type": "object"}),
+        }
+    }
+    fn run(&self, _input: &Value, _ctx: &ToolCtx) -> anyhow::Result<ToolOutput> {
+        Ok(ToolOutput::text("ok"))
+    }
+    fn origin(&self) -> crate::tools::ToolOrigin {
+        crate::tools::ToolOrigin::Mcp
+    }
+    fn mcp_server(&self) -> Option<&str> {
+        Some("fake_server")
+    }
+}
+
+#[test]
+fn env_attribution_splits_env_from_base() {
+    // inject_environment=true: the env header is its own segment, the user's
+    // prompt is the base, and no intro exists on direct construction
+    // (skill_intro == 0 — the default attribution is correct without the
+    // assembly-time setter).
+    let cfg = serde_json::from_str::<Config>(
+        r#"{"provider":"openai","api_key_env":"K","model":"m","inject_environment":true,"system_prompt":"You are a careful test agent."}"#,
+    )
+    .unwrap();
+    let agent = Agent::new(
+        &cfg,
+        Box::new(MockProvider::new(vec![]).0),
+        vec![],
+        vec![],
+        test_ctx(),
+    );
+    let bd = agent.context_breakdown();
+    assert!(bd.system.env > 0, "env header attributed");
+    assert!(bd.system.base > 0, "user prompt attributed");
+    assert_eq!(bd.system.skill_intro, 0, "direct try_new has no intro");
+    assert_eq!(
+        bd.system.env + bd.system.base + bd.system.skill_intro,
+        bd.system.tokens
+    );
+
+    // inject_environment=false: everything after (nothing) — env == 0 and
+    // the base carries the whole prompt.
+    let cfg = serde_json::from_str::<Config>(
+        r#"{"provider":"openai","api_key_env":"K","model":"m","inject_environment":false,"system_prompt":"You are a careful test agent."}"#,
+    )
+    .unwrap();
+    let agent = Agent::new(
+        &cfg,
+        Box::new(MockProvider::new(vec![]).0),
+        vec![],
+        vec![],
+        test_ctx(),
+    );
+    let bd = agent.context_breakdown();
+    assert_eq!(bd.system.env, 0);
+    assert_eq!(bd.system.skill_intro, 0);
+    assert_eq!(bd.system.base, bd.system.tokens);
+    assert!(bd.system.tokens > 0);
+}

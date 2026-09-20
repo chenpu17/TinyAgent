@@ -796,3 +796,94 @@ def test_code_method_from_callback_raises_instead_of_deadlocking(tmp_path):
     t.join(timeout=30)
     assert not t.is_alive(), "run() deadlocked: code method re-entered the lock"
     assert outcome["err"] is not None, "disable_code from on_event should have raised"
+
+
+# ── 16. context_breakdown (estimated composition of the next request) ──────
+
+def test_context_breakdown_shape_and_calibration(tmp_path):
+    """context_breakdown() returns the estimated composition dict: calibration
+    is None before any billed run, then carries the anchor's measured prompt
+    size after a usage-reporting run. Every number is an estimate — usage()
+    stays the billing authority — so this pins the SHAPE, not the numbers."""
+    usage = {
+        "prompt_tokens": 5000,
+        "completion_tokens": 9,
+        "total_tokens": 5009,
+    }
+
+    def respond(handler, body):
+        write_sse(handler, text_sse("done", usage=usage))
+
+    mock = ScriptedMock([respond]).start()
+    try:
+        cfg = openai_config(mock.url, tools=[], workdir=str(tmp_path))
+        a = tiny_agent.Agent(cfg, api_key=MOCK_KEY)
+        a.push_user("hi 你好")
+        before = a.context_breakdown()
+        assert before["calibration"] is None, "no billed run yet"
+        assert before["total_tokens"] > 0
+
+        a.run()
+        bd = a.context_breakdown()
+        cal = bd["calibration"]
+        assert cal["measured_prompt_tokens"] == 5000
+        # chars/4 under-counts the CJK text → the anchored scale exceeds 1.
+        assert cal["scale"] > 1.0
+        # The pinned JSON face (bindings hand this shape to host code).
+        for k in ("system", "tools", "messages", "total_tokens", "calibration"):
+            assert k in bd, k
+        for k in ("env", "base", "skill_intro", "tokens"):
+            assert k in bd["system"], k
+        for k in ("builtin", "mcp", "skill", "custom", "tokens"):
+            assert k in bd["tools"], k
+        for k in ("user_text", "assistant_text", "tool_use", "tool_result",
+                  "image", "document", "skill_content", "other"):
+            assert k in bd["messages"]["by_kind"], k
+    finally:
+        mock.stop()
+
+
+def test_context_breakdown_custom_tool_bucket(tmp_path):
+    """A host callback tool's schema is attributed to the custom bucket."""
+    tool = tiny_agent.Tool(
+        name="get_weather",
+        description="Look up the weather for a city.",
+        schema={"type": "object", "properties": {"city": {"type": "string"}}},
+        callback=lambda args: "sunny",
+    )
+    cfg = openai_config("http://unused", tools=[], workdir=str(tmp_path))
+
+    def provider(request):
+        return {"text": "done", "stop_reason": "end_turn"}
+
+    a = tiny_agent.Agent(cfg, tools=[tool], provider=provider)
+    bd = a.context_breakdown()
+    names = [t["name"] for t in bd["tools"]["custom"]["tools"]]
+    assert names == ["get_weather"]
+    assert bd["tools"]["custom"]["tokens"] > 0
+    # Nothing else claims it.
+    assert bd["tools"]["builtin"]["tools"] == []
+    assert bd["tools"]["mcp"]["tools"] == []
+
+
+def test_context_breakdown_from_other_thread_during_run(tmp_path):
+    """Same cross-thread contract as usage(): blocks (GIL released) until the
+    in-flight run finishes, then returns — never deadlocks."""
+    started = threading.Event()
+
+    def provider(request):
+        started.set()
+        time.sleep(1.0)
+        return {"text": "done", "stop_reason": "end_turn"}
+
+    cfg = openai_config("http://unused", tools=[], workdir=str(tmp_path))
+    agent = tiny_agent.Agent(cfg, provider=provider)
+    agent.push_user("hi")
+
+    t = threading.Thread(target=agent.run)
+    t.start()
+    assert started.wait(timeout=30), "provider never called"
+    bd = agent.context_breakdown()
+    assert bd["total_tokens"] > 0
+    t.join(timeout=30)
+    assert not t.is_alive(), "run() deadlocked against a cross-thread sync call"

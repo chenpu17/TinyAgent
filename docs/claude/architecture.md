@@ -456,6 +456,33 @@
   `id: 'm1'`。
 - **会话持久化**由 `session.rs` 负责；`--session none`（`main::session_target` 判定字面量 `none`）
   关闭读写，与 `--resume` 互斥（直接 bail）。
+- **上下文构成分解（`context_report.rs` + `Agent::context_breakdown()`，拉取式只读查询）**：把下一次
+  请求的上下文按来源拆出 token **估算**量——system 三段（env 头/用户 base/skill 简介）、工具 schema
+  四类（`Tool::origin()` 能力标记：Builtin/Mcp/Skill/Custom，默认 Custom、SharedTool 委托 inner，类内
+  逐工具 name+desc+schema JSON）、消息历史按 block 分型（user_text/assistant_text/tool_use/tool_result/
+  image/document/skill_content/other；**没有 thinking 桶**——思考是纯事件流永不进 history，恒 0 字段是
+  撒谎式 API；skill_content 按 tool 名 == `read_skill` 归因，ToolResult 只有 tool_use_id，先扫 ToolUse 建
+  id→name 映射（同 compress `todo_use_ids` 模式），eager 注入对与运行期真实调用一并归入）。**口径纪律**：
+  一切数字是启发式估算（`compress::estimate_tokens` 同一套 yardstick：chars/4 + 图片 len/100 + PDF 页
+  ×3000），**不是 provider 实测——记账权威永远是 Usage 事件/`usage()`；估算与实测刻意不混流**，所以走
+  拉取式查询而非事件。**等和不变量**：未校准时
+  `system.tokens+tools.tokens+messages.tokens == total_tokens == estimate_tokens(全量)` 严格成立，靠**单趟
+  running-floor 分摊**（对全部 chars 段按固定顺序一遍：每段领 `floor(acc_after/4)-floor(acc_before/4)`；
+  各段独立 /4 会因舍入差 1-2——`uncalibrated_total_equals_estimate_tokens` 测试是刻意钉子）；共享计费
+  原语 `compress::block_chars`/`block_pdf_tokens` 是 total_chars/estimate_tokens 与分解共用的单点
+  （新 Block 变体在此编译期强制决策，context_report 的分型 match 同样穷尽、`other` 是显式兜底目的地
+  而非 wildcard）。**校准**：`UsageAnchor` 加 `scale: f64`（锚点写点顺手算
+  `raw=estimate_tokens(同前缀)`，`scale=prompt/raw`，raw==0→1.0），`live_anchor()`（estimate_input_tokens
+  四条件校验的抽取复用）有效时全分量 ×scale 并透出 `Calibration{measured_prompt_tokens, scale}`——
+  **均匀缩放本身是启发式**（假设估算误差在各成分间比例相近，CJK 低估类成立）；prune/fold/热增删/
+  前缀改写使锚点失效 → calibration 自动回 None。**归因流**：env 头长度在 `try_new` 内（`system_with_env`
+  单点）记录；skill 简介边界只有 assemble 知道（render_intro 拼进 cfg 克隆），经
+  `pub(crate) set_skill_intro_base` 由 build_agent\* 在**装配窗口**（try_new 后、返回前，无并发）收窄；
+  **`skill_intro_base_chars` 默认 = cfg.system_prompt.len()（"env 之后全是 base"）**——默认 0 会把直接
+  try_new 用户的 system prompt 全错归 skill_intro；直接构造/子 agent（不继承 skill）默认归因天然正确。
+  绑定照 `usage()` 模式透出（Python `context_breakdown()` pythonize dict / Node native `contextBreakdown()`
+  serde Value + wrapper.d.ts 同步两件套纪律）；TUI `/context` 是第一个消费端（worker channel 模式，
+  busy 拒绝与 /clear 同款——worker 在 run 里不泵 in_rx）。
 - **TUI 是可选 feature**（`ratatui` + `crossterm` + `tui-markdown` + `unicode-width`），
   `src/tui.rs` 在 `#[cfg(feature = "tui")]` 后。默认 headless 版不含它，保持体积。
   **内联/流式渲染**（非全屏 alternate-screen，与 Claude Code / Codex 同款）：

@@ -1,5 +1,6 @@
 use crate::compress;
 use crate::config::{Config, Limits, McpServerConfig};
+use crate::context_report::{Calibration, ContextBreakdown};
 use crate::hooks::ToolDecision;
 use crate::provider::{Block, ChatEvent, ChatRequest, Message, Provider, Role, ToolDef, Usage};
 use crate::tools::{BudgetGate, Tool, ToolConcurrency, ToolCtx, ToolOutput};
@@ -513,6 +514,14 @@ struct UsageAnchor {
     /// `tool_schema_chars` at request time — same rationale as `system_chars`
     /// (MCP hot add/remove rebuilds the tool table between runs).
     tool_schema_chars: usize,
+    /// Measured/estimated ratio at anchor time: `prompt_tokens` ÷
+    /// `estimate_tokens` over the SAME prefix/system/tool table. `1.0` when
+    /// the raw estimate was 0 (degenerate empty context). Feeds
+    /// `context_breakdown`'s calibration: while the anchor stays valid,
+    /// every breakdown component is uniformly scaled by it — a heuristic
+    /// (see `context_report::Calibration`'s doc), not a per-component
+    /// measurement.
+    scale: f64,
 }
 
 pub struct Agent {
@@ -584,6 +593,19 @@ pub struct Agent {
     /// which rebuilds it via `refresh_tool_defs` — recomputing per turn would
     /// re-serialize every schema on EVERY turn's preflight check.
     tool_schema_chars: usize,
+    /// `context_breakdown`'s system attribution: bytes of the `# Environment`
+    /// header `system_with_env` prepended in `try_new` (separator included;
+    /// 0 when `inject_environment` is off). The system prompt is assembled
+    /// exactly once at construction and never mutated, so a
+    /// construction-time record is valid for the agent's whole life.
+    system_env_chars: usize,
+    /// Bytes of the USER's system prompt inside `self.system` (after the env
+    /// header); everything beyond it is the skill intro `assemble` appended.
+    /// Initialized to "everything after env is base" (correct for direct
+    /// `try_new` — no intro exists there, and for `task` sub-agents, which
+    /// don't inherit skills); `build_agent*` narrows it to the pre-assembly
+    /// length via `set_skill_intro_base` inside the assembly window.
+    skill_intro_base_chars: usize,
     /// The ONE top-level `run_code` instance (design §8.6, H3): constructed by
     /// `assemble` and installed post-construction via `set_code_tool`. When
     /// enabled, a CLONE lives in `tools` — both share the
@@ -673,17 +695,27 @@ impl Agent {
         // chokepoint — so BOTH the main agent and every `task` sub-agent (which
         // overwrites system_prompt then calls Agent::new) get it. `os`/`shell`
         // are args to the pure helper so the cross-platform shape is testable
-        // off-platform; read `ctx.workdir` before it is moved below.
-        let system = if cfg.inject_environment {
-            system_with_env(
+        // off-platform; read `ctx.workdir` before it is moved below. The env
+        // header's byte length (separator included — `system_with_env` joins
+        // with `"\n\n"`) is recorded for `context_breakdown`'s attribution.
+        let (system, system_env_chars) = if cfg.inject_environment {
+            let base_chars = cfg.system_prompt.as_ref().map(|p| p.len()).unwrap_or(0);
+            let s = system_with_env(
                 cfg.system_prompt.as_deref(),
                 std::env::consts::OS,
                 if cfg!(unix) { "sh -c" } else { "cmd /C" },
                 &ctx.workdir.display().to_string(),
-            )
+            );
+            let env_chars = s.as_ref().map_or(0, |s| s.len().saturating_sub(base_chars));
+            (s, env_chars)
         } else {
-            cfg.system_prompt.clone()
+            (cfg.system_prompt.clone(), 0)
         };
+        // Default attribution: everything after the env header is the user's
+        // base prompt (skill_intro 0) — exactly right for direct construction
+        // and sub-agents. `build_agent*` narrows this via
+        // `set_skill_intro_base` when assembly appended a skill intro.
+        let skill_intro_base_chars = cfg.system_prompt.as_ref().map(|p| p.len()).unwrap_or(0);
         // Ingest point for the initial history: id-less messages (a fresh
         // task, an old-format session file) get agent-minted ids here; ones
         // that already carry an id (resumed save, host-supplied) keep it.
@@ -712,6 +744,8 @@ impl Agent {
             usage_anchor: None,
             session_archive: Vec::new(),
             tool_schema_chars,
+            system_env_chars,
+            skill_intro_base_chars,
             #[cfg(feature = "code")]
             code_tool: None,
             #[cfg(feature = "code")]
@@ -732,6 +766,35 @@ impl Agent {
     /// each [`Agent::run`]; after a run returns it holds that run's summed usage.
     pub fn usage(&self) -> Usage {
         self.usage
+    }
+
+    /// The estimated token composition of the NEXT request's context:
+    /// system prompt (env header / user base / skill intro), tool schemas
+    /// (builtin / mcp / skill / custom, per tool), and message history by
+    /// block kind — plus a total and, when a measured anchor is still
+    /// valid, the calibration that scaled the numbers. Read-only, emits no
+    /// events, sends no request.
+    ///
+    /// Every number is an ESTIMATE on the `compress::estimate_tokens`
+    /// yardstick (chars/4, images len/100, PDF pages × 3000), never a
+    /// provider measurement — the billing authority stays
+    /// [`AgentEvent::Usage`] / [`Agent::usage`]. That register split is why
+    /// this is a pull query and not an event. See `crate::context_report`'s
+    /// module docs for the exactness invariant and calibration semantics.
+    pub fn context_breakdown(&self) -> ContextBreakdown {
+        let calibration = self.live_anchor().map(|a| Calibration {
+            measured_prompt_tokens: a.prompt_tokens,
+            scale: a.scale,
+        });
+        crate::context_report::build(
+            self.system.as_deref(),
+            self.system_env_chars,
+            self.skill_intro_base_chars,
+            &self.tools,
+            &self.tool_defs,
+            &self.messages,
+            calibration,
+        )
     }
 
     /// The model name this agent sends with each request (from the config).
@@ -963,6 +1026,17 @@ impl Agent {
     #[cfg(feature = "code")]
     pub(crate) fn code_audit(&self) -> Option<(crate::config::SkillInjection, bool)> {
         self.code_audit
+    }
+
+    /// Narrow the system-prompt attribution for `context_breakdown`: record
+    /// how many bytes of the (post-env) system prompt are the USER's, with
+    /// everything after that being the skill intro `assemble` appended. Only
+    /// `build_agent*` knows the pre-assembly length, and it calls this inside
+    /// the assembly window — between `try_new` and returning the agent, no
+    /// concurrency. `pub(crate)` on purpose: not a host knob, pure
+    /// attribution bookkeeping.
+    pub(crate) fn set_skill_intro_base(&mut self, base_chars: usize) {
+        self.skill_intro_base_chars = base_chars;
     }
 
     /// Atomically replace the WHOLE [`CodeConfig`] (switch + every limit /
@@ -1628,16 +1702,30 @@ impl Agent {
                 // `estimate_input_tokens`): the provider's own count of the
                 // prompt it just processed, measured against the history as
                 // sent. All three input axes made up that prompt; output
-                // tokens did not.
+                // tokens did not. The measured/estimated `scale` recorded
+                // alongside is what `context_breakdown`'s calibration
+                // multiplies its components by while this anchor stays
+                // valid.
+                let prompt_tokens = u
+                    .input_tokens
+                    .saturating_add(u.cache_creation_input_tokens)
+                    .saturating_add(u.cache_read_input_tokens);
+                let raw = compress::estimate_tokens(
+                    &self.messages[..request_msg_count],
+                    self.system.as_deref(),
+                    self.tool_schema_chars,
+                );
                 self.usage_anchor = Some(UsageAnchor {
-                    prompt_tokens: u
-                        .input_tokens
-                        .saturating_add(u.cache_creation_input_tokens)
-                        .saturating_add(u.cache_read_input_tokens),
+                    prompt_tokens,
                     msg_count: request_msg_count,
                     prefix_chars: compress::total_chars(&self.messages[..request_msg_count]),
                     system_chars: self.system.as_ref().map(|s| s.len()),
                     tool_schema_chars: self.tool_schema_chars,
+                    scale: if raw == 0 {
+                        1.0
+                    } else {
+                        prompt_tokens as f64 / raw as f64
+                    },
                 });
             }
 
@@ -2752,27 +2840,35 @@ impl Agent {
     /// reports no usage) or when the prefix changed since the measurement —
     /// both strictly conservative directions.
     fn estimate_input_tokens(&self) -> usize {
-        if let Some(a) = &self.usage_anchor {
-            let valid = self.messages.len() >= a.msg_count
-                && compress::total_chars(&self.messages[..a.msg_count]) == a.prefix_chars
-                && self.system.as_ref().map(|s| s.len()) == a.system_chars
-                && self.tool_schema_chars == a.tool_schema_chars;
-            if valid {
-                let delta = compress::estimate_tokens(
-                    &self.messages[a.msg_count..],
-                    /* system: */ None,
-                    /* tool_schema_chars: */ 0,
-                );
-                return usize::try_from(a.prompt_tokens)
-                    .unwrap_or(usize::MAX)
-                    .saturating_add(delta);
-            }
+        if let Some(a) = self.live_anchor() {
+            let delta = compress::estimate_tokens(
+                &self.messages[a.msg_count..],
+                /* system: */ None,
+                /* tool_schema_chars: */ 0,
+            );
+            return usize::try_from(a.prompt_tokens)
+                .unwrap_or(usize::MAX)
+                .saturating_add(delta);
         }
         compress::estimate_tokens(
             &self.messages,
             self.system.as_deref(),
             self.tool_schema_chars,
         )
+    }
+
+    /// The anchor that still describes the current history/prompt shape —
+    /// the one four-condition validity check `estimate_input_tokens` and
+    /// `context_breakdown`'s calibration share (history only grew, prefix
+    /// unchanged, system prompt and tool table untouched). `None` once any
+    /// of those moved (prune/fold rewrite, MCP hot add/remove, prefix edit).
+    fn live_anchor(&self) -> Option<&UsageAnchor> {
+        let a = self.usage_anchor.as_ref()?;
+        let valid = self.messages.len() >= a.msg_count
+            && compress::total_chars(&self.messages[..a.msg_count]) == a.prefix_chars
+            && self.system.as_ref().map(|s| s.len()) == a.system_chars
+            && self.tool_schema_chars == a.tool_schema_chars;
+        valid.then_some(a)
     }
 
     /// One prune pass over the history with the configured protection window

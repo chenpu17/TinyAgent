@@ -216,6 +216,27 @@ pub enum ToolConcurrency {
     Parallel,
 }
 
+/// Which source a tool came from — the axis [`Agent::context_breakdown`]
+/// (crate::agent::Agent::context_breakdown) buckets tool-schema tokens by.
+/// Producer-side enum (tool authors CONSTRUCT it from `origin()`; only the
+/// core consumes/matches it) — deliberately NOT `#[non_exhaustive]`, per the
+/// `AgentEvent` hygiene rule: constructors must not be forced into wildcard
+/// arms. New variants are still possible (semver-minor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolOrigin {
+    /// Ships in the binary: shell / files / image / todo / task / run_code.
+    Builtin,
+    /// Discovered from an MCP server config (`McpTool`).
+    Mcp,
+    /// The progressive-disclosure pair `read_skill` / `list_skill`, injected
+    /// by assembly alongside the skill intro.
+    Skill,
+    /// Host-injected (`CallbackTool` / bindings) or unknown — the trait's
+    /// default so a third-party tool never has to say.
+    Custom,
+}
+
 /// Validate a tool list's names: non-empty, `[A-Za-z0-9_-]` only, ≤64 chars
 /// (the Anthropic tool-name / OpenAI function-name wire limit), and unique.
 /// Called from BOTH assembly ([`crate::assemble`], covering built-in + MCP +
@@ -347,6 +368,16 @@ pub trait Tool: Send + Sync {
     fn mcp_server(&self) -> Option<&str> {
         None
     }
+
+    /// Which source bucket this tool's schema belongs to in
+    /// `Agent::context_breakdown`'s tool report. Default `Custom` — the
+    /// safe attribution for anything the core didn't ship: a host-injected
+    /// or third-party tool that doesn't say otherwise. Capability-marker
+    /// style like `concurrency()`; built-ins / `McpTool` / the skill pair
+    /// override.
+    fn origin(&self) -> ToolOrigin {
+        ToolOrigin::Custom
+    }
 }
 
 /// A tool backed by a closure — the zero-boilerplate way to add a custom tool,
@@ -466,6 +497,9 @@ impl Tool for SharedTool {
     }
     fn mcp_server(&self) -> Option<&str> {
         self.inner.mcp_server()
+    }
+    fn origin(&self) -> ToolOrigin {
+        self.inner.origin()
     }
 }
 

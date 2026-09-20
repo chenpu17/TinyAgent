@@ -1,4 +1,4 @@
-use super::{truncate, Tool, ToolCtx, ToolOutput};
+use super::{truncate, Tool, ToolCtx, ToolOrigin, ToolOutput};
 use crate::provider::ToolDef;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -9,6 +9,10 @@ use std::time::{Duration, Instant};
 pub struct Shell;
 
 impl Tool for Shell {
+    fn origin(&self) -> ToolOrigin {
+        ToolOrigin::Builtin
+    }
+
     /// Guest-registry opt-in (run_code's `tools.call` surface) — shell is
     /// part of the sandbox's built-in I/O substrate (byte pipelines, file
     /// ops the JS stdlib lacks).

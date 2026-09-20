@@ -1,4 +1,4 @@
-use super::{Tool, ToolCtx, ToolOutput};
+use super::{Tool, ToolCtx, ToolOrigin, ToolOutput};
 use crate::config::McpServerConfig;
 use crate::mcp::McpClient;
 use crate::provider::{Block, ToolDef};
@@ -33,6 +33,10 @@ pub struct McpTool {
 const MAX_MCP_IMAGE_B64: usize = 14 * 1024 * 1024;
 
 impl Tool for McpTool {
+    fn origin(&self) -> ToolOrigin {
+        ToolOrigin::Mcp
+    }
+
     /// Guest-registry opt-in (run_code's `tools.call` surface). CRITICAL:
     /// the AppWorld-style play (data behind app APIs, guest loops pages
     /// in-sandbox) lives on this — dropping the override removes every

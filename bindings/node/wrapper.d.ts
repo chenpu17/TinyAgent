@@ -115,6 +115,69 @@ export interface CompactOutcome {
   usage: Usage | null;
 }
 
+/** One tool's estimated schema cost (name + description + schema JSON,
+ *  chars/4 — an estimate, never a provider measurement). */
+export interface ToolEntry {
+  name: string;
+  tokens: number;
+}
+
+/** One origin bucket of tool-schema cost. `tools` lists every tool in
+ *  tool-list order (unsorted). */
+export interface ToolCategory {
+  tokens: number;
+  tools: ToolEntry[];
+}
+
+/** The system prompt split into its three sources (separator bytes belong
+ *  to the adjacent segment; the three sum to `tokens`). */
+export interface SystemBreakdown {
+  env: number;
+  base: number;
+  skill_intro: number;
+  tokens: number;
+}
+
+/** Message history aggregated by block kind (snake_case keys mirror the
+ *  Rust serde shape). There is no `thinking` kind: thinking never enters
+ *  history. */
+export interface MessageKinds {
+  user_text: number;
+  assistant_text: number;
+  tool_use: number;
+  tool_result: number;
+  image: number;
+  document: number;
+  skill_content: number;
+  other: number;
+}
+
+/** Calibration info for a scaled breakdown: `scale` is the anchored
+ *  request's measured/estimated ratio; every component was multiplied by
+ *  it (a heuristic — see the Rust `context_report` module docs). */
+export interface Calibration {
+  measured_prompt_tokens: number;
+  scale: number;
+}
+
+/** Estimated token composition of the next request's context. EVERY number
+ *  is an estimate (chars/4 yardstick); `usage()` stays the billing
+ *  authority. `calibration` is null until a measured anchor exists (and
+ *  after it's invalidated by a fold / tool-table change). */
+export interface ContextBreakdown {
+  system: SystemBreakdown;
+  tools: {
+    builtin: ToolCategory;
+    mcp: ToolCategory;
+    skill: ToolCategory;
+    custom: ToolCategory;
+    tokens: number;
+  };
+  messages: { tokens: number; by_kind: MessageKinds };
+  total_tokens: number;
+  calibration: Calibration | null;
+}
+
 export declare class Agent {
   constructor(configPath: string, opts?: AgentOptions);
   /** Append a user message (text) to the conversation. */
@@ -138,6 +201,10 @@ export declare class Agent {
   ): Promise<CompactOutcome | null>;
   /** Cumulative token usage of the current/latest run (4 axes). */
   usage(): Usage;
+  /** Estimated token composition of the next request's context (see
+   *  ContextBreakdown — every number is an estimate). Read-only; busy-errors
+   *  while a run is in flight, like usage(). */
+  contextBreakdown(): ContextBreakdown;
   /** Conversation history as a list of message objects. */
   messages(): unknown[];
   /** The model name this agent sends with each request. */

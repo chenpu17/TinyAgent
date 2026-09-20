@@ -748,3 +748,72 @@ test('runCode: busy error when called during run(); works again after (A-10c)', 
   // After the awaited run resolves, the method works again.
   a.enableCode();
 });
+
+// ── 11. contextBreakdown (estimated composition of the next request) ────────
+
+test('contextBreakdown: composition, calibration, custom-tool bucket', async (t) => {
+  const { cfgPath } = providerConfig(t);
+  const a = new Agent(cfgPath, {
+    tools: [{
+      name: 'get_weather',
+      description: 'Look up the weather.',
+      schema: { type: 'object', properties: { city: { type: 'string' } } },
+      run: () => 'sunny',
+    }],
+    provider: () => ({
+      text: 'done',
+      stop_reason: 'end_turn',
+      usage: { input_tokens: 5000, output_tokens: 9 },
+    }),
+  });
+  a.pushUser('hi 你好');
+
+  const before = a.contextBreakdown();
+  assert.strictEqual(before.calibration, null, 'no billed run yet');
+  assert.ok(before.total_tokens > 0);
+
+  await a.run();
+  const bd = a.contextBreakdown();
+  assert.strictEqual(bd.calibration.measured_prompt_tokens, 5000);
+  // chars/4 under-counts the CJK text → the anchored scale exceeds 1.
+  assert.ok(bd.calibration.scale > 1.0, `scale=${bd.calibration.scale}`);
+  // The pinned JSON face (snake_case keys mirror the Rust serde shape).
+  for (const k of ['system', 'tools', 'messages', 'total_tokens', 'calibration']) {
+    assert.ok(k in bd, `missing ${k}`);
+  }
+  for (const k of ['env', 'base', 'skill_intro', 'tokens']) assert.ok(k in bd.system, k);
+  for (const k of ['builtin', 'mcp', 'skill', 'custom', 'tokens']) assert.ok(k in bd.tools, k);
+  for (const k of ['user_text', 'assistant_text', 'tool_use', 'tool_result',
+    'image', 'document', 'skill_content', 'other']) {
+    assert.ok(k in bd.messages.by_kind, k);
+  }
+  // The host callback tool landed in the custom bucket.
+  const customNames = bd.tools.custom.tools.map((x) => x.name);
+  assert.deepStrictEqual(customNames, ['get_weather']);
+  assert.ok(bd.tools.custom.tokens > 0);
+  assert.deepStrictEqual(bd.tools.builtin.tools, []);
+});
+
+test('contextBreakdown busy-errors while a run is in flight', async (t) => {
+  // The provider entering its callback proves the worker thread holds the
+  // agent lock (run() spawns onto a dedicated thread — the lock isn't taken
+  // synchronously at the call site, so a bare fire-and-assert would race).
+  let providerEntered;
+  const entered = new Promise((r) => (providerEntered = r));
+  const { cfgPath } = providerConfig(t);
+  const a = new Agent(cfgPath, {
+    provider: async () => {
+      providerEntered();
+      await new Promise((r) => setTimeout(r, 300));
+      return { text: 'ok', stop_reason: 'end_turn' };
+    },
+  });
+  a.pushUser('hi');
+  const p = a.run();
+  await entered;
+  // try_lock contract, same as usage(): immediate explanatory error, never
+  // a freeze of the JS event loop.
+  assert.throws(() => a.contextBreakdown(), /Agent\.run\(\) is active/);
+  await p;
+  assert.ok(a.contextBreakdown().total_tokens > 0, 'works again after the run');
+});

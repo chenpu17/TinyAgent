@@ -573,8 +573,8 @@ impl Default for CancelToken {
 fn agent_busy() -> Error {
     err(
         "Agent.run() is active: sync methods (pushUser, setCancel, usage, \
-        messages, model, enableCode/disableCode/setCodeConfig) must not be \
-        called until the awaited run() resolves — calling them while a run is \
+        contextBreakdown, messages, model, enableCode/disableCode/setCodeConfig) must \
+        not be called until the awaited run() resolves — calling them while a run is \
         in flight would freeze the JS event loop the run depends on",
     )
 }
@@ -746,6 +746,19 @@ impl Agent {
     pub fn usage(&self) -> Result<Value> {
         let a = self.inner.try_lock().map_err(|_| agent_busy())?;
         serde_json::to_value(a.usage()).map_err(err)
+    }
+
+    /// Estimated token composition of the NEXT request's context — system
+    /// (env/base/skill_intro), tools (builtin/mcp/skill/custom, per tool),
+    /// messages by kind, plus total & calibration. Every number is an
+    /// ESTIMATE (chars/4 yardstick), not a provider measurement — `usage()`
+    /// stays the billing authority; `calibration` is non-null only while a
+    /// measured anchor is still valid. Read-only; same busy contract as
+    /// `usage()`.
+    #[napi]
+    pub fn context_breakdown(&self) -> Result<Value> {
+        let a = self.inner.try_lock().map_err(|_| agent_busy())?;
+        serde_json::to_value(a.context_breakdown()).map_err(err)
     }
 
     /// Conversation history as a list of message objects. Busy-errors while

@@ -18,7 +18,7 @@
 //! got (`plan`). That closes a gap in the "complete, honest, machine-readable
 //! bill" positioning.
 
-use super::{Tool, ToolCtx, ToolOutput};
+use super::{Tool, ToolCtx, ToolOrigin, ToolOutput};
 use crate::agent::{AgentEvent, TodoItem};
 use crate::provider::ToolDef;
 use anyhow::{ensure, Result};
@@ -36,6 +36,10 @@ const MAX_SUBJECT_CHARS: usize = 200;
 pub struct Todo;
 
 impl Tool for Todo {
+    fn origin(&self) -> ToolOrigin {
+        ToolOrigin::Builtin
+    }
+
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "todo".into(),

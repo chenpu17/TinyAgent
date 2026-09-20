@@ -109,6 +109,7 @@ cargo clippy -p tiny-agent-node
 - **打转护栏**：键 =（工具名， canon 生效参数， 结果指纹），同参不同果即进展、不计数；canon 数值统一经 f64 归一（1 与 1.0 同键）；第 3 次 nudge 进历史块、第 6 次 `stuck_loop` 收尾；无闩锁（轮尾直读当前连续计数），轮尾 cancel 优先于 stuck_loop。
 - **token 预算闸门**：run 级共享计数器父子同读；turn 边界比较的 cap 以 `BudgetGate::cap` 为单源（自身 limits 快照只能收紧）；工具账单按 `ToolOutput::usage_in_shared_budget` 分流——子 agent（已自计）只折 totals，其余工具的 usage 由 fold 代入计数器。
 - **宿主热更新面**：`set_model` 等不传播给已构造的子 agent 快照（既定决策）；`compact()` 成本绝不进 `self.usage`。
+- **上下文构成分解**：`context_breakdown()` 是拉取式估算查询（system 三段/工具四类 `Tool::origin()`/消息分型），与 Usage 实测口径刻意不混流；等和不变量靠单趟 running-floor；锚点 scale 校准、失效即回 None。
 - **MCP 热增删**：撞名 = Err + 回滚；热增路径不打印；子 agent 与 run_code registry 都不感知（快照语义）。
 - **MCP SSE 同源闸门**：endpoint 解析与 POST 发送共用 `reqwest::Url`（真解析器）——别写字符串版 origin 切分，反斜杠混淆可绕过。
 - **子 agent（task）**：按 `Tool::concurrency()`/`available_to_subagent()` 能力标记路由，无名字黑名单；共享父 MCP、预算与 cancel。
@@ -148,6 +149,7 @@ cargo clippy -p tiny-agent-node
 - **`ToolConcurrency::Parallel` 是承诺**：可重入 + 轮询 cancel，核心不校验，谎报只在生产数据竞争。
 - **`#[non_exhaustive]` 只给消费侧枚举**；`Role`/`CompressTrigger`/生产侧枚举不加。
 - **思考展示**：headless 写 stderr 不进 stdout；TUI 独立 ✻ 区块不走 markdown。
+- **context_breakdown 等和靠单趟 running-floor**（各段独立 /4 会差 1-2 丢不变量）；无 thinking 桶（思考永不进 history）；锚点失效即校准回 None。
 
 ## 离线 / 视觉验证
 

@@ -30,7 +30,7 @@
 use crate::agent::{Agent, AgentEvent, RunOutcome, ToolCallRecord};
 use crate::config::Config;
 use crate::provider::{self, Block, Message, Usage};
-use crate::tools::{self, Tool, ToolConcurrency, ToolCtx, ToolOutput};
+use crate::tools::{self, Tool, ToolConcurrency, ToolCtx, ToolOrigin, ToolOutput};
 use anyhow::Result;
 use serde_json::{json, Value};
 
@@ -75,6 +75,10 @@ impl SubAgent {
 }
 
 impl Tool for SubAgent {
+    fn origin(&self) -> ToolOrigin {
+        ToolOrigin::Builtin
+    }
+
     fn def(&self) -> crate::provider::ToolDef {
         crate::provider::ToolDef {
             name: "task".into(),

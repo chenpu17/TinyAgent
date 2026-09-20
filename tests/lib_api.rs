@@ -600,3 +600,118 @@ fn off_skill_injection_tombstones_read_skill() {
         "read_skill: skill \"run-code\" 已被配置关闭（code.skill_injection = \"off\"）。run_code 的环境事实见其工具描述；完整用法文档在此配置下不可用。"
     );
 }
+
+/// Isolated temp workdir for the context-attribution tests (fr1_scratch is
+/// `code`-gated; these tests are not).
+fn ctx_scratch(tag: &str) -> std::path::PathBuf {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let d = std::env::temp_dir().join(format!(
+        "ta-lib-ctx-{}-{tag}-{}",
+        std::process::id(),
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+/// `context_breakdown`'s assembly-time attribution: the skill intro
+/// `assemble` appends to the system prompt is its own segment and the
+/// user's base keeps its pre-assembly share; the skill tools land in the
+/// skill bucket. A workdir without skills gets no intro segment.
+#[test]
+fn build_agent_skill_intro_attribution() {
+    use tiny_agent::provider::new_client;
+    let dir = ctx_scratch("attrib");
+    let skill_dir = dir.join(".tinyagent/skills/demo-skill");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: demo-skill\ndescription: a demo skill for attribution\n---\n\nBody text.",
+    )
+    .unwrap();
+    let cfg: Config = serde_json::from_value(json!({
+        "provider": "openai",
+        "api_key_env": "NONE",
+        "model": "mock-model",
+        "tools": [],
+        "system_prompt": "You are the base prompt.",
+        "workdir": dir.to_str().unwrap()
+    }))
+    .expect("config");
+    let client = new_client(0);
+    let (provider, _s) = MockProvider::new(vec![]);
+    let agent = tiny_agent::build_agent_with_provider(
+        &cfg,
+        Box::new(provider),
+        Vec::new(),
+        &client,
+        vec![],
+        "",
+    )
+    .expect("assemble with a skill");
+    let bd = agent.context_breakdown();
+    assert!(bd.system.skill_intro > 0, "intro appended and attributed");
+    assert!(bd.system.base > 0, "user base prompt attributed");
+    assert_eq!(
+        bd.system.env + bd.system.base + bd.system.skill_intro,
+        bd.system.tokens,
+        "three-way partition"
+    );
+    let names: Vec<&str> = bd
+        .tools
+        .skill
+        .tools
+        .iter()
+        .map(|t| t.name.as_str())
+        .collect();
+    assert_eq!(names, ["read_skill", "list_skill"]);
+
+    // The "no skills anywhere → skill_intro == 0" leg is NOT asserted here:
+    // `resolve_skill_dirs` also reads the machine's GLOBAL skills dir, so an
+    // empty workdir still sees the developer's installed skills — the claim
+    // is environment-dependent. The no-intro default (direct `Agent::new`,
+    // no assembly) is pinned in agent_tests::env_attribution instead.
+}
+
+/// The bindings hand the breakdown to host code as a native dict / object
+/// via serde — pin the JSON face (snake_case keys, `calibration` null
+/// before any billed run).
+#[test]
+fn context_breakdown_serializable() {
+    let cfg = minimal_config();
+    let agent = Agent::new(
+        &cfg,
+        Box::new(MockProvider::new(vec![]).0),
+        vec![],
+        vec![tiny_agent::Message::user(vec![tiny_agent::Block::Text(
+            "hello".into(),
+        )])],
+        plain_ctx(),
+    );
+    let v = serde_json::to_value(agent.context_breakdown()).unwrap();
+    for k in ["system", "tools", "messages", "total_tokens", "calibration"] {
+        assert!(v.get(k).is_some(), "missing top-level key {k}");
+    }
+    assert!(v["calibration"].is_null(), "no billed run yet");
+    for k in ["env", "base", "skill_intro", "tokens"] {
+        assert!(v["system"].get(k).is_some(), "missing system.{k}");
+    }
+    for k in ["builtin", "mcp", "skill", "custom", "tokens"] {
+        assert!(v["tools"].get(k).is_some(), "missing tools.{k}");
+    }
+    for k in [
+        "user_text",
+        "assistant_text",
+        "tool_use",
+        "tool_result",
+        "image",
+        "document",
+        "skill_content",
+        "other",
+    ] {
+        assert!(
+            v["messages"]["by_kind"].get(k).is_some(),
+            "missing by_kind.{k}"
+        );
+    }
+}

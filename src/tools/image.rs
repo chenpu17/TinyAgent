@@ -1,4 +1,4 @@
-use super::{resolve, Tool, ToolCtx, ToolOutput};
+use super::{resolve, Tool, ToolCtx, ToolOrigin, ToolOutput};
 use crate::provider::{Block, ToolDef};
 use anyhow::{bail, Context, Result};
 use base64::Engine;
@@ -49,6 +49,10 @@ pub fn load_block(full: &Path) -> Result<Block> {
 }
 
 impl Tool for LoadImage {
+    fn origin(&self) -> ToolOrigin {
+        ToolOrigin::Builtin
+    }
+
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "load_image".into(),

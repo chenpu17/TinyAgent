@@ -229,35 +229,52 @@ pub(crate) const OVERFLOW_PHRASES: &[&str] = &[
                                    // guard in `is_context_overflow` instead.
 ];
 
+/// Size of a single block under the shared chars yardstick (the `/4` happens
+/// once on the SUM — see [`estimate_tokens`]). `total_chars` and
+/// `context_report`'s per-bucket attribution both route through this one
+/// function so the two can never drift apart — the precondition for
+/// "uncalibrated breakdown total == `estimate_tokens`" (context_report's
+/// sum invariant). Deliberately an EXHAUSTIVE match: a new `Block` variant
+/// must decide its cost here at compile time (the four-layer new-variant
+/// checklist's compress entry).
+pub(crate) fn block_chars(b: &Block) -> usize {
+    match b {
+        Block::Text(t) => t.len(),
+        Block::Image { data, .. } => data.len() / 100, // base64 is ~33% overhead
+        // Char floor (same heuristic as images) — the legacy
+        // `compress_threshold_chars` gate's only signal for documents, and
+        // a small conservative extra on top of the page-aware estimate in
+        // `estimate_tokens` (both over-estimate, which is the safe
+        // direction for a compaction preflight).
+        Block::Document { data, .. } => data.len() / 100,
+        Block::ToolUse { input, .. } => input.to_string().len(),
+        // A tool result may carry an image payload (e.g. load_image).
+        // Count it like a top-level image, or a load_image-heavy
+        // conversation never trips the compress threshold.
+        Block::ToolResult { content, image, .. } => {
+            content.len() + image.as_deref().map(image_payload_len).unwrap_or(0)
+        }
+    }
+}
+
+/// Exact token ADD-ON a block contributes outside the chars/4 channel: PDF
+/// documents bill per PAGE (`pdf_page_estimate × PDF_TOKENS_PER_PAGE`), every
+/// other block adds nothing. Shared by [`estimate_tokens`] and
+/// `context_report`'s document bucket for the same never-drift reason as
+/// [`block_chars`].
+pub(crate) fn block_pdf_tokens(b: &Block) -> usize {
+    match b {
+        Block::Document { data, .. } => pdf_page_estimate(data).saturating_mul(PDF_TOKENS_PER_PAGE),
+        _ => 0,
+    }
+}
+
 /// Rough size estimate of a conversation (chars; images count cheaply).
 pub(crate) fn total_chars(messages: &[Message]) -> usize {
     messages
         .iter()
         .flat_map(|m| &m.content)
-        .map(|b| match b {
-            Block::Text(t) => t.len(),
-            Block::Image { data, .. } => data.len() / 100, // base64 is ~33% overhead
-            // Char floor (same heuristic as images) — the legacy
-            // `compress_threshold_chars` gate's only signal for documents, and
-            // a small conservative extra on top of the page-aware estimate in
-            // `estimate_tokens` (both over-estimate, which is the safe
-            // direction for a compaction preflight).
-            Block::Document { data, .. } => data.len() / 100,
-            Block::ToolUse { input, .. } => input.to_string().len(),
-            // A tool result may carry an image payload (e.g. load_image).
-            // Count it like a top-level image, or a load_image-heavy
-            // conversation never trips the compress threshold.
-            Block::ToolResult { content, image, .. } => {
-                let img = image
-                    .as_deref()
-                    .map(|b| match b {
-                        Block::Image { data, .. } => data.len() / 100,
-                        _ => 0,
-                    })
-                    .unwrap_or(0);
-                content.len() + img
-            }
-        })
+        .map(block_chars)
         .sum()
 }
 
@@ -282,12 +299,8 @@ pub(crate) fn estimate_tokens(
     let pdf_tokens: usize = messages
         .iter()
         .flat_map(|m| &m.content)
-        .filter_map(|b| match b {
-            Block::Document { data, .. } => Some(pdf_page_estimate(data)),
-            _ => None,
-        })
-        .sum::<usize>()
-        .saturating_mul(PDF_TOKENS_PER_PAGE);
+        .map(block_pdf_tokens)
+        .sum();
     chars / CHARS_PER_TOKEN + pdf_tokens
 }
 
@@ -565,7 +578,9 @@ pub(crate) fn prune_tool_results(
 /// chars while the window only got ~2k smaller, so prune declared victory,
 /// skipped the LLM summary, and the next turn re-triggered compression (and
 /// re-broke the prompt-cache prefix) on the still-oversized history.
-fn image_payload_len(b: &Block) -> usize {
+/// `context_report` also reads it, to split a ToolResult's image payload
+/// into the image bucket while its text goes to the result bucket.
+pub(crate) fn image_payload_len(b: &Block) -> usize {
     match b {
         Block::Image { data, .. } => data.len() / 100,
         _ => 0,
