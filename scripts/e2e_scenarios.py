@@ -14,7 +14,7 @@ cannot reach:
   parallel — one assistant turn fans out 10 `task` calls (wave cap 8): all
              10 ToolCall/ToolResult pairs land, request count is exactly
              2 (parent) + 10 (children)
-  cancel   — SIGINT during a slow request: exit code 130
+  cancel   — interrupt (SIGINT; CTRL_BREAK on Windows) a slow request: exit 130
 
 Exit code 0 iff every check passes. No network, no API key — safe for CI.
 
@@ -77,9 +77,21 @@ def tool_calls_resp(calls):
 
 
 SHELL_STUCK = json.dumps({"command": "echo still-waiting"})
-# Same command string every turn, but the OUTPUT advances (tick-1, tick-2, …)
-# — a polling call making progress must not trip the stuck guardrail.
-SHELL_POLL = json.dumps({"command": "sh -c 'n=$(cat n.txt 2>/dev/null || echo 0); n=$((n+1)); echo $n > n.txt; echo tick-$n'"})
+# Same command string every turn, but the OUTPUT advances each call — a
+# polling call making progress must not trip the stuck guardrail.
+#
+# Windows note: the shell tool runs commands via `cmd /C` there, and the sh
+# spelling below would be metacharacter soup for cmd (2>/dev/null, $((…)) are
+# cmd syntax) — every call would return the same error text and the guardrail
+# would (rightly) fire. Command strings also can't carry double quotes through
+# the MSVCRT arg quoting, which rules out powershell -Command "…" one-liners.
+# `echo tick-%time%-%random%` keeps the contract (same call, advancing output):
+# each tool call spawns a fresh cmd.exe, so %time%/%random% re-expand per call.
+SHELL_POLL = json.dumps({
+    "command": ("echo tick-%time%-%random%" if os.name == "nt" else
+                "sh -c 'n=$(cat n.txt 2>/dev/null || echo 0); "
+                "n=$((n+1)); echo $n > n.txt; echo tick-$n'"),
+})
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -210,8 +222,9 @@ def main():
           d and d.get("stop_reason") == "max_turns_reached", f"got {d}")
     check("poll: 8 requests", requests_served() - before == 8,
           f"delta={requests_served() - before}")
-    outs = "".join(e.get("content", "") for e in tr_events_of(ev))
-    check("poll: outputs progressed", "tick-1" in outs and "tick-8" in outs)
+    outs = [e.get("content", "") for e in tr_events_of(ev)]
+    check("poll: outputs progressed", len(outs) == 8 and len(set(outs)) == 8,
+          f"{len(set(outs))} distinct")
 
     # parallel: 10 task calls in one turn (wave cap 8 -> 2 waves)
     before = requests_served()
@@ -227,13 +240,22 @@ def main():
     check("parallel: 12 requests (2 parent + 10 children)",
           requests_served() - before == 12, f"delta={requests_served() - before}")
 
-    # cancel: SIGINT during a slow request -> exit 130
+    # cancel: interrupt a slow request -> exit 130.
+    # Windows: send_signal(SIGINT) raises ValueError there (Python 3.14) and
+    # CTRL_C is disabled for a new process group anyway — CTRL_BREAK_EVENT
+    # aimed at the child's CREATE_NEW_PROCESS_GROUP group rides the same
+    # SetConsoleCtrlHandler path (src/signal.rs treats events 0 and 1 alike).
+    # Unlike POSIX SIGINT it can't EINTR a blocked read; the run breaks at the
+    # next chunk boundary (the in-flight request is capped by timeout_secs),
+    # which stays well inside the communicate timeout below.
     env = dict(os.environ, E2E_KEY="dummy")
+    creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
     proc = subprocess.Popen([BIN, "--config", write_cfg("cancel", ["shell"]),
                              "--task", "SLOW_E2E wait", "--session", "none"],
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+                            creationflags=creationflags)
     time.sleep(1.5)
-    proc.send_signal(signal.SIGINT)
+    proc.send_signal(signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGINT)
     proc.communicate(timeout=30)
     check("cancel: exit 130", proc.returncode == 130, f"rc={proc.returncode}")
 

@@ -25,6 +25,17 @@ def sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def sha_file_rel(path):
+    """sha256 of a tracked file's content, line endings folded to LF.
+
+    The manifest pins source files on Linux CI (LF working trees), but a
+    Windows checkout with core.autocrlf=true materializes them as CRLF —
+    hashing raw bytes would turn the gate into a checkout-format detector
+    instead of a content-drift detector. Fold CRLF before hashing so the
+    recorded hashes stay platform-independent."""
+    return sha((ROOT / path).read_bytes().replace(b"\r\n", b"\n"))
+
+
 def readme_spec_section():
     """The README's code-config block (JSON example + field table), kept
     between BEGIN/END CODE CONFIG SPEC markers."""
@@ -110,7 +121,7 @@ def main():
     manifest = {
         "contract_version": "run-code-routing-v2",
         "hash_algorithm": "sha256",
-        "files": {p: sha((ROOT / p).read_bytes()) for p in paths},
+        "files": {p: sha_file_rel(p) for p in paths},
         "prompt_bodies": {},
         "description": {"chars": len(description), "sha256": sha(description.encode("utf-8"))},
         "teaser": {"chars": len(teaser), "sha256": sha(teaser.encode("utf-8"))},
@@ -129,8 +140,10 @@ def main():
     expected_manifest = json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
 
     if args.write:
-        doc.write_text(expected_doc, encoding="utf-8")
-        MANIFEST.write_text(expected_manifest, encoding="utf-8")
+        # newline="\n" keeps the generated files byte-identical across
+        # platforms (text-mode default would write CRLF on Windows).
+        doc.write_text(expected_doc, encoding="utf-8", newline="\n")
+        MANIFEST.write_text(expected_manifest, encoding="utf-8", newline="\n")
     else:
         if current != expected_doc:
             raise SystemExit("Appendix A is stale; run with --write.")

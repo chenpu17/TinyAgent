@@ -23,6 +23,18 @@ const { ScriptedMock, textSse, respondSse } = require('./mock');
 
 const PKG_DIR = path.join(__dirname, '..');
 
+// npm ships as npm.cmd on Windows: CreateProcess can't exec a .cmd directly
+// and Node refuses to spawn one without a shell outright (EINVAL, since the
+// 2024 batch-injection fix) — so shell mode is required there. Shell mode
+// joins args unquoted, hence the manual quoting for spaced paths (mkdtemp
+// under a spaced TMPDIR). POSIX keeps the direct exec; nothing changes on CI.
+function npm(args, opts) {
+  const win = process.platform === 'win32';
+  return execFileSync('npm', win
+    ? args.map((a) => (/\s/.test(a) ? `"${a}"` : a))
+    : args, { ...opts, shell: win, encoding: 'utf8' });
+}
+
 test('npm pack → clean install → load + mock round-trip', { timeout: 60000 }, async (t) => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ta-pack-'));
   t.after(() => {
@@ -33,9 +45,9 @@ test('npm pack → clean install → load + mock round-trip', { timeout: 60000 }
   //    suite: a locally built *.node must exist, or the tarball has no
   //    binary to ship and the install below fails — which is the bug this
   //    test exists to catch).
-  const packOut = execFileSync(
-    'npm', ['pack', '--json', '--silent', `--pack-destination=${tmp}`],
-    { cwd: PKG_DIR, encoding: 'utf8' },
+  const packOut = npm(
+    ['pack', '--json', '--silent', `--pack-destination=${tmp}`],
+    { cwd: PKG_DIR },
   );
   const tarball = path.join(tmp, JSON.parse(packOut)[0].filename);
 
@@ -44,9 +56,9 @@ test('npm pack → clean install → load + mock round-trip', { timeout: 60000 }
   fs.mkdirSync(consumer);
   fs.writeFileSync(path.join(consumer, 'package.json'),
     JSON.stringify({ name: 'ta-pack-consumer', private: true }));
-  execFileSync(
-    'npm', ['install', '--no-audit', '--no-fund', '--no-save', tarball],
-    { cwd: consumer, encoding: 'utf8' },
+  npm(
+    ['install', '--no-audit', '--no-fund', '--no-save', tarball],
+    { cwd: consumer },
   );
 
   // 3. Load the INSTALLED artifact and run one offline round-trip through
