@@ -50,6 +50,14 @@ def check(name, cond, detail=""):
 REQ_COUNT = [0]
 LOCK = threading.Lock()
 
+# M0 (docs/code_llm_design.md §7 前置): per-model scripted payloads — the SSE
+# mock recognizes a SECOND model name, so two-model e2e (外层/内层对拍) can
+# drive different behavior per model through the real HTTP/SSE stack. A model
+# with a registered route is served from its own FIFO (empty queue still
+# answers — never a 5xx mid-e2e); unregistered models fall through to the
+# content-based dispatch below, so existing scenarios are untouched.
+MODEL_ROUTES = {}
+
 
 def sse(chunks):
     return "".join(f"data: {json.dumps(c)}\n\n" for c in chunks) + "data: [DONE]\n\n"
@@ -105,6 +113,10 @@ class Handler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         with LOCK:
             REQ_COUNT[0] += 1
+            queue = MODEL_ROUTES.get(body.get("model"))
+            payload = (queue.pop(0) if queue
+                       else text_resp("mock: model route exhausted")) \
+                if queue is not None else None
         msgs = body["messages"]
         has_tool_msg = any(m.get("role") == "tool" for m in msgs)
         first_user = ""
@@ -114,24 +126,25 @@ class Handler(BaseHTTPRequestHandler):
                 first_user = c if isinstance(c, str) else json.dumps(c)
                 break
 
-        if "STUCK_E2E" in first_user:
-            payload = tool_calls_resp([("call_s0", "shell", SHELL_STUCK)])
-        elif "POLL_E2E" in first_user:
-            payload = tool_calls_resp([("call_q0", "shell", SHELL_POLL)])
-        elif has_tool_msg:
-            payload = text_resp("done")
-        elif "PARALLEL_E2E" in first_user:
-            calls = [(f"call_p{i}", "task",
-                      json.dumps({"name": f"child{i}",
-                                  "description": f"child {i}",
-                                  "prompt": f"child {i} do work"}))
-                     for i in range(10)]
-            payload = tool_calls_resp(calls)
-        elif "SLOW_E2E" in first_user:
-            time.sleep(6)
-            payload = text_resp("slow done")
-        else:
-            payload = text_resp("child done")
+        if payload is None:
+            if "STUCK_E2E" in first_user:
+                payload = tool_calls_resp([("call_s0", "shell", SHELL_STUCK)])
+            elif "POLL_E2E" in first_user:
+                payload = tool_calls_resp([("call_q0", "shell", SHELL_POLL)])
+            elif has_tool_msg:
+                payload = text_resp("done")
+            elif "PARALLEL_E2E" in first_user:
+                calls = [(f"call_p{i}", "task",
+                          json.dumps({"name": f"child{i}",
+                                      "description": f"child {i}",
+                                      "prompt": f"child {i} do work"}))
+                         for i in range(10)]
+                payload = tool_calls_resp(calls)
+            elif "SLOW_E2E" in first_user:
+                time.sleep(6)
+                payload = text_resp("slow done")
+            else:
+                payload = text_resp("child done")
 
         data = payload.encode()
         self.send_response(200)
@@ -185,12 +198,12 @@ def main():
 
     root = tempfile.mkdtemp(prefix="ta-e2e-")
 
-    def write_cfg(name, tools, max_turns=50):
+    def write_cfg(name, tools, max_turns=50, model="mock-model"):
         workdir = os.path.join(root, f"wd-{name}")
         os.makedirs(workdir, exist_ok=True)
         cfg = {
             "provider": "openai", "base_url": base, "api_key_env": "E2E_KEY",
-            "model": "mock-model", "max_tokens": 4096, "workdir": workdir,
+            "model": model, "max_tokens": 4096, "workdir": workdir,
             "tools": tools,
             "limits": {"max_turns": max_turns, "timeout_secs": 60,
                        "max_output_chars": 10000},
@@ -258,6 +271,27 @@ def main():
     proc.send_signal(signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGINT)
     proc.communicate(timeout=30)
     check("cancel: exit 130", proc.returncode == 130, f"rc={proc.returncode}")
+
+    # model-route (M0): the SSE mock recognizes a SECOND model name — same
+    # server instance, per-model routing through the real HTTP/SSE stack
+    # (docs/code_llm_design.md §7 前置). If routing were broken, the prompts
+    # below would fall through to the content dispatch and answer "child done".
+    MODEL_ROUTES["mock-outer"] = [text_resp("outer ok")]
+    MODEL_ROUTES["mock-inner"] = [text_resp("inner verdict")]
+    before = requests_served()
+    p, ev = run_agent(write_cfg("mroute-a", ["shell"], model="mock-outer"),
+                      "MR_OUTER say something")
+    check("model-route: outer model served its own script",
+          p.returncode == 0 and any("outer ok" in json.dumps(e) for e in ev),
+          f"rc={p.returncode}")
+    p, ev = run_agent(write_cfg("mroute-b", ["shell"], model="mock-inner"),
+                      "MR_INNER say something")
+    check("model-route: inner (second) model served its own script",
+          p.returncode == 0 and any("inner verdict" in json.dumps(e) for e in ev),
+          f"rc={p.returncode}")
+    check("model-route: one request per run",
+          requests_served() - before == 2, f"delta={requests_served() - before}")
+    MODEL_ROUTES.clear()
 
     server.shutdown()
     print()

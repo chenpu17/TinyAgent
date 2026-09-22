@@ -100,6 +100,13 @@ pub struct Captured {
 /// provider being moved into the agent.
 pub struct MockState {
     queue: Mutex<VecDeque<MockTurn>>,
+    /// Per-model script queues (M0 probe support, docs/code_llm_design.md §7
+    /// "前置"：按请求 `model` 字段分流). When non-empty, routing is STRICT:
+    /// a request whose `model` has a key is served from that queue (FIFO),
+    /// a model with no key is an honest error — the "custom provider that
+    /// cannot serve the inner model" shape — and the default `queue` is
+    /// bypassed entirely. Empty = legacy single-queue behavior (any model).
+    routes: Mutex<std::collections::HashMap<String, VecDeque<MockTurn>>>,
     captured: Mutex<Vec<Captured>>,
 }
 
@@ -123,8 +130,26 @@ impl MockProvider {
     /// Returns the provider (to box into an agent) and a handle to its shared
     /// state (to assert on after the run).
     pub fn new(turns: Vec<MockTurn>) -> (Self, Arc<MockState>) {
+        Self::build(turns, Vec::new())
+    }
+
+    /// Strict model-routed variant (M0): each `(model, turns)` pair is its
+    /// own FIFO; a request for any OTHER model errors — same-instance
+    /// multi-model serving AND the "cannot serve that model" honest-failure
+    /// shape, the two halves of the A-L9 topology probe.
+    pub fn routed(routes: Vec<(&str, Vec<MockTurn>)>) -> (Self, Arc<MockState>) {
+        Self::build(Vec::new(), routes)
+    }
+
+    fn build(turns: Vec<MockTurn>, routes: Vec<(&str, Vec<MockTurn>)>) -> (Self, Arc<MockState>) {
         let state = Arc::new(MockState {
             queue: Mutex::new(turns.into()),
+            routes: Mutex::new(
+                routes
+                    .into_iter()
+                    .map(|(m, ts)| (m.to_string(), VecDeque::from(ts)))
+                    .collect(),
+            ),
             captured: Mutex::new(Vec::new()),
         });
         (
@@ -194,13 +219,32 @@ impl Provider for MockProvider {
         });
 
         // Pop the next scripted turn; running off the end is a test bug.
-        let turn = self
-            .state
-            .queue
-            .lock()
-            .unwrap()
-            .pop_front()
-            .unwrap_or_else(|| MockTurn::Err("mock: scripted turns exhausted".into()));
+        // Model-routed mode first (strict: unknown model = honest error),
+        // legacy single-queue otherwise.
+        let turn = {
+            let mut routes = self.state.routes.lock().unwrap();
+            if routes.is_empty() {
+                self.state
+                    .queue
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_else(|| MockTurn::Err("mock: scripted turns exhausted".into()))
+            } else {
+                match routes.get_mut(req.model) {
+                    Some(q) => q.pop_front().unwrap_or_else(|| {
+                        MockTurn::Err(format!(
+                            "mock: scripted turns exhausted for model `{}`",
+                            req.model
+                        ))
+                    }),
+                    None => MockTurn::Err(format!(
+                        "mock: no script route for model `{}` (provider cannot serve it)",
+                        req.model
+                    )),
+                }
+            }
+        };
         match turn {
             MockTurn::Ok(resp) => {
                 // Stream text blocks through the event callback, mirroring a
