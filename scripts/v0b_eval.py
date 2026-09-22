@@ -127,7 +127,7 @@ def stage_e0p_skill(run_dir):
         sys.exit(f"E0′ 指纹漂移：{digest} != {E0P_SHA} —— 先修装置再跑")
 
 
-def write_config(run_dir, arm, wd, max_tokens, outer_model):
+def write_config(run_dir, arm, wd, max_tokens, outer_model, max_total):
     base, key = gateway()
     code = {"enabled": True, "skill_injection": "on_demand",
             "include": False, "call_batch": False}
@@ -146,7 +146,7 @@ def write_config(run_dir, arm, wd, max_tokens, outer_model):
         "tools": ["shell", "read_file", "write_file", "edit_file", "list_dir"],
         "inject_environment": False,
         "limits": {"max_turns": 120, "timeout_secs": 5400,
-                   "max_output_chars": 60000, "max_total_tokens": 4_000_000},
+                   "max_output_chars": 60000, "max_total_tokens": max_total},
         "code": code,
     }
     p = run_dir / "config.json"
@@ -154,13 +154,14 @@ def write_config(run_dir, arm, wd, max_tokens, outer_model):
     return p
 
 
-def run_once(arm, rep, n_holdout, warm_lib, corpus_ver, timeout_s, max_tokens, outer_model):
+def run_once(arm, rep, n_holdout, warm_lib, corpus_ver, timeout_s, max_tokens,
+             outer_model, max_total):
     run_dir = ART / f"{arm}-r{rep}"
     run_dir.mkdir(parents=True, exist_ok=True)
     wd, gold = stage_workdir(run_dir, n_holdout, warm_lib)
     if arm == "e0p":
         stage_e0p_skill(run_dir)
-    cfg = write_config(run_dir, arm, wd, max_tokens, outer_model)
+    cfg = write_config(run_dir, arm, wd, max_tokens, outer_model, max_total)
     env = dict(os.environ, V0B_KEY=gateway()[1])
     t0 = time.time()
     with open(run_dir / "events.ndjson", "w") as evf, \
@@ -172,7 +173,8 @@ def run_once(arm, rep, n_holdout, warm_lib, corpus_ver, timeout_s, max_tokens, o
     return {"arm": arm, "rep": rep, "rc": p.returncode,
             "wall": round(time.time() - t0, 1), "gold": gold, "run_dir": run_dir,
             "corpus": corpus_ver, "warm": bool(warm_lib),
-            "max_tokens": max_tokens, "outer_model": outer_model}
+            "max_tokens": max_tokens, "outer_model": outer_model,
+            "max_total": max_total}
 
 
 def score(run_dir, gold):
@@ -298,6 +300,10 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=4096,
                     help="外层 max_tokens（装置参数，进版本戳；8192 用于探测"
                          "完成墙是 cap 还是探索长度）")
+    ap.add_argument("--max-total-tokens", type=int, default=4_000_000,
+                    help="run 级 token 预算闸（装置参数，进版本戳）。默认 4M = "
+                         "四臂主批任意默认值；e3 复查批用 8M（装配文档 §2.2 登记的"
+                         "开放项：主批 e3 2/3 在产物写全后触 4M 闸）")
     ap.add_argument("--outer-model", default=OUTER_MODEL,
                     help="外层模型（默认 glm-5.3-flash；deepseek-flash 为完成墙"
                          "探针——glm 在 4096/8192 两档均烧满任意 cap 不完成）")
@@ -319,7 +325,8 @@ def main():
             print(f"[v0b] arm {arm} rep {rep} ...", flush=True)
             try:
                 r = run_once(arm, rep, args.holdout, args.warm_lib,
-                             corpus_ver, args.timeout, args.max_tokens, args.outer_model)
+                             corpus_ver, args.timeout, args.max_tokens,
+                             args.outer_model, args.max_total_tokens)
             except subprocess.TimeoutExpired:
                 print(f"[v0b] arm {arm} rep {rep} TIMED OUT", flush=True)
                 continue
@@ -330,11 +337,13 @@ def main():
             if c["stop_reason"] == "stream_idle":
                 print(f"[v0b]   stream_idle — rerunning once", flush=True)
                 r = run_once(arm, rep, args.holdout, args.warm_lib,
-                             corpus_ver, args.timeout, args.max_tokens, args.outer_model)
+                             corpus_ver, args.timeout, args.max_tokens,
+                             args.outer_model, args.max_total_tokens)
                 s = score(run_dir, r["gold"])
                 c = cost(run_dir)
             summary = {"arm": arm, "rep": rep, "rc": r["rc"], "wall_s": r["wall"],
                        "warm": r["warm"], "corpus": corpus_ver,
+                       "max_total": r["max_total"],
                        "score": s, **c}
             (run_dir / "summary.json").write_text(
                 json.dumps(summary, ensure_ascii=False, indent=2))
