@@ -127,15 +127,15 @@ def stage_e0p_skill(run_dir):
         sys.exit(f"E0′ 指纹漂移：{digest} != {E0P_SHA} —— 先修装置再跑")
 
 
-def write_config(run_dir, arm, wd, max_tokens, outer_model, max_total):
+def write_config(run_dir, arm, wd, max_tokens, outer_model, max_total, inner_model):
     base, key = gateway()
     code = {"enabled": True, "skill_injection": "on_demand",
             "include": False, "call_batch": False}
     if arm in ("e1", "e2", "e3"):
         code["include"] = True
     if arm in ("e2", "e3"):
-        code["llm"] = {"enabled": True, "default_model": INNER_MODEL,
-                       "models": [INNER_MODEL]}
+        code["llm"] = {"enabled": True, "default_model": inner_model,
+                       "models": [inner_model]}
     if arm == "e3":
         code["call_batch"] = True
     cfg = {
@@ -155,13 +155,13 @@ def write_config(run_dir, arm, wd, max_tokens, outer_model, max_total):
 
 
 def run_once(arm, rep, n_holdout, warm_lib, corpus_ver, timeout_s, max_tokens,
-             outer_model, max_total):
+             outer_model, max_total, inner_model):
     run_dir = ART / f"{arm}-r{rep}"
     run_dir.mkdir(parents=True, exist_ok=True)
     wd, gold = stage_workdir(run_dir, n_holdout, warm_lib)
     if arm == "e0p":
         stage_e0p_skill(run_dir)
-    cfg = write_config(run_dir, arm, wd, max_tokens, outer_model, max_total)
+    cfg = write_config(run_dir, arm, wd, max_tokens, outer_model, max_total, inner_model)
     env = dict(os.environ, V0B_KEY=gateway()[1])
     t0 = time.time()
     with open(run_dir / "events.ndjson", "w") as evf, \
@@ -307,12 +307,16 @@ def main():
     ap.add_argument("--outer-model", default=OUTER_MODEL,
                     help="外层模型（默认 glm-5.3-flash；deepseek-flash 为完成墙"
                          "探针——glm 在 4096/8192 两档均烧满任意 cap 不完成）")
+    ap.add_argument("--inner-model", default=INNER_MODEL,
+                    help="内层判别模型（级联档位探针用：换模型测弱类是否被"
+                         "不同内层修复；默认与外层同款单档）")
     ap.add_argument("--timeout", type=int, default=5400)
     args = ap.parse_args()
     if not BIN.exists():
         sys.exit(f"missing {BIN} — cargo build --release --features code")
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
     corpus_ver = corpus_version()
+    corpus_ver = {**corpus_ver, "inner_model": args.inner_model}
     ART.mkdir(exist_ok=True)
     print(f"[v0b] corpus {corpus_ver['version']} (kw_probe={corpus_ver['kw_probe_macro_f1']})")
 
@@ -326,7 +330,8 @@ def main():
             try:
                 r = run_once(arm, rep, args.holdout, args.warm_lib,
                              corpus_ver, args.timeout, args.max_tokens,
-                             args.outer_model, args.max_total_tokens)
+                             args.outer_model, args.max_total_tokens,
+                             args.inner_model)
             except subprocess.TimeoutExpired:
                 print(f"[v0b] arm {arm} rep {rep} TIMED OUT", flush=True)
                 continue
@@ -338,7 +343,8 @@ def main():
                 print(f"[v0b]   stream_idle — rerunning once", flush=True)
                 r = run_once(arm, rep, args.holdout, args.warm_lib,
                              corpus_ver, args.timeout, args.max_tokens,
-                             args.outer_model, args.max_total_tokens)
+                             args.outer_model, args.max_total_tokens,
+                             args.inner_model)
                 s = score(run_dir, r["gold"])
                 c = cost(run_dir)
             summary = {"arm": arm, "rep": rep, "rc": r["rc"], "wall_s": r["wall"],
