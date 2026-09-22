@@ -374,6 +374,15 @@ pub struct CodeConfig {
     /// read-only by construction (`Tool::batchable`, LD-19): no atomicity,
     /// no rollback, partial execution is a normal outcome.
     pub call_batch: bool,
+    /// The sandbox `llm` primitive's own config (code_llm_design §5, M3):
+    /// gate + cost-tiered model routing. `enabled` is its own explicit trust
+    /// decision (D15 class — NOT the sandbox's `enabled`); when on, the guest
+    /// registry gains the `llm` tool (registry-build snapshot, LD-14) and
+    /// `default_model`/`models` govern which models inner calls may reach.
+    /// Validated eagerly by [`Config::validate_and_normalize`] so a broken
+    /// enablement fails at config time, not at first sandbox call.
+    #[serde(default)]
+    pub llm: LlmConfig,
 }
 
 impl Default for CodeConfig {
@@ -391,8 +400,33 @@ impl Default for CodeConfig {
             precheck: false,
             include: false,
             call_batch: false,
+            llm: LlmConfig::default(),
         }
     }
+}
+
+/// The sandbox `llm` primitive's config (code_llm_design §5, LD-5): a gate +
+/// a cost-tiered model allowlist. Kept as plain data on `CodeConfig` (same
+/// round-trip discipline: present regardless of the `code` cargo feature).
+///
+/// Invariants (enforced in [`Config::validate_and_normalize`], so both the
+/// file-loading path and the Python binding's parse fail at config time):
+/// - `enabled` requires `default_model` to be Some AND to appear in `models`
+///   (a default the tier can't serve is a config typo, not a runtime event).
+/// - `models` order is preserved as the declaration order; dedup happens at
+///   parse normalization so the batch-overrides intersection logic and the
+///   tool's allowlist never see duplicates.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LlmConfig {
+    /// Off by default (D15 class): exposing inner model calls to guest code
+    /// is its own explicit trust decision, independent of `code.enabled`.
+    pub enabled: bool,
+    /// The model used when a guest `llm` call omits `model` (LD-5). Required
+    /// when enabled.
+    pub default_model: Option<String>,
+    /// The models an explicit `model` param may name (LD-5 allowlist).
+    pub models: Vec<String>,
 }
 
 /// Default `deny_paths` (design §7): modern secret/credential shapes. Nested
@@ -518,6 +552,39 @@ impl Config {
             s.validate()?;
         }
         self.workdir = self.workdir.take().map(resolve_workdir).transpose()?;
+        // `code.llm` enablement invariants (code_llm_design §5, LD-5): fail
+        // at config time with the config blamed, not at the first sandbox
+        // `llm` call with a confusing provider error. Every config entry
+        // point (file load, Python inline dict) routes through here.
+        if self.code.llm.enabled {
+            if self.code.llm.models.is_empty() {
+                bail!(
+                    "code.llm.enabled requires a non-empty code.llm.models \
+                     allowlist (the cost tier guest `llm` calls may route within)"
+                );
+            }
+            match &self.code.llm.default_model {
+                None => bail!(
+                    "code.llm.enabled requires code.llm.default_model (the \
+                     model used when a guest llm call omits `model`)"
+                ),
+                Some(m) if !self.code.llm.models.contains(m) => bail!(
+                    "code.llm.default_model `{}` must appear in code.llm.models \
+                     — a default the tier cannot serve is a config typo, not a \
+                     runtime event",
+                    m
+                ),
+                _ => {}
+            }
+        }
+        // Stable first-occurrence dedup (plain `dedup` only collapses
+        // ADJACENT copies): declaration order is preserved for the
+        // batch-overlays intersection and the tool's allowlist never sees
+        // duplicates.
+        {
+            let mut seen = std::collections::HashSet::new();
+            self.code.llm.models.retain(|m| seen.insert(m.clone()));
+        }
         Ok(())
     }
 
@@ -646,7 +713,23 @@ impl Config {
                      cannot switch the sandbox on or off"
                 );
             }
-            self.code.merge_partial(pc);
+            if let Some(pl) = &pc.llm {
+                if pl.enabled.is_some() {
+                    anyhow::bail!(
+                        "task file must not set code.llm.enabled — untrusted \
+                         fragments cannot switch the inner-model primitive on \
+                         or off"
+                    );
+                }
+                if pl.default_model.is_some() {
+                    anyhow::bail!(
+                        "task file must not set code.llm.default_model — the \
+                         default route is the trusted base config's decision; \
+                         fragments may only narrow code.llm.models"
+                    );
+                }
+            }
+            self.code.merge_partial(pc)?;
         }
         Ok(())
     }
@@ -752,13 +835,29 @@ pub struct PartialCodeConfig {
     pub precheck: Option<bool>,
     pub include: Option<bool>,
     pub call_batch: Option<bool>,
+    pub llm: Option<PartialLlmConfig>,
+}
+
+/// Batch-overlay shape for [`LlmConfig`]: the fragment may only SHRINK the
+/// tier (`models` intersection in `CodeConfig::merge_partial`). `enabled`
+/// and `default_model` are rejected outright by `Config::apply` — switching
+/// the primitive on/off and picking the default route are the trusted base
+/// config's calls, same class as `code.enabled`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PartialLlmConfig {
+    pub enabled: Option<bool>,
+    pub default_model: Option<String>,
+    pub models: Option<Vec<String>>,
 }
 
 impl CodeConfig {
     /// §9 merge table. Exhaustive destructure (no `..`): a field added to
     /// [`PartialCodeConfig`] without a policy here is a compile error — the
-    /// same anti-fossil discipline as `PartialLimits`.
-    fn merge_partial(&mut self, p: PartialCodeConfig) {
+    /// same anti-fossil discipline as `PartialLimits`. Fallsible only for
+    /// the `llm` post-condition (an overlay that breaks an enabled tier's
+    /// default route is a bad_task, not a silently-broken config).
+    fn merge_partial(&mut self, p: PartialCodeConfig) -> Result<()> {
         let PartialCodeConfig {
             enabled: _, // rejected by Config::apply before we get here
             deny_paths,
@@ -772,6 +871,7 @@ impl CodeConfig {
             precheck,
             include,
             call_batch,
+            llm,
         } = p;
         if let Some(v) = deny_paths {
             // Union — a fragment can only ADD denials. Sort+dedup (plain
@@ -813,6 +913,41 @@ impl CodeConfig {
         self.include = Clamp::Tighten.merge(self.include, include);
         // Batch channel gate: Tighten (LD-15) — same rule, same class.
         self.call_batch = Clamp::Tighten.merge(self.call_batch, call_batch);
+        // llm: `enabled`/`default_model` presence is rejected by
+        // Config::apply before we get here; the fragment's only power over
+        // the tier is REMOVING models.
+        if let Some(PartialLlmConfig {
+            enabled: _,
+            default_model: _,
+            models,
+        }) = llm
+        {
+            if let Some(v) = models {
+                // Intersection, base declaration order preserved: a fragment
+                // can only tighten. Unlike fs_write_dirs, EMPTY here means
+                // "nothing allowed", not the universe — an empty side just
+                // yields an empty tier.
+                let frag: std::collections::HashSet<_> = v.iter().collect();
+                self.llm.models.retain(|m| frag.contains(m));
+            }
+            // Post-condition (LD-5): an enabled primitive must still be able
+            // to serve its default after the narrowing. A base that was
+            // validated keeps this true for every overlay that doesn't drop
+            // the default, so reaching the failure means the fragment DID
+            // drop it — bad_task with an actionable message.
+            if self.llm.enabled {
+                if let Some(m) = &self.llm.default_model {
+                    if !self.llm.models.contains(m) {
+                        bail!(
+                            "code.llm.models overlay drops default_model `{}` \
+                             — the narrowed tier cannot serve the default model",
+                            m
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1553,6 +1688,123 @@ mod tests {
             serde_json::from_str(r#"{"code":{"timeout_secs":18446744073709551615}}"#).unwrap();
         cfg.apply(frag).unwrap();
         assert_eq!(cfg.code.timeout_secs, u64::MAX);
+    }
+
+    /// `code.llm` (code_llm_design §5, LD-5): parse-time enablement
+    /// invariants + fragment strategies. Enabled-without-a-serving-default
+    /// fails at CONFIG time (every entry point routes through
+    /// validate_and_normalize); a fragment may only SHRINK `models`
+    /// (intersection), and `enabled`/`default_model` presence is bad_task.
+    #[test]
+    fn llm_config_validation_and_fragment_strategies() {
+        // Defaults: fully off, absent key round-trips.
+        let cfg: Config =
+            serde_json::from_str(r#"{"provider":"anthropic","api_key_env":"K","model":"m"}"#)
+                .unwrap();
+        assert!(!cfg.code.llm.enabled);
+        assert_eq!(cfg.code.llm.default_model, None);
+        assert!(cfg.code.llm.models.is_empty());
+        let mut cfg = cfg;
+        cfg.validate_and_normalize().unwrap();
+
+        // Enablement invariants — each with its actionable message.
+        let mut cfg: Config = serde_json::from_str(
+            r#"{"provider":"anthropic","api_key_env":"K","model":"m",
+                "code":{"llm":{"enabled":true}}}"#,
+        )
+        .unwrap();
+        let err = cfg.validate_and_normalize().unwrap_err().to_string();
+        assert!(err.contains("models"), "empty allowlist blamed: {err}");
+        let mut cfg: Config = serde_json::from_str(
+            r#"{"provider":"anthropic","api_key_env":"K","model":"m",
+                "code":{"llm":{"enabled":true,"models":["m1"],"default_model":null}}}"#,
+        )
+        .unwrap();
+        let err = cfg.validate_and_normalize().unwrap_err().to_string();
+        assert!(
+            err.contains("default_model"),
+            "missing default blamed: {err}"
+        );
+        let mut cfg: Config = serde_json::from_str(
+            r#"{"provider":"anthropic","api_key_env":"K","model":"m",
+                "code":{"llm":{"enabled":true,"models":["m1"],"default_model":"other"}}}"#,
+        )
+        .unwrap();
+        let err = cfg.validate_and_normalize().unwrap_err().to_string();
+        assert!(
+            err.contains("other") && err.contains("models"),
+            "default-not-in-tier blamed: {err}"
+        );
+        // Valid shape passes; duplicate entries dedup stably (first
+        // occurrence order).
+        let mut cfg: Config = serde_json::from_str(
+            r#"{"provider":"anthropic","api_key_env":"K","model":"m",
+                "code":{"llm":{"enabled":true,"models":["m1","m2","m1"],
+                "default_model":"m1"}}}"#,
+        )
+        .unwrap();
+        cfg.validate_and_normalize().unwrap();
+        assert_eq!(cfg.code.llm.models, ["m1", "m2"]);
+        // deny_unknown_fields inside the llm object.
+        let e = serde_json::from_str::<Config>(
+            r#"{"provider":"anthropic","api_key_env":"K","model":"m",
+                "code":{"llm":{"enabled":false,"modles":[]}}}"#,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("modles"));
+
+        // Fragment presence of enabled / default_model → bad_task (even
+        // value-equal-to-base).
+        let base: Config = serde_json::from_str(
+            r#"{"provider":"anthropic","api_key_env":"K","model":"m",
+                "code":{"llm":{"enabled":true,"models":["m1","m2"],
+                "default_model":"m1"}}}"#,
+        )
+        .unwrap();
+        for frag_json in [
+            r#"{"code":{"llm":{"enabled":false}}}"#,
+            r#"{"code":{"llm":{"enabled":true}}}"#,
+            r#"{"code":{"llm":{"default_model":"m1"}}}"#,
+        ] {
+            let frag: PartialConfig = serde_json::from_str(frag_json).unwrap();
+            let err = base.clone().apply(frag).unwrap_err().to_string();
+            assert!(
+                err.contains("code.llm."),
+                "fragment must not set llm gates: {err} ({frag_json})"
+            );
+        }
+
+        // models intersection: base order preserved; keeping the default is
+        // fine; dropping it (even while keeping others) is bad_task.
+        let frag: PartialConfig =
+            serde_json::from_str(r#"{"code":{"llm":{"models":["m2","m1"]}}}"#).unwrap();
+        let mut cfg = base.clone();
+        cfg.apply(frag).unwrap();
+        assert_eq!(cfg.code.llm.models, ["m1", "m2"], "base declaration order");
+        let frag: PartialConfig =
+            serde_json::from_str(r#"{"code":{"llm":{"models":["m2"]}}}"#).unwrap();
+        let err = base.clone().apply(frag).unwrap_err().to_string();
+        assert!(
+            err.contains("m1") && err.contains("drops"),
+            "dropped default blamed: {err}"
+        );
+        let frag: PartialConfig =
+            serde_json::from_str(r#"{"code":{"llm":{"models":["m3"]}}}"#).unwrap();
+        let err = base.clone().apply(frag).unwrap_err().to_string();
+        assert!(err.contains("drops"), "disjoint overlay blamed: {err}");
+
+        // A DISABLED base may narrow to anything, even empty — the tier is
+        // inert until the trusted base enables it.
+        let mut cfg: Config = serde_json::from_str(
+            r#"{"provider":"anthropic","api_key_env":"K","model":"m",
+                "code":{"llm":{"enabled":false,"models":["m1"],
+                "default_model":"m1"}}}"#,
+        )
+        .unwrap();
+        let frag: PartialConfig =
+            serde_json::from_str(r#"{"code":{"llm":{"models":[]}}}"#).unwrap();
+        cfg.apply(frag).unwrap();
+        assert!(cfg.code.llm.models.is_empty());
     }
 
     /// A-2 (finetune_support): disclosure/intervention knobs merge as min

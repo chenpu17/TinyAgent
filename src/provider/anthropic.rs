@@ -228,6 +228,14 @@ impl Anthropic {
             }
             None => {}
         }
+        // Per-request sampling temperature (LD-4): forwarded only when the
+        // caller set it — the agent's turns never do, so their bodies are
+        // byte-identical to before. Anthropic's range is 0..=1; the in-tree
+        // caller sends 0.0. A caller out of range gets the API's own 400
+        // (diagnosed like any other request error), not a silent clamp.
+        if let Some(t) = req.temperature {
+            body["temperature"] = json!(t);
+        }
         if let Some(sys) = req.system {
             if req.cache {
                 // System must be a content-block array (not a bare string) to
@@ -1045,6 +1053,7 @@ mod tests {
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cache,
             reasoning_effort: effort,
+            temperature: None,
         }
     }
 

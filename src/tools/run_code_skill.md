@@ -89,7 +89,7 @@ return classifyTier(150);           // "medium"
 - **无事务语义（三句话）**：无原子性；无回滚；部分执行是正常结果。批量结果必须**逐条检查**结果数组——哪些条目跑了、哪些被拒纳，数组里如实可见。次序保证仅存在于顺序 for 循环（副作用批量）。
 - **只读面**：仅 batchable 工具可入批（read_file 等纯只读工具）。混入非只读工具（write_file/shell 等）→ 该条目为 `e.kind="batch"` 错误条目，单条不中止；**副作用调用写顺序 for 循环**。
 - **失败条目判别**：单项失败不 throw，该条目为 `Error` 实例带 `e.kind`/`e.tool`——用 `instanceof Error` 判别，细节取 `.kind`/`.message`，**不要 `JSON.stringify` 失败条目**（Error 序列化成 `{}`，细节全丢）。成功条目就是工具结果本体（JSON 自动解析，同 `tools.call`）。
-- **额度**：K 条计 K 次调用计数（失败条目也计）；撞调用额度时尾部条目得 `e.kind="budget"`（`e.halted=true`，沙箱已停只能 return 收尾）。token 预算面（`e.halted=false`、可落盘收尾）随 llm 工具引入，当前无此路径。
+- **额度**：K 条计 K 次调用计数（失败条目也计）；撞调用额度时尾部条目得 `e.kind="budget"`（`e.halted=true`，沙箱已停只能 return 收尾）。token 预算面的 `e.halted=false`（预占拒绝、沙箱活着、可落盘收尾）由 llm 工具引入，见「LLM 判别」段。
 - **超时预算**：`timeout_secs ≈ 单调用预期时长 × ceil(批量规模 / 有效并发度) + 计算与限流余量`；有效并发度不大于 8。仅作规划估算，不是最坏时延保证。
 
 ```js
@@ -106,6 +106,46 @@ for (const r of results) {
 return { ok, bad };   // bad 非空就如实上报，不吞
 ```
 <!-- END BATCH SECTION -->
+
+<!-- BEGIN LLM SECTION（code.llm.enabled=true 时保留；=false 时装配端整段剔除，见
+     run_code.rs::run_code_skill_md —— 门关时模型可见契约与旧二进制一致） -->
+## LLM 判别（需配置开启 code.llm.enabled；未开启时 llm 工具不存在）
+
+`tools.call("llm", {prompt, system?, model?, max_tokens?, labels?})` 单次模型调用（无工具、无历史、无流式，一轮返回）。大量同构的逐项语义判断（分类/抽取/校对/打标）用代码循环 + llm 承接；model 须在 code.llm.models 内（缺省 default_model）。返回 `{text, label?, usage, model}`；调用也计工具额度、token 成本发前预占。
+
+- **判别纪律**：输出词表用 `labels` 声明（含 unsure 显式词），**且 prompt 里同写"输出必须是这些词之一"**（宿主只校验不注入提示）；未声明 labels = 生成模式（任意文本，作结构化抽取须在库内另行校验）；非法输出得 `kind="llm_output"`——分支前先判 label 合法性；unsure 单独计数进聚合摘要；`max_tokens` 用目标模型验证后设小；**首发只产出只读结果**；其他部署的副作用按宿主授权政策执行，外层复判不等于用户授权。
+- **成本纪律**：开工前 `tools.budget()` 查 tokens_left（**含未结算的预占**），循环里定期查；429/5xx 保留失败项并交外层诊断，系统性限流须宿主延后处理；`e.kind === "budget"` 时查 **`e.halted`**：true = 沙箱已停，只能 return 收尾；false = 额度关口拒绝但沙箱活着，可 write_file 落盘部分结果再收尾。单次 `tools.call` 的封套无 `e.halted` 字段——按错误文案判断沙箱是否还活着（预占拒绝的文案自带"沙箱仍在运行"语义）。
+- **批量形态**：逐项判别的并发形态见「批量调用」段（仅部署开启 code.call_batch 时可用——llm 是 batchable 工具，判别 fan-out 与分页拉取是理想对象）；未开启时写顺序 for 循环。失败条目判别与逐条检查纪律同该段：`instanceof Error`、取 `.kind`/`.message`、**不要 `JSON.stringify` 失败条目**、部分执行是常态。
+- **级联模式**：便宜 model 先判，`unsure`/`llm_output` 错误升级贵 model：
+
+```js
+// 级联判别 example：便宜模型先判，unsure 升级贵模型（示意模型名）。
+function judge(item) {
+  try {
+    const r = tools.call("llm", {
+      prompt: item.text + "\n\n输出必须是这些词之一：yes / no / unsure",
+      model: "cheap-model", max_tokens: 8,
+      labels: ["yes", "no", "unsure"],
+    });
+    if (r.label === "unsure") {
+      const up = tools.call("llm", {
+        prompt: item.text + "\n\n输出必须是这些词之一：yes / no",
+        model: "expensive-model", max_tokens: 8,
+        labels: ["yes", "no"],
+      });
+      return up.label;              // 升级后输出未命中 → 走下方 llm_output 分支
+    }
+    return r.label;
+  } catch (e) {
+    if (e.kind === "llm_output") return "unresolved";  // 词表未命中：换模型或标记跳过
+    throw e;                                           // budget / llm 等交外层诊断
+  }
+}
+```
+
+- **质量交付**：按预先给定的场景政策抽检本批实际输出（不是重跑 verify）；保留原文版本与定位。没有质量政策或未完成复核时标未验证/待复核；抽检通过不等于全量正确。unsure、错误与未完成项保留在分母和交付清单。
+- **恢复**：按块提前保存 checkpoint；不要等 quota/cancel/deadline 已阻断工具后才尝试落盘。恢复时只读任务可重算待确认项；副作用另需宿主的确认/幂等政策。
+<!-- END LLM SECTION -->
 
 ## read_file 的三种模式（tools.call 直调时按需选）
 1. **文本模式**（默认）：首行 `[文件名: 总行数 · 总字符 · complete|行区间 a-b]` 元数据，其后每行 `行号→tab` 前缀；带 limit 截断时末尾多一行 `... [line limit reached]`。需要解析内容时优先 readAll / readLines 或 json 模式，**不要手解析这个格式**

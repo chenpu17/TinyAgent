@@ -2,15 +2,58 @@
 
 | 项 | 值 |
 |---|---|
-| 状态 | v0.7.1 设计修订稿（M2 callBatch 通道已落码，M3 起未实现）；可进入有界原型验证，产品收益与运行时实现均未验收 |
-| 版本 | v0.7.1 |
+| 状态 | v0.7.2 设计修订稿（M2 callBatch + M3 llm 已落码，M4 起未实现）；产品收益未验收（V0-B 未跑） |
+| 版本 | v0.7.2 |
 | 日期 | 2026-09-22 |
 | 关联文档 | `docs/run_code_design.md`（D 编号）、`docs/finetune_support_design.md`（FD 编号、附录 A 即规格纪律）、`docs/run_code_routing_report.md`（评测方法论）、`docs/code_memory_design.md`（姊妹稿，共享纪律见 §10） |
-| 代码基线 | master @ 0579564（其后行号会漂移，以代码为准） |
+| 代码基线 | master @ edfb9bc（其后行号会漂移，以代码为准） |
 | 决策编号 | 本文 LD-n 独立编号；引用 run_code_design 写 D-n、finetune_support 写 FD-n |
 
 修订记录（历史仅说明演进，当前正文与决策表为规格）：
 
+- **v0.7.2（M3 llm 落码）**：LD-1～19 契约落码，语义差异与补充如下——
+  ① **⑨ 定案：单次调用错误封套不补 `halted`**。预算拒绝（kind="budget"）的恢复
+  语义（沙箱仍活着、可继续 write_file 落盘收尾）由错误 message 文本承载；机读
+  `halted` 字段只在批量封套存在。理由与 ⑨ 相同不再议：单次封套不受任何 gate
+  门控，加字段立即改变全关对照臂（A-L8）的错误形状。
+  ② 批量封套 halted 矩阵落码：budget 类 entry **恒带** `halted`（true = latch
+  态：call-limit/deadline/cancel；false = token 预占拒绝）；其余错误类仅
+  halted=true 时携带（additive）。llm 的错误类（`llm`/`llm_output`）与 `tool`
+  类同列"非 halt 态"。
+  ③ 错误类的传递通道：LlmTool 在 `ToolOutput.meta` 写 `llm_err`，新 Tool trait
+  方法 `envelope_error_kind()`（默认 None → 沿用 tool/unknown_tool 分类）读出，
+  run_code 的 dispatch 收尾是唯一读者——prelude glue 与既有工具零改动。
+  ④ LD-12 审计落码形状：result.json `code.llm` 配置锚点（enabled/
+  default_model/models，仅启用时落、additive）+ `meta.llm` **聚合**台账
+  （calls/reserved/settled/over_reserve + per-model known_usage/known_calls/
+  unknown_calls）；per-call 明细行（model/reserved/actual/known/over_reserve）
+  经完成尾折叠为聚合，成功与终止两个出口都折叠（失败出口审计纪律）。
+  ⑤ LD-16 落码形态：`Agent.provider` 内部由 Box 改 Arc（公共 API 仍是 Box，
+  try_new 处转换）；cell 晚填充收敛在 `Agent::set_code_tool` 单点（LD-16 文中
+  "build_agent_with_provider 回填"由该点实现，绑定宿主 enable_code 同路）。
+  ⑥ LD-3 落码位置：顶层撞名检查在 `Agent::try_new`（工具表已到手、先于任何
+  装配），不在 `validate_tool_names` 尾部——后者在 assemble 末尾，触达时
+  RunCodeTool 已构造；guest 侧注册表构建时再查一次（防 extra_tools 之外的
+  直入路径），文案带"名字保留"提示。
+  ⑦ 描述/技能披露落码：批量段 readers 的 "read_file / llm 等 batchable 工具"
+  仅当 llm gate 开启才点名（关闭时保持 ⑦（v0.7.1）的"read_file 等"字面——
+  封闭清单诚实，BATCH_DESC_SUFFIX 基字面不动、运行时替换）；描述【LLM 判别】
+  overlay 段与技能「LLM 判别」段同随 `code.llm.enabled`。技能批量段的 llm
+  批量形态在 call_batch 关时用指针措辞（不出现 `tools.callBatch` 字样，守
+  A-L8 的 gate 各管各的段纪律）。
+  ⑧ e2e 落码（A-L4）：`scripts/e2e_scenarios.py` 增 llmbatch 场景——8 entry
+  callBatch × llm 过真实 CLI/HTTP/SSE 栈，请求数精确核算（2 外层 + 8 内层）、
+  服务端按模型注入延迟并记录**服务窗口**，时间区间重叠断言真并发；CI e2e
+  job 构建改 `--features code`。坑位记录：socketserver 默认 listen backlog 5
+  在 8 路瞬发新连接下丢 SYN（表现为随机 connection reset 的 entry 错误），
+  `request_queue_size=64` 解决——批扇出场景的 mock 服务端都要带。
+  ⑨ 配置落码：`LlmConfig` 三字段（deny_unknown_fields），解析归一做首现去重、
+  enabled 时的不变式校验（models 空/缺 default/default ∉ models 均为可行动
+  报错）；batch 片段拒绝改 `llm.enabled`/`default_model`，`models` 只能收紧
+  （交集、保 base 序）且交集丢 default_model 直接报错。
+  ⑩ v0.7.1 ⑩（批结果宿主侧驻留上限）**M3 未包含**，维持推迟：跨 entry 字节
+  预算/逐 entry 写回随评测门再议；llm entry 的驻留由 max_tokens ≤8192 tokens
+  钳制、read_file 沿用 max_output_chars，风险仍如 ⑩ 所述有界未消除。
 - **v0.7.1（M2 callBatch 落码）**：§4 契约落码，语义差异与补充如下——
   ① `batchable()` 能力轴（LD-19）：`Tool::batchable()` 默认 false，read_file 与 MCP
   `readOnlyHint` 覆写 opt-in，缺注解=false；`SharedTool`（extra_tools 包装）转发
@@ -463,7 +506,7 @@ V0-A 先验证工作方式，V0-B 在最小实现后验证产品集成；**V0-B 
 | M0 技术探针 | mock model 分流、同实例/clone 身份、reserve/settle 与失败账本；仅验证所需并行机制 | A-L2b/2c/9 原型通过；确认主循环重构边界、非流式消费与 provider 按请求参数方案；未通过则先修设计 |
 | M1 include 最小闭环 | 宿主加载/哈希边界、manifest、会话登记、默认流程准入、独立 gate；模板文档与行为同时落地 | 姊妹稿 A-M1～M7、M9～M12 默认流程项；A-M8 随 M3 完成，宿主可信配置随 V0-B 验收 |
 | M2 callBatch | ✅ 落码（v0.7.1）：只读能力、同一路径的逐波 gate/执行/结算、保留名门控；token 预占留 M3（llm 是唯一 token 消费面） | A-L4/8（`batch_*`/`gate_on_description_lists_batch_helper`/`skill_gated_sections_ride_their_gates`，并发以进程内时间戳重叠证明）；真实 LLM 吞吐留 M3/V0-B |
-| M3 llm 最小闭环 | LlmTool、共享 Provider、预算/用量分账、labels、审计与交付示例 | A-L1～9、A-M8、全部结算出口、修改后参数校验及既有回归通过；A-L10 交付示例机制检查完成，真实质量验证留 V0-B；这些是完成判据，不是编码开始前必须已全绿 |
+| M3 llm 最小闭环 | ✅ 落码（v0.7.2）：LlmTool、共享 Provider cell、LD-17 预占/结算全矩阵、LD-18 labels、`meta.llm` 审计、描述/skill 披露、e2e llmbatch；差异记录见修订 ⑪ | A-L1～9 进程内 + e2e 通过（A-L4 以服务端服务窗口重叠证真并发）；A-M8 见姊妹稿；全部结算出口、修改后参数校验及既有回归通过；A-L10 交付示例机制检查完成，真实质量验证留 V0-B |
 | M4 契约与评测装配 | 汇总 README/描述/skill/prelude/manifest；各功能随 gate 披露；装配 E0–E3 与四路线实验 | sync_run_code_contract 与门关回归通过，配方可复现；文案随各功能开发，不能等 M4 才首次测试 |
 | V0-B 集成与生命周期验证 | 最小实现上跑 E0–E3/外部对照及变化任务；覆盖起草、发现、修订、晋升、证据失效/重新验证，计入人工与部署成本 | 满足预登记质量与覆盖率底线，达到选定任务族的成本/时延/维护目标且负例回归在容差内；宿主可信部署另验策略；不满足则缩范围/保留独立原语/停止扩展 |
 

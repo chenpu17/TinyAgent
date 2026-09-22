@@ -3888,7 +3888,7 @@ fn run_installs_a_fleet_budget_counter_and_resets_it_per_run() {
     // Second run: fresh provider script, fresh spend — the counter must
     // NOT still carry the previous run's 65.
     let (prov2, _) = MockProvider::new(vec![mock::resp_text("again", mock::mk_usage(7, 3))]);
-    agent.provider = Box::new(prov2);
+    agent.provider = std::sync::Arc::new(prov2);
     agent.run(&mut |_| {}).unwrap();
     let counter2 = agent.ctx.budget.clone().expect("counter re-installed");
     assert_eq!(

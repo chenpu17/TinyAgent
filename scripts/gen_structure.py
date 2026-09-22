@@ -45,6 +45,7 @@ ENTRIES = [
     ("tools/subagent.rs", "task 子 agent 工具（独立上下文 + turn 封顶；不可递归）"),
     ("tools/todo.rs", "todo 工具（任务计划，全量替换；plan 落 result.json）"),
     ("tools/run_code.rs", "run_code 工具（feature code）：QuickJS-in-wasm 沙箱——epoch/fuel/mem 限额、路径拦截、hooks 闸门、审计 meta（双哈希）"),
+    ("tools/llm.rs", "llm 判别原语（feature code + code.llm 门）：单发无状态内层模型调用——LD-17 预占/结算、LD-18 labels 归一、共享 Provider cell"),
     ("mcp.rs", "MCP 客户端（stdio / Streamable HTTP / 旧版 SSE）"),
     ("batch.rs", "批量任务 + --retries/--failed + 报告合并"),
     ("harness.rs", "headless 模式 + result.json + NDJSON + exit code"),

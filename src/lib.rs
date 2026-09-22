@@ -166,10 +166,10 @@ pub fn build_agent_with_provider(
 struct CodeInstall {
     #[cfg(feature = "code")]
     tool: Option<tools::run_code::RunCodeTool>,
-    /// Assembly-time `(skill_injection, precheck)` audit facts
-    /// (finetune_support NFR-3) — `Some` only when the sandbox is enabled.
+    /// Assembly-time audit facts (finetune_support NFR-3 + LD-12) — `Some`
+    /// only when the sandbox is enabled.
     #[cfg(feature = "code")]
-    audit: Option<(config::SkillInjection, bool)>,
+    audit: Option<crate::agent::CodeAudit>,
 }
 
 impl CodeInstall {
@@ -301,11 +301,13 @@ fn assemble(
             tool: Some(tool),
             // Captured at assembly (FD-7): skill_injection is an
             // assembly-time decision — a later set_code_config replace must
-            // not rewrite the audit of what actually happened.
-            audit: cfg
-                .code
-                .enabled
-                .then_some((cfg.code.skill_injection, cfg.code.precheck)),
+            // not rewrite the audit of what actually happened. The llm
+            // anchor (LD-12) rides the same snapshot rule.
+            audit: cfg.code.enabled.then(|| crate::agent::CodeAudit {
+                skill_injection: cfg.code.skill_injection,
+                precheck: cfg.code.precheck,
+                llm: cfg.code.llm.enabled.then(|| cfg.code.llm.clone()),
+            }),
         }
     };
     #[cfg(not(feature = "code"))]
@@ -355,12 +357,13 @@ fn assemble(
                 run_code_tombstone = index.entry_of(RUN_CODE_SKILL_NAME).is_none();
             }
             policy @ (SkillInjection::OnDemand | SkillInjection::Eager) => {
-                // MD-13 / LD-15: the lib and batch sections ride their
-                // assembly-time gates — spliced out when off, so a gate-off
-                // skill stays the pre-gate contract.
+                // MD-13 / LD-15 / LD-14: the lib, batch and llm sections
+                // ride their assembly-time gates — spliced out when off, so
+                // a gate-off skill stays the pre-gate contract.
                 match skills::embedded_entry(&tools::run_code::run_code_skill_md(
                     cfg.code.include,
                     cfg.code.call_batch,
+                    cfg.code.llm.enabled,
                 )) {
                     Some(e) => index.insert_builtin(e),
                     None => eprintln!("[skill] built-in run-code skill is malformed, skipped"),

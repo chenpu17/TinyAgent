@@ -525,7 +525,13 @@ struct UsageAnchor {
 }
 
 pub struct Agent {
-    provider: Box<dyn Provider>,
+    /// `Arc`, not `Box` (code_llm_design LD-16): the sandbox `llm` primitive
+    /// must ride the VERY instance this agent chats through — `set_code_tool`
+    /// clones the Arc into the `RunCodeTool`'s shared cell, so inner calls,
+    /// custom providers and the outer turns all see one provider. The public
+    /// constructors keep taking `Box<dyn Provider>` (API stability for the
+    /// bindings) and convert here.
+    provider: std::sync::Arc<dyn Provider>,
     /// The protocol family declared by the config ("anthropic" / "openai") —
     /// NOT derived from the boxed `provider` above. When a caller injects a
     /// custom provider (bindings' provider= callback) this still records what
@@ -616,15 +622,28 @@ pub struct Agent {
     /// go through the `build_agent*` helpers).
     #[cfg(feature = "code")]
     code_tool: Option<crate::tools::run_code::RunCodeTool>,
-    /// Assembly-time audit facts `(skill_injection, precheck)` for the harness's
-    /// result.json / NDJSON anchor (finetune_support NFR-3). Captured at
+    /// Assembly-time audit facts for the harness's result.json / NDJSON
+    /// anchor (finetune_support NFR-3 + code_llm_design LD-12). Captured at
     /// install time — NOT read live — because `skill_injection` is an
     /// assembly-time decision: a runtime `set_code_config` replace does not
     /// re-inject (FD-7), so the live value could misreport what actually
     /// happened. `Some` only when the sandbox was enabled at assembly;
     /// `None` on feature-off builds and direct `try_new` agents.
     #[cfg(feature = "code")]
-    code_audit: Option<(crate::config::SkillInjection, bool)>,
+    code_audit: Option<CodeAudit>,
+}
+
+/// The audit facts named above (see the `code_audit` field doc). `llm` is
+/// `Some` only when the inner-model primitive was enabled at assembly — the
+/// LD-12 anchor (default_model + allowlist) — keeping llm-off output
+/// byte-identical (additive-key discipline).
+#[cfg(feature = "code")]
+pub(crate) struct CodeAudit {
+    pub(crate) skill_injection: crate::config::SkillInjection,
+    pub(crate) precheck: bool,
+    /// The llm gate's config snapshot (enabled=true by construction of the
+    /// Some).
+    pub(crate) llm: Option<crate::config::LlmConfig>,
 }
 
 /// Build the system prompt with a leading `# Environment` block (OS / Shell /
@@ -683,6 +702,20 @@ impl Agent {
         ctx: ToolCtx,
     ) -> Result<Self> {
         crate::tools::validate_tool_names(&tools)?;
+        // LD-3 top-level name reservation (code_llm_design): when the sandbox
+        // AND its llm primitive are enabled, `llm` names the guest-only tool
+        // — a same-named top-level tool (an MCP server) would mislead the
+        // model into calling something the llm contract doesn't describe.
+        // Err + actionable hint, mirroring `__tools_list`. Sandbox off → no
+        // reservation (a user MCP tool named `llm` stays legal, LD-3).
+        #[cfg(feature = "code")]
+        if cfg.code.enabled && cfg.code.llm.enabled && tools.iter().any(|t| t.def().name == "llm") {
+            anyhow::bail!(
+                "tool name 'llm' is reserved (the run_code sandbox's llm \
+                 primitive, code.llm.enabled=true) — rename the tool or set \
+                 code.llm.enabled=false"
+            );
+        }
         let tool_defs: Vec<ToolDef> = tools.iter().map(|t| t.def()).collect();
         let tool_schema_chars = tool_defs
             .iter()
@@ -722,6 +755,10 @@ impl Agent {
         let mut messages = initial;
         let mut next_msg_id = 0u64;
         assign_missing_ids(&mut messages, &mut next_msg_id);
+        // Box→Arc at the single chokepoint (see the field doc): callers keep
+        // their Box-based API, the agent's internals (and the LD-16 llm cell
+        // fill in `set_code_tool`) share one Arc.
+        let provider: std::sync::Arc<dyn Provider> = provider.into();
         Ok(Self {
             provider,
             provider_label: cfg.provider.as_str().to_string(),
@@ -1009,6 +1046,16 @@ impl Agent {
     /// parks the live handle the switch methods below act on.
     #[cfg(feature = "code")]
     pub fn set_code_tool(&mut self, tool: crate::tools::run_code::RunCodeTool) {
+        // LD-16 fill point: the llm primitive's shared provider cell gets
+        // THIS agent's provider — the same instance the outer turns ride —
+        // so inner `llm` calls reach the very provider the deployment
+        // configured (custom providers included; they answer with their own
+        // honest error when they cannot serve a model). `let _` on the set:
+        // exactly one install happens per agent by construction (assemble's
+        // single construction point), so there is no second write to lose.
+        let _ = tool
+            .provider_cell()
+            .set(std::sync::Arc::clone(&self.provider));
         self.code_tool = Some(tool);
     }
 
@@ -1016,16 +1063,16 @@ impl Agent {
     /// Called by `CodeInstall::install` — the only path that knows the
     /// effective post-merge config the session assembled with.
     #[cfg(feature = "code")]
-    pub(crate) fn set_code_audit(&mut self, audit: Option<(crate::config::SkillInjection, bool)>) {
+    pub(crate) fn set_code_audit(&mut self, audit: Option<CodeAudit>) {
         self.code_audit = audit;
     }
 
-    /// The assembly-time code audit facts `(skill_injection, precheck)`, for
-    /// the harness's result.json / NDJSON anchor. `None` when the sandbox was
-    /// not enabled at assembly (or no assembly happened).
+    /// The assembly-time code audit facts (see the `code_audit` field doc),
+    /// for the harness's result.json / NDJSON anchor. `None` when the sandbox
+    /// was not enabled at assembly (or no assembly happened).
     #[cfg(feature = "code")]
-    pub(crate) fn code_audit(&self) -> Option<(crate::config::SkillInjection, bool)> {
-        self.code_audit
+    pub(crate) fn code_audit(&self) -> Option<&CodeAudit> {
+        self.code_audit.as_ref()
     }
 
     /// Narrow the system-prompt attribution for `context_breakdown`: record
@@ -1565,6 +1612,7 @@ impl Agent {
                         // out.
                         cache: true,
                         reasoning_effort: self.reasoning_effort.as_deref(),
+                        temperature: None,
                     };
                     // Hooks observation point — MAIN-turn requests only (the
                     // compression summary call deliberately not surfaced; see
@@ -3267,6 +3315,7 @@ impl Agent {
                 // Gateways that default to thinking anyway are handled by the
                 // empty-body retry below, provider-agnostically.)
                 reasoning_effort: None,
+                temperature: None,
             };
             // One transient retry (Codex-style backoff): a single lost
             // packet/5xx on the summary request currently disables

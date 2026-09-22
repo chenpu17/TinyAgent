@@ -40,6 +40,7 @@ fn call(provider: &dyn Provider, model: &str) -> anyhow::Result<ChatResponse> {
         cancel,
         cache: false,
         reasoning_effort: None,
+        temperature: None,
     };
     let mut deltas = 0usize;
     let resp = provider.chat(&req, &mut |_e: ChatEvent| deltas += 1)?;

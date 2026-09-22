@@ -86,6 +86,10 @@ pub struct Captured {
     pub model: String,
     pub max_tokens: u32,
     pub reasoning_effort: Option<String>,
+    /// Per-request sampling temperature (LD-4) — lets the sandbox `llm`
+    /// primitive's tests assert it reached the request (Some(0.0)), and the
+    /// agent-turn tests assert it did NOT (None — outer default untouched).
+    pub temperature: Option<f32>,
     /// Tool names as sent on this request — pins hot add/remove actually
     /// reaching the request side, not just the agent's getter.
     pub tool_names: Vec<String>,
@@ -214,6 +218,7 @@ impl Provider for MockProvider {
             model: req.model.to_string(),
             max_tokens: req.max_tokens,
             reasoning_effort: req.reasoning_effort.map(str::to_string),
+            temperature: req.temperature,
             tool_names: req.tools.iter().map(|t| t.name.clone()).collect(),
             per_request_timeout: req.per_request_timeout,
         });

@@ -407,6 +407,12 @@ struct HostCtx {
     /// 会话恢复"). This is the ONLY admission input the guest cannot forge:
     /// the host reads and hashes the bytes itself.
     lib_sessions: LibSessions,
+    /// LD-12 ledger for the sandbox `llm` primitive: per-model known usage,
+    /// unknown-call counts, reservation totals and over_reserve events,
+    /// folded from each call's meta marker by the completion tails. Emitted
+    /// into `ToolOutput.meta["llm"]` only when calls > 0 (additive-key
+    /// discipline — llm-off runs stay byte-identical).
+    llm: LlmAudit,
 }
 
 /// Which asynchronous limit cut the guest short (§6). Cancel and the wall
@@ -452,8 +458,30 @@ impl HostCtx {
             deadline,
             interrupt: None,
             lib_sessions,
+            llm: LlmAudit::default(),
         }
     }
+}
+
+/// LD-12 audit ledger for the sandbox `llm` primitive (see `HostCtx::llm`).
+/// "unknown" is a first-class state, not zero: a call whose usage never
+/// arrived keeps its reservation standing and counts under `unknown_calls`
+/// — the totals are KNOWN usage, never presented as the complete bill.
+#[derive(Default)]
+struct LlmAudit {
+    calls: u64,
+    reserved: u64,
+    settled: u64,
+    over_reserve: u64,
+    /// Per model (BTreeMap: deterministic key order in the JSON audit).
+    models: std::collections::BTreeMap<String, LlmModelSpend>,
+}
+
+#[derive(Default)]
+struct LlmModelSpend {
+    known_usage: u64,
+    known_calls: u64,
+    unknown_calls: u64,
 }
 
 /// A latched halt (call limit / wall clock): the guest-visible message plus
@@ -923,6 +951,7 @@ fn finish_batch_entry(
         in_hash_eff: meta.in_hash_eff,
     });
     fold_inner_usage(d, output);
+    fold_llm_audit(d, output);
 }
 
 /// Refuse an announced entry and complete it through the same tail
@@ -971,10 +1000,20 @@ fn batch_entry_envelope(name: Option<&str>, f: &EntryFinal) -> Value {
         if let Some(n) = name {
             e["tool"] = json!(n);
         }
-        if f.class != "tool" {
+        // LD-7: "tool" AND the llm classes omit `retryable` (the model
+        // judges from the message); every other class is definitive.
+        if !matches!(f.class, "tool" | "llm" | "llm_output") {
             e["retryable"] = json!(false);
         }
-        if f.halted {
+        // LD-9's machine-readable recovery split, batch surface: budget-class
+        // errors ALWAYS carry `halted` — true = a latch (call-limit /
+        // deadline / cancel) refuses everything, only `return` can follow;
+        // false = a reserve refusal, the sandbox is alive and settled
+        // releases can re-open dispatch (write_file partial results, then
+        // wrap up). Other classes carry it only when actually latched.
+        if f.class == "budget" {
+            e["halted"] = json!(f.halted);
+        } else if f.halted {
             e["halted"] = json!(true);
         }
         return e;
@@ -1297,9 +1336,10 @@ fn call_batch_dispatch(caller: &mut Caller<'_, HostCtx>, args: &Value) -> i64 {
                 };
                 let output = run_tool(&tools, &defs, &name, &input, &ctx, &mut emit);
                 let meta = metas[idx].take().expect("inline entry was announced");
+                let class = real_run_class(&tools, &name, true, &output);
                 finals[idx] = Some(EntryFinal {
                     output: output.clone(),
-                    class: "tool",
+                    class,
                     halted: false,
                 });
                 finish_batch_entry(caller, meta, &output, Some(true));
@@ -1371,9 +1411,10 @@ fn call_batch_dispatch(caller: &mut Caller<'_, HostCtx>, args: &Value) -> i64 {
                             },
                             WaveMsg::Done(idx, output) => {
                                 let meta = metas[idx].take().expect("worker entry was announced");
+                                let class = real_run_class(&tools, &meta.name, true, &output);
                                 finals[idx] = Some(EntryFinal {
                                     output: output.clone(),
-                                    class: "tool",
+                                    class,
                                     halted: false,
                                 });
                                 finish_batch_entry(caller, meta, &output, Some(true));
@@ -1565,6 +1606,65 @@ fn fold_inner_usage(d: &mut HostCtx, output: &ToolOutput) {
         crate::compress::merge_usage(Some(std::mem::take(&mut d.usage)), output.usage)
     {
         d.usage = merged;
+    }
+}
+
+/// The guest envelope's error CLASS for a real tool run (LD-7): a tool with
+/// its own failure vocabulary (`Tool::envelope_error_kind` — the `llm`
+/// primitive's "llm" / "llm_output" / "budget") names it; every other tool
+/// is plain "tool" (or "unknown_tool" when the name never resolved — the
+/// caller's `known` flag). The by-name lookup runs on the ERROR path only;
+/// the happy path pays nothing.
+fn real_run_class(
+    tools: &[Box<dyn Tool>],
+    name: &str,
+    known: bool,
+    output: &ToolOutput,
+) -> &'static str {
+    if output.is_error {
+        if let Some(kind) = tools
+            .iter()
+            .find(|t| t.def().name == name)
+            .and_then(|t| t.envelope_error_kind(output))
+        {
+            return kind;
+        }
+    }
+    if known {
+        "tool"
+    } else {
+        "unknown_tool"
+    }
+}
+
+/// Fold one output's `llm_call` audit marker (LD-12) into the execution's
+/// ledger. Called from the same completion tails as [`fold_inner_usage`] —
+/// the single-call Phase B tail and every batch completion — so failure
+/// exits carry their cost story too ("完整性信息必须在成功和失败出口都可见").
+/// Saturating everywhere: a lying tool meta cannot wrap the ledger.
+fn fold_llm_audit(d: &mut HostCtx, output: &ToolOutput) {
+    let Some(row) = output.meta.as_ref().and_then(|m| m.get("llm_call")) else {
+        return;
+    };
+    d.llm.calls = d.llm.calls.saturating_add(1);
+    let reserved = row.get("reserved").and_then(Value::as_u64).unwrap_or(0);
+    d.llm.reserved = d.llm.reserved.saturating_add(reserved);
+    let model = row
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("?")
+        .to_string();
+    let m = d.llm.models.entry(model).or_default();
+    match row.get("actual").and_then(Value::as_u64) {
+        Some(a) => {
+            m.known_usage = m.known_usage.saturating_add(a);
+            m.known_calls = m.known_calls.saturating_add(1);
+            d.llm.settled = d.llm.settled.saturating_add(a);
+        }
+        None => m.unknown_calls = m.unknown_calls.saturating_add(1),
+    }
+    if row.get("over_reserve").and_then(Value::as_bool) == Some(true) {
+        d.llm.over_reserve = d.llm.over_reserve.saturating_add(1);
     }
 }
 
@@ -1820,7 +1920,8 @@ fn host_call_tool(
                             let output =
                                 run_tool(&d.tools, &d.defs, &name, &effective, &d.ctx, emit);
                             notify_tool_after(&d.ctx, &name, &args, &output, true);
-                            (output, if known { "tool" } else { "unknown_tool" })
+                            let class = real_run_class(&d.tools, &name, known, &output);
+                            (output, class)
                         }
                     }
                 }
@@ -1840,6 +1941,7 @@ fn host_call_tool(
             in_hash_eff,
         });
         fold_inner_usage(d, &output);
+        fold_llm_audit(d, &output);
     }
 
     // Phase C — hand the envelope back (needs the mutable caller again).
@@ -1857,7 +1959,12 @@ fn host_call_tool(
              call read_file on the path instead, or use load_image at the top level",
         )
     } else if output.is_error {
-        let retryable = if err_class == "tool" {
+        // LD-7: "tool" AND the llm classes deliberately OMIT `retryable` —
+        // the host cannot classify a plain tool's own failure, and an llm
+        // failure's retry-worthiness (transient 5xx vs deterministic param
+        // reject) is the model's judgment from the message. Every other
+        // class is definitive → retryable:false.
+        let retryable = if matches!(err_class, "tool" | "llm" | "llm_output") {
             None
         } else {
             Some(false)
@@ -2464,6 +2571,7 @@ fn audit_meta(
     fuel_used: u64,
     truncated: bool,
     logs_dropped: u64,
+    llm: &LlmAudit,
 ) -> Value {
     let entries: Vec<Value> = calls
         .iter()
@@ -2492,6 +2600,33 @@ fn audit_meta(
     }
     if logs_dropped > 0 {
         meta["logs_dropped"] = json!(logs_dropped);
+    }
+    // LD-12 llm ledger — additive key, only when the primitive actually ran
+    // (llm-off / no-llm-call runs stay byte-identical). Per-model known
+    // usage + unknown-call counts; `settled` is KNOWN usage, never
+    // presented as the complete bill when `unknown_calls` > 0.
+    if llm.calls > 0 {
+        let models: serde_json::Map<String, Value> = llm
+            .models
+            .iter()
+            .map(|(m, s)| {
+                (
+                    m.clone(),
+                    json!({
+                        "known_usage": s.known_usage,
+                        "known_calls": s.known_calls,
+                        "unknown_calls": s.unknown_calls,
+                    }),
+                )
+            })
+            .collect();
+        meta["llm"] = json!({
+            "calls": llm.calls,
+            "reserved": llm.reserved,
+            "settled": llm.settled,
+            "over_reserve": llm.over_reserve,
+            "models": models,
+        });
     }
     meta
 }
@@ -2602,7 +2737,7 @@ pub(crate) const RUN_CODE_SKILL_MD: &str = include_str!("run_code_skill.md");
 /// Marker discipline: exactly one BEGIN and one END line per section, BEGIN
 /// before END; a malformed marker set is a hard error at assembly (fail
 /// loud, never silently ship a half-section).
-pub fn run_code_skill_md(include: bool, call_batch: bool) -> String {
+pub fn run_code_skill_md(include: bool, call_batch: bool, llm: bool) -> String {
     /// Strip one marked section (fail loud on a malformed marker set).
     fn strip_once(src: &str, begin: &str, end: &str, what: &str) -> String {
         let (b, e) = match (src.find(begin), src.find(end)) {
@@ -2629,6 +2764,14 @@ pub fn run_code_skill_md(include: bool, call_batch: bool) -> String {
             "<!-- BEGIN BATCH SECTION",
             "<!-- END BATCH SECTION -->",
             "BATCH SECTION",
+        );
+    }
+    if !llm {
+        out = strip_once(
+            &out,
+            "<!-- BEGIN LLM SECTION",
+            "<!-- END LLM SECTION -->",
+            "LLM SECTION",
         );
     }
     out
@@ -2959,6 +3102,13 @@ pub struct RunCodeTool {
     /// Session registration set for the lib family (MD-14): shared across
     /// clones — every execution of this lineage admits against one set.
     lib_sessions: LibSessions,
+    /// Shared provider cell for the `llm` primitive (LD-16): late-filled by
+    /// `Agent::set_code_tool` with the SAME `Arc<dyn Provider>` the outer
+    /// agent chats through. Must be an Arc'd cell (not a plain field) so
+    /// every clone of the lineage — and the `LlmTool` the registry builds —
+    /// sees the one fill; a plain OnceLock would split between clones and
+    /// guests would call an unfilled copy.
+    provider_cell: Arc<OnceLock<Arc<dyn crate::provider::Provider>>>,
 }
 
 impl RunCodeTool {
@@ -2979,7 +3129,16 @@ impl RunCodeTool {
             extra_tools,
             registry: Arc::new(OnceLock::new()),
             lib_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            provider_cell: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// The shared provider cell (LD-16) — the fill point `Agent::
+    /// set_code_tool` writes through. `pub(crate)` so the agent (same
+    /// crate) is the only writer; guests only ever read it through the
+    /// `LlmTool` the registry builds.
+    pub(crate) fn provider_cell(&self) -> &Arc<OnceLock<Arc<dyn crate::provider::Provider>>> {
+        &self.provider_cell
     }
 
     /// Read-lock → clone → release: the snapshot an execution runs with for
@@ -3039,6 +3198,32 @@ impl RunCodeTool {
                 // list): copy_bytes — pushed AFTER the retain, which stays
                 // about top-level/third-party tools.
                 tools.push(Box::new(CopyBytesTool));
+                // The `llm` primitive (LD-1/LD-14): admitted iff the
+                // snapshot AT THIS BUILD has the gate on — the OnceLock
+                // caches the decision for the lineage's lifetime, so a
+                // later hot flip is not sensed (documented snapshot
+                // boundary, same class as the MCP hot add/remove).
+                if self.snapshot().llm.enabled {
+                    // LD-3 name reservation, guest side: an admitted tool
+                    // already named "llm" (an MCP server, an injected
+                    // opt-in) must not be silently shadowed — dispatch is
+                    // first-match, the model would be calling a fake llm.
+                    // The whole registry build fails (cached, reported on
+                    // every call), mirroring validate_tool_names' Err+hint
+                    // on the top-level side.
+                    if tools.iter().any(|t| t.def().name == "llm") {
+                        return Err(anyhow::anyhow!(
+                            "a tool named `llm` is already registered (an MCP server or an \
+                             injected tool) — code.llm.enabled=true reserves that name for \
+                             the sandbox llm primitive; rename the tool or set \
+                             code.llm.enabled=false"
+                        ));
+                    }
+                    tools.push(Box::new(crate::tools::llm::LlmTool::new(
+                        self.snapshot().llm.clone(),
+                        Arc::clone(&self.provider_cell),
+                    )));
+                }
                 let defs = tools.iter().map(|t| t.def()).collect();
                 Ok(Registry {
                     tools: Arc::new(tools),
@@ -3111,7 +3296,7 @@ impl RunCodeTool {
                 image: None,
                 // Same audit shape as the in-flight path: zero calls, zero
                 // fuel — the guest never executed.
-                meta: Some(audit_meta(&[], &snap, 0, false, 0)),
+                meta: Some(audit_meta(&[], &snap, 0, false, 0, &LlmAudit::default())),
             };
         }
 
@@ -3311,6 +3496,7 @@ impl RunCodeTool {
             fuel_used,
             truncated,
             logs_dropped,
+            &store.data().llm,
         );
         ToolOutput {
             is_error: rc != 0,
@@ -3394,6 +3580,7 @@ impl RunCodeTool {
             fuel_used,
             fitted_truncated,
             logs_dropped,
+            &store.data().llm,
         );
         ToolOutput {
             is_error: true,
@@ -3441,6 +3628,14 @@ const LIB_DESC_SUFFIX: &str = "\n\n【库】（仅 code.include 开启时；关�
 /// anti-hallucination contract, so v1 says "read_file 等" (M3 revisits,
 /// through this file's doc + the design revision log).
 const BATCH_DESC_SUFFIX: &str = "\n\n【批量】（仅 code.call_batch 开启时；关闭时无此助手）tools.callBatch([{name, args}, …])：并发执行一批只读工具调用（read_file 等 batchable 工具；按提交序返回数组；无原子性、无回滚、部分执行是正常结果——逐条检查）。单项失败不抛、该条目为 Error 实例带 e.kind/e.tool——用 instanceof 判别，不要 JSON.stringify 失败条目（Error 序列化成 {}，细节丢失）。并发上限 8/波；分页拉取与逐项判别是理想对象；副作用调用不在批内——写顺序 for 循环。详见 run-code 技能的「批量调用」段。";
+
+/// The llm gate-ON description overlay (code_llm_design 附录 A，LD-15 同款
+/// gate 三同源纪律：描述行 / prelude 说明 / skill 段随 gate 整体出现/消失)。
+/// Appended when `code.llm.enabled` is set, outside every pinned literal.
+/// The tool's OWN entry in `tools.list()` carries appendix A① verbatim
+/// (see `llm.rs`); this overlay only adds the routing pointer to the
+/// run_code surface.
+const LLM_DESC_SUFFIX: &str = "\n\n【LLM 判别】（仅 code.llm.enabled 开启时；关闭时无此工具）tools.call(\"llm\", {prompt, system?, model?, max_tokens?, labels?})：单次模型调用（无工具、无历史、无流式）——大量同构的逐项语义判断（分类/抽取/校对/打标）用代码循环 + llm 承接；model 须在 code.llm.models 内（缺省 default_model）。声明 labels（封闭词表，≤16 项）时宿主校验输出并返回规范 label，未命中 e.kind=\"llm_output\"；词表要求必须同时写进 prompt（宿主不注入）。返回 {text, label?, usage, model}。token 成本发前预占、也计调用额度。判别纪律/成本纪律/级联详见 run-code 技能的「LLM 判别」段。";
 
 impl Tool for RunCodeTool {
     fn origin(&self) -> ToolOrigin {
@@ -3495,12 +3690,30 @@ read_file 三模式（text / format:"json" / raw）、字节保真复制及分�
             }),
         };
         let snap = self.snapshot();
-        let description = match (snap.include, snap.call_batch) {
-            (false, false) => return base,
-            (true, false) => format!("{}{LIB_DESC_SUFFIX}", base.description),
-            (false, true) => format!("{}{BATCH_DESC_SUFFIX}", base.description),
-            (true, true) => format!("{}{LIB_DESC_SUFFIX}{BATCH_DESC_SUFFIX}", base.description),
-        };
+        let mut description = base.description;
+        if snap.include {
+            description.push_str(LIB_DESC_SUFFIX);
+        }
+        if snap.call_batch {
+            // M3 revisit (recorded in the design revision log): appendix ④'s
+            // canonical reader list is "read_file / llm" — llm is named only
+            // when ITS gate is also on at def() time, so an llm-off config
+            // keeps the closed-list contract honest (no phantom tool in the
+            // description). The splice targets the suffix const, never the
+            // pinned base literal above.
+            let suffix = if snap.llm.enabled {
+                BATCH_DESC_SUFFIX.replace(
+                    "read_file 等 batchable 工具",
+                    "read_file / llm 等 batchable 工具",
+                )
+            } else {
+                BATCH_DESC_SUFFIX.to_string()
+            };
+            description.push_str(&suffix);
+        }
+        if snap.llm.enabled {
+            description.push_str(LLM_DESC_SUFFIX);
+        }
         ToolDef {
             description,
             ..base
@@ -7610,25 +7823,32 @@ return t.length;"#}),
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// MD-13/M2 + LD-15/M2: the skill's gated sections ride their
+    /// MD-13/M2 + LD-15/M2 + LD-14/M3: the skill's gated sections ride their
     /// assembly-time gates — off strips the marked block (gate-off skill =
     /// pre-gate contract, still frontmatter-valid), on keeps the file
-    /// verbatim. Both sections strip independently.
+    /// verbatim. Every section strips independently.
     #[test]
     fn skill_gated_sections_ride_their_gates() {
-        let on = run_code_skill_md(true, true);
-        assert!(on.contains("库与复用") && on.contains("批量调用"));
-        assert_eq!(on, RUN_CODE_SKILL_MD, "both gates on is the file verbatim");
-        let off = run_code_skill_md(false, false);
+        let on = run_code_skill_md(true, true, true);
         assert!(
-            !off.contains("库与复用") && !off.contains("批量调用（需配置开启"),
-            "gates off strip both sections: {off}"
+            on.contains("库与复用") && on.contains("批量调用") && on.contains("LLM 判别"),
+            "all gates on keeps every section: {on}"
+        );
+        assert_eq!(on, RUN_CODE_SKILL_MD, "all gates on is the file verbatim");
+        let off = run_code_skill_md(false, false, false);
+        assert!(
+            !off.contains("库与复用")
+                && !off.contains("批量调用（需配置开启")
+                && !off.contains("LLM 判别（需配置开启"),
+            "gates off strip all sections: {off}"
         );
         assert!(
             !off.contains("saveLib")
                 && !off.contains("BEGIN LIB SECTION")
                 && !off.contains("callBatch")
-                && !off.contains("BEGIN BATCH SECTION"),
+                && !off.contains("BEGIN BATCH SECTION")
+                && !off.contains("tools.call(\"llm\"")
+                && !off.contains("BEGIN LLM SECTION"),
             "gate-off body teaches neither feature: {off}"
         );
         // The stripped skill must still parse as a valid built-in.
@@ -7646,10 +7866,24 @@ return t.length;"#}),
             "shared kind line keeps its pre-gate wording"
         );
         // Each gate strips only its own section.
-        let lib_only = run_code_skill_md(true, false);
+        let lib_only = run_code_skill_md(true, false, false);
         assert!(lib_only.contains("库与复用") && !lib_only.contains("BATCH SECTION"));
-        let batch_only = run_code_skill_md(false, true);
+        let batch_only = run_code_skill_md(false, true, false);
         assert!(!batch_only.contains("库与复用") && batch_only.contains("callBatch"));
+        let llm_only = run_code_skill_md(false, false, true);
+        assert!(
+            !llm_only.contains("库与复用") && !llm_only.contains("BEGIN BATCH SECTION"),
+            "llm gate strips neither sibling section"
+        );
+        assert!(
+            !llm_only.contains("tools.callBatch"),
+            "llm section must not teach the batch API when its gate is off — \
+             pointer wording only (independent-gate discipline)"
+        );
+        assert!(
+            llm_only.contains("LLM 判别") && llm_only.contains("级联判别"),
+            "llm gate on keeps its section: {llm_only}"
+        );
     }
 
     // ── code_llm M2: callBatch（只读并行批量） ────────────────────────────
@@ -8313,5 +8547,1015 @@ return t.length;"#}),
         // And the prelude exposes the wrapper only when on.
         let out = run_code(r#"return typeof tools.callBatch;"#, batch_cfg());
         assert_eq!(out.content, "\"function\"");
+    }
+
+    // ── code_llm M3: llm 原语 ─────────────────────────────────────────────
+    //
+    // A-L 编号对应 docs/code_llm_design.md §7；A-L4 的 e2e 时间区间重叠
+    // 另在 scripts/e2e_scenarios.py，这里用进程内真实线程 + 区间记录钉住
+    // 并发本身（内存纪律：功能单测证明不了真并发）。
+
+    fn llm_cfg() -> CodeConfig {
+        CodeConfig {
+            llm: crate::config::LlmConfig {
+                enabled: true,
+                default_model: Some("m1".into()),
+                models: vec!["m1".into(), "m2".into()],
+            },
+            ..CodeConfig::default()
+        }
+    }
+
+    /// [`tool_with`] + the LD-16 cell fill: a scripted mock provider rides
+    /// the shared cell exactly the way `Agent::set_code_tool` installs it.
+    fn llm_tool(
+        code_cfg: CodeConfig,
+        prov: std::sync::Arc<dyn crate::provider::Provider>,
+    ) -> RunCodeTool {
+        let t = tool_with(code_cfg);
+        let _ = t.provider_cell().set(prov);
+        t
+    }
+
+    fn gated_ctx(dir: &std::path::Path, cap: u64) -> ToolCtx {
+        ToolCtx {
+            budget: Some(crate::tools::BudgetGate::new(cap)),
+            ..ctx(dir)
+        }
+    }
+
+    /// A-L1: the minimal loop — one llm call through the real guest dispatch,
+    /// billed EXACTLY once (settle replaces the reservation; the fold merges
+    /// totals without re-sharing), audit row landed, request shaped per LD-4.
+    #[test]
+    fn llm_minimal_loop_bills_once_and_settles_once() {
+        let dir = scratch();
+        let (prov, state) =
+            crate::provider::mock::MockProvider::new(vec![crate::provider::mock::resp_text(
+                "yes",
+                crate::provider::mock::mk_usage(10, 5),
+            )]);
+        let g = gated_ctx(&dir, 10_000);
+        let out = llm_tool(llm_cfg(), std::sync::Arc::new(prov))
+            .run_with_emit(
+                &json!({"code": r#"
+                    const r = tools.call("llm", {prompt: "hello"});
+                    return { text: r.text, model: r.model, in: r.usage.input_tokens };"#}),
+                &g,
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        assert_eq!(v["text"], json!("yes"), "{}", out.content);
+        assert_eq!(v["model"], json!("m1"), "LD-5 default_model route");
+        assert_eq!(v["in"], json!(10), "LD-6 real provider usage passthrough");
+        // LD-17 settle-once: the reservation was est("hello")=1+64 +1024 =
+        // 1089; settle(15) refunds 1074 — the counter holds the ACTUAL 15.
+        assert_eq!(
+            g.budget
+                .as_ref()
+                .unwrap()
+                .used
+                .load(std::sync::atomic::Ordering::Relaxed),
+            15,
+            "settle replaced the reservation with actual usage"
+        );
+        // One provider call, shaped per LD-4: temperature pinned at the
+        // provider layer, default max_tokens, the model the tier picked.
+        let cap = state.captured();
+        assert_eq!(cap.len(), 1);
+        assert_eq!(cap[0].temperature, Some(0.0));
+        assert_eq!(cap[0].max_tokens, 1024);
+        assert_eq!(cap[0].model, "m1");
+        assert!(!cap[0].cache, "one-shot, no cache-write premium");
+        // Usage folds ONCE into run_code's aggregate (self-settled — flag
+        // true means the parent fold must not re-share the counter half).
+        assert_eq!(out.usage.as_ref().map(|u| u.total()), Some(15));
+        assert!(out.usage_in_shared_budget);
+        // LD-12 audit: known usage attributed to the model.
+        let llm = out.meta.as_ref().unwrap().get("llm").unwrap();
+        assert_eq!(llm["calls"], json!(1));
+        assert_eq!(llm["settled"], json!(15));
+        assert_eq!(llm["models"]["m1"]["known_usage"], json!(15));
+        assert_eq!(llm["models"]["m1"]["unknown_calls"], json!(0));
+    }
+
+    /// A-L2b: usage never arriving is NOT zero — the reservation stands in
+    /// the budget, the totals stay unfaked, the audit says unknown.
+    #[test]
+    fn llm_missing_usage_keeps_reservation_and_fakes_nothing() {
+        let dir = scratch();
+        let (prov, _) =
+            crate::provider::mock::MockProvider::new(vec![crate::provider::mock::resp_text(
+                "yes", None,
+            )]);
+        let g = gated_ctx(&dir, 10_000);
+        let out = llm_tool(llm_cfg(), std::sync::Arc::new(prov))
+            .run_with_emit(
+                &json!({"code": r#"
+                    const r = tools.call("llm", {prompt: "hi"});
+                    return { text: r.text, usage: r.usage };"#}),
+                &g,
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        assert_eq!(
+            v["usage"],
+            json!(null),
+            "LD-6: usage is null, not fabricated"
+        );
+        // Reservation kept: est("hi") = 0 + 64 + 1024 = 1088 still held.
+        assert_eq!(
+            g.budget
+                .as_ref()
+                .unwrap()
+                .used
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1088,
+            "unknown usage keeps the full reservation (over-hold, never under-hold)"
+        );
+        assert_eq!(
+            out.usage.map(|u| u.total()).unwrap_or(0),
+            0,
+            "no fake usage in the aggregate either"
+        );
+        let llm = out.meta.as_ref().unwrap().get("llm").unwrap();
+        assert_eq!(llm["models"]["m1"]["unknown_calls"], json!(1));
+        assert_eq!(llm["settled"], json!(0));
+        assert_eq!(llm["reserved"], json!(1088));
+    }
+
+    /// A-L2c, labels-failure arm: an out-of-vocabulary output still settles
+    /// and still bills (非法输出仍有成本) — kind="llm_output", usage folds.
+    #[test]
+    fn llm_label_miss_settles_bills_and_reports_llm_output() {
+        let dir = scratch();
+        let (prov, _) =
+            crate::provider::mock::MockProvider::new(vec![crate::provider::mock::resp_text(
+                "MAYBE SO",
+                crate::provider::mock::mk_usage(7, 9),
+            )]);
+        let g = gated_ctx(&dir, 10_000);
+        let out = llm_tool(llm_cfg(), std::sync::Arc::new(prov))
+            .run_with_emit(
+                &json!({"code": r#"
+                    try {
+                        tools.call("llm", {prompt: "pick one", labels: ["yes", "no"]});
+                        return { threw: false };
+                    } catch (e) {
+                        return { threw: true, kind: e.kind, retryable: e.retryable };
+                    }"#}),
+                &g,
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        assert_eq!(v["threw"], json!(true), "{}", out.content);
+        assert_eq!(v["kind"], json!("llm_output"), "{}", out.content);
+        assert_eq!(
+            v["retryable"],
+            Value::Null,
+            "LD-7: llm classes omit retryable (the model judges)"
+        );
+        // Settled to actual (16) and billed through the fold.
+        assert_eq!(
+            g.budget
+                .as_ref()
+                .unwrap()
+                .used
+                .load(std::sync::atomic::Ordering::Relaxed),
+            16
+        );
+        assert_eq!(out.usage.map(|u| u.total()), Some(16));
+        let llm = out.meta.as_ref().unwrap().get("llm").unwrap();
+        assert_eq!(
+            llm["settled"],
+            json!(16),
+            "the failed-validation call is audited"
+        );
+    }
+
+    /// A-L2c, request-error arm: a failed provider request keeps the
+    /// reservation, reports kind="llm", omits retryable.
+    #[test]
+    fn llm_request_error_keeps_reserve_and_kinds_llm() {
+        let dir = scratch();
+        let (prov, _) =
+            crate::provider::mock::MockProvider::new(vec![crate::provider::mock::MockTurn::Err(
+                "gateway 503".into(),
+            )]);
+        let g = gated_ctx(&dir, 10_000);
+        let out = llm_tool(llm_cfg(), std::sync::Arc::new(prov))
+            .run_with_emit(
+                &json!({"code": r#"
+                    try {
+                        tools.call("llm", {prompt: "hi"});
+                        return { threw: false };
+                    } catch (e) {
+                        return { threw: true, kind: e.kind, retryable: e.retryable };
+                    }"#}),
+                &g,
+                &mut |_| {},
+            )
+            .unwrap();
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        assert_eq!(v["threw"], json!(true), "{}", out.content);
+        assert_eq!(v["kind"], json!("llm"), "{}", out.content);
+        assert_eq!(v["retryable"], Value::Null, "{}", out.content);
+        assert_eq!(
+            g.budget
+                .as_ref()
+                .unwrap()
+                .used
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1088,
+            "dispatched-and-failed keeps the reservation (LD-17 row 2)"
+        );
+        let llm = out.meta.as_ref().unwrap().get("llm").unwrap();
+        assert_eq!(llm["models"]["m1"]["unknown_calls"], json!(1));
+    }
+
+    /// A-L2c, provider-panic arm: the Drop-settlement guarantee — a panic
+    /// mid-flight unwinds through everything, and the reservation survives
+    /// (the guard's Drop keeps it; no under-hold).
+    #[test]
+    fn llm_provider_panic_keeps_reservation_via_drop() {
+        struct PanicProvider;
+        impl crate::provider::Provider for PanicProvider {
+            fn chat(
+                &self,
+                _req: &crate::provider::ChatRequest,
+                _on_event: &mut dyn FnMut(crate::provider::ChatEvent),
+            ) -> anyhow::Result<crate::provider::ChatResponse> {
+                panic!("custom provider panicked mid-call");
+            }
+        }
+        let dir = scratch();
+        let g = gated_ctx(&dir, 10_000);
+        let tool = llm_tool(llm_cfg(), std::sync::Arc::new(PanicProvider));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tool.run_with_emit(
+                &json!({"code": r#"tools.call("llm", {prompt: "hi"}); return 1;"#}),
+                &g,
+                &mut |_| {},
+            )
+        }));
+        assert!(r.is_err(), "the panic must propagate (no silent swallow)");
+        assert_eq!(
+            g.budget
+                .as_ref()
+                .unwrap()
+                .used
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1088,
+            "ReserveGuard::Drop kept the full reservation through the unwind"
+        );
+    }
+
+    /// A-L2c/A-L3, unstarted arm: hooks Deny lands BEFORE dispatch — zero
+    /// reservation, zero provider calls, event pair + trace + after_tool
+    /// (executed=false) all still happen.
+    #[test]
+    fn llm_hooks_deny_runs_nothing_but_audits_everything() {
+        struct DenyLlm {
+            afters: std::sync::Mutex<Vec<(String, bool)>>,
+        }
+        impl crate::hooks::Hooks for DenyLlm {
+            fn before_tool(
+                &self,
+                tool: &str,
+                _i: &Value,
+                _c: &ToolCtx,
+            ) -> crate::hooks::ToolDecision {
+                if tool == "llm" {
+                    crate::hooks::ToolDecision::Deny("llm is off-limits".into())
+                } else {
+                    crate::hooks::ToolDecision::Allow
+                }
+            }
+            fn after_tool(
+                &self,
+                tool: &str,
+                _i: &Value,
+                _o: &ToolOutput,
+                executed: bool,
+                _ctx: &ToolCtx,
+            ) {
+                self.afters
+                    .lock()
+                    .unwrap()
+                    .push((tool.to_string(), executed));
+            }
+        }
+        let dir = scratch();
+        let (prov, state) =
+            crate::provider::mock::MockProvider::new(vec![crate::provider::mock::resp_text(
+                "never",
+                crate::provider::mock::mk_usage(1, 1),
+            )]);
+        let hooks = std::sync::Arc::new(DenyLlm {
+            afters: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut g = gated_ctx(&dir, 10_000);
+        g.hooks = Some(hooks.clone());
+        let mut events = Vec::new();
+        let out = llm_tool(llm_cfg(), std::sync::Arc::new(prov))
+            .run_with_emit(
+                &json!({"code": r#"
+                    try {
+                        tools.call("llm", {prompt: "hi"});
+                        return { threw: false };
+                    } catch (e) {
+                        return { threw: true, kind: e.kind };
+                    }"#}),
+                &g,
+                &mut |ev| events.push(ev),
+            )
+            .unwrap();
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        assert_eq!(v["threw"], json!(true), "{}", out.content);
+        assert_eq!(v["kind"], json!("hooks"), "{}", out.content);
+        assert_eq!(state.calls(), 0, "never dispatched");
+        assert_eq!(
+            g.budget
+                .as_ref()
+                .unwrap()
+                .used
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "nothing reserved — the gate refused before the reserve"
+        );
+        // Event pair discipline: the announced ToolCall has its ToolResult.
+        let calls = events
+            .iter()
+            .filter(
+                |e| matches!(e, crate::agent::AgentEvent::ToolCall { name, .. } if name == "llm"),
+            )
+            .count();
+        let results = events
+            .iter()
+            .filter(|e| matches!(e, crate::agent::AgentEvent::ToolResult { name, is_error: true, .. } if name == "llm"))
+            .count();
+        assert_eq!((calls, results), (1, 1), "event pair intact");
+        assert_eq!(
+            *hooks.afters.lock().unwrap(),
+            vec![("llm".to_string(), false)],
+            "after_tool(executed=false) fired"
+        );
+        // The trace records the refused call (quota honesty).
+        let calls_meta = out
+            .meta
+            .as_ref()
+            .unwrap()
+            .get("calls")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(calls_meta.len(), 1);
+        assert_eq!(calls_meta[0]["name"], json!("llm"));
+        assert_eq!(calls_meta[0]["ok"], json!(false));
+    }
+
+    /// A-L5: an unbounded judge loop is bounded by the shared call quota —
+    /// the budget latch ends it with kind="budget"; no stuck-loop
+    /// interference (the guard is the outer loop's, direct runs don't trip).
+    #[test]
+    fn llm_judge_loop_is_bounded_by_call_quota() {
+        let dir = scratch();
+        let script: Vec<_> = (0..3)
+            .map(|_| crate::provider::mock::resp_text("yes", crate::provider::mock::mk_usage(1, 1)))
+            .collect();
+        let (prov, state) = crate::provider::mock::MockProvider::new(script);
+        let cfg = CodeConfig {
+            max_tool_calls: 3,
+            ..llm_cfg()
+        };
+        let out = llm_tool(cfg, std::sync::Arc::new(prov))
+            .run_with_emit(
+                &json!({"code": r#"
+                    let n = 0;
+                    try {
+                        for (;;) { tools.call("llm", {prompt: "judge"}); n++; }
+                    } catch (e) {
+                        return { n, kind: e.kind };
+                    }"#}),
+                &ctx(&dir),
+                &mut |_| {},
+            )
+            .unwrap();
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        assert_eq!(
+            v["n"],
+            json!(3),
+            "quota = 3 → exactly 3 run: {}",
+            out.content
+        );
+        assert_eq!(v["kind"], json!("budget"), "{}", out.content);
+        assert_eq!(state.calls(), 3, "the 4th never dispatched");
+    }
+
+    /// A-L6: the envelope vocabulary + allowlist + labels contract.
+    #[test]
+    fn llm_kinds_allowlist_and_labels_contract() {
+        let dir = scratch();
+        // Allowlist: an explicit model outside the tier is a param error —
+        // kind="llm", NOTHING reserved, NOTHING dispatched.
+        let (prov, state) =
+            crate::provider::mock::MockProvider::new(vec![crate::provider::mock::resp_text(
+                "x", None,
+            )]);
+        let g = gated_ctx(&dir, 10_000);
+        let out = llm_tool(llm_cfg(), std::sync::Arc::new(prov))
+            .run_with_emit(
+                &json!({"code": r#"
+                    try {
+                        tools.call("llm", {prompt: "hi", model: "m3"});
+                        return { threw: false };
+                    } catch (e) { return { threw: true, kind: e.kind }; }"#}),
+                &g,
+                &mut |_| {},
+            )
+            .unwrap();
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        assert_eq!(v["kind"], json!("llm"), "{}", out.content);
+        assert_eq!(state.calls(), 0);
+        assert_eq!(
+            g.budget
+                .as_ref()
+                .unwrap()
+                .used
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+
+        // Labels: case-fold + trim + quote-wrap normalization hits the
+        // CANONICAL declared spelling; a declared collision is a param error.
+        let (prov, _) = crate::provider::mock::MockProvider::new(vec![
+            crate::provider::mock::resp_text("  \"yes\"  ", None),
+            crate::provider::mock::resp_text("maybe", None),
+        ]);
+        let out = llm_tool(llm_cfg(), std::sync::Arc::new(prov))
+            .run_with_emit(
+                &json!({"code": r#"
+                    const hit = tools.call("llm", {
+                        prompt: "pick", labels: ["Yes", "No", "unsure"], max_tokens: 16,
+                    });
+                    let miss;
+                    try {
+                        tools.call("llm", {prompt: "pick", labels: ["Yes", "No"], max_tokens: 16});
+                        miss = "no-throw";
+                    } catch (e) { miss = e.kind; }
+                    let collide;
+                    try {
+                        tools.call("llm", {prompt: "pick", labels: ["Yes", "yes"]});
+                        collide = "no-throw";
+                    } catch (e) { collide = e.kind; }
+                    return { label: hit.label, miss, collide };"#}),
+                &ctx(&dir),
+                &mut |_| {},
+            )
+            .unwrap();
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        assert_eq!(
+            v["label"],
+            json!("Yes"),
+            "canonical spelling, folded match: {}",
+            out.content
+        );
+        assert_eq!(v["miss"], json!("llm_output"), "{}", out.content);
+        assert_eq!(
+            v["collide"],
+            json!("llm"),
+            "declared collision is a param error: {}",
+            out.content
+        );
+    }
+
+    /// LD-9's headline recovery split: a reserve refusal is NOT a latch —
+    /// the sandbox stays alive and write_file still works afterwards.
+    #[test]
+    fn llm_budget_refusal_leaves_the_sandbox_alive() {
+        let dir = scratch();
+        let (prov, state) =
+            crate::provider::mock::MockProvider::new(vec![crate::provider::mock::resp_text(
+                "x", None,
+            )]);
+        // Cap below the estimate (est ≈ 1088) → the reserve refuses.
+        let g = gated_ctx(&dir, 100);
+        let cfg: Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"K","model":"m","inject_environment":false,
+                "tools":["read_file","list_dir","write_file"]}"#,
+        )
+        .unwrap();
+        let t = RunCodeTool::new(
+            &cfg,
+            Arc::new(RwLock::new(llm_cfg())),
+            &reqwest::blocking::Client::new(),
+            "k",
+            vec![],
+            vec![],
+        );
+        let _ = t.provider_cell().set(std::sync::Arc::new(prov));
+        let out = t
+            .run_with_emit(
+                &json!({"code": r#"
+                    let kind, retryable, left;
+                    try {
+                        tools.call("llm", {prompt: "hi"});
+                        kind = "none";
+                    } catch (e) {
+                        kind = e.kind; retryable = e.retryable;
+                    }
+                    const b = tools.budget();
+                    left = b.tokens_left;
+                    const w = tools.call("write_file", {path: "partial.txt", content: "saved"});
+                    return { kind, retryable, left, wrote: typeof w };"#}),
+                &g,
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        assert_eq!(v["kind"], json!("budget"), "{}", out.content);
+        assert_eq!(v["retryable"], json!(false), "{}", out.content);
+        assert_eq!(
+            v["left"],
+            json!(100),
+            "no reservation was held: {}",
+            out.content
+        );
+        assert_eq!(
+            v["wrote"],
+            json!("string"),
+            "write_file still works (text result): {}",
+            out.content
+        );
+        assert_eq!(state.calls(), 0, "never dispatched");
+        // And no llm audit row — nothing ran.
+        assert!(out.meta.as_ref().unwrap().get("llm").is_none());
+    }
+
+    /// A-L8 + LD-14: registry membership is a BUILD-TIME snapshot — a hot
+    /// flip after the first build is not sensed, in either direction; and
+    /// the gate-off contract keeps llm out of tools.list entirely.
+    #[test]
+    fn llm_registry_membership_is_a_build_time_snapshot() {
+        let dir = scratch();
+        let cfg: Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"K","model":"m","inject_environment":false,
+                "tools":["read_file","list_dir"]}"#,
+        )
+        .unwrap();
+        let shared = Arc::new(RwLock::new(CodeConfig::default()));
+        let client = reqwest::blocking::Client::new();
+        let tool = RunCodeTool::new(&cfg, shared.clone(), &client, "k", vec![], vec![]);
+        let list = |t: &RunCodeTool| {
+            let out = t
+                .run_with_emit(
+                    &json!({"code": r#"
+                        return tools.list().some(t => t.name === "llm");"#}),
+                    &ctx(&dir),
+                    &mut |_| {},
+                )
+                .unwrap();
+            out.content == "true"
+        };
+        assert!(!list(&tool), "A-L8: gate off → not in tools.list");
+        // Hot-ON after the first build: the OnceLock registry does not
+        // rebuild — the lineage keeps its snapshot (LD-14).
+        *shared.write().unwrap() = llm_cfg();
+        assert!(
+            !list(&tool),
+            "hot flip on is not sensed (registry already built without llm)"
+        );
+        // A fresh lineage built with the gate ON admits it…
+        let on_tool = RunCodeTool::new(&cfg, shared.clone(), &client, "k", vec![], vec![]);
+        assert!(list(&on_tool));
+        // …and a hot-OFF after that build does not retract it either.
+        *shared.write().unwrap() = CodeConfig::default();
+        assert!(list(&on_tool), "hot flip off is not sensed either");
+        // The description overlay follows the same def-time snapshot rule.
+        let d_on = RunCodeTool::new(
+            &cfg,
+            Arc::new(RwLock::new(llm_cfg())),
+            &client,
+            "k",
+            vec![],
+            vec![],
+        )
+        .def()
+        .description;
+        assert!(
+            d_on.contains("【LLM 判别】"),
+            "gate-on description carries the overlay"
+        );
+        let both = RunCodeTool::new(
+            &cfg,
+            Arc::new(RwLock::new(CodeConfig {
+                call_batch: true,
+                ..llm_cfg()
+            })),
+            &client,
+            "k",
+            vec![],
+            vec![],
+        )
+        .def()
+        .description;
+        assert!(
+            both.contains("read_file / llm 等 batchable"),
+            "llm on names it in the batch overlay (appendix ④ canonical): {both}"
+        );
+        let batch_only = RunCodeTool::new(
+            &cfg,
+            Arc::new(RwLock::new(CodeConfig {
+                call_batch: true,
+                ..CodeConfig::default()
+            })),
+            &client,
+            "k",
+            vec![],
+            vec![],
+        )
+        .def()
+        .description;
+        assert!(
+            !batch_only.contains("read_file / llm 等"),
+            "llm off keeps the closed-list contract: {batch_only}"
+        );
+    }
+
+    /// LD-3: a guest-registry tool named `llm` colliding with the primitive
+    /// fails the registry build (cached, actionable), not silent shadowing.
+    #[test]
+    fn llm_name_collision_fails_the_registry_build() {
+        struct FakeLlm;
+        impl Tool for FakeLlm {
+            fn def(&self) -> ToolDef {
+                ToolDef {
+                    name: "llm".into(),
+                    description: "an impostor".into(),
+                    schema: json!({"type": "object"}),
+                }
+            }
+            fn run(&self, _i: &Value, _c: &ToolCtx) -> Result<ToolOutput> {
+                Ok(ToolOutput::text("impostor"))
+            }
+            fn available_to_code(&self) -> bool {
+                true
+            }
+        }
+        let dir = scratch();
+        let cfg: Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"K","model":"m","inject_environment":false,
+                "tools":["read_file","list_dir"]}"#,
+        )
+        .unwrap();
+        let extra: Vec<Arc<Box<dyn Tool>>> = vec![Arc::new(Box::new(FakeLlm) as Box<dyn Tool>)];
+        let tool = RunCodeTool::new(
+            &cfg,
+            Arc::new(RwLock::new(llm_cfg())),
+            &reqwest::blocking::Client::new(),
+            "k",
+            vec![],
+            extra,
+        );
+        let out = tool
+            .run_with_emit(
+                &json!({"code": r#"return tools.list().length;"#}),
+                &ctx(&dir),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(out.is_error, "the registry build must fail");
+        assert!(
+            out.content.contains("reserves that name"),
+            "actionable hint in: {}",
+            out.content
+        );
+    }
+
+    /// LD-9 on the batch surface: a reserve refusal inside callBatch reports
+    /// kind="budget" with halted:false (machine-readable recovery split);
+    /// a provider failure reports kind="llm" without retryable.
+    #[test]
+    fn llm_batch_entries_carry_the_recovery_vocabulary() {
+        let dir = scratch();
+        let (prov, _) = crate::provider::mock::MockProvider::new(vec![
+            // Entry 0 (model m2, the only one the tight cap can... no — both
+            // refuse; this turn serves the SECOND scenario below.
+            crate::provider::mock::MockTurn::Err("boom".into()),
+        ]);
+        let g = gated_ctx(&dir, 100);
+        let cfg = CodeConfig {
+            call_batch: true,
+            ..llm_cfg()
+        };
+        let out = llm_tool(cfg, std::sync::Arc::new(prov))
+            .run_with_emit(
+                &json!({"code": r#"
+                    const rs = tools.callBatch([
+                        { name: "llm", args: { prompt: "hi" } },
+                        { name: "llm", args: { prompt: "ho" } },
+                    ]);
+                    return rs.map(r => r instanceof Error
+                        ? { kind: r.kind, halted: r.halted, retryable: r.retryable }
+                        : { ok: true });"#}),
+                &g,
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        for e in arr {
+            assert_eq!(e["kind"], json!("budget"), "{}", out.content);
+            assert_eq!(
+                e["halted"],
+                json!(false),
+                "reserve refusal, not a latch: {}",
+                out.content
+            );
+        }
+
+        // Provider failure inside a batch: kind="llm", retryable omitted.
+        let (prov, _) =
+            crate::provider::mock::MockProvider::new(vec![crate::provider::mock::MockTurn::Err(
+                "boom".into(),
+            )]);
+        let out = llm_tool(
+            CodeConfig {
+                call_batch: true,
+                ..llm_cfg()
+            },
+            std::sync::Arc::new(prov),
+        )
+        .run_with_emit(
+            &json!({"code": r#"
+                const rs = tools.callBatch([{ name: "llm", args: { prompt: "hi" } }]);
+                const r = rs[0];
+                return r instanceof Error
+                    ? { kind: r.kind, retryable: r.retryable }
+                    : { ok: true };"#}),
+            &gated_ctx(&dir, 10_000),
+            &mut |_| {},
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        assert_eq!(v["kind"], json!("llm"), "{}", out.content);
+        assert_eq!(
+            v["retryable"],
+            Value::Null,
+            "omitted per LD-7: {}",
+            out.content
+        );
+    }
+
+    /// A-L4 in-proc + A-M8 shape: callBatch × llm fan-out runs on REAL
+    /// threads — a provider that records per-call [start, end] intervals
+    /// lets the test assert overlap (a serialized execution cannot produce
+    /// it). The e2e twin (CLI + ThreadingHTTPServer) lives in
+    /// scripts/e2e_scenarios.py.
+    #[test]
+    fn llm_callbatch_fanout_actually_overlaps() {
+        struct SlowCounting {
+            spans: std::sync::Mutex<Vec<(std::time::Instant, std::time::Instant)>>,
+        }
+        impl crate::provider::Provider for SlowCounting {
+            fn chat(
+                &self,
+                _req: &crate::provider::ChatRequest,
+                _on_event: &mut dyn FnMut(crate::provider::ChatEvent),
+            ) -> anyhow::Result<crate::provider::ChatResponse> {
+                let s = std::time::Instant::now();
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                self.spans
+                    .lock()
+                    .unwrap()
+                    .push((s, std::time::Instant::now()));
+                Ok(crate::provider::ChatResponse {
+                    blocks: vec![crate::provider::Block::Text("yes".into())],
+                    stop_reason: "end_turn".into(),
+                    usage: crate::provider::mock::mk_usage(1, 1),
+                })
+            }
+        }
+        let dir = scratch();
+        let spans = std::sync::Arc::new(SlowCounting {
+            spans: std::sync::Mutex::new(Vec::new()),
+        });
+        let cfg = CodeConfig {
+            call_batch: true,
+            ..llm_cfg()
+        };
+        let out = llm_tool(cfg, spans.clone())
+            .run_with_emit(
+                &json!({"code": r#"
+                    const entries = [];
+                    for (let i = 0; i < 8; i++) entries.push({ name: "llm", args: { prompt: "p" } });
+                    const rs = tools.callBatch(entries);
+                    const labels = rs.map(r => r instanceof Error ? "err" : r.text);
+                    return { n: labels.filter(t => t === "yes").length };"#}),
+                &ctx(&dir),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        assert_eq!(v["n"], json!(8), "all 8 entries succeeded: {}", out.content);
+        let spans = spans.spans.lock().unwrap().clone();
+        assert_eq!(spans.len(), 8);
+        // At least one pair of calls overlapped in time — impossible under
+        // serial dispatch; the wave engine + Parallel routing did it. (The
+        // wall-clock bound is deliberately NOT asserted: in a debug build
+        // the first execution of the process may still be paying wasmtime's
+        // lazy module compilation, and the overlap math is the honest proof
+        // regardless of clock noise.)
+        let mut overlapped = 0;
+        for i in 0..spans.len() {
+            for j in (i + 1)..spans.len() {
+                if spans[i].0 < spans[j].1 && spans[j].0 < spans[i].1 {
+                    overlapped += 1;
+                }
+            }
+        }
+        assert!(
+            overlapped > 0,
+            "no temporal overlap — the fan-out serialized"
+        );
+    }
+
+    /// A-M8 (code_memory §7, completed with this milestone per its M1/M2
+    /// rows): the 判别库 verify probe — the highest-value lib shape once the
+    /// llm primitive exists. `verify(n)` runs golden cases through the lib's
+    /// `classify` (which rides llm with a closed label vocabulary) BEFORE any
+    /// batch fan-out: all-pass returns a summary and the batch proceeds;
+    /// any mismatch throws and the outer layer receives a clear error with
+    /// the batch never dispatched. Both legs here: llm calls land in the
+    /// per-call trace (`meta.calls`) and the LD-12 ledger, mock routed per
+    /// model (M0 分流).
+    const JUDGE_LIB: &str = r##"
+function classify(item) {
+  const r = tools.call('llm', {prompt: 'judge: ' + item, labels: ['yes', 'no'], max_tokens: 8});
+  return r.label;
+}
+function verify(n) {
+  const gold = ['yes', 'yes', 'no'];
+  let pass = 0;
+  for (let i = 0; i < n && i < gold.length; i++) {
+    const got = classify('item-' + i);
+    if (got !== gold[i]) throw new Error('verify probe failed at ' + i + ': got ' + got + ', want ' + gold[i]);
+    pass++;
+  }
+  return 'verify ok ' + pass + '/' + n;
+}
+"##;
+
+    fn am8_cfg() -> CodeConfig {
+        CodeConfig {
+            include: true,
+            call_batch: true,
+            llm: crate::config::LlmConfig {
+                enabled: true,
+                default_model: Some("judge".into()),
+                models: vec!["judge".into()],
+            },
+            ..CodeConfig::default()
+        }
+    }
+
+    /// [`llm_tool`] + the file tools saveLib needs (it writes the lib file
+    /// and the INDEX upsert through the ordinary file tools).
+    fn llm_lib_tool(
+        code_cfg: CodeConfig,
+        prov: std::sync::Arc<dyn crate::provider::Provider>,
+    ) -> RunCodeTool {
+        let t = tool_with_tools(code_cfg, r#"["read_file","write_file","list_dir"]"#);
+        let _ = t.provider_cell().set(prov);
+        t
+    }
+
+    #[test]
+    fn am8_verify_probe_passes_then_batch_fanout_proceeds() {
+        let dir = scratch();
+        // Golden sequence yes/yes/no for verify(3), then the 2-entry batch.
+        let (prov, state) = crate::provider::mock::MockProvider::routed(vec![(
+            "judge",
+            vec![
+                crate::provider::mock::resp_text("yes", crate::provider::mock::mk_usage(10, 5)),
+                crate::provider::mock::resp_text("yes", crate::provider::mock::mk_usage(10, 5)),
+                crate::provider::mock::resp_text("no", crate::provider::mock::mk_usage(10, 5)),
+                crate::provider::mock::resp_text("yes", crate::provider::mock::mk_usage(10, 5)),
+                crate::provider::mock::resp_text("yes", crate::provider::mock::mk_usage(10, 5)),
+            ],
+        )]);
+        let g = gated_ctx(&dir, 10_000);
+        let code = format!(
+            r#"
+            saveLib('lib/judge.js', {lib:?});
+            include('lib/judge.js');
+            const summary = verify(3);
+            const entries = [];
+            for (let i = 0; i < 2; i++)
+              entries.push({{name: 'llm', args: {{prompt: 'batch item ' + i, labels: ['yes', 'no'], max_tokens: 8}}}});
+            const rs = tools.callBatch(entries);
+            let ok = 0;
+            for (const r of rs) if (!(r instanceof Error) && r.label === 'yes') ok++;
+            return {{ summary: summary, ok: ok }};"#,
+            lib = JUDGE_LIB
+        );
+        let out = llm_lib_tool(am8_cfg(), std::sync::Arc::new(prov))
+            .run_with_emit(&json!({"code": code}), &g, &mut |_| {})
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        assert_eq!(v["summary"], json!("verify ok 3/3"), "{}", out.content);
+        assert_eq!(v["ok"], json!(2), "batch ran after a green probe: {v}");
+        // 3 probe calls + 2 batch calls, ALL model-routed to "judge".
+        let cap = state.captured();
+        assert_eq!(cap.len(), 5);
+        assert!(cap.iter().all(|c| c.model == "judge"));
+        // verify's llm calls are in the trace (per-call summary) and the
+        // LD-12 ledger; usage settled 5 × 15 = 75 into the shared budget.
+        let meta = out.meta.as_ref().unwrap();
+        let traced = meta["calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["name"] == json!("llm"))
+            .count();
+        assert_eq!(traced, 5, "probe calls are traceable: {meta}");
+        let llm = &meta["llm"];
+        assert_eq!(llm["calls"], json!(5));
+        assert_eq!(llm["settled"], json!(75));
+        assert_eq!(llm["models"]["judge"]["known_calls"], json!(5));
+        assert_eq!(llm["models"]["judge"]["unknown_calls"], json!(0));
+        assert_eq!(
+            g.budget
+                .as_ref()
+                .unwrap()
+                .used
+                .load(std::sync::atomic::Ordering::Relaxed),
+            75
+        );
+    }
+
+    #[test]
+    fn am8_verify_probe_failure_blocks_the_batch() {
+        let dir = scratch();
+        // First golden case wants "yes", the judge answers "no" — the probe
+        // throws on the FIRST case; the mock has no further script (a second
+        // request would fail the test via the strict-routing honest error).
+        let (prov, state) = crate::provider::mock::MockProvider::routed(vec![(
+            "judge",
+            vec![crate::provider::mock::resp_text(
+                "no",
+                crate::provider::mock::mk_usage(10, 5),
+            )],
+        )]);
+        let g = gated_ctx(&dir, 10_000);
+        let code = format!(
+            r#"
+            saveLib('lib/judge.js', {lib:?});
+            include('lib/judge.js');
+            const summary = verify(3);
+            const entries = [];
+            for (let i = 0; i < 2; i++)
+              entries.push({{name: 'llm', args: {{prompt: 'batch item ' + i}}}});
+            const rs = tools.callBatch(entries);
+            return {{ summary: summary, n: rs.length }};"#,
+            lib = JUDGE_LIB
+        );
+        let out = llm_lib_tool(am8_cfg(), std::sync::Arc::new(prov))
+            .run_with_emit(&json!({"code": code}), &g, &mut |_| {})
+            .unwrap();
+        assert!(out.is_error, "probe failure must surface as an error");
+        assert!(
+            out.content.contains("verify probe failed at 0"),
+            "clear error to the outer layer: {}",
+            out.content
+        );
+        // The batch NEVER dispatched: exactly one llm request reached the
+        // provider (the failing probe call itself).
+        assert_eq!(state.captured().len(), 1);
+        // The failed exit still audits honestly (失败出口审计纪律): the one
+        // call is in the trace and the ledger, its usage settled.
+        let meta = out.meta.as_ref().expect("error exit still audits");
+        let llm = &meta["llm"];
+        assert_eq!(llm["calls"], json!(1));
+        assert_eq!(llm["settled"], json!(15));
+        assert_eq!(
+            g.budget
+                .as_ref()
+                .unwrap()
+                .used
+                .load(std::sync::atomic::Ordering::Relaxed),
+            15,
+            "the probe's real cost is billed even though the run failed"
+        );
     }
 }

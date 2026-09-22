@@ -262,6 +262,13 @@ impl Provider for OpenAi {
         if let Some(eff) = req.reasoning_effort {
             body["reasoning_effort"] = json!(eff);
         }
+        // Per-request sampling temperature (LD-4): forwarded only when the
+        // caller set it — the agent's turns never do, so their bodies are
+        // unchanged. OpenAI-compatible endpoints universally know the field
+        // (unlike reasoning_effort), so no 400-fix arm is wired for it.
+        if let Some(t) = req.temperature {
+            body["temperature"] = json!(t);
+        }
         if !req.tools.is_empty() {
             body["tools"] = Self::tools_json(req.tools);
         }
@@ -1350,6 +1357,7 @@ mod tests {
             cancel: cancel.clone(),
             cache: true,
             reasoning_effort: None,
+            temperature: None,
         };
         let r1 = provider
             .chat(&req1, &mut |_| {})
@@ -1369,6 +1377,7 @@ mod tests {
             cancel: cancel.clone(),
             cache: true,
             reasoning_effort: None,
+            temperature: None,
         };
         let r2 = provider.chat(&req2, &mut |_| {}).expect("turn 2 succeeds");
         assert_eq!(r2.stop_reason, "end_turn");
@@ -1469,6 +1478,7 @@ mod tests {
             cancel: Arc::new(AtomicBool::new(false)),
             cache: true,
             reasoning_effort: None,
+            temperature: None,
         };
         let started = std::time::Instant::now();
         let r = provider.chat(&req, &mut |_| {});
@@ -1513,6 +1523,7 @@ mod tests {
             cancel: Arc::new(AtomicBool::new(true)),
             cache: true,
             reasoning_effort: None,
+            temperature: None,
         };
         let err = match provider.chat(&req, &mut |_| {}) {
             Err(e) => e,
@@ -1617,6 +1628,7 @@ mod tests {
                 cancel: cancel.clone(),
                 cache: true,
                 reasoning_effort: None,
+                temperature: None,
             }
         }
 

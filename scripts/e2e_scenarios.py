@@ -15,8 +15,17 @@ cannot reach:
              10 ToolCall/ToolResult pairs land, request count is exactly
              2 (parent) + 10 (children)
   cancel   — interrupt (SIGINT; CTRL_BREAK on Windows) a slow request: exit 130
+  llmbatch — (code feature, M3 A-L4) guest callBatch x 8 llm calls through
+             the real stack: exactly 2 (outer) + 8 (inner) requests, and
+             the mock records per-inner-request service windows so TRUE
+             temporal overlap is asserted server-side (功能单测证明不了
+             真并发 — 内存纪律).
 
 Exit code 0 iff every check passes. No network, no API key — safe for CI.
+
+The binary is built WITH --features code (run_code stays gate-off by
+default, so the plain scenarios run byte-identically on it; the llmbatch
+scenario needs the feature).
 
 Usage:  python3 scripts/e2e_scenarios.py            # auto-builds if needed
         TA_BIN=/path/to/tiny-agent python3 scripts/e2e_scenarios.py
@@ -57,6 +66,13 @@ LOCK = threading.Lock()
 # answers — never a 5xx mid-e2e); unregistered models fall through to the
 # content-based dispatch below, so existing scenarios are untouched.
 MODEL_ROUTES = {}
+
+# M3 (A-L4): per-model artificial service delay + the recorded service
+# windows — the server-side evidence that inner llm requests were truly
+# in flight at the same time (ThreadingHTTPServer serves each on its own
+# thread; a serialized client cannot produce overlapping windows).
+MODEL_DELAYS = {}
+SPANS = []
 
 
 def sse(chunks):
@@ -143,8 +159,19 @@ class Handler(BaseHTTPRequestHandler):
             elif "SLOW_E2E" in first_user:
                 time.sleep(6)
                 payload = text_resp("slow done")
+            elif "judge item" in first_user:
+                # M3 A-L4: the sandbox llm primitive's inner calls — single
+                # user prompt, no tools, recognizable by the scripted prefix.
+                payload = text_resp("yes")
             else:
                 payload = text_resp("child done")
+
+        delay = MODEL_DELAYS.get(body.get("model"), 0.0)
+        if delay:
+            t0 = time.time()
+            time.sleep(delay)
+            with LOCK:
+                SPANS.append((t0, time.time()))
 
         data = payload.encode()
         self.send_response(200)
@@ -152,6 +179,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+
+class E2EServer(ThreadingHTTPServer):
+    # The default socketserver listen backlog (5) drops SYNs when the M3
+    # llm fan-out opens 7+ fresh connections in one instant — the guest then
+    # sees connection resets as per-entry errors. 64 covers a full batch
+    # wave on top of the pooled keep-alive connections.
+    request_queue_size = 64
+    daemon_threads = True
 
 
 # ── driver ─────────────────────────────────────────────────────────
@@ -184,21 +220,21 @@ def done_event(events):
 
 def main():
     if not os.path.exists(BIN):
-        print(f"[setup] building {BIN} ...")
-        subprocess.run(["cargo", "build"], cwd=REPO, check=True)
+        print(f"[setup] building {BIN} (code feature) ...")
+        subprocess.run(["cargo", "build", "--features", "code"], cwd=REPO, check=True)
 
     # Ephemeral port: no collision with a dev's local mock or parallel CI jobs.
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     port = sock.getsockname()[1]
     sock.close()
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    server = E2EServer(("127.0.0.1", port), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{port}"
 
     root = tempfile.mkdtemp(prefix="ta-e2e-")
 
-    def write_cfg(name, tools, max_turns=50, model="mock-model"):
+    def write_cfg(name, tools, max_turns=50, model="mock-model", code=None):
         workdir = os.path.join(root, f"wd-{name}")
         os.makedirs(workdir, exist_ok=True)
         cfg = {
@@ -208,6 +244,8 @@ def main():
             "limits": {"max_turns": max_turns, "timeout_secs": 60,
                        "max_output_chars": 10000},
         }
+        if code is not None:
+            cfg["code"] = code
         path = os.path.join(root, f"cfg-{name}.json")
         with open(path, "w") as f:
             json.dump(cfg, f)
@@ -291,6 +329,58 @@ def main():
           f"rc={p.returncode}")
     check("model-route: one request per run",
           requests_served() - before == 2, f"delta={requests_served() - before}")
+    MODEL_ROUTES.clear()
+
+    # llmbatch (M3 A-L4): callBatch x llm — 8 guest-side single-shots in ONE
+    # batch through the real CLI/HTTP/SSE stack. Request count pins the
+    # topology (2 outer + 8 inner, no silent retries); the mock's recorded
+    # service windows pin TRUE concurrency (an overlap pair is impossible
+    # under serial dispatch — the whole point of the batch channel).
+    batch_js = (
+        "const entries = [];"
+        "for (let i = 0; i < 8; i++) "
+        "entries.push({name: 'llm', args: {prompt: 'judge item ' + i}});"
+        "const rs = tools.callBatch(entries);"
+        "let ok = 0, bad = [];"
+        "for (const r of rs) { if (r instanceof Error) "
+        "bad.push(String(r.kind) + '|' + String(r.message).slice(0, 100)); "
+        "else if (r.text === 'yes') ok++; }"
+        "return { ok, bad };"
+    )
+    MODEL_DELAYS["mock-judge"] = 0.4
+    MODEL_ROUTES["mock-outer2"] = [
+        tool_calls_resp([("call_b1", "run_code", json.dumps({"code": batch_js}))]),
+        text_resp("done"),
+    ]
+    with LOCK:
+        del SPANS[:]
+    before = requests_served()
+    p, ev = run_agent(
+        write_cfg("llmbatch", ["run_code"], model="mock-outer2",
+                  code={"enabled": True, "call_batch": True,
+                        "llm": {"enabled": True, "default_model": "mock-judge",
+                                "models": ["mock-judge"]}}),
+        "LLMBATCH_E2E fan out")
+    d = done_event(ev)
+    check("llmbatch: end_turn", d and d.get("stop_reason") == "end_turn", f"got {d}")
+    check("llmbatch: exit 0", p.returncode == 0, f"rc={p.returncode}")
+    check("llmbatch: 10 requests (2 outer + 8 inner)",
+          requests_served() - before == 10, f"delta={requests_served() - before}")
+    tr = [e for e in ev if e.get("type") == "tool_result"
+          and e.get("name") == "run_code"]
+    check("llmbatch: guest saw all 8 verdicts",
+          len(tr) == 1 and '"ok":8' in tr[0].get("content", "")
+          and '"bad":[]' in tr[0].get("content", ""),
+          f"content={tr[0].get('content', '') if tr else 'NONE'}")
+    with LOCK:
+        spans = list(SPANS)
+    check("llmbatch: 8 inner calls served", len(spans) == 8, f"got {len(spans)}")
+    overlapped = sum(
+        1 for i in range(len(spans)) for j in range(i + 1, len(spans))
+        if spans[i][0] < spans[j][1] and spans[j][0] < spans[i][1])
+    check("llmbatch: inner calls overlapped in time (true concurrency)",
+          overlapped > 0, f"overlapping pairs={overlapped}")
+    MODEL_DELAYS.clear()
     MODEL_ROUTES.clear()
 
     server.shutdown()

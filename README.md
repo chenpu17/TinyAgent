@@ -916,6 +916,11 @@ GUI 可渲染"正在构造调用…"（headless 终端不重复打印——完�
   "precheck": false,
   "include": false,
   "call_batch": false,
+  "llm": {
+    "enabled": false,
+    "default_model": "judge-small",
+    "models": ["judge-small", "judge-large"]
+  },
   "deny_paths": [".env", "secrets/**"],
   "fs_write_dirs": [],
   "max_tool_calls": 200,
@@ -932,7 +937,8 @@ GUI 可渲染"正在构造调用…"（headless 终端不重复打印——完�
 | `skill_injection` | `"on_demand"` | 内置技能 `run-code` 的三态披露：`"on_demand"`（默认，模型经 `read_skill` 按需加载）；`"eager"`（装配时把技能正文以合成 read_skill 问答对预置进会话历史——微调/评测的轨迹对齐用，resume 的历史不重复注入）；`"off"`（内置技能关闭，`read_skill` 命中返回明确的「已被配置关闭」错误；磁盘同名覆盖仍照常服务） |
 | `precheck` | `false` | 执行前静态预检：单遍 lexer 检出沙箱不支持的写法（`async`/`await`/`import`、未声明的 `Promise`/`setTimeout`/`fetch` 调用、`Date.now`/`Math.random`、`tools.call` 保留名 `run_code`/`task`/`todo`），命中即拒答并附修正指引，**代码不执行、无副作用、不占预算**。注意 `__tools_list`/`__budget` 不在检出集内——它们是可工作的只读内省拦截（`tools.budget()` 的底层通道） |
 | `include` | `false` | 库通道开关（code_memory M1）：开启后 guest 增 `include(path)`（加载 `lib/` 下已登记代码库，幂等 + 循环截断，经 `__include` 保留名）与 `saveLib(path, src)`（写库 + `__hash_file` 宿主哈希登记 `lib/INDEX.md`，恒 `st=draft`）两个助手，及描述的【库】段；准入 = `st=ok` 或本会话登记过（clone 共享、不跨会话）。关闭时保留名明确拒绝、模型可见契约与无此特性的旧二进制一致。调用期生效（资源限制先例）；batch 片段只能关不能开 |
-| `call_batch` | `false` | 批量通道开关（code_llm M2，评测门）：开启后 guest 增 `tools.callBatch([{name, args}, …])`（并发执行一批只读工具调用，经 `__call_batch` 保留名逐 entry 走与单次调用完全相同的闸门链；8/波扇出、按提交序返回数组、单项失败为 Error 条目不中止批次）与描述的【批量】段。只读面 = `batchable()` 工具（v1 白名单 `read_file` + MCP `readOnlyHint`，缺注解为否）。关闭时保留名按未知工具报错、模型可见契约与旧二进制一致。调用期生效；batch 片段只能关不能开 |
+| `call_batch` | `false` | 批量通道开关（code_llm M2，评测门）：开启后 guest 增 `tools.callBatch([{name, args}, …])`（并发执行一批只读工具调用，经 `__call_batch` 保留名逐 entry 走与单次调用完全相同的闸门链；8/波扇出、按提交序返回数组、单项失败为 Error 条目不中止批次）与描述的【批量】段。只读面 = `batchable()` 工具（v1 白名单 `read_file` + `llm` + MCP `readOnlyHint`，缺注解为否）。关闭时保留名按未知工具报错、模型可见契约与旧二进制一致。调用期生效；batch 片段只能关不能开 |
+| `llm` | `{enabled:false, default_model:null, models:[]}` | 内层模型判别开关（code_llm M3）：`llm` 嵌套对象三字段——`enabled`（默认关；开启后 guest 增 `llm` 判别原语，见下节）、`default_model`（开启时必填：省略 `model` 参数的内层调用用它）、`models`（显式 `model` 参数的允许列表，可含多档判别模型；`default_model` 必须在列表内）。开启时顶层工具表与该名撞名报错（名字保留）；注册表是构建期快照，`set_code_config` 热翻开关两个方向都不被感知。batch 片段不能改 `llm.enabled`/`default_model`，`models` 只能收紧（交集） |
 | `deny_paths` | `.env`、密钥类目录等 | **经工具的**文件读写拒绝清单（glob：`*` 单段、`**` 跨段），定位**防误读不防恶意**。`shell` 命令不经此层（`cat .env` 照常，见下一行） |
 | `fs_write_dirs` | `[]` = 整个 workdir 可写 | 经工具的写路径白名单（相对 workdir；交集语义，可收紧到无处可写）。**仅约束 4 个文件工具与 `copy_bytes`**——`shell`（含其重定向写入）不经此层与写侧 symlink 拒绝；敌对 guest 的对策是 `restrict_to_workdir` / hooks Deny / 从 `tools` 去 `shell`（A-8 读写两侧同界，有钉住测试） |
 | `max_tool_calls` | 200 | 沙箱内工具调用次数上限（含失败调用）。AppWorld 高循环任务实证：金标方案 91–244 次调用，旧默认 50 连"先摸元数据再批量写"的两阶段打法都装不下（实测摸底阶段即触顶、正事零执行） |
@@ -973,16 +979,35 @@ v1 只认 workdir `lib/` 一个库目录；**收紧 `fs_write_dirs` 的部署须
 如实反映哪些 entry 跑了/被拒，**必须逐条检查**；次序保证仅存在于 guest 顺序 for 循环（副作用批量
 写 for 循环，批内只收 `batchable()` 只读工具，混入副作用工具该条目得 `kind="batch"` 错误条目、
 单条不中止）。单项失败不 throw、该条目为 `Error` 实例带 `e.kind`/`e.tool`（含 LD-9 的
-`e.halted`：latch 态错误为 true——沙箱已停只能 return 收尾；token 预占面的 false 值随 M3 的
-`llm` 工具引入，当前无此路径）。额度 K 条计 K 次调用计数。并发上限 8/波、按提交序返回；事件 ToolCall 在 gate 期按
+`e.halted`：latch 态错误为 true——沙箱已停只能 return 收尾；`llm` 的 token 预占拒绝为
+false——沙箱存活、可继续别的路）。额度 K 条计 K 次调用计数。并发上限 8/波、按提交序返回；事件 ToolCall 在 gate 期按
 提交序串行发、ToolResult 各 entry 完成即发。超时规划公式（不给魔数）：
 `timeout_secs ≈ 单调用预期时长 × ceil(批量规模 / 有效并发度) + 计算与限流余量`（有效并发度 ≤8，
-仅作估算非保证）。实际并发按 `ToolConcurrency` 路由（LD-11）：v1 白名单 `read_file` 与
-MCP `readOnlyHint` 工具是 Sequential，批内按提交序串行执行（契约一致、无提速）；真正并发要等
-Parallel 的 batchable 工具（M3 的 `llm`）。门关 = prelude 不暴露 `callBatch`、保留名直调按未知
+仅作估算非保证）。实际并发按 `ToolConcurrency` 路由（LD-11）：`llm` 是 v1 唯一 Parallel 的
+batchable 工具（批内真并发）；`read_file` 与 MCP `readOnlyHint` 工具是 Sequential，批内按
+提交序串行执行（契约一致、无提速）。门关 = prelude 不暴露 `callBatch`、保留名直调按未知
 工具报错、描述与 skill 的批量段不出现（模型可见契约与旧二进制一致）；通道调用期生效、描述与
 skill 段装配期生效。教学与陷阱（`instanceof Error` 判别、勿 `JSON.stringify` 失败条目）在内置
 技能 `run-code` 的「批量调用」段（`code.call_batch` 开启时才有该段）。
+
+**LLM 判别（`code.llm`，默认关）**：`tools.call("llm", {...})` 给 guest 一个**单次判别/生成原语**
+（code_llm M3，LD-1…19）——无工具、无历史、无流式，一轮往返；经普通 `tools.call` 通道进 host，
+hooks 闸门、事件对、审计 trace、调用额度照常适用。参数：`prompt`（必填，自包含指令）、`system`、
+`model`（省略用 `default_model`，显式必须在 `models` 允许列表）、`max_tokens`（1..=8192，默认
+1024）、`labels`（≤16 个非空声明词表）；`temperature` 固定 0（逐项判别要可复现）。返回
+`{text, label?, usage, model}`——`labels` 命中时 `label` 是**声明拼写**的 canonical（输出侧仅做
+trim → 剥一层包裹引号/反引号 → 大小写折叠的最小归一）。三类失败各带结构化 `kind`：`llm`
+（参数/允许列表/provider 失败，刻意不给 retryable——由模型读 message 自判）、`llm_output`
+（labels 未命中；带真实 usage，成本诚实）、`budget`（run 级 token 预占被拒——沙箱存活，
+`write_file` 等照常可用，预占语义见下）。**token 预占后结算（LD-17）**：调用前按
+`est(prompt+system) + max_tokens + 协议余量` 预占 run 级共享预算，完成后按真实 usage 结算
+（多退少补；usage 未知则保留预占——闸门宁可多占不少占），result.json 的 `meta.llm` 落 per-model
+台账（reserved/actual/known/over_reserve/known_calls/unknown_calls）。**同一 provider 实例
+（LD-16）**：内层调用走外层 agent 构造时的同一个 provider（绑定宿主的自定义 provider 也会收到
+内层调用，答不了就用自己的诚实错误回）；每次调用 120s 硬超时。门关 = guest 工具表里没有 `llm`
+（顶层撞名才报错）、描述【LLM 判别】段与 skill 的「LLM 判别」段不出现。级联判别（结果再喂
+下一轮 llm）的示例在内置技能 `run-code` 的「LLM 判别」段（`code.llm.enabled` 开启时才有该段）。
+
 
 **代码编排提示词（可选）**：`examples/prompts/agentic-code.md` 在原参考纪律上增加
 “规则明确且剩余有规模”的选择规则，支持探查后换轨与大清单保存在变量/文件中。
@@ -993,7 +1018,8 @@ skill 段装配期生效。教学与陷阱（`instanceof Error` 判别、勿 `JS
 **沙箱内环境**：纯同步 ES2023——无 async/Promise/timer/`import`/`fetch`，`Date.now`/`Math.random`
 不可用（评测可复现）。API 五个：`tools.call(name, args)`（失败 throw、可 try/catch 后继续，异常带
 结构化字段 `e.kind`/`e.tool`/`e.retryable`——`denied`/`hooks`/`budget`/`deadline`/`unknown_tool`/`lib`
-类重试无意义，工具自身失败为 `tool` 类且刻意不给 retryable，由模型读 message 自行判断）、
+类重试无意义，工具自身失败为 `tool` 类且刻意不给 retryable，由模型读 message 自行判断；`llm`
+类的 `llm`/`llm_output` 同理不给 retryable），
 `tools.list()`（不确定工具名时先调它）、`tools.budget()`（剩余调用次数 / 墙钟 / 燃料 / run 级
 token 预算 `tokens_left`——未设 `max_total_tokens` 时为 null；查询本身免费，长批量开工前对一下
 额度）、`console.log(...)`（实时透出 + 随结果返回）、
@@ -1002,7 +1028,8 @@ token 预算 `tokens_left`——未设 `max_total_tokens` 时为 null；查询�
 `writeVerified(path, content)`）：大文件整读 / 逐行读 / 字节保真写（写后 raw 读回比对，不经文本
 往返），底层就是 `read_file` 的 `format:"json"` 分页与 `raw`/`content_b64` 字节通道——此外没有
 别的内置助手（`code.include` 开启时再加 `include`/`saveLib` 两个库助手，见上节；
-`code.call_batch` 开启时再加 `tools.callBatch(entries)` 批量助手，见批量调用节）。工具描述刻意保持精简
+`code.call_batch` 开启时再加 `tools.callBatch(entries)` 批量助手，见批量调用节；`code.llm`
+开启时再加 `llm` 判别原语，见 LLM 判别节）。工具描述刻意保持精简
 （封闭助手清单 + 指针），深契约与完整示例在**内置技能 `run-code`** 里（`code.enabled` 时自动出现在
 技能列表、经 `read_skill` 按需加载；在自己的技能目录放同名 `run-code/` 可覆盖它）。**可调工具集** =
 主 agent 的工具白名单（含 MCP），但不含 `task` / `todo` / `run_code` 自身；宿主经 `build_agent_with`
@@ -1184,14 +1211,14 @@ release 下 panic 不触发 `Drop`——调试 destructors（如 TUI 终端还�
 ```text
 src/
 ├── main.rs           (  930)  # CLI 入口 + 组装（build_agent）+ --session none
-├── lib.rs            (  548)  # 库根：build_agent* / assemble 装配（工具表、ToolCtx、code 安装、技能注入）
-├── config.rs         ( 1621)  # 配置解析 + 任务片段合并 + 批量覆盖白名单
+├── lib.rs            (  551)  # 库根：build_agent* / assemble 装配（工具表、ToolCtx、code 安装、技能注入）
+├── config.rs         ( 1873)  # 配置解析 + 任务片段合并 + 批量覆盖白名单
 ├── provider/  # LLM 后端
-│   ├── mod.rs            (  930)  # 共享 Message/Block、SSE reader、CancellableSse
-│   ├── openai.rs         ( 1645)  # OpenAI 兼容（include_usage；400 回退：max_tokens→max_completion_tokens / 丢 stream_options）
-│   ├── anthropic.rs      ( 1102)  # Anthropic 原生（message_start/message_delta usage）
-│   └── mock.rs           (  340)  # 测试用脚本化 Provider（cfg(any(test, feature="mock"))）
-├── agent.rs          ( 3369)  # 核心 loop + usage 累计 + cancel + 上下文压缩（前馈/溢出双触发 + 滚动分块摘要）+ 相邻消息归一 + 同 turn 多 task 并行
+│   ├── mod.rs            (  938)  # 共享 Message/Block、SSE reader、CancellableSse
+│   ├── openai.rs         ( 1657)  # OpenAI 兼容（include_usage；400 回退：max_tokens→max_completion_tokens / 丢 stream_options）
+│   ├── anthropic.rs      ( 1111)  # Anthropic 原生（message_start/message_delta usage）
+│   └── mock.rs           (  345)  # 测试用脚本化 Provider（cfg(any(test, feature="mock"))）
+├── agent.rs          ( 3418)  # 核心 loop + usage 累计 + cancel + 上下文压缩（前馈/溢出双触发 + 滚动分块摘要）+ 相邻消息归一 + 同 turn 多 task 并行
 ├── agent_tests.rs    ( 8823)  # 核心 loop 回归测试（provider::mock 脚本化，不连网）
 ├── compress.rs       (  810)  # 压缩引擎（find_safe_cut / 分块摘要 / saturating usage 合并 + block 级计费原语）
 ├── context_report.rs (  785)  # 上下文构成分解（ContextBreakdown 估算口径：system 三段 / 工具四类 / 消息分型 + 锚点校准）
@@ -1201,7 +1228,7 @@ src/
 ├── skills.rs         ( 1017)  # 三级技能加载（内置 / 用户目录 / 项目）
 ├── hooks.rs          (  181)  # hooks 闸门（Deny / Modify / 审计）
 ├── tools/  # 工具集：内置工具 + MCP 包装 + task 子 agent + run_code（feature code）
-│   ├── mod.rs            (  941)  # Tool trait + ToolCtx + CallbackTool/SharedTool + build 白名单组装
+│   ├── mod.rs            (  960)  # Tool trait + ToolCtx + CallbackTool/SharedTool + build 白名单组装
 │   ├── shell.rs          (  924)  # shell 工具
 │   ├── file.rs           ( 1345)  # read_file / write_file / edit_file / list_dir
 │   ├── image.rs          (   87)  # load_image 工具
@@ -1210,10 +1237,11 @@ src/
 │   ├── mcp.rs            (  485)  # MCP 工具包装（sanitize_name + wire_name 分发）
 │   ├── subagent.rs       (  917)  # task 子 agent 工具（独立上下文 + turn 封顶；不可递归）
 │   ├── todo.rs           (  310)  # todo 工具（任务计划，全量替换；plan 落 result.json）
-│   └── run_code.rs       ( 8317)  # run_code 工具（feature code）：QuickJS-in-wasm 沙箱——epoch/fuel/mem 限额、路径拦截、hooks 闸门、审计 meta（双哈希）
+│   ├── run_code.rs       ( 9561)  # run_code 工具（feature code）：QuickJS-in-wasm 沙箱——epoch/fuel/mem 限额、路径拦截、hooks 闸门、审计 meta（双哈希）
+│   └── llm.rs            (  506)  # llm 判别原语（feature code + code.llm 门）：单发无状态内层模型调用——LD-17 预占/结算、LD-18 labels 归一、共享 Provider cell
 ├── mcp.rs            ( 1427)  # MCP 客户端（stdio / Streamable HTTP / 旧版 SSE）
 ├── batch.rs          ( 3047)  # 批量任务 + --retries/--failed + 报告合并
-├── harness.rs        ( 1962)  # headless 模式 + result.json + NDJSON + exit code
+├── harness.rs        ( 2003)  # headless 模式 + result.json + NDJSON + exit code
 └── tui.rs            ( 7792)  # TUI（feature tui）：内联流式渲染（对话进原生 scrollback）/ InputBuffer 多行输入 / 斜杠命令+补全 / markdown 渲染 / bracketed paste
 ```
 <!-- END CODE STRUCTURE -->

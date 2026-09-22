@@ -23,6 +23,16 @@ pub struct ResultMeta {
 pub struct CodeFacts {
     pub skill_injection: &'static str,
     pub precheck: bool,
+    /// LD-12 llm anchor (default_model + allowlist): `Some` only when the
+    /// inner-model primitive was enabled at assembly — absent key keeps the
+    /// default output byte-identical.
+    pub llm: Option<LlmFacts>,
+}
+
+/// The llm gate's audit snapshot (LD-12).
+pub struct LlmFacts {
+    pub default_model: String,
+    pub models: Vec<String>,
 }
 
 /// Read the agent's assembly-time code audit facts (`None` unless the sandbox
@@ -30,9 +40,13 @@ pub struct CodeFacts {
 pub(crate) fn code_facts_of(agent: &Agent) -> Option<CodeFacts> {
     #[cfg(feature = "code")]
     {
-        agent.code_audit().map(|(si, pc)| CodeFacts {
-            skill_injection: si.as_str(),
-            precheck: pc,
+        agent.code_audit().map(|a| CodeFacts {
+            skill_injection: a.skill_injection.as_str(),
+            precheck: a.precheck,
+            llm: a.llm.as_ref().map(|l| LlmFacts {
+                default_model: l.default_model.clone().unwrap_or_default(),
+                models: l.models.clone(),
+            }),
         })
     }
     #[cfg(not(feature = "code"))]
@@ -157,20 +171,37 @@ pub(crate) fn run_with_retries(
     // NFR-3 audit anchor (finetune_support): when the run_code sandbox was
     // enabled at assembly, open the stream with the skill_injection/precheck
     // decision so a bench rerun can attribute trajectories without result.json.
+    // LD-12: the llm gate's default_model/allowlist rides the same record as
+    // an additive `llm` key — present only when the primitive was on.
     if let Some(cf) = code_facts_of(agent) {
         if json {
-            let v = json!({
+            let mut v = json!({
                 "type": "code",
                 "enabled": true,
                 "skill_injection": cf.skill_injection,
                 "precheck": cf.precheck,
             });
+            if let Some(l) = &cf.llm {
+                v["llm"] = json!({
+                    "enabled": true,
+                    "default_model": l.default_model,
+                    "models": l.models,
+                });
+            }
             print_ndjson(&serde_json::to_string(&v).unwrap_or_else(|_| "{}".into()));
         } else {
-            eprintln!(
+            let mut line = format!(
                 "[code] skill_injection={} precheck={}",
                 cf.skill_injection, cf.precheck
             );
+            if let Some(l) = &cf.llm {
+                line.push_str(&format!(
+                    " llm=default:{} allowlist:{}",
+                    l.default_model,
+                    l.models.join(",")
+                ));
+            }
+            eprintln!("{line}");
         }
     }
     let (mut code, outcome, error) = loop {
@@ -636,13 +667,22 @@ pub fn write_result(
     // run_code audit anchor (NFR-3): additive key, only when the sandbox was
     // enabled at assembly — default-config output stays byte-identical. Both
     // branches above land here before serialization, so a single insertion
-    // covers success and failure (the `plan` precedent).
+    // covers success and failure (the `plan` precedent). LD-12: the llm
+    // gate's config anchor nests under it, same additive rule.
     if let Some(cf) = &meta.code {
-        result["code"] = json!({
+        let mut code = json!({
             "enabled": true,
             "skill_injection": cf.skill_injection,
             "precheck": cf.precheck,
         });
+        if let Some(l) = &cf.llm {
+            code["llm"] = json!({
+                "enabled": true,
+                "default_model": l.default_model,
+                "models": l.models,
+            });
+        }
+        result["code"] = code;
     }
     let bytes = serde_json::to_string_pretty(&result)?;
     atomic_write(path, bytes.as_bytes())
@@ -1442,6 +1482,7 @@ mod tests {
             code: Some(CodeFacts {
                 skill_injection: "eager",
                 precheck: true,
+                llm: None,
             }),
         };
         let o = RunOutcome {

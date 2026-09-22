@@ -431,7 +431,7 @@ fn eager_skill_injection_prepends_synthetic_pair() {
     // code_memory MD-13: the eager pair carries the EFFECTIVE skill body for
     // this assembly — include off (the default) strips the marked lib
     // section, so the injected bytes are the gated file, not the raw one.
-    let md = tiny_agent::tools::run_code::run_code_skill_md(false, false);
+    let md = tiny_agent::tools::run_code::run_code_skill_md(false, false, false);
     match &msgs[1].content[0] {
         tiny_agent::Block::ToolResult {
             tool_use_id,
@@ -713,4 +713,113 @@ fn context_breakdown_serializable() {
             "missing by_kind.{k}"
         );
     }
+}
+
+// ── code_llm M3: A-L9 — the llm primitive rides the OUTER provider instance
+// (LD-16), end to end through the real assembly fill path.
+#[cfg(all(feature = "code", feature = "mock"))]
+#[test]
+fn llm_primitive_rides_the_outer_provider_instance() {
+    use tiny_agent::provider::new_client;
+    // Strict model routing (M0 topology): the outer model, the tier's m1/m2,
+    // and m3 — allowlisted but deliberately UNROUTED, the "custom provider
+    // cannot serve that model" honest-failure shape.
+    let outer_code = r#"
+        const one = tools.call("llm", {prompt: "first"});
+        const two = tools.call("llm", {prompt: "second", model: "m2", max_tokens: 32});
+        let third;
+        try {
+            tools.call("llm", {prompt: "third", model: "m3"});
+            third = "no-throw";
+        } catch (e) { third = e.kind; }
+        return { one: one.text, two: two.text, m2: two.model, third };"#;
+    let (provider, state) = MockProvider::routed(vec![
+        (
+            "mock-model",
+            vec![
+                resp_tool(
+                    "t1",
+                    "run_code",
+                    json!({"code": outer_code}),
+                    mk_usage(20, 10),
+                ),
+                resp_text("done", mk_usage(5, 5)),
+            ],
+        ),
+        ("m1", vec![resp_text("answer-one", mk_usage(7, 3))]),
+        ("m2", vec![resp_text("answer-two", mk_usage(9, 4))]),
+    ]);
+    let cfg: Config = serde_json::from_value(json!({
+        "provider": "openai",
+        "api_key_env": "NONE",
+        "model": "mock-model",
+        "tools": [],
+        "inject_environment": false,
+        "limits": {"max_turns": 5, "timeout_secs": 120, "max_total_tokens": 100000},
+        "code": {
+            "enabled": true,
+            "llm": {"enabled": true, "default_model": "m1", "models": ["m1", "m2", "m3"]}
+        }
+    }))
+    .expect("config");
+    let client = new_client(0);
+    let mut agent = tiny_agent::build_agent_with_provider(
+        &cfg,
+        Box::new(provider),
+        vec![tiny_agent::Message::user(vec![tiny_agent::Block::Text(
+            "go".into(),
+        )])],
+        &client,
+        Vec::new(),
+        "",
+    )
+    .expect("assemble");
+    let outcome = agent.run(&mut |_| {}).expect("run");
+    assert_eq!(outcome.stop_reason, "end_turn");
+    // Same-instance proof: ONE MockState saw the outer turns AND the inner
+    // model calls, in dispatch order — the llm cell carries the very Arc the
+    // outer agent chats through (the LD-16 fill in Agent::set_code_tool).
+    let captured = state.captured();
+    let models: Vec<&str> = captured.iter().map(|c| c.model.as_str()).collect();
+    assert_eq!(
+        models,
+        vec!["mock-model", "m1", "m2", "m3", "mock-model"],
+        "outer turn → inner m1/m2 (allowlist) → m3 (unrouted, errors) → outer final"
+    );
+    assert_eq!(captured[1].temperature, Some(0.0), "LD-4 on the inner call");
+    assert_eq!(captured[2].max_tokens, 32, "explicit max_tokens forwarded");
+    assert_eq!(captured[1].cache, false, "one-shot, no cache markup");
+    // The guest saw the texts + the honest m3 failure class — they travel in
+    // the run_code result record the outer model received.
+    let rc = outcome
+        .tool_calls
+        .iter()
+        .find(|r| r.name == "run_code")
+        .expect("run_code record");
+    assert!(
+        rc.output.contains("answer-one") && rc.output.contains("answer-two"),
+        "guest saw both routed answers: {}",
+        rc.output
+    );
+    assert!(
+        rc.output.contains("llm"),
+        "the unrouted m3 surfaced as kind=llm: {}",
+        rc.output
+    );
+    assert!(!rc.is_error);
+    let llm = rc
+        .meta
+        .as_ref()
+        .expect("run_code meta")
+        .get("llm")
+        .expect("LD-12 ledger");
+    assert_eq!(llm["calls"], json!(3));
+    assert_eq!(llm["models"]["m1"]["known_usage"], json!(10));
+    assert_eq!(llm["models"]["m2"]["known_usage"], json!(13));
+    assert_eq!(llm["models"]["m3"]["unknown_calls"], json!(1));
+    // The inner spend folded ONCE into the run totals: outer turns 20+10 and
+    // 5+5, inner 16+7 (m1 7+3, m2 9+4, m3 nothing — unknown stays unknown,
+    // never faked as zero-cost usage).
+    assert_eq!(outcome.input_tokens, 41);
+    assert_eq!(outcome.output_tokens, 22);
 }

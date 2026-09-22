@@ -357,7 +357,7 @@ skills are part of the task's environment"），三条行为说明即闭合：
 | A-M5 覆写语义 | include + 重定义同名函数，本次生效、文件不变；writeVerified 写回后新哈希登记 |
 | A-M6 生命周期 e2e | 起草登记→新会话直接加载 draft 拒绝→负责人批准相同 hash→加载→局部覆写→写回回 draft、原质量证据过期→重新验证/批准；会话登记不跨 resume 恢复 |
 | A-M7 batch 行为 | copy 模式沙箱内 workdir 根 `lib/` 随行可达（COPY_EXCLUDE 四项不含它；A-M 系列跑在隔离目录下）。`.tinyagent/` 随行是技能系统事实、其 guest 侧可达性归 Tier-2（M3）验收 |
-| A-M8 verify 探针 | 判别库 verify(n)：全过返回摘要、任一错例 throw；批量前 verify 失败 → 外层收到明确错误不进批量；verify 的 llm 调用进 trace 与额度（mock 按 model 分流） |
+| A-M8 verify 探针 | 判别库 verify(n)：全过返回摘要、任一错例 throw；批量前 verify 失败 → 外层收到明确错误不进批量；verify 的 llm 调用进 trace 与额度（mock 按 model 分流）。✅ 2026-09-22 随姊妹稿 M3 落码：`am8_verify_probe_passes_then_batch_fanout_proceeds` / `am8_verify_probe_failure_blocks_the_batch`（include × llm × callBatch 三通道合流，失败腿钉住"批次未派发 + 失败出口审计"） |
 | A-M9 通道边界（v0.4） | `__include`：lib/ 外路径拒（含 `../` 拼写逃逸与符号链接——既有路径拦截走查三纪律全过一遍）；hooks Deny include → `kind="hooks"`；trace 记录（name="include"） |
 | A-M10 注册制/hash 闭环（v0.4） | 未登记文件 include → 硬拒（文案指向 writeVerified）；writeVerified 后成功；篡改文件一字节 → `kind="include"` 硬错（文案含期望/实际哈希前缀）；删 INDEX 条目 → 硬拒；**显式 readAll+eval 仍可行**（记录 include 门控不覆盖全部执行路径的限制） |
 | A-M11 manifest 解析（v0.7） | 仅解析机器行；缺失/重复冲突拒绝；多库 upsert 不串条目；部分写入失败报错，未完成登记不冒充可用 |
@@ -368,7 +368,7 @@ skills are part of the task's environment"），三条行为说明即闭合：
 | # | 内容 | 出口判据 |
 |---|---|---|
 | M1 | **include v1**：`__include`/`__hash_file` 保留名 + prelude include/**saveLib** + INDEX manifest（含 st）+ **默认流程准入（MD-14）** + `code.include` 门 + 钉子用例 | ✅ 2026-09-22 落码：`cargo test --features code,mock` 绿（A-M1~M7、M9~M12；A-M8 随 M3）；读取上限=1 MiB 超限错误实证（`lib_read_cap_error`）；门关模型可见契约与旧版一致含保留名直调拒（`gate_off_matches_old_contract`，`__include`/`__hash_file` 双名）。复审补钉（同日）：A-M9 逃逸腿 `../` 拼写与符号链接（伪造同 hash INDEX 也拒，`lib_channel_path_escape_legs`，unix-only）；A-M2 负腿 let/const/class 不导出 + strict 不导出（`lib_lexical_and_strict_declarations_not_exported`）；A-M10 readAll+eval 仍可行的限制钉（`lib_readall_eval_still_works`）；A-M11 多库 upsert 不串条目 + INDEX 写失败不冒充可用（`lib_index_upsert_and_partial_failure`）。A-M12 伪造 st 腿未单独成测——`lib_lifecycle_e2e` 第 3 步的 st=draft→ok 手改即同一机制（批准与伪造共享写路径，属已记录限制，不宣称阻断）。落地差异见修订记录 v0.7.1（saveLib 改名 / kind="lib" / globalThis 挂载） |
-| M2 | 库模板（含 verify）+ skill 生命周期教学 + README（A-M6/7；A-M8 随 llm M3 完成） | ✅ 2026-09-22 落码：skill「库与复用」段带 `BEGIN/END LIB SECTION` 标记、装配期按 include 剔除（`run_code_skill_md`）；A-M6 生命周期 e2e（`lib_lifecycle_e2e`）、A-M7 COPY_EXCLUDE 钉子（`copy_exclude_never_lists_lib`）过；sync_run_code_contract 绿 |
+| M2 | 库模板（含 verify）+ skill 生命周期教学 + README（A-M6/7；A-M8 随 llm M3 完成） | ✅ 2026-09-22 落码：skill「库与复用」段带 `BEGIN/END LIB SECTION` 标记、装配期按 include 剔除（`run_code_skill_md`）；A-M6 生命周期 e2e（`lib_lifecycle_e2e`）、A-M7 COPY_EXCLUDE 钉子（`copy_exclude_never_lists_lib`）过；sync_run_code_contract 绿。A-M8 已随姊妹稿 M3 同日完成（见 §7 行） |
 | M3（V0-B 后，v2 另立项） | Tier-2 索引 skill + ReadSkill 翻转 + 全局库通道 | 届时设计补充评审 |
 
 本稿 M1/M2 组成姊妹稿 M1 的加载/模板工作，V0-A 通过后实现最小闭环；不要求

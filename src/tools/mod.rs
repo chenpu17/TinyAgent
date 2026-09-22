@@ -1,6 +1,8 @@
 mod document;
 mod file;
 mod image;
+#[cfg(feature = "code")]
+pub mod llm;
 pub mod mcp;
 // The wasm-sandboxed JS tool. Gated: wasmtime adds ≈4.6 MiB to the release
 // binary, and enabling the tool is a per-deployment trust decision
@@ -477,6 +479,20 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// This tool's OWN failure vocabulary for the run_code guest's structured
+    /// error envelope (code_llm_design LD-7): `None` — the default — means
+    /// plain "tool" (the host cannot classify a third-party tool's failures,
+    /// and both `retryable` values would mislead). A tool with a richer
+    /// failure taxonomy (the sandbox `llm` primitive: "llm" / "llm_output" /
+    /// "budget") overrides this, reading its own marker out of
+    /// [`ToolOutput::meta`] — meta is host-audit data the model never sees,
+    /// so reusing it as the class carrier adds no guest-visible surface.
+    /// run_code's dispatch is the ONLY caller; the top-level loop keeps its
+    /// plain error strings (llm never runs top-level).
+    fn envelope_error_kind(&self, _output: &ToolOutput) -> Option<&'static str> {
+        None
+    }
+
     /// Which source bucket this tool's schema belongs to in
     /// `Agent::context_breakdown`'s tool report. Default `Custom` — the
     /// safe attribution for anything the core didn't ship: a host-injected
@@ -608,6 +624,9 @@ impl Tool for SharedTool {
     }
     fn mcp_server(&self) -> Option<&str> {
         self.inner.mcp_server()
+    }
+    fn envelope_error_kind(&self, output: &ToolOutput) -> Option<&'static str> {
+        self.inner.envelope_error_kind(output)
     }
     fn origin(&self) -> ToolOrigin {
         self.inner.origin()

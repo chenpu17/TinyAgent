@@ -305,6 +305,14 @@ pub struct ChatRequest<'a> {
     /// — vendor ladders differ and shift across generations); `None` = server
     /// default. One-off requests (the compression summary) pass `None`.
     pub reasoning_effort: Option<&'a str>,
+    /// Sampling temperature forwarded per request (LD-4, code_llm_design §3):
+    /// `None` = the provider's/server's default — the outer agent turns and
+    /// the compression summary never set it, so their behavior is unchanged.
+    /// The one in-tree caller that sets it is the sandbox `llm` primitive
+    /// (`Some(0.0)`, deterministic-leaning single shots); per-request control
+    /// lives HERE (the provider layer) rather than in the tool so every
+    /// provider maps it once — the single-source rule for request shaping.
+    pub temperature: Option<f32>,
 }
 
 pub trait Provider: Send + Sync {
