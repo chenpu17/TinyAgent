@@ -2,15 +2,42 @@
 
 | 项 | 值 |
 |---|---|
-| 状态 | v0.7.3 设计修订稿（M2 callBatch + M3 llm + M4 契约/评测装配已落码，V0-B 未跑）；产品收益未验收 |
-| 版本 | v0.7.3 |
-| 日期 | 2026-09-22 |
+| 状态 | v0.7.4 读数登记稿（M2/M3/M4 落码；V0-B 四臂主批 + e3 复查 + e1 库臂已跑：e2 一致性增量成立，A③/include 零效应登记）；产品收益部分验收 |
+| 版本 | v0.7.4 |
+| 日期 | 2026-09-23 |
 | 关联文档 | `docs/run_code_design.md`（D 编号）、`docs/finetune_support_design.md`（FD 编号、附录 A 即规格纪律）、`docs/run_code_routing_report.md`（评测方法论）、`docs/code_memory_design.md`（姊妹稿，共享纪律见 §10） |
 | 代码基线 | master @ edfb9bc（其后行号会漂移，以代码为准） |
 | 决策编号 | 本文 LD-n 独立编号；引用 run_code_design 写 D-n、finetune_support 写 FD-n |
 
 修订记录（历史仅说明演进，当前正文与决策表为规格）：
 
+- **v0.7.4（V0-B 正式轮读数登记：A③ 零效应 + include 零采用；规格文字未动，
+  修订讨论开启）**：读数来源 `docs/code_v0b_report.md` §5（四臂主批
+  v1.4 / 协议 v2.1 / 外层 deepseek-flash@8192 交错 ×3 + e3 预算复查 + e1
+  库臂 cold ×6 / warm ×3）。
+  ① **E2 一致性增量成立**（本战役主读数）：e2 三跑 F1 极差 0.012、3/3
+  干净完成，同批 gates-off 臂在 0↔0.97 翻转——分层设计（规则层 + llm
+  兜底）的可靠性主张实测坐实；代价 4.8× 墙钟 + **二阶路由方差**（高效跑
+  116 内层调用规则先 / 低效跑 835 调用 llm 全量判——"何时停用 llm"未解）。
+  LD-17/18 账本与 labels 契约 ~4000 内层调用 0–1 unknown 实地成立。
+  ② **A③ 三问边界句（E0′ 装置）两批皆零效应**：完成率 3/6 vs e0 5/6
+  （反向）、质量上限持平、路由行为差异未观察到（"试走 lib/llm 撞诚实
+  拒绝"事件为零）。**处置：A③ 冻结文字与 E0′ 装置保留不动**（§8.2 纪律：
+  读数仅覆盖 deepseek 外层 + 单任务形状，证据不足不强行判负），但 E0′
+  降出主假设位——后续战役不再作为首要臂，除非换外层模型重测翻案。
+  ③ **include 库通道摊销假设双端不成立（此任务形状）**：cold 零建库 0/6
+  （单次任务无建库动机）；warm 预置批准库（真实 saveLib 登记 + 负责人
+  批准 + 跨会话 include 准入探针通过）后 **include() 零采用 0/3**——完成跑
+  读库源码后手工移植成 Python（知识复用发生、通道复用没有）。归因 =
+  substrate 错配：include 只在 QuickJS 沙箱内生效，外层偏好 shell+Python。
+  **修订方向登记（未决）**：include 的价值面在"沙箱内已有代码路径"的场景
+  （e2/e3 的 llm 判别循环里 include 判别库——「库与复用」段本就点名判别库
+  是最高价值形态），不在"外层从零选执行路线"的场景；后续探针 = e2 臂 +
+  预置判别库（含 verify 探针）的 warm 形状。v1 不为此扩 Python 沙箱
+  （run_code = QuickJS 是既定决策，姊妹稿 D 编号同口径）。
+  ④ 装置面增补：runner `--max-total-tokens`/`--inner-model` 参数化（进 run
+  版本戳）、e3 预算包络登记（装配文档 §2.2）、warm 库装置
+  `examples/eval/e1-warm-lib/`（sha256 指纹登记）。
 - **v0.7.3（M4 契约与评测装配落码）**：
   ① **A③ 三问边界句冻结**（"落码即冻结"条款于本版生效）：载体 = E0′ 实验
   装置变体 `examples/eval/e0prime-skill/run-code/SKILL.md`（磁盘同名覆盖
