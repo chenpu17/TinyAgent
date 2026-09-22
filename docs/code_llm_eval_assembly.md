@@ -37,7 +37,14 @@ E1/E2/E3 用内置技能（门开即披露对应段）；E0′→E1/E2/E3 比较
 
 **E1 注意**：收紧 `fs_write_dirs` 的部署必须把 `lib/` 列入可写集，否则 `saveLib`
 全拒（README 库与复用节）；`lib/` 的版本管理交给 git，评测任务状态重置时清
-workdir 但保留 warm 臂的预置库。
+workdir 但保留 warm 臂的预置库。**V0-B 实测后的 warm 实现口径（2026-09-23）**：
+cold 6 跑零建库（单次任务无建库动机），"上轮产出的库"不存在——warm 臂预置库
+改为**评测侧蒸馏**：cold r1 自己的噪声剥离管道（TA_BP 频次池 + core()，零类
+信息）→ 真实 saveLib 机制登记 → 负责人批准（st=ok + 人类字段）。装置与指纹
+`examples/eval/e1-warm-lib/`（strip.js sha256 =
+`e0b15aadcc7f8f5962ab0f5b411d3183537f766c125e10d06fe0b88ece171be5`）；
+跨会话 include 准入已由探针验证。实测读数（零通道采用 / substrate 错配）见
+`docs/code_v0b_report.md` §5.4。
 
 **E2 注意**：判别模型与升级模型的档位、`max_tokens`（先用目标模型验证再设小）、
 价目与日期按 §8.1 存档；result.json 的 `meta.llm` 台账（per-model known_usage/
@@ -201,3 +208,10 @@ code,mock`）：
   弱分离（中位 0.894 vs 0.951，点值全低于 e2 最小值，n=3 不下结论）。
   §2.2 预算包络登记为 e3=8M。四臂主批工件归档 `v0b_eval_4arm_v1.4_4M/`，
   复查批工件 `v0b_eval/`。读数详 `docs/code_v0b_report.md` §5.3。
+- 2026-09-23：e1 库臂（cold ×6 两批 + warm ×3）：**摊销假设双端不成立**——
+  cold 零建库 0/6（无建库动机）、warm include() 零采用 0/3（2/3 读 INDEX、
+  完成跑把库内容手工移植成 Python——知识复用发生、通道复用没有，substrate
+  错配：include 只在 QuickJS 沙箱、模型偏好 shell+Python）。生命周期机制面
+  全绿：saveLib 登记 → 负责人批准 → 跨会话 include 准入探针通过；修库无
+  事件。e1≈e0（完成率/F1 同档）。§2 E1 注意补 warm 实现口径与装置指纹
+  （examples/eval/e1-warm-lib/）。读数详 `docs/code_v0b_report.md` §5.4。
