@@ -29,6 +29,9 @@ jobs:
       # README 代码结构树：行数从源文件实时生成，手工维护曾偏差 2–5× 并漏列
       # 整个模块（外审 P1）——生成物漂移红灯。
       - run: python3 scripts/gen_structure.py --check
+      # E0′ 评测装置漂移门（M4）：变体技能指纹 vs 装配文档登记、A③ 边界句
+      # 逐字一致、all-off 变体无门控内容渗漏——评测配方可复现性的 CI 面。
+      - run: python3 scripts/check_eval_apparatus.py
 
   test:
     # 三平台 × 双 clippy 配置 + 测试。CLAUDE.md 约定两个 clippy 都要过：

@@ -1014,6 +1014,10 @@ trim → 剥一层包裹引号/反引号 → 大小写折叠的最小归一）�
 仅在 `run_code` 可用时，将文件第一个 `---` 后的正文设为 `system_prompt`；不会自动加载。
 `agentic.md` 保持原样供 no-code/历史对照。新版描述与技能会随重新编译进入 code 臂，
 请按 [落地报告](docs/run_code_routing_report.md) 固定文案、提示词与二进制指纹，分批验证效果。
+**评测装配**：include / callBatch / llm 三特性的 E0–E3 分期矩阵与四路线对照的
+可复现配方（臂配置、E0′ 三问边界句装置 `examples/eval/e0prime-skill/`、指纹与
+测量协议）见 [评测装配文档](docs/code_llm_eval_assembly.md)；装置漂移由
+`scripts/check_eval_apparatus.py` 在 CI 红灯把守。
 
 **沙箱内环境**：纯同步 ES2023——无 async/Promise/timer/`import`/`fetch`，`Date.now`/`Math.random`
 不可用（评测可复现）。API 五个：`tools.call(name, args)`（失败 throw、可 try/catch 后继续，异常带
@@ -1225,7 +1229,7 @@ src/
 ├── retry.rs          (  158)  # batch --retries / 单跑瞬态重试共用的指数退避（±25% jitter 防 lockstep）
 ├── signal.rs         (  114)  # headless SIGINT → cancel（首次优雅 / 二次硬退 130）
 ├── session.rs        (  382)  # 会话持久化（原子写 + archive 折叠）
-├── skills.rs         ( 1017)  # 三级技能加载（内置 / 用户目录 / 项目）
+├── skills.rs         ( 1074)  # 三级技能加载（内置 / 用户目录 / 项目）
 ├── hooks.rs          (  181)  # hooks 闸门（Deny / Modify / 审计）
 ├── tools/  # 工具集：内置工具 + MCP 包装 + task 子 agent + run_code（feature code）
 │   ├── mod.rs            (  960)  # Tool trait + ToolCtx + CallbackTool/SharedTool + build 白名单组装
@@ -1237,7 +1241,7 @@ src/
 │   ├── mcp.rs            (  485)  # MCP 工具包装（sanitize_name + wire_name 分发）
 │   ├── subagent.rs       (  917)  # task 子 agent 工具（独立上下文 + turn 封顶；不可递归）
 │   ├── todo.rs           (  310)  # todo 工具（任务计划，全量替换；plan 落 result.json）
-│   ├── run_code.rs       ( 9561)  # run_code 工具（feature code）：QuickJS-in-wasm 沙箱——epoch/fuel/mem 限额、路径拦截、hooks 闸门、审计 meta（双哈希）
+│   ├── run_code.rs       ( 9577)  # run_code 工具（feature code）：QuickJS-in-wasm 沙箱——epoch/fuel/mem 限额、路径拦截、hooks 闸门、审计 meta（双哈希）
 │   └── llm.rs            (  506)  # llm 判别原语（feature code + code.llm 门）：单发无状态内层模型调用——LD-17 预占/结算、LD-18 labels 归一、共享 Provider cell
 ├── mcp.rs            ( 1427)  # MCP 客户端（stdio / Streamable HTTP / 旧版 SSE）
 ├── batch.rs          ( 3047)  # 批量任务 + --retries/--failed + 报告合并

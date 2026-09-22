@@ -111,7 +111,7 @@ return { ok, bad };   // bad 非空就如实上报，不吞
      run_code.rs::run_code_skill_md —— 门关时模型可见契约与旧二进制一致） -->
 ## LLM 判别（需配置开启 code.llm.enabled；未开启时 llm 工具不存在）
 
-`tools.call("llm", {prompt, system?, model?, max_tokens?, labels?})` 单次模型调用（无工具、无历史、无流式，一轮返回）。大量同构的逐项语义判断（分类/抽取/校对/打标）用代码循环 + llm 承接；model 须在 code.llm.models 内（缺省 default_model）。返回 `{text, label?, usage, model}`；调用也计工具额度、token 成本发前预占。
+`tools.call("llm", {prompt, system?, model?, max_tokens?, labels?})` 单次模型调用（无工具、无历史、无流式，一轮返回）。大量同构的逐项语义判断（分类/抽取/校对/打标）用代码循环 + llm 承接；model 须在 code.llm.models 内（缺省 default_model）。返回 `{text, label?, usage, model}`；调用也计工具额度、token 成本发前预占。失败两类：`kind="llm"`（参数/允许列表/provider 失败）与 `kind="llm_output"`（词表未命中，带真实 usage）——均无 retryable，读 message 自判。
 
 - **判别纪律**：输出词表用 `labels` 声明（含 unsure 显式词），**且 prompt 里同写"输出必须是这些词之一"**（宿主只校验不注入提示）；未声明 labels = 生成模式（任意文本，作结构化抽取须在库内另行校验）；非法输出得 `kind="llm_output"`——分支前先判 label 合法性；unsure 单独计数进聚合摘要；`max_tokens` 用目标模型验证后设小；**首发只产出只读结果**；其他部署的副作用按宿主授权政策执行，外层复判不等于用户授权。
 - **成本纪律**：开工前 `tools.budget()` 查 tokens_left（**含未结算的预占**），循环里定期查；429/5xx 保留失败项并交外层诊断，系统性限流须宿主延后处理；`e.kind === "budget"` 时查 **`e.halted`**：true = 沙箱已停，只能 return 收尾；false = 额度关口拒绝但沙箱活着，可 write_file 落盘部分结果再收尾。单次 `tools.call` 的封套无 `e.halted` 字段——按错误文案判断沙箱是否还活着（预占拒绝的文案自带"沙箱仍在运行"语义）。

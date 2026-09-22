@@ -3635,7 +3635,7 @@ const BATCH_DESC_SUFFIX: &str = "\n\n【批量】（仅 code.call_batch 开启�
 /// The tool's OWN entry in `tools.list()` carries appendix A① verbatim
 /// (see `llm.rs`); this overlay only adds the routing pointer to the
 /// run_code surface.
-const LLM_DESC_SUFFIX: &str = "\n\n【LLM 判别】（仅 code.llm.enabled 开启时；关闭时无此工具）tools.call(\"llm\", {prompt, system?, model?, max_tokens?, labels?})：单次模型调用（无工具、无历史、无流式）——大量同构的逐项语义判断（分类/抽取/校对/打标）用代码循环 + llm 承接；model 须在 code.llm.models 内（缺省 default_model）。声明 labels（封闭词表，≤16 项）时宿主校验输出并返回规范 label，未命中 e.kind=\"llm_output\"；词表要求必须同时写进 prompt（宿主不注入）。返回 {text, label?, usage, model}。token 成本发前预占、也计调用额度。判别纪律/成本纪律/级联详见 run-code 技能的「LLM 判别」段。";
+const LLM_DESC_SUFFIX: &str = "\n\n【LLM 判别】（仅 code.llm.enabled 开启时；关闭时无此工具）tools.call(\"llm\", {prompt, system?, model?, max_tokens?, labels?})：单次模型调用（无工具、无历史、无流式）——大量同构的逐项语义判断（分类/抽取/校对/打标）用代码循环 + llm 承接；model 须在 code.llm.models 内（缺省 default_model）。声明 labels（封闭词表，≤16 项）时宿主校验输出并返回规范 label，未命中 e.kind=\"llm_output\"、其余失败 e.kind=\"llm\"（均无 retryable，读 message 自判）；词表要求必须同时写进 prompt（宿主不注入）。返回 {text, label?, usage, model}。token 成本发前预占、也计调用额度。判别纪律/成本纪律/级联详见 run-code 技能的「LLM 判别」段。";
 
 impl Tool for RunCodeTool {
     fn origin(&self) -> ToolOrigin {
@@ -8277,13 +8277,29 @@ return t.length;"#}),
                 &mut |_| {},
             )
             .unwrap();
-        assert!(!out.is_error, "{}", out.content);
-        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
-        assert_eq!(
-            v,
-            json!(["ran", {"k": "cancel", "h": true}, {"k": "cancel", "h": true}]),
-            "in-flight entry completes, tail refused: {v}"
-        );
+        // TWO legitimate endings, both proving the flag was honored. Entry 0
+        // trips the cancel flag and it STAYS set, so the epoch machinery
+        // delivers the frozen hard-stop discipline ("stop at the next
+        // instruction boundary") at the NEXT ticker tick (~10ms). The guest's
+        // epilogue after callBatch (rs.map + return) is microseconds — but
+        // under a loaded test run it can be descheduled past a tick, and the
+        // whole call then ends in the run-level cancel tombstone instead of
+        // returning the envelope. The envelope shape (this test's subject)
+        // is asserted exactly when it does come back.
+        if out.is_error {
+            assert!(
+                out.content.contains("[run_code] terminated: cancelled"),
+                "unexpected error shape: {}",
+                out.content
+            );
+        } else {
+            let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+            assert_eq!(
+                v,
+                json!(["ran", {"k": "cancel", "h": true}, {"k": "cancel", "h": true}]),
+                "in-flight entry completes, tail refused: {v}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

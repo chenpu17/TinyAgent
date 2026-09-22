@@ -692,6 +692,63 @@ mod tests {
         std::fs::remove_dir_all(&project).ok();
     }
 
+    /// The E0′ eval apparatus (code_llm M4): the registered variant file
+    /// (`examples/eval/e0prime-skill/run-code/SKILL.md`, deployed by copying
+    /// into a task workdir's `.tinyagent/skills/`) must actually load through
+    /// the REAL scan — a shape drift between the apparatus file and the scan
+    /// contract (frontmatter caps, name rules) would otherwise only surface
+    /// mid-eval. The CI fingerprint gate (scripts/check_eval_apparatus.py)
+    /// pins the file's content; this pins its loadability.
+    #[test]
+    fn scan_loads_the_e0prime_eval_apparatus() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples/eval/e0prime-skill/run-code");
+        assert!(src.join("SKILL.md").is_file(), "apparatus missing: {src:?}");
+        let workdir = tmpd("e0p");
+        let skills_dir = workdir.join(".tinyagent").join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        // Copy the dir as the assembly doc instructs evaluators to.
+        fs_extra_copy_dir(&src, &skills_dir.join("run-code")).unwrap();
+        let (idx, warns) = scan(&[skills_dir]);
+        assert!(
+            warns.is_empty(),
+            "apparatus scanned with warnings: {warns:?}"
+        );
+        let e = idx
+            .entries()
+            .iter()
+            .find(|e| e.name == "run-code")
+            .expect("apparatus loads as run-code");
+        assert!(
+            matches!(&e.source, SkillSource::Dir(d) if d.ends_with("run-code")),
+            "loaded from the copied dir, not a stale built-in: {:?}",
+            e.source
+        );
+        // The frozen A③ boundary sentence is what the arm is supposed to
+        // measure — its lead line must be in the served body.
+        let body = std::fs::read_to_string(src.join("SKILL.md")).unwrap();
+        assert!(
+            body.contains("面对剩余任务先三问"),
+            "boundary sentence missing from the apparatus"
+        );
+        std::fs::remove_dir_all(&workdir).ok();
+    }
+
+    /// `fs::copy` per file — no fs_extra dep for one test.
+    fn fs_extra_copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            let to = dst.join(entry.file_name());
+            if entry.file_type()?.is_dir() {
+                fs_extra_copy_dir(&entry.path(), &to)?;
+            } else {
+                std::fs::copy(entry.path(), &to)?;
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn scan_silently_skips_missing_dir() {
         let (idx, warns) = scan(&[PathBuf::from("/nonexistent/ta-skill-dir-xyz")]);

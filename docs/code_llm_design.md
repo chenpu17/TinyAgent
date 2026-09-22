@@ -2,8 +2,8 @@
 
 | 项 | 值 |
 |---|---|
-| 状态 | v0.7.2 设计修订稿（M2 callBatch + M3 llm 已落码，M4 起未实现）；产品收益未验收（V0-B 未跑） |
-| 版本 | v0.7.2 |
+| 状态 | v0.7.3 设计修订稿（M2 callBatch + M3 llm + M4 契约/评测装配已落码，V0-B 未跑）；产品收益未验收 |
+| 版本 | v0.7.3 |
 | 日期 | 2026-09-22 |
 | 关联文档 | `docs/run_code_design.md`（D 编号）、`docs/finetune_support_design.md`（FD 编号、附录 A 即规格纪律）、`docs/run_code_routing_report.md`（评测方法论）、`docs/code_memory_design.md`（姊妹稿，共享纪律见 §10） |
 | 代码基线 | master @ edfb9bc（其后行号会漂移，以代码为准） |
@@ -11,6 +11,28 @@
 
 修订记录（历史仅说明演进，当前正文与决策表为规格）：
 
+- **v0.7.3（M4 契约与评测装配落码）**：
+  ① **A③ 三问边界句冻结**（"落码即冻结"条款于本版生效）：载体 = E0′ 实验
+  装置变体 `examples/eval/e0prime-skill/run-code/SKILL.md`（磁盘同名覆盖
+  内置技能的既有机制；all-off 形态——门控三段手工剔除，磁盘技能不做标记
+  剔除），装配与指纹登记在 `docs/code_llm_eval_assembly.md`。文字变更仍走
+  本修订记录。
+  ② **正式披露按 gate 的规则定案**：内置技能 ungated 基面**不含**三问边界
+  （改基面即破坏 A-L8 钉住的门关字节一致基线）；三问全文只存在于 E0′ 装置
+  与本文 A③；门开臂的路线教学由各门控段承担（LIB 段教 INDEX 复用、LLM 段
+  教语义批量、BATCH 段教并发形态）。E0′ 变体在门全关下点名 lib/llm 路线是
+  刻意的文案效应测量设计（§8：试走该路线得诚实 unknown_tool/保留名拒绝）。
+  ③ 契约汇总补缺（M4 审计产出）：LD-7 的 `kind="llm"` 此前只在错误封套与
+  测试里、两个教学面（run_code 描述【LLM 判别】overlay 与 skill LLM 段
+  引言）均未点名——已补（"未命中 llm_output、其余失败 llm，均无 retryable
+  读 message 自判"）。
+  ④ **附录 A⑤ 新增**：run_code 描述的 LLM overlay 段 verbatim 钉住（与 A④
+  callBatch 行对称）——三面同源（描述 / skill / 附录）对 llm 面完整。
+  ⑤ 评测装配：`docs/code_llm_eval_assembly.md`（E0–E3 臂配置表、E1
+  cold/warm、E2 判别模型档位与 meta.llm 成本归集、四路线协议、测量协议
+  沿用 req1_unc 勘误口径、门关回归清单）；`scripts/check_eval_apparatus.py`
+  装置漂移门（指纹 vs 登记 / A③ 逐字一致 / all-off 变体无门控内容渗漏 /
+  frontmatter 名=目录名）进 CI 文档门 job。
 - **v0.7.2（M3 llm 落码）**：LD-1～19 契约落码，语义差异与补充如下——
   ① **⑨ 定案：单次调用错误封套不补 `halted`**。预算拒绝（kind="budget"）的恢复
   语义（沙箱仍活着、可继续 write_file 落盘收尾）由错误 message 文本承载；机读
@@ -507,7 +529,7 @@ V0-A 先验证工作方式，V0-B 在最小实现后验证产品集成；**V0-B 
 | M1 include 最小闭环 | 宿主加载/哈希边界、manifest、会话登记、默认流程准入、独立 gate；模板文档与行为同时落地 | 姊妹稿 A-M1～M7、M9～M12 默认流程项；A-M8 随 M3 完成，宿主可信配置随 V0-B 验收 |
 | M2 callBatch | ✅ 落码（v0.7.1）：只读能力、同一路径的逐波 gate/执行/结算、保留名门控；token 预占留 M3（llm 是唯一 token 消费面） | A-L4/8（`batch_*`/`gate_on_description_lists_batch_helper`/`skill_gated_sections_ride_their_gates`，并发以进程内时间戳重叠证明）；真实 LLM 吞吐留 M3/V0-B |
 | M3 llm 最小闭环 | ✅ 落码（v0.7.2）：LlmTool、共享 Provider cell、LD-17 预占/结算全矩阵、LD-18 labels、`meta.llm` 审计、描述/skill 披露、e2e llmbatch；差异记录见修订 ⑪ | A-L1～9 进程内 + e2e 通过（A-L4 以服务端服务窗口重叠证真并发）；A-M8 见姊妹稿；全部结算出口、修改后参数校验及既有回归通过；A-L10 交付示例机制检查完成，真实质量验证留 V0-B |
-| M4 契约与评测装配 | 汇总 README/描述/skill/prelude/manifest；各功能随 gate 披露；装配 E0–E3 与四路线实验 | sync_run_code_contract 与门关回归通过，配方可复现；文案随各功能开发，不能等 M4 才首次测试 |
+| M4 契约与评测装配 | ✅ 落码（v0.7.3）：契约汇总（kind="llm" 补进两个教学面 + A⑤ 钉住 LLM overlay）、A③ 冻结 + E0′ 装置（`examples/eval/e0prime-skill/`）、E0–E3/四路线装配文档（`docs/code_llm_eval_assembly.md`）、装置漂移门进 CI；差异见修订 v0.7.3 | sync_run_code_contract 与门关回归通过（既有钉住测试 + sync/gen 门全绿）；配方可复现（`check_eval_apparatus.py` 指纹/A③/渗漏红灯化）；文案随各功能开发未等 M4（三特性各自落码时已三面同步） |
 | V0-B 集成与生命周期验证 | 最小实现上跑 E0–E3/外部对照及变化任务；覆盖起草、发现、修订、晋升、证据失效/重新验证，计入人工与部署成本 | 满足预登记质量与覆盖率底线，达到选定任务族的成本/时延/维护目标且负例回归在容差内；宿主可信部署另验策略；不满足则缩范围/保留独立原语/停止扩展 |
 
 V0-A→M1/M2/M3 最小实现→M4→V0-B；M0 与 V0-A 可并行，M2 依赖 M0 并行与
@@ -596,7 +618,7 @@ V0-A→M1/M2/M3 最小实现→M4→V0-B；M0 与 V0-A 可并行，M2 依赖 M0 
 - 恢复：按块提前保存 checkpoint；不要等 quota/cancel/deadline 已阻断工具后
   才尝试落盘。恢复时只读任务可重算待确认项；副作用另需宿主的确认/幂等政策。
 
-**③ 统一三选一边界句（属主本稿，v0.7；正式评测前冻结）**：
+**③ 统一三选一边界句（属主本稿，v0.7；v0.7.3 冻结——文字变更走修订记录；E0′ 装置载体 `examples/eval/e0prime-skill/`，指纹登记见 `docs/code_llm_eval_assembly.md`）**：
 
 ```
 面对剩余任务先三问：
@@ -614,6 +636,21 @@ V0-A→M1/M2/M3 最小实现→M4→V0-B；M0 与 V0-A 可并行，M2 依赖 M0 
 ```
 
 **④ callBatch 的 prelude/描述行**（同源同步进描述与 skill）：
+
+```
+tools.callBatch([{name, args}, …])：并发执行一批只读工具调用（read_file / llm 等
+batchable 工具；按提交序返回数组；无原子性、无回滚、部分执行是正常结果——逐条
+检查）。单项失败不抛、该条目为 Error 实例带 e.kind/e.tool——用 instanceof 判别，
+不要 JSON.stringify 失败条目。并发上限 8/波；分页拉取与逐项判别是理想对象；
+副作用调用不在批内——写顺序 for 循环。
+```
+
+**⑤ run_code 描述的【LLM 判别】overlay 段**（v0.7.3 钉住；仅 code.llm.enabled
+开启时追加在描述尾部，基字面不动）：
+
+```
+【LLM 判别】（仅 code.llm.enabled 开启时；关闭时无此工具）tools.call("llm", {prompt, system?, model?, max_tokens?, labels?})：单次模型调用（无工具、无历史、无流式）——大量同构的逐项语义判断（分类/抽取/校对/打标）用代码循环 + llm 承接；model 须在 code.llm.models 内（缺省 default_model）。声明 labels（封闭词表，≤16 项）时宿主校验输出并返回规范 label，未命中 e.kind="llm_output"、其余失败 e.kind="llm"（均无 retryable，读 message 自判）；词表要求必须同时写进 prompt（宿主不注入）。返回 {text, label?, usage, model}。token 成本发前预占、也计调用额度。判别纪律/成本纪律/级联详见 run-code 技能的「LLM 判别」段。
+```
 
 ```
 tools.callBatch([{name, args}, …])：并发执行一批只读工具调用（read_file / llm 等
