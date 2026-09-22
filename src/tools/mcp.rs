@@ -23,6 +23,10 @@ pub struct McpTool {
     server: String,
     wire_name: String,
     def: ToolDef,
+    /// Server-declared `annotations.readOnlyHint` (absent = false) — feeds
+    /// [`Tool::batchable`] for the run_code `callBatch` surface. A scheduling
+    /// hint, not a side-effect-freedom proof (LD-19).
+    read_only_hint: bool,
 }
 
 /// Cap on a base64 image payload from an MCP tool result, mirroring
@@ -43,6 +47,14 @@ impl Tool for McpTool {
     /// `mcp_*` tool from the sandbox and breaks the whole mechanism.
     fn available_to_code(&self) -> bool {
         true
+    }
+
+    /// LD-19: server-declared `readOnlyHint` gates batch membership. Absent
+    /// annotation = false (the conservative default); a present hint is still
+    /// only the server's claim — no-transaction semantics apply to every
+    /// batchable tool regardless.
+    fn batchable(&self) -> bool {
+        self.read_only_hint
     }
 
     fn def(&self) -> ToolDef {
@@ -180,6 +192,7 @@ fn start_server(cfg: &McpServerConfig) -> Result<Vec<McpTool>> {
             // tools/call must dispatch with the name the server knows.
             // Only the name shown to the model is sanitized.
             wire_name: info.name,
+            read_only_hint: info.read_only_hint,
         });
     }
     Ok(out)

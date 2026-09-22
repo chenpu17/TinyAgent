@@ -88,6 +88,10 @@ pub struct McpToolInfo {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+    /// `annotations.readOnlyHint` from the server (absent = false). A
+    /// SERVER-declared scheduling hint feeding `Tool::batchable` — not a
+    /// side-effect-freedom proof (LD-19: 有注解也只视为调度提示).
+    pub read_only_hint: bool,
 }
 
 /// One JSON-RPC message channel. Requests carry a client-generated id
@@ -258,6 +262,7 @@ fn bound_tools(tools: Value) -> Vec<McpToolInfo> {
             name,
             description,
             input_schema,
+            read_only_hint: t["annotations"]["readOnlyHint"].as_bool().unwrap_or(false),
         });
     }
     infos

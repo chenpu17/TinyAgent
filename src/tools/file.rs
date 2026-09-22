@@ -91,6 +91,13 @@ impl Tool for ReadFile {
         true
     }
 
+    /// Every `read_file` input is a pure read (LD-19's v1 batch whitelist;
+    /// the write/list siblings deliberately stay out — list is not on the
+    /// whitelist v1 and the writers are side effects by definition).
+    fn batchable(&self) -> bool {
+        true
+    }
+
     fn def(&self) -> ToolDef {
         ToolDef {
             name: "read_file".into(),

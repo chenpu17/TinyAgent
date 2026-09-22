@@ -428,11 +428,10 @@ fn eager_skill_injection_prepends_synthetic_pair() {
         other => panic!("expected tool_use, got {other:?}"),
     }
     assert_eq!(msgs[1].role, tiny_agent::Role::User);
-    let md = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/tools/run_code_skill.md"
-    ))
-    .unwrap();
+    // code_memory MD-13: the eager pair carries the EFFECTIVE skill body for
+    // this assembly — include off (the default) strips the marked lib
+    // section, so the injected bytes are the gated file, not the raw one.
+    let md = tiny_agent::tools::run_code::run_code_skill_md(false, false);
     match &msgs[1].content[0] {
         tiny_agent::Block::ToolResult {
             tool_use_id,
@@ -442,7 +441,7 @@ fn eager_skill_injection_prepends_synthetic_pair() {
         } => {
             assert_eq!(tool_use_id, "eager-run-code", "N:N paired");
             assert!(!is_error);
-            assert_eq!(content, &md, "byte-identical to the shipped skill md");
+            assert_eq!(content, &md, "byte-identical to the effective skill md");
         }
         other => panic!("expected tool_result, got {other:?}"),
     }

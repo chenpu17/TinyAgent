@@ -358,6 +358,22 @@ pub struct CodeConfig {
     /// obfuscated past; the capability sandbox / deterministic stubs /
     /// interception layer do not depend on it.
     pub precheck: bool,
+    /// Lib channel gate (code_memory_design MD-13, M1): enables the
+    /// `__include`/`__hash_file` reserved names, the prelude `include()` /
+    /// `saveLib()` helpers and the 【库】 description section. Off by default —
+    /// the guest-visible contract of a gate-off binary is byte-identical to
+    /// the pre-include build. Call-time via snapshot for the channels and
+    /// prelude (resource-limit precedent); the description overlay is taken
+    /// at `def()` time (skill_injection's snapshot precedent — a later
+    /// `set_code_config` does not rewrite schemas already handed out).
+    pub include: bool,
+    /// Batch channel gate (code_llm_design LD-15, M2): enables the
+    /// `__call_batch` reserved name, the prelude `tools.callBatch()` wrapper
+    /// and the 【批量并发】 description/skill sections. Off by default — same
+    /// gate-off contract discipline as `include` (A-L8). The batch surface is
+    /// read-only by construction (`Tool::batchable`, LD-19): no atomicity,
+    /// no rollback, partial execution is a normal outcome.
+    pub call_batch: bool,
 }
 
 impl Default for CodeConfig {
@@ -373,6 +389,8 @@ impl Default for CodeConfig {
             max_result_chars: 60_000,
             skill_injection: SkillInjection::OnDemand,
             precheck: false,
+            include: false,
+            call_batch: false,
         }
     }
 }
@@ -732,6 +750,8 @@ pub struct PartialCodeConfig {
     pub max_result_chars: Option<usize>,
     pub skill_injection: Option<SkillInjection>,
     pub precheck: Option<bool>,
+    pub include: Option<bool>,
+    pub call_batch: Option<bool>,
 }
 
 impl CodeConfig {
@@ -750,6 +770,8 @@ impl CodeConfig {
             max_result_chars,
             skill_injection,
             precheck,
+            include,
+            call_batch,
         } = p;
         if let Some(v) = deny_paths {
             // Union — a fragment can only ADD denials. Sort+dedup (plain
@@ -785,6 +807,12 @@ impl CodeConfig {
         // the trusted base is silently clamped to the base.
         self.skill_injection = Clamp::Tighten.merge(self.skill_injection, skill_injection);
         self.precheck = Clamp::Tighten.merge(self.precheck, precheck);
+        // Lib channel gate: Tighten (MD-13) — an untrusted fragment may only
+        // turn include OFF; enabling the channel is the trusted base config's
+        // call (same class as precheck, a host-side capability switch).
+        self.include = Clamp::Tighten.merge(self.include, include);
+        // Batch channel gate: Tighten (LD-15) — same rule, same class.
+        self.call_batch = Clamp::Tighten.merge(self.call_batch, call_batch);
     }
 }
 
@@ -1401,6 +1429,37 @@ mod tests {
                 "enabled presence must be rejected: {err}"
             );
         }
+
+        // Channel gates (include MD-13 / call_batch LD-15) are Tighten on
+        // bools — false < true: a fragment may only turn them OFF, never ON,
+        // and an absent key keeps the base.
+        let gated_base: Config = serde_json::from_str(
+            r#"{"provider":"anthropic","api_key_env":"K","model":"m",
+                "code":{"include":true,"call_batch":true}}"#,
+        )
+        .unwrap();
+        let mut cfg = gated_base.clone();
+        let frag: PartialConfig =
+            serde_json::from_str(r#"{"code":{"include":false,"call_batch":false}}"#).unwrap();
+        cfg.apply(frag).unwrap();
+        assert!(!cfg.code.include, "fragment may turn include off");
+        assert!(!cfg.code.call_batch, "fragment may turn call_batch off");
+        let mut cfg = gated_base;
+        let frag: PartialConfig =
+            serde_json::from_str(r#"{"code":{"include":true,"call_batch":true}}"#).unwrap();
+        cfg.apply(frag).unwrap();
+        assert!(cfg.code.include, "fragment true == base true, no-op");
+        assert!(cfg.code.call_batch, "fragment true == base true, no-op");
+        // Default base (both off): a fragment asking to enable is silently
+        // clamped back off — enabling channels is the trusted base's call.
+        let mut cfg: Config =
+            serde_json::from_str(r#"{"provider":"anthropic","api_key_env":"K","model":"m"}"#)
+                .unwrap();
+        let frag: PartialConfig =
+            serde_json::from_str(r#"{"code":{"include":true,"call_batch":true}}"#).unwrap();
+        cfg.apply(frag).unwrap();
+        assert!(!cfg.code.include, "fragment may not enable include");
+        assert!(!cfg.code.call_batch, "fragment may not enable call_batch");
 
         let frag: PartialConfig = serde_json::from_str(
             r#"{"code":{"deny_paths":[".env","logs/**"],"fs_write_dirs":["src","out"],

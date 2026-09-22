@@ -1460,6 +1460,18 @@ mod tests {
     use std::net::TcpListener;
     use std::time::{Duration, Instant};
 
+    /// code_memory A-M7: the workdir-root `lib/` (the include library root)
+    /// must travel with the isolation copy — COPY_EXCLUDE means build caches
+    /// / VCS / prior-run artifacts, and a lib there is task input. Pin it so
+    /// a future exclusion addition has to make that call explicitly.
+    #[test]
+    fn copy_exclude_never_lists_lib() {
+        assert!(
+            !COPY_EXCLUDE.contains(&"lib"),
+            "lib/ is the include library root — excluding it silently breaks code_memory"
+        );
+    }
+
     /// Recorded [start, end] window for each request the mock served — used to
     /// prove two batch tasks' provider calls actually overlapped in wall clock.
     type Spans = Arc<Mutex<Vec<(Instant, Instant)>>>;

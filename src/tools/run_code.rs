@@ -55,6 +55,37 @@ const TOOLS_LIST_NAME: &str = "__tools_list";
 /// class as [`TOOLS_LIST_NAME`] (no gate/audit/quota), so checking the
 /// budget never spends it.
 const BUDGET_NAME: &str = "__budget";
+/// Reserved names of the lib family (code_memory_design MD-2, M1). Unlike
+/// the two above these are REAL gated actions — host file reads under
+/// policy — dispatched through [`lib_reserved_call`]: lib/ confinement →
+/// deny_paths → hooks gate (pseudo-tool name without the dunder) → cancel
+/// checkpoint → host work, audited and counted like any inner call. The
+/// prelude wrappers `include()` / `saveLib()` route here; the guest may
+/// also call the names directly (same checks either way).
+const INCLUDE_NAME: &str = "__include";
+const HASH_FILE_NAME: &str = "__hash_file";
+/// Reserved name behind `tools.callBatch(entries)` (code_llm_design §4/LD-19,
+/// M2): one batched dispatch of read-only calls. The reserved name is only
+/// the ENTRANCE — every entry runs the exact single-call sequence (entry
+/// checks → gate → deny/fs → run → after); nothing is exempted.
+const CALL_BATCH_NAME: &str = "__call_batch";
+/// Wave fan-out (§4): 8 per wave, aligned with the loop's parallel-batch
+/// `MAX_PARALLEL_TOOL_WORKERS` so sandbox and outer fan-out share one
+/// blast-radius convention.
+const BATCH_WAVE: usize = 8;
+/// Shape guard on one batch (not a spec'd number): the 1 MiB code cap
+/// already bounds entries to ~10⁴; this keeps the per-entry error-envelope
+/// build for a degenerate all-refused batch cheap and the guest's result
+/// array sane. Larger work = smaller batches + checkpoint files.
+const MAX_BATCH_ENTRIES: usize = 4096;
+/// The manifest file the host parses for admission (MD-11): `lib/INDEX.md`,
+/// machine lines `<!-- ta-lib: path=… sha256=… needs=… ver=… st=… -->`
+/// (path relative to `lib/`). The HOST only ever parses; writes stay with
+/// the caller (saveLib upserts via the ordinary file tools — 5.1's
+/// counterexample 2 documents that a guest with write access can edit
+/// INDEX; the session registration the admission actually trusts is
+/// host-side and untouchable).
+const LIB_INDEX_REL: &str = "lib/INDEX.md";
 /// Guest-visible tombstone for "cancel observed, the sandbox is halting" —
 /// shared by the host_call ENTRY gate (§13-5) and the post-hooks-gate cancel
 /// checkpoint so the copy stays single-sourced (LLM-visible copy is spec;
@@ -368,6 +399,14 @@ struct HostCtx {
     /// their own native signals). `terminated` maps it to a source-specific
     /// message.
     interrupt: Option<Interrupt>,
+    /// Session registration set for the lib family (MD-14): `(workdir-relative
+    /// canonical path, sha256 of delivered bytes)` pairs the session has
+    /// registered via `__hash_file` (i.e. via `saveLib`). Clone-shared across
+    /// every execution of one tool lineage, never persisted — a fresh
+    /// Agent/process starts empty, `--resume` included ("clone 共享、不跨
+    /// 会话恢复"). This is the ONLY admission input the guest cannot forge:
+    /// the host reads and hashes the bytes itself.
+    lib_sessions: LibSessions,
 }
 
 /// Which asynchronous limit cut the guest short (§6). Cancel and the wall
@@ -387,6 +426,7 @@ impl HostCtx {
         max_bytes: usize,
         snap: CodeConfig,
         deadline: Option<WallDeadline>,
+        lib_sessions: LibSessions,
     ) -> Self {
         let workdir_canon = ctx
             .workdir
@@ -411,6 +451,7 @@ impl HostCtx {
             halted: None,
             deadline,
             interrupt: None,
+            lib_sessions,
         }
     }
 }
@@ -421,6 +462,970 @@ impl HostCtx {
 struct HaltState {
     kind: &'static str,
     why: String,
+}
+
+// ── lib family: include / saveLib (code_memory_design M1) ───────────────────
+
+/// Shared session registration set behind [`HostCtx::lib_sessions`] (see
+/// there). `HashSet` over an `Arc<Mutex<_>>` so all clones of one
+/// `RunCodeTool` lineage — and every execution they run — see one set.
+type LibSessions = Arc<std::sync::Mutex<std::collections::HashSet<(String, String)>>>;
+
+/// One parsed `ta-lib` line of `lib/INDEX.md` (MD-11). `needs`/`ver` are
+/// carried for forward compatibility (M2+ routing) and round-tripping by
+/// saveLib's upsert; M1 admission only consults `sha256` and `st`.
+struct LibEntry {
+    sha256: String,
+    #[allow(dead_code)] // parsed + round-tripped by saveLib; read from M2 on
+    needs: String,
+    #[allow(dead_code)]
+    ver: String,
+    st: String,
+}
+
+/// Parse the manifest (MD-11). Strict by design — a malformed, duplicated or
+/// conflicting entry is a HARD error, never a silent pick: INDEX is the
+/// cross-session trust list, and "which entry won" is exactly the ambiguity
+/// the design refuses. A missing file is the caller's case (→ "no entry"
+/// admission error), not a parse error.
+fn parse_lib_index(text: &str) -> Result<std::collections::HashMap<String, LibEntry>, String> {
+    let mut map: std::collections::HashMap<String, LibEntry> = std::collections::HashMap::new();
+    for (no, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if !(line.starts_with("<!-- ta-lib:") && line.ends_with("-->")) {
+            continue; // prose/comments are free-form; only ta-lib lines parse
+        }
+        let body = line
+            .strip_prefix("<!-- ta-lib:")
+            .and_then(|s| s.strip_suffix("-->"))
+            .unwrap_or("");
+        let mut path: Option<String> = None;
+        let mut sha256: Option<String> = None;
+        let mut needs: Option<String> = None;
+        let mut ver: Option<String> = None;
+        let mut st: Option<String> = None;
+        for tok in body.split_whitespace() {
+            let (k, v) = tok.split_once('=').unwrap_or(("", ""));
+            let v = v.to_string();
+            match k {
+                "path" if path.is_none() => path = Some(v),
+                "sha256" if sha256.is_none() => sha256 = Some(v),
+                "needs" if needs.is_none() => needs = Some(v),
+                "ver" if ver.is_none() => ver = Some(v),
+                "st" if st.is_none() => st = Some(v),
+                _ => {
+                    return Err(format!(
+                        "line {}: unknown or duplicated field {:?}",
+                        no + 1,
+                        if k.is_empty() { tok } else { k }
+                    ))
+                }
+            }
+        }
+        let (Some(path), Some(sha256), Some(needs), Some(ver), Some(st)) =
+            (path, sha256, needs, ver, st)
+        else {
+            return Err(format!(
+                "line {}: a ta-lib line needs all five fields \
+                 (path/sha256/needs/ver/st)",
+                no + 1
+            ));
+        };
+        if path.is_empty()
+            || path.starts_with('/')
+            || path.contains("..")
+            || path.split('/').any(|s| s.is_empty())
+        {
+            return Err(format!(
+                "line {}: path must be a clean lib/-relative path",
+                no + 1
+            ));
+        }
+        if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(format!("line {}: sha256 must be 64 hex chars", no + 1));
+        }
+        if st != "ok" && st != "draft" {
+            return Err(format!(
+                "line {}: st must be ok or draft, got {st:?}",
+                no + 1
+            ));
+        }
+        if ver.is_empty() || !ver.chars().all(|c| c.is_ascii_digit()) {
+            return Err(format!(
+                "line {}: ver must be a number, got {ver:?}",
+                no + 1
+            ));
+        }
+        if map
+            .insert(
+                path.clone(),
+                LibEntry {
+                    sha256,
+                    needs,
+                    ver,
+                    st,
+                },
+            )
+            .is_some()
+        {
+            return Err(format!(
+                "line {}: duplicate ta-lib entry for path {path:?}",
+                no + 1
+            ));
+        }
+    }
+    Ok(map)
+}
+
+/// Full-hex sha256 of delivered bytes (MD-12 — hashed on what the guest will
+/// actually receive, i.e. the lossy-decoded source, not the raw disk bytes:
+/// invalid-UTF-8 files hash as they deliver).
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = sha2::Sha256::digest(bytes);
+    let mut hex = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
+}
+
+/// Confine a lib-family path: the workdir-relative normalized form, required
+/// to sit under `lib/` (MD-2 ①). Symlink safety comes free from
+/// [`workdir_relative`]'s canonicalize-based walk — `lib/x.js` symlinked
+/// outside the workdir canonicalizes outside and yields `None`; absolute
+/// spellings resolve from the workdir anchor like every other guest path.
+/// Whitespace is refused too: `lib/INDEX.md` machine lines are
+/// whitespace-tokenized, so a whitespace path can never round-trip through
+/// the manifest — admitting it would let saveLib poison the whole channel.
+fn lib_rel(workdir_canon: &Path, path: &str) -> Option<String> {
+    let rel = workdir_relative(workdir_canon, path)?;
+    (rel.starts_with("lib/")
+        && rel.len() > "lib/".len()
+        && !rel.ends_with('/')
+        && !rel.chars().any(char::is_whitespace))
+    .then_some(rel)
+}
+
+/// Dispatch for the lib-family reserved names — the Phase-B-shaped sequence
+/// with the lib policy layers first (MD-2 order: ① lib/ confinement
+/// ② deny_paths ③ hooks gate as pseudo-tool ④ trace) and the HOST doing the
+/// work instead of `run_tool`. Emits the event pair, audits into `calls`,
+/// counts against `max_tool_calls` (a probing guest pays like any caller).
+/// Gate off (`code.include=false`): explicit refusal naming the knob, still
+/// audited — the pre-guest contract of the old binary minus the probe.
+fn lib_reserved_call(caller: &mut Caller<'_, HostCtx>, name: &str, args: &Value) -> i64 {
+    let started = Instant::now();
+    let (in_len, in_hash) = hash_input(args);
+    // The pseudo-tool name the hooks gate / after_tool see ("include" /
+    // "hash_file" — MD-2 ③): dunder names are the wire protocol, the
+    // policy surface is the tool the action actually is.
+    let pseudo = name.trim_start_matches("__");
+    let (output, class) = {
+        let d = caller.data();
+        // SAFETY: same frame-limited alias as in `host_call_tool`.
+        let emit = unsafe { &mut *d.emit };
+        emit(AgentEvent::ToolCall {
+            name: name.to_string(),
+            input: args.clone(),
+        });
+        if !d.snap.include {
+            (
+                ToolOutput::error(format!(
+                    "run_code: {name} is not available in this configuration \
+                     (code.include=false) — the lib helpers are disabled"
+                )),
+                "denied",
+            )
+        } else {
+            let path = args.get("path").and_then(Value::as_str);
+            let confined = path.and_then(|p| lib_rel(&d.workdir_canon, p));
+            // ① confinement + ② deny_paths — ahead of the hooks gate: a path
+            // outside the lib root is a guest bug, not a policy question.
+            let policy_err = match (&path, &confined) {
+                (None, _) => Some("run_code: lib helpers need a string field 'path'".to_string()),
+                (Some(p), None) => Some(format!(
+                    "run_code: lib helpers only accept relative paths under lib/ \
+                     ('{p}' is not one)"
+                )),
+                (Some(p), Some(rel)) => {
+                    if deny_match(&d.snap.deny_paths, rel) {
+                        Some(format!(
+                            "run_code: path '{p}' matches a code.deny_paths pattern"
+                        ))
+                    } else {
+                        None
+                    }
+                }
+            };
+            match policy_err {
+                Some(err) => (ToolOutput::error(err), "denied"),
+                None => match gate_tool_call(&d.ctx, pseudo, args) {
+                    ToolDecision::Deny(mut reason) => {
+                        crate::tools::truncate(&mut reason, d.ctx.max_output_chars);
+                        let output = ToolOutput::error(reason);
+                        notify_tool_after(&d.ctx, pseudo, args, &output, false);
+                        (output, "hooks")
+                    }
+                    _ => {
+                        if ctx_cancelled(&d.ctx) {
+                            let output = ToolOutput::error(CANCEL_HALTED_WHY.to_string());
+                            notify_tool_after(&d.ctx, pseudo, args, &output, false);
+                            (output, "cancel")
+                        } else {
+                            let rel = confined.expect("policy_err None implies confined");
+                            let path = path.expect("policy_err None implies path");
+                            let (output, class) = if name == INCLUDE_NAME {
+                                include_deliver(d, &rel, path)
+                            } else {
+                                hash_file_register(d, &rel)
+                            };
+                            notify_tool_after(&d.ctx, pseudo, args, &output, true);
+                            (output, class)
+                        }
+                    }
+                },
+            }
+        }
+    };
+    emit_inner_result(caller, name, &output);
+    {
+        let d = caller.data_mut();
+        // ④ trace (MD-2): the wire name — audit records what the guest
+        // actually called. No `in_hash_eff`: the lib family has no Modify
+        // path (the path IS the input).
+        d.calls.push(CallTrace {
+            name: name.to_string(),
+            ok: !output.is_error,
+            ms: started.elapsed().as_millis(),
+            in_len,
+            in_hash,
+            in_hash_eff: None,
+        });
+    }
+    if output.is_error {
+        envelope_err(caller, class, Some(name), Some(false), &output.content)
+    } else {
+        envelope_or_trap(caller, true, &output.content)
+    }
+}
+
+/// Read a lib file with the HOST-side allocation capped at the lib read
+/// limit: `take(MAX+1)` bounds the buffer even if the file is bigger on disk
+/// (or grows mid-read). The wasm memory limiter cannot see host allocations,
+/// so an unbounded slurp here would be an OOM side channel the sandbox
+/// budgets know nothing about — `read_file` streams; this is the lib
+/// channel's equivalent discipline.
+fn read_lib_capped(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let file = std::fs::File::open(path)?;
+    let mut buf = Vec::new();
+    file.take(MAX_CODE_BYTES as u64 + 1).read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+/// `__include` (MD-14 admission): read the lib file, hash the DELIVERED
+/// bytes, verify against the manifest entry, then admit on `st=ok` OR a
+/// this-session registration. Every failure is a hard "lib" error — the
+/// integrity chain is the feature; nothing degrades to "include anyway".
+fn include_deliver(d: &HostCtx, rel: &str, spelling: &str) -> (ToolOutput, &'static str) {
+    let err = |msg: String| (ToolOutput::error(msg), "lib");
+    let manifest_rel = rel.strip_prefix("lib/").unwrap_or(rel);
+    let bytes = match read_lib_capped(&d.workdir_canon.join(rel)) {
+        Ok(b) => b,
+        Err(e) => {
+            return err(format!(
+                "run_code: cannot read '{spelling}' for include: {e} — saveLib it first"
+            ))
+        }
+    };
+    if bytes.len() > MAX_CODE_BYTES {
+        return err(format!(
+            "run_code: '{spelling}' is {} bytes, over the {}-byte include read cap \
+             — split the library (a lib file shares the size budget of one \
+             run_code program)",
+            bytes.len(),
+            MAX_CODE_BYTES
+        ));
+    }
+    let src = String::from_utf8_lossy(&bytes).into_owned();
+    let hex = sha256_hex(src.as_bytes());
+    let index_text =
+        std::fs::read_to_string(d.workdir_canon.join(LIB_INDEX_REL)).unwrap_or_default();
+    let index = match parse_lib_index(&index_text) {
+        Ok(m) => m,
+        Err(e) => return err(format!("run_code: {LIB_INDEX_REL} is malformed: {e}")),
+    };
+    let Some(entry) = index.get(manifest_rel) else {
+        return err(format!(
+            "run_code: '{spelling}' has no entry in {LIB_INDEX_REL} — register it \
+             first with saveLib(\"{rel}\", src), then include it"
+        ));
+    };
+    if entry.sha256 != hex {
+        return err(format!(
+            "run_code: '{spelling}' on disk does not match its {LIB_INDEX_REL} entry \
+             (file sha256:{}…, registered sha256:{}…) — the library changed after \
+             registration; re-run saveLib or restore the file",
+            &hex[..16],
+            &entry.sha256[..16]
+        ));
+    }
+    let registered = d
+        .lib_sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&(rel.to_string(), hex.clone()));
+    if entry.st != "ok" && !registered {
+        return err(format!(
+            "run_code: '{spelling}' is st=draft and was not written in this session — \
+             admission refused. saveLib it in this session, or have a human review \
+             the library and set st=ok in {LIB_INDEX_REL}"
+        ));
+    }
+    (ToolOutput::text(src), "tool")
+}
+
+/// `__hash_file` (MD-12/MD-14): hash the delivered bytes of a lib file and
+/// REGISTER `(canonical rel path, sha256)` in the session set. This is the
+/// host-side half of saveLib — the registration the admission actually
+/// trusts, derived from file facts, never from guest self-report.
+fn hash_file_register(d: &HostCtx, rel: &str) -> (ToolOutput, &'static str) {
+    let bytes = match read_lib_capped(&d.workdir_canon.join(rel)) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                ToolOutput::error(format!("run_code: cannot read '{rel}': {e}")),
+                "lib",
+            )
+        }
+    };
+    if bytes.len() > MAX_CODE_BYTES {
+        return (
+            ToolOutput::error(format!(
+                "run_code: '{rel}' is {} bytes, over the {}-byte lib read cap — \
+                 split the library",
+                bytes.len(),
+                MAX_CODE_BYTES
+            )),
+            "lib",
+        );
+    }
+    let src = String::from_utf8_lossy(&bytes).into_owned();
+    let hex = sha256_hex(src.as_bytes());
+    d.lib_sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((rel.to_string(), hex.clone()));
+    (
+        ToolOutput::text(json!({ "sha256": hex, "bytes": src.len() }).to_string()),
+        "tool",
+    )
+}
+
+// ── callBatch: read-only parallel batch (code_llm_design §4, M2) ─────────────
+
+/// Wave-start refresh of the entry-gate latches, batch form (§4: every entry
+/// runs the same 入口检查 as a single call; the wave boundary is where a
+/// batch re-runs them). Mirrors `host_call_tool`'s Phase A exactly — cancel
+/// and the wall clock latch `interrupt` + `halted` TOGETHER (a catchable
+/// envelope must not clear the latch on retry) — but instead of failing the
+/// whole call it hands back the halt state so the not-yet-started entries of
+/// the wave can be refused individually (`kind`/`halted:true` entries; the
+/// batch itself keeps its shape).
+fn batch_wave_halt_refresh(d: &mut HostCtx) -> Option<HaltState> {
+    if d.halted.is_some() {
+        return d.halted.clone();
+    }
+    if d.interrupt.is_none() && ctx_cancelled(&d.ctx) {
+        d.interrupt = Some(Interrupt::Cancel);
+        d.halted = Some(HaltState {
+            kind: "cancel",
+            why: CANCEL_HALTED_WHY.to_string(),
+        });
+    } else if d.deadline.is_some_and(|w| Instant::now() >= w.at) && d.interrupt.is_none() {
+        let why = format!(
+            "run_code: {} — the sandbox is halted for the rest of this execution",
+            deadline_why(&d.snap, d.deadline.map(|w| w.from_cfg).unwrap_or(false))
+        );
+        d.interrupt = Some(Interrupt::Deadline);
+        d.halted = Some(HaltState {
+            kind: "deadline",
+            why,
+        });
+    }
+    d.halted.clone()
+}
+
+/// What one announced batch entry carries until it resolves (the audit /
+/// hooks tail needs the ORIGINAL input and both hashes — same fields a
+/// single call's Phase B/C record).
+struct BatchEntryMeta {
+    name: String,
+    args: Value,
+    in_len: usize,
+    in_hash: String,
+    in_hash_eff: Option<String>,
+    started: Instant,
+}
+
+/// The resolved outcome of one entry — `class` shapes the error envelope
+/// ("tool" for a real run, the refusal classes otherwise); `halted` rides
+/// only on latch-sourced refusals (LD-9: call-limit / deadline / cancel).
+struct EntryFinal {
+    output: ToolOutput,
+    class: &'static str,
+    halted: bool,
+}
+
+/// Worker → main funnel message: forwarded child events (bounded backpressure
+/// channel) plus per-entry completions in true completion order.
+enum WaveMsg {
+    Ev(AgentEvent),
+    Done(usize, ToolOutput),
+    Cancelled(usize),
+}
+
+/// The after_tool policy for one batch entry completion: `Some(executed)`
+/// fires the hook with that flag, `None` skips it — reserved for the
+/// deny/fs layer, which is not a hooks decision and never fires `after`
+/// (the Hooks contract, mirrored from the single-call Phase B).
+type AfterFlag = Option<bool>;
+
+/// Complete one announced batch entry on the main thread — the exact
+/// Phase B/C tail of a single call: `after_tool` (original input, the
+/// policy above), the ToolResult event, the audit trace, the usage fold.
+/// EVERY announced entry goes through here, refused ones included (external
+/// design-review F1): an announced ToolCall without its ToolResult breaks
+/// the event pairing discipline, and a refused entry that skips the trace
+/// leaks quota — `admitted` counted it but `calls.len()` never sees it, so
+/// post-batch single calls admit past `max_tool_calls` (the single-call
+/// Deny/unknown/fs refusals all push their trace; batch parity demands the
+/// same). Consumes the entry's meta.
+fn finish_batch_entry(
+    caller: &mut Caller<'_, HostCtx>,
+    meta: BatchEntryMeta,
+    output: &ToolOutput,
+    after: AfterFlag,
+) {
+    if let Some(executed) = after {
+        let d = caller.data();
+        notify_tool_after(&d.ctx, &meta.name, &meta.args, output, executed);
+    }
+    emit_inner_result(caller, &meta.name, output);
+    let d = caller.data_mut();
+    d.calls.push(CallTrace {
+        name: meta.name,
+        ok: !output.is_error,
+        ms: meta.started.elapsed().as_millis(),
+        in_len: meta.in_len,
+        in_hash: meta.in_hash,
+        in_hash_eff: meta.in_hash_eff,
+    });
+    fold_inner_usage(d, output);
+}
+
+/// Refuse an announced entry and complete it through the same tail
+/// ([`finish_batch_entry`]) — the entry was announced and gated, so it owes
+/// the event stream its ToolResult and the audit ledger its trace whatever
+/// the refusal class; only the after_tool policy varies by class. The final
+/// outcome travels as the [`EntryFinal`] it becomes.
+fn refuse_batch_entry(
+    caller: &mut Caller<'_, HostCtx>,
+    metas: &mut [Option<BatchEntryMeta>],
+    finals: &mut [Option<EntryFinal>],
+    idx: usize,
+    final_: EntryFinal,
+    after: AfterFlag,
+) {
+    let output = final_.output.clone();
+    let meta = metas[idx].take().expect("announced entry has meta");
+    finals[idx] = Some(final_);
+    finish_batch_entry(caller, meta, &output, after);
+}
+
+/// One entry's D12 envelope for the result array (§4: the return shape is an
+/// ARRAY of envelopes, not one envelope wrapping an array). Success carries
+/// only `content`; errors carry `kind` (+ `tool`), `retryable:false` for
+/// every non-"tool" class, and `halted:true` on latch-sourced refusals.
+fn batch_entry_envelope(name: Option<&str>, f: &EntryFinal) -> Value {
+    if f.output.image.is_some() {
+        // The call RAN — side effects happened — the envelope is only the
+        // transport-level inability to carry an image (same text as the
+        // single-call Phase C; retryable:false too — a batch entry cannot
+        // retry its way around a transport limit).
+        let mut e = json!({
+            "__ok": false,
+            "error": "run_code: this tool returned an image, which run_code cannot carry — \
+                      call read_file on the path instead, or use load_image at the top level",
+            "kind": "image",
+            "retryable": false,
+        });
+        if let Some(n) = name {
+            e["tool"] = json!(n);
+        }
+        return e;
+    }
+    if f.output.is_error {
+        let mut e = json!({ "__ok": false, "error": f.output.content, "kind": f.class });
+        if let Some(n) = name {
+            e["tool"] = json!(n);
+        }
+        if f.class != "tool" {
+            e["retryable"] = json!(false);
+        }
+        if f.halted {
+            e["halted"] = json!(true);
+        }
+        return e;
+    }
+    json!({ "__ok": true, "content": f.output.content })
+}
+
+/// Dispatch for the `__call_batch` reserved name — `tools.callBatch(entries)`
+/// (§4). The reserved name is only the ENTRANCE: every entry runs the exact
+/// single-call sequence (entry checks → ToolCall event → hooks gate →
+/// deny/fs layer → run → after_tool → trace → usage fold), nothing exempted.
+///
+/// Structure per wave of [`BATCH_WAVE`] entries (aligned with the loop's
+/// `MAX_PARALLEL_TOOL_WORKERS`):
+/// - prep is SERIAL on the main thread, in submission order — entry checks
+///   (halted / call-limit with latch / shape), the ToolCall event, the hooks
+///   gate ("approval decisions never race", the loop's spawn-gate contract),
+///   the cancel checkpoint, the `batchable()` + concurrency routing, and the
+///   deny/fs layer;
+/// - Sequential-batchable entries (v1: `read_file`, MCP readOnlyHint) then
+///   run serially on the main thread — LD-11 routes the wave ENGINE by
+///   `ToolConcurrency::Parallel`, and v1 has no Parallel batchable tool yet
+///   (M3's `llm` is the first), so the common path is an honest serial batch
+///   with the same per-entry contract;
+/// - Parallel-batchable entries spawn one worker each; events funnel through
+///   a bounded `sync_channel` created inside the scope closure (the unwind
+///   discipline from the loop's parallel batch), workers re-check cancel
+///   before the tool body, and completions (ToolResult, after_tool, trace,
+///   usage) are processed on the main thread as they arrive — true
+///   completion order for the events, submission order for the result array.
+///
+/// No transaction semantics (§4, the three sentences): no atomicity, no
+/// rollback, partial execution is a normal result — the result array shows
+/// exactly which entries ran and which were refused.
+fn call_batch_dispatch(caller: &mut Caller<'_, HostCtx>, args: &Value) -> i64 {
+    // Whole-call shape: a malformed BATCH is a whole-call `kind="batch"`
+    // error (thrown to the guest by the prelude wrapper); malformed ENTRIES
+    // are per-entry outcomes below.
+    let entries: Vec<Value> = match args.get("entries").and_then(Value::as_array) {
+        Some(a) if a.len() <= MAX_BATCH_ENTRIES => a.clone(),
+        _ => {
+            return envelope_err(
+                caller,
+                "batch",
+                Some(CALL_BATCH_NAME),
+                Some(false),
+                &format!(
+                    "run_code: __call_batch needs {{entries: [{{name, args}}, …]}} with at \
+                     most {MAX_BATCH_ENTRIES} items"
+                ),
+            )
+        }
+    };
+    let n = entries.len();
+    let mut finals: Vec<Option<EntryFinal>> = (0..n).map(|_| None).collect();
+    let mut metas: Vec<Option<BatchEntryMeta>> = (0..n).map(|_| None).collect();
+    // Call-quota arithmetic (§4: K entries count as K calls). Admitted-but-
+    // unfinished entries have not pushed their trace yet, so the live
+    // `calls.len()` alone undercounts — track admissions against the budget
+    // left at dispatch (Phase A already admitted this call itself). The
+    // snapshot also feeds the refusal MESSAGE: during later waves the live
+    // `calls.len()` already contains this batch's finished traces, so
+    // recomputing `used` from it would double-count every completed entry.
+    let initial_calls = caller.data().calls.len() as u64;
+    let budget_left = (caller.data().snap.max_tool_calls as u64).saturating_sub(initial_calls);
+    let mut admitted: u64 = 0;
+    let order: Vec<usize> = (0..n).collect();
+
+    for wave in order.chunks(BATCH_WAVE) {
+        // Wave-start latch refresh (cancel / wall clock) — the entries of
+        // this wave inherit the halt state as per-entry refusals.
+        let halted = batch_wave_halt_refresh(caller.data_mut());
+
+        // ── prep: serial, submission order ────────────────────────────────
+        // (idx, name, effective input) — workers get the post-Modify input;
+        // hooks and traces always see the original.
+        let mut spawn: Vec<(usize, String, Value)> = Vec::new();
+        let mut inline: Vec<(usize, String, Value)> = Vec::new();
+        for &idx in wave {
+            let entry = &entries[idx];
+            let name = entry.get("name").and_then(Value::as_str);
+            // Entry checks, single-call order: halted → call limit → shape.
+            if let Some(h) = &halted {
+                finals[idx] = Some(EntryFinal {
+                    output: ToolOutput::error(h.why.clone()),
+                    class: h.kind,
+                    halted: true,
+                });
+                continue;
+            }
+            if admitted >= budget_left {
+                // First over-budget admission latches (single-call semantics:
+                // refusal latches) so post-batch calls fail fast too.
+                // `initial_calls + admitted` = dispatch-time calls + every
+                // entry announced so far — the count this refusal makes true.
+                let used = initial_calls + admitted;
+                let max = caller.data().snap.max_tool_calls;
+                let why = call_limit_exceeded_why(used as usize, max);
+                caller.data_mut().halted = Some(HaltState {
+                    kind: "budget",
+                    why: why.clone(),
+                });
+                finals[idx] = Some(EntryFinal {
+                    output: ToolOutput::error(why),
+                    class: "budget",
+                    halted: true,
+                });
+                continue;
+            }
+            let (Some(name), Ok(args_v)) = (
+                name,
+                entry.get("args").map_or(Ok(Value::Null), |a| {
+                    if a.is_object() {
+                        Ok(a.clone())
+                    } else {
+                        Err(())
+                    }
+                }),
+            ) else {
+                finals[idx] = Some(EntryFinal {
+                    output: ToolOutput::error(
+                        "run_code: batch entries must be {name: \"tool name\", args: {…}} — \
+                         use tools.list() for names"
+                            .to_string(),
+                    ),
+                    class: "batch",
+                    halted: false,
+                });
+                continue;
+            };
+            // Missing args defaults to {} (the single-call glue's
+            // `undefined → {}` parity); a present-but-non-object args is the
+            // shape error above.
+            let entry_args = if args_v.is_null() { json!({}) } else { args_v };
+            admitted += 1; // every announced entry counts (failures too, §6)
+
+            // Announce + gate + intercept — the Phase B sequence, per entry.
+            let (decision, started, in_hash) = {
+                let d = caller.data();
+                // SAFETY: same frame-limited alias as in `host_call_tool`.
+                let emit = unsafe { &mut *d.emit };
+                emit(AgentEvent::ToolCall {
+                    name: name.to_string(),
+                    input: entry_args.clone(),
+                });
+                let started = Instant::now();
+                let (_, in_hash) = hash_input(&entry_args);
+                (gate_tool_call(&d.ctx, name, &entry_args), started, in_hash)
+            };
+            metas[idx] = Some(BatchEntryMeta {
+                name: name.to_string(),
+                args: entry_args.clone(),
+                in_len: entry_args.to_string().len(),
+                in_hash,
+                in_hash_eff: None,
+                started,
+            });
+            let effective = match &decision {
+                ToolDecision::Modify(v) => v.clone(),
+                _ => entry_args.clone(),
+            };
+            match decision {
+                ToolDecision::Deny(mut reason) => {
+                    let cap = caller.data().ctx.max_output_chars;
+                    crate::tools::truncate(&mut reason, cap);
+                    refuse_batch_entry(
+                        caller,
+                        &mut metas,
+                        &mut finals,
+                        idx,
+                        EntryFinal {
+                            output: ToolOutput::error(reason),
+                            class: "hooks",
+                            halted: false,
+                        },
+                        Some(false),
+                    );
+                }
+                _ => {
+                    // Cancel checkpoint between the gate and execution — the
+                    // announced entry still completes its event pair.
+                    if ctx_cancelled(&caller.data().ctx) {
+                        let output = ToolOutput::error(CANCEL_HALTED_WHY.to_string());
+                        refuse_batch_entry(
+                            caller,
+                            &mut metas,
+                            &mut finals,
+                            idx,
+                            EntryFinal {
+                                output,
+                                class: "cancel",
+                                halted: true,
+                            },
+                            Some(false),
+                        );
+                        continue;
+                    }
+                    // Registry lookup + the two capability axes: batchable
+                    // (LD-19) and concurrency (LD-11). Non-batchable → the
+                    // entry-level kind="batch" error (单条不中止，与 Deny 同
+                    // 语义：after_tool(executed=false) 照发，批次继续).
+                    let tool_idx = caller.data().defs.iter().position(|t| t.name == name);
+                    let Some(tool_idx) = tool_idx else {
+                        // Mirror the single-call unknown path (run_tool's
+                        // message, after_tool executed=true — dispatch
+                        // happened, the tool did not exist).
+                        let output = ToolOutput::error(format!("unknown tool: {name}"));
+                        refuse_batch_entry(
+                            caller,
+                            &mut metas,
+                            &mut finals,
+                            idx,
+                            EntryFinal {
+                                output,
+                                class: "unknown_tool",
+                                halted: false,
+                            },
+                            Some(true),
+                        );
+                        continue;
+                    };
+                    {
+                        let d = caller.data();
+                        let tool = &d.tools[tool_idx];
+                        if !tool.batchable() {
+                            let output = ToolOutput::error(format!(
+                                "run_code: {name} is not batchable — callBatch admits \
+                                 read-only tools only (batchable()); side effects belong \
+                                 in a sequential for loop of tools.call"
+                            ));
+                            refuse_batch_entry(
+                                caller,
+                                &mut metas,
+                                &mut finals,
+                                idx,
+                                EntryFinal {
+                                    output,
+                                    class: "batch",
+                                    halted: false,
+                                },
+                                Some(false),
+                            );
+                            continue;
+                        }
+                        // Dual-hash audit (§8.4): effective hash only when a
+                        // Modify actually changed the input.
+                        if effective != entry_args {
+                            metas[idx].as_mut().expect("meta set above").in_hash_eff =
+                                Some(hash_input(&effective).1);
+                        }
+                    }
+                    // deny/fs layer on the EFFECTIVE input — not a hooks
+                    // decision, after_tool does not fire (Hooks contract,
+                    // same as the single-call Phase B).
+                    if let Some(err) = intercept_file_paths(
+                        name,
+                        &effective,
+                        &caller.data().snap,
+                        &caller.data().workdir_canon,
+                    ) {
+                        refuse_batch_entry(
+                            caller,
+                            &mut metas,
+                            &mut finals,
+                            idx,
+                            EntryFinal {
+                                output: ToolOutput::error(err),
+                                class: "denied",
+                                halted: false,
+                            },
+                            None,
+                        );
+                        continue;
+                    }
+                    // LD-11 routing: the wave engine takes Parallel tools;
+                    // Sequential batchable entries run serially below.
+                    let parallel =
+                        caller.data().tools[tool_idx].concurrency() == ToolConcurrency::Parallel;
+                    if parallel {
+                        spawn.push((idx, name.to_string(), effective));
+                    } else {
+                        inline.push((idx, name.to_string(), effective));
+                    }
+                }
+            }
+        }
+
+        // ── execution: inline (Sequential) first, then the worker wave ────
+        // (the loop's own discipline: its inline leaf pass also completes
+        // before the parallel batch spawns — same order, same reasoning.)
+        {
+            let (tools, defs, ctx) = {
+                let d = caller.data();
+                (Arc::clone(&d.tools), Arc::clone(&d.defs), d.ctx.clone())
+            };
+            let emit_ptr = caller.data().emit;
+            for (idx, name, input) in inline {
+                // Pre-body cancel re-check — the inline twin of the worker
+                // checkpoint below.
+                if ctx_cancelled(&ctx) {
+                    let output = ToolOutput::error(CANCEL_HALTED_WHY.to_string());
+                    refuse_batch_entry(
+                        caller,
+                        &mut metas,
+                        &mut finals,
+                        idx,
+                        EntryFinal {
+                            output,
+                            class: "cancel",
+                            halted: true,
+                        },
+                        Some(false),
+                    );
+                    continue;
+                }
+                // SAFETY: no workers exist yet — the emit alias is used from
+                // this thread only.
+                let mut emit = |ev: AgentEvent| unsafe {
+                    (&mut *emit_ptr)(ev);
+                };
+                let output = run_tool(&tools, &defs, &name, &input, &ctx, &mut emit);
+                let meta = metas[idx].take().expect("inline entry was announced");
+                finals[idx] = Some(EntryFinal {
+                    output: output.clone(),
+                    class: "tool",
+                    halted: false,
+                });
+                finish_batch_entry(caller, meta, &output, Some(true));
+            }
+
+            if !spawn.is_empty() {
+                std::thread::scope(|s| {
+                    // The channel is created INSIDE the scope closure so `rx`
+                    // is a closure local: on a drain-loop unwind the receiver
+                    // drops, worker sends start failing, and scope's join-all
+                    // can complete (borrowed-from-outside `rx` + blocked
+                    // senders = deadlock — the loop's parallel batch hit this
+                    // as re-review P2). The guard trips the shared cancel
+                    // flag on unwind so in-flight workers wind down fast.
+                    struct CancelOnUnwind {
+                        flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+                        armed: bool,
+                    }
+                    impl Drop for CancelOnUnwind {
+                        fn drop(&mut self) {
+                            if self.armed && std::thread::panicking() {
+                                if let Some(c) = &self.flag {
+                                    c.store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    }
+                    let (tx, rx) = std::sync::mpsc::sync_channel::<WaveMsg>(256);
+                    let mut unwind_guard = CancelOnUnwind {
+                        flag: ctx.cancel.clone(),
+                        armed: true,
+                    };
+                    let mut handles = Vec::with_capacity(spawn.len());
+                    for (idx, name, input) in &spawn {
+                        let tools = Arc::clone(&tools);
+                        let defs = Arc::clone(&defs);
+                        let ctx = ctx.clone();
+                        let name = name.clone();
+                        let input = input.clone();
+                        let tx = tx.clone();
+                        let idx = *idx;
+                        handles.push(s.spawn(move || {
+                            let mut emit = |ev: AgentEvent| {
+                                // Blocks when the funnel is full — the drain
+                                // loop in this same scope is the only
+                                // consumer, so it always unwinds.
+                                let _ = tx.send(WaveMsg::Ev(ev));
+                            };
+                            if ctx_cancelled(&ctx) {
+                                let _ = tx.send(WaveMsg::Cancelled(idx));
+                                return;
+                            }
+                            let output = run_tool(&tools, &defs, &name, &input, &ctx, &mut emit);
+                            let _ = tx.send(WaveMsg::Done(idx, output));
+                        }));
+                    }
+                    drop(tx); // workers hold the last clones; rx ends when they drop
+                              // Drain on the main thread: forward child events live and
+                              // complete each entry as its Done/Cancelled arrives —
+                              // completion order for events, slots keep submission
+                              // order for the final array.
+                    while let Ok(msg) = rx.recv() {
+                        match msg {
+                            WaveMsg::Ev(ev) => unsafe {
+                                // SAFETY: workers never touch the sink; the
+                                // alias is main-thread-only (same window as
+                                // host_call_tool).
+                                (&mut *emit_ptr)(ev);
+                            },
+                            WaveMsg::Done(idx, output) => {
+                                let meta = metas[idx].take().expect("worker entry was announced");
+                                finals[idx] = Some(EntryFinal {
+                                    output: output.clone(),
+                                    class: "tool",
+                                    halted: false,
+                                });
+                                finish_batch_entry(caller, meta, &output, Some(true));
+                            }
+                            WaveMsg::Cancelled(idx) => {
+                                let output = ToolOutput::error(CANCEL_HALTED_WHY.to_string());
+                                let meta = metas[idx].take().expect("worker entry was announced");
+                                finals[idx] = Some(EntryFinal {
+                                    output: output.clone(),
+                                    class: "cancel",
+                                    halted: true,
+                                });
+                                finish_batch_entry(caller, meta, &output, Some(false));
+                            }
+                        }
+                    }
+                    unwind_guard.armed = false;
+                    // Join in spawn order: a panicked worker never sent Done —
+                    // it gets the loop's placeholder shape (an honest error
+                    // entry, after_tool(executed=true) on the dispatch that
+                    // did happen). The `is_none` guard keeps a pathological
+                    // panic-after-Done from overwriting (or double-finishing)
+                    // the already-recorded outcome.
+                    for ((idx, _, _), h) in spawn.iter().zip(handles) {
+                        if h.join().is_err() && finals[*idx].is_none() {
+                            let output = ToolOutput::error("batch tool worker panicked");
+                            let meta = metas[*idx].take().expect("worker entry was announced");
+                            finals[*idx] = Some(EntryFinal {
+                                output: output.clone(),
+                                class: "tool",
+                                halted: false,
+                            });
+                            finish_batch_entry(caller, meta, &output, Some(true));
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    // Assemble the result array in submission order (§4: the return shape is
+    // the array of per-entry envelopes).
+    let arr: Vec<Value> = (0..n)
+        .map(|i| {
+            let f = finals[i]
+                .take()
+                .expect("every entry resolves to a final outcome");
+            let name = entries[i].get("name").and_then(Value::as_str);
+            batch_entry_envelope(name, &f)
+        })
+        .collect();
+    envelope_or_trap(caller, true, &Value::Array(arr).to_string())
 }
 
 /// The guest-visible tool registry (§2): the agent's tool surface filtered
@@ -499,7 +1504,8 @@ fn write_guest(caller: &mut Caller<'_, HostCtx>, bytes: &[u8]) -> Result<i64> {
 /// Interception order (design §7, fixed by review): entry checks (halted /
 /// call limit — BEFORE the reserved names, so a busy loop can't sidestep the
 /// audit cap via `tools.list`) → reserved-name intercepts (`__tools_list`,
-/// `__budget` — read-only introspection, not tool calls) → hooks gate
+/// `__budget` — read-only introspection, not tool calls; `__include` /
+/// `__hash_file` — gated host actions with their own dispatch) → hooks gate
 /// (unknown names gate too — same order as the top-level loop) → deny_paths /
 /// fs_write_dirs on the post-`Modify` EFFECTIVE input → run.
 /// Parse the guest's serialized tool arguments. The shipped glue always sends
@@ -512,6 +1518,54 @@ fn write_guest(caller: &mut Caller<'_, HostCtx>, bytes: &[u8]) -> Result<i64> {
 /// bug to the tool.
 fn parse_guest_args(raw: &str) -> Result<Value, String> {
     serde_json::from_str(raw).map_err(|e| format!("tool arguments are not valid JSON: {e}"))
+}
+
+/// The call-limit refusal text — model-visible spec, byte-identical at every
+/// emission site (the single-call entry check and the batch's per-entry
+/// admission check share it).
+///
+/// 实测教训（TinyAgentBench AppWorld 复核）：模型连撞两次后曾误判"额度是整个
+/// 会话累计的"而放弃沙箱路线。报错必须说清三件事：额度按次独立（下次 run_code
+/// 重新计满）、超了怎么恢复（分批 + 中间结果落盘续跑）、失败/写错名的调用也
+/// 照扣（先 tools.list）。
+fn call_limit_exceeded_why(used: usize, max: u32) -> String {
+    format!(
+        "run_code: tool call limit exceeded ({used} of max_tool_calls={max}) — \
+         the sandbox is halted for the rest of this execution. \
+         The budget resets every invocation: the next run_code call \
+         gets a fresh {max} calls. Split the work into batches of ≤{max} \
+         calls and persist intermediate results with write_file so \
+         the next batch can resume. Failed calls (including wrong \
+         tool names) count too — check tools.list() before guessing."
+    )
+}
+
+/// Saturating usage fold for inner-call billing (same shape as the core's):
+/// share leaf-reported usage into the run-level budget counter, then merge
+/// into the sandbox's aggregate. Shared by the single-call dispatch, the
+/// batch's inline entries, and the batch's worker completions — one fold, no
+/// local re-implementations drifting apart.
+fn fold_inner_usage(d: &mut HostCtx, output: &ToolOutput) {
+    // Honest cost fold (FR-10): inner tool usage bills to this run via the
+    // shared saturating merge (compress.rs). Leaf-reported usage
+    // (usage_in_shared_budget=false — e.g. a host callback tool metering an
+    // upstream API) is shared into the budget counter HERE, at the innermost
+    // fold: run_code reports the aggregate upward with the flag set
+    // (everything in it is now counter-shared), and inner `task` children's
+    // spend was already shared by their own chats — so nothing double-counts
+    // on the way up.
+    if let Some(u) = &output.usage {
+        if !output.usage_in_shared_budget {
+            if let Some(g) = &d.ctx.budget {
+                g.share(u.total());
+            }
+        }
+    }
+    if let Some(merged) =
+        crate::compress::merge_usage(Some(std::mem::take(&mut d.usage)), output.usage)
+    {
+        d.usage = merged;
+    }
 }
 
 fn host_call_tool(
@@ -620,23 +1674,7 @@ fn host_call_tool(
             return envelope_err(caller, "deadline", Some(&name), Some(false), &why);
         }
         if d.calls.len() as u64 >= d.snap.max_tool_calls as u64 {
-            // 实测教训（TinyAgentBench AppWorld 复核）：模型连撞两次后曾误判
-            // "额度是整个会话累计的"而放弃沙箱路线。报错必须说清三件事：
-            // 额度按次独立（下次 run_code 重新计满）、超了怎么恢复（分批 +
-            // 中间结果落盘续跑）、失败/写错名的调用也照扣（先 tools.list）。
-            let why = format!(
-                "run_code: tool call limit exceeded ({} of max_tool_calls={}) — \
-                 the sandbox is halted for the rest of this execution. \
-                 The budget resets every invocation: the next run_code call \
-                 gets a fresh {} calls. Split the work into batches of ≤{} \
-                 calls and persist intermediate results with write_file so \
-                 the next batch can resume. Failed calls (including wrong \
-                 tool names) count too — check tools.list() before guessing.",
-                d.calls.len(),
-                d.snap.max_tool_calls,
-                d.snap.max_tool_calls,
-                d.snap.max_tool_calls
-            );
+            let why = call_limit_exceeded_why(d.calls.len(), d.snap.max_tool_calls);
             d.halted = Some(HaltState {
                 kind: "budget",
                 why: why.clone(),
@@ -694,6 +1732,22 @@ fn host_call_tool(
         })
         .to_string();
         return envelope_or_trap(caller, true, &payload);
+    }
+
+    if name == INCLUDE_NAME || name == HASH_FILE_NAME {
+        // Lib-family reserved names (MD-2): REAL gated host actions, not the
+        // read-only introspection class above — routed to their own dispatch
+        // with gate/audit/quota (see `lib_reserved_call`).
+        return lib_reserved_call(caller, &name, &args);
+    }
+
+    if name == CALL_BATCH_NAME && caller.data().snap.call_batch {
+        // The batch channel's reserved name (§4/LD-19): intercepted only when
+        // `code.call_batch` is ON. Gate OFF deliberately falls through to the
+        // ordinary Phase B below — an unknown-tool error, byte-identical to
+        // the pre-batch binary (LD-19's 保留名直调钉住: gate-off direct calls
+        // behave exactly like the feature was never compiled).
+        return call_batch_dispatch(caller, &args);
     }
 
     // Phase B — dispatch: the same gate → run → after sequence the top-level
@@ -785,26 +1839,7 @@ fn host_call_tool(
             in_hash,
             in_hash_eff,
         });
-        // Honest cost fold (FR-10): inner tool usage bills to this run via
-        // the shared saturating merge (compress.rs) — no local re-implementation.
-        // Leaf-reported usage (usage_in_shared_budget=false — e.g. a host
-        // callback tool metering an upstream API) is shared into the budget
-        // counter HERE, at the innermost fold: run_code reports the aggregate
-        // upward with the flag set (everything in it is now counter-shared),
-        // and inner `task` children's spend was already shared by their own
-        // chats — so nothing double-counts on the way up.
-        if let Some(u) = &output.usage {
-            if !output.usage_in_shared_budget {
-                if let Some(g) = &d.ctx.budget {
-                    g.share(u.total());
-                }
-            }
-        }
-        if let Some(merged) =
-            crate::compress::merge_usage(Some(std::mem::take(&mut d.usage)), output.usage)
-        {
-            d.usage = merged;
-        }
+        fold_inner_usage(d, &output);
     }
 
     // Phase C — hand the envelope back (needs the mutable caller again).
@@ -1494,14 +2529,17 @@ fn envelope_or_trap(caller: &mut Caller<'_, HostCtx>, is_ok: bool, payload: &str
 /// Adds `kind` / `tool` / `retryable` to the envelope; the glue attaches
 /// them to the thrown Error (`e.kind`, `e.tool`, `e.retryable`) and older
 /// string-only reasoning keeps working via `e.message`. Vocabulary:
-/// "denied" (deny_paths / fs_write_dirs / symlink / outside-workdir —
+/// "denied" (deny_paths / fs_write_dirs / symlink / outside-workdir — and
+/// the lib channel's policy layer, incl. the code.include=false refusal —
 /// definitive, retrying the same call cannot help), "hooks" (before_tool
 /// Deny — definitive), "budget" (call limit latched; terminal for this
 /// execution, resets on the next run_code), "deadline" (wall clock;
 /// terminal), "cancel" (the host's run-level cancel flag; terminal — the
 /// whole execution is stopping, not just this call), "unknown_tool"
 /// (definitive), "image" (the call RAN — the result just cannot be carried
-/// into the sandbox), "host" (envelope / pointer machinery). Plain tool
+/// into the sandbox), "host" (envelope / pointer machinery), "lib" (the
+/// include family's verification chain — not-registered / hash mismatch /
+/// malformed manifest / read-cap; definitive). Plain tool
 /// failures use "tool" and deliberately
 /// OMIT `retryable`: the host cannot classify a tool's own error, and both
 /// hard values mislead (false suppresses legitimate retries, true retries
@@ -1554,6 +2592,47 @@ const GUEST_OUTPUT_CHARS: usize = 2_000_000;
 /// when (and only when) the tool is enabled, and a disk skill named
 /// `run-code` overrides it (the shipped guide is never a cage).
 pub(crate) const RUN_CODE_SKILL_MD: &str = include_str!("run_code_skill.md");
+
+/// The skill body for one assembly (MD-13, M2): gated sections are spliced at
+/// assembly time — `code.include` keeps/strips the `BEGIN/END LIB SECTION`
+/// block, `code.call_batch` the `BEGIN/END BATCH SECTION` block (LD-15);
+/// with every gate off the result is the pre-include/pre-batch contract.
+/// Assembly-time decision (the `skill_injection` snapshot precedent): a
+/// later `set_code_config` does not re-splice an already-built skill index.
+/// Marker discipline: exactly one BEGIN and one END line per section, BEGIN
+/// before END; a malformed marker set is a hard error at assembly (fail
+/// loud, never silently ship a half-section).
+pub fn run_code_skill_md(include: bool, call_batch: bool) -> String {
+    /// Strip one marked section (fail loud on a malformed marker set).
+    fn strip_once(src: &str, begin: &str, end: &str, what: &str) -> String {
+        let (b, e) = match (src.find(begin), src.find(end)) {
+            (Some(b), Some(e)) if b < e => (b, e + end.len()),
+            _ => panic!("run_code_skill.md: {what} markers malformed"),
+        };
+        let mut out = String::with_capacity(src.len());
+        out.push_str(&src[..b]);
+        out.push_str(src[e..].trim_start_matches('\n'));
+        out
+    }
+    let mut out = RUN_CODE_SKILL_MD.to_string();
+    if !include {
+        out = strip_once(
+            &out,
+            "<!-- BEGIN LIB SECTION",
+            "<!-- END LIB SECTION -->",
+            "LIB SECTION",
+        );
+    }
+    if !call_batch {
+        out = strip_once(
+            &out,
+            "<!-- BEGIN BATCH SECTION",
+            "<!-- END BATCH SECTION -->",
+            "BATCH SECTION",
+        );
+    }
+    out
+}
 
 /// Guest prelude (v2 P1): a tiny, CLOSED set of I/O helpers so model-generated
 /// code expresses intent instead of re-implementing paging loops and
@@ -1625,17 +2704,142 @@ function writeVerified(path, content) {
 tools.budget = function () { return tools.call("__budget", {}); };
 "#;
 
+/// The lib half of the prelude (code_memory_design §3.1, M1) — appended by
+/// [`prelude_line`] only when `code.include` is on (MD-13: gate off = the
+/// helpers do not exist, `typeof include === "undefined"`). Same closed-list
+/// discipline as above: the gate-ON description names exactly these two, in
+/// lockstep with the 【库】 overlay.
+///
+/// `include` is idempotent per path spelling and cycle-cut: the marker is
+/// set BEFORE the indirect eval, so `a → b → a` loads `a` once and finishes;
+/// a marker left behind on a throwing eval would poison the session, so it
+/// is deleted on throw (a retry re-attempts, and fails again, honestly).
+/// `(0, eval)` evaluates in global scope — the lib's declarations land on
+/// the global object, visible to the calling program and to later includes.
+///
+/// `saveLib` = the MD-10 write path: `write_file` (full write policy
+/// applies) → `__hash_file` (host hashes the delivered bytes AND registers
+/// the session admission) → INDEX upsert (st always `draft`; existing
+/// `needs`/`ver` preserved, ver=1/needs=- on create). The manifest write
+/// goes through the ordinary file tools — the host only ever PARSES INDEX
+/// (see [`parse_lib_index`]). The pre-existing `writeVerified` (byte-fidelity
+/// write, v2 P1) is a different helper and stays untouched: the design doc's
+/// "writeVerified" naming collided with it, the M1 helper is `saveLib`
+/// (revision note in docs/code_memory_design.md).
+const PRELUDE_LIB_SRC: &str = r#"
+var __ta_libs = Object.create(null);
+function include(path) {
+    if (__ta_libs[path]) return undefined;
+    var src = tools.call("__include", {path: path});
+    __ta_libs[path] = true;
+    try { (0, eval)(src); }
+    catch (e) { delete __ta_libs[path]; throw e; }
+    return undefined;
+}
+function saveLib(path, src) {
+    path = String(path);
+    if (path.indexOf("lib/") !== 0) throw new Error("saveLib: path must start with lib/ (got " + path + ")");
+    // lib/INDEX.md machine lines are whitespace-tokenized on the host — a
+    // whitespace path would register fine here and poison EVERY later
+    // include with a malformed-index error. Reject before any write.
+    if (/\s/.test(path)) throw new Error("saveLib: path must not contain whitespace — INDEX.md lines are whitespace-tokenized (got " + path + ")");
+    tools.call("write_file", {path: path, content: src});
+    var h = tools.call("__hash_file", {path: path});
+    var rel = path.slice(4), tok = "path=" + rel;
+    var text = "";
+    try { text = readAll("lib/INDEX.md"); } catch (e) {}
+    var lines = text ? text.split("\n") : [], out = [], hit = false, needs = "-", ver = "1", i, j, seg;
+    for (i = 0; i < lines.length; i++) {
+        seg = lines[i].split(" ");
+        if (lines[i].indexOf("ta-lib:") !== -1 && seg.indexOf(tok) !== -1) {
+            for (j = 0; j < seg.length; j++) {
+                if (seg[j].indexOf("needs=") === 0) needs = seg[j].slice(6);
+                if (seg[j].indexOf("ver=") === 0) ver = seg[j].slice(4);
+            }
+            out.push("<!-- ta-lib: path=" + rel + " sha256=" + h.sha256 + " needs=" + needs + " ver=" + ver + " st=draft -->");
+            hit = true;
+        } else { out.push(lines[i]); }
+    }
+    if (!hit) {
+        if (out.length && out[out.length - 1] !== "") out.push("");
+        out.push("<!-- ta-lib: path=" + rel + " sha256=" + h.sha256 + " needs=" + needs + " ver=" + ver + " st=draft -->");
+    }
+    tools.call("write_file", {path: "lib/INDEX.md", content: out.join("\n") + "\n"});
+    return {path: rel, sha256: h.sha256, st: "draft"};
+}
+// The prelude's declarations live in the OUTER eval's scope — an indirectly
+// eval'd lib source runs in GLOBAL scope and cannot see them (empirically:
+// ReferenceError from the cycle test). Export the closed helper set onto
+// globalThis so lib code gets the same environment the calling program has.
+// User code may still shadow the names in its own scope; lib code binds to
+// these globals (nesting, not scoping, per the design's prelude sketch).
+globalThis.include = include;
+globalThis.saveLib = saveLib;
+globalThis.readAll = readAll;
+globalThis.readLines = readLines;
+globalThis.writeVerified = writeVerified;
+"#;
+
+/// The callBatch half of the prelude (code_llm_design §4/附录 A④, M2) —
+/// appended by [`prelude_line`] only when `code.call_batch` is on (LD-15:
+/// gate off = `typeof tools.callBatch === "undefined"`, the pre-batch
+/// contract). The wrapper is THIN on purpose: the host runs every entry
+/// through the exact single-call sequence; the only guest-side duty is the
+/// envelope-array convention (§4) — `__ok:true` arms become parsed contents
+/// (the same auto-parse-without-unwrap the single-call glue applies),
+/// `__ok:false` arms become `Error` instances carrying `e.kind` / `e.tool` /
+/// `e.retryable` / `e.halted` (the additive LD-9 field). `JSON.parse` can
+/// never yield an Error instance, so a successful entry cannot fake a
+/// failure and vice versa (the D12 collision argument).
+const PRELUDE_BATCH_SRC: &str = r#"
+function __ta_parse(s) {
+    try { return JSON.parse(s); } catch (e) { return s; }
+}
+tools.callBatch = function (entries) {
+    var arr = tools.call("__call_batch", { entries: entries });
+    if (typeof arr === "string") arr = __ta_parse(arr);
+    if (!arr || !Array.isArray(arr)) throw new Error("callBatch: unexpected host output");
+    var out = [], i, env;
+    for (i = 0; i < arr.length; i++) {
+        env = arr[i];
+        if (env && env.__ok === true) out.push(__ta_parse(env.content));
+        else {
+            var e = new Error(env && env.error ? env.error : "callBatch entry failed");
+            if (env) {
+                if (env.kind !== undefined) e.kind = env.kind;
+                if (env.tool !== undefined) e.tool = env.tool;
+                if (env.retryable !== undefined) e.retryable = env.retryable;
+                if (env.halted !== undefined) e.halted = env.halted;
+            }
+            out.push(e);
+        }
+    }
+    return out;
+};
+"#;
+
 /// The prelude flattened to a single physical line (see PRELUDE_SRC docs).
 /// Blank lines and `//`-comments are dropped, the rest joined with no
 /// separator — every remaining line must therefore end with `;`, `{` or `}`
 /// (the invariant test pins both properties; a separator-free join of
 /// statements relying on ASI would silently glue two statements together).
-fn prelude_line() -> String {
-    PRELUDE_SRC
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with("//"))
-        .collect()
+/// `include_libs` / `call_batch` append the gated halves' flattened source
+/// (MD-13 / LD-15: the gates decide existence, per-execution via snapshot).
+fn prelude_line(include_libs: bool, call_batch: bool) -> String {
+    fn flatten(src: &str) -> String {
+        src.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("//"))
+            .collect()
+    }
+    let mut out = flatten(PRELUDE_SRC);
+    if include_libs {
+        out.push_str(&flatten(PRELUDE_LIB_SRC));
+    }
+    if call_batch {
+        out.push_str(&flatten(PRELUDE_BATCH_SRC));
+    }
+    out
 }
 
 fn guest_ctx(ctx: &ToolCtx) -> ToolCtx {
@@ -1752,6 +2956,9 @@ pub struct RunCodeTool {
     /// Lazily-built inner registry, shared across clones. The failure (bad
     /// cfg.tools) is cached too — reported identically on every call.
     registry: Arc<OnceLock<Result<Registry, String>>>,
+    /// Session registration set for the lib family (MD-14): shared across
+    /// clones — every execution of this lineage admits against one set.
+    lib_sessions: LibSessions,
 }
 
 impl RunCodeTool {
@@ -1771,6 +2978,7 @@ impl RunCodeTool {
             mcp_tools,
             extra_tools,
             registry: Arc::new(OnceLock::new()),
+            lib_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -1927,6 +3135,7 @@ impl RunCodeTool {
             mem_cap,
             snap.clone(),
             wall,
+            Arc::clone(&self.lib_sessions),
         );
 
         let engine = match engine() {
@@ -2023,7 +3232,7 @@ impl RunCodeTool {
         // frames shift by a constant +1 instead of the prelude's full length.
         // Same function-body scope as the user code: the helper declarations
         // hoist ahead of it, and user code may shadow them freely.
-        let full_source = format!("{}\n{}", prelude_line(), code);
+        let full_source = format!("{}\n{}", prelude_line(snap.include, snap.call_batch), code);
         let code_bytes = full_source.as_bytes();
         // alloc → write code → eval, sharing one error path: any trap here is
         // a termination (fuel/mem), not a JS outcome.
@@ -2216,6 +3425,23 @@ fn read_memory_string(
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
+/// The gate-ON description overlay (MD-13): appended to the base description
+/// when `code.include` is set. A separate const so the extractor in
+/// scripts/sync_run_code_contract.py — which pins the gate-OFF r# literal —
+/// keeps matching exactly one description. LLM-visible copy is spec: this
+/// text is mirrored in docs/code_memory_design.md's appendix; the two change
+/// together through its revision log.
+const LIB_DESC_SUFFIX: &str = "\n\n【库】（仅 code.include 开启时；关闭时上句成立、无以下助手）include(path)：加载 lib/ 下已登记的代码库到全局作用域（幂等，循环依赖自动截断，失败 throw）；saveLib(path, src)：写库文件并在 lib/INDEX.md 登记（恒 st=draft，本会话即可 include；跨会话复用需人工审校后将该行 st 改为 ok）。库校验失败（未登记/内容与登记不符/超限）e.kind=\"lib\"，重试无意义。建库/用库/修库生命周期详见 run-code 技能的「库与复用」段。";
+
+/// The call_batch gate-ON description overlay (LD-15/附录 A④): appended when
+/// `code.call_batch` is set, outside the pinned r# literal (same extractor
+/// discipline as [`LIB_DESC_SUFFIX`]). Copy is A④ finalized at landing — the
+/// draft's "read_file / llm" lists `llm`, which does not exist in the
+/// registry until M3; naming it now would break the closed-list
+/// anti-hallucination contract, so v1 says "read_file 等" (M3 revisits,
+/// through this file's doc + the design revision log).
+const BATCH_DESC_SUFFIX: &str = "\n\n【批量】（仅 code.call_batch 开启时；关闭时无此助手）tools.callBatch([{name, args}, …])：并发执行一批只读工具调用（read_file 等 batchable 工具；按提交序返回数组；无原子性、无回滚、部分执行是正常结果——逐条检查）。单项失败不抛、该条目为 Error 实例带 e.kind/e.tool——用 instanceof 判别，不要 JSON.stringify 失败条目（Error 序列化成 {}，细节丢失）。并发上限 8/波；分页拉取与逐项判别是理想对象；副作用调用不在批内——写顺序 for 循环。详见 run-code 技能的「批量调用」段。";
+
 impl Tool for RunCodeTool {
     fn origin(&self) -> ToolOrigin {
         ToolOrigin::Builtin
@@ -2230,8 +3456,15 @@ impl Tool for RunCodeTool {
         // "slim description + run_code_skill.md" together: the helper list
         // must stay closed and named here (anti-hallucination surface), and
         // prelude/description/skill.md change together.
-        ToolDef {
-            name: "run_code".into(),
+        //
+        // The r#-literal below is the gate-OFF contract — byte-identical to
+        // the pre-include/pre-batch binary; scripts/sync_run_code_contract.py
+        // pins THIS text, so both overlays append OUTSIDE the literal
+        // (code.include on → 【库】 section, MD-13; code.call_batch on →
+        // 【批量】 section, LD-15; the closed-list sentence stays true because
+        // each overlay explicitly scopes itself).
+        let base = ToolDef {
+        name: "run_code".into(),
             description: r#"在进程内 JS 沙箱（QuickJS，同步 ES2023）编排 MCP/API 分页、批量操作和大文件处理。规则已明确，剩余仍有跨页/大量对象的同构调用或大量中间数据处理时，先 read_skill({"skill":"run-code"})，再用代码承接。可先直接探查接口，拿到结果后重判；只续做未完成部分。整个剩余任务一次工具调用或一条可用 shell 管道即可完成时直接做；小集合或逐项需语义判断时不必用代码。不能仅凭“所有/批量”触发。
 
 【环境】无 async/await、Promise、timer、import/fetch、网络与文件系统直访（读写经工具）；Date.now/Math.random 不可用。调用次数/内存/时长有限，超限终止；调用额度每次重计，超了分批续跑。
@@ -2260,6 +3493,17 @@ read_file 三模式（text / format:"json" / raw）、字节保真复制及分�
                 },
                 "required": ["code"]
             }),
+        };
+        let snap = self.snapshot();
+        let description = match (snap.include, snap.call_batch) {
+            (false, false) => return base,
+            (true, false) => format!("{}{LIB_DESC_SUFFIX}", base.description),
+            (false, true) => format!("{}{BATCH_DESC_SUFFIX}", base.description),
+            (true, true) => format!("{}{LIB_DESC_SUFFIX}{BATCH_DESC_SUFFIX}", base.description),
+        };
+        ToolDef {
+            description,
+            ..base
         }
     }
 
@@ -5391,17 +6635,25 @@ return t.length;"#}),
         // the flattened prelude shifts user frames by a CONSTANT +1. A
         // newline in the flattened form would break that invariant, and a
         // line not ending in `;`/`{`/`}` would glue statements together.
-        let flat = prelude_line();
-        assert!(!flat.contains('\n'), "flattened prelude must be one line");
-        assert!(flat.starts_with("var __TA_B64T"), "unexpected head: {flat}");
-        for line in PRELUDE_SRC.lines().map(str::trim) {
-            if line.is_empty() || line.starts_with("//") {
-                continue;
+        // Both gate states must hold the invariant (each gated half flattens
+        // under the same rules).
+        for (include_libs, call_batch, src) in [
+            (false, false, PRELUDE_SRC),
+            (true, false, PRELUDE_LIB_SRC),
+            (false, true, PRELUDE_BATCH_SRC),
+        ] {
+            let flat = prelude_line(include_libs, call_batch);
+            assert!(!flat.contains('\n'), "flattened prelude must be one line");
+            assert!(flat.starts_with("var __TA_B64T"), "unexpected head: {flat}");
+            for line in src.lines().map(str::trim) {
+                if line.is_empty() || line.starts_with("//") {
+                    continue;
+                }
+                assert!(
+                    line.ends_with(';') || line.ends_with('{') || line.ends_with('}'),
+                    "prelude line must end in ;/{{/}} for separator-free flattening: {line:?}"
+                );
             }
-            assert!(
-                line.ends_with(';') || line.ends_with('{') || line.ends_with('}'),
-                "prelude line must end in ;/{{/}} for separator-free flattening: {line:?}"
-            );
         }
     }
 
@@ -5568,5 +6820,1498 @@ return t.length;"#}),
         assert_eq!(out.content, "0");
         assert_eq!(std::fs::read(dir.join("dst.bin")).unwrap(), bytes);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── code_memory M1: lib family (include / saveLib) ─────────────────────
+    //
+    // A-M 编号对应 docs/code_memory_design.md §7 的验收清单（A-M8 属 M3）。
+
+    fn include_cfg() -> CodeConfig {
+        CodeConfig {
+            include: true,
+            ..CodeConfig::default()
+        }
+    }
+
+    /// [`include_cfg`] + write access (saveLib writes the lib file AND the
+    /// INDEX upsert through the ordinary file tools).
+    fn lib_tool() -> RunCodeTool {
+        tool_with_tools(include_cfg(), r#"["read_file","write_file","list_dir"]"#)
+    }
+
+    /// Hand-write a lib + a matching st=ok INDEX entry Rust-side (the
+    /// "human-reviewed library" leg — no session registration involved).
+    fn plant_lib(dir: &std::path::Path, rel: &str, src: &str, st: &str) -> String {
+        let lib_rel = format!("lib/{rel}");
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        std::fs::write(dir.join(&lib_rel), src).unwrap();
+        let hex = sha256_hex(src.as_bytes());
+        std::fs::write(
+            dir.join(LIB_INDEX_REL),
+            format!(
+                "# lib index\n<!-- ta-lib: path={rel} sha256={hex} needs=- ver=1 st={st} -->\n"
+            ),
+        )
+        .unwrap();
+        hex
+    }
+
+    fn js_out(tool: &RunCodeTool, dir: &std::path::Path, code: &str) -> Value {
+        let out = tool
+            .run_with_emit(&json!({ "code": code }), &ctx(dir), &mut |_| {})
+            .unwrap();
+        assert!(!out.is_error, "guest failed: {}", out.content);
+        serde_json::from_str(&out.content).unwrap_or(json!(null))
+    }
+
+    /// A-M1: saveLib → include in the same execution; idempotent double
+    /// include (one load); `__hash_file` direct call returns a full digest;
+    /// audit traces both reserved names.
+    #[test]
+    fn lib_save_and_include_same_execution() {
+        let dir = scratch();
+        let v = js_out(
+            &lib_tool(),
+            &dir,
+            r#"
+            saveLib("lib/c.js", "globalThis.loads = (globalThis.loads || 0) + 1; function add(a, b) { return a + b; }");
+            include("lib/c.js");
+            include("lib/c.js");
+            var h = tools.call("__hash_file", {path: "lib/c.js"});
+            return {sum: add(2, 3), loads: globalThis.loads, hashlen: h.sha256.length};"#,
+        );
+        assert_eq!(v["sum"], json!(5), "included lib is callable: {v}");
+        assert_eq!(v["loads"], json!(1), "double include loads once: {v}");
+        assert_eq!(v["hashlen"], json!(64), "full sha256 hex: {v}");
+        // The manifest on disk carries the machine line with st=draft (MD-10).
+        let index = std::fs::read_to_string(dir.join(LIB_INDEX_REL)).unwrap();
+        assert!(index.contains("path=c.js"), "index: {index}");
+        assert!(
+            index.contains("st=draft"),
+            "saveLib never ok's itself: {index}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A-M1/A-M7 + MD-14 clone-sharing: a draft lib is admitted in a LATER
+    /// execution of the SAME tool lineage (session registration survives the
+    /// execution), and refused for a FRESH lineage (session is per-lineage,
+    /// never persisted).
+    #[test]
+    fn lib_draft_admission_is_session_scoped() {
+        let dir = scratch();
+        let tool = lib_tool();
+        let out = tool
+            .run_with_emit(
+                &json!({"code": r#"saveLib("lib/c.js", "function add(a, b) { return a + b; }"); return 1;"#}),
+                &ctx(&dir),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        // Same lineage, new execution: admitted via session registration.
+        let v = js_out(&tool, &dir, r#"include("lib/c.js"); return add(9, 1);"#);
+        assert_eq!(v, json!(10), "session-registered draft admits: {v}");
+        // Fresh lineage, same disk state: draft without session → refused.
+        let v = js_out(
+            &lib_tool(),
+            &dir,
+            r#"
+            try { include("lib/c.js"); return {refused: false}; }
+            catch (e) { return {refused: true, kind: e.kind, msg: String(e)}; }"#,
+        );
+        assert_eq!(v["refused"], json!(true), "{v}");
+        assert_eq!(v["kind"], json!("lib"), "{v}");
+        assert!(
+            v["msg"].as_str().unwrap_or("").contains("st=draft"),
+            "error names the admission state: {v}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A-M7 st=ok leg: a hand-reviewed INDEX (st=ok, matching hash) admits
+    /// with NO session registration — the cross-session path.
+    #[test]
+    fn lib_st_ok_admits_without_session() {
+        let dir = scratch();
+        plant_lib(&dir, "t.js", "function twice(x) { return x * 2; }", "ok");
+        let v = js_out(
+            &lib_tool(),
+            &dir,
+            r#"include("lib/t.js"); return twice(21);"#,
+        );
+        assert_eq!(v, json!(42), "{v}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A-M6: content changed after registration → hash mismatch is a hard
+    /// refusal even though the session registered the OLD bytes.
+    #[test]
+    fn lib_tamper_after_registration_rejected() {
+        let dir = scratch();
+        let tool = lib_tool();
+        let out = tool
+            .run_with_emit(
+                &json!({"code": r#"saveLib("lib/c.js", "function f() { return 1; }"); return 1;"#}),
+                &ctx(&dir),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        std::fs::write(dir.join("lib/c.js"), "function f() { return 2; }").unwrap();
+        let v = js_out(
+            &tool,
+            &dir,
+            r#"
+            try { include("lib/c.js"); return {refused: false}; }
+            catch (e) { return {refused: true, kind: e.kind, msg: String(e)}; }"#,
+        );
+        assert_eq!(v["refused"], json!(true), "{v}");
+        assert_eq!(v["kind"], json!("lib"), "{v}");
+        assert!(
+            v["msg"].as_str().unwrap_or("").contains("does not match"),
+            "integrity error: {v}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A-M10: an unregistered file (no INDEX entry at all) is refused with
+    /// guidance toward saveLib.
+    #[test]
+    fn lib_missing_entry_rejected() {
+        let dir = scratch();
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        std::fs::write(dir.join("lib/x.js"), "var x = 1;").unwrap();
+        let v = js_out(
+            &lib_tool(),
+            &dir,
+            r#"
+            try { include("lib/x.js"); return {refused: false}; }
+            catch (e) { return {refused: true, msg: String(e)}; }"#,
+        );
+        assert_eq!(v["refused"], json!(true), "{v}");
+        assert!(
+            v["msg"]
+                .as_str()
+                .unwrap_or("")
+                .contains("no entry in lib/INDEX.md"),
+            "{v}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A-M11: duplicate/conflicting INDEX entries are a hard error — no
+    /// silent pick between the lines.
+    #[test]
+    fn lib_duplicate_index_entries_rejected() {
+        let dir = scratch();
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        std::fs::write(dir.join("lib/x.js"), "var x = 1;").unwrap();
+        let hex = sha256_hex(b"var x = 1;");
+        let other = sha256_hex(b"var x = 2;");
+        std::fs::write(
+            dir.join(LIB_INDEX_REL),
+            format!(
+                "<!-- ta-lib: path=x.js sha256={hex} needs=- ver=1 st=ok -->\n\
+                 <!-- ta-lib: path=x.js sha256={other} needs=- ver=1 st=ok -->\n"
+            ),
+        )
+        .unwrap();
+        let v = js_out(
+            &lib_tool(),
+            &dir,
+            r#"
+            try { include("lib/x.js"); return {refused: false}; }
+            catch (e) { return {refused: true, msg: String(e)}; }"#,
+        );
+        assert_eq!(v["refused"], json!(true), "{v}");
+        assert!(v["msg"].as_str().unwrap_or("").contains("duplicate"), "{v}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A-M12: the host-side source-read bound — an oversized lib fails with
+    /// the cap named, before any admission judgment.
+    #[test]
+    fn lib_read_cap_error() {
+        let dir = scratch();
+        let big = "x".repeat(MAX_CODE_BYTES + 1);
+        plant_lib(&dir, "big.js", &big, "ok");
+        let v = js_out(
+            &lib_tool(),
+            &dir,
+            r#"
+            try { include("lib/big.js"); return {refused: false}; }
+            catch (e) { return {refused: true, kind: e.kind, msg: String(e)}; }"#,
+        );
+        assert_eq!(v["refused"], json!(true), "{v}");
+        assert_eq!(v["kind"], json!("lib"), "{v}");
+        assert!(v["msg"].as_str().unwrap_or("").contains("read cap"), "{v}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A-M2: cycle-cut (a → b → a loads each once) and the throwing-eval
+    /// marker discipline (marker deleted on throw → a retry re-attempts).
+    #[test]
+    fn lib_cycle_cut_and_retry_after_throw() {
+        let dir = scratch();
+        let tool = lib_tool();
+        let out = tool
+            .run_with_emit(
+                &json!({"code": r#"
+                    saveLib("lib/a.js", "include('lib/b.js'); globalThis.a = (globalThis.a || 0) + 1;");
+                    saveLib("lib/b.js", "include('lib/a.js'); globalThis.b = (globalThis.b || 0) + 1;");
+                    return 1;"#}),
+                &ctx(&dir),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        let v = js_out(
+            &tool,
+            &dir,
+            r#"
+            include("lib/a.js");
+            return {a: globalThis.a, b: globalThis.b};"#,
+        );
+        assert_eq!(v, json!({"a": 1, "b": 1}), "cycle cut, each lib once: {v}");
+
+        let v = js_out(
+            &tool,
+            &dir,
+            r#"
+            saveLib("lib/x.js", "throw new Error('boom');");
+            var caught = 0, rethrown = 0;
+            try { include("lib/x.js"); } catch (e) { caught = 1; }
+            try { include("lib/x.js"); rethrown = 1; } catch (e2) { rethrown = String(e2).indexOf("boom") !== -1 ? 2 : 3; }
+            return {caught: caught, second: rethrown};"#,
+        );
+        assert_eq!(
+            v,
+            json!({"caught": 1, "second": 2}),
+            "throwing lib re-attempts after the marker was deleted: {v}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A-M3: a hooks Deny on the pseudo-tool ("include" — no dunder) throws
+    /// kind="hooks" in the guest, fires after_tool(executed=false), and
+    /// audits as not-ok.
+    #[test]
+    fn lib_hooks_deny_pseudo_tool() {
+        use crate::hooks::{Hooks, ToolDecision};
+        use std::sync::Mutex;
+
+        struct DenyIncludeHooks {
+            afters: Mutex<Vec<bool>>,
+        }
+        impl Hooks for DenyIncludeHooks {
+            fn before_tool(&self, tool: &str, _i: &Value, _c: &ToolCtx) -> ToolDecision {
+                if tool == "include" {
+                    ToolDecision::Deny("no libs today".into())
+                } else {
+                    ToolDecision::Allow
+                }
+            }
+            fn after_tool(
+                &self,
+                _t: &str,
+                _i: &Value,
+                _o: &ToolOutput,
+                executed: bool,
+                _ctx: &ToolCtx,
+            ) {
+                self.afters.lock().unwrap().push(executed);
+            }
+        }
+        let hooks = Arc::new(DenyIncludeHooks {
+            afters: Mutex::new(Vec::new()),
+        });
+        let dir = scratch();
+        plant_lib(&dir, "t.js", "var t = 1;", "ok");
+        let mut c = ctx(&dir);
+        c.hooks = Some(hooks.clone());
+        let out = lib_tool()
+            .run_with_emit(
+                &json!({"code": r#"
+                    try { include("lib/t.js"); return {denied: false}; }
+                    catch (e) { return {denied: true, kind: e.kind, msg: String(e)}; }"#}),
+                &c,
+                &mut |_| {},
+            )
+            .unwrap();
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        assert_eq!(v["denied"], json!(true), "{}", out.content);
+        assert_eq!(v["kind"], json!("hooks"), "{}", out.content);
+        assert!(
+            v["msg"].as_str().unwrap_or("").contains("no libs today"),
+            "{}",
+            out.content
+        );
+        assert_eq!(*hooks.afters.lock().unwrap(), vec![false]);
+        let meta = out.meta.expect("audit meta");
+        assert_eq!(meta["calls"][0]["name"], json!("__include"));
+        assert_eq!(meta["calls"][0]["ok"], json!(false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A-M5: deny_paths covers the lib channel — `lib/**` refuses an
+    /// otherwise-valid, st=ok library.
+    #[test]
+    fn lib_deny_paths_blocks_include() {
+        let dir = scratch();
+        plant_lib(&dir, "t.js", "var t = 1;", "ok");
+        let cfg = CodeConfig {
+            deny_paths: vec!["lib/**".into()],
+            ..include_cfg()
+        };
+        let out = tool_with_tools(cfg, r#"["read_file","write_file","list_dir"]"#)
+            .run_with_emit(
+                &json!({"code": r#"
+                    try { include("lib/t.js"); return {denied: false}; }
+                    catch (e) { return {denied: true, kind: e.kind, msg: String(e)}; }"#}),
+                &ctx(&dir),
+                &mut |_| {},
+            )
+            .unwrap();
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        assert_eq!(v["denied"], json!(true), "{}", out.content);
+        assert_eq!(v["kind"], json!("denied"), "{}", out.content);
+        assert!(
+            v["msg"].as_str().unwrap_or("").contains("deny_paths"),
+            "{}",
+            out.content
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A-M9 escape legs on the lib channel: `../` spelling escapes and
+    /// symlinks under lib/ must be refused by the confinement walk (the same
+    /// three-discipline walk the file tools use), for BOTH `__include` and
+    /// `__hash_file`. The symlink leg forges a matching-hash INDEX entry —
+    /// proving the refusal is the path walk, not a hash/admission miss.
+    #[cfg(unix)]
+    #[test]
+    fn lib_channel_path_escape_legs() {
+        use std::os::unix::fs::symlink;
+        let dir = scratch();
+        plant_lib(&dir, "real.js", "globalThis.fromReal = 1;", "ok");
+        // A file OUTSIDE lib/ that the escapes try to reach; give it a valid
+        // machine line so only the path walk stands in the way.
+        std::fs::write(dir.join("evil.js"), "globalThis.escaped = 1;").unwrap();
+        symlink("../evil.js", dir.join("lib/alias.js")).unwrap();
+        let hex = sha256_hex(b"globalThis.escaped = 1;");
+        let index = std::fs::read_to_string(dir.join(LIB_INDEX_REL)).unwrap();
+        std::fs::write(
+            dir.join(LIB_INDEX_REL),
+            format!("{index}<!-- ta-lib: path=alias.js sha256={hex} needs=- ver=1 st=ok -->\n"),
+        )
+        .unwrap();
+        let v = js_out(
+            &lib_tool(),
+            &dir,
+            r#"
+            function attempt(kind, path) {
+                try { tools.call(kind, {path: path}); return "ran"; }
+                catch (e) { return e.kind + ": " + String(e); }
+            }
+            return {
+                dotsInclude: attempt("__include", "lib/../evil.js"),
+                dotsHash: attempt("__hash_file", "lib/../evil.js"),
+                linkInclude: attempt("__include", "lib/alias.js"),
+                linkHash: attempt("__hash_file", "lib/alias.js"),
+                clean: (include("lib/real.js"), globalThis.fromReal === 1),
+            };"#,
+        );
+        for leg in ["dotsInclude", "dotsHash", "linkInclude", "linkHash"] {
+            let msg = v[leg].as_str().unwrap_or_default();
+            assert!(
+                msg.starts_with("denied: ") && msg.contains("under lib/"),
+                "{leg} must refuse at the confinement walk: {v}"
+            );
+        }
+        assert_eq!(v["clean"], json!(true), "the honest path still works: {v}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Whitespace lib paths (impl-review #3): INDEX machine lines are
+    /// whitespace-tokenized on the host — `saveLib("lib/a b.js")` used to
+    /// sail through and poison EVERY later include with a malformed-index
+    /// error. Rejected at the JS boundary before any write, and the host
+    /// channel (`lib_rel`) refuses such paths even when a file exists.
+    /// Plus the `__hash_file` read-cap leg: a >1 MiB lib file refuses with
+    /// the cap error instead of an unbounded host slurp (impl-review #4).
+    #[test]
+    fn lib_whitespace_paths_refused_and_hash_read_capped() {
+        let dir = scratch();
+        let v = js_out(
+            &lib_tool(),
+            &dir,
+            r#"
+            var saveMsg = null;
+            try { saveLib("lib/a b.js", "var x = 1;"); } catch (e) { saveMsg = String(e); }
+            var hashKind = null;
+            try { tools.call("__hash_file", {path: "lib/a b.js"}); }
+            catch (e) { hashKind = e.kind; }
+            return {saveMsg: saveMsg, hashKind: hashKind};"#,
+        );
+        assert!(
+            v["saveMsg"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("whitespace"),
+            "JS boundary rejects before any write: {v}"
+        );
+        assert_eq!(v["hashKind"], json!("denied"), "host channel refuses: {v}");
+        assert!(
+            !dir.join(LIB_INDEX_REL).exists(),
+            "no poisoned INDEX was written"
+        );
+        // Sparse file just over the cap — the read is bounded, the refusal
+        // is the cap error (not an unbounded slurp into host memory).
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        let big = std::fs::File::create(dir.join("lib/big.js")).unwrap();
+        big.set_len(MAX_CODE_BYTES as u64 + 4096).unwrap();
+        drop(big);
+        let v = js_out(
+            &lib_tool(),
+            &dir,
+            r#"
+            try { tools.call("__hash_file", {path: "lib/big.js"}); return {capped: false}; }
+            catch (e) { return {capped: true, kind: e.kind, msg: String(e)}; }"#,
+        );
+        assert_eq!(v["capped"], json!(true), "{}", v);
+        assert_eq!(v["kind"], json!("lib"), "{}", v);
+        assert!(
+            v["msg"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("lib read cap"),
+            "{}",
+            v
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A-M2 negative legs: the include channel is an INDIRECT eval in global
+    /// scope — `function`/`var` declarations leak to globalThis (the export
+    /// contract), while lexical declarations (`let`/`const`/`class`) stay in
+    /// the eval's own environment, and a `'use strict'` prologue confines
+    /// even `function`/`var`. A QuickJS change to eval scoping must trip
+    /// this pin, not a downstream task.
+    #[test]
+    fn lib_lexical_and_strict_declarations_not_exported() {
+        let dir = scratch();
+        let v = js_out(
+            &lib_tool(),
+            &dir,
+            r#"
+            saveLib("lib/lex.js",
+                "function fn() { return 1; }\nvar vv = 2;\nlet ll = 3;\nconst cc = 4;\nclass KK {}\nglobalThis.ran = true;");
+            saveLib("lib/strict.js", "'use strict';\nfunction sf() { return 9; }\nvar sv = 9;");
+            include("lib/lex.js");
+            include("lib/strict.js");
+            return {
+                fn: typeof fn, vv: typeof vv,
+                ll: typeof ll, cc: typeof cc, kk: typeof KK,
+                ran: globalThis.ran === true,
+                sf: typeof sf, sv: typeof sv,
+            };"#,
+        );
+        assert_eq!(v["fn"], json!("function"), "functions export: {v}");
+        assert_eq!(v["vv"], json!("number"), "vars export: {v}");
+        for leg in ["ll", "cc", "kk"] {
+            assert_eq!(
+                v[leg],
+                json!("undefined"),
+                "lexical declaration '{leg}' must not export: {v}"
+            );
+        }
+        assert_eq!(v["ran"], json!(true), "side effects of the load run: {v}");
+        for leg in ["sf", "sv"] {
+            assert_eq!(
+                v[leg],
+                json!("undefined"),
+                "strict-mode lib must not export '{leg}': {v}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A-M10's last leg — the recorded LIMITATION, pinned so it stays a
+    /// documented fact rather than a regression: the include gate does not
+    /// cover every execution path. A guest can always `readAll` a lib file
+    /// (reads are not lib-gated) and `eval` it itself — the lib channel's
+    /// admission is load-channel hygiene, not a containment boundary.
+    #[test]
+    fn lib_readall_eval_still_works() {
+        let dir = scratch();
+        // st=draft + no session registration → include must refuse…
+        plant_lib(&dir, "x.js", "globalThis.viaEval = 41;", "draft");
+        let v = js_out(
+            &lib_tool(),
+            &dir,
+            r#"
+            var refused = null;
+            try { include("lib/x.js"); refused = false; }
+            catch (e) { refused = e.kind; }
+            // …but readAll + eval is ordinary guest code and still runs.
+            eval(readAll("lib/x.js"));
+            return {refused: refused, viaEval: (globalThis.viaEval || 0) + 1};"#,
+        );
+        assert_eq!(v["refused"], json!("lib"), "draft admission refuses: {v}");
+        assert_eq!(
+            v["viaEval"],
+            json!(42),
+            "readAll+eval bypasses admission: {v}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A-M11: multi-lib upsert never crosses INDEX entries, and a failed
+    /// INDEX write (here: a directory squatting on the INDEX path) errors
+    /// the whole saveLib WITHOUT leaving a half-registration that admits —
+    /// the lib file may exist on disk, but include still refuses.
+    #[test]
+    fn lib_index_upsert_and_partial_failure() {
+        let dir = scratch();
+        js_out(
+            &lib_tool(),
+            &dir,
+            r#"
+            saveLib("lib/a.js", "globalThis.a = 1;");
+            saveLib("lib/b.js", "globalThis.b = 2;");
+            saveLib("lib/a.js", "globalThis.a = 10;");
+            return 1;"#,
+        );
+        let index = std::fs::read_to_string(dir.join(LIB_INDEX_REL)).unwrap();
+        assert_eq!(
+            index.matches("ta-lib:").count(),
+            2,
+            "upsert replaces, never duplicates: {index}"
+        );
+        assert!(
+            index.contains("path=a.js") && index.contains("path=b.js"),
+            "both entries intact: {index}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("lib/a.js")).unwrap(),
+            "globalThis.a = 10;",
+            "upsert wrote the new content"
+        );
+        // Partial-failure leg: the INDEX path is unusable → saveLib errors…
+        let dir2 = scratch();
+        std::fs::create_dir_all(dir2.join("lib/INDEX.md")).unwrap();
+        let out = lib_tool()
+            .run_with_emit(
+                &json!({"code": r#"saveLib("lib/c.js", "var c = 1;"); return 1;"#}),
+                &ctx(&dir2),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(
+            out.is_error,
+            "INDEX write failure surfaces: {}",
+            out.content
+        );
+        assert!(
+            dir2.join("lib/c.js").exists(),
+            "the lib file half of the write did land — this is the partial state"
+        );
+        // …and the half-state does not admit: no entry, refused.
+        let v = js_out(
+            &lib_tool(),
+            &dir2,
+            r#"
+            try { include("lib/c.js"); return {admitted: true}; }
+            catch (e) { return {admitted: false, kind: e.kind}; }"#,
+        );
+        assert_eq!(v["admitted"], json!(false), "{}", json!(v));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// A-M4 (folded into the audit assertions above) + A-M9: gate OFF is the
+    /// old binary's model-visible contract — no prelude helpers, reserved-name
+    /// direct calls refused naming the knob, no 【库】 in the description.
+    #[test]
+    fn gate_off_matches_old_contract() {
+        let out = run_code(
+            r#"return [typeof include, typeof saveLib];"#,
+            CodeConfig::default(),
+        );
+        assert_eq!(out.content, "[\"undefined\",\"undefined\"]");
+        let out = run_code(
+            r#"
+            try { tools.call("__include", {path: "lib/x.js"}); return {refused: false}; }
+            catch (e) { return {refused: true, kind: e.kind, msg: String(e)}; }"#,
+            CodeConfig::default(),
+        );
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        assert_eq!(v["refused"], json!(true), "{}", out.content);
+        assert_eq!(v["kind"], json!("denied"), "{}", out.content);
+        assert!(
+            v["msg"]
+                .as_str()
+                .unwrap_or("")
+                .contains("code.include=false"),
+            "refusal names the knob: {}",
+            out.content
+        );
+        // Both lib-family reserved names refuse the same way when gated off
+        // (MD-2: hash is a gated host action, not the introspection class).
+        let out = run_code(
+            r#"
+            try { tools.call("__hash_file", {path: "lib/x.js"}); return {refused: false}; }
+            catch (e) { return {refused: true, kind: e.kind, msg: String(e)}; }"#,
+            CodeConfig::default(),
+        );
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        assert_eq!(v["refused"], json!(true), "{}", out.content);
+        assert_eq!(v["kind"], json!("denied"), "{}", out.content);
+        assert!(
+            v["msg"]
+                .as_str()
+                .unwrap_or("")
+                .contains("code.include=false"),
+            "hash refusal names the same knob: {}",
+            out.content
+        );
+        let d = tool_with(CodeConfig::default()).def().description;
+        assert!(
+            !d.contains("【库】") && !d.contains("saveLib"),
+            "gate-off description must stay the old contract"
+        );
+    }
+
+    /// MD-13 gate-ON description: the 【库】 overlay names exactly the two
+    /// new helpers and stays slim (bounded like the base).
+    #[test]
+    fn gate_on_description_lists_lib_helpers() {
+        let d = tool_with(include_cfg()).def().description;
+        assert!(d.contains("【库】"), "{d}");
+        assert!(
+            d.contains("include(path)") && d.contains("saveLib(path, src)"),
+            "{d}"
+        );
+        // Base contract unchanged underneath the overlay.
+        assert!(d.contains("readAll") && d.contains("writeVerified"), "{d}");
+        assert!(
+            d.chars().count() <= 1500,
+            "gate-on description grew to {} chars",
+            d.chars().count()
+        );
+    }
+
+    /// saveLib's own input check: non-lib/ paths throw before any write.
+    #[test]
+    fn save_lib_requires_lib_prefix() {
+        let dir = scratch();
+        let v = js_out(
+            &lib_tool(),
+            &dir,
+            r#"
+            try { saveLib("out/x.js", "var x = 1;"); return {threw: false}; }
+            catch (e) { return {threw: true, msg: String(e)}; }"#,
+        );
+        assert_eq!(v["threw"], json!(true), "{v}");
+        assert!(
+            v["msg"]
+                .as_str()
+                .unwrap_or("")
+                .contains("must start with lib/"),
+            "{v}"
+        );
+        assert!(!dir.join("out").exists(), "nothing written on refusal");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A-M6 lifecycle e2e: 起草登记 → 新会话 draft 拒 → 负责人批准相同 hash →
+    /// 加载 → 局部覆写（本次生效、文件不变）→ saveLib 写回回 draft（原批准作废）
+    /// → 再批准后才复可用；内容未变时重新登记可救活。
+    #[test]
+    fn lib_lifecycle_e2e() {
+        let dir = scratch();
+        // 1. 起草登记（会话 A）。
+        let tool_a = lib_tool();
+        let out = tool_a
+            .run_with_emit(
+                &json!({"code": r#"saveLib("lib/judge.js", "function judge(x) { return x > 0 ? 'pos' : 'neg'; }"); return 1;"#}),
+                &ctx(&dir),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        // 2. 新会话（fresh lineage）直接加载 draft → 拒。
+        let tool_b = lib_tool();
+        let v = js_out(
+            &tool_b,
+            &dir,
+            r#"
+            try { include("lib/judge.js"); return {refused: false}; }
+            catch (e) { return {refused: true}; }"#,
+        );
+        assert_eq!(v["refused"], json!(true), "draft needs approval: {v}");
+        // 3. 负责人批准相同 hash（st: draft → ok，内容不动）。
+        let index = std::fs::read_to_string(dir.join(LIB_INDEX_REL)).unwrap();
+        std::fs::write(dir.join(LIB_INDEX_REL), index.replace("st=draft", "st=ok")).unwrap();
+        // 4. 加载（无会话登记，纯 st=ok 准入）+ 5. 局部覆写本次生效、文件不变。
+        let v = js_out(
+            &tool_b,
+            &dir,
+            r#"
+            include("lib/judge.js");
+            function judge(x) { return x > 0 ? 'POS' : 'neg'; }
+            return {overridden: judge(1), onDiskStillOld: readAll("lib/judge.js").indexOf("POS") === -1};"#,
+        );
+        assert_eq!(v["overridden"], json!("POS"), "{v}");
+        assert_eq!(v["onDiskStillOld"], json!(true), "{v}");
+        // 6. 写回：新哈希登记、回 draft。
+        let out = tool_b
+            .run_with_emit(
+                &json!({"code": r#"
+                    include("lib/judge.js");
+                    function judge(x) { return x > 0 ? 'POSITIVE' : 'neg'; }
+                    saveLib("lib/judge.js", "function judge(x) { return x > 0 ? 'POSITIVE' : 'neg'; }");
+                    return 1;"#}),
+                &ctx(&dir),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        let index = std::fs::read_to_string(dir.join(LIB_INDEX_REL)).unwrap();
+        assert!(
+            index.contains("st=draft"),
+            "write-back resets draft: {index}"
+        );
+        // 7. 原批准作废：fresh lineage 再次被拒（回 draft 且其会话未登记）。
+        let v = js_out(
+            &lib_tool(),
+            &dir,
+            r#"
+            try { include("lib/judge.js"); return {refused: false}; }
+            catch (e) { return {refused: true}; }"#,
+        );
+        assert_eq!(
+            v["refused"],
+            json!(true),
+            "approval died with the old hash: {v}"
+        );
+        // 8. 内容未变时重新登记可救活（同 hash，本会话登记）。
+        let v = js_out(
+            &lib_tool(),
+            &dir,
+            r#"
+            var src = readAll("lib/judge.js");
+            saveLib("lib/judge.js", src);
+            include("lib/judge.js");
+            return judge(2);"#,
+        );
+        assert_eq!(v, json!("POSITIVE"), "re-register same bytes revives: {v}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// MD-13/M2 + LD-15/M2: the skill's gated sections ride their
+    /// assembly-time gates — off strips the marked block (gate-off skill =
+    /// pre-gate contract, still frontmatter-valid), on keeps the file
+    /// verbatim. Both sections strip independently.
+    #[test]
+    fn skill_gated_sections_ride_their_gates() {
+        let on = run_code_skill_md(true, true);
+        assert!(on.contains("库与复用") && on.contains("批量调用"));
+        assert_eq!(on, RUN_CODE_SKILL_MD, "both gates on is the file verbatim");
+        let off = run_code_skill_md(false, false);
+        assert!(
+            !off.contains("库与复用") && !off.contains("批量调用（需配置开启"),
+            "gates off strip both sections: {off}"
+        );
+        assert!(
+            !off.contains("saveLib")
+                && !off.contains("BEGIN LIB SECTION")
+                && !off.contains("callBatch")
+                && !off.contains("BEGIN BATCH SECTION"),
+            "gate-off body teaches neither feature: {off}"
+        );
+        // The stripped skill must still parse as a valid built-in.
+        assert!(
+            crate::skills::embedded_entry(&off).is_some(),
+            "stripped skill stays valid"
+        );
+        // And the gate-off body carries the rest of the guide unchanged —
+        // including the shared e.kind line in its pre-gate wording (no "lib"
+        // class outside the markers: the gate-off contract stays the old
+        // binary's).
+        assert!(off.contains("read_file 的三种模式") && off.contains("批量操作纪律"));
+        assert!(
+            off.contains("`tool`=工具自身失败）、`e.tool`"),
+            "shared kind line keeps its pre-gate wording"
+        );
+        // Each gate strips only its own section.
+        let lib_only = run_code_skill_md(true, false);
+        assert!(lib_only.contains("库与复用") && !lib_only.contains("BATCH SECTION"));
+        let batch_only = run_code_skill_md(false, true);
+        assert!(!batch_only.contains("库与复用") && batch_only.contains("callBatch"));
+    }
+
+    // ── code_llm M2: callBatch（只读并行批量） ────────────────────────────
+    //
+    // A-L 编号对应 docs/code_llm_design.md §7 的验收清单；A-L4 的真实 llm
+    // 吞吐与 e2e 时间区间重叠证明留 M3/V0-B（里程碑表），这里用进程内真实
+    // 线程 + host 侧时间戳重叠钉住并发本身。
+
+    fn batch_cfg() -> CodeConfig {
+        CodeConfig {
+            call_batch: true,
+            ..CodeConfig::default()
+        }
+    }
+
+    fn batch_tool() -> RunCodeTool {
+        tool_with_tools(batch_cfg(), r#"["read_file","write_file","list_dir"]"#)
+    }
+
+    /// A-L8（call_batch 半边）: gate off = the pre-batch binary's
+    /// model-visible contract — no wrapper in the prelude, reserved-name
+    /// direct call falls through to the ordinary unknown-tool error (LD-19
+    /// 保留名直调钉住), no 【批量】 in the description.
+    #[test]
+    fn batch_gate_off_matches_old_contract() {
+        let out = run_code(r#"return typeof tools.callBatch;"#, CodeConfig::default());
+        assert_eq!(out.content, "\"undefined\"");
+        let out = run_code(
+            r#"
+            try { tools.call("__call_batch", {entries: []}); return {refused: false}; }
+            catch (e) { return {refused: true, kind: e.kind, msg: String(e)}; }"#,
+            CodeConfig::default(),
+        );
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        assert_eq!(v["refused"], json!(true), "{}", out.content);
+        assert_eq!(v["kind"], json!("unknown_tool"), "{}", out.content);
+        assert!(
+            v["msg"].as_str().unwrap_or("").contains("__call_batch"),
+            "the unknown-tool path names the called name: {}",
+            out.content
+        );
+        let d = tool_with(CodeConfig::default()).def().description;
+        assert!(
+            !d.contains("【批量】") && !d.contains("callBatch"),
+            "gate-off description must stay the old contract: {d}"
+        );
+    }
+
+    /// A-L4 basics: results in submission order, auto-parsed contents, the
+    /// event pair per entry (ToolCall serial at gate time, ToolResult on
+    /// completion), K entries = K audit calls — the wrapper itself is
+    /// transport and neither announces nor counts.
+    #[test]
+    fn batch_submission_order_events_and_quota() {
+        let dir = scratch();
+        for (n, body) in [("a.txt", "AA"), ("b.txt", "BB"), ("c.txt", "CC")] {
+            std::fs::write(dir.join(n), body).unwrap();
+        }
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let out = batch_tool()
+            .run_with_emit(
+                &json!({"code": r#"
+                    const rs = tools.callBatch([
+                        {name: "read_file", args: {path: "c.txt", format: "json"}},
+                        {name: "read_file", args: {path: "a.txt", format: "json"}},
+                        {name: "read_file", args: {path: "b.txt", format: "json"}}
+                    ]);
+                    return rs.map(r => r.content.trim());"#}),
+                &ctx(&dir),
+                &mut |ev| events.push(ev),
+            )
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        assert_eq!(
+            v,
+            json!(["CC", "AA", "BB"]),
+            "results in submission order: {v}"
+        );
+        // Sequential inline entries: all ToolCalls announced during the
+        // serial prep, ToolResults on completion — and the wrapper itself
+        // never appears in the event stream.
+        let names = |key: &str, is_result: bool| -> Vec<String> {
+            events
+                .iter()
+                .filter_map(|e| match (key, e, is_result) {
+                    ("call", AgentEvent::ToolCall { name, .. }, _) => Some(name.clone()),
+                    ("result", AgentEvent::ToolResult { name, .. }, _) => Some(name.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            names("call", false),
+            vec!["read_file", "read_file", "read_file"],
+            "ToolCall serial in submission order"
+        );
+        assert_eq!(
+            names("result", true),
+            vec!["read_file", "read_file", "read_file"],
+            "ToolResult pairs every announced entry"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolCall { name, .. } if name.contains("batch"))),
+            "the reserved name is transport, not an announced call"
+        );
+        let meta = out.meta.expect("audit meta");
+        assert_eq!(meta["call_count"], 3, "K entries count as K calls: {meta}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A-L4: single-entry failures are entries, not aborts — a tool error,
+    /// a non-batchable tool, an unknown tool, and a malformed shape each
+    /// become their own array slot (kind carries the class, no `halted` on
+    /// non-halt classes), and the batch keeps going.
+    #[test]
+    fn batch_mixed_outcomes_single_entry_errors() {
+        let dir = scratch();
+        std::fs::write(dir.join("ok.txt"), "hello").unwrap();
+        let v = js_out(
+            &batch_tool(),
+            &dir,
+            r#"
+            const rs = tools.callBatch([
+                {name: "read_file", args: {path: "ok.txt", format: "json"}},
+                {name: "read_file", args: {path: "missing.txt", format: "json"}},
+                {name: "write_file", args: {path: "x.txt", content: "no"}},
+                {name: "no_such_tool", args: {}},
+                {name: "read_file", args: 5}
+            ]);
+            return rs.map(r => r instanceof Error
+                ? {err: true, kind: r.kind, halted: r.halted === undefined ? null : r.halted}
+                : {err: false});"#,
+        );
+        let arr = v.as_array().expect("the wrapper returns an array");
+        assert_eq!(arr.len(), 5, "every entry gets a slot: {v}");
+        assert_eq!(v[0]["err"], json!(false), "success stays a value: {v}");
+        assert_eq!(v[1]["kind"], json!("tool"), "tool failure: {v}");
+        assert_eq!(v[2]["kind"], json!("batch"), "non-batchable refused: {v}");
+        assert_eq!(v[3]["kind"], json!("unknown_tool"), "unknown name: {v}");
+        assert_eq!(
+            v[4]["kind"],
+            json!("batch"),
+            "non-object args is the entry shape error: {v}"
+        );
+        for i in 1..5 {
+            assert_eq!(
+                v[i]["halted"],
+                json!(null),
+                "non-halt classes carry no halted: {v}"
+            );
+        }
+        // The refused write never executed.
+        assert!(!dir.join("x.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A-L4: a hooks Deny on ONE entry → that entry is a kind="hooks" Error
+    /// (after_tool(executed=false) fires) and the batch does NOT abort.
+    #[test]
+    fn batch_hooks_deny_single_entry_does_not_abort() {
+        use crate::hooks::{Hooks, ToolDecision};
+        use std::sync::Mutex;
+
+        struct DenySecond {
+            afters: Mutex<Vec<(String, bool)>>,
+        }
+        impl Hooks for DenySecond {
+            fn before_tool(&self, tool: &str, input: &Value, _c: &ToolCtx) -> ToolDecision {
+                if tool == "read_file" && input["path"].as_str() == Some("b.txt") {
+                    return ToolDecision::Deny("not b today".into());
+                }
+                ToolDecision::Allow
+            }
+            fn after_tool(
+                &self,
+                t: &str,
+                _i: &Value,
+                _o: &ToolOutput,
+                executed: bool,
+                _c: &ToolCtx,
+            ) {
+                self.afters.lock().unwrap().push((t.to_string(), executed));
+            }
+        }
+        let dir = scratch();
+        std::fs::write(dir.join("a.txt"), "A").unwrap();
+        std::fs::write(dir.join("b.txt"), "B").unwrap();
+        std::fs::write(dir.join("c.txt"), "C").unwrap();
+        let hooks = Arc::new(DenySecond {
+            afters: Mutex::new(Vec::new()),
+        });
+        let mut c = ctx(&dir);
+        c.hooks = Some(hooks.clone());
+        let out = batch_tool()
+            .run_with_emit(
+                &json!({"code": r#"
+                    const rs = tools.callBatch([
+                        {name: "read_file", args: {path: "a.txt", format: "json"}},
+                        {name: "read_file", args: {path: "b.txt", format: "json"}},
+                        {name: "read_file", args: {path: "c.txt", format: "json"}}
+                    ]);
+                    return rs.map(r => r instanceof Error ? r.kind : r.content.trim());"#}),
+                &c,
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        assert_eq!(
+            v,
+            json!(["A", "hooks", "C"]),
+            "denied entry is an Error slot, siblings ran: {v}"
+        );
+        let afters = hooks.afters.lock().unwrap().clone();
+        // after_tool order is gate/completion order, not submission order:
+        // the Deny notifies at its gate slot (prep), the executed entries at
+        // their completions — the flags themselves are the contract.
+        assert_eq!(
+            afters,
+            vec![
+                ("read_file".to_string(), false),
+                ("read_file".to_string(), true),
+                ("read_file".to_string(), true)
+            ],
+            "after_tool fires per entry with the honest executed flag"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// §4 额度 + LD-9: K entries count as K calls; over-budget tail entries
+    /// are kind="budget" halted:true (call-limit latches), and the latch
+    /// holds for post-batch single calls.
+    #[test]
+    fn batch_call_limit_tail_entries_budget_halted() {
+        let dir = scratch();
+        for n in ["a", "b", "c", "d", "e"] {
+            std::fs::write(dir.join(format!("{n}.txt")), n).unwrap();
+        }
+        let cfg = CodeConfig {
+            call_batch: true,
+            max_tool_calls: 3,
+            ..CodeConfig::default()
+        };
+        let tool = tool_with_tools(cfg, r#"["read_file","write_file","list_dir"]"#);
+        // Same execution throughout: the latch is per-execution by design
+        // ("the budget resets every invocation") — the post-batch single
+        // call must fail fast within THIS run_code invocation.
+        let out = tool
+            .run_with_emit(
+                &json!({"code": r#"
+                    const entries = ["a", "b", "c", "d", "e"].map(n =>
+                        ({name: "read_file", args: {path: n + ".txt", format: "json"}}));
+                    const rs = tools.callBatch(entries);
+                    const shape = rs.map(r => r instanceof Error
+                        ? {k: r.kind, h: r.halted} : "ok");
+                    var after = "ran";
+                    try { tools.call("read_file", {path: "a.txt", format: "json"}); }
+                    catch (e) { after = e.kind; }
+                    return {shape, after};"#}),
+                &ctx(&dir),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        assert_eq!(
+            v["shape"],
+            json!([
+                "ok", "ok", "ok",
+                {"k": "budget", "h": true},
+                {"k": "budget", "h": true}
+            ]),
+            "admitted prefix runs, tail refused with halted: {v}"
+        );
+        assert_eq!(
+            v["after"],
+            json!("budget"),
+            "the latch holds for the rest of THIS execution: {v}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// impl-review #2: the budget refusal MESSAGE counts each entry exactly
+    /// once. A multi-wave batch recomputes `used` from a dispatch-time
+    /// snapshot; reading the live `calls.len()` there double-counts — by wave
+    /// 2 it already holds this batch's finished traces while `admitted`
+    /// counts the same entries again (the bug printed "(18 of 10)").
+    #[test]
+    fn batch_budget_message_counts_once_across_waves() {
+        let dir = scratch();
+        for n in 0..12 {
+            std::fs::write(dir.join(format!("f{n}.txt")), "x").unwrap();
+        }
+        let cfg = CodeConfig {
+            call_batch: true,
+            max_tool_calls: 10,
+            ..CodeConfig::default()
+        };
+        let tool = tool_with_tools(cfg, r#"["read_file","write_file","list_dir"]"#);
+        let out = tool
+            .run_with_emit(
+                &json!({"code": r#"
+                    var entries = [];
+                    for (var i = 0; i < 12; i++)
+                        entries.push({name: "read_file", args: {path: "f" + i + ".txt", format: "json"}});
+                    const rs = tools.callBatch(entries);
+                    return rs.map(r => r instanceof Error ? String(r.message) : "ok");"#}),
+                &ctx(&dir),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        let arr = v.as_array().expect("array result");
+        assert_eq!(arr.len(), 12, "{v}");
+        assert_eq!(
+            arr.iter().filter(|r| r.as_str() == Some("ok")).count(),
+            10,
+            "admitted prefix runs: {v}"
+        );
+        for r in &arr[10..] {
+            let m = r.as_str().unwrap_or_default();
+            assert!(
+                m.contains("(10 of max_tool_calls=10)"),
+                "refusal counts each entry once: {m}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// §4 cancel: a cancel landing mid-batch → already-passed-gate unstarted
+    /// entries complete as kind="cancel" halted:true entries (the 装配段补发
+    /// discipline, batch form); the in-flight entry that tripped the flag
+    /// still reports its own success.
+    #[test]
+    fn batch_cancel_mid_batch_refuses_tail() {
+        struct TripCancel;
+        impl Tool for TripCancel {
+            fn def(&self) -> ToolDef {
+                ToolDef {
+                    name: "trip_cancel".into(),
+                    description: "test: sets the run cancel flag".into(),
+                    schema: json!({"type": "object", "properties": {}}),
+                }
+            }
+            fn run(&self, _i: &Value, c: &ToolCtx) -> Result<ToolOutput> {
+                if let Some(f) = &c.cancel {
+                    f.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(ToolOutput::text("tripped"))
+            }
+            fn available_to_code(&self) -> bool {
+                true
+            }
+            fn batchable(&self) -> bool {
+                true
+            }
+        }
+        let dir = scratch();
+        std::fs::write(dir.join("a.txt"), "A").unwrap();
+        std::fs::write(dir.join("b.txt"), "B").unwrap();
+        let cfg: Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"K","model":"m","inject_environment":false,
+                "tools":["read_file"],"code":{"enabled":true}}"#,
+        )
+        .unwrap();
+        let tool = RunCodeTool::new(
+            &cfg,
+            Arc::new(RwLock::new(batch_cfg())),
+            &reqwest::blocking::Client::new(),
+            "k",
+            vec![],
+            vec![Arc::new(Box::new(TripCancel))],
+        );
+        let mut c = ctx(&dir);
+        c.cancel = Some(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let out = tool
+            .run_with_emit(
+                &json!({"code": r#"
+                    const rs = tools.callBatch([
+                        {name: "trip_cancel", args: {}},
+                        {name: "read_file", args: {path: "a.txt", format: "json"}},
+                        {name: "read_file", args: {path: "b.txt", format: "json"}}
+                    ]);
+                    return rs.map(r => r instanceof Error
+                        ? {k: r.kind, h: r.halted} : "ran");"#}),
+                &c,
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        assert_eq!(
+            v,
+            json!(["ran", {"k": "cancel", "h": true}, {"k": "cancel", "h": true}]),
+            "in-flight entry completes, tail refused: {v}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A-L4 并行（进程内真实线程版）: a Parallel batchable tool fanned out
+    /// over one 8-entry wave MUST overlap in wall time — host-side (start,
+    /// end) spans prove it; a batch that quietly serialized still passes
+    /// every functional assertion, only the interval intersection catches
+    /// it (the concurrency-needs-overlap-proof lesson).
+    #[test]
+    fn batch_parallel_wave_actually_overlaps() {
+        use std::time::Duration;
+
+        struct SlowProbe {
+            spans: Arc<std::sync::Mutex<Vec<(Instant, Instant)>>>,
+        }
+        impl Tool for SlowProbe {
+            fn def(&self) -> ToolDef {
+                ToolDef {
+                    name: "slow_probe".into(),
+                    description: "test: sleeps then records its span".into(),
+                    schema: json!({"type": "object", "properties": {
+                        "tag": {"type": "string"}
+                    }}),
+                }
+            }
+            fn run(&self, _i: &Value, _c: &ToolCtx) -> Result<ToolOutput> {
+                let s = Instant::now();
+                std::thread::sleep(Duration::from_millis(120));
+                self.spans.lock().unwrap().push((s, Instant::now()));
+                Ok(ToolOutput::text("done"))
+            }
+            fn available_to_code(&self) -> bool {
+                true
+            }
+            fn batchable(&self) -> bool {
+                true
+            }
+            fn concurrency(&self) -> ToolConcurrency {
+                ToolConcurrency::Parallel
+            }
+        }
+        let dir = scratch();
+        // One shared handle: the injected instance and the test's reader see
+        // the same span log.
+        let spans: Arc<std::sync::Mutex<Vec<(Instant, Instant)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let probe: Arc<Box<dyn Tool>> = Arc::new(Box::new(SlowProbe {
+            spans: Arc::clone(&spans),
+        }));
+        let cfg: Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"K","model":"m","inject_environment":false,
+                "tools":["read_file"],"code":{"enabled":true}}"#,
+        )
+        .unwrap();
+        let tool = RunCodeTool::new(
+            &cfg,
+            Arc::new(RwLock::new(batch_cfg())),
+            &reqwest::blocking::Client::new(),
+            "k",
+            vec![],
+            vec![probe],
+        );
+        let t0 = Instant::now();
+        let out = tool
+            .run_with_emit(
+                &json!({"code": r#"
+                    const entries = [1,2,3,4,5,6,7,8].map(i =>
+                        ({name: "slow_probe", args: {tag: String(i)}}));
+                    const rs = tools.callBatch(entries);
+                    return rs.filter(r => r === "done").length;"#}),
+                &ctx(&dir),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        assert_eq!(v, json!(8), "all eight ran: {v}");
+        let wall = t0.elapsed();
+        let recorded = spans.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 8, "eight spans recorded");
+        let mut overlaps = 0usize;
+        for (i, (a_start, a_end)) in recorded.iter().enumerate() {
+            for (j, (b_start, _)) in recorded.iter().enumerate() {
+                if i != j && a_start < b_start && b_start < a_end {
+                    overlaps += 1;
+                }
+            }
+        }
+        assert!(
+            overlaps >= 2,
+            "no interval overlap — the wave serialized: {overlaps} overlaps, wall {}ms",
+            wall.as_millis()
+        );
+        assert!(
+            wall < Duration::from_millis(8 * 120),
+            "wall {}ms — a serial run would be ≥{}ms",
+            wall.as_millis(),
+            8 * 120
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// LD-19 保留名直调（gate ON half): `__call_batch` driven directly walks
+    /// the exact same chain as the wrapper — the guest gets the raw envelope
+    /// ARRAY (the wrapper's Error conversion is sugar on top).
+    #[test]
+    fn batch_reserved_name_direct_call_walks_full_chain() {
+        let dir = scratch();
+        std::fs::write(dir.join("a.txt"), "A").unwrap();
+        let v = js_out(
+            &batch_tool(),
+            &dir,
+            r#"
+            const rs = tools.call("__call_batch", {entries: [
+                {name: "read_file", args: {path: "a.txt", format: "json"}},
+                {name: "write_file", args: {path: "x.txt", content: "no"}}
+            ]});
+            return {n: rs.length, first_ok: rs[0].__ok === true,
+                    first_content_is_string: typeof rs[0].content === "string",
+                    second_kind: rs[1].kind};"#,
+        );
+        assert_eq!(v["n"], json!(2), "{v}");
+        assert_eq!(v["first_ok"], json!(true), "{v}");
+        assert_eq!(
+            v["first_content_is_string"],
+            json!(true),
+            "direct callers get the raw envelope array — per-entry auto-parse \
+             is the wrapper's sugar, not the transport's: {v}"
+        );
+        assert_eq!(v["second_kind"], json!("batch"), "{v}");
+        assert!(!dir.join("x.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// External design-review F1 regression: prep-refused entries still
+    /// pair their ToolResult, land in the audit ledger, and consume quota —
+    /// N denied entries must leave N in `calls.len()`, so post-batch single
+    /// calls see the honest remaining budget (`max_tool_calls` is per
+    /// execution, and the frozen copy promises failed calls count too).
+    #[test]
+    fn batch_refused_entries_pair_events_and_consume_quota() {
+        use crate::hooks::{Hooks, ToolDecision};
+
+        struct DenyAll;
+        impl Hooks for DenyAll {
+            fn before_tool(&self, _t: &str, _i: &Value, _c: &ToolCtx) -> ToolDecision {
+                ToolDecision::Deny("no reads today".into())
+            }
+        }
+        let dir = scratch();
+        std::fs::write(dir.join("a.txt"), "A").unwrap();
+        let cfg = CodeConfig {
+            call_batch: true,
+            max_tool_calls: 2,
+            ..CodeConfig::default()
+        };
+        let tool = tool_with_tools(cfg, r#"["read_file","list_dir"]"#);
+        let mut c = ctx(&dir);
+        c.hooks = Some(Arc::new(DenyAll));
+        let mut events: Vec<AgentEvent> = Vec::new();
+        let out = tool
+            .run_with_emit(
+                &json!({"code": r#"
+                    const rs = tools.callBatch([
+                        {name: "read_file", args: {path: "a.txt", format: "json"}},
+                        {name: "read_file", args: {path: "a.txt", format: "json"}},
+                        {name: "read_file", args: {path: "a.txt", format: "json"}}
+                    ]);
+                    const shape = rs.map(r => r instanceof Error
+                        ? {k: r.kind, h: r.halted === undefined ? null : r.halted} : "ok");
+                    var after = "ran";
+                    try { tools.call("read_file", {path: "a.txt", format: "json"}); }
+                    catch (e) { after = e.kind; }
+                    return {shape, after};"#}),
+                &c,
+                &mut |ev| events.push(ev),
+            )
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        assert_eq!(
+            v["shape"],
+            json!([
+                {"k": "hooks", "h": null},
+                {"k": "hooks", "h": null},
+                {"k": "budget", "h": true}
+            ]),
+            "two denied (admitted) entries + one over-budget tail: {v}"
+        );
+        assert_eq!(
+            v["after"],
+            json!("budget"),
+            "the denied entries consumed the execution's quota: {v}"
+        );
+        // Event pairing: every ANNOUNCED entry has its ToolResult (the
+        // budget tail was refused before announcing, so it stays silent).
+        let calls = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ToolCall { .. }))
+            .count();
+        let results = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ToolResult { .. }))
+            .count();
+        assert_eq!((calls, results), (2, 2), "announced entries pair 1:1");
+        // And the audit ledger agrees with the announcements.
+        let meta = out.meta.expect("audit meta");
+        assert_eq!(meta["call_count"], 2, "{meta}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Whole-call shape: a malformed BATCH (not the entries) throws
+    /// kind="batch" to the guest instead of returning an array.
+    #[test]
+    fn batch_whole_call_shape_error_throws() {
+        let out = batch_tool()
+            .run_with_emit(
+                &json!({"code": r#"
+                    try { tools.callBatch(null); return {threw: false}; }
+                    catch (e) { return {threw: true, kind: e.kind}; }"#}),
+                &ctx(&scratch()),
+                &mut |_| {},
+            )
+            .unwrap();
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        assert_eq!(v["threw"], json!(true), "{}", out.content);
+        assert_eq!(v["kind"], json!("batch"), "{}", out.content);
+    }
+
+    /// LD-15 gate-ON description: the 【批量】 overlay names the wrapper and
+    /// the three no-transaction sentences' home (the skill), stays bounded,
+    /// and composes with the 【库】 overlay without touching the base.
+    #[test]
+    fn gate_on_description_lists_batch_helper() {
+        let d = tool_with(batch_cfg()).def().description;
+        assert!(d.contains("【批量】"), "{d}");
+        assert!(d.contains("tools.callBatch"), "{d}");
+        assert!(d.contains("无原子性、无回滚、部分执行是正常结果"), "{d}");
+        assert!(!d.contains("【库】"), "the other gate stays off: {d}");
+        assert!(
+            d.chars().count() <= 1600,
+            "gate-on description grew to {} chars",
+            d.chars().count()
+        );
+        let both = tool_with(CodeConfig {
+            include: true,
+            call_batch: true,
+            ..CodeConfig::default()
+        })
+        .def()
+        .description;
+        assert!(
+            both.contains("【库】") && both.contains("【批量】"),
+            "{both}"
+        );
+        assert!(
+            both.chars().count() <= 1800,
+            "both-gates description grew to {} chars",
+            both.chars().count()
+        );
+        // And the prelude exposes the wrapper only when on.
+        let out = run_code(r#"return typeof tools.callBatch;"#, batch_cfg());
+        assert_eq!(out.content, "\"function\"");
     }
 }

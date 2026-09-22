@@ -677,6 +677,66 @@ function responseRows(r) {
 - 其余能力一律 `tools.call`；**调 MCP 工具前先 `tools.list()` 核对准确名字**——MCP 工具名长、分隔符易混（`_` 与 `__`），写错名字的失败调用也照扣额度，一批全错就是额度白烧。`tools.list()` 返回**对象数组** `[{name, description}]`（不是字符串数组），取名字用 `.map(t => t.name)`
 - 工具错误可 try/catch，异常带结构化字段：`e.kind`（`denied`=路径/权限拒绝、`hooks`=钩子拒绝、`budget`=调用额度、`deadline`=墙钟、`cancel`=宿主取消（整个执行终止，勿重试）、`unknown_tool`=写错名字、`tool`=工具自身失败）、`e.tool`（调用名）。`e.retryable===false` 的类别重试无意义（改输入或跳过）；`tool` 类**不带** retryable（无法机判，读 message 自行判断）
 
+<!-- BEGIN LIB SECTION（code.include=true 时保留；=false 时装配端整段剔除，见
+     run_code.rs::run_code_skill_md —— 门关时模型可见契约与旧二进制一致） -->
+## 库与复用（需配置开启 code.include；未开启时 include/saveLib 不存在、保留名直调被拒）
+跨任务会重用的逻辑（判别函数、聚合骨架、格式转换）沉淀为 `lib/` 下的库，不要每次重写。生命周期：**建库 → 用库 → 修库**，状态由 `lib/INDEX.md` 的机器行（`st=draft/ok` + 内容哈希）承载。
+
+- **建库**：写成函数声明风格 + 内嵌纯断言自测块（判别库另附 `verify(n)` 探针），用 `saveLib("lib/xxx.js", src)` 落盘——写文件、宿主算哈希、登记 INDEX 一条龙，**恒 `st=draft`**。裸 `write_file` 写的文件 `include` 会被拒（未登记）； INDEX 行同步维护人类字段（io 签名、适用条件、质量证据指针、owner/来源）。
+- **用库**：先 `read_file("lib/INDEX.md")` 对照 `needs` 与当前能力，有现成库就 `include("lib/xxx.js")`（幂等、循环依赖自动截断），只写增量胶水。准入 = `st=ok`（负责人核对内容与证据后人工改）或本会话 `saveLib` 登记过相同内容；旧 draft 被拒时提示负责人处理批准，不要用重新登记绕过审批。
+- **修库**：`include` 后重定义同名函数，本次执行即生效（文件不变）；跑通自测后 `saveLib` 写回——新哈希重新登记、回 `st=draft`，**旧批准与质量成绩不沿用**，须重新验证/批准。
+- **纪律**：库只放代码（函数声明、顶部不放 `'use strict'`、保持多行便于检查、命名带库前缀），不塞业务数据；版本历史交给 git。宿主 include 整文件直读（不受 readAll 分页限制），单库上限 1 MiB。纯断言不调用工具；判别探针显式运行、小样例内嵌。库链路校验失败（未登记/内容与登记哈希不符/超限/门未开启直调保留名）统一 `e.kind="lib"`，属确定性错误，重试无意义。
+- **判别库**（若宿主还启用了 llm 原语，级联判别是最高价值的库形态）：批量前先跑 `verify` 做链路健康检查（全过返回摘要、任一错例 throw，外层收到明确错误不进批量）；实际输出仍按场景质量政策核验，区分「已处理」与「已验证」。程序/依赖/模型/标准变化时，旧跑分只作历史证据。
+
+库源码形态（函数声明 + 自测块；这就是要传给 saveLib 的 src）：
+```js
+// lib-example: 库源码形态，tests execute this exact block in QuickJS.
+function classifyTier(n) {
+  if (n <= 80) return "small";
+  if (n <= 200) return "medium";
+  return "large";
+}
+(function selfTest() {
+  const cases = [[10, "small"], [200, "medium"], [201, "large"]];
+  for (const c of cases)
+    if (classifyTier(c[0]) !== c[1]) throw new Error("tier selfTest: " + c[0]);
+})();
+```
+使用：
+```js
+saveLib("lib/tier.js", TIER_SRC);   // TIER_SRC = 上述形态的源码字符串
+include("lib/tier.js");             // 幂等；自测块在加载时跑一遍
+return classifyTier(150);           // "medium"
+```
+<!-- END LIB SECTION -->
+
+<!-- BEGIN BATCH SECTION（code.call_batch=true 时保留；=false 时装配端整段剔除，见
+     run_code.rs::run_code_skill_md —— 门关时模型可见契约与旧二进制一致） -->
+## 批量调用（需配置开启 code.call_batch；未开启时 tools.callBatch 不存在、直调保留名按未知工具报错）
+
+`tools.callBatch([{name, args}, …])` 并发执行一批**只读**工具调用（分页拉取、逐项判别是理想对象）。并发上限 8/波；结果**按提交序**返回数组。
+
+- **无事务语义（三句话）**：无原子性；无回滚；部分执行是正常结果。批量结果必须**逐条检查**结果数组——哪些条目跑了、哪些被拒纳，数组里如实可见。次序保证仅存在于顺序 for 循环（副作用批量）。
+- **只读面**：仅 batchable 工具可入批（read_file 等纯只读工具）。混入非只读工具（write_file/shell 等）→ 该条目为 `e.kind="batch"` 错误条目，单条不中止；**副作用调用写顺序 for 循环**。
+- **失败条目判别**：单项失败不 throw，该条目为 `Error` 实例带 `e.kind`/`e.tool`——用 `instanceof Error` 判别，细节取 `.kind`/`.message`，**不要 `JSON.stringify` 失败条目**（Error 序列化成 `{}`，细节全丢）。成功条目就是工具结果本体（JSON 自动解析，同 `tools.call`）。
+- **额度**：K 条计 K 次调用计数（失败条目也计）；撞调用额度时尾部条目得 `e.kind="budget"`（`e.halted=true`，沙箱已停只能 return 收尾）。token 预算面（`e.halted=false`、可落盘收尾）随 llm 工具引入，当前无此路径。
+- **超时预算**：`timeout_secs ≈ 单调用预期时长 × ceil(批量规模 / 有效并发度) + 计算与限流余量`；有效并发度不大于 8。仅作规划估算，不是最坏时延保证。
+
+```js
+// callBatch example: 并发拉多页 + 逐条检查（示意端点）。
+const entries = [1, 2, 3, 4].map(p =>
+  ({ name: "mcp_list_items", args: { cursor: null, limit: 100, page: p } }));
+const results = tools.callBatch(entries);
+let ok = 0, bad = [];
+for (const r of results) {
+  if (r instanceof Error) { bad.push({ kind: r.kind, msg: r.message }); continue; }
+  if (!Array.isArray(r.items)) { bad.push({ kind: "shape", msg: "no items" }); continue; }
+  ok += r.items.length;
+}
+return { ok, bad };   // bad 非空就如实上报，不吞
+```
+<!-- END BATCH SECTION -->
+
 ## read_file 的三种模式（tools.call 直调时按需选）
 1. **文本模式**（默认）：首行 `[文件名: 总行数 · 总字符 · complete|行区间 a-b]` 元数据，其后每行 `行号→tab` 前缀；带 limit 截断时末尾多一行 `... [line limit reached]`。需要解析内容时优先 readAll / readLines 或 json 模式，**不要手解析这个格式**
 2. **format:"json"**：返回 `{content, first_line, lines_total, chars_total, truncated, truncation, next_offset}`——content 无前缀。只有 limit 截断（行对齐）给非空 next_offset，循环传 `{offset: next_offset, limit, format:"json"}` 续读直到 null；chars/bytes 截断时 next_offset 为 null（窗口可能切在行中间，无法线对齐续读），此时改用 raw

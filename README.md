@@ -914,6 +914,8 @@ GUI 可渲染"正在构造调用…"（headless 终端不重复打印——完�
   "enabled": true,
   "skill_injection": "on_demand",
   "precheck": false,
+  "include": false,
+  "call_batch": false,
   "deny_paths": [".env", "secrets/**"],
   "fs_write_dirs": [],
   "max_tool_calls": 200,
@@ -929,6 +931,8 @@ GUI 可渲染"正在构造调用…"（headless 终端不重复打印——完�
 | `enabled` | `false` | 运行期开关；`run_code` 不在 `tools` 白名单语义内（开关即 membership，见下） |
 | `skill_injection` | `"on_demand"` | 内置技能 `run-code` 的三态披露：`"on_demand"`（默认，模型经 `read_skill` 按需加载）；`"eager"`（装配时把技能正文以合成 read_skill 问答对预置进会话历史——微调/评测的轨迹对齐用，resume 的历史不重复注入）；`"off"`（内置技能关闭，`read_skill` 命中返回明确的「已被配置关闭」错误；磁盘同名覆盖仍照常服务） |
 | `precheck` | `false` | 执行前静态预检：单遍 lexer 检出沙箱不支持的写法（`async`/`await`/`import`、未声明的 `Promise`/`setTimeout`/`fetch` 调用、`Date.now`/`Math.random`、`tools.call` 保留名 `run_code`/`task`/`todo`），命中即拒答并附修正指引，**代码不执行、无副作用、不占预算**。注意 `__tools_list`/`__budget` 不在检出集内——它们是可工作的只读内省拦截（`tools.budget()` 的底层通道） |
+| `include` | `false` | 库通道开关（code_memory M1）：开启后 guest 增 `include(path)`（加载 `lib/` 下已登记代码库，幂等 + 循环截断，经 `__include` 保留名）与 `saveLib(path, src)`（写库 + `__hash_file` 宿主哈希登记 `lib/INDEX.md`，恒 `st=draft`）两个助手，及描述的【库】段；准入 = `st=ok` 或本会话登记过（clone 共享、不跨会话）。关闭时保留名明确拒绝、模型可见契约与无此特性的旧二进制一致。调用期生效（资源限制先例）；batch 片段只能关不能开 |
+| `call_batch` | `false` | 批量通道开关（code_llm M2，评测门）：开启后 guest 增 `tools.callBatch([{name, args}, …])`（并发执行一批只读工具调用，经 `__call_batch` 保留名逐 entry 走与单次调用完全相同的闸门链；8/波扇出、按提交序返回数组、单项失败为 Error 条目不中止批次）与描述的【批量】段。只读面 = `batchable()` 工具（v1 白名单 `read_file` + MCP `readOnlyHint`，缺注解为否）。关闭时保留名按未知工具报错、模型可见契约与旧二进制一致。调用期生效；batch 片段只能关不能开 |
 | `deny_paths` | `.env`、密钥类目录等 | **经工具的**文件读写拒绝清单（glob：`*` 单段、`**` 跨段），定位**防误读不防恶意**。`shell` 命令不经此层（`cat .env` 照常，见下一行） |
 | `fs_write_dirs` | `[]` = 整个 workdir 可写 | 经工具的写路径白名单（相对 workdir；交集语义，可收紧到无处可写）。**仅约束 4 个文件工具与 `copy_bytes`**——`shell`（含其重定向写入）不经此层与写侧 symlink 拒绝；敌对 guest 的对策是 `restrict_to_workdir` / hooks Deny / 从 `tools` 去 `shell`（A-8 读写两侧同界，有钉住测试） |
 | `max_tool_calls` | 200 | 沙箱内工具调用次数上限（含失败调用）。AppWorld 高循环任务实证：金标方案 91–244 次调用，旧默认 50 连"先摸元数据再批量写"的两阶段打法都装不下（实测摸底阶段即触顶、正事零执行） |
@@ -949,6 +953,37 @@ GUI 可渲染"正在构造调用…"（headless 终端不重复打印——完�
 （`skill_injection`/`precheck` 的装配时值），NDJSON 模式首行打印同内容——bench 复盘可归因轨迹
 出自哪种披露/预检配置。
 
+**库与复用（`code.include`，默认关）**：跨任务复用的逻辑沉淀为 workdir `lib/` 下的库——
+`saveLib("lib/xxx.js", src)` 写文件 + 宿主算 sha256 + 登记 `lib/INDEX.md`（机器行
+`<!-- ta-lib: path=… sha256=… needs=… ver=… st=draft/ok -->`，恒 `st=draft`）；
+`include("lib/xxx.js")` 整文件直读进全局作用域（幂等、循环依赖截断、单库 1 MiB 上限）。
+准入 = `st=ok`（负责人核对内容后人工改）或本会话登记过相同内容（登记集按工具 lineage 共享、
+不跨会话恢复，resume 亦不恢复）；磁盘内容与登记哈希不符 → 硬拒。通道经 `__include`/
+`__hash_file` 保留名走完整策略链（lib/ 收纳 + `deny_paths` + hooks 闸门 + 审计/计额），
+库校验错误 `e.kind="lib"`。门关 = 助手不存在、保留名明确拒绝、描述与 skill 的库段不出现
+（模型可见契约与无此特性的旧二进制一致）；通道与 prelude 调用期生效、描述与 skill 段装配期生效。
+v1 只认 workdir `lib/` 一个库目录；**收紧 `fs_write_dirs` 的部署须把 `lib/` 列入可写集**，
+否则 `saveLib` 的写全部被拒（读不受影响）；库的版本管理交给 git。
+建库/用库/修库生命周期教学在内置技能 `run-code` 的「库与复用」段（`code.include` 开启时才有该段）。
+
+**批量调用（`code.call_batch`，默认关）**：`tools.callBatch([{name, args}, …])` 并发执行一批
+**只读**工具调用（分页拉取、逐项判别是理想对象），经 `__call_batch` 保留名进 host——保留名只是
+入口，不豁免任何闸门：每个 entry 走与单次调用完全相同的序列（入口检查 → hooks 闸门 → deny/fs
+层 → 执行 → after）。**无事务语义（三句话）**：无原子性；无回滚；部分执行是正常结果——结果数组
+如实反映哪些 entry 跑了/被拒，**必须逐条检查**；次序保证仅存在于 guest 顺序 for 循环（副作用批量
+写 for 循环，批内只收 `batchable()` 只读工具，混入副作用工具该条目得 `kind="batch"` 错误条目、
+单条不中止）。单项失败不 throw、该条目为 `Error` 实例带 `e.kind`/`e.tool`（含 LD-9 的
+`e.halted`：latch 态错误为 true——沙箱已停只能 return 收尾；token 预占面的 false 值随 M3 的
+`llm` 工具引入，当前无此路径）。额度 K 条计 K 次调用计数。并发上限 8/波、按提交序返回；事件 ToolCall 在 gate 期按
+提交序串行发、ToolResult 各 entry 完成即发。超时规划公式（不给魔数）：
+`timeout_secs ≈ 单调用预期时长 × ceil(批量规模 / 有效并发度) + 计算与限流余量`（有效并发度 ≤8，
+仅作估算非保证）。实际并发按 `ToolConcurrency` 路由（LD-11）：v1 白名单 `read_file` 与
+MCP `readOnlyHint` 工具是 Sequential，批内按提交序串行执行（契约一致、无提速）；真正并发要等
+Parallel 的 batchable 工具（M3 的 `llm`）。门关 = prelude 不暴露 `callBatch`、保留名直调按未知
+工具报错、描述与 skill 的批量段不出现（模型可见契约与旧二进制一致）；通道调用期生效、描述与
+skill 段装配期生效。教学与陷阱（`instanceof Error` 判别、勿 `JSON.stringify` 失败条目）在内置
+技能 `run-code` 的「批量调用」段（`code.call_batch` 开启时才有该段）。
+
 **代码编排提示词（可选）**：`examples/prompts/agentic-code.md` 在原参考纪律上增加
 “规则明确且剩余有规模”的选择规则，支持探查后换轨与大清单保存在变量/文件中。
 仅在 `run_code` 可用时，将文件第一个 `---` 后的正文设为 `system_prompt`；不会自动加载。
@@ -957,7 +992,7 @@ GUI 可渲染"正在构造调用…"（headless 终端不重复打印——完�
 
 **沙箱内环境**：纯同步 ES2023——无 async/Promise/timer/`import`/`fetch`，`Date.now`/`Math.random`
 不可用（评测可复现）。API 五个：`tools.call(name, args)`（失败 throw、可 try/catch 后继续，异常带
-结构化字段 `e.kind`/`e.tool`/`e.retryable`——`denied`/`hooks`/`budget`/`deadline`/`unknown_tool`
+结构化字段 `e.kind`/`e.tool`/`e.retryable`——`denied`/`hooks`/`budget`/`deadline`/`unknown_tool`/`lib`
 类重试无意义，工具自身失败为 `tool` 类且刻意不给 retryable，由模型读 message 自行判断）、
 `tools.list()`（不确定工具名时先调它）、`tools.budget()`（剩余调用次数 / 墙钟 / 燃料 / run 级
 token 预算 `tokens_left`——未设 `max_total_tokens` 时为 null；查询本身免费，长批量开工前对一下
@@ -966,7 +1001,8 @@ token 预算 `tokens_left`——未设 `max_total_tokens` 时为 null；查询�
 逐字节一致，内容不经过 JS 字符串）。另有三个内置助手（`readAll(path)` / `readLines(path)` /
 `writeVerified(path, content)`）：大文件整读 / 逐行读 / 字节保真写（写后 raw 读回比对，不经文本
 往返），底层就是 `read_file` 的 `format:"json"` 分页与 `raw`/`content_b64` 字节通道——此外没有
-别的内置助手。工具描述刻意保持精简
+别的内置助手（`code.include` 开启时再加 `include`/`saveLib` 两个库助手，见上节；
+`code.call_batch` 开启时再加 `tools.callBatch(entries)` 批量助手，见批量调用节）。工具描述刻意保持精简
 （封闭助手清单 + 指针），深契约与完整示例在**内置技能 `run-code`** 里（`code.enabled` 时自动出现在
 技能列表、经 `read_skill` 按需加载；在自己的技能目录放同名 `run-code/` 可覆盖它）。**可调工具集** =
 主 agent 的工具白名单（含 MCP），但不含 `task` / `todo` / `run_code` 自身；宿主经 `build_agent_with`
@@ -1148,13 +1184,13 @@ release 下 panic 不触发 `Drop`——调试 destructors（如 TUI 终端还�
 ```text
 src/
 ├── main.rs           (  930)  # CLI 入口 + 组装（build_agent）+ --session none
-├── lib.rs            (  534)  # 库根：build_agent* / assemble 装配（工具表、ToolCtx、code 安装、技能注入）
-├── config.rs         ( 1562)  # 配置解析 + 任务片段合并 + 批量覆盖白名单
+├── lib.rs            (  548)  # 库根：build_agent* / assemble 装配（工具表、ToolCtx、code 安装、技能注入）
+├── config.rs         ( 1621)  # 配置解析 + 任务片段合并 + 批量覆盖白名单
 ├── provider/  # LLM 后端
 │   ├── mod.rs            (  930)  # 共享 Message/Block、SSE reader、CancellableSse
 │   ├── openai.rs         ( 1645)  # OpenAI 兼容（include_usage；400 回退：max_tokens→max_completion_tokens / 丢 stream_options）
 │   ├── anthropic.rs      ( 1102)  # Anthropic 原生（message_start/message_delta usage）
-│   └── mock.rs           (  296)  # 测试用脚本化 Provider（cfg(any(test, feature="mock"))）
+│   └── mock.rs           (  340)  # 测试用脚本化 Provider（cfg(any(test, feature="mock"))）
 ├── agent.rs          ( 3369)  # 核心 loop + usage 累计 + cancel + 上下文压缩（前馈/溢出双触发 + 滚动分块摘要）+ 相邻消息归一 + 同 turn 多 task 并行
 ├── agent_tests.rs    ( 8823)  # 核心 loop 回归测试（provider::mock 脚本化，不连网）
 ├── compress.rs       (  810)  # 压缩引擎（find_safe_cut / 分块摘要 / saturating usage 合并 + block 级计费原语）
@@ -1165,18 +1201,18 @@ src/
 ├── skills.rs         ( 1017)  # 三级技能加载（内置 / 用户目录 / 项目）
 ├── hooks.rs          (  181)  # hooks 闸门（Deny / Modify / 审计）
 ├── tools/  # 工具集：内置工具 + MCP 包装 + task 子 agent + run_code（feature code）
-│   ├── mod.rs            (  830)  # Tool trait + ToolCtx + CallbackTool/SharedTool + build 白名单组装
+│   ├── mod.rs            (  941)  # Tool trait + ToolCtx + CallbackTool/SharedTool + build 白名单组装
 │   ├── shell.rs          (  924)  # shell 工具
-│   ├── file.rs           ( 1338)  # read_file / write_file / edit_file / list_dir
+│   ├── file.rs           ( 1345)  # read_file / write_file / edit_file / list_dir
 │   ├── image.rs          (   87)  # load_image 工具
 │   ├── document.rs       (  100)  # PDF → Block::Document 加载（库 API load_document_block）
 │   ├── skill.rs          (  785)  # read_skill / list_skill（不在白名单，由装配注入）
-│   ├── mcp.rs            (  472)  # MCP 工具包装（sanitize_name + wire_name 分发）
+│   ├── mcp.rs            (  485)  # MCP 工具包装（sanitize_name + wire_name 分发）
 │   ├── subagent.rs       (  917)  # task 子 agent 工具（独立上下文 + turn 封顶；不可递归）
 │   ├── todo.rs           (  310)  # todo 工具（任务计划，全量替换；plan 落 result.json）
-│   └── run_code.rs       ( 5572)  # run_code 工具（feature code）：QuickJS-in-wasm 沙箱——epoch/fuel/mem 限额、路径拦截、hooks 闸门、审计 meta（双哈希）
-├── mcp.rs            ( 1422)  # MCP 客户端（stdio / Streamable HTTP / 旧版 SSE）
-├── batch.rs          ( 3035)  # 批量任务 + --retries/--failed + 报告合并
+│   └── run_code.rs       ( 8317)  # run_code 工具（feature code）：QuickJS-in-wasm 沙箱——epoch/fuel/mem 限额、路径拦截、hooks 闸门、审计 meta（双哈希）
+├── mcp.rs            ( 1427)  # MCP 客户端（stdio / Streamable HTTP / 旧版 SSE）
+├── batch.rs          ( 3047)  # 批量任务 + --retries/--failed + 报告合并
 ├── harness.rs        ( 1962)  # headless 模式 + result.json + NDJSON + exit code
 └── tui.rs            ( 7792)  # TUI（feature tui）：内联流式渲染（对话进原生 scrollback）/ InputBuffer 多行输入 / 斜杠命令+补全 / markdown 渲染 / bracketed paste
 ```

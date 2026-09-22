@@ -31,7 +31,11 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Shared context passed to every tool invocation.
+/// Shared context passed to every tool invocation. `Clone` is the documented
+/// sharing idiom for fan-out contexts (`task` children, the run_code batch
+/// wave): every mutable-interest field is Arc-backed or Copy, so a clone
+/// shares cancel/hooks/budget with the original — nothing forks state.
+#[derive(Clone)]
 pub struct ToolCtx {
     pub workdir: PathBuf,
     pub max_output_chars: usize,
@@ -130,9 +134,99 @@ impl BudgetGate {
         self.cap
             .saturating_sub(self.used.load(std::sync::atomic::Ordering::Relaxed))
     }
+
+    /// Pre-hold `n` tokens of in-flight headroom against the cap (M0
+    /// prototype of the LD-17 reservation ledger,
+    /// `docs/code_llm_design.md` §3.1). Unlike post-hoc [`Self::share`]
+    /// folding, the hold and the cap check are ONE atomic step, so a fleet
+    /// of concurrent leaf calls cannot collectively overshoot the budget
+    /// between the check and the charge. Returns `None` — charging nothing
+    /// — when the reservation doesn't fit; callers treat that as a soft
+    /// budget reject, not a halt. Nothing in production calls this yet;
+    /// the sandbox `llm` primitive (M3) will.
+    pub fn reserve(&self, n: u64) -> Option<ReserveGuard> {
+        // fetch_update, not check-then-fetch_add: a racing share() landing
+        // between the check and the add could push the counter past the cap
+        // after the check had already passed.
+        self.used
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |v| {
+                    let next = v.checked_add(n)?;
+                    (next <= self.cap).then_some(next)
+                },
+            )
+            .ok()
+            .map(|_| ReserveGuard {
+                used: Arc::clone(&self.used),
+                amount: n,
+            })
+    }
 }
 
-#[derive(Debug)]
+/// The in-flight half of [`BudgetGate::reserve`] (M0 prototype, LD-17).
+/// Exactly-once settlement is enforced by OWNERSHIP: `settle`/`release`
+/// consume the guard, so no path can double-refund. Dropping without
+/// settling KEEPS the full reservation — the deliberate LD-17 policy for
+/// unknown usage (missing `usage`, request error, panic mid-flight): the
+/// gate may over-hold, it must never under-hold.
+#[must_use = "dropping a ReserveGuard keeps its full reservation; settle(实际) or release()"]
+pub struct ReserveGuard {
+    used: Arc<std::sync::atomic::AtomicU64>,
+    amount: u64,
+}
+
+/// What one settlement did — the audit row LD-17 asks callers to keep
+/// alongside the known-usage totals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "the settlement record is the LD-17 audit row; report it, don't discard it"]
+pub struct Settled {
+    pub reserved: u64,
+    pub actual: u64,
+    /// `actual > reserved`: the estimate under-held. Not an error (the cap
+    /// is a soft budget) but reported, so 超额 stays observable.
+    pub over_reserve: bool,
+}
+
+impl ReserveGuard {
+    /// Settle against the ACTUAL billed usage: `actual < reserved` refunds
+    /// the difference, `actual > reserved` charges the difference and flags
+    /// it. Subtractions go through fetch_update + saturating_sub — a plain
+    /// `fetch_sub` wraps on underflow and would hand back a huge lying
+    /// counter (the same anti-wrap discipline as [`BudgetGate::share`]).
+    pub fn settle(self, actual: u64) -> Settled {
+        let over = actual > self.amount;
+        let delta = actual.abs_diff(self.amount);
+        if delta > 0 {
+            if over {
+                let _ = self.used.fetch_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |v| Some(v.saturating_add(delta)),
+                );
+            } else {
+                let _ = self.used.fetch_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |v| Some(v.saturating_sub(delta)),
+                );
+            }
+        }
+        Settled {
+            reserved: self.amount,
+            actual,
+            over_reserve: over,
+        }
+    }
+
+    /// Full refund — the unstarted path (cancel observed before dispatch).
+    pub fn release(self) -> Settled {
+        self.settle(0)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct ToolOutput {
     pub content: String,
     pub image: Option<Block>,
@@ -361,6 +455,20 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// Whether this tool may enter a `run_code` guest's `callBatch` wave
+    /// (code_llm_design LD-19). **Default false — the batch surface is
+    /// read-only by construction**, not by promise: only tools whose EVERY
+    /// input is a pure read opt in (`read_file`; the M3 `llm` single-shot;
+    /// MCP tools via the server's `annotations.readOnlyHint`, which is a
+    /// scheduling hint from the SERVER, not a safety proof). Tools whose
+    /// read/write nature depends on the arguments (todo) deliberately stay
+    /// out — a tool-level bool cannot express "this input is a read".
+    /// Side-effect batches are the guest's sequential `for` loop (the skill
+    /// teaches it); no transactional API is offered.
+    fn batchable(&self) -> bool {
+        false
+    }
+
     /// The MCP server (CONFIG name, unsanitized) this tool belongs to, for
     /// `Agent::remove_mcp_server`'s hot-remove routing. Default `None` for
     /// every non-MCP tool — capability-marker style (like `concurrency()`):
@@ -494,6 +602,9 @@ impl Tool for SharedTool {
     }
     fn available_to_code(&self) -> bool {
         self.inner.available_to_code()
+    }
+    fn batchable(&self) -> bool {
+        self.inner.batchable()
     }
     fn mcp_server(&self) -> Option<&str> {
         self.inner.mcp_server()

@@ -37,6 +37,14 @@ pub mod session;
 pub mod skills;
 pub mod tools;
 
+/// M0 mechanism probes (`docs/code_llm_design.md` §7「前置（M0，评测与拓扑的
+/// 地基）」): in-process prototypes for the reserve/settle ledger, the
+/// shared-provider cell, and per-request model routing — the parts of
+/// A-L2b/2c/9 provable before any M1–M3 feature code exists.
+#[cfg(test)]
+#[path = "m0_probes.rs"]
+mod m0_probes;
+
 // ── Facade re-exports (the library's public face) ──────────────────────────
 pub use agent::{
     extract_plan, Agent, AgentEvent, CompressError, CompressOutcome, CompressTrigger, RunCost,
@@ -347,7 +355,13 @@ fn assemble(
                 run_code_tombstone = index.entry_of(RUN_CODE_SKILL_NAME).is_none();
             }
             policy @ (SkillInjection::OnDemand | SkillInjection::Eager) => {
-                match skills::embedded_entry(tools::run_code::RUN_CODE_SKILL_MD) {
+                // MD-13 / LD-15: the lib and batch sections ride their
+                // assembly-time gates — spliced out when off, so a gate-off
+                // skill stays the pre-gate contract.
+                match skills::embedded_entry(&tools::run_code::run_code_skill_md(
+                    cfg.code.include,
+                    cfg.code.call_batch,
+                )) {
                     Some(e) => index.insert_builtin(e),
                     None => eprintln!("[skill] built-in run-code skill is malformed, skipped"),
                 }
