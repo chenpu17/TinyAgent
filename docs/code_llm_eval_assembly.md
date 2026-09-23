@@ -215,3 +215,11 @@ code,mock`）：
   全绿：saveLib 登记 → 负责人批准 → 跨会话 include 准入探针通过；修库无
   事件。e1≈e0（完成率/F1 同档）。§2 E1 注意补 warm 实现口径与装置指纹
   （examples/eval/e1-warm-lib/）。读数详 `docs/code_v0b_report.md` §5.4。
+- 2026-09-23：级联档位探针（e2 臂、inner=glm-5.3-flash ×3，runner 加
+  `--inner-model` 进版本戳）：**弱类 account 是语料侧语义边界而非内层模型
+  盲区**（glm 内层 account recall 0.765/0.784 ≈ ds 的 0.765，换内层修不了）；
+  glm 内层可用但更慢更弱（F1 0.89/0.89/超时 vs ds 的 0.94–0.96，墙钟
+  1633–3193s vs 1105s）——内层档位结论 ds > glm。**首个自发库采用事件**
+  （r2 自发 saveLib 判别库 + include() 52 次 + dev 分片验证——v0.7.4
+  登记的 substrate 对齐场景在 e2 臂自发出现，但 1/3 随机且该跑超时）。
+  读数详 `docs/code_v0b_report.md` §5.5。
