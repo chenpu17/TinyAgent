@@ -324,6 +324,9 @@ def main():
                     help="内层判别模型（级联档位探针用：换模型测弱类是否被"
                          "不同内层修复；默认与外层同款单档）")
     ap.add_argument("--timeout", type=int, default=5400)
+    ap.add_argument("--max-parallel", type=int, default=1,
+                    help="并发跑数（>1 时墙钟受网关争用污染，summary 标记 "
+                         "parallel=true，臂间墙钟对照只认串行批）")
     args = ap.parse_args()
     if not BIN.exists():
         sys.exit(f"missing {BIN} — cargo build --release --features code")
@@ -343,44 +346,56 @@ def main():
     print(f"[v0b] corpus {corpus_ver['version']} (kw_probe={corpus_ver['kw_probe_macro_f1']})")
 
     all_runs = []
+
+    def run_pair(arm, rep):
+        run_dir = ART / f"{arm}-r{rep}"
+        print(f"[v0b] arm {arm} rep {rep} ...", flush=True)
+        try:
+            r = run_once(arm, rep, args.holdout, args.warm_lib,
+                         corpus_ver, args.timeout, args.max_tokens,
+                         args.outer_model,
+                         budget_map.get(arm, budget_default),
+                         args.inner_model, warm_arms)
+        except subprocess.TimeoutExpired:
+            print(f"[v0b] arm {arm} rep {rep} TIMED OUT", flush=True)
+            return
+        s = score(run_dir, r["gold"])
+        c = cost(run_dir)
+        # stream_idle = 网关断流（基建失败≠模型失败）：同 (arm,rep) 重跑一次，
+        # 两次记录都进 runs（重跑覆盖工件目录，失败记录在 log 里留痕）。
+        if c["stop_reason"] == "stream_idle":
+            print(f"[v0b]   stream_idle — rerunning once", flush=True)
+            r = run_once(arm, rep, args.holdout, args.warm_lib,
+                         corpus_ver, args.timeout, args.max_tokens,
+                         args.outer_model,
+                         budget_map.get(arm, budget_default),
+                         args.inner_model, warm_arms)
+            s = score(run_dir, r["gold"])
+            c = cost(run_dir)
+        summary = {"arm": arm, "rep": rep, "rc": r["rc"], "wall_s": r["wall"],
+                   "warm": r["warm"], "corpus": corpus_ver,
+                   "max_total": r["max_total"],
+                   "parallel": args.max_parallel > 1,
+                   "score": s, **c}
+        (run_dir / "summary.json").write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2))
+        all_runs.append(summary)
+        one = {"f1": s["macro_f1"], "valid": s["valid_rate"],
+               "routes": c["routes"], "stop": c["stop_reason"]}
+        print(f"[v0b]   -> {json.dumps(one, ensure_ascii=False)}", flush=True)
+
+    schedule = []
     for rep in range(args.repeats):
         # 交错：每重复内臂顺序轮转（rep0 顺序、rep1 轮转一位……），摊网关时段效应
         order = arms[rep % len(arms):] + arms[:rep % len(arms)]
-        for arm in order:
-            run_dir = ART / f"{arm}-r{rep}"
-            print(f"[v0b] arm {arm} rep {rep} ...", flush=True)
-            try:
-                r = run_once(arm, rep, args.holdout, args.warm_lib,
-                             corpus_ver, args.timeout, args.max_tokens,
-                             args.outer_model,
-                             budget_map.get(arm, budget_default),
-                             args.inner_model, warm_arms)
-            except subprocess.TimeoutExpired:
-                print(f"[v0b] arm {arm} rep {rep} TIMED OUT", flush=True)
-                continue
-            s = score(run_dir, r["gold"])
-            c = cost(run_dir)
-            # stream_idle = 网关断流（基建失败≠模型失败）：同 (arm,rep) 重跑一次，
-            # 两次记录都进 runs（重跑覆盖工件目录，失败记录在 log 里留痕）。
-            if c["stop_reason"] == "stream_idle":
-                print(f"[v0b]   stream_idle — rerunning once", flush=True)
-                r = run_once(arm, rep, args.holdout, args.warm_lib,
-                             corpus_ver, args.timeout, args.max_tokens,
-                             args.outer_model,
-                             budget_map.get(arm, budget_default),
-                             args.inner_model, warm_arms)
-                s = score(run_dir, r["gold"])
-                c = cost(run_dir)
-            summary = {"arm": arm, "rep": rep, "rc": r["rc"], "wall_s": r["wall"],
-                       "warm": r["warm"], "corpus": corpus_ver,
-                       "max_total": r["max_total"],
-                       "score": s, **c}
-            (run_dir / "summary.json").write_text(
-                json.dumps(summary, ensure_ascii=False, indent=2))
-            all_runs.append(summary)
-            one = {"f1": s["macro_f1"], "valid": s["valid_rate"],
-                   "routes": c["routes"], "stop": c["stop_reason"]}
-            print(f"[v0b]   -> {json.dumps(one, ensure_ascii=False)}", flush=True)
+        schedule.extend((arm, rep) for arm in order)
+    if args.max_parallel > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=args.max_parallel) as ex:
+            list(ex.map(lambda p: run_pair(*p), schedule))
+    else:
+        for arm, rep in schedule:
+            run_pair(arm, rep)
 
     if all_runs:
         agg = aggregate(all_runs)
