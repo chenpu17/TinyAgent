@@ -28,9 +28,11 @@
 //! server — on the JS main thread. `chat()` deliberately moved that work off
 //! the main thread; the constructor has not (yet). With slow MCP servers the
 //! event loop freezes for seconds at construction. Scope note in the same
-//! breath: hooks (`set_hooks`), the `setModel` family, and MCP hot
-//! add/remove are deliberately NOT exposed here (minimal-surface v0.3
-//! decision; Rust hosts get them via the core crate).
+//! breath: the `setModel` family and MCP hot add/remove remain deliberately
+//! NOT exposed (minimal-surface v0.3 decision; Rust hosts get them via the
+//! core crate). The hooks interception layer IS exposed (`setHooks` /
+//! `hooks` option): `beforeTool` round-trips like a tool call (blocking
+//! decision), the observe-only hooks are fire-and-forget TSFNs.
 
 // napi's `#[napi]` attribute macro can trip clippy's `useless_conversion` on
 // `Result` returns the same way pyo3's macros do. Scoped to this pure-binding
@@ -46,7 +48,7 @@ use std::time::{Duration, Instant};
 
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction, ThreadsafeFunctionCallMode};
-use napi::{JsDeferred, JsObject};
+use napi::{JsDeferred, JsObject, NapiRaw};
 use napi_derive::napi;
 use serde_json::Value;
 
@@ -169,11 +171,11 @@ const CALLBACK_POLL_SLICE: Duration = Duration::from_millis(200);
 /// within ~one slice instead of blocking out the whole (possibly 120s)
 /// ceiling — the ToolConcurrency contract expects tools to observe
 /// `ctx.cancel` mid-call.
-fn recv_interruptible(
-    rx: &mpsc::Receiver<ToolResult>,
+fn recv_interruptible<T>(
+    rx: &mpsc::Receiver<T>,
     wait: Duration,
     cancel: Option<&std::sync::atomic::AtomicBool>,
-) -> std::result::Result<ToolResult, ()> {
+) -> std::result::Result<T, ()> {
     let end = Instant::now() + wait;
     loop {
         if let Some(c) = cancel {
@@ -450,6 +452,244 @@ fn build_provider(env: Env, provider: Option<Object>) -> Result<Option<Box<dyn t
     Ok(Some(Box::new(NodeProvider { tsfn })))
 }
 
+// ── JS hooks: interception layer (mirrors the tool round-trip for the gate) ──
+//
+// The hooks layer needs three call shapes:
+//   beforeTool: must RETURN a decision → blocking round-trip, identical
+//               machinery to the custom-tool round-trip (TSFN → JS runs the
+//               user fn on the main thread → resolveHooksDecision(id, result)
+//               fulfills the channel). A never-resolving / ill-formed gate
+//               FAILS CLOSED: the tool call is denied with a message the
+//               model sees — a broken policy must not degrade into
+//               allow-everything.
+//   afterTool / onChatRequest: observe-only, no return value → fire-and-forget
+//               TSFNs (ErrorStrategy::Fatal, same as the event TSFN). wrapper.js
+//               wraps them with the same swallow guard as onEvent, because a
+//               raw throw in a Fatal-strategy callback is an UNCATCHABLE
+//               process abort.
+
+static NEXT_HOOK_ID: AtomicI64 = AtomicI64::new(1);
+static PENDING_HOOKS: OnceLock<Mutex<HashMap<i64, mpsc::Sender<Value>>>> = OnceLock::new();
+
+fn pending_hooks() -> &'static Mutex<HashMap<i64, mpsc::Sender<Value>>> {
+    PENDING_HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Payload handed to the wrapped JS `beforeTool`: the call's id (to report
+/// back via `resolveHooksDecision`), the tool name, the model's ORIGINAL
+/// arguments, and the attribution ctx (`{workdir, subagent}`).
+#[napi(object)]
+pub struct HookGateCall {
+    pub id: i64,
+    pub tool: String,
+    pub input: Value,
+    pub ctx: Value,
+}
+
+/// Fulfill the channel for an in-flight gate call. Called from JS after the
+/// wrapped `beforeTool` returns. A missing id means the call already timed
+/// out — the late decision is dropped, harmless (same discipline as
+/// `resolveTool` / `resolveProvider`).
+#[napi(js_name = "resolveHooksDecision")]
+pub fn resolve_hooks_decision(id: i64, result: Value) -> Result<()> {
+    if let Some(tx) = pending_hooks().lock().unwrap().remove(&id) {
+        let _ = tx.send(result);
+    }
+    Ok(())
+}
+
+/// Parse a JS decision into a [`ta::ToolDecision`]: `null` → Allow, a string
+/// → Deny(message), `{deny: string}` / `{modify: input}` → the matching
+/// decision. Anything else fails closed.
+fn decision_from_value(v: Value, tool: &str) -> ta::ToolDecision {
+    match v {
+        Value::Null => ta::ToolDecision::Allow,
+        Value::String(s) => ta::ToolDecision::Deny(s),
+        Value::Object(ref m) => match (m.get("deny"), m.get("modify")) {
+            (Some(Value::String(d)), _) => ta::ToolDecision::Deny(d.clone()),
+            (None, Some(modv)) => ta::ToolDecision::Modify(modv.clone()),
+            _ => ta::ToolDecision::Deny(format!(
+                "[hooks] beforeTool('{tool}') refused the call: object must be \
+                 {{deny: string}} or {{modify: input}}"
+            )),
+        },
+        _ => ta::ToolDecision::Deny(format!(
+            "[hooks] beforeTool('{tool}') refused the call: expected null, a deny \
+             string, or {{deny|modify: …}}"
+        )),
+    }
+}
+
+/// The ctx projection (same minimal attribution surface as the Python
+/// binding: full ToolCtx plumbing stays binding-internal).
+#[derive(serde::Serialize)]
+struct HookCtx<'a> {
+    workdir: &'a str,
+    subagent: Option<&'a str>,
+}
+
+/// The observe-only afterTool payload: original input, an output view
+/// ({content, is_error, meta}), whether it executed (false only for a Deny),
+/// and the ctx.
+#[derive(serde::Serialize)]
+struct HookAfterCall<'a> {
+    tool: &'a str,
+    input: &'a Value,
+    output: HookAfterOutput<'a>,
+    executed: bool,
+    ctx: HookCtx<'a>,
+}
+
+#[derive(serde::Serialize)]
+struct HookAfterOutput<'a> {
+    content: &'a str,
+    is_error: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    meta: Option<&'a Value>,
+}
+
+/// The onChatRequest projection (same shape the custom provider receives,
+/// minus the agent-internal cancel / timeout plumbing).
+#[derive(serde::Serialize)]
+struct HookChatRequest<'a> {
+    system: Option<&'a str>,
+    messages: &'a [ta::Message],
+    tools: &'a [ta::ToolDef],
+    model: &'a str,
+    max_tokens: u32,
+    cache: bool,
+}
+
+struct JsHooks {
+    before: Option<ThreadsafeFunction<HookGateCall, ErrorStrategy::CalleeHandled>>,
+    after: Option<ThreadsafeFunction<Value, ErrorStrategy::Fatal>>,
+    on_chat: Option<ThreadsafeFunction<Value, ErrorStrategy::Fatal>>,
+}
+
+impl ta::Hooks for JsHooks {
+    fn before_tool(&self, tool: &str, input: &Value, ctx: &ta::ToolCtx) -> ta::ToolDecision {
+        let Some(tsfn) = self.before.as_ref() else {
+            return ta::ToolDecision::Allow;
+        };
+        let id = NEXT_HOOK_ID.fetch_add(1, Ordering::Relaxed);
+        let Ok(ctx_v) = serde_json::to_value(HookCtx {
+            workdir: &ctx.workdir.to_string_lossy(),
+            subagent: ctx.subagent.as_deref(),
+        }) else {
+            return ta::ToolDecision::Deny(format!(
+                "[hooks] beforeTool('{tool}') refused the call: ctx serialization failed"
+            ));
+        };
+        let call = HookGateCall {
+            id,
+            tool: tool.to_string(),
+            input: input.clone(),
+            ctx: ctx_v,
+        };
+        let (tx, rx) = mpsc::channel();
+        pending_hooks().lock().unwrap().insert(id, tx);
+        if tsfn.call(Ok(call), ThreadsafeFunctionCallMode::NonBlocking) != Status::Ok {
+            pending_hooks().lock().unwrap().remove(&id);
+            return ta::ToolDecision::Deny(format!(
+                "[hooks] beforeTool('{tool}') refused the call: dispatch to JS failed"
+            ));
+        }
+        // Same wait discipline as the tool round-trip: the run's remaining
+        // wall-clock budget (capped by the backstop), cancel-aware in slices.
+        let wait = callback_wait_ceiling(ctx.deadline);
+        match recv_interruptible(&rx, wait, ctx.cancel.as_deref()) {
+            Ok(v) => decision_from_value(v, tool),
+            Err(_) => ta::ToolDecision::Deny(format!(
+                "[hooks] beforeTool('{tool}') refused the call: JS callback did not \
+                 resolve within {}s",
+                wait.as_secs() + u64::from(wait.subsec_millis() > 0)
+            )),
+        }
+    }
+
+    fn after_tool(
+        &self,
+        tool: &str,
+        input: &Value,
+        output: &ta::ToolOutput,
+        executed: bool,
+        ctx: &ta::ToolCtx,
+    ) {
+        if let Some(tsfn) = self.after.as_ref() {
+            if let Ok(v) = serde_json::to_value(HookAfterCall {
+                tool,
+                input,
+                output: HookAfterOutput {
+                    content: &output.content,
+                    is_error: output.is_error,
+                    meta: output.meta.as_ref(),
+                },
+                executed,
+                ctx: HookCtx {
+                    workdir: &ctx.workdir.to_string_lossy(),
+                    subagent: ctx.subagent.as_deref(),
+                },
+            }) {
+                let _ = tsfn.call(v, ThreadsafeFunctionCallMode::NonBlocking);
+            }
+        }
+    }
+
+    fn on_chat_request(&self, req: &ta::ChatRequest) {
+        if let Some(tsfn) = self.on_chat.as_ref() {
+            if let Ok(v) = serde_json::to_value(HookChatRequest {
+                system: req.system,
+                messages: req.messages,
+                tools: req.tools,
+                model: req.model,
+                max_tokens: req.max_tokens,
+                cache: req.cache,
+            }) {
+                let _ = tsfn.call(v, ThreadsafeFunctionCallMode::NonBlocking);
+            }
+        }
+    }
+}
+
+/// Turn the user's duck-typed hooks object into a [`ta::Hooks`]. Methods are
+/// resolved HERE, on the JS thread, once — a present-but-not-a-function
+/// property errors at install time instead of failing silently mid-run.
+/// Returns None when no hooks object was passed (no layer installed).
+fn build_hooks(env: Env, hooks: Option<Object>) -> Result<Option<Arc<dyn ta::Hooks>>> {
+    let Some(h) = hooks else { return Ok(None) };
+    let before: Option<JsFunction> = h.get("beforeTool")?;
+    let after: Option<JsFunction> = h.get("afterTool")?;
+    let on_chat: Option<JsFunction> = h.get("onChatRequest")?;
+    // Env::create_threadsafe_function hardwires the CalleeHandled strategy;
+    // the observe-only hooks need Fatal (fire-and-forget), so go through the
+    // FromNapiValue conversion the #[napi] params themselves use, which takes
+    // the strategy from the target type. Same mechanism, same safety (the
+    // function object is pinned for the TSFN's lifetime by napi).
+    let before = before
+        .map(|f: JsFunction| unsafe {
+            ThreadsafeFunction::<HookGateCall, ErrorStrategy::CalleeHandled>::from_napi_value(
+                env.raw(),
+                f.raw(),
+            )
+        })
+        .transpose()?;
+    let after = after
+        .map(|f: JsFunction| unsafe {
+            ThreadsafeFunction::<Value, ErrorStrategy::Fatal>::from_napi_value(env.raw(), f.raw())
+        })
+        .transpose()?;
+    let on_chat = on_chat
+        .map(|f: JsFunction| unsafe {
+            ThreadsafeFunction::<Value, ErrorStrategy::Fatal>::from_napi_value(env.raw(), f.raw())
+        })
+        .transpose()?;
+    Ok(Some(Arc::new(JsHooks {
+        before,
+        after,
+        on_chat,
+    })))
+}
+
 // ── agent work on dedicated threads (NOT the libuv pool) ─────────────────────
 //
 // `run`/`compact`/`chat` drive the synchronous core agent on a freshly spawned
@@ -594,6 +834,7 @@ impl Agent {
         tools: Option<Vec<Object>>,
         provider: Option<Object>,
         api_key: Option<String>,
+        hooks: Option<Object>,
     ) -> Result<Self> {
         let cfg = ta::Config::load(Path::new(&config_path)).map_err(err)?;
         // A custom provider needs no API key for the main agent; only fall back
@@ -607,17 +848,42 @@ impl Agent {
         };
         let client = ta::provider::new_client(cfg.limits.timeout_secs);
         let extra = build_extra_tools(env, tools)?;
-        // The TSFN must be created on the JS thread (env); build_provider does
-        // that, then the trait object is Send and safe to thread into the agent.
+        // The TSFNs must be created on the JS thread (env); build_provider /
+        // build_hooks do that, then the trait objects are Send and safe to
+        // thread into the agent.
         let prov = build_provider(env, provider)?;
-        let agent = match prov {
+        let hooks_layer = build_hooks(env, hooks)?;
+        let mut agent = match prov {
             Some(p) => ta::build_agent_with_provider(&cfg, p, Vec::new(), &client, extra, &api_key),
             None => ta::build_agent_with(&cfg, Vec::new(), &client, extra, &api_key),
         }
         .map_err(err)?;
+        if let Some(h) = hooks_layer {
+            agent.set_hooks(h);
+        }
         Ok(Self {
             inner: Arc::new(Mutex::new(agent)),
         })
+    }
+
+    /// Install the interception layer from a duck-typed hooks object with any
+    /// of `beforeTool(tool, input, ctx)` (returns null / deny string /
+    /// {modify: input}; a throwing or ill-formed gate FAILS CLOSED — the call
+    /// is denied with the reason in the message) / `afterTool(tool, input,
+    /// output, executed, ctx)` / `onChatRequest(request)` (observe-only, no
+    /// return value). Methods are resolved at install time; a present-but-
+    /// not-a-function property errors here, not mid-run. Busy-errors while
+    /// `run()` is in flight. `task` sub-agents inherit the layer; attribution
+    /// arrives via `ctx.subagent` (`null` = top-level). NOTE: a rebuilt agent
+    /// (e.g. from a resumed session) does NOT carry hooks over — reinstall.
+    #[napi]
+    pub fn set_hooks(&self, env: Env, hooks: Object) -> Result<()> {
+        // TSFN creation needs the JS thread; do it BEFORE taking the lock so
+        // a busy agent isn't blocked by JS-object conversion.
+        let layer = build_hooks(env, Some(hooks))?.expect("build_hooks(Some) returns Some");
+        let mut a = self.inner.try_lock().map_err(|_| agent_busy())?;
+        a.set_hooks(layer);
+        Ok(())
     }
 
     /// Append a user message (text) to the conversation, then (typically) call
@@ -845,6 +1111,7 @@ impl Agent {
 /// at call time. (Malformed `tools`, by contrast, throw synchronously — the
 /// tool `Function`s must be taken from JS before the worker thread runs.)
 #[napi]
+#[allow(clippy::too_many_arguments)] // flat positional surface mirrors the other entry points
 pub fn chat(
     env: Env,
     config_path: String,
@@ -853,11 +1120,13 @@ pub fn chat(
     tools: Option<Vec<Object>>,
     provider: Option<Object>,
     api_key: Option<String>,
+    hooks: Option<Object>,
 ) -> Result<JsObject> {
     let extra = build_extra_tools(env, tools)?;
-    // Build the provider TSFN on the JS thread (env); the trait object is Send
-    // and threads safely into the worker thread.
+    // Build the provider / hooks TSFNs on the JS thread (env); the trait
+    // objects are Send and thread safely into the worker thread.
     let prov = build_provider(env, provider)?;
+    let hooks_layer = build_hooks(env, hooks)?;
     let (deferred, promise) = env.create_deferred::<Outcome, AgentResolver>()?;
     spawn_agent_work(deferred, move || {
         let cfg = ta::Config::load(Path::new(&config_path)).map_err(err)?;
@@ -874,6 +1143,9 @@ pub fn chat(
             None => ta::build_agent_with(&cfg, Vec::new(), &client, extra, &api_key),
         }
         .map_err(err)?;
+        if let Some(h) = hooks_layer {
+            agent.set_hooks(h);
+        }
         agent.push_user(vec![ta::Block::Text(message)]);
 
         let outcome = agent
@@ -921,7 +1193,7 @@ mod tests {
 
     #[test]
     fn recv_interruptible_honors_cancel_within_a_slice() {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::channel::<ToolResult>();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         // A never-resolving JS side, a 120s ceiling, and a cancel that flips
         // after 300ms: the wait must give up within ~one poll slice of the

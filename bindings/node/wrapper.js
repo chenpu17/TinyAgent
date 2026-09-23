@@ -1,7 +1,7 @@
 'use strict';
 
 // User-facing JS layer over the raw napi addon (./index.js). It hides the
-// custom-tool AND custom-provider round-trip ceremony:
+// custom-tool, custom-provider, AND hooks round-trip ceremony:
 //
 //   tool:     native hands the wrapped JS `run` a `(err, req)` CalleeHandled
 //             TSFN call and expects `resolveTool(req.id, result)` back; here we
@@ -10,10 +10,13 @@
 //             and expects `resolveProvider(call.id, result)` back; here we wrap
 //             the user's `provider(request)` (a function or `{ chat }` object)
 //             into that shape.
+//   hooks:    beforeTool round-trips the same way (resolveHooksDecision);
+//             afterTool / onChatRequest are fire-and-forget and get the
+//             swallow guard wrapOnEvent uses (their TSFNs are Fatal strategy).
 //
 // Also presents an options-object API (new Agent(path, { tools, provider,
-// apiKey }) and chat(path, message, { onEvent, tools, provider, apiKey }))
-// instead of the raw positional one.
+// hooks, apiKey }) and chat(path, message, { onEvent, tools, provider, hooks,
+// apiKey })) instead of the raw positional one.
 
 const native = require('./index.js');
 
@@ -110,9 +113,88 @@ function wrapOnEvent(onEvent) {
   };
 }
 
+/** Wrap the user's duck-typed hooks object into the TSFN callback shapes the
+ *  native side expects. Method resolution happens HERE (once, at install
+ *  time) — a hooks object without a method simply omits it (no-op), matching
+ *  the Python binding.
+ *
+ *  beforeTool must return a decision, so it round-trips: native hands us
+ *  `(err, call)` with { id, tool, input, ctx } and blocks; we run the user's
+ *  fn, normalize the decision (undefined → null = allow; string = deny;
+ *  {deny|modify: …}), and fulfill via resolveHooksDecision(call.id, result).
+ *  A user fn that THROWS must still resolve the channel — it resolves with a
+ *  deny carrying the error (fail-closed), so a broken policy can't hang the
+ *  worker for 120s; the native side fail-closes the remaining paths (timeout,
+ *  ill-formed decision) itself.
+ *
+ *  afterTool / onChatRequest are observe-only: the native TSFNs are
+ *  ErrorStrategy::Fatal, so a raw throw would be an UNCATCHABLE process
+ *  abort — same guard as wrapOnEvent (swallow + stderr). */
+function wrapHooks(hooks) {
+  if (hooks == null) return undefined;
+  const out = {};
+  if (typeof hooks.beforeTool === 'function') {
+    out.beforeTool = async function (_err, call) {
+      let result;
+      try {
+        result = await hooks.beforeTool(call.tool, call.input, call.ctx);
+        if (result === undefined) result = null;
+      } catch (e) {
+        result = {
+          deny: `[hooks] beforeTool('${call.tool}') refused the call: hook threw ${
+            String((e && e.message) || e)
+          }`,
+        };
+      }
+      native.resolveHooksDecision(call.id, result);
+    };
+  }
+  // NB: the observe-only TSFNs are ErrorStrategy::Fatal — napi invokes them
+  // with the payload as the SINGLE argument (no leading `err`, unlike the
+  // CalleeHandled tool/provider/gate callbacks).
+  if (typeof hooks.afterTool === 'function') {
+    const fn = hooks.afterTool;
+    out.afterTool = function (payload) {
+      try {
+        Promise.resolve(fn(payload)).catch((e) => {
+          console.error('[tiny-agent] afterTool hook threw (ignored):', e);
+        });
+      } catch (e) {
+        console.error('[tiny-agent] afterTool hook threw (ignored):', e);
+      }
+    };
+  }
+  if (typeof hooks.onChatRequest === 'function') {
+    const fn = hooks.onChatRequest;
+    out.onChatRequest = function (payload) {
+      try {
+        Promise.resolve(fn(payload)).catch((e) => {
+          console.error('[tiny-agent] onChatRequest hook threw (ignored):', e);
+        });
+      } catch (e) {
+        console.error('[tiny-agent] onChatRequest hook threw (ignored):', e);
+      }
+    };
+  }
+  return out;
+}
+
 class Agent extends native.Agent {
   constructor(configPath, opts = {}) {
-    super(configPath, wrapTools(opts.tools), wrapProvider(opts.provider), opts.apiKey);
+    super(
+      configPath,
+      wrapTools(opts.tools),
+      wrapProvider(opts.provider),
+      opts.apiKey,
+      wrapHooks(opts.hooks),
+    );
+  }
+
+  // The native setHooks takes the (already wrapped) hooks object; the TSFNs
+  // must be created on the JS thread, which this override guarantees before
+  // native touches the agent lock.
+  setHooks(hooks) {
+    return super.setHooks(wrapHooks(hooks));
   }
 
   run(onEvent) {
@@ -137,6 +219,7 @@ async function chat(configPath, message, opts = {}) {
     wrapTools(opts.tools),
     wrapProvider(opts.provider),
     opts.apiKey,
+    wrapHooks(opts.hooks),
   );
 }
 

@@ -39,7 +39,7 @@ cargo fmt --all                            # 格式化（CI 有 --check 门禁�
 
 ### 语言绑定（workspace 成员 `bindings/python`、`bindings/node`）
 
-两者 path-依赖根库（`features = ["mock"]`），都复用 `CallbackTool` 注入自定义工具、不改核心。两者各带一个
+两者 path-依赖根库（`features = ["mock"]`），都复用 `CallbackTool` 注入自定义工具、不改核心。**Hooks 拦截层已双绑定暴露**（py `set_hooks`/`hooks=`、node `setHooks`/`hooks=`）：鸭子类型三方法任意子集，`before_tool` 决策 fail-closed（抛异常/非法返回=拒绝），观察类钩子异常吞掉——node 侧观察类 TSFN 是 Fatal 策略、wrapper 必须吞（与 wrapOnEvent 同纪律），决策走 `resolveHooksDecision` round-trip。两者各带一个
 默认关闭的 `code` **转发 feature**（`code = ["ta_core/code"]`）：编入后 `enable_code`/`disable_code`/
 `set_code_config`（Node 侧 camelCase）真实生效；未编入时三方法返回带重建提示的明确错误（设计 §8.6——
 避免给所有 wheel 强加 ~10MB wasmtime）。绑定测试 build-自适应（探测 wheel 是否带 feature，另一侧 skip）。

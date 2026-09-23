@@ -242,6 +242,14 @@ await a.run();
 
 与自定义工具同款 TSFN round-trip（JS 调 `resolveProvider(id, result)` 唤醒 worker）。非流式 v1：返回整段文本，作为单条 delta 发出；不支持 tool_use（需要工具调用请用内置 provider + 自定义 `Tool`）。provider 抛异常会**诚实地 reject 该轮**。worker 等待回调的上限取 `min(本次请求剩余预算, 120s)`——run 设了 `timeout_secs` 时永不超出预算（预算仍在轮次边界生效；同步阻塞的 host 代码本身无法被中断）。
 
+**Hooks 拦截层**（Node 侧同款核心能力，与 Python 鸭子类型面一致）：`a.setHooks(obj)` 或构造时
+`hooks: obj` / `chat(cfg, msg, { hooks: obj })`——obj 按需提供 `beforeTool(tool, input, ctx)`
+（返回 `null` 放行 / 拒绝字符串 / `{ modify: input }`，async 可用——决策经 TSFN round-trip）、
+`afterTool(payload)` / `onChatRequest(request)`（只读观察，payload 形状见 `wrapper.d.ts`）。
+`ctx` 是归因投影 `{ workdir, subagent }`（顶层 `subagent: null`）。缺的方法即无操作；
+**`beforeTool` 抛异常或返回非法值 = fail-closed 拒绝该调用**（理由进消息），观察类钩子的异常被
+吞掉（其 TSFN 是 Fatal 策略——不吞就是进程 abort）。语义同 Python 侧；`setHooks` 有 busy 契约。
+
 **`runCode` 开关**（绑定默认不带 `code` feature，`npm run build -- --features code` 编入）：`a.enableCode()`
 / `a.disableCode()` 运行期开关、`a.setCodeConfig({...})` 整包替换 code 配置（对象形状同配置文件的
 `code` 节，未知键报错、缺省键重置为默认值）。未编入该 feature 时三个方法返回带重建提示的明确错误。

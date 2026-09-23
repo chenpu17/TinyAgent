@@ -89,6 +89,7 @@ export type Provider =
 export interface AgentOptions {
   tools?: Tool[];
   provider?: Provider;
+  hooks?: Hooks;
   apiKey?: string;
 }
 
@@ -96,7 +97,69 @@ export interface ChatOptions {
   onEvent?: (event: AgentEvent) => void;
   tools?: Tool[];
   provider?: Provider;
+  hooks?: Hooks;
   apiKey?: string;
+}
+
+/** Attribution context handed to the hook methods. `subagent` is null on
+ *  top-level calls; a task child's name (or "__code__" for calls originating
+ *  inside the runCode sandbox) otherwise. */
+export interface HookCtx {
+  workdir: string;
+  subagent: string | null;
+}
+
+/** What beforeTool decides for one pending tool call: null/undefined = run
+ *  with the model's original input; a string = refuse (the model sees it as
+ *  the error tool_result); { modify } = run with the REPLACED input (the
+ *  audit log keeps the original). Anything else is refused (fail-closed). */
+export type HookDecision =
+  | null
+  | undefined
+  | string
+  | { deny: string }
+  | { modify: any };
+
+/** The finished-call view afterTool receives. `executed` is false only when
+ *  beforeTool denied the call. */
+export interface HookAfterPayload {
+  tool: string;
+  /** The model's ORIGINAL input (never a modify replacement). */
+  input: any;
+  output: { content: string; is_error: boolean; meta?: unknown };
+  executed: boolean;
+  ctx: HookCtx;
+}
+
+/** The request projection onChatRequest observes (main-turn requests only;
+ *  the compression summary call is not surfaced). */
+export interface HookChatRequest {
+  system?: string;
+  messages: unknown[];
+  tools: { name: string; description: string; schema: object }[];
+  model: string;
+  max_tokens: number;
+  cache: boolean;
+}
+
+/**
+ * The interception layer, as a duck-typed object — provide any subset of the
+ * methods; missing ones are no-ops. `beforeTool` gates a call BEFORE it runs
+ * (return null / deny string / { modify: input }); a throwing or ill-formed
+ * beforeTool FAILS CLOSED (the call is denied, the reason rides the message).
+ * `afterTool` and `onChatRequest` are observe-only; a throw in them is
+ * swallowed (logged to stderr). Task sub-agents inherit the layer; attribute
+ * calls via ctx.subagent. NOTE: an agent rebuilt from a resumed session does
+ * NOT carry hooks over — reinstall with setHooks.
+ */
+export interface Hooks {
+  beforeTool?(
+    tool: string,
+    input: any,
+    ctx: HookCtx,
+  ): HookDecision | Promise<HookDecision>;
+  afterTool?(payload: HookAfterPayload): void | Promise<void>;
+  onChatRequest?(request: HookChatRequest): void | Promise<void>;
 }
 
 export declare class CancelToken {
@@ -223,6 +286,10 @@ export declare class Agent {
    *  unknown keys reject, missing keys reset to their DEFAULTS (send the
    *  full object to keep a knob). Takes effect for the next execution. */
   setCodeConfig(cfg: object): void;
+  /** Install (or replace) the interception layer — see [[Hooks]]. Methods
+   *  are resolved at call time; a present-but-not-a-function property
+   *  throws here, not mid-run. Throws while a run is in flight. */
+  setHooks(hooks: Hooks): void;
 }
 
 export declare function chat(
