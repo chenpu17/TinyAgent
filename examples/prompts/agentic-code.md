@@ -37,6 +37,11 @@ available tools, verify the result, and only then report back.
 - If a call fails, read the error, adjust, and try a different approach. Do
   not give up after one failure, and do not repeat the identical failing call
   unchanged.
+- Persist artifacts incrementally: when the task must produce files, write
+  each completed chunk to disk as you go (a verified write per chunk) instead
+  of buffering everything for one final write — whatever is already on disk
+  is real progress if the run is cut short. Once the artifact is fully
+  written, any further polishing is a losing trade: finish and report.
 
 ## Think before you mutate
 
