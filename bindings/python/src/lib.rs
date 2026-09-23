@@ -23,12 +23,12 @@
 //! (the Node binding's TSFN path has a 120s backstop; Python has none).
 //! Keep callbacks non-blocking; never join GIL-dependent threads from one.
 //!
-//! Scope note: the hooks interception layer (`set_hooks`), the `set_model` /
-//! limits hot-update family, and MCP hot add/remove are deliberately NOT
-//! exposed here (minimal-surface v0.3 decision — Rust hosts get them via the
-//! core crate; binding-side hooks exposure is a future milestone, and the
-//! `after_tool` signature already carries `&ToolCtx` so it can land without
-//! another breaking change).
+//! Scope note: the `set_model` / limits hot-update family and MCP hot
+//! add/remove are deliberately NOT exposed here (minimal-surface v0.3 decision
+//! — Rust hosts get them via the core crate). The hooks interception layer IS
+//! exposed (`Agent.set_hooks` / `hooks=` kwarg): a Python object with any of
+//! `before_tool` / `after_tool` / `on_chat_request`; missing methods are
+//! no-ops, and the core `after_tool` signature already carries `&ToolCtx`.
 //!
 //! `ta` is the Rust core library `tiny_agent` (package `tiny-agent`, aliased
 //! here because this crate's own lib name — the Python import — is *also*
@@ -52,6 +52,8 @@ use std::sync::{Arc, Mutex};
 // The core library: package `tiny-agent` (crate `tiny_agent`), imported under a
 // distinct dep key so it doesn't clash with this crate's own lib name.
 use ta_core as ta;
+
+use serde_json::Value;
 
 // ── error / conversion helpers ──────────────────────────────────────────────
 
@@ -267,6 +269,213 @@ impl PyTool {
     }
 }
 
+// ── Hooks: the interception layer as a duck-typed Python object ─────────────
+
+/// The execution context projected to `before_tool` / `after_tool`. Deliberate
+/// minimal surface: what a policy needs for attribution and path decisions —
+/// the full `ToolCtx` carries agent plumbing (cancel flag, budget gate, the
+/// hooks Arc itself) a Python host must not touch.
+#[derive(serde::Serialize)]
+struct HookCtx<'a> {
+    workdir: &'a str,
+    /// `None` on top-level calls; the `task` child's name (or `"__code__"`
+    /// for calls originating inside the run_code sandbox).
+    subagent: Option<&'a str>,
+}
+
+/// The finished-call view projected to `after_tool`. `image` / `usage` /
+/// `usage_in_shared_budget` stay binding-internal: usage surfaces through the
+/// `Usage` event, an image blob has no host-policy meaning, and the budget
+/// flag is core accounting.
+#[derive(serde::Serialize)]
+struct HookToolOutput<'a> {
+    content: &'a str,
+    is_error: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    meta: Option<&'a serde_json::Value>,
+}
+
+/// The outgoing-request view projected to `on_chat_request` — same shape the
+/// custom provider receives (host-relevant conversation + params), with the
+/// agent-internal plumbing (`cancel`, `per_request_timeout`) withheld.
+#[derive(serde::Serialize)]
+struct HookChatRequest<'a> {
+    system: Option<&'a str>,
+    messages: &'a [ta::Message],
+    tools: &'a [ta::ToolDef],
+    model: &'a str,
+    max_tokens: u32,
+    cache: bool,
+}
+
+/// Look up an optional duck-typed hook method. AttributeError (i.e. the host
+/// object doesn't define it) → None = core's default no-op; any other lookup
+/// error is a real problem and surfaces as a constructor error.
+fn optional_method(obj: &Bound<'_, PyAny>, name: &str) -> PyResult<Option<PyObject>> {
+    match obj.getattr(name) {
+        Ok(m) => Ok(Some(m.unbind())),
+        Err(e) => {
+            if e.is_instance_of::<pyo3::exceptions::PyAttributeError>(obj.py()) {
+                Ok(None)
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+/// A host hooks object wrapped into [`ta::Hooks`]. Methods are resolved at
+/// `set_hooks`/construction time (getattr once, not per call — per-call
+/// getattr would silently swallow typos as no-ops).
+struct PyHooks {
+    before_tool: Option<PyObject>,
+    after_tool: Option<PyObject>,
+    on_chat_request: Option<PyObject>,
+}
+
+impl PyHooks {
+    fn from_obj(obj: Py<PyAny>, py: Python<'_>) -> PyResult<Self> {
+        let b = obj.bind(py);
+        Ok(Self {
+            before_tool: optional_method(b, "before_tool")?,
+            after_tool: optional_method(b, "after_tool")?,
+            on_chat_request: optional_method(b, "on_chat_request")?,
+        })
+    }
+}
+
+/// Parse a `before_tool` return value into a [`ta::ToolDecision`]:
+/// `None` → Allow; a `str` → Deny(message) (the model sees it as the
+/// tool_result); a single-key dict `{"deny": msg}` or `{"modify": input}`
+/// → the matching decision. Anything else is an error → the caller
+/// fail-closes with a Deny that names the problem.
+fn decision_from_py(bound: &Bound<'_, PyAny>) -> anyhow::Result<ta::ToolDecision> {
+    if bound.is_none() {
+        return Ok(ta::ToolDecision::Allow);
+    }
+    if let Ok(s) = bound.extract::<String>() {
+        return Ok(ta::ToolDecision::Deny(s));
+    }
+    let v: serde_json::Value = depythonize(bound)
+        .map_err(|e| anyhow::anyhow!("expected None, a deny string, or {{deny|modify: …}}: {e}"))?;
+    match v {
+        serde_json::Value::Object(ref m) if m.len() == 1 => {
+            if let Some(serde_json::Value::String(d)) = m.get("deny") {
+                Ok(ta::ToolDecision::Deny(d.clone()))
+            } else if let Some(modv) = m.get("modify") {
+                Ok(ta::ToolDecision::Modify(modv.clone()))
+            } else {
+                Err(anyhow::anyhow!(
+                    "single-key dict must use 'deny' (string) or 'modify' (input)"
+                ))
+            }
+        }
+        _ => Err(anyhow::anyhow!(
+            "expected None, a deny string, or a single-key {{'deny': …}} / {{'modify': …}} dict"
+        )),
+    }
+}
+
+/// The fail-closed deny for a misbehaving gate: a hook that raises or returns
+/// garbage must not silently degrade into "allow everything" — the tool call
+/// is refused with a message the model sees (hooks doc: return Deny on bad
+/// input rather than panicking; the binding enforces that for the host).
+fn deny_fail_closed(tool: &str, why: String) -> ta::ToolDecision {
+    ta::ToolDecision::Deny(format!(
+        "[hooks] before_tool('{tool}') refused the call: {why}"
+    ))
+}
+
+impl ta::Hooks for PyHooks {
+    fn before_tool(&self, tool: &str, input: &Value, ctx: &ta::ToolCtx) -> ta::ToolDecision {
+        let Some(cb) = self.before_tool.as_ref() else {
+            return ta::ToolDecision::Allow;
+        };
+        Python::with_gil(|py| {
+            let proj = HookCtx {
+                workdir: &ctx.workdir.to_string_lossy(),
+                subagent: ctx.subagent.as_deref(),
+            };
+            let Ok(py_ctx) = pythonize(py, &proj) else {
+                return deny_fail_closed(tool, "ctx serialization failed".into());
+            };
+            let Ok(py_in) = pythonize(py, input) else {
+                return deny_fail_closed(tool, "input serialization failed".into());
+            };
+            match cb.call1(py, (tool, py_in, py_ctx)) {
+                Ok(ret) => decision_from_py(ret.bind(py))
+                    .unwrap_or_else(|e| deny_fail_closed(tool, e.to_string())),
+                Err(e) => deny_fail_closed(tool, format!("hook raised: {e}")),
+            }
+        })
+    }
+
+    fn after_tool(
+        &self,
+        tool: &str,
+        input: &Value,
+        output: &ta::ToolOutput,
+        executed: bool,
+        ctx: &ta::ToolCtx,
+    ) {
+        let Some(cb) = self.after_tool.as_ref() else {
+            return;
+        };
+        // Observe-only: a buggy after_tool must not poison the run (same
+        // swallow contract as the on_event callback).
+        let _ = Python::with_gil(|py| -> pyo3::PyResult<()> {
+            let proj = HookCtx {
+                workdir: &ctx.workdir.to_string_lossy(),
+                subagent: ctx.subagent.as_deref(),
+            };
+            let out = HookToolOutput {
+                content: &output.content,
+                is_error: output.is_error,
+                meta: output.meta.as_ref(),
+            };
+            cb.call1(
+                py,
+                (
+                    tool,
+                    pythonize(py, input)?,
+                    pythonize(py, &out)?,
+                    executed,
+                    pythonize(py, &proj)?,
+                ),
+            )?;
+            Ok(())
+        });
+    }
+
+    fn on_chat_request(&self, req: &ta::ChatRequest) {
+        let Some(cb) = self.on_chat_request.as_ref() else {
+            return;
+        };
+        let _ = Python::with_gil(|py| -> pyo3::PyResult<()> {
+            let proj = HookChatRequest {
+                system: req.system,
+                messages: req.messages,
+                tools: req.tools,
+                model: req.model,
+                max_tokens: req.max_tokens,
+                cache: req.cache,
+            };
+            cb.call1(py, (pythonize(py, &proj)?,))?;
+            Ok(())
+        });
+    }
+}
+
+/// Validate + install a host hooks object on the freshly built agent (shared
+/// by `Agent.__init__` and `chat()`).
+fn install_hooks(agent: &mut ta::Agent, hooks: Option<Py<PyAny>>, py: Python<'_>) -> PyResult<()> {
+    if let Some(obj) = hooks {
+        let h = PyHooks::from_obj(obj, py)?;
+        agent.set_hooks(std::sync::Arc::new(h));
+    }
+    Ok(())
+}
+
 // ── Provider: a custom provider from a Python callable ──────────────────────
 
 /// The request shape handed to a Python custom provider: the conversation +
@@ -400,12 +609,13 @@ impl Agent {
 #[pymethods]
 impl Agent {
     #[new]
-    #[pyo3(signature = (config, *, tools=None, provider=None, api_key=None))]
+    #[pyo3(signature = (config, *, tools=None, provider=None, api_key=None, hooks=None))]
     fn new(
         config: &Bound<'_, PyAny>,
         tools: Option<Vec<Py<PyTool>>>,
         provider: Option<Py<PyAny>>,
         api_key: Option<String>,
+        hooks: Option<Py<PyAny>>,
         py: Python<'_>,
     ) -> PyResult<Self> {
         let cfg = load_config(config)?;
@@ -422,7 +632,7 @@ impl Agent {
         };
         let client = ta::provider::new_client(cfg.limits.timeout_secs);
         let extra = build_extra_tools(tools, py)?;
-        let agent = match provider {
+        let mut agent = match provider {
             Some(chat_fn) => {
                 let prov: Box<dyn ta::Provider> = Box::new(PyProvider { chat_fn });
                 ta::build_agent_with_provider(&cfg, prov, Vec::new(), &client, extra, &api_key)
@@ -430,9 +640,28 @@ impl Agent {
             None => ta::build_agent_with(&cfg, Vec::new(), &client, extra, &api_key),
         }
         .map_err(to_pyerr)?;
+        install_hooks(&mut agent, hooks, py)?;
         Ok(Self {
             inner: Mutex::new(agent),
         })
+    }
+
+    /// Install the interception layer from a Python object with any of
+    /// `before_tool(tool, input, ctx)` / `after_tool(tool, input, output,
+    /// executed, ctx)` / `on_chat_request(request)` — missing methods are
+    /// no-ops. `before_tool` returns `None` (allow), a deny string (the model
+    /// sees it as the error tool_result), or `{"modify": input}` (run with
+    /// replaced input; the audit keeps the original). A raising or
+    /// ill-formed `before_tool` FAILS CLOSED (the call is denied, with the
+    /// reason in the message); the observe-only hooks swallow errors.
+    /// Call between runs (same busy contract as the other sync methods).
+    /// `task` sub-agents inherit the layer; attribution arrives via
+    /// `ctx["subagent"]` (`None` = top-level).
+    fn set_hooks(&self, hooks: Py<PyAny>, py: Python<'_>) -> PyResult<()> {
+        // Resolve + validate the methods with the GIL held, then install
+        // lock-only (from_obj / set_hooks touch no Python).
+        let h = PyHooks::from_obj(hooks, py)?;
+        self.with_agent(py, |a| a.set_hooks(std::sync::Arc::new(h)))
     }
 
     /// Append a user message (text) to the conversation, then `.run()`.
@@ -619,7 +848,8 @@ impl Agent {
 /// One-shot: build an agent from `config`, send `message`, run to completion,
 /// and return the `RunOutcome` dict. Optional `on_event` streams events.
 #[pyfunction]
-#[pyo3(signature = (config, message, *, on_event=None, tools=None, provider=None, api_key=None))]
+#[pyo3(signature = (config, message, *, on_event=None, tools=None, provider=None, api_key=None, hooks=None))]
+#[allow(clippy::too_many_arguments)] // flat kwarg surface mirrors the other entry points
 fn chat(
     config: &Bound<'_, PyAny>,
     message: &str,
@@ -627,6 +857,7 @@ fn chat(
     tools: Option<Vec<Py<PyTool>>>,
     provider: Option<Py<PyAny>>,
     api_key: Option<String>,
+    hooks: Option<Py<PyAny>>,
     py: Python<'_>,
 ) -> PyResult<PyObject> {
     let cfg = load_config(config)?;
@@ -647,6 +878,7 @@ fn chat(
         None => ta::build_agent_with(&cfg, Vec::new(), &client, extra, &api_key),
     }
     .map_err(to_pyerr)?;
+    install_hooks(&mut agent, hooks, py)?;
     agent.push_user(vec![ta::Block::Text(message.into())]);
     // Local agent (no shared mutex): the run itself still releases the GIL so
     // other Python threads progress during the network-bound loop.

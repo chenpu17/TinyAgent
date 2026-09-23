@@ -176,6 +176,16 @@ a = tiny_agent.Agent("chat.json", provider=echo_provider)  # 无 api_key
 
 非流式 v1：返回整段文本，作为单条 delta 发出；不支持 tool_use（需要工具调用请用内置 provider + 自定义 `Tool`）。provider 抛异常会**诚实地 fail 该轮**。**取消 / 超时契约**：callable 在 GIL 内同步执行，`timeout_secs` 与取消**不会中断它**——agent 等它返回，可长时间运行的 provider 必须自行设限；预算与超时仍在轮次边界生效。
 
+**Hooks 拦截层**（Python 侧同款核心能力）：`a.set_hooks(obj)` 或构造时 `hooks=obj` /
+`chat(cfg, msg, hooks=obj)`——obj 按鸭子类型提供任意子集：`before_tool(tool, input, ctx)`
+返回 `None`（放行）/ 拒绝字符串（成为模型看到的错误结果）/ `{"modify": input}`（换输入执行，
+审计留原始输入）；`after_tool(tool, input, output, executed, ctx)` 事后审计（`executed=False`
+仅当 Deny）；`on_chat_request(request)` 只读观察主 turn 请求。`ctx` 是归因投影
+`{workdir, subagent}`（顶层 `subagent=None`，`task` 子 agent / run_code 沙箱各自有名）。
+缺的方法即无操作；**`before_tool` 抛异常或返回非法值 = fail-closed 拒绝该调用**（理由进消息），
+观察类钩子的异常被吞掉。完整语义（并发、`--resume` 不带 hooks、威胁模型）见库 API 节与
+`src/hooks.rs` trait 文档。
+
 **`run_code` 开关**（绑定默认不带 `code` feature，`maturin develop --features code` 编入）：`a.enable_code()`
 / `a.disable_code()` 运行期开关、`a.set_code_config({...})` 整包替换 code 配置（dict 形状同配置文件的
 `code` 节，未知键报错、缺省键重置为默认值）。未编入该 feature 时三个方法返回带重建提示的明确错误。
