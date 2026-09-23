@@ -49,10 +49,10 @@ COUNTS_DEV = {  # 4×33 + 2×19 + 22 = 192
     "bug": 33, "feature": 33, "account": 33, "howto": 33,
     "billing": 19, "complaint": 19, "unsure": 22,
 }
-COUNTS_HOLD = {  # 4×51 + 2×29 + 26 = 288
-    "bug": 51, "feature": 51, "account": 51, "howto": 51,
-    "billing": 29, "complaint": 29, "unsure": 26,
-}
+COUNTS_HOLD = {  # 4×102 + 2×58 + 52 = 576（v1.5：288→576 放大，帧池不变——
+    "bug": 102, "feature": 102, "account": 102, "howto": 102,
+    "billing": 58, "complaint": 58, "unsure": 52,
+}               # 12 帧/类 × 中性槽位组合空间 ≫ 每类 ~36 稀释票，枚举面保持关闭）
 COUNTS_E1 = dict(COUNTS_HOLD)
 
 # ── holdout 增量槽位（词汇移位：dev 规则只覆盖共享基座部分） ──────────
@@ -624,7 +624,7 @@ def main():
     problems, probe_f1, leaked = check(dev, hold, e1)
     stats = {
         "seed_main": SEED_MAIN, "seed_e1": SEED_E1,
-        "version": "v0b-corpus v1.4（残差组合化：稀释 12 帧/类 + 冲突帧全部带中性槽位，唯一句 ~44 → 上千；其余同 v1.3）",
+        "version": "v0b-corpus v1.5（holdout/e1 288→576 放大，帧池与比例不变；account 边界澄清走任务文本协议 v2.2 不动生成语义；dev 族不变）",
         "dev": len(dev), "holdout": len(hold), "e1": len(e1), "neg": len(neg),
         "dev_classes": dict(Counter(x["label"] for x in dev)),
         "holdout_classes": dict(Counter(x["label"] for x in hold)),

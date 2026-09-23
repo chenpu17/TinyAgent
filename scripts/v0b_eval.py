@@ -8,6 +8,7 @@
   e0p 门全关 + E0′ 磁盘技能（三问边界句）  文案/路由效应（主假设臂）
   e1  e0p 的门 + include=true + 内置技能  库复用增量（cold；warm 用 --warm-lib）
   e2  e1 + llm                            语义批量
+  e2w e2 + 预置已批准判别库（--warm-lib + --warm-arms e2w）  判别库采用/方差收窄
   e3  e2 + call_batch                     并发墙钟
 
 用法：
@@ -51,18 +52,25 @@ TASK_TEXT = (
     "workdir 里有 dev.jsonl（带 label 金标的历史工单）与 holdout.jsonl（待分类工单）。"
     "请为 holdout 的每条工单判定 label，词表固定为 bug / feature / account / billing "
     "/ howto / complaint / unsure。判定标准从 dev 的金标归纳。"
+    "边界口径：按根因域归类——登录、验证码、账号状态、绑定与认证类问题，"
+    "即便被描述成「进不去/被踢出/界面出不来」等故障措辞也归 account；"
+    "bug 只指账号流程之外的产品功能故障。"
     "把结果写到 predictions.jsonl：每行一个 JSON 对象 {\"id\": \"...\", \"label\": \"...\"}，"
     "行数与 holdout 完全一致、id 一一对应、label 必须在词表内。"
     "先写出完整 predictions 再做总结（完成后只回复紧凑摘要：总条数、各类计数、准确率自估）。"
     "predictions.jsonl 写出并通过行数/词表自检后即视为完成，直接给摘要结束，"
     "不要追加逐条复核。开工前先 read_skill 加载 run-code 技能再规划做法。"
 )
-# 末三句是协议级干预（所有臂同文，不是臂变量）：
-# 1. 完成纪律（试点发现 3：E3 未写产物即烧穿）；
-# 2. 无复核句（v2.1）：两次实测死在产物已完整、复核/格式化轮烧穿 cap
+# 末四句是协议级干预（所有臂同文，不是臂变量）：
+# 1. 边界口径句（v2.2）：级联探针证明 account 弱类（recall 恒 0.765–0.784，
+#    ds/glm 内层同错）是标注边界未书面化而非模型盲区——补人话口径测天花板
+#    是标准缺失还是能力；只钉 account↔bug 一条（唯一实测弱边界），不铺全量
+#    定义以免压掉其余类的残差难度；
+# 2. 完成纪律（试点发现 3：E3 未写产物即烧穿）；
+# 3. 无复核句（v2.1）：两次实测死在产物已完整、复核/格式化轮烧穿 cap
 #    （v1.2 ds@4096 死在格式化轮；v1.4 ds@8192 写完 288 行 review 表后
 #    死在逐条复核轮）——复核是模型自觉行为，明确"自检即完成"；
-# 3. 技能拉起——门控披露（LIB/BATCH/LLM 段）与 E0′ 边界句全部骑在技能正文上，
+# 4. 技能拉起——门控披露（LIB/BATCH/LLM 段）与 E0′ 边界句全部骑在技能正文上，
 #    模型不 read_skill 则干预零曝光（v1.1 批实测 6/6 零 read_skill；试点 E2
 #    同因 LLM 披露未进上下文）。统一拉起后，臂间差异才真正回到"读到的技能
 #    内容"（e0p 的磁盘变体同名覆盖内置）。
@@ -131,9 +139,9 @@ def write_config(run_dir, arm, wd, max_tokens, outer_model, max_total, inner_mod
     base, key = gateway()
     code = {"enabled": True, "skill_injection": "on_demand",
             "include": False, "call_batch": False}
-    if arm in ("e1", "e2", "e3"):
+    if arm in ("e1", "e2", "e2w", "e3"):
         code["include"] = True
-    if arm in ("e2", "e3"):
+    if arm in ("e2", "e2w", "e3"):
         code["llm"] = {"enabled": True, "default_model": inner_model,
                        "models": [inner_model]}
     if arm == "e3":
@@ -155,10 +163,11 @@ def write_config(run_dir, arm, wd, max_tokens, outer_model, max_total, inner_mod
 
 
 def run_once(arm, rep, n_holdout, warm_lib, corpus_ver, timeout_s, max_tokens,
-             outer_model, max_total, inner_model):
+             outer_model, max_total, inner_model, warm_arms=None):
     run_dir = ART / f"{arm}-r{rep}"
     run_dir.mkdir(parents=True, exist_ok=True)
-    wd, gold = stage_workdir(run_dir, n_holdout, warm_lib)
+    lib_for_arm = warm_lib if (warm_arms is None or arm in warm_arms) else None
+    wd, gold = stage_workdir(run_dir, n_holdout, lib_for_arm)
     if arm == "e0p":
         stage_e0p_skill(run_dir)
     cfg = write_config(run_dir, arm, wd, max_tokens, outer_model, max_total, inner_model)
@@ -172,7 +181,7 @@ def run_once(arm, rep, n_holdout, warm_lib, corpus_ver, timeout_s, max_tokens,
             stdout=evf, stderr=logf, env=env, timeout=timeout_s)
     return {"arm": arm, "rep": rep, "rc": p.returncode,
             "wall": round(time.time() - t0, 1), "gold": gold, "run_dir": run_dir,
-            "corpus": corpus_ver, "warm": bool(warm_lib),
+            "corpus": corpus_ver, "warm": bool(lib_for_arm),
             "max_tokens": max_tokens, "outer_model": outer_model,
             "max_total": max_total}
 
@@ -300,10 +309,14 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=4096,
                     help="外层 max_tokens（装置参数，进版本戳；8192 用于探测"
                          "完成墙是 cap 还是探索长度）")
-    ap.add_argument("--max-total-tokens", type=int, default=4_000_000,
-                    help="run 级 token 预算闸（装置参数，进版本戳）。默认 4M = "
-                         "四臂主批任意默认值；e3 复查批用 8M（装配文档 §2.2 登记的"
-                         "开放项：主批 e3 2/3 在产物写全后触 4M 闸）")
+    ap.add_argument("--max-total-tokens", default="4000000",
+                    help="run 级 token 预算闸（装置参数，进版本戳）。单值 = 全臂统一；"
+                         "或臂映射 'e0:4000000,e2:16000000'（未列出的臂用第一个值"
+                         "兜底）。历史包络：主批 4M / e3 复查 8M / v1.5 放大批"
+                         " llm 臂 16M（装配文档 §2.2 登记）")
+    ap.add_argument("--warm-arms", default=None,
+                    help="逗号分隔的臂名单：--warm-lib 只预置给这些臂"
+                         "（缺省 = 全部臂，兼容 e1 warm 单臂批的既有用法）")
     ap.add_argument("--outer-model", default=OUTER_MODEL,
                     help="外层模型（默认 glm-5.3-flash；deepseek-flash 为完成墙"
                          "探针——glm 在 4096/8192 两档均烧满任意 cap 不完成）")
@@ -315,6 +328,15 @@ def main():
     if not BIN.exists():
         sys.exit(f"missing {BIN} — cargo build --release --features code")
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
+    budget_raw = str(args.max_total_tokens)
+    if ":" in budget_raw:
+        pairs = dict(p.split(":", 1) for p in budget_raw.split(","))
+        budget_map = {a.strip(): int(v) for a, v in pairs.items()}
+        budget_default = next(iter(budget_map.values()))
+    else:
+        budget_map, budget_default = {}, int(budget_raw)
+    warm_arms = ([a.strip() for a in args.warm_arms.split(",") if a.strip()]
+                 if args.warm_arms else None)
     corpus_ver = corpus_version()
     corpus_ver = {**corpus_ver, "inner_model": args.inner_model}
     ART.mkdir(exist_ok=True)
@@ -330,8 +352,9 @@ def main():
             try:
                 r = run_once(arm, rep, args.holdout, args.warm_lib,
                              corpus_ver, args.timeout, args.max_tokens,
-                             args.outer_model, args.max_total_tokens,
-                             args.inner_model)
+                             args.outer_model,
+                             budget_map.get(arm, budget_default),
+                             args.inner_model, warm_arms)
             except subprocess.TimeoutExpired:
                 print(f"[v0b] arm {arm} rep {rep} TIMED OUT", flush=True)
                 continue
@@ -343,8 +366,9 @@ def main():
                 print(f"[v0b]   stream_idle — rerunning once", flush=True)
                 r = run_once(arm, rep, args.holdout, args.warm_lib,
                              corpus_ver, args.timeout, args.max_tokens,
-                             args.outer_model, args.max_total_tokens,
-                             args.inner_model)
+                             args.outer_model,
+                             budget_map.get(arm, budget_default),
+                             args.inner_model, warm_arms)
                 s = score(run_dir, r["gold"])
                 c = cost(run_dir)
             summary = {"arm": arm, "rep": rep, "rc": r["rc"], "wall_s": r["wall"],

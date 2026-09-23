@@ -2,7 +2,7 @@
 
 | 项 | 值 |
 |---|---|
-| 状态 | v0.7.1；M1（include v1）已落码（§8 M1 行含落地差异）；M2 模板/skill 待做；V0-B 验收未做 |
+| 状态 | v0.7.1；M1（include v1）与 M2（模板/skill 生命周期教学）均已落码（§8 里程碑表）；V0-B 验收见姊妹稿 v0.7.4 读数登记 |
 | 版本 | v0.7.1 |
 | 日期 | 2026-09-22 |
 | 关联文档 | `docs/run_code_design.md`（D 编号、prelude 封闭清单纪律 D18）、`docs/finetune_support_design.md`（附录 A 即规格纪律）、`docs/code_llm_design.md`（姊妹稿——统一边界句、责任与权限边界、共享纪律见其 §6/§10） |
