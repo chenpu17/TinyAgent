@@ -3,10 +3,25 @@
 本文件记录 TinyAgent 的版本演化。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)（0.x 阶段 minor 即破坏性窗口）。
 
-## [Unreleased]
+## [0.4.0] - 2026-09-24
 
 ### Added
 
+- **run_code 代码承接（QuickJS 沙箱全链）**：进程内同步 JS 沙箱（QuickJS，ES2023，无 tokio 依赖）——
+  编排 MCP/API 分页、批量操作与大文件处理。封闭 prelude（`readAll`/`readLines`/`writeVerified`/
+  `copy_bytes`，字节保真写读回校验）；workdir 路径拦截（符号链接按原始拼写逐组件走查、不存在目标经
+  最深已存在祖先 canonicalize 判定）；fuel/内存/墙钟/调用额度四限 + 中断四点（入口门/epoch 回调/
+  host_call 入口/收尾裁决）；`tools.list()/call()` 宿主工具面、`tools.budget()` 额度自察、结构化
+  `e.kind` 错误分类（denied/hooks/budget/deadline/cancel/unknown_tool/lib/llm/llm_output）。默认全关，
+  `code.enabled` 开启。
+- **include 库通道 + callBatch 批量通道 + llm 判别原语**：`lib/INDEX.md` 生命周期（`saveLib` 登记 →
+  负责人批准 → 跨会话 `include` 准入，哈希防漂移）；`tools.callBatch` 只读并发批量（8/波、按提交序、
+  无事务语义、失败条目 `instanceof Error` 判别）；`tools.call("llm", …)` 单发判别调用（`labels` 受约束
+  输出契约 + 词表归一化校验、token 发前预占、成本落 `meta.llm` 台账、级联判别教学面）。三通道各自
+  独立开关（`code.include`/`call_batch`/`llm.enabled`），门关时模型可见契约与旧二进制逐字一致。
+- **run_code 微调支持**：`skill_injection` 三态（声明序=披露序）装配期消费；`precheck` 调用期检出台
+  （`{run_code, task, todo}`）拒答与墓碑文案——LLM 可见文案即规格，冻结在
+  `docs/finetune_support_design.md` 附录 A。
 - **上下文构成查询 `context_breakdown()`（4278d8e，跨核心 + 双绑定 + TUI）**：新公共 API——外部宿主可查询
   下一请求上下文的估算 token 构成与占比：`system` 三段（env 头 / 用户 base / skill 简介）、工具 schema 四类
   （`builtin`/`mcp`/`skill`/`custom`，经 `Tool` trait 新默认方法 `origin()` 归类，含逐工具明细）、消息历史
@@ -18,6 +33,16 @@
   透出面：Rust `Agent::context_breakdown()`、Python `context_breakdown()`（跨线程阻塞等锁）、Node
   `contextBreakdown()`（run 中立即报错，wrapper.d.ts 类型同步）、TUI `/context` 命令（busy 时禁用，同
   `/clear`）。
+- **跨平台 npm 分发（bfac803）**：主包 `files` 白名单不再携带任何 `*.node`；五平台
+  （darwin/linux × arm64/x64 + win32-x64）以 `tiny-agent-<platform>` optionalDependencies 子包
+  同版本分发，release workflow 五平台矩阵构建（NPM_TOKEN 缺省时子包 tarball 附 GitHub Release）。
+  `tests/test_packaging.test.js` 为打包验收门：主包白名单无 `*.node` + 本地伪造平台子包安装 →
+  加载 + mock 调用全链路。
+- **绑定 hooks 拦截层暴露（0986858 / a951ac9）**：Python `set_hooks` / `hooks=` kwarg、Node
+  `setHooks` / `hooks` 选项——鸭子类型三方法任意子集（`before_tool`/`after_tool`/`on_chat_request`，
+  Node 侧 camelCase）。决策 fail-closed：抛异常/非法返回 = Deny（理由进模型可见错误 tool_result）；
+  观察类钩子异常吞掉（Node 观察类 TSFN 是 Fatal 策略，wrapper 必吞）；`before_tool` 决策经
+  `resolveHooksDecision` round-trip；`ctx.subagent` 审计归因。`chat()` 一次性入口同面。
 
 ### Changed（破坏性）
 
@@ -27,6 +52,10 @@
   **迁移**：已有实现参数表追加 `, _ctx: &ToolCtx`。**注意此变更是静默失效型**：旧签名的
   `fn after_tool` 实现在升级后不再是 trait 方法实现（编译照过、降级为 inherent 方法），trait 默认
   no-op 接管——钩子悄悄停止触发，升级后务必核对审计输出仍在。
+- **run-code 技能正文新增「产物分块增量写」纪律条（7cbf815）**：大文件产物每完成一段
+  `writeVerified` 落盘一次、写完产物即收尾（真实跑实测遵循：批间 checkpoint 九次单调增长 +
+  收尾核对式正式写）；`examples/prompts/agentic-code.md` Persistence 段加同义英文条目。
+  增量变更只加不改，teaser 与工具描述未动（finetune 文档修订记录 v0.6）。
 
 ### Fixed
 
