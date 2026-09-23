@@ -21,7 +21,9 @@ summary.json} + v0b_eval/agg.json（跨重复聚合）。语料 v0b_artifacts/
 （scripts/v0b_corpus.py 生成；gen_stats 摘要进每 run 版本戳）。
 
 诚实边界：交错 = 臂内顺序在每重复内轮转；任务状态每 run 重置（workdir 重铺，
-warm 臂显式预置库）；墙钟含网关时延波动，聚合报 min/median/max 不只报均值。
+warm 臂显式预置库）；墙钟含网关时延波动，聚合报 min/median/max 不只报均值；
+max_tokens 截断且产物缺失/不足的 run 标 partial=true 聚合单列（假 0 防护，
+artifact_robustness_design.md 案 C），不混入臂级统计。
 """
 import argparse
 import hashlib
@@ -186,6 +188,14 @@ def run_once(arm, rep, n_holdout, warm_lib, corpus_ver, timeout_s, max_tokens,
             "max_total": max_total}
 
 
+def is_partial(summary_score, stop_reason):
+    """假 0 防护（artifact_robustness_design.md 案 C）：截断 + 产物缺失/不足
+    的 run 不许以 0.0 混进聚合——e2-r0 实录（575/576 判完、max_tokens 烧穿
+    在写盘前一行没写，真实 F1 0.9020 记成 0.0）。判据刻意保守：只钉「
+    max_tokens 终态 且 answered < n」这一实测死亡形态；其他终态照常计分。"""
+    return stop_reason == "max_tokens" and summary_score["answered"] < summary_score["n"]
+
+
 def score(run_dir, gold):
     pred_path = run_dir / "wd" / "predictions.jsonl"
     preds = {}
@@ -266,14 +276,18 @@ def cost(run_dir):
 
 
 def aggregate(all_runs):
-    """跨重复聚合：min/median/max（墙钟与 token 波动大，只报均值会撒谎）。"""
+    """跨重复聚合：min/median/max（墙钟与 token 波动大，只报均值会撒谎）。
+    partial（假 0 防护命中）的 run 单列：不计入臂级 min/median/max，
+    只报数量与其各自分数——拿 partial 混进统计就是把死亡当读数。"""
     agg = {}
     for arm in sorted({s["arm"] for s in all_runs}):
         runs = [s for s in all_runs if s["arm"] == arm]
+        clean = [s for s in runs if not s.get("partial")]
+        partials = [s for s in runs if s.get("partial")]
 
         def stat(key, sub=None):
             vals = []
-            for r in runs:
+            for r in clean:
                 v = r[key] if sub is None else ((r[key] or {}).get(sub))
                 if isinstance(v, (int, float)):
                     vals.append(v)
@@ -281,10 +295,15 @@ def aggregate(all_runs):
                 return None
             vals.sort()
             med = vals[len(vals) // 2]
-            return {"min": vals[0], "median": med, "max": vals[-1]}
+            return {"min": vals[0], "median": med, "max": vals[-1], "n": len(vals)}
 
         agg[arm] = {
             "repeats": len(runs),
+            "partial_runs": [
+                {"rep": p["rep"], "stop": p["stop_reason"],
+                 "answered": p["score"]["answered"], "n": p["score"]["n"],
+                 "inner_calls": (p["inner"] or {}).get("calls")}
+                for p in partials],
             "macro_f1": stat("score", "macro_f1"),
             "valid_rate": stat("score", "valid_rate"),
             "wall_s": stat("wall_s"),
@@ -377,6 +396,11 @@ def main():
                    "max_total": r["max_total"],
                    "parallel": args.max_parallel > 1,
                    "score": s, **c}
+        summary["partial"] = is_partial(s, c["stop_reason"])
+        if summary["partial"]:
+            print(f"[v0b]   PARTIAL: stop_reason={c['stop_reason']} 且 "
+                  f"answered {s['answered']}/{s['n']} —— 假 0 防护生效，"
+                  f"标 partial=true，聚合单列不计入臂级统计", flush=True)
         (run_dir / "summary.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2))
         all_runs.append(summary)
