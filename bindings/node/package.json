@@ -21,7 +21,13 @@
     "wrapper.js",
     "wrapper.d.ts",
     "index.js",
-    "index.d.ts",
-    "*.node"
-  ]
+    "index.d.ts"
+  ],
+  "optionalDependencies": {
+    "tiny-agent-darwin-x64": "0.3.0",
+    "tiny-agent-darwin-arm64": "0.3.0",
+    "tiny-agent-linux-x64-gnu": "0.3.0",
+    "tiny-agent-linux-x64-musl": "0.3.0",
+    "tiny-agent-win32-x64-msvc": "0.3.0"
+  }
 }

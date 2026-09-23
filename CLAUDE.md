@@ -46,9 +46,11 @@ cargo fmt --all                            # 格式化（CI 有 --check 门禁�
 **Node 侧增删/改名 native `Agent` 方法必须同步两件套**：`wrapper.js`（带 onEvent 的方法要套
 `wrapOnEvent`——native 事件 TSFN 是 Fatal 策略，裸透传用户回调 = 抛错即进程 abort）与 `wrapper.d.ts`
 类型声明；`tests/test_wrapper_sync.test.js` 以 native 原型为真值源钉住漂移。
-`tests/test_packaging.test.js` 是打包验收门（`npm pack` → 独立目录安装 → 加载 + mock 调用一遍），
-守 `package.json` 的 `files` 白名单——tarball 只带本地平台的 `*.node`，跨平台 npm 分发
-（optionalDependencies 拆包）仍是未做的发布决策。
+`tests/test_packaging.test.js` 是打包验收门（主包白名单无 `*.node` + 本地伪造平台子包
+的安装 → 加载 + mock 调用全链路）——守跨平台拆包分发契约：主包 `files` 不含 `*.node`，
+平台子包 `tiny-agent-<platform>`（optionalDependencies 同版本）由 release workflow
+五平台矩阵构建，`NPM_TOKEN` secret 缺省时子包 tarball 附 GitHub Release；子包 name
+必须与 napi 生成 index.js 的 require 候选一致（测试钉住）。
 改了核心 provider/agent 后，两个绑定的测试都要跟着跑一遍回归；动了 run_code/装配则另跑
 `maturin develop --features code` + `npm run build:debug -- --features code` 的双构建。
 

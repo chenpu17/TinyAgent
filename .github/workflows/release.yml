@@ -52,3 +52,103 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.sha256
+
+  # Node 绑定跨平台分发（0.3.x）：主包 npm 包只带 loader/类型，*.node 按
+  # optionalDependencies 拆平台子包（tiny-agent-<platform>）。每个平台 job
+  # 构建 + npm pack 子包；publish job 在配了 NPM_TOKEN secret 时发布到
+  # registry，否则把子包 tarball 附到 GitHub Release（npm install <tgz> 可用）。
+  bindings-node:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-13,      target: x86_64-apple-darwin,       pkg: tiny-agent-darwin-x64 }
+          - { os: macos-latest,  target: aarch64-apple-darwin,      pkg: tiny-agent-darwin-arm64 }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu,  pkg: tiny-agent-linux-x64-gnu }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, pkg: tiny-agent-linux-x64-musl }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,   pkg: tiny-agent-win32-x64-msvc }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: node-${{ matrix.target }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install musl-tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build native binding
+        working-directory: bindings/node
+        run: npm install && npm run build -- --target ${{ matrix.target }}
+
+      # 子包 = package.json（name/version 与主包一致）+ 平台 .node + LICENSE。
+      # 版本单源 = 主包 package.json；子包 name 必须与生成的 index.js 的
+      # require('tiny-agent-<platform>') 候选一致（打包验收测试钉住）。
+      - name: Stage and pack subpackage
+        shell: bash
+        working-directory: bindings/node
+        env:
+          PKG_NAME: ${{ matrix.pkg }}
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          STAGE="npm-stage/${PKG_NAME}"
+          mkdir -p "$STAGE"
+          NODE_FILE=$(ls tiny-agent.*.node | head -1)
+          cp "$NODE_FILE" "$STAGE/"
+          cp ../../LICENSE "$STAGE/"
+          PKG_STAGE="$STAGE" PKG_VERSION="$VERSION" PKG_NODE_FILE="$NODE_FILE" \
+            node -e 'const fs=require("fs");const e=process.env;fs.writeFileSync(e.PKG_STAGE+"/package.json",JSON.stringify({name:e.PKG_NAME,version:e.PKG_VERSION,description:`TinyAgent native binding (${e.PKG_NAME})`,license:"MIT",main:e.PKG_NODE_FILE,files:[e.PKG_NODE_FILE]},null,2)+"\n")'
+          (cd "$STAGE" && npm pack --silent)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.pkg }}
+          path: bindings/node/npm-stage/**/*.tgz
+
+  bindings-node-publish:
+    needs: bindings-node
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: pkgs
+
+      - name: Publish to npm (requires NPM_TOKEN secret)
+        if: env.NPM_TOKEN != ''
+        run: |
+          find pkgs -name '*.tgz' | while read -r tgz; do
+            npm publish "$tgz" --access public
+          done
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # 未配 NPM_TOKEN：把子包 tarball 附到 GitHub Release（离线分发路径，
+      # npm install <tgz> 可用）；配了 token 的发布此步多余但无害。
+      - uses: softprops/action-gh-release@v2
+        if: env.NPM_TOKEN == ''
+        with:
+          generate_notes: false
+          files: |
+            pkgs/**/*.tgz
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}

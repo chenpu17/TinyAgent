@@ -187,9 +187,14 @@ cd bindings/node && npm install && npm run build   # 生成 .node + wrapper.js
 npm test                                            # 离线测试（node --test，对进程内 SSE mock）
 ```
 
-> 分发边界：`npm pack` 产出的 tarball 只带**打包机的平台**二进制（`files` 含 `*.node`），本机/
-> 同架构离线分发可用；跨平台 npm 发布（optionalDependencies 按平台拆包 + CI 矩阵构建）尚未建设。
-> `tests/test_packaging.test.js` 是验收门：pack → 独立目录安装 → 加载 + mock 调用一遍全链路。
+> 分发模型（0.3.x 起跨平台拆包）：主包 `tiny-agent` 只带 loader/类型（`files` 不含
+> `*.node`），原生二进制按平台拆 `tiny-agent-<platform>` 子包（darwin-x64/arm64、
+> linux-x64-gnu/musl、win32-x64-msvc），主包以 `optionalDependencies` 引用同版本
+> 子包；napi 生成的 `index.js` 优先加载本地 `.node`（开发构建）再回落子包。CI 的
+> release workflow 按平台矩阵构建打包；配了 `NPM_TOKEN` secret 则发布 registry，
+> 否则子包 tarball 附在 GitHub Release（`npm install <tgz>` 离线可用）。
+> `tests/test_packaging.test.js` 是验收门：主包白名单（无 `*.node`、loader/类型
+> 齐全）+ 本地伪造平台子包的安装 → 加载 + mock 调用全链路。
 
 ```javascript
 const { chat, Agent } = require('tiny-agent');
@@ -1199,7 +1204,9 @@ release 下 panic 不触发 `Drop`——调试 destructors（如 TUI 终端还�
 3. 提交后打 tag：`git tag vX.Y.Z`；
 4. `git push --tags` —— tag 推上 GitHub 后自动触发 release workflow
    （`.github/workflows/release.yml`：musl x86_64 静态二进制 + sha256 上传 GitHub Releases，
-   附自动生成的 release notes）。gitee 侧 `git push origin --tags` 同步标签。
+   附自动生成的 release notes；另有 `bindings-node` 五平台矩阵——主包 + 平台子包
+   `tiny-agent-<platform>` 的构建与打包，配 `NPM_TOKEN` secret 自动发布 registry，
+   未配则子包 tarball 附 Release）。gitee 侧 `git push origin --tags` 同步标签。
 
    **产物带 `code` feature**（0.3.x 起）：musl 二进制编译入 run_code 沙箱
    （较无 feature 版 +≈4.6 MiB），但运行期开关 `code.enabled` 默认关——
