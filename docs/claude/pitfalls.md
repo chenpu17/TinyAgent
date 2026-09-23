@@ -296,3 +296,16 @@
 - **lib_api 里别断言"空 workdir ⇒ 无技能"**：`resolve_skill_dirs` 还会读机器级全局技能目录
   （`~/.config/tinyagent/skills`），开发机上装了技能的与干净的 CI 跑出不同结果——环境依赖的断言
   是移植性地雷。"无 intro"语义用直接 `Agent::new`（不经装配）来测。
+- **思考型模型的输出 cap 是装置红线：4096/8192 档均实测烧穿，正式跑 32K 起**
+  （2026-09-23 产物健壮性 mini 两跑实录）：glm-5.3-flash 外层在 4096 档会把整段
+  cap 烧在思考上（逐轮 output 精确 =4096、无 tool call 无正文），salvage nudge
+  开火后 salvage 轮同样烧穿 → `max_tokens` 终态假 0；连"传统管线"的逐条
+  deepseek-flash 调用都在 4096 档烧穿 8%（23/288 空判）。思考段计入 output
+  计费与 max_tokens——**给思考型模型配 max_tokens 时按「思考 ~2K+/条」预留**，
+  正式批一律 32768（runner `--max-tokens`）。判读死亡先看逐轮 output 是否精确
+  等于 cap（烧穿指纹）。
+- **`测试模型.md` 的 `vol-glm-5.3-flash` 是会话别名，不是网关模型名**：网关
+  OpenAI 兼容接口直接调它 400「未找到匹配模型」，`/models` 实测只有
+  `deepseek-flash` / `glm-5.3` / `glm-5.3-flash` / `k3`。`vol-` 前缀只对
+  Claude Code 接入端有效；评测/绑定测试一律用网关名（`v0b_eval.py` 默认值
+  即正确）。新会话第一次真模型烟雾门撞 400 时先查这里，别急着改装置。
