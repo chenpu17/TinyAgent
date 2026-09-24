@@ -346,6 +346,193 @@ TASK_TEXTS = {
 }
 
 
+# ── G2 新实例（方案 §4.4：每类 2 新实例；同规模同部署条件）────────────────
+# 边界语义与 G1 完全一致：强制边界记录逐谓词覆盖、孤儿事件、随机填充只落
+# 非保留用户。随机体 seed 派生自 G1（SEED + 100 + 实例号）——数据是新的，
+# 刻意不与 G1 任何实例重合；规模不变（可比性）。T0 无随机体，两实例各自
+# 手写变体（同谓词覆盖、不同取值/位置/目标数）。
+
+G2_INSTANCE_IDS = ("g2i1", "g2i2")
+
+
+def _g2_seed(instance: str) -> int:
+    return SEED + 100 + G2_INSTANCE_IDS.index(instance)
+
+
+# T0 手写变体：每实例 12 条，谓词边界全覆盖（sev==2 入 / sev==1 出 /
+# confirmed=false 出 / free 出 / cancelled 出 / expired 出），目标非空非全集。
+_G2_T0_VARIANTS = {
+    "g2i1": [
+        ("r-01", "paid", "active", 5, True),    # 入
+        ("r-02", "paid", "active", 2, True),    # sev==2 边界入
+        ("r-03", "paid", "active", 1, True),    # sev==1 出
+        ("r-04", "paid", "active", 6, False),   # confirmed=false 出
+        ("r-05", "free", "active", 7, True),    # free 出
+        ("r-06", "paid", "cancelled", 2, True),  # cancelled 出
+        ("r-07", "paid", "expired", 3, True),   # expired 出
+        ("r-08", "free", "expired", 1, False),
+        ("r-09", "paid", "active", 4, True),    # 入
+        ("r-10", "free", "active", 9, True),
+        ("r-11", "paid", "active", 2, False),   # confirmed=false 出
+        ("r-12", "free", "cancelled", 2, True),
+    ],
+    "g2i2": [
+        ("r-01", "free", "active", 3, True),
+        ("r-02", "paid", "active", 2, True),    # sev==2 边界入
+        ("r-03", "paid", "active", 1, True),    # sev==1 出
+        ("r-04", "paid", "active", 4, False),   # confirmed=false 出
+        ("r-05", "paid", "active", 3, True),    # 入
+        ("r-06", "free", "active", 2, True),
+        ("r-07", "paid", "cancelled", 4, True),  # cancelled 出
+        ("r-08", "paid", "expired", 2, True),   # expired 出
+        ("r-09", "paid", "active", 2, True),    # 入
+        ("r-10", "paid", "active", 1, False),   # sev==1 且 confirmed=false 出
+        ("r-11", "free", "expired", 3, True),
+        ("r-12", "paid", "active", 5, True),    # 入
+    ],
+}
+
+
+def g2_t0_records(instance: str):
+    """G2 的 T0 实例：12 条手写变体（同谓词覆盖，不同取值/位置）。"""
+    return [{"id": i, "plan": p, "status": s, "severity": sev,
+             "confirmed": c}
+            for i, p, s, sev, c in _G2_T0_VARIANTS[instance]]
+
+
+def g2_t1_data(instance: str):
+    """G2 的 T1 实例：128 订阅 + 256 事件，边界语义同 G1（新随机体）。"""
+    rng = random.Random(_g2_seed(instance))
+    subs = []
+    for i in range(1, 129):
+        subs.append({"user_id": f"u-{i:04d}", "plan": rng.choice(PLANS),
+                     "status": rng.choice(STATUSES)})
+    for idx, plan, status, _ in T1_FORCED_SUBS:
+        subs[idx - 1] = {"user_id": f"u-{idx:04d}", "plan": plan,
+                         "status": status}
+    events = []
+
+    def ev(n, uid, sev, conf):
+        events.append({"event_id": f"e-{n:05d}", "user_id": uid,
+                       "severity": sev, "confirmed": conf})
+
+    ev(1, "u-0001", 2, True)
+    ev(2, "u-0001", 4, True)
+    ev(3, "u-0002", 2, True)
+    ev(4, "u-0003", 1, True)
+    ev(5, "u-0004", 3, False)
+    ev(6, "u-0005", 3, True)
+    ev(7, "u-0006", 2, True)
+    ev(8, "u-0008", 2, True)
+    ev(9, "u-0008", 1, True)
+    ev(10, "u-9901", 3, True)   # 孤儿事件
+    ev(11, "u-9902", 2, True)
+    for n in range(12, 257):
+        ev(n, f"u-{rng.randint(9, 128):04d}", rng.randint(1, 4),
+           rng.random() < 0.6)
+    return subs, events
+
+
+def g2_t2_data(instance: str):
+    """G2 的 T2 实例：80 订阅 + 160 事件（4+8 页），边界语义同 G1。"""
+    rng = random.Random(_g2_seed(instance))
+    subs = []
+    for i in range(1, 81):
+        subs.append({"user_id": f"u-{i:04d}", "plan": rng.choice(PLANS),
+                     "status": rng.choice(STATUSES)})
+    for idx, plan, status, _ in T2_FORCED_SUBS:
+        subs[idx - 1] = {"user_id": f"u-{idx:04d}", "plan": plan,
+                         "status": status}
+    events = []
+
+    def ev(n, uid, sev, conf):
+        events.append({"event_id": f"e-{n:05d}", "uid": uid,
+                       "severity": sev, "confirmed": conf})
+
+    ev(1, "u-0001", 2, True)
+    ev(2, "u-0001", 4, True)
+    ev(3, "u-0002", 2, True)
+    ev(4, "u-0003", 1, True)
+    ev(5, "u-0004", 3, False)
+    ev(6, "u-0005", 3, True)
+    ev(7, "u-0006", 2, True)
+    ev(8, "u-0008", 2, True)
+    ev(9, "u-0008", 1, True)
+    ev(10, "u-9901", 3, True)   # 孤儿 uid
+    ev(11, "u-9902", 2, True)
+    for n in range(12, 161):
+        ev(n, f"u-{rng.randint(9, 80):04d}", rng.randint(1, 4),
+           rng.random() < 0.6)
+    return subs, events
+
+
+def g2_data(instance: str, task: str):
+    """G2 实例数据入口：t0 返回 records；t1/t2 返回 (subs, events)。"""
+    if task == "t0":
+        return g2_t0_records(instance)
+    if task == "t1":
+        return g2_t1_data(instance)
+    if task == "t2":
+        return g2_t2_data(instance)
+    raise ValueError(f"unknown task {task}")
+
+
+def g2_gold(instance: str, task: str):
+    """G2 实例的 gold（判卷进程现算；不落盘）。形状与 scorer.load_gold 一致。"""
+    data = g2_data(instance, task)
+    if task == "t0":
+        return {"id": {t: None for t in solve_t0(data)}}
+    subs, events = data
+    if task == "t1":
+        return {"user_id": solve_join(subs, events)}
+    # t2：事件源关联字段是 uid（与 G1 同款跨源字段名差异）
+    return {"user_id": solve_join(subs, events, sub_key="user_id",
+                                  ev_key="uid")}
+
+
+def g2_serialize(instance: str, task: str) -> dict:
+    """G2 实例数据的落盘字节（stage_workdir_g2 / g2-sealed 写出的同名文件）。
+
+    哈希封存与铺设共用这一序列化——保证「prepare 封存的哈希」与「run 时
+    铺进 workdir 的字节」逐字节一致（数据漂移即校验失败）。
+    """
+    data = g2_data(instance, task)
+    out = {}
+    if task == "t0":
+        out["records.jsonl"] = "".join(
+            json.dumps(r, ensure_ascii=False) + "\n" for r in data).encode()
+    elif task == "t1":
+        subs, events = data
+        out["subscriptions.jsonl"] = "".join(
+            json.dumps(r, ensure_ascii=False) + "\n"
+            for r in subs).encode()
+        out["events.jsonl"] = "".join(
+            json.dumps(r, ensure_ascii=False) + "\n"
+            for r in events).encode()
+    elif task == "t2":
+        subs, events = data
+        out["subscriptions.json"] = json.dumps(
+            subs, ensure_ascii=False).encode()
+        out["events.json"] = json.dumps(events, ensure_ascii=False).encode()
+    else:
+        raise ValueError(f"unknown task {task}")
+    return out
+
+
+def g2_gold_digest() -> dict:
+    """全部 G2 实例的 gold 摘要（hash-only，不可逆；同 gen_stats.gold_digest
+    纪律）。判卷进程重算 gold 后对此对账，防生成模块被篡改后静默判错。"""
+    digest = {}
+    for instance in G2_INSTANCE_IDS:
+        for task in ("t0", "t1", "t2"):
+            gold = g2_gold(instance, task)
+            canon = json.dumps(gold, sort_keys=True, ensure_ascii=False)
+            digest[f"{instance}-{task}"] = {
+                "count": len(next(iter(gold.values()))),
+                "gold_sha256": hashlib.sha256(canon.encode()).hexdigest()}
+    return digest
+
+
 # ── 模型工作目录铺设（gold 永不进入 workdir）───────────────────────────────
 
 def stage_workdir(task: str, wd: Path, root: Path):
@@ -362,6 +549,21 @@ def stage_workdir(task: str, wd: Path, root: Path):
         pass  # 数据只经 MCP；workdir 留空（answer.jsonl 由模型写出）
     else:
         raise ValueError(f"unknown task {task}")
+
+
+def stage_workdir_g2(instance: str, task: str, wd: Path):
+    """G2 实例的工作目录铺设：数据现生成（g2_serialize 同款字节）。
+
+    t2 的数据不进 workdir——只经实例专属 MCP 服务器（数据文件在 run_dir
+    内、Seatbelt literal allow 放行），与 G1 的部署条件一致。
+    """
+    if wd.exists():
+        shutil.rmtree(wd)
+    wd.mkdir(parents=True)
+    if task == "t2":
+        return
+    for name, blob in g2_serialize(instance, task).items():
+        (wd / name).write_bytes(blob)
 
 
 # ── 生成与自检 ──────────────────────────────────────────────────────────────

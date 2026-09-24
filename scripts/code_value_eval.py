@@ -16,6 +16,13 @@ code_value_fixture.py，T2 数据源在 code_value_mcp_server.py。
   run-g1      执行冻结配方。必须 --execute 且价表、费用停止值齐备；
               预算闸不足一个 80K run 的预留时不启动；不自动重启失败 run，
               不自动解锁下一阶段。
+  prepare-g2  冻结 G2 十二跑配方（方案 §4.4 / 工单 04：3 类 × 2 新实例
+              × A/B 配对；第一实例 AB、第二实例 BA，顺序开跑前封存）。
+              实例数据由 code_value_fixture.g2_* 现生成（seed 派生自 G1，
+              边界语义同 G1），gold 摘要 hash-only 封存，不落盘。
+  run-g2      执行冻结的 G2 配方。付费三重门与 run-g1 同款；判卷用
+              g2_gold（实例级），预算闸对 G2 包络 0.96M 并按 G1+G2 ≤1.76M
+              联合封顶（G1 已用额度从既有批次 ledger 读出）。
 
 工件：artifacts/code_value/批次目录（manifest.json、configs/、runs/、
 ledger.json、g0_gate.json）+ docs/code_value_reports/批次.md。
@@ -53,6 +60,17 @@ MAX_TOKENS_PER_REQUEST = 32768
 G1_RUNS = [("t0", "B"), ("t0", "A"), ("t1", "A"), ("t1", "B"),
            ("t2", "B"), ("t2", "A")]
 G1_TOKEN_ENVELOPE = 480_000
+# G2 固定顺序与计划包络（方案 §4.4 / 工单 04：3 类 × 2 新实例 × A/B 配对；
+# 每实例只做一次配对，第一实例 AB、第二实例 BA——类内交替消位置偏置；
+# 12×80K=0.96M；G1+G2 联合上限 1.76M）
+G2_RUNS = [("t0", "g2i1", "A"), ("t0", "g2i1", "B"),
+           ("t0", "g2i2", "B"), ("t0", "g2i2", "A"),
+           ("t1", "g2i1", "A"), ("t1", "g2i1", "B"),
+           ("t1", "g2i2", "B"), ("t1", "g2i2", "A"),
+           ("t2", "g2i1", "A"), ("t2", "g2i1", "B"),
+           ("t2", "g2i2", "B"), ("t2", "g2i2", "A")]
+G2_TOKEN_ENVELOPE = 960_000
+G1_G2_COMBINED_CAP = 1_760_000
 # 在途超额风险上界（工单 01R：须含输入与输出，不能只算输出上限）。
 # 软闸是轮边界语义：最后一轮请求可再消耗 max_tokens 输出 + 该轮完整
 # 输入（上界取包络内单 run 软闸值——一个 run 的全部已知输入预算）。
@@ -197,12 +215,15 @@ def isolated_env(extra: dict = None) -> dict:
 
 
 def build_config(task: str, arm: str, wd: Path, base_url: str, model: str,
-                 fixture_root: Path, server_log: Path = None) -> dict:
+                 fixture_root: Path, server_log: Path = None,
+                 g2_instance: str = None, g2_data_dir: Path = None) -> dict:
     """A/B 配置：唯一差异 = code 可用包（enabled + on_demand skill）。
 
     A/B 用同一个 code-feature 二进制、同模型、同 limits、同公共任务文本
     （任务文本经 --task 注入，不进 system prompt，两臂逐字相同）。
     B 不在 tools 白名单里列 run_code（成员资格由 code.enabled 驱动）。
+    g2_instance/g2_data_dir：G2 的 t2 run 用实例专属数据文件（MCP 服务器
+    读 g2_data_dir 下的 subscriptions.json/events.json——铺设与封存同源）。
     """
     tools = (["shell", "read_file", "write_file", "edit_file", "list_dir"]
              if task in ("t0", "t1")
@@ -228,7 +249,14 @@ def build_config(task: str, arm: str, wd: Path, base_url: str, model: str,
         },
     }
     if task == "t2":
-        cmd = fixture.mcp_server_command(fixture_root, server_log)
+        if g2_instance:
+            cmd = ["python3", str(ROOT / "scripts" / "code_value_mcp_server.py"),
+                   "--subscriptions", str(g2_data_dir / "subscriptions.json"),
+                   "--events", str(g2_data_dir / "events.json")]
+        else:
+            cmd = fixture.mcp_server_command(fixture_root, server_log)
+        if server_log is not None:
+            cmd += ["--log", str(server_log)]
         cfg["mcp_servers"] = [{"name": "t2data",
                                "command": cmd[0], "args": cmd[1:]}]
     return cfg
@@ -262,12 +290,14 @@ def run_binary(cfg_path: Path, task_text: str, run_dir: Path, env: dict,
 
 
 def score_run(run_dir: Path, task: str, arm: str, fixture_root: Path,
-              price) -> dict:
+              price, g2_instance: str = None) -> dict:
     """验收 + 计账（score 模块），写 validation/usage/summary.json。
 
     arm 由调用方显式传入（run_id 尾段是 normal/failure 等场景名，不是臂）。
     events.ndjson 一并传入：usage_from_result 用 turn/usage 事件差检出
     「部分请求没报账」的未知消耗（§4.1）。
+    g2_instance：G2 run 的判卷 gold 用实例级 g2_gold（与 G1 快照 gold
+    同款形状；判卷后对 g2_gold_digest 对账防静默判错）。
     """
     result = {}
     rp = run_dir / "result.json"
@@ -277,7 +307,17 @@ def score_run(run_dir: Path, task: str, arm: str, fixture_root: Path,
         except (json.JSONDecodeError, UnicodeDecodeError):
             # P1-01：损坏的 result 与缺失同罪——不崩、不归零，events 核账
             result = {}
-    gold = scorer.load_gold(fixture_root / task)
+    if g2_instance:
+        gold = fixture.g2_gold(g2_instance, task)
+        digest = fixture.g2_gold_digest()[f"{g2_instance}-{task}"]
+        canon = json.dumps(gold, sort_keys=True, ensure_ascii=False)
+        if hashlib.sha256(canon.encode()).hexdigest() != digest["gold_sha256"]:
+            raise RuntimeError(f"{g2_instance}-{task} gold disagrees with "
+                               "g2_gold_digest — 生成模块被篡改？")
+        if len(next(iter(gold.values()))) != digest["count"]:
+            raise RuntimeError(f"{g2_instance}-{task} gold count disagrees")
+    else:
+        gold = scorer.load_gold(fixture_root / task)
     validation = scorer.validate_artifact(run_dir / "wd" / "answer.jsonl",
                                           gold, task)
     usage = scorer.usage_from_result(result, run_dir / "events.ndjson")
@@ -464,14 +504,27 @@ def analyze_inventory(inventory: dict) -> dict:
     """
     problems = []
     diff_summary = {}
-    tasks = sorted({v["task"] for v in inventory.values()})
     expected_extra = {"run_code", "read_skill", "list_skill"}
+    # 差分按「任务类 × 臂」聚合：G2 的 12 个 config 键带实例段
+    # （t0-g2i1-A 等），同一任务类的两臂工具面必须一致——按 task+arm
+    # 分组后组内任取一份代表（全部 config 的工具面应相同，不同即报）。
+    by_task_arm = {}
+    for key, v in inventory.items():
+        by_task_arm.setdefault((v["task"], v["arm"]), []).append((key, v))
+    for (task, arm), members in sorted(by_task_arm.items()):
+        first_key, first = members[0]
+        for key, v in members[1:]:
+            if v["agent_tool_names"] != first["agent_tool_names"]:
+                problems.append(f"{key}: 工具面与同任务同臂的 {first_key} "
+                                "不一致（实例间装置漂移）")
+    tasks = sorted({task for task, _ in by_task_arm})
     for task in tasks:
-        a = inventory.get(f"{task}-A")
-        b = inventory.get(f"{task}-B")
-        if not a or not b:
+        a_list = by_task_arm.get((task, "A"))
+        b_list = by_task_arm.get((task, "B"))
+        if not a_list or not b_list:
             problems.append(f"{task}: inventory missing an arm")
             continue
+        a, b = a_list[0][1], b_list[0][1]
         a_tools, b_tools = set(a["agent_tool_names"]), set(b["agent_tool_names"])
         extra, missing = a_tools - b_tools, b_tools - a_tools
         if extra != expected_extra:
@@ -617,7 +670,9 @@ def build_manifest(batch_id: str, stage: str, fp: dict, fixture_stats: dict,
         "cost_stop": None,  # G1 放行前由评测负责人填（¥ 数值）
         "token_stop": {"per_run_soft_gate": RUN_LIMITS["max_total_tokens"],
                        "stage_envelope": (G1_TOKEN_ENVELOPE
-                                          if stage == "g1" else 0),
+                                          if stage == "g1"
+                                          else G2_TOKEN_ENVELOPE
+                                          if stage == "g2" else 0),
                        "inflight_overrun_risk": INFLIGHT_OVERRUN_TOKENS,
                        "kind": "soft (turn-boundary); not a billing hard cap"},
         "turn_limit": RUN_LIMITS["max_turns"],
@@ -1095,6 +1150,21 @@ def seatbelt_profile(run_dir: Path, wd: Path,
         for sib in sorted(runs_root.iterdir()):
             if sib.is_dir() and sib.resolve() != run_dir.resolve():
                 lines.append(f'(deny file-read* (subpath "{sib.resolve()}"))')
+    # G2 批次根的 manifest.json 含 gold 摘要与冻结配方——判卷对账面，不是
+    # 任务输入面。批次根整体 deny 会挡掉本 run 需要的 configs/（run-g2
+    # 已把 config 复制进 run_dir，不受影响）与 g2-data/（t2 数据文件走
+    # literal allow 洞）。兄弟实例的数据文件同 deny：判卷按实例走，读别
+    # 实例的数据对判卷无益，只会引入跨实例串扰面。
+    batch_root = runs_root.parent if runs_root.name == "runs" else None
+    if batch_root is not None and (batch_root / "manifest.json").exists():
+        lines.append(f'(deny file-read* '
+                     f'(literal "{(batch_root / "manifest.json").resolve()}"))')
+        g2_data = batch_root / "g2-data"
+        if g2_data.is_dir():
+            for inst in sorted(g2_data.iterdir()):
+                if inst.is_dir():
+                    lines.append(f'(deny file-read* '
+                                 f'(subpath "{inst.resolve()}"))')
     for d in (ROOT / "docs", ROOT / "scripts", ROOT / "src", ROOT / "tests"):
         lines.append(f'(deny file-read* (subpath "{d.resolve()}"))')
     # git 历史：GOLD_T0 字面量与 fixture 生成器（含 solve_*）已进提交——
@@ -1233,7 +1303,13 @@ def verify_frozen_recipe(batch_dir: Path, manifest: dict) -> list:
     # 新任务/臂组合或乱序，但允许只跑受影响的子集。
     if manifest.get("run_schedule"):
         expect = [(s["task"], s["arm"]) for s in manifest["run_schedule"]]
-        if manifest.get("retry_of"):
+        if manifest.get("stage") == "g2":
+            expect_g2 = [(s["task"], s.get("instance"), s["arm"])
+                         for s in manifest["run_schedule"]]
+            if expect_g2 != G2_RUNS:
+                problems.append(f"schedule_drift: {expect_g2} != 冻结顺序 "
+                                f"{G2_RUNS}（G2）")
+        elif manifest.get("retry_of"):
             it = iter(G1_RUNS)
             subseq = all(pair in it for pair in expect)
             if not subseq:
@@ -1241,6 +1317,17 @@ def verify_frozen_recipe(batch_dir: Path, manifest: dict) -> list:
                                 f"{G1_RUNS} 的有序子序列（重跑批次）")
         elif expect != G1_RUNS:
             problems.append(f"schedule_drift: {expect} != 冻结顺序 {G1_RUNS}")
+    # G2 实例数据封存校验：铺设字节哈希与冻结记录一致（防生成模块改动
+    # 后旧批次静默换数据——方案 §4.4「不得中途调 schema」的执行面）。
+    if manifest.get("stage") == "g2" and manifest.get("g2_data_hashes"):
+        cur = {}
+        for key, want in manifest["g2_data_hashes"].items():
+            inst, task = key.rsplit("-", 1)
+            cur[key] = {name: hashlib.sha256(blob).hexdigest()
+                        for name, blob in
+                        fixture.g2_serialize(inst, task).items()}
+        if cur != manifest["g2_data_hashes"]:
+            problems.append("g2_data_drift: 实例数据序列化与冻结哈希不一致")
     return problems
 
 
@@ -1331,6 +1418,302 @@ def cmd_finalize_g1(args):
     print(f"[finalize-g1] {batch_dir.name} 最终冻结完成：价表 "
           f"{price['currency']}，停止值 {args.cost_stop}；"
           "run-g1 --execute 将按此校验")
+    return 0
+
+
+# ── prepare-g2 / run-g2（方案 §4.4 / 工单 04：新实例信号确认）──────────────
+
+def g1_spent_tokens() -> int:
+    """G1 已消耗 token（ledger_tokens + unknown_reserve，全部 g1 批次）。
+
+    G1+G2 ≤1.76M 的联合封顶需要 G1 侧真实读数——从既有批次 ledger 读，
+    不靠手记。无 ledger 的批次（未执行）不计。
+    """
+    spent = 0
+    for d in sorted(ART.iterdir()):
+        ledger = d / "ledger.json"
+        if not ledger.exists():
+            continue
+        try:
+            m = json.load(open(d / "manifest.json", encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if m.get("stage") != "g1":
+            continue
+        lg = json.load(open(ledger, encoding="utf-8"))
+        gate = lg.get("budget_gate_final", {})
+        spent += gate.get("ledger_tokens", 0) + gate.get(
+            "unknown_reserve_tokens", 0)
+    return spent
+
+
+def cmd_prepare_g2(args):
+    """冻结 G2 十二跑配方（不执行）。实例数据现生成并哈希封存。"""
+    check_global_skills_clean()
+    batch_id = args.batch_id or time.strftime("g2-%Y%m%d-%H%M%S")
+    batch_dir = ART / batch_id
+    if batch_dir.exists():
+        sys.exit(f"batch 目录已存在，拒绝覆盖：{batch_dir}")
+    batch_dir.mkdir(parents=True)
+    fp = fingerprint()
+    if "code" not in (fp["binary_manifest"].get("features") or []):
+        sys.exit("二进制缺 code feature")
+    write_json(batch_dir / "fingerprint.json", fp)
+
+    gateway, secret = gateway_identity()
+    if not gateway["model"] or not gateway["base_url_host"]:
+        sys.exit("测试模型.md 缺 base url / 模型名称 —— 无法冻结网关身份")
+
+    price = load_price_snapshot(args.price)
+    schedule = [{"order": i, "run_id": f"{task}-{instance}-{arm}",
+                 "task": task, "instance": instance, "arm": arm}
+                for i, (task, instance, arm) in enumerate(G2_RUNS)]
+
+    # 实例数据封存：t2 的 MCP 数据文件落批次目录（每 run 一份，Seatbelt
+    # literal allow 放行；gold 不在其中——gold 由判卷进程从生成模块现算，
+    # 摘要 hash-only 记进 manifest）。t0/t1 的数据在 run 时 stage_workdir_g2
+    # 现铺（字节与 g2_data_hashes 一致，verify_frozen_recipe 对账）。
+    g2_data_hashes = {}
+    for instance in fixture.G2_INSTANCE_IDS:
+        for task in ("t0", "t1", "t2"):
+            blobs = fixture.g2_serialize(instance, task)
+            g2_data_hashes[f"{instance}-{task}"] = {
+                name: hashlib.sha256(blob).hexdigest()
+                for name, blob in blobs.items()}
+            if task == "t2":
+                ddir = batch_dir / "g2-data" / instance
+                ddir.mkdir(parents=True, exist_ok=True)
+                for name, blob in blobs.items():
+                    (ddir / name).write_bytes(blob)
+
+    # 逐 run 配置（真实网关；密钥经 api_key_env 注入，不落盘）
+    configs_spec = []
+    for s in schedule:
+        run_dir = batch_dir / "runs" / s["run_id"]
+        wd = run_dir / "wd"
+        wd.mkdir(parents=True, exist_ok=True)
+        g2_data_dir = (batch_dir / "g2-data" / s["instance"]
+                       if s["task"] == "t2" else None)
+        cfg = build_config(s["task"], s["arm"], wd, secret["base_url"],
+                           gateway["model"], FIXTURE_ROOT,
+                           run_dir / "server_events.ndjson",
+                           g2_instance=s["instance"],
+                           g2_data_dir=g2_data_dir)
+        p = batch_dir / "configs" / f"{s['run_id']}.json"
+        write_json(p, cfg)
+        configs_spec.append({"key": s["run_id"], "path": str(p),
+                             "task": s["task"], "arm": s["arm"]})
+
+    inventory = collect_inventory(batch_dir, configs_spec)
+    inv_analysis = analyze_inventory(inventory)
+    write_json(batch_dir / "inventory_analysis.json", inv_analysis)
+    if inv_analysis["problems"]:
+        for p in inv_analysis["problems"]:
+            print(f"[prepare-g2] INVENTORY PROBLEM: {p}", file=sys.stderr)
+
+    fixture_stats = json.load(open(FIXTURE_ROOT / "gen_stats.json",
+                                   encoding="utf-8"))
+    manifest = build_manifest(batch_id, "g2", fp, fixture_stats, inventory,
+                              model=gateway["model"], gateway=gateway,
+                              price=price, run_schedule=schedule)
+    manifest["cost_stop"] = args.cost_stop
+    manifest["g2_data_hashes"] = g2_data_hashes
+    manifest["g2_gold_digest"] = fixture.g2_gold_digest()
+    manifest["g2_instances"] = list(fixture.G2_INSTANCE_IDS)
+    manifest["g1_spent_tokens_at_freeze"] = g1_spent_tokens()
+    missing = require_paid_prereqs(manifest)
+    manifest["blocked_paid"] = bool(missing)
+    manifest["blocked_paid_missing"] = missing
+    write_json(batch_dir / "manifest.json", manifest)
+
+    gate = budget_gate(0, 0, G2_TOKEN_ENVELOPE,
+                       RUN_LIMITS["max_total_tokens"])
+    gate["g1_spent_tokens"] = manifest["g1_spent_tokens_at_freeze"]
+    gate["combined_cap"] = G1_G2_COMBINED_CAP
+    gate["combined_headroom"] = (G1_G2_COMBINED_CAP
+                                 - manifest["g1_spent_tokens_at_freeze"])
+    write_json(batch_dir / "budget_gate.json", gate)
+    print(f"[prepare-g2] {batch_id}：schedule {len(schedule)} runs，"
+          f"envelope {G2_TOKEN_ENVELOPE}，G1 已用 "
+          f"{manifest['g1_spent_tokens_at_freeze']}（联合上限 "
+          f"{G1_G2_COMBINED_CAP}），blocked_paid={manifest['blocked_paid']}"
+          f"({missing or '无'})")
+    if missing:
+        print("[prepare-g2] 补齐价表（--price，含 input/output/cache_creation/"
+              "cache_read/currency 五项）与 --cost-stop 后方可 run-g2 --execute",
+              file=sys.stderr)
+    return 0
+
+
+def cmd_finalize_g2(args):
+    """G2 的显式最终冻结（P1-02 同款纪律：不是手改 manifest）。"""
+    batch_dir = Path(args.batch)
+    manifest_path = batch_dir / "manifest.json"
+    if not manifest_path.exists():
+        sys.exit(f"没有冻结的 manifest：{manifest_path}（先 prepare-g2）")
+    manifest = json.load(open(manifest_path, encoding="utf-8"))
+    if manifest.get("stage") != "g2":
+        sys.exit(f"manifest stage != g2：{manifest.get('stage')}")
+    price = load_price_snapshot(args.price)
+    if price is None:
+        sys.exit("价表缺失/非法（需五项：input/output/cache_creation/"
+                 "cache_read/currency，单价有限非负）")
+    if args.cost_stop is None or args.cost_stop <= 0:
+        sys.exit("费用停止值必须为有限正数")
+    drift = verify_frozen_recipe(batch_dir, manifest)
+    if drift:
+        for d in drift:
+            print(f"[finalize-g2] RECIPE DRIFT: {d}", file=sys.stderr)
+        sys.exit("冻结配方已漂移 —— 重新 prepare-g2 后再 finalize")
+    manifest = freeze_final(batch_dir, manifest, price, args.cost_stop)
+    manifest["blocked_paid"] = False
+    write_json(manifest_path, manifest)
+    print(f"[finalize-g2] {batch_dir.name} 最终冻结完成：价表 "
+          f"{price['currency']}，停止值 {args.cost_stop}；"
+          "run-g2 --execute 将按此校验")
+    return 0
+
+
+def cmd_run_g2(args):
+    """执行冻结的 G2 配方。付费三重门与 run-g1 同款；判卷用实例级 gold；
+    预算闸双封顶：G2 包络 0.96M + G1+G2 联合 1.76M。"""
+    batch_dir = Path(args.batch)
+    manifest_path = batch_dir / "manifest.json"
+    if not manifest_path.exists():
+        sys.exit(f"没有冻结的 manifest：{manifest_path}（先 prepare-g2）")
+    manifest = json.load(open(manifest_path, encoding="utf-8"))
+    if manifest.get("stage") != "g2":
+        sys.exit(f"manifest stage != g2：{manifest.get('stage')}")
+    if not args.execute:
+        print("[run-g2] dry-run（默认）：只打印将执行的顺序，不发起任何请求")
+        for s in manifest["run_schedule"]:
+            print(f"  order {s['order']}: {s['run_id']}")
+        return 0
+    missing = require_paid_prereqs(manifest)
+    if missing:
+        sys.exit(f"付费前置缺失/非法 {missing} —— 方案 §4.1：不填价表不开付费运行")
+
+    drift = verify_frozen_recipe(batch_dir, manifest)
+    if drift:
+        for d in drift:
+            print(f"[run-g2] RECIPE DRIFT: {d}", file=sys.stderr)
+        sys.exit("冻结配方校验失败 —— 拒绝执行（重新 prepare-g2 或显式 finalize-g2）")
+
+    price = manifest["price_snapshot"]
+    cost_stop = manifest["cost_stop"]
+    currency = manifest["cost_currency"]
+    # 联合封顶：G1 已用（冻结时读数 + 本机现算取大——G1 若在 G2 冻结后
+    # 又有新批次，以现算为准）+ G2 已跑 ≤ 1.76M
+    g1_now = max(manifest.get("g1_spent_tokens_at_freeze", 0),
+                 g1_spent_tokens())
+    ledger_tokens, unknown_reserve = 0, 0
+    known_lower_total = 0.0
+    reserve_cost_total = 0.0
+    runs_done = []
+    stop_reason = None
+    for s in manifest["run_schedule"]:
+        gate = budget_gate(ledger_tokens, unknown_reserve,
+                           manifest["token_stop"]["stage_envelope"],
+                           manifest["token_stop"]["per_run_soft_gate"])
+        combined = g1_now + ledger_tokens + unknown_reserve
+        if not gate["ok"]:
+            print(f"[run-g2] 预算闸拒绝启动 {s['run_id']}：{gate}",
+                  file=sys.stderr)
+            stop_reason = "budget_gate"
+            break
+        if combined + manifest["token_stop"]["per_run_soft_gate"] \
+                > G1_G2_COMBINED_CAP:
+            print(f"[run-g2] 联合封顶拒绝启动 {s['run_id']}：G1 已用 "
+                  f"{g1_now} + G2 已用 {ledger_tokens + unknown_reserve} "
+                  f"+ 单 run 预留 > {G1_G2_COMBINED_CAP}", file=sys.stderr)
+            stop_reason = "combined_cap"
+            break
+        run_dir = batch_dir / "runs" / s["run_id"]
+        claim_run_slot(run_dir)   # P1-03：原子登记 started，拒绝覆盖中断记录
+        wd = run_dir / "wd"
+        fixture.stage_workdir_g2(s["instance"], s["task"], wd)
+        cfg_path = batch_dir / "configs" / f"{s['run_id']}.json"
+        cfg = json.load(open(cfg_path, encoding="utf-8"))
+        cfg["workdir"] = str(wd)          # 指到本 run 的全新 workdir
+        cfg_path = run_dir / "config_redacted.json"
+        write_json(cfg_path, cfg)
+        _, secret = gateway_identity()
+        env = isolated_env({"CODE_VALUE_KEY": secret["api_key"]})
+        # P1-04：答案隔离（同 run-g1；G2 的 t2 数据文件在批次 g2-data/ 内，
+        # 不在 deny 面，literal allow 洞照常放行脚本/解释器/数据文件）
+        mcp_cmd = (cfg.get("mcp_servers") or [{}])[0]
+        mcp_command = ([mcp_cmd["command"]] + mcp_cmd.get("args", [])
+                       if cfg.get("mcp_servers") else None)
+        sb = seatbelt_profile(run_dir, wd, mcp_command)
+        sb_check = verify_seatbelt(sb, wd, mcp_command)
+        write_json(run_dir / "seatbelt_check.json", sb_check)
+        if not sb_check["ok"]:
+            sys.exit(f"[run-g2] 答案隔离不可用/未通过（{sb_check}）——"
+                     "阻塞：本机无法提供隔离时不启动有答案泄漏的盲测")
+        print(f"[run-g2] {s['run_id']} ...", flush=True)
+        rc, wall = run_binary(cfg_path, fixture.TASK_TEXTS[s["task"]],
+                              run_dir, env,
+                              timeout_s=RUN_LIMITS["timeout_secs"] + 60,
+                              seatbelt_profile=sb)
+        summary = score_run(run_dir, s["task"], s["arm"], FIXTURE_ROOT, price,
+                            g2_instance=s["instance"])
+        summary.update({"wall_s": wall, "rc": rc, "provider": "real",
+                        "order": s["order"],
+                        "instance_id": s["instance"], "repetition": 1,
+                        "paid_model_requests":
+                            summary["usage"]["turns"] or 1})
+        write_json(run_dir / "summary.json", summary)
+        mark_run_completed(run_dir)
+        runs_done.append({"run_id": s["run_id"], "task": s["task"],
+                          "arm": s["arm"], "instance": s["instance"],
+                          "summary": summary})
+        ledger_tokens += summary["usage"]["total_tokens"]
+        unknown_reserve += summary["usage"]["unknown_reserve_tokens"]
+        known_lower_total += summary["cost"]["cost_known_lower"] or 0
+        reserve_cost_total += reserve_cost(
+            summary["usage"]["unknown_reserve_tokens"], price)
+        print(f"[run-g2] {s['run_id']}：delivered="
+              f"{summary['delivered_exact']} end={summary['end_reason']} "
+              f"tokens={summary['usage']['total_tokens']} "
+              f"cost_lower={known_lower_total:.4f} "
+              f"reserve={reserve_cost_total:.4f} {currency}")
+        # 停止判断（与 run-g1 同款：费用停止线 + 完整性保守停）
+        if known_lower_total + reserve_cost_total >= cost_stop:
+            print(f"[run-g2] 费用停止线触发：lower="
+                  f"{known_lower_total:.4f} + reserve="
+                  f"{reserve_cost_total:.4f} ≥ {cost_stop} {currency}"
+                  " —— 不再启动后续 run", file=sys.stderr)
+            stop_reason = "cost_stop"
+            break
+        if not summary["usage"]["usage_complete"]:
+            print(f"[run-g2] 用量无法完整核账（"
+                  f"{summary['cost'].get('reason')}）——保守停止后续 run，"
+                  "证据已封存，交评测负责人裁决", file=sys.stderr)
+            stop_reason = "usage_incomplete"
+            break
+    if runs_done:
+        ledger = scorer.aggregate(runs_done)
+        ledger["budget_gate_final"] = budget_gate(
+            ledger_tokens, unknown_reserve,
+            manifest["token_stop"]["stage_envelope"], 0)
+        ledger["combined_cap"] = {
+            "g1_spent_tokens": g1_now,
+            "g2_spent_tokens": ledger_tokens + unknown_reserve,
+            "cap": G1_G2_COMBINED_CAP,
+            "stop_reason": stop_reason if stop_reason == "combined_cap"
+            else None}
+        ledger["cost_stop"] = {
+            "limit": cost_stop, "currency": currency,
+            "known_lower_total": round(known_lower_total, 6),
+            "unknown_reserve_cost": round(reserve_cost_total, 6),
+            "triggered": stop_reason == "cost_stop",
+            "stop_reason": stop_reason,
+            "kind": "run 间停止线；非供应商扣费硬上限（在途风险见 "
+                    "budget_gate_final.inflight_overrun_risk_tokens）"}
+        write_json(batch_dir / "ledger.json", ledger)
+    print(f"[run-g2] 完成 {len(runs_done)} runs"
+          + (f"（停止原因：{stop_reason}）" if stop_reason else "")
+          + "；不自动诊断、不自动进入 G3（方案 §4.4：读完才由评测负责人决定）")
     return 0
 
 
@@ -1491,6 +1874,25 @@ def main():
     rg1.add_argument("--execute", action="store_true",
                      help="付费执行开关；缺省永远 dry-run")
     rg1.set_defaults(func=cmd_run_g1)
+    pg2 = sub.add_parser("prepare-g2", help="冻结 G2 十二跑配方（不执行）")
+    pg2.add_argument("--batch-id", default=None)
+    pg2.add_argument("--price", default=None,
+                     help="价表 JSON（input/output/cache_creation/cache_read/"
+                          "currency，per-token 单价）")
+    pg2.add_argument("--cost-stop", type=float, default=None,
+                     help="阶段费用停止值（与价表同币种）")
+    pg2.set_defaults(func=cmd_prepare_g2)
+    fg2 = sub.add_parser("finalize-g2",
+                         help="G2 价格补全的显式最终冻结步骤")
+    fg2.add_argument("--batch", required=True)
+    fg2.add_argument("--price", required=True)
+    fg2.add_argument("--cost-stop", type=float, required=True)
+    fg2.set_defaults(func=cmd_finalize_g2)
+    rg2 = sub.add_parser("run-g2", help="执行冻结的 G2 配方（默认 dry-run）")
+    rg2.add_argument("--batch", required=True, help="prepare-g2 的批次目录")
+    rg2.add_argument("--execute", action="store_true",
+                     help="付费执行开关；缺省永远 dry-run")
+    rg2.set_defaults(func=cmd_run_g2)
     args = ap.parse_args()
     sys.exit(args.func(args))
 

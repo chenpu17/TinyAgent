@@ -12,8 +12,11 @@
 
 全部离线：不碰真实网关、不起二进制（g0 子命令另有端到端）。
 """
+import hashlib
 import json
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -432,6 +435,343 @@ def test_g1_schedule_order():
 def test_g1_envelope_covers_six_runs():
     assert cv_eval.G1_TOKEN_ENVELOPE \
         >= len(cv_eval.G1_RUNS) * cv_eval.RUN_LIMITS["max_total_tokens"]
+
+
+# ── G2（方案 §4.4 / 工单 04：3 类 × 2 新实例 × A/B 配对）────────────────────
+
+def test_g2_schedule_order_and_parity():
+    """顺序封存：每实例一次 A/B 配对，第一实例 AB、第二实例 BA；
+    12 runs 覆盖 3 类 × 2 实例 × 2 臂，无缺无重。"""
+    assert len(cv_eval.G2_RUNS) == 12
+    seen = set()
+    for task, instance, arm in cv_eval.G2_RUNS:
+        assert (task, instance, arm) not in seen
+        seen.add((task, instance, arm))
+    assert seen == {(t, i, a) for t in ("t0", "t1", "t2")
+                    for i in fixture.G2_INSTANCE_IDS for a in ("A", "B")}
+    # 每实例的臂序：第一实例 AB、第二实例 BA（方案 §4.4）
+    for task in ("t0", "t1", "t2"):
+        pairs = [(i, a) for t, i, a in cv_eval.G2_RUNS if t == task]
+        assert pairs == [("g2i1", "A"), ("g2i1", "B"),
+                         ("g2i2", "B"), ("g2i2", "A")], (task, pairs)
+
+
+def test_g2_envelope_and_combined_cap():
+    assert cv_eval.G2_TOKEN_ENVELOPE \
+        >= len(cv_eval.G2_RUNS) * cv_eval.RUN_LIMITS["max_total_tokens"]
+    # 方案 §4.4 / 工单 04：G1 包络 0.48M + G2 包络 0.96M ≤ 1.76M 联合上限
+    assert cv_eval.G1_TOKEN_ENVELOPE + cv_eval.G2_TOKEN_ENVELOPE \
+        <= cv_eval.G1_G2_COMBINED_CAP
+
+
+def test_g2_instances_preserve_boundary_semantics():
+    """G2 实例与 G1 同款边界语义：强制边界用户逐个命中、孤儿不进 gold、
+    随机填充只落非保留用户、规模不变（可比性）。"""
+    reserved = ("u-0001", "u-0002", "u-0003", "u-0004", "u-0005", "u-0006",
+                "u-0007", "u-0008", "u-9901", "u-9902")
+    for inst in fixture.G2_INSTANCE_IDS:
+        # t0：谓词边界全覆盖 + 目标非空非全集
+        recs = fixture.g2_t0_records(inst)
+        assert len(recs) == 12
+        gold0 = fixture.solve_t0(recs)
+        assert 0 < len(gold0) < 12
+        assert any(r["severity"] == 2 and r["confirmed"] is True
+                   and r["plan"] == "paid" and r["status"] == "active"
+                   for r in recs), "sev==2 边界入"
+        assert any(r["severity"] == 1 and r["confirmed"] is True
+                   and r["plan"] == "paid" and r["status"] == "active"
+                   for r in recs), "sev==1 出"
+        assert any(r["confirmed"] is False and r["severity"] >= 2
+                   and r["plan"] == "paid" and r["status"] == "active"
+                   for r in recs), "confirmed=false 出"
+        assert any(r["plan"] == "free" and r["severity"] >= 2
+                   and r["confirmed"] is True for r in recs), "free 出"
+        assert any(r["status"] == "cancelled" and r["plan"] == "paid"
+                   and r["severity"] >= 2 and r["confirmed"] is True
+                   for r in recs), "cancelled 出"
+        assert any(r["status"] == "expired" and r["plan"] == "paid"
+                   and r["severity"] >= 2 and r["confirmed"] is True
+                   for r in recs), "expired 出"
+
+        # t1：规模 + 边界计数 + 孤儿 + 随机填充范围
+        subs, events = fixture.g2_t1_data(inst)
+        assert (len(subs), len(events)) == (128, 256)
+        g1 = fixture.solve_join(subs, events)
+        assert g1.get("u-0001") == 2 and g1.get("u-0002") == 1 \
+            and g1.get("u-0008") == 1
+        for uid in ("u-0003", "u-0004", "u-0005", "u-0006", "u-0007",
+                    "u-9901", "u-9902"):
+            assert uid not in g1, uid
+        assert 0 < len(g1) < 128
+        for e in events[11:]:
+            assert e["user_id"] not in reserved
+
+        # t2：规模 + uid 关联 + 边界 + 孤儿
+        subs, events = fixture.g2_t2_data(inst)
+        assert (len(subs), len(events)) == (80, 160)
+        assert all("uid" in e and "user_id" not in e for e in events)
+        g2 = fixture.solve_join(subs, events, sub_key="user_id",
+                                ev_key="uid")
+        assert g2.get("u-0001") == 2 and g2.get("u-0002") == 1 \
+            and g2.get("u-0008") == 1
+        for uid in ("u-0003", "u-0004", "u-0005", "u-0006", "u-0007",
+                    "u-9901", "u-9902"):
+            assert uid not in g2, uid
+        assert 0 < len(g2) < 80
+        for e in events[11:]:
+            assert e["uid"] not in reserved
+
+
+def test_g2_instances_are_new_not_g1_copies():
+    """新实例 ≠ G1 实例 ≠ 彼此（方案 §4.4「新实例」：数据重合即无效）。"""
+    g1_t1 = fixture.t1_data()
+    g1_t2 = fixture.t2_data()
+    g1_t0 = fixture.t0_records()
+    for inst in fixture.G2_INSTANCE_IDS:
+        assert fixture.g2_t0_records(inst) != g1_t0
+        assert fixture.g2_t1_data(inst) != g1_t1
+        assert fixture.g2_t2_data(inst) != g1_t2
+    assert fixture.g2_t0_records("g2i1") != fixture.g2_t0_records("g2i2")
+    assert fixture.g2_t1_data("g2i1") != fixture.g2_t1_data("g2i2")
+    assert fixture.g2_t2_data("g2i1") != fixture.g2_t2_data("g2i2")
+
+
+def test_g2_gold_digest_hash_only():
+    """gold 摘要 hash-only：只有 count + sha256，无明文（§2.1 纪律）。"""
+    d = fixture.g2_gold_digest()
+    assert len(d) == 6
+    for key in ("g2i1-t0", "g2i1-t1", "g2i1-t2", "g2i2-t0", "g2i2-t1",
+                "g2i2-t2"):
+        assert set(d[key]) == {"count", "gold_sha256"}
+        assert len(d[key]["gold_sha256"]) == 64
+        # 判卷对账：重算 gold 的规范化哈希必须与摘要一致
+        inst, task = key.rsplit("-", 1)
+        gold = fixture.g2_gold(inst, task)
+        import hashlib
+        canon = json.dumps(gold, sort_keys=True, ensure_ascii=False)
+        assert hashlib.sha256(canon.encode()).hexdigest() \
+            == d[key]["gold_sha256"]
+        assert len(next(iter(gold.values()))) == d[key]["count"]
+
+
+def test_g2_serialize_matches_staged_bytes(tmp_path):
+    """铺设字节 = 封存字节：stage_workdir_g2 写出的文件与 g2_serialize
+    逐字节一致（verify_frozen_recipe 的 g2_data_hashes 对账基础）。"""
+    import hashlib
+    for inst in fixture.G2_INSTANCE_IDS:
+        for task in ("t0", "t1"):
+            wd = tmp_path / f"{inst}-{task}"
+            fixture.stage_workdir_g2(inst, task, wd)
+            blobs = fixture.g2_serialize(inst, task)
+            for name, blob in blobs.items():
+                assert (wd / name).read_bytes() == blob
+        # t2：数据不进 workdir（只经 MCP）
+        wd = tmp_path / f"{inst}-t2"
+        fixture.stage_workdir_g2(inst, "t2", wd)
+        assert list(wd.iterdir()) == []
+        # t2 数据文件可序列化（prepare-g2 落盘 g2-data/ 用）
+        blobs = fixture.g2_serialize(inst, "t2")
+        assert set(blobs) == {"subscriptions.json", "events.json"}
+
+
+def test_g2_stage_workdir_never_contains_gold(tmp_path):
+    """铺设目录里没有 gold 文件（gold 不落盘纪律的 G2 面——与 G1 的
+    test_stage_workdir_never_contains_gold 同款：检查的是「无答案文件」，
+    不是「目标值字符串不出现」，目标值本来就在任务数据里）。"""
+    for inst in fixture.G2_INSTANCE_IDS:
+        for task in ("t0", "t1", "t2"):
+            wd = tmp_path / f"{inst}-{task}"
+            fixture.stage_workdir_g2(inst, task, wd)
+            names = {p.name for p in wd.iterdir()}
+            assert not any("gold" in n for n in names)
+            if task == "t2":
+                assert names == set()  # 数据只经 MCP，workdir 留空
+            # 判卷 gold 与铺设数据可区分：gold 是数据的函数，不是数据本身
+            gold = fixture.g2_gold(inst, task)
+            n = len(next(iter(gold.values())))
+            assert 0 < n < (13 if task == "t0"
+                            else 129 if task == "t1" else 81)
+
+
+def test_build_config_g2_t2_uses_instance_data(tmp_path):
+    """G2 的 t2 配置指向实例数据文件（g2-data/<inst>/），不是 G1 快照。"""
+    wd = tmp_path / "wd"
+    data_dir = tmp_path / "g2-data" / "g2i1"
+    data_dir.mkdir(parents=True)
+    cfg = cv_eval.build_config("t2", "A", wd, "http://x", "m", tmp_path,
+                               server_log=tmp_path / "log.ndjson",
+                               g2_instance="g2i1", g2_data_dir=data_dir)
+    args = cfg["mcp_servers"][0]["args"]
+    subs = next(a for a in args if a.endswith("subscriptions.json"))
+    assert str(data_dir) in subs, "MCP 数据源必须指向实例目录"
+    assert str(cv_eval.FIXTURE_ROOT) not in subs
+    # A/B 两臂的数据源一致（装置差分只在 code 包）
+    cfg_b = cv_eval.build_config("t2", "B", wd, "http://x", "m", tmp_path,
+                                 server_log=tmp_path / "log.ndjson",
+                                 g2_instance="g2i1", g2_data_dir=data_dir)
+    assert cfg_b["mcp_servers"][0]["args"] == args
+
+
+def test_analyze_inventory_groups_g2_instance_keys():
+    """G2 的 12 个 config 键带实例段——analyze_inventory 按 task+arm 聚合
+    差分，实例间工具面不一致要报，同构则通过。"""
+    def one(task, arm):
+        tools = (["shell", "read_file", "write_file", "edit_file",
+                  "list_dir"] if task != "t2"
+                 else ["read_file", "write_file", "edit_file", "list_dir"])
+        guest = None
+        if arm == "A":
+            tools = tools + ["run_code", "read_skill", "list_skill"]
+            guest = [{"name": n} for n in ("run_code", "read_file",
+                                           "write_file", "edit_file",
+                                           "list_dir")]
+        if task == "t2":
+            # MCP 分页工具两臂都有（数据入口与 code 开关无关）
+            tools = tools + ["mcp_t2data_subscriptions_page",
+                             "mcp_t2data_events_page"]
+            if arm == "A":
+                guest = guest + [
+                    {"name": "mcp_t2data_subscriptions_page"},
+                    {"name": "mcp_t2data_events_page"}]
+        return {"task": task, "arm": arm, "agent_tool_names": tools,
+                "request_tool_names": [tools],
+                "guest_tools": guest,
+                "system_prompt": (cv_eval.PROMPT_A if arm == "A"
+                                  else cv_eval.PROMPT_COMMON)}
+    inv = {}
+    for task, instance, arm in cv_eval.G2_RUNS:
+        inv[f"{task}-{instance}-{arm}"] = one(task, arm)
+    r = cv_eval.analyze_inventory(inv)
+    assert r["problems"] == [], r["problems"]
+    assert set(r["per_task"]) == {"t0", "t1", "t2"}
+    # 实例间工具面漂移必须被报出
+    bad = dict(inv)
+    bad["t0-g2i2-A"] = dict(one("t0", "A"),
+                            agent_tool_names=["shell", "read_file"])
+    r2 = cv_eval.analyze_inventory(bad)
+    assert any("不一致" in p for p in r2["problems"])
+
+
+def test_verify_frozen_recipe_g2_schedule_and_data():
+    """G2 批次：schedule 必须与 G2_RUNS 全等；实例数据哈希漂移要报。"""
+    batch = Path(tempfile.mkdtemp())
+    schedule = [{"order": i, "run_id": f"{t}-{inst}-{a}", "task": t,
+                 "instance": inst, "arm": a}
+                for i, (t, inst, a) in enumerate(cv_eval.G2_RUNS)]
+    hashes = {f"{inst}-{task}": {name: hashlib.sha256(blob).hexdigest()
+                                 for name, blob in
+                                 fixture.g2_serialize(inst, task).items()}
+              for inst in fixture.G2_INSTANCE_IDS
+              for task in ("t0", "t1", "t2")}
+    manifest = {"stage": "g2", "run_schedule": schedule,
+                "g2_data_hashes": hashes, "model": "m"}
+    (batch / "inventory_analysis.json").write_text(
+        json.dumps({"problems": [], "per_task": {}}), encoding="utf-8")
+    # verify_frozen_recipe 逐 run 查 config 存在 + 模型一致
+    for s in schedule:
+        (batch / "configs").mkdir(exist_ok=True)
+        (batch / "configs" / f"{s['run_id']}.json").write_text(
+            json.dumps({"model": "m"}), encoding="utf-8")
+    assert cv_eval.verify_frozen_recipe(batch, manifest) == []
+    # 乱序拒绝
+    bad = dict(manifest)
+    bad["run_schedule"] = list(reversed(schedule))
+    probs = cv_eval.verify_frozen_recipe(batch, bad)
+    assert any("schedule_drift" in p for p in probs)
+    # 实例数据漂移拒绝（生成模块被改 → 序列化哈希变）
+    bad2 = dict(manifest)
+    bad2["g2_data_hashes"] = dict(hashes)
+    bad2["g2_data_hashes"]["g2i1-t0"] = {
+        "records.jsonl": "0" * 64}
+    probs2 = cv_eval.verify_frozen_recipe(batch, bad2)
+    assert any("g2_data_drift" in p for p in probs2)
+    shutil.rmtree(batch)
+
+
+def test_g1_spent_tokens_reads_g1_ledgers(tmp_path, monkeypatch):
+    """联合封顶的 G1 侧读数：只认 stage==g1 且有 ledger 的批次，
+    ledger_tokens + unknown_reserve 求和。"""
+    art = tmp_path / "art"
+    for name, stage, has_ledger, tokens in (
+            ("g1-a", "g1", True, 100), ("g1-b", "g1", True, 50),
+            ("g2-x", "g2", True, 999), ("g1-c", "g1", False, 0),
+            ("g0-y", "g0", True, 777)):
+        d = art / name
+        d.mkdir(parents=True)
+        (d / "manifest.json").write_text(
+            json.dumps({"stage": stage}), encoding="utf-8")
+        if has_ledger:
+            (d / "ledger.json").write_text(json.dumps({
+                "budget_gate_final": {"ledger_tokens": tokens,
+                                      "unknown_reserve_tokens": 1}}),
+                encoding="utf-8")
+    monkeypatch.setattr(cv_eval, "ART", art)
+    assert cv_eval.g1_spent_tokens() == 152  # (100+1) + (50+1)
+
+
+def test_run_g2_executes_all_twelve_and_scores_per_instance(
+        tmp_path, monkeypatch):
+    """G2 执行回路：12 runs 全跑、判卷用实例级 gold（g2i2-t0 的 gold 与
+    g2i1-t0 不同——桩产物写 g2i1 的答案必须被 g2i2 判错）。"""
+    batch = _make_g2_batch(tmp_path, TEST_PRICE, 100.0, finalize=True)
+    # 桩：全部 run 写「g2i1 的 gold」——g2i1 两臂过，g2i2 两臂必须不过。
+    # 先 _patch_for_stub（seatbelt/gateway 桩），再覆盖 run_binary 为
+    # G2 桩（后设的赢——顺序反了会被普通桩顶掉）。
+    _patch_for_stub(monkeypatch, "normal")
+    monkeypatch.setattr(cv_eval, "run_binary",
+                        _stub_run_binary_g2("g2i1"))
+    args = type("A", (), {"batch": str(batch), "execute": True})()
+    cv_eval.cmd_run_g2(args)
+    ledger = json.load(open(batch / "ledger.json", encoding="utf-8"))
+    assert ledger["runs"] == 12
+    # g2i1 全过、g2i2 全不过（实例级判卷生效）
+    for s in batch_manifest(batch)["run_schedule"]:
+        summary = json.load(open(batch / "runs" / s["run_id"] /
+                                 "summary.json", encoding="utf-8"))
+        want = s["instance"] == "g2i1"
+        assert summary["delivered_exact"] is want, s["run_id"]
+        assert summary["instance_id"] == s["instance"]
+    # 联合封顶记录在 ledger
+    assert ledger["combined_cap"]["g2_spent_tokens"] > 0
+    assert ledger["combined_cap"]["cap"] == cv_eval.G1_G2_COMBINED_CAP
+
+
+def test_run_g2_combined_cap_stops_before_g1_exhausted(
+        tmp_path, monkeypatch):
+    """联合封顶：G1 已用接近 1.76M 时拒绝启动任何 G2 run。"""
+    batch = _make_g2_batch(tmp_path, TEST_PRICE, 100.0, finalize=True)
+    m = batch_manifest(batch)
+    m["g1_spent_tokens_at_freeze"] = cv_eval.G1_G2_COMBINED_CAP
+    (batch / "manifest.json").write_text(json.dumps(m), encoding="utf-8")
+    _patch_for_stub(monkeypatch, "normal")
+    args = type("A", (), {"batch": str(batch), "execute": True})()
+    rc = cv_eval.cmd_run_g2(args)
+    # 0 runs 完成 → 不写 ledger（与 run-g1 同款）；run 目录无 started
+    assert not (batch / "ledger.json").exists()
+    assert not (batch / "runs" / "t0-g2i1-A" / "started.json").exists()
+
+
+def test_run_g2_refuses_hand_edited_price(tmp_path, monkeypatch):
+    """P1-02 同款：手改 manifest 填价表（无 config_hashes）→ 拒绝执行。"""
+    batch = _make_g2_batch(tmp_path, TEST_PRICE, 100.0, finalize=False)
+    _patch_for_stub(monkeypatch, "normal")
+    args = type("A", (), {"batch": str(batch), "execute": True})()
+    with pytest.raises(SystemExit, match="付费前置缺失"):
+        cv_eval.cmd_run_g2(args)
+
+
+def test_finalize_g2_explicit_freeze(tmp_path):
+    """finalize-g2 写入 config_hashes + final_frozen_at，之后放行。"""
+    batch = _make_g2_batch(tmp_path, TEST_PRICE, 100.0, finalize=False)
+    price_path = tmp_path / "price.json"
+    price_path.write_text(json.dumps(TEST_PRICE), encoding="utf-8")
+    args = type("A", (), {"batch": str(batch), "price": str(price_path),
+                          "cost_stop": 100.0})()
+    cv_eval.cmd_finalize_g2(args)
+    m = batch_manifest(batch)
+    assert m["config_hashes"] and m["final_frozen_at"]
+    assert m["blocked_paid"] is False
+    assert len(m["config_hashes"]) == 12
 
 
 def test_build_config_only_diff_is_code_package(tmp_path):
@@ -865,6 +1205,96 @@ def _run_g1(tmp_path, monkeypatch, outcome, price, cost_stop, finalize=True):
     rc = cv_eval.cmd_run_g1(args)
     ledger = json.load(open(batch / "ledger.json", encoding="utf-8"))
     return batch, rc, ledger
+
+
+# ── G2 测试辅助 ─────────────────────────────────────────────────────────────
+
+def batch_manifest(batch: Path) -> dict:
+    return json.load(open(batch / "manifest.json", encoding="utf-8"))
+
+
+def _make_g2_batch(tmp_path, price=None, cost_stop=None, finalize=False):
+    """构造可执行的 g2 批次（manifest + configs + inventory + g2-data）。"""
+    batch = tmp_path / "g2batch"
+    batch.mkdir(parents=True)
+    schedule = [{"order": i, "run_id": f"{t}-{inst}-{a}", "task": t,
+                 "instance": inst, "arm": a}
+                for i, (t, inst, a) in enumerate(cv_eval.G2_RUNS)]
+    manifest = {
+        "stage": "g2", "run_schedule": schedule,
+        "token_stop": {"stage_envelope": cv_eval.G2_TOKEN_ENVELOPE,
+                       "per_run_soft_gate": 80_000},
+        "model": "stub-model",
+        "price_snapshot": price, "cost_currency":
+            (price or {}).get("currency"), "cost_stop": cost_stop,
+        "binary_hash": None, "fixture_hash": None, "task_hash": None,
+        "prompt_hashes": None,
+        "g2_data_hashes": {
+            f"{inst}-{task}": {
+                name: hashlib.sha256(blob).hexdigest()
+                for name, blob in fixture.g2_serialize(inst, task).items()}
+            for inst in fixture.G2_INSTANCE_IDS
+            for task in ("t0", "t1", "t2")},
+        "g1_spent_tokens_at_freeze": 0,
+    }
+    for s in schedule:
+        cfg_dir = batch / "configs"
+        cfg_dir.mkdir(exist_ok=True)
+        cfg = {"model": "stub-model", "workdir":
+               str(batch / "runs" / s["run_id"] / "wd"),
+               "code": {"enabled": s["arm"] == "A"}}
+        (cfg_dir / f"{s['run_id']}.json").write_text(
+            json.dumps(cfg), encoding="utf-8")
+    (batch / "inventory_analysis.json").write_text(
+        json.dumps({"problems": [], "per_task": {}}), encoding="utf-8")
+    (batch / "manifest.json").write_text(json.dumps(manifest),
+                                         encoding="utf-8")
+    if finalize:
+        price_path = tmp_path / "price.json"
+        price_path.write_text(json.dumps(price), encoding="utf-8")
+        args = type("A", (), {"batch": str(batch), "price": str(price_path),
+                              "cost_stop": cost_stop})()
+        cv_eval.cmd_finalize_g2(args)
+    return batch
+
+
+def _stub_run_binary_g2(instance, outcome="normal"):
+    """G2 桩模型：产物写指定实例的 gold（证明判卷按实例走）。
+
+    与 _stub_run_binary 同款产物/账目形状；task/instance 从 run_id 解析
+    （<task>-g2i<N>-<arm>）。outcome 仅 "normal"——G2 执行回路测试不
+    覆盖失败形状（那是 run-g1 回归的地盘，两回路共用 score_run/停止线）。
+    """
+    assert outcome == "normal"
+    def stub(cfg_path, task_text, run_dir, env, timeout_s,
+             seatbelt_profile=None):
+        run_dir = Path(run_dir)
+        wd = run_dir / "wd"
+        wd.mkdir(parents=True, exist_ok=True)
+        parts = run_dir.name.rsplit("-", 1)
+        task = parts[0].rsplit("-", 1)[0]
+        ev = run_dir / "events.ndjson"
+        ev.write_text('{"type":"turn"}\n'
+                      '{"type":"usage","input_tokens":1000,'
+                      '"output_tokens":100,"cache_creation_input_tokens":0,'
+                      '"cache_read_input_tokens":0}\n', encoding="utf-8")
+        (run_dir / "result.json").write_text(json.dumps({
+            "input_tokens": 1000, "output_tokens": 100,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0, "turns": 1, "attempts": 1,
+            "stop_reason": "end_turn", "tool_calls": []}), encoding="utf-8")
+        gold = fixture.g2_gold(instance, task)
+        key = next(iter(gold))
+        if task == "t0":
+            content = "".join(json.dumps({"id": t}, ensure_ascii=False)
+                              + "\n" for t in gold[key])
+        else:
+            content = "".join(json.dumps({"user_id": u, "event_count": c},
+                                         ensure_ascii=False) + "\n"
+                              for u, c in gold[key].items())
+        (wd / "answer.jsonl").write_text(content, encoding="utf-8")
+        return 0, 0.1
+    return stub
 
 
 TEST_PRICE = {"input": 1e-6, "output": 1e-6, "cache_creation": 1e-6,
