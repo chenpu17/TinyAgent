@@ -346,8 +346,12 @@ def mock_plumbing_run(batch_dir: Path, fixture_root: Path, name: str,
         write_json(cfg_path, cfg)
         env = isolated_env({"CODE_VALUE_KEY": "mock-not-a-real-key"})
         # P1-04：mock 联通同样过 Seatbelt——证明隔离下装置全链路可用
-        sb = seatbelt_profile(run_dir, wd)
-        sb_check = verify_seatbelt(sb, wd)
+        # （T2 场景的 MCP 数据源经 literal allow 洞放行，探针验证）
+        mcp_cmd = (cfg.get("mcp_servers") or [{}])[0]
+        mcp_command = ([mcp_cmd["command"]] + mcp_cmd.get("args", [])
+                       if cfg.get("mcp_servers") else None)
+        sb = seatbelt_profile(run_dir, wd, mcp_command)
+        sb_check = verify_seatbelt(sb, wd, mcp_command)
         write_json(run_dir / "seatbelt_check.json", sb_check)
         rc, wall = run_binary(cfg_path, fixture.TASK_TEXTS[task], run_dir,
                               env, timeout_s=RUN_LIMITS["timeout_secs"] + 60,
@@ -400,6 +404,16 @@ def mock_plumbing_run(batch_dir: Path, fixture_root: Path, name: str,
         ok = bool(rc_calls) and rc_calls[0]["is_error"]
         check("run_code_absent_error", ok is expect["run_code_absent_error"],
               f"run_code calls: {names}")
+    if expect.get("mcp_tools_live"):
+        # t2：MCP 工具在 Seatbelt 隔离下真实执行成功（服务器活着且返回
+        # 分页数据，不是空调用）——方案 §4.3「有效承接」的装置侧前提
+        mcp_names = ("mcp_t2data_subscriptions_page",
+                     "mcp_t2data_events_page")
+        mcp_calls = [c for c in tool_calls
+                     if c.get("name") in mcp_names]
+        ok = bool(mcp_calls) and not any(c["is_error"] for c in mcp_calls)
+        check("mcp_tools_live", ok is expect["mcp_tools_live"],
+              f"mcp calls: {names}")
     check("events_recorded", (run_dir / "events.ndjson").stat().st_size > 0)
     check("seatbelt_isolation", sb_check["ok"],
           json.dumps(sb_check))
@@ -757,6 +771,37 @@ def cmd_g0(args):
         expect={"delivered": True, "usage_missing": True,
                 "cost_reserved_not_zero": True, "abnormal_end": False}))
 
+    # t2 联通：MCP 数据源在 Seatbelt deny 面内（scripts/ + fixture/）——
+    # 本场景证明 literal allow 洞放行数据源、真 MCP 服务器在隔离下可起、
+    # 模型侧经 MCP 工具读到分页数据后写出答案（g0-20260924-r1 的 T2 付费
+    # 跑死于此路径，补进零付费联通防回归）。工具名用模型可见的 sanitize
+    # 展示名（mcp_<server>_<tool>），不是 MCP wire 名。
+    gold_t2 = gold_as_answer_lines(FIXTURE_ROOT, "t2")
+    plumbing.append(mock_plumbing_run(
+        batch_dir, FIXTURE_ROOT, "t2-A-mcp-plumbing", "t2", "A",
+        scenario={
+            "turns": [
+                {"kind": "tool_call", "id": "c1",
+                 "name": "mcp_t2data_subscriptions_page",
+                 "arguments": {"page": 1},
+                 "usage": {"prompt_tokens": 500, "completion_tokens": 30,
+                           "cached_tokens": 0}},
+                {"kind": "tool_call", "id": "c2",
+                 "name": "mcp_t2data_events_page",
+                 "arguments": {"page": 1},
+                 "usage": {"prompt_tokens": 700, "completion_tokens": 30,
+                           "cached_tokens": 100}},
+                {"kind": "tool_call", "id": "c3", "name": "write_file",
+                 "arguments": {"path": "answer.jsonl", "content": gold_t2},
+                 "usage": {"prompt_tokens": 900, "completion_tokens": 60,
+                           "cached_tokens": 300}},
+                {"kind": "text", "text": "done: 8 users",
+                 "usage": {"prompt_tokens": 1100, "completion_tokens": 25,
+                           "cached_tokens": 500}},
+            ]},
+        expect={"delivered": True, "mcp_tools_live": True,
+                "usage_positive": True, "abnormal_end": False}))
+
     runs_for_ledger = [{"run_id": p_["run_id"], "task": p_["task"],
                         "arm": p_["arm"], "summary": p_["summary"]}
                        for p_ in plumbing]
@@ -1004,7 +1049,8 @@ def cmd_prepare_g1(args):
     return 0
 
 
-def seatbelt_profile(run_dir: Path, wd: Path) -> Path:
+def seatbelt_profile(run_dir: Path, wd: Path,
+                     mcp_command: list = None) -> Path:
     """P1-04 答案隔离：macOS Seatbelt（sandbox-exec）配置，评测进程的
     shell 不可达答案面。
 
@@ -1013,6 +1059,10 @@ def seatbelt_profile(run_dir: Path, wd: Path) -> Path:
     fixture 快照（gold digest）、全部历史批次（mock 场景明文答案 +
     wd/answer.jsonl）、参考解脚本与方案文档、网关凭证文件。
     workdir 与 run_dir（events/result 落盘处）保持可写。
+    mcp_command：T2 的 stdio MCP 服务器启动命令。deny scripts/ 与
+    fixture/ 会挡住它——对服务器脚本、解释器与其 --subscriptions/
+    --events 数据文件打 literal allow 洞（数据是任务输入面，模型本该
+    经 MCP 读；fixture 目录级 deny 仍挡 gen_stats/gold digest）。
     返回 profile 路径；非 macOS 或 sandbox-exec 缺失返回 None（调用方
     必须视为阻塞——工单 01R：无法隔离就明确回报，不静默降级）。
     """
@@ -1050,6 +1100,22 @@ def seatbelt_profile(run_dir: Path, wd: Path) -> Path:
     # git 历史：GOLD_T0 字面量与 fixture 生成器（含 solve_*）已进提交——
     # 不拒绝 .git 则模型可 `git show HEAD:scripts/...` 直读答案
     lines.append(f'(deny file-read* (subpath "{(ROOT / ".git").resolve()}"))')
+    # MCP 例外（literal allow 实测可穿透 subpath deny）：服务器脚本本体 +
+    # 解释器 + 数据文件。数据是任务输入面；digest 仍被目录级 deny 挡。
+    if mcp_command:
+        script = next((a for a in mcp_command
+                       if str(a).endswith(".py")), None)
+        if script:
+            lines.append(f'(allow file-read* '
+                         f'(literal "{Path(script).resolve()}"))')
+        interp = _sh.which(mcp_command[0]) if mcp_command else None
+        if interp:
+            lines.append(f'(allow file-read* '
+                         f'(literal "{Path(interp).resolve()}"))')
+        for flag, val in zip(mcp_command, mcp_command[1:]):
+            if flag in ("--subscriptions", "--events") and Path(val).exists():
+                lines.append(f'(allow file-read* '
+                             f'(literal "{Path(val).resolve()}"))')
     lines.append(f'(deny file-read* (literal "'
                  f'{(ROOT / "测试模型.md").resolve()}"))')
     prof = run_dir / "seatbelt.sb"
@@ -1057,9 +1123,11 @@ def seatbelt_profile(run_dir: Path, wd: Path) -> Path:
     return prof
 
 
-def verify_seatbelt(profile: Path, wd: Path) -> dict:
+def verify_seatbelt(profile: Path, wd: Path,
+                    mcp_command: list = None) -> dict:
     """P1-04：隔离不是「配置写了」而是「实测不可达」。启动前用真实
-    sandbox-exec 探针验证：答案面读不出内容 + workdir 可写。"""
+    sandbox-exec 探针验证：答案面读不出内容 + workdir 可写 + （T2）
+    MCP 服务器脚本与数据文件可读——隔离不能把自己的数据源挡死。"""
     if profile is None:
         return {"ok": False, "reason": "seatbelt_unavailable",
                 "note": "非 macOS 或无 sandbox-exec——按工单 01R 视为阻塞"}
@@ -1071,9 +1139,23 @@ def verify_seatbelt(profile: Path, wd: Path) -> dict:
                         f'echo x > "{wd}/.sb_probe" && cat "{wd}/.sb_probe"'],
                        capture_output=True, text=True)
     wd_ok = w.returncode == 0 and "x" in w.stdout
-    ok = (not secret_leaks) and wd_ok
+    mcp_ok = True
+    if mcp_command:
+        script = next((a for a in mcp_command
+                       if str(a).endswith(".py")), None)
+        if script:
+            m = subprocess.run(["sandbox-exec", "-f", str(profile), "/bin/cat",
+                                str(script)], capture_output=True, text=True)
+            mcp_ok = m.returncode == 0 and bool(m.stdout.strip())
+        for flag, val in zip(mcp_command, mcp_command[1:]):
+            if flag in ("--subscriptions", "--events"):
+                m = subprocess.run(["sandbox-exec", "-f", str(profile),
+                                    "/bin/cat", str(val)],
+                                   capture_output=True, text=True)
+                mcp_ok = mcp_ok and m.returncode == 0 and bool(m.stdout.strip())
+    ok = (not secret_leaks) and wd_ok and mcp_ok
     return {"ok": ok, "secret_leaks": secret_leaks, "workdir_writable": wd_ok,
-            "probe_rc": r.returncode}
+            "mcp_readable": mcp_ok, "probe_rc": r.returncode}
 
 
 def reserve_cost(reserve_tokens: int, price) -> float:
@@ -1299,9 +1381,14 @@ def cmd_run_g1(args):
         _, secret = gateway_identity()
         env = isolated_env({"CODE_VALUE_KEY": secret["api_key"]})
         # P1-04：答案隔离——Seatbelt 实测不可达才启动；不可用即阻塞，
-        # 不静默降级（工单 01R：无法隔离就回报，不把答案可达当盲测）
-        sb = seatbelt_profile(run_dir, wd)
-        sb_check = verify_seatbelt(sb, wd)
+        # 不静默降级（工单 01R：无法隔离就回报，不把答案可达当盲测）。
+        # T2 的 MCP 数据源在 deny 面内（scripts/ + fixture/）——把服务器
+        # 命令传进去打 literal allow 洞，探针同时验证数据源可读。
+        mcp_cmd = (cfg.get("mcp_servers") or [{}])[0]
+        mcp_command = ([mcp_cmd["command"]] + mcp_cmd.get("args", [])
+                       if cfg.get("mcp_servers") else None)
+        sb = seatbelt_profile(run_dir, wd, mcp_command)
+        sb_check = verify_seatbelt(sb, wd, mcp_command)
         write_json(run_dir / "seatbelt_check.json", sb_check)
         if not sb_check["ok"]:
             sys.exit(f"[run-g1] 答案隔离不可用/未通过（{sb_check}）——"

@@ -849,8 +849,9 @@ def _patch_for_stub(monkeypatch, outcome):
     # seatbelt 桩：真实 sandbox-exec 探针过重，桩为通过（隔离本身
     # 另有真实探针测试 test_seatbelt_isolation_real_probe）
     monkeypatch.setattr(cv_eval, "verify_seatbelt",
-                        lambda prof, wd: {"ok": True})
-    monkeypatch.setattr(cv_eval, "seatbelt_profile", lambda rd, wd: None)
+                        lambda prof, wd, mcp=None: {"ok": True})
+    monkeypatch.setattr(cv_eval, "seatbelt_profile",
+                        lambda rd, wd, mcp=None: None)
     # gateway 桩：不读 测试模型.md、不注入真实密钥
     monkeypatch.setattr(cv_eval, "gateway_identity",
                         lambda: ({"model": "stub-model"},
