@@ -1056,3 +1056,44 @@ def test_run_g1_crash_midway_preserves_evidence(tmp_path, monkeypatch):
     args = type("A", (), {"batch": str(batch), "execute": True})()
     with pytest.raises(SystemExit, match="拒绝覆盖"):
         cv_eval.cmd_run_g1(args)
+
+
+def test_retry_batch_subseq_schedule(tmp_path):
+    """方案 §4.3 重跑批次：schedule 允许是 G1_RUNS 的有序子序列（只跑
+    受影响对），但注入新任务/臂组合或乱序仍拒绝。"""
+    batch = _make_batch(tmp_path, TEST_PRICE, 100.0, finalize=True)
+    m = json.load(open(batch / "manifest.json", encoding="utf-8"))
+    # 合法重跑：T2 对（G1_RUNS 尾部子序列）+ retry_of 标记
+    m["retry_of"] = "g1-20260924-r1"
+    m["run_schedule"] = [
+        {"order": 0, "run_id": "t2-B-retry1", "task": "t2", "arm": "B"},
+        {"order": 1, "run_id": "t2-A-retry1", "task": "t2", "arm": "A"}]
+    # 重跑 run_id 的 configs（内容照抄原 run，workdir 指新 id）
+    for s in m["run_schedule"]:
+        src_cfg = json.load(open(batch / "configs" / f"{s['task']}-{s['arm']}.json",
+                                 encoding="utf-8"))
+        src_cfg["workdir"] = str(batch / "runs" / s["run_id"] / "wd")
+        (batch / "configs" / f"{s['run_id']}.json").write_text(
+            json.dumps(src_cfg), encoding="utf-8")
+    (batch / "manifest.json").write_text(json.dumps(m), encoding="utf-8")
+    assert cv_eval.verify_frozen_recipe(batch, m) == []
+    # 非法：乱序（A 在 B 前，与冻结顺序相反）
+    m["run_schedule"] = [
+        {"order": 0, "run_id": "t2-A-retry1", "task": "t2", "arm": "A"},
+        {"order": 1, "run_id": "t2-B-retry1", "task": "t2", "arm": "B"}]
+    (batch / "manifest.json").write_text(json.dumps(m), encoding="utf-8")
+    assert any("schedule_drift" in p
+               for p in cv_eval.verify_frozen_recipe(batch, m))
+    # 非法：注入冻结外的新臂组合
+    m["run_schedule"] = [
+        {"order": 0, "run_id": "t2-A-retry1", "task": "t2", "arm": "A"},
+        {"order": 1, "run_id": "t2-A-retry2", "task": "t2", "arm": "A"}]
+    (batch / "manifest.json").write_text(json.dumps(m), encoding="utf-8")
+    assert any("schedule_drift" in p
+               for p in cv_eval.verify_frozen_recipe(batch, m))
+    # 无 retry_of 标记的普通批次仍要求全等
+    m2 = json.load(open(batch / "manifest.json", encoding="utf-8"))
+    m2.pop("retry_of")
+    (batch / "manifest.json").write_text(json.dumps(m2), encoding="utf-8")
+    assert any("schedule_drift" in p
+               for p in cv_eval.verify_frozen_recipe(batch, m2))

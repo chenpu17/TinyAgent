@@ -1228,10 +1228,18 @@ def verify_frozen_recipe(batch_dir: Path, manifest: dict) -> list:
                 .encode()).hexdigest()
             if cur_hash != frozen_hash:
                 problems.append(f"config_drift: {s['run_id']} 配置被改动")
-    # schedule 顺序与冻结时一致
+    # schedule 顺序与冻结时一致。重跑批次（retry_of，方案 §4.3「修后
+    # 最多重跑受影响的一对」）校验为 G1_RUNS 的有序子序列——不得注入
+    # 新任务/臂组合或乱序，但允许只跑受影响的子集。
     if manifest.get("run_schedule"):
         expect = [(s["task"], s["arm"]) for s in manifest["run_schedule"]]
-        if expect != G1_RUNS:
+        if manifest.get("retry_of"):
+            it = iter(G1_RUNS)
+            subseq = all(pair in it for pair in expect)
+            if not subseq:
+                problems.append(f"schedule_drift: {expect} 不是冻结顺序 "
+                                f"{G1_RUNS} 的有序子序列（重跑批次）")
+        elif expect != G1_RUNS:
             problems.append(f"schedule_drift: {expect} != 冻结顺序 {G1_RUNS}")
     return problems
 
