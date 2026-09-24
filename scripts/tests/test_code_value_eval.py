@@ -1,0 +1,554 @@
+#!/usr/bin/env python3
+"""code_value 装置单元测试（工单 01 第 4 条：先于任何评测跑通）。
+
+覆盖：
+  - 评分器 §5.1 全套反例（缺行/重复 id/未知 id/错计数/坏 JSON/类型与
+    schema 错/空产物/空 gold + 误报/run 失败但产物完整）；
+  - 计费诚实性：缺 usage → cost=null + 未知预留（绝不当 0）、缓存不双计、
+    失败 run 留账不剔除；
+  - 预算闸：余量不足一个 run 预留时拒绝启动；
+  - run_id 唯一性（目录已存在即拒绝）；
+  - G1 顺序与 fixture 不变量、prompt 组装的差分断言。
+
+全部离线：不碰真实网关、不起二进制（g0 子命令另有端到端）。
+"""
+import json
+import sys
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "scripts"))
+
+import code_value_score as scorer   # noqa: E402
+import code_value_fixture as fixture  # noqa: E402
+import code_value_eval as cv_eval   # noqa: E402
+
+
+# ── 评分器：§5.1 全套反例 ───────────────────────────────────────────────────
+
+GOLD_T0 = {"id": {"r-01": None, "r-02": None, "r-09": None}}
+GOLD_T1 = {"user_id": {"u-1": 2, "u-2": 1}}
+
+
+def _write(tmp_path, content: str) -> Path:
+    p = tmp_path / "answer.jsonl"
+    p.write_text(content, encoding="utf-8")
+    return p
+
+
+def test_validator_accepts_complete_correct(tmp_path):
+    art = _write(tmp_path, '{"id": "r-01"}\n{"id": "r-02"}\n{"id": "r-09"}\n')
+    v = scorer.validate_artifact(art, GOLD_T0, "t0")
+    assert v["delivered_exact"] and not v["reasons"]
+    assert v["details"]["delivered_count"] == 3
+
+
+def test_validator_rejects_missing_id(tmp_path):
+    art = _write(tmp_path, '{"id": "r-01"}\n{"id": "r-02"}\n')
+    v = scorer.validate_artifact(art, GOLD_T0, "t0")
+    assert not v["delivered_exact"]
+    assert any(r.startswith("missing_id: r-09") for r in v["reasons"])
+
+
+def test_validator_rejects_duplicate_id(tmp_path):
+    art = _write(tmp_path, '{"id": "r-01"}\n{"id": "r-01"}\n{"id": "r-02"}\n'
+                           '{"id": "r-09"}\n')
+    v = scorer.validate_artifact(art, GOLD_T0, "t0")
+    assert not v["delivered_exact"]
+    assert any(r.startswith("duplicate_id: r-01") for r in v["reasons"])
+    assert "r-01" in v["details"]["duplicate_ids"]
+
+
+def test_validator_rejects_unknown_id(tmp_path):
+    art = _write(tmp_path, '{"id": "r-01"}\n{"id": "r-02"}\n{"id": "r-09"}\n'
+                           '{"id": "r-77"}\n')
+    v = scorer.validate_artifact(art, GOLD_T0, "t0")
+    assert not v["delivered_exact"]
+    assert any(r.startswith("unknown_id: r-77") for r in v["reasons"])
+
+
+def test_validator_rejects_wrong_count(tmp_path):
+    art = _write(tmp_path, '{"user_id": "u-1", "event_count": 3}\n'
+                           '{"user_id": "u-2", "event_count": 1}\n')
+    v = scorer.validate_artifact(art, GOLD_T1, "t1")
+    assert not v["delivered_exact"]
+    assert any(r.startswith("wrong_count: u-1") for r in v["reasons"])
+    assert v["details"]["wrong_counts"]["u-1"] == {"delivered": 3, "want": 2}
+
+
+def test_validator_rejects_invalid_json_line(tmp_path):
+    art = _write(tmp_path, '{"id": "r-01"}\nnot json at all\n{"id": "r-02"}\n'
+                           '{"id": "r-09"}\n')
+    v = scorer.validate_artifact(art, GOLD_T0, "t0")
+    assert not v["delivered_exact"]
+    assert any(r.startswith("invalid_json: line 2") for r in v["reasons"])
+    assert 2 in v["details"]["invalid_lines"]
+
+
+def test_validator_rejects_schema_extra_field(tmp_path):
+    art = _write(tmp_path, '{"id": "r-01", "note": "x"}\n')
+    v = scorer.validate_artifact(art, GOLD_T0, "t0")
+    assert not v["delivered_exact"]
+    assert any(r.startswith("schema_error: line 1: fields") for r in v["reasons"])
+
+
+def test_validator_rejects_schema_missing_field(tmp_path):
+    art = _write(tmp_path, '{"user_id": "u-1"}\n')
+    v = scorer.validate_artifact(art, GOLD_T1, "t1")
+    assert not v["delivered_exact"]
+    assert any(r.startswith("schema_error: line 1: fields") for r in v["reasons"])
+
+
+def test_validator_rejects_wrong_type(tmp_path):
+    art = _write(tmp_path, '{"user_id": "u-1", "event_count": "2"}\n')
+    v = scorer.validate_artifact(art, GOLD_T1, "t1")
+    assert not v["delivered_exact"]
+    assert any(r.startswith("schema_error: line 1: wrong type") for r in v["reasons"])
+
+
+def test_validator_rejects_bool_as_count(tmp_path):
+    # bool 是 int 子类：true 冒充 event_count 必须拦下
+    art = _write(tmp_path, '{"user_id": "u-1", "event_count": true}\n')
+    v = scorer.validate_artifact(art, GOLD_T1, "t1")
+    assert not v["delivered_exact"]
+    assert any(r.startswith("schema_error: line 1: wrong type") for r in v["reasons"])
+
+
+def test_validator_rejects_non_object_line(tmp_path):
+    art = _write(tmp_path, '["r-01"]\n')
+    v = scorer.validate_artifact(art, GOLD_T0, "t0")
+    assert not v["delivered_exact"]
+    assert any(r.startswith("schema_error: line 1: not a JSON object")
+               for r in v["reasons"])
+
+
+def test_validator_rejects_missing_file(tmp_path):
+    v = scorer.validate_artifact(tmp_path / "nope.jsonl", GOLD_T0, "t0")
+    assert not v["delivered_exact"]
+    assert any(r.startswith("empty_artifact: answer.jsonl not found")
+               for r in v["reasons"])
+
+
+def test_validator_rejects_zero_byte_file(tmp_path):
+    art = _write(tmp_path, "")
+    v = scorer.validate_artifact(art, GOLD_T0, "t0")
+    assert not v["delivered_exact"]
+    assert any("0 bytes" in r for r in v["reasons"])
+
+
+def test_validator_empty_gold_false_positive(tmp_path):
+    empty_gold = {"id": {}}
+    art = _write(tmp_path, '{"id": "r-01"}\n{"id": "r-02"}\n')
+    v = scorer.validate_artifact(art, empty_gold, "t0")
+    assert not v["delivered_exact"]
+    assert any(r.startswith("false_positive: gold is empty but 2 ids delivered")
+               for r in v["reasons"])
+    assert v["details"]["false_positive_ids"] == ["r-01", "r-02"]
+
+
+def test_validator_blank_lines_are_not_business_errors(tmp_path):
+    art = _write(tmp_path, '\n{"id": "r-01"}\n\n{"id": "r-02"}\n{"id": "r-09"}\n\n')
+    v = scorer.validate_artifact(art, GOLD_T0, "t0")
+    assert v["delivered_exact"], v["reasons"]
+    assert v["details"]["line_count"] == 3
+
+
+# ── 计费诚实性（§5.2 / §4.1）────────────────────────────────────────────────
+
+PRICE = {"input": 1.0, "output": 2.0, "cache_creation": 1.25,
+         "cache_read": 0.1, "currency": "CNY"}
+
+
+def _result(input_tokens=100, output_tokens=50, cache_creation=0,
+            cache_read=0, turns=2, attempts=1, tool_calls=None):
+    return {"input_tokens": input_tokens, "output_tokens": output_tokens,
+            "cache_creation_input_tokens": cache_creation,
+            "cache_read_input_tokens": cache_read,
+            "turns": turns, "attempts": attempts,
+            "tool_calls": tool_calls or []}
+
+
+def test_usage_normal():
+    u = scorer.usage_from_result(_result())
+    assert u["requests_happened"] and not u["usage_missing"]
+    assert u["total_tokens"] == 150
+    assert u["unknown_reserve_tokens"] == 0
+
+
+def test_usage_missing_is_flagged_and_reserved_not_zero():
+    # 请求发生过（turns>0）但 usage 全零 → 未知消耗，预留，绝不当 0
+    u = scorer.usage_from_result({"turns": 3, "attempts": 1})
+    assert u["usage_missing"]
+    assert u["unknown_reserve_tokens"] == scorer.UNKNOWN_RESERVE_TOKENS
+    assert u["unknown_reserve_tokens"] > 0
+
+
+def test_no_requests_no_missing_usage():
+    # run 根本没发出请求（turns=0 attempts=0）：不是「缺 usage」
+    u = scorer.usage_from_result({})
+    assert not u["requests_happened"] and not u["usage_missing"]
+    assert u["unknown_reserve_tokens"] == 0
+
+
+def test_cost_null_when_price_missing():
+    u = scorer.usage_from_result(_result())
+    c = scorer.cost_from_usage(u, None)
+    assert c["cost"] is None and not c["cost_known"]
+    assert c["reason"] == "price_snapshot_missing"
+
+
+def test_cost_null_when_usage_missing():
+    u = scorer.usage_from_result({"turns": 1, "attempts": 1})
+    c = scorer.cost_from_usage(u, PRICE)
+    assert c["cost"] is None and not c["cost_known"]
+    assert c["reason"] == "usage_missing"
+    assert c["unknown_reserve_tokens"] > 0
+
+
+def test_cost_math_each_bucket_once():
+    u = scorer.usage_from_result(_result(input_tokens=100, output_tokens=50,
+                                         cache_creation=10, cache_read=40))
+    c = scorer.cost_from_usage(u, PRICE)
+    assert c["cost_known"]
+    assert c["cost"] == pytest.approx(100 * 1.0 + 50 * 2.0
+                                      + 10 * 1.25 + 40 * 0.1)
+    assert c["currency"] == "CNY"
+
+
+def test_cache_not_double_counted():
+    # input_tokens 在 provider 层已剔除缓存读：input + cache_read 各计一次，
+    # 两者相加不会把同一批 token 计两次（openai.rs 语义）。
+    u = scorer.usage_from_result(_result(input_tokens=60, cache_read=40))
+    assert u["tokens"]["input_tokens"] + u["tokens"]["cache_read_input_tokens"] \
+        == 100
+    c = scorer.cost_from_usage(u, PRICE)
+    assert c["cost"] == pytest.approx(60 * 1.0 + 50 * 2.0 + 40 * 0.1)
+
+
+def test_inner_llm_meta_accounting():
+    tc = [{"name": "run_code",
+           "meta": {"llm": {"models": {"m1": {"known_usage": 500}},
+                            "unknown_calls": 2}}}]
+    u = scorer.usage_from_result(_result(tool_calls=tc))
+    assert u["inner_llm"] == {"known_usage": 500, "unknown_calls": 2}
+
+
+def test_summarize_run_failed_but_artifact_complete():
+    # §5.1：run 失败但产物完整 → delivered=True + abnormal_end=True
+    validation = {"delivered_exact": True, "reasons": [],
+                  "details": {"task": "t0"}}
+    usage = scorer.usage_from_result(_result())
+    cost = scorer.cost_from_usage(usage, PRICE)
+    s = scorer.summarize_run({"run_id": "x", "task": "t0", "arm": "A"},
+                             validation, usage, cost,
+                             end_reason="max_tokens")
+    assert s["delivered_exact"] and s["abnormal_end"]
+    assert s["end_reason"] == "max_tokens"
+
+
+def test_aggregate_keeps_failed_and_missing_usage_runs():
+    # §5.3：所有 run（含失败/partial）都进账，不做任何剔除
+    def _run(run_id, delivered, end_reason, result):
+        validation = {"delivered_exact": delivered, "reasons": [],
+                      "details": {}}
+        usage = scorer.usage_from_result(result)
+        cost = scorer.cost_from_usage(usage, PRICE)
+        summary = scorer.summarize_run(
+            {"run_id": run_id, "task": "t0", "arm": "A"},
+            validation, usage, cost, end_reason)
+        return {"run_id": run_id, "task": "t0", "arm": "A",
+                "summary": summary}
+
+    runs = [
+        _run("ok-1", True, "end_turn", _result()),
+        _run("fail-1", True, "error", _result()),          # 失败但产物完整
+        _run("miss-1", False, "end_turn", {"turns": 2}),   # 缺 usage
+    ]
+    agg = scorer.aggregate(runs)
+    assert agg["runs"] == 3
+    assert agg["delivered_exact_count"] == 2
+    assert "fail-1" in agg["failed_runs"]
+    assert "miss-1" in agg["usage_missing_runs"]
+    assert "miss-1" in agg["unknown_cost_runs"]
+    # cost_per_success = 已知费用 / 成功数（失败轮真实成本不清零）
+    per_run_cost = 100 * 1.0 + 50 * 2.0  # input*1 + output*2
+    expected_total = per_run_cost * 2    # ok-1 + fail-1（miss-1 费用未知不计入）
+    assert agg["cost_known_total"] == pytest.approx(expected_total)
+    assert agg["cost_per_success"] == pytest.approx(expected_total / 2)
+    assert agg["by_arm"]["A"]["runs"] == 3
+
+
+# ── 预算闸（§4.1：防「软闸」冒充硬预算）────────────────────────────────────
+
+def test_budget_gate_allows_when_headroom():
+    g = cv_eval.budget_gate(ledger_tokens=0, unknown_reserve=0,
+                            envelope=480_000, per_run_reserve=80_000)
+    assert g["ok"]
+    assert g["headroom_tokens"] == 400_000
+    assert g["inflight_overrun_risk_tokens"] == cv_eval.INFLIGHT_OVERRUN_TOKENS
+
+
+def test_budget_gate_refuses_when_insufficient_headroom():
+    g = cv_eval.budget_gate(ledger_tokens=400_001, unknown_reserve=0,
+                            envelope=480_000, per_run_reserve=80_000)
+    assert not g["ok"]  # 400,001 + 80,000 > 480,000：拒绝启动
+    assert g["headroom_tokens"] < 0
+
+
+def test_budget_gate_boundary_inclusive():
+    g = cv_eval.budget_gate(ledger_tokens=400_000, unknown_reserve=0,
+                            envelope=480_000, per_run_reserve=80_000)
+    assert g["ok"]  # 恰好用满包络 = 允许（needed <= envelope）
+    assert g["headroom_tokens"] == 0
+
+
+def test_budget_gate_counts_unknown_reserve():
+    g = cv_eval.budget_gate(ledger_tokens=300_000,
+                            unknown_reserve=scorer.UNKNOWN_RESERVE_TOKENS,
+                            envelope=480_000, per_run_reserve=80_000)
+    # 300K + 112,768 + 80K > 480K → 拒绝
+    assert not g["ok"]
+
+
+def test_require_paid_prereqs_blocks_without_price():
+    m = {"price_snapshot": None, "cost_currency": None, "cost_stop": None}
+    assert cv_eval.require_paid_prereqs(m) == ["price_snapshot",
+                                               "cost_currency", "cost_stop"]
+    m2 = {"price_snapshot": PRICE, "cost_currency": "CNY", "cost_stop": 5.0}
+    assert cv_eval.require_paid_prereqs(m2) == []
+
+
+def test_load_price_snapshot_rejects_partial():
+    assert cv_eval.load_price_snapshot(None) is None
+    assert cv_eval.load_price_snapshot("/nonexistent/x.json") is None
+    p = {"input": 1, "output": 2, "currency": "CNY"}  # 缺 cache 两项
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".json",
+                                     delete=False) as f:
+        json.dump(p, f)
+        path = f.name
+    assert cv_eval.load_price_snapshot(path) is None
+    with tempfile.NamedTemporaryFile("w", suffix=".json",
+                                     delete=False) as f:
+        json.dump(PRICE, f)
+        path2 = f.name
+    assert cv_eval.load_price_snapshot(path2) == PRICE
+
+
+# ── run_id 唯一性 / 不覆盖（§6：新 run_id 重派，不覆盖旧记录）───────────────
+
+def test_mock_plumbing_run_refuses_existing_run_id(tmp_path):
+    batch = tmp_path / "batch"
+    (batch / "runs" / "t0-A-normal").mkdir(parents=True)
+    with pytest.raises(SystemExit, match="拒绝覆盖"):
+        cv_eval.mock_plumbing_run(
+            batch, tmp_path, "t0-A-normal", "t0", "A",
+            scenario={"turns": []}, expect={})
+
+
+def test_cmd_g0_refuses_existing_batch_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(cv_eval, "ART", tmp_path)
+    monkeypatch.setattr(cv_eval, "check_global_skills_clean", lambda: None)
+    batch_id = "g0-test-01"
+    (tmp_path / batch_id).mkdir(parents=True)
+    with pytest.raises(SystemExit, match="拒绝覆盖"):
+        cv_eval.cmd_g0(type("A", (), {"batch_id": batch_id})())
+
+
+def test_cmd_prepare_g1_refuses_existing_batch_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(cv_eval, "ART", tmp_path)
+    monkeypatch.setattr(cv_eval, "check_global_skills_clean", lambda: None)
+    batch_id = "g1-test-01"
+    (tmp_path / batch_id).mkdir(parents=True)
+    with pytest.raises(SystemExit, match="拒绝覆盖"):
+        cv_eval.cmd_prepare_g1(
+            type("A", (), {"batch_id": batch_id, "price": None,
+                           "cost_stop": None})())
+
+
+# ── G1 顺序与配置面（§4.3：T0-B,A、T1-A,B、T2-B,A）─────────────────────────
+
+def test_g1_schedule_order():
+    assert cv_eval.G1_RUNS == [("t0", "B"), ("t0", "A"), ("t1", "A"),
+                               ("t1", "B"), ("t2", "B"), ("t2", "A")]
+
+
+def test_g1_envelope_covers_six_runs():
+    assert cv_eval.G1_TOKEN_ENVELOPE \
+        >= len(cv_eval.G1_RUNS) * cv_eval.RUN_LIMITS["max_total_tokens"]
+
+
+def test_build_config_only_diff_is_code_package(tmp_path):
+    wd = tmp_path / "wd"
+    a = cv_eval.build_config("t1", "A", wd, "http://x", "m", tmp_path)
+    b = cv_eval.build_config("t1", "B", wd, "http://x", "m", tmp_path)
+    assert a["code"]["enabled"] and not b["code"]["enabled"]
+    assert a["code"]["skill_injection"] == "on_demand"
+    assert not a["code"]["include"] and not a["code"]["call_batch"]
+    assert not a["code"]["llm"]["enabled"]
+    # 除 code.enabled 与 system_prompt 外逐字段相同
+    for k in set(a) | set(b):
+        if k in ("code", "system_prompt"):
+            continue
+        assert a[k] == b[k], f"config field drifted: {k}"
+    # B 不在 tools 白名单列 run_code（成员资格由 code.enabled 驱动）
+    assert "run_code" not in b["tools"]
+    assert "run_code" not in a["tools"]
+    # 三原语全关（范围纪律）
+    assert a["code"]["include"] is False
+    assert a["code"]["call_batch"] is False
+    assert a["code"]["llm"]["enabled"] is False
+
+
+def test_build_config_t2_has_no_shell_and_mcp(tmp_path):
+    wd = tmp_path / "wd"
+    a = cv_eval.build_config("t2", "A", wd, "http://x", "m", tmp_path,
+                             server_log=tmp_path / "log.ndjson")
+    assert "shell" not in a["tools"]
+    assert "shell" not in cv_eval.build_config("t2", "B", wd, "http://x", "m",
+                                               tmp_path)["tools"]
+    assert len(a["mcp_servers"]) == 1
+    assert a["mcp_servers"][0]["name"] == "t2data"
+
+
+def test_run_limits_match_plan():
+    assert cv_eval.RUN_LIMITS == {"max_turns": 20, "timeout_secs": 600,
+                                  "max_output_chars": 60000,
+                                  "max_total_tokens": 80000}
+    assert cv_eval.MAX_TOKENS_PER_REQUEST == 32768
+
+
+# ── prompt 组装（§3：公共段逐字相同，增量=能力披露）────────────────────────
+
+def test_prompt_parts_a_minus_capability_is_common():
+    common, a_system, recipe = cv_eval.prompt_parts()
+    assert a_system.startswith(common[:200])
+    # A 必须以能力段开头插入（在 Verify 段之前）
+    assert "## Choose how to execute the remaining work" in a_system
+    assert "## Choose how to execute the remaining work" not in common
+    # 公共段含交付纪律（两臂都有，不只给 A）
+    assert "Persist artifacts incrementally" in common
+    assert "Persist artifacts incrementally" in a_system
+    assert set(recipe) == {"agentic_md_sha256", "agentic_code_md_sha256",
+                           "persist_bullet_sha256", "cap_section_sha256",
+                           "common_sha256", "a_system_sha256"}
+
+
+def test_prompt_parts_deterministic():
+    c1, a1, r1 = cv_eval.prompt_parts()
+    c2, a2, r2 = cv_eval.prompt_parts()
+    assert (c1, a1, r1) == (c2, a2, r2)
+
+
+def test_module_prompts_match_recipe():
+    assert cv_eval.PROMPT_COMMON and cv_eval.PROMPT_A
+    assert cv_eval.PROMPT_A.startswith(cv_eval.PROMPT_COMMON[:100])
+    assert len(cv_eval.PROMPT_A) > len(cv_eval.PROMPT_COMMON)
+
+
+# ── fixture 不变量（§2：确定性、gold 不进 workdir、规模上限）────────────────
+
+@pytest.fixture(scope="module")
+def fixture_root(tmp_path_factory):
+    root = tmp_path_factory.mktemp("fixture")
+    stats = fixture.generate(root)
+    assert not stats.get("selfcheck_problems")
+    return root
+
+
+def test_fixture_deterministic(fixture_root, tmp_path_factory):
+    other = tmp_path_factory.mktemp("fixture2")
+    fixture.generate(other)
+    for fa in sorted(fixture_root.rglob("*")):
+        if not fa.is_file() or fa.name == "gen_stats.json":
+            continue
+        rel = fa.relative_to(fixture_root)
+        fb = other / rel
+        assert fb.is_file(), f"{rel} missing in second generation"
+        assert fa.read_bytes() == fb.read_bytes(), f"{rel} not deterministic"
+
+
+def test_fixture_sizes_within_caps(fixture_root):
+    t0 = (fixture_root / "t0" / "records.jsonl").stat().st_size
+    t1 = ((fixture_root / "t1" / "subscriptions.jsonl").stat().st_size
+          + (fixture_root / "t1" / "events.jsonl").stat().st_size)
+    assert t0 <= fixture.T0_MAX_BYTES
+    assert t1 <= fixture.T1_MAX_BYTES
+    stats = json.load(open(fixture_root / "gen_stats.json", encoding="utf-8"))
+    assert stats["t2"]["reach"]["total_body_bytes"] <= fixture.T2_MAX_BODY_BYTES
+
+
+def test_stage_workdir_never_contains_gold(fixture_root, tmp_path):
+    for task in ("t0", "t1", "t2"):
+        wd = tmp_path / f"wd-{task}"
+        fixture.stage_workdir(task, wd, fixture_root)
+        names = {p.name for p in wd.iterdir()}
+        assert "gold.json" not in names
+        if task == "t2":
+            assert names == set()  # T2 数据只经 MCP，workdir 留空
+
+
+def test_stage_workdir_resets_state(fixture_root, tmp_path):
+    wd = tmp_path / "wd"
+    fixture.stage_workdir("t0", wd, fixture_root)
+    (wd / "answer.jsonl").write_text('{"id": "leftover"}\n')
+    fixture.stage_workdir("t0", wd, fixture_root)
+    assert not (wd / "answer.jsonl").exists()  # 上轮残留被清
+
+
+def test_gold_solved_by_independent_reference(fixture_root):
+    for task in ("t0", "t1"):
+        gold = json.load(open(fixture_root / task / "gold.json",
+                              encoding="utf-8"))
+        assert gold["target"], f"{task} gold empty"
+    t2_gold = json.load(open(fixture_root / "t2" / "gold.json",
+                             encoding="utf-8"))
+    assert t2_gold["target"]
+    stats = json.load(open(fixture_root / "gen_stats.json", encoding="utf-8"))
+    reach = stats["t2"]["reach"]
+    assert reach["paging"]["subscriptions_page"]["pages"] == 4
+    assert reach["paging"]["events_page"]["pages"] == 8
+
+
+def test_task_texts_identical_contract():
+    for task, text in fixture.TASK_TEXTS.items():
+        assert "answer.jsonl" in text
+        assert "自检" in text
+    assert set(fixture.TASK_TEXTS) == {"t0", "t1", "t2"}
+
+
+def test_verify_immutable_rejects_tampered(fixture_root):
+    assert fixture.verify_immutable(fixture_root)
+    gold = fixture_root / "t0" / "gold.json"
+    saved = gold.read_bytes()
+    gold.write_text('{"target": []}')
+    assert not fixture.verify_immutable(fixture_root)
+    gold.write_bytes(saved)
+    assert fixture.verify_immutable(fixture_root)
+
+
+# ── manifest 必填字段（§6.1）────────────────────────────────────────────────
+
+def test_manifest_fields_complete():
+    assert set(cv_eval.MANIFEST_FIELDS) >= {
+        "batch_id", "stage", "experiment_version", "code_head",
+        "dirty_diff_hash", "binary_hash", "fixture_hash", "task_hash",
+        "prompt_hashes", "prompt_diff", "tool_inventory", "feature_flags",
+        "model", "gateway_identity", "sampling", "price_snapshot",
+        "cost_currency", "cost_stop", "token_stop", "turn_limit",
+        "wall_limit", "retry_policy", "run_schedule", "success_rule",
+        "gate_rule", "demand_status"}
+
+
+def test_gold_as_answer_lines_roundtrip(fixture_root, tmp_path):
+    # mock「完美模型」写出的内容必须过验收（gold → answer → validate）
+    for task in ("t0", "t1"):
+        content = cv_eval.gold_as_answer_lines(fixture_root, task)
+        gold = scorer.load_gold(fixture_root / task / "gold.json")
+        art = tmp_path / f"rt-{task}" / "answer.jsonl"
+        art.parent.mkdir(parents=True, exist_ok=True)
+        art.write_text(content, encoding="utf-8")
+        v = scorer.validate_artifact(art, gold, task)
+        assert v["delivered_exact"], v["reasons"]
