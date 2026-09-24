@@ -195,14 +195,15 @@ def test_no_requests_no_missing_usage():
 def test_cost_null_when_price_missing():
     u = scorer.usage_from_result(_result())
     c = scorer.cost_from_usage(u, None)
-    assert c["cost"] is None and not c["cost_known"]
+    assert c["cost"] is None and c["cost_known_lower"] is None
+    assert not c["cost_complete"]
     assert c["reason"] == "price_snapshot_missing"
 
 
 def test_cost_null_when_usage_missing():
     u = scorer.usage_from_result({"turns": 1, "attempts": 1})
     c = scorer.cost_from_usage(u, PRICE)
-    assert c["cost"] is None and not c["cost_known"]
+    assert c["cost"] is None and not c["cost_complete"]
     assert c["reason"] == "usage_missing"
     assert c["unknown_reserve_tokens"] > 0
 
@@ -211,9 +212,10 @@ def test_cost_math_each_bucket_once():
     u = scorer.usage_from_result(_result(input_tokens=100, output_tokens=50,
                                          cache_creation=10, cache_read=40))
     c = scorer.cost_from_usage(u, PRICE)
-    assert c["cost_known"]
+    assert c["cost_complete"]
     assert c["cost"] == pytest.approx(100 * 1.0 + 50 * 2.0
                                       + 10 * 1.25 + 40 * 0.1)
+    assert c["cost_known_lower"] == c["cost"]
     assert c["currency"] == "CNY"
 
 
@@ -272,12 +274,29 @@ def test_aggregate_keeps_failed_and_missing_usage_runs():
     assert "fail-1" in agg["failed_runs"]
     assert "miss-1" in agg["usage_missing_runs"]
     assert "miss-1" in agg["unknown_cost_runs"]
-    # cost_per_success = 已知费用 / 成功数（失败轮真实成本不清零）
+    # 主指标：有未知消耗即 null（工单 01R——不把混合口径当主指标）
+    assert agg["cost_per_success"] is None
+    # 已知费用下界合计仍给出（ok-1 + fail-1 的完整费用）
     per_run_cost = 100 * 1.0 + 50 * 2.0  # input*1 + output*2
-    expected_total = per_run_cost * 2    # ok-1 + fail-1（miss-1 费用未知不计入）
-    assert agg["cost_known_total"] == pytest.approx(expected_total)
-    assert agg["cost_per_success"] == pytest.approx(expected_total / 2)
+    assert agg["cost_complete_total"] == pytest.approx(per_run_cost * 2)
+    assert agg["cost_known_lower_total"] == pytest.approx(per_run_cost * 2)
     assert agg["by_arm"]["A"]["runs"] == 3
+
+
+def test_aggregate_cost_per_success_when_all_complete():
+    def _run(run_id, result):
+        usage = scorer.usage_from_result(result)
+        cost = scorer.cost_from_usage(usage, PRICE)
+        return {"run_id": run_id, "task": "t0", "arm": "A",
+                "summary": scorer.summarize_run(
+                    {"run_id": run_id, "task": "t0", "arm": "A"},
+                    {"delivered_exact": True, "reasons": [], "details": {}},
+                    usage, cost, "end_turn")}
+    runs = [_run("a", _result()), _run("b", _result())]
+    agg = scorer.aggregate(runs)
+    per = 100 * 1.0 + 50 * 2.0
+    assert agg["cost_per_success"] == pytest.approx(per * 2 / 2)
+    assert agg["unknown_cost_runs"] == []
 
 
 # ── 预算闸（§4.1：防「软闸」冒充硬预算）────────────────────────────────────
@@ -314,10 +333,43 @@ def test_budget_gate_counts_unknown_reserve():
 
 def test_require_paid_prereqs_blocks_without_price():
     m = {"price_snapshot": None, "cost_currency": None, "cost_stop": None}
-    assert cv_eval.require_paid_prereqs(m) == ["price_snapshot",
-                                               "cost_currency", "cost_stop"]
-    m2 = {"price_snapshot": PRICE, "cost_currency": "CNY", "cost_stop": 5.0}
+    assert cv_eval.require_paid_prereqs(m) == ["price_snapshot(price_snapshot_missing)",
+                                               "cost_currency", "cost_stop",
+                                               "config_hashes(final_freeze_missing)",
+                                               "final_frozen_at(final_freeze_missing)"]
+    # 合法价表也必须经显式 finalize-g1（P1-02：手改 manifest 不产生
+    # config_hashes/final_frozen_at → 不得进付费循环）
+    m_hand = {"price_snapshot": PRICE, "cost_currency": "CNY", "cost_stop": 5.0}
+    assert any("final_freeze_missing" in p
+               for p in cv_eval.require_paid_prereqs(m_hand))
+    m2 = {"price_snapshot": PRICE, "cost_currency": "CNY", "cost_stop": 5.0,
+          "config_hashes": {"t0-B": "x"}, "final_frozen_at": "2026-09-24"}
     assert cv_eval.require_paid_prereqs(m2) == []
+
+
+def test_require_paid_prereqs_rejects_invalid_numbers():
+    # 工单 01R P1-01：负价/NaN/零停止值不得放行
+    bad_price = dict(PRICE, input=-1)
+    m = {"price_snapshot": bad_price, "cost_currency": "CNY",
+         "cost_stop": 5.0, "config_hashes": {"x": "y"},
+         "final_frozen_at": "2026-09-24"}
+    assert any("price_snapshot_input_invalid" in p
+               for p in cv_eval.require_paid_prereqs(m))
+    nan_price = dict(PRICE, output=float("nan"))
+    m2 = {"price_snapshot": nan_price, "cost_currency": "CNY",
+          "cost_stop": 5.0, "config_hashes": {"x": "y"},
+          "final_frozen_at": "2026-09-24"}
+    assert any("invalid" in p for p in cv_eval.require_paid_prereqs(m2))
+    m3 = {"price_snapshot": PRICE, "cost_currency": "CNY",
+          "cost_stop": float("nan"), "config_hashes": {"x": "y"},
+          "final_frozen_at": "2026-09-24"}
+    assert "cost_stop" in cv_eval.require_paid_prereqs(m3)
+    m4 = {"price_snapshot": PRICE, "cost_currency": "CNY", "cost_stop": 0,
+          "config_hashes": {"x": "y"}, "final_frozen_at": "2026-09-24"}
+    assert "cost_stop" in cv_eval.require_paid_prereqs(m4)
+    m5 = {"price_snapshot": PRICE, "cost_currency": "USD", "cost_stop": 1.0,
+          "config_hashes": {"x": "y"}, "final_frozen_at": "2026-09-24"}
+    assert "cost_currency_mismatch" in cv_eval.require_paid_prereqs(m5)
 
 
 def test_load_price_snapshot_rejects_partial():
@@ -341,7 +393,9 @@ def test_load_price_snapshot_rejects_partial():
 
 def test_mock_plumbing_run_refuses_existing_run_id(tmp_path):
     batch = tmp_path / "batch"
-    (batch / "runs" / "t0-A-normal").mkdir(parents=True)
+    run_dir = batch / "runs" / "t0-A-normal"
+    run_dir.mkdir(parents=True)
+    (run_dir / "events.ndjson").write_text('{"type":"turn"}\n')
     with pytest.raises(SystemExit, match="拒绝覆盖"):
         cv_eval.mock_plumbing_run(
             batch, tmp_path, "t0-A-normal", "t0", "A",
@@ -462,8 +516,9 @@ def test_fixture_deterministic(fixture_root, tmp_path_factory):
     other = tmp_path_factory.mktemp("fixture2")
     fixture.generate(other)
     for fa in sorted(fixture_root.rglob("*")):
-        if not fa.is_file() or fa.name == "gen_stats.json":
-            continue
+        if not fa.is_file() or fa.name == "gen_stats.json" \
+                or fa.name == "reference_solve_events.ndjson":
+            continue  # 运行时日志含时间戳，非快照数据
         rel = fa.relative_to(fixture_root)
         fb = other / rel
         assert fb.is_file(), f"{rel} missing in second generation"
@@ -673,3 +728,330 @@ def test_summarize_run_carries_instance_fields():
                               validation, usage, cost, "end_turn")
     assert (s2["instance_id"], s2["repetition"]) == (1, 1)
     assert s2["order"] is None
+
+
+# ── 工单 01R 回归：真实 cmd_run_g1() 入口 + 桩 run_binary（不联网）─────────
+# 复核指出旧测试「手写费用循环代替被测控制逻辑」——以下全部走真实入口，
+# 只把模型执行入口 run_binary 换成不联网的桩。覆盖复核反例矩阵：
+#   result 丢失/损坏、部分未知、费用不足、非法价表、配方漂移、
+#   重复启动、中断后再启动、答案文件可达。
+
+
+def _make_batch(tmp_path, price=None, cost_stop=None, finalize=False):
+    """构造可执行的 g1 批次（manifest + configs + inventory）。
+
+    finalize=True 时走真实 cmd_finalize_g1 补价表（产生 config_hashes +
+    final_frozen_at）；False 时模拟手改 manifest 填价表。
+    """
+    batch = tmp_path / "batch"
+    batch.mkdir(parents=True)
+    schedule = [{"order": i, "run_id": f"{t}-{a}", "task": t, "arm": a}
+                for i, (t, a) in enumerate(cv_eval.G1_RUNS)]
+    manifest = {
+        "stage": "g1", "run_schedule": schedule,
+        "token_stop": {"stage_envelope": 480_000, "per_run_soft_gate": 80_000},
+        "model": "stub-model",
+        "price_snapshot": price, "cost_currency":
+            (price or {}).get("currency"), "cost_stop": cost_stop,
+        "binary_hash": None, "fixture_hash": None, "task_hash": None,
+        "prompt_hashes": None,
+    }
+    for s in schedule:
+        cfg_dir = batch / "configs"
+        cfg_dir.mkdir(exist_ok=True)
+        cfg = {"model": "stub-model", "workdir":
+               str(batch / "runs" / s["run_id"] / "wd"),
+               "code": {"enabled": s["arm"] == "A"}}
+        (cfg_dir / f"{s['run_id']}.json").write_text(
+            json.dumps(cfg), encoding="utf-8")
+    (batch / "inventory_analysis.json").write_text(
+        json.dumps({"problems": [], "per_task": {}}), encoding="utf-8")
+    (batch / "manifest.json").write_text(json.dumps(manifest),
+                                         encoding="utf-8")
+    if finalize:
+        price_path = tmp_path / "price.json"
+        price_path.write_text(json.dumps(price), encoding="utf-8")
+        args = type("A", (), {"batch": str(batch), "price": str(price_path),
+                              "cost_stop": cost_stop})()
+        cv_eval.cmd_finalize_g1(args)
+    return batch
+
+
+def _stub_run_binary(outcome, task_of=None):
+    """桩模型执行：写 events/result/wd 产物，不联网。
+
+    outcome: "normal"（完整 usage）/ "partial"（一个未报账请求）/
+             "missing"（整轮无 usage）/ "no_result"（result 缺失）/
+             "corrupt"（result 损坏）/ "crash"（进程死在半路，只有 events）。
+    task_of: run_id → task 名映射（从 run 目录名推断）。
+    """
+    def stub(cfg_path, task_text, run_dir, env, timeout_s,
+             seatbelt_profile=None):
+        run_dir = Path(run_dir)
+        wd = run_dir / "wd"
+        wd.mkdir(parents=True, exist_ok=True)
+        ev = run_dir / "events.ndjson"
+        usage_frame = ('{"type":"usage","input_tokens":1000,'
+                       '"output_tokens":100,"cache_creation_input_tokens":0,'
+                       '"cache_read_input_tokens":0}\n')
+        if outcome == "normal":
+            ev.write_text('{"type":"turn"}\n' + usage_frame,
+                          encoding="utf-8")
+            (run_dir / "result.json").write_text(json.dumps({
+                "input_tokens": 1000, "output_tokens": 100,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0, "turns": 1, "attempts": 1,
+                "stop_reason": "end_turn", "tool_calls": []}),
+                encoding="utf-8")
+        elif outcome == "partial":
+            # 两轮 turn，只有一轮报账——复核反例「部分未知」
+            ev.write_text('{"type":"turn"}\n' + usage_frame
+                          + '{"type":"turn"}\n', encoding="utf-8")
+            (run_dir / "result.json").write_text(json.dumps({
+                "input_tokens": 1000, "output_tokens": 100,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0, "turns": 2, "attempts": 1,
+                "stop_reason": "error", "tool_calls": []}),
+                encoding="utf-8")
+        elif outcome == "missing":
+            ev.write_text('{"type":"turn"}\n{"type":"turn"}\n',
+                          encoding="utf-8")
+            (run_dir / "result.json").write_text(json.dumps({
+                "turns": 2, "attempts": 1, "stop_reason": "error",
+                "tool_calls": []}), encoding="utf-8")
+        elif outcome == "no_result":
+            ev.write_text('{"type":"turn"}\n' + usage_frame,
+                          encoding="utf-8")
+            # result.json 不写——模拟进程崩溃在写 result 之前
+        elif outcome == "corrupt":
+            ev.write_text('{"type":"turn"}\n' + usage_frame,
+                          encoding="utf-8")
+            (run_dir / "result.json").write_text(
+                '{"input_tokens": 1000, "output_tok', encoding="utf-8")
+        elif outcome == "crash":
+            # 进程死在半路：只有半截 events，无 result
+            ev.write_text('{"type":"turn"}\n', encoding="utf-8")
+        # 产物：写一份必然过验收的 answer（gold 现算，不落盘）
+        task = task_of(run_dir.name) if task_of else "t0"
+        gold = cv_eval.gold_as_answer_lines(cv_eval.FIXTURE_ROOT, task)
+        (wd / "answer.jsonl").write_text(gold, encoding="utf-8")
+        return 0, 0.1
+    return stub
+
+
+def _task_of_run_id(run_id):
+    return run_id.rsplit("-", 1)[0]
+
+
+def _patch_for_stub(monkeypatch, outcome):
+    monkeypatch.setattr(cv_eval, "run_binary", _stub_run_binary(
+        outcome, task_of=_task_of_run_id))
+    # seatbelt 桩：真实 sandbox-exec 探针过重，桩为通过（隔离本身
+    # 另有真实探针测试 test_seatbelt_isolation_real_probe）
+    monkeypatch.setattr(cv_eval, "verify_seatbelt",
+                        lambda prof, wd: {"ok": True})
+    monkeypatch.setattr(cv_eval, "seatbelt_profile", lambda rd, wd: None)
+    # gateway 桩：不读 测试模型.md、不注入真实密钥
+    monkeypatch.setattr(cv_eval, "gateway_identity",
+                        lambda: ({"model": "stub-model"},
+                                 {"api_key": "stub", "base_url": "stub"}))
+
+
+def _run_g1(tmp_path, monkeypatch, outcome, price, cost_stop, finalize=True):
+    batch = _make_batch(tmp_path, price, cost_stop, finalize=finalize)
+    _patch_for_stub(monkeypatch, outcome)
+    args = type("A", (), {"batch": str(batch), "execute": True})()
+    rc = cv_eval.cmd_run_g1(args)
+    ledger = json.load(open(batch / "ledger.json", encoding="utf-8"))
+    return batch, rc, ledger
+
+
+TEST_PRICE = {"input": 1e-6, "output": 1e-6, "cache_creation": 1e-6,
+              "cache_read": 1e-6, "currency": "TEST"}
+
+
+def test_run_g1_partial_unknown_stops_subsequent_runs(tmp_path, monkeypatch,
+                                                      capsys):
+    """P1-01 反例回归：每跑已知费用 0.0011 + 一个未报账请求。
+    修复前：六跑全部启动、known_cost_total=0、triggered=false。
+    修复后：首跑检出 partial_unknown → 停止启动后续 run，已知下界保留。"""
+    batch, rc, ledger = _run_g1(tmp_path, monkeypatch, "partial", TEST_PRICE,
+                                100.0)
+    assert ledger["runs"] == 1, "partial_unknown 必须立即停止后续 run"
+    assert ledger["cost_stop"]["stop_reason"] == "usage_incomplete"
+    # 已知费用下界不被抹掉（P1-01 核心）：1000×1e-6 + 100×1e-6
+    assert ledger["cost_known_lower_total"] == pytest.approx(0.0011)
+    # 主指标：存在未知费用 → null（不拿混合口径当主指标）
+    assert ledger["cost_per_success"] is None
+    assert ledger["partial_unknown_runs"] == ["t0-B"]
+    # 证据保留：首跑目录完整（events/result/summary/completed）
+    rd = batch / "runs" / "t0-B"
+    for f in ("started.json", "events.ndjson", "result.json",
+              "summary.json", "completed.json"):
+        assert (rd / f).exists(), f"{f} 必须封存"
+    # 后续 run 未被启动（无 started.json）
+    assert not (batch / "runs" / "t0-A" / "started.json").exists()
+
+
+def test_run_g1_cost_stop_triggers_on_lower_plus_reserve(tmp_path,
+                                                         monkeypatch):
+    """P1-01：停止判断 = 已知下界 + 未知预留折算 ≥ 停止值。
+    missing：首跑 usage_missing → 已知下界 0 + 预留 112768 tok × 1e-6
+    = 0.1128 ≥ 0.05 → 触发费用停止线（而非静默跑满六跑）。"""
+    batch, rc, ledger = _run_g1(tmp_path, monkeypatch, "missing", TEST_PRICE,
+                                0.05)
+    assert ledger["runs"] == 1
+    assert ledger["cost_stop"]["stop_reason"] == "cost_stop"
+    assert ledger["cost_stop"]["triggered"] is True
+    assert ledger["cost_stop"]["unknown_reserve_cost"] == pytest.approx(
+        (80_000 + 32_768) * 1e-6)
+    # 停止线语义标注：run 间停止线，非供应商扣费硬上限
+    assert "非供应商扣费硬上限" in ledger["cost_stop"]["kind"]
+
+
+def test_run_g1_normal_runs_all_six(tmp_path, monkeypatch):
+    """对照：全部正常时六跑完整执行，主指标有值、停止线不触发。"""
+    batch, rc, ledger = _run_g1(tmp_path, monkeypatch, "normal", TEST_PRICE,
+                                100.0)
+    assert ledger["runs"] == 6
+    assert ledger["cost_stop"]["stop_reason"] is None
+    assert ledger["cost_stop"]["triggered"] is False
+    assert ledger["cost_per_success"] is not None
+    assert ledger["cost_per_success"] == pytest.approx(0.0011)
+
+
+def test_run_g1_missing_result_accounted_from_events(tmp_path, monkeypatch):
+    """P1-01 反例回归：result 缺失但 events 有账——修复前被记成
+    requests_happened=false / cost=0；修复后从 events 核账，不归零。"""
+    batch, rc, ledger = _run_g1(tmp_path, monkeypatch, "no_result", TEST_PRICE,
+                                100.0)
+    # events 完整报账 → usage_complete=True → 六跑全跑（不误停）
+    assert ledger["runs"] == 6
+    summary = json.load(open(batch / "runs" / "t0-B" / "summary.json",
+                             encoding="utf-8"))
+    u = summary["usage"]
+    assert u["result_missing"], "result 缺失必须显式标记"
+    assert u["requests_happened"], "events 有账不得记成零请求"
+    assert u["total_tokens"] == 1100, "从 events 核账，不归零"
+    assert u["usage_complete"], "events 全报账即完整"
+
+
+def test_run_g1_corrupt_result_accounted_from_events(tmp_path, monkeypatch):
+    """P1-01 反例回归：result 损坏（半截 JSON）——修复前 json.load 直接
+    崩溃；修复后与缺失同罪，events 核账。"""
+    batch, rc, ledger = _run_g1(tmp_path, monkeypatch, "corrupt", TEST_PRICE,
+                                100.0)
+    assert ledger["runs"] == 6
+    summary = json.load(open(batch / "runs" / "t0-B" / "summary.json",
+                             encoding="utf-8"))
+    assert summary["usage"]["result_missing"]
+    assert summary["usage"]["total_tokens"] == 1100
+
+
+def test_run_g1_refuses_interrupted_run(tmp_path, monkeypatch):
+    """P1-03 反例回归：已有 events/answer 无 summary 的中断 run，
+    修复前允许重新执行并覆盖；修复后拒绝且原证据不被破坏。"""
+    batch = _make_batch(tmp_path, TEST_PRICE, 100.0, finalize=True)
+    run_dir = batch / "runs" / "t0-B"
+    run_dir.mkdir(parents=True)
+    (run_dir / "wd").mkdir()
+    (run_dir / "events.ndjson").write_text('{"type":"turn"}\n',
+                                           encoding="utf-8")
+    (run_dir / "wd" / "answer.jsonl").write_text('{"id": "r-01"}\n',
+                                                 encoding="utf-8")
+    _patch_for_stub(monkeypatch, "normal")
+    args = type("A", (), {"batch": str(batch), "execute": True})()
+    with pytest.raises(SystemExit, match="拒绝覆盖"):
+        cv_eval.cmd_run_g1(args)
+    # 原证据未被破坏
+    assert (run_dir / "events.ndjson").read_text() == '{"type":"turn"}\n'
+    assert (run_dir / "wd" / "answer.jsonl").exists()
+    assert not (run_dir / "started.json").exists()
+
+
+def test_run_g1_started_marker_atomic(tmp_path):
+    """P1-03：started.json O_EXCL 原子登记——并发双执行者只有一个成功。"""
+    run_dir = tmp_path / "runs" / "x"
+    run_dir.mkdir(parents=True)
+    cv_eval.claim_run_slot(run_dir)
+    assert (run_dir / "started.json").exists()
+    # 第二个执行者：目录里已有证据文件 → 拒绝（并发禁止）
+    with pytest.raises(SystemExit, match="拒绝覆盖"):
+        cv_eval.claim_run_slot(run_dir)
+
+
+def test_run_g1_refuses_recipe_drift(tmp_path, monkeypatch, capsys):
+    """P1-02 反例回归：manifest 二进制哈希与实际不符 / 配置模型被改 →
+    拒绝执行（修复前照跑）。漂移项打 stderr，退出即拒绝。"""
+    batch = _make_batch(tmp_path, TEST_PRICE, 100.0, finalize=True)
+    m = json.load(open(batch / "manifest.json", encoding="utf-8"))
+    m["binary_hash"] = "0" * 64
+    (batch / "manifest.json").write_text(json.dumps(m), encoding="utf-8")
+    _patch_for_stub(monkeypatch, "normal")
+    args = type("A", (), {"batch": str(batch), "execute": True})()
+    with pytest.raises(SystemExit):
+        cv_eval.cmd_run_g1(args)
+    err = capsys.readouterr().err
+    assert "binary_hash_drift" in err
+    # 漂移 2：配置模型被手改（config_hashes 对不上）
+    m = json.load(open(batch / "manifest.json", encoding="utf-8"))
+    m["binary_hash"] = None
+    (batch / "manifest.json").write_text(json.dumps(m), encoding="utf-8")
+    cfg = json.load(open(batch / "configs" / "t0-B.json", encoding="utf-8"))
+    cfg["model"] = "UNFROZEN-MODEL"
+    (batch / "configs" / "t0-B.json").write_text(json.dumps(cfg),
+                                                 encoding="utf-8")
+    with pytest.raises(SystemExit):
+        cv_eval.cmd_run_g1(args)
+    err = capsys.readouterr().err
+    assert "config_model_drift" in err
+    # 任何 run 都没被启动
+    assert not (batch / "runs" / "t0-B" / "started.json").exists()
+
+
+def test_run_g1_refuses_hand_edited_price(tmp_path, monkeypatch):
+    """P1-02 反例回归：手改 manifest 填价表（未经 finalize-g1）→
+    拒绝执行。价表补全必须是显式最终冻结步骤。"""
+    batch = _make_batch(tmp_path, TEST_PRICE, 100.0, finalize=False)
+    _patch_for_stub(monkeypatch, "normal")
+    args = type("A", (), {"batch": str(batch), "execute": True})()
+    with pytest.raises(SystemExit, match="付费前置缺失"):
+        cv_eval.cmd_run_g1(args)
+    assert not (batch / "runs" / "t0-B" / "started.json").exists()
+
+
+def test_finalize_g1_explicit_freeze(tmp_path, monkeypatch):
+    """P1-02：finalize-g1 写 config_hashes + final_frozen_at；之后手改
+    配置 → run-g1 拒绝（config_drift）。"""
+    batch = _make_batch(tmp_path, TEST_PRICE, 100.0, finalize=True)
+    m = json.load(open(batch / "manifest.json", encoding="utf-8"))
+    assert m["config_hashes"] and m["final_frozen_at"]
+    assert m["blocked_paid"] is False
+    assert m["cost_stop"] == 100.0
+    # 手改配置后 run-g1 拒绝（config_hashes 对不上）
+    cfg = json.load(open(batch / "configs" / "t0-B.json", encoding="utf-8"))
+    cfg["model"] = "TAMPERED"
+    (batch / "configs" / "t0-B.json").write_text(json.dumps(cfg),
+                                                 encoding="utf-8")
+    _patch_for_stub(monkeypatch, "normal")
+    args = type("A", (), {"batch": str(batch), "execute": True})()
+    with pytest.raises(SystemExit):
+        cv_eval.cmd_run_g1(args)
+
+
+def test_run_g1_crash_midway_preserves_evidence(tmp_path, monkeypatch):
+    """P1-03 反例回归：进程死在半路（只有半截 events）→ 该 run 记账为
+    usage_missing + 停止后续；重跑同批次被拒绝，证据保留。"""
+    batch, rc, ledger = _run_g1(tmp_path, monkeypatch, "crash", TEST_PRICE,
+                                100.0)
+    assert ledger["runs"] == 1
+    assert ledger["cost_stop"]["stop_reason"] == "usage_incomplete"
+    assert ledger["usage_missing_runs"] == ["t0-B"]
+    rd = batch / "runs" / "t0-B"
+    assert (rd / "events.ndjson").exists()
+    assert (rd / "summary.json").exists()
+    # 重跑同批次：中断证据在 → 拒绝
+    _patch_for_stub(monkeypatch, "normal")
+    args = type("A", (), {"batch": str(batch), "execute": True})()
+    with pytest.raises(SystemExit, match="拒绝覆盖"):
+        cv_eval.cmd_run_g1(args)

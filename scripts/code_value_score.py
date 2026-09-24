@@ -26,6 +26,7 @@
 """
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -54,8 +55,12 @@ def load_gold(fixture_task_dir: Path):
     task = fixture_task_dir.name
     if task == "t0":
         gold = _fx.solve_t0(_fx.load_jsonl(fixture_task_dir / "records.jsonl"))
-        if gold != digest["ids"]:
+        canon = json.dumps({t: None for t in gold}, sort_keys=True,
+                           ensure_ascii=False)
+        if hashlib.sha256(canon.encode()).hexdigest() != digest["gold_sha256"]:
             raise RuntimeError("t0 recomputed gold disagrees with digest")
+        if len(gold) != digest["count"]:
+            raise RuntimeError("t0 recomputed gold count disagrees with digest")
         return {"id": {t: None for t in gold}}
     if task == "t1":
         subs = _fx.load_jsonl(fixture_task_dir / "subscriptions.jsonl")
@@ -69,11 +74,11 @@ def load_gold(fixture_task_dir: Path):
         gold = _fx.solve_join(subs, evs, sub_key="user_id", ev_key="uid")
     else:
         raise ValueError(f"unknown task {task}")
-    if sorted(gold) != digest["user_ids"]:
-        raise RuntimeError(f"{task} recomputed gold ids disagree with digest")
-    if hashlib.sha256(json.dumps(gold, sort_keys=True).encode()).hexdigest() \
-            != digest["counts_sha256"]:
-        raise RuntimeError(f"{task} recomputed gold counts disagree with digest")
+    canon = json.dumps(gold, sort_keys=True, ensure_ascii=False)
+    if hashlib.sha256(canon.encode()).hexdigest() != digest["gold_sha256"]:
+        raise RuntimeError(f"{task} recomputed gold disagrees with digest")
+    if len(gold) != digest["count"]:
+        raise RuntimeError(f"{task} recomputed gold count disagrees with digest")
     return {"user_id": dict(gold)}
 
 
@@ -177,106 +182,169 @@ UNKNOWN_RESERVE_TOKENS = 80_000 + 32_768
 PARTIAL_UNKNOWN_PER_REQUEST_TOKENS = 32_768 + 32_768
 
 
-def usage_from_result(result: dict, events_path=None):
-    """从 result.json 抽 usage 账。判定「请求发生过但 usage 缺失」——
-    那是未知消耗，不是零成本（§4.1：未知费用预留，不能当 0）。
-    另有 partial_unknown：部分请求没报 usage（如中途 HTTP 500 的失败轮），
-    run 总量 >0 掩盖了那几轮的真实消耗——events 流里 turn 事件每尝试
-    一个、usage 事件每已计费请求一个，差值即「烧了没报账」的请求数。
+def _events_usage(events_path):
+    """从 events.ndjson 核账：turn/usage 事件计数 + usage 帧的 token 累计。
 
-    result.json 的 usage 覆盖全部尝试（失败轮经 RunCost 折入，attempts>1
-    即含重试），这里直接采信、不重复累加缓存子项：input_tokens 在
-    provider 解析层已剔除缓存读（openai.rs），cache_read 单列，
-    两者相加不会把同一批 token 计两次。
+    返回 (n_turn, n_usage, tokens_dict)。events 是进程侧证据——result.json
+    缺失/损坏时它是唯一账本（工单 01R P1-01：不能因 result 缺失归零）。
     """
+    n_turn = n_usage = 0
+    tokens = {"input_tokens": 0, "output_tokens": 0,
+              "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
+    if events_path is None or not Path(events_path).exists():
+        return n_turn, n_usage, tokens
+    with open(events_path, encoding="utf-8") as f:
+        for line in f:
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            et = ev.get("type")
+            if et == "turn":
+                n_turn += 1
+            elif et == "usage":
+                n_usage += 1
+                for k in tokens:
+                    tokens[k] += ev.get(k) or 0
+    return n_turn, n_usage, tokens
+
+
+def usage_from_result(result: dict, events_path=None):
+    """抽 usage 账并判定完整性。证据链：result.json 为主，events.ndjson
+    为核账与兜底（result 缺失/损坏时 events 是唯一账本——不归零）。
+
+    完整性三态（工单 01R P1-01：已知费用与费用完整性分开）：
+      complete        —— 全部请求都报了账；
+      partial_unknown —— 部分请求没报 usage（如中途 HTTP 500 的失败轮）；
+      usage_missing   —— 请求发生过但没有任何已知 token。
+    未知消耗绝不归零：unknown_reserve_tokens 按口径预留。
+    """
+    result_ok = isinstance(result, dict) and bool(result)
     tokens = {
-        "input_tokens": result.get("input_tokens") or 0,
-        "output_tokens": result.get("output_tokens") or 0,
+        "input_tokens": (result.get("input_tokens") if result_ok else 0) or 0,
+        "output_tokens": (result.get("output_tokens") if result_ok else 0) or 0,
         "cache_creation_input_tokens":
-            result.get("cache_creation_input_tokens") or 0,
-        "cache_read_input_tokens": result.get("cache_read_input_tokens") or 0,
+            (result.get("cache_creation_input_tokens")
+             if result_ok else 0) or 0,
+        "cache_read_input_tokens":
+            (result.get("cache_read_input_tokens") if result_ok else 0) or 0,
     }
     total = sum(tokens.values())
-    turns = result.get("turns") or 0
-    attempts = result.get("attempts") or 0
-    requests_happened = turns > 0 or attempts > 0
+    turns = (result.get("turns") if result_ok else 0) or 0
+    attempts = (result.get("attempts") if result_ok else 0) or 0
+
+    # events 证据：请求计数 + 已报账 token（result 缺失时的兜底账本）
+    n_turn, n_usage, ev_tokens = _events_usage(events_path)
+
+    # result 缺失/损坏但 events 有账：以 events 为准核账（不归零）
+    result_missing = not result_ok
+    if result_missing and (n_turn > 0 or n_usage > 0):
+        tokens = dict(ev_tokens)
+        total = sum(tokens.values())
+        turns = n_turn
+        attempts = max(attempts, n_turn)
+
+    requests_happened = (turns > 0 or attempts > 0
+                         or n_turn > 0 or n_usage > 0)
     usage_missing = requests_happened and total == 0
 
-    # 部分未知：events 流逐请求对账（turn=尝试，usage=已报账请求）
+    # 部分未知：turn=尝试，usage=已报账请求；差值即「烧了没报账」的请求数
     unreported_requests = None
-    if events_path is not None and Path(events_path).exists():
-        n_turn = n_usage = 0
-        with open(events_path, encoding="utf-8") as f:
-            for line in f:
-                try:
-                    ev = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if ev.get("type") == "turn":
-                    n_turn += 1
-                elif ev.get("type") == "usage":
-                    n_usage += 1
+    if n_turn > 0 or n_usage > 0:
         unreported_requests = max(0, n_turn - n_usage)
-    partial_unknown = bool(unreported_requests)
+    partial_unknown = bool(unreported_requests) and not usage_missing
+
     inner = 0
     inner_unknown = 0
-    for tc in result.get("tool_calls") or []:
+    for tc in ((result.get("tool_calls") or []) if result_ok else []):
         llm = (tc.get("meta") or {}).get("llm")
         if not llm:
             continue
         for _, s in (llm.get("models") or {}).items():
             inner += s.get("known_usage", 0)
         inner_unknown += llm.get("unknown_calls", 0)
+
+    # 预留口径：整轮缺按完整 run 预留；部分缺按缺报请求数 × 每请求预留
+    # （单请求输出上限 + 保守输入——宁可高估不可漏计）。
+    reserve = 0
+    if usage_missing:
+        reserve = UNKNOWN_RESERVE_TOKENS
+    elif partial_unknown:
+        reserve = unreported_requests * PARTIAL_UNKNOWN_PER_REQUEST_TOKENS
+
+    # 完整性结论：任一未知（整缺/部分缺/内层 LLM 未知调用）即不完整
+    complete = (not usage_missing and not partial_unknown
+                and inner_unknown == 0)
     return {
         "tokens": tokens,
         "total_tokens": total,
         "turns": turns,
         "attempts": attempts,
         "requests_happened": requests_happened,
+        "result_missing": result_missing,
         "usage_missing": usage_missing,
         "partial_unknown": partial_unknown,
         "unreported_requests": unreported_requests,
-        # 未知消耗的显式标记：缺失即预留，绝不当 0（§5.2）。
-        # 整轮缺按完整 run 预留；部分缺按缺报请求数 × 每请求预留
-        # （单请求输出上限 + 保守输入——宁可高估不可漏计）。
-        "unknown_reserve_tokens": (
-            UNKNOWN_RESERVE_TOKENS if usage_missing
-            else (unreported_requests or 0) * PARTIAL_UNKNOWN_PER_REQUEST_TOKENS
-            if partial_unknown else 0),
+        "usage_complete": complete,
+        # 未知消耗的显式标记：缺失即预留，绝不当 0（§5.2）
+        "unknown_reserve_tokens": reserve,
         "inner_llm": ({"known_usage": inner, "unknown_calls": inner_unknown}
                       if (inner or inner_unknown) else None),
     }
 
 
 def cost_from_usage(usage: dict, price_snapshot):
-    """token → 钱。价表缺失或 usage 未知 → cost=null（费用不可判，不是 0）。
+    """token → 钱。已知部分永远算出下界；完整性单独标记（工单 01R）。
 
-    price_snapshot: {"input": per_tok, "output": per_tok,
-                     "cache_creation": per_tok, "cache_read": per_tok,
-                     "currency": "CNY"}（per-token 单价，浮点）。
-    计费公式只对各分项各计一次；input 不含缓存读（见 usage_from_result）。
+    返回：
+      cost_known_lower —— 已知 token 的费用（下界，完整性无关）；
+      cost             —— 完整时 == 下界；不完整时 None（总费用不可判）；
+      cost_complete    —— 费用是否完整（usage 完整且价表合法）；
+      reason           —— 不完整/不可算的原因。
+    价表缺失/非法 → 下界也不可算（cost_known_lower=None, reason 说明）。
+    计费公式各分项各计一次；input 不含缓存读（见 usage_from_result）。
     """
-    if not price_snapshot:
-        return {"cost": None, "cost_known": False,
-                "reason": "price_snapshot_missing"}
-    if usage.get("usage_missing"):
-        return {"cost": None, "cost_known": False,
-                "reason": "usage_missing",
-                "unknown_reserve_tokens": usage["unknown_reserve_tokens"]}
-    if usage.get("partial_unknown"):
-        # 部分请求没报 usage：已知部分能算，但 run 总费用不可判——
-        # 按 §4.1「未知不能当 0」，cost=null + 预留，已知 token 单列参考
-        return {"cost": None, "cost_known": False,
-                "reason": "partial_usage_missing",
+    valid, why = validate_price_snapshot(price_snapshot)
+    if not valid:
+        return {"cost": None, "cost_known_lower": None,
+                "cost_complete": False, "reason": why}
+    t = usage["tokens"]
+    lower = (t["input_tokens"] * price_snapshot["input"]
+             + t["output_tokens"] * price_snapshot["output"]
+             + t["cache_creation_input_tokens"]
+             * price_snapshot["cache_creation"]
+             + t["cache_read_input_tokens"] * price_snapshot["cache_read"])
+    lower = round(lower, 6)
+    if not usage.get("usage_complete"):
+        reason = ("usage_missing" if usage.get("usage_missing")
+                  else "partial_usage_missing")
+        return {"cost": None, "cost_known_lower": lower,
+                "cost_complete": False, "reason": reason,
                 "unknown_reserve_tokens": usage["unknown_reserve_tokens"],
                 "known_tokens": usage["total_tokens"]}
-    t = usage["tokens"]
-    cost = (t["input_tokens"] * price_snapshot["input"]
-            + t["output_tokens"] * price_snapshot["output"]
-            + t["cache_creation_input_tokens"] * price_snapshot["cache_creation"]
-            + t["cache_read_input_tokens"] * price_snapshot["cache_read"])
-    return {"cost": round(cost, 6), "cost_known": True,
+    return {"cost": lower, "cost_known_lower": lower,
+            "cost_complete": True,
             "currency": price_snapshot.get("currency")}
+
+
+def validate_price_snapshot(price_snapshot):
+    """价表校验（工单 01R P1-01：负价/NaN/缺项/缺币种不得放行）。
+
+    返回 (ok, reason)。要求五项齐全、四个单价为有限非负数、币种非空。
+    """
+    if not price_snapshot or not isinstance(price_snapshot, dict):
+        return False, "price_snapshot_missing"
+    keys = ("input", "output", "cache_creation", "cache_read")
+    for k in keys:
+        v = price_snapshot.get(k)
+        if not isinstance(v, (int, float)) or isinstance(v, bool):
+            return False, f"price_snapshot_{k}_not_number"
+        if not math.isfinite(v) or v < 0:
+            return False, f"price_snapshot_{k}_invalid"
+    cur = price_snapshot.get("currency")
+    if not isinstance(cur, str) or not cur.strip():
+        return False, "price_snapshot_currency_missing"
+    return True, None
 
 
 def summarize_run(run: dict, validation: dict, usage: dict, cost: dict,
@@ -309,28 +377,32 @@ def summarize_run(run: dict, validation: dict, usage: dict, cost: dict,
 def aggregate(runs: list) -> dict:
     """阶段总账：所有 run（含失败/partial）都进账，不做任何剔除（§5.3）。
 
-    cost_per_success = 全部尝试费用 / delivered_exact 数；零成功为 null。
-    未知费用（cost=null）单列 unknown_cost_runs，不折算成 0。
+    费用口径（工单 01R P1-01）：
+      cost_per_success —— 主指标。任一 run 费用不完整（未知消耗）时为
+        null（不把「已知费用/全部成功数」这种混合口径当主指标）；
+      cost_known_lower_total —— 已知费用下界合计（完整性无关，永远给出）；
+      unknown_cost_runs —— 费用不完整的 run 清单（必须连同下界一起读）。
     """
     delivered = [r for r in runs if r["summary"]["delivered_exact"]]
-    known = [r for r in runs if r["summary"]["cost"]["cost_known"]]
+    complete = [r for r in runs if r["summary"]["cost"]["cost_complete"]]
     unknown = [r["run_id"] for r in runs
-               if not r["summary"]["cost"]["cost_known"]]
-    total_known = sum(r["summary"]["cost"]["cost"] or 0 for r in known)
-    # cost_per_success 口径（§5.2）：分子=全部尝试的已知费用，分母=
-    # delivered_exact 数。有未知费用 run 时该值偏保守（分子缺它）——
-    # known_delivered_count 单列，报告里必须连同 unknown_cost_runs 一起读。
-    delivered_known = [r for r in delivered
-                       if r["summary"]["cost"]["cost_known"]]
+               if not r["summary"]["cost"]["cost_complete"]]
+    total_complete = sum(r["summary"]["cost"]["cost"] or 0 for r in complete)
+    lower_total = sum(r["summary"]["cost"]["cost_known_lower"] or 0
+                      for r in runs)
     return {
         "runs": len(runs),
         "delivered_exact_count": len(delivered),
-        "cost_known_total": round(total_known, 6),
-        "cost_currency": (known[0]["summary"]["cost"].get("currency")
-                          if known else None),
-        "cost_per_success": (round(total_known / len(delivered), 6)
-                             if delivered and known else None),
-        "known_delivered_count": len(delivered_known),
+        # 主指标：只有全部 run 费用完整才有值；否则 null + 下界单列
+        "cost_per_success": (round(total_complete / len(delivered), 6)
+                             if delivered and len(complete) == len(runs)
+                             else None),
+        "cost_complete_total": round(total_complete, 6),
+        "cost_known_lower_total": round(lower_total, 6),
+        "known_delivered_count": len([r for r in delivered
+                                      if r["summary"]["cost"]["cost_complete"]]),
+        "cost_currency": (complete[0]["summary"]["cost"].get("currency")
+                          if complete else None),
         "unknown_cost_runs": unknown,
         "usage_missing_runs": [r["run_id"] for r in runs
                                if r["summary"]["usage"]["usage_missing"]],
@@ -353,10 +425,13 @@ def _by_arm(runs: list) -> dict:
                                 for r in sub),
             "unknown_reserve_tokens": sum(
                 r["summary"]["usage"]["unknown_reserve_tokens"] for r in sub),
-            "cost_known_total": round(
+            "cost_complete_total": round(
                 sum(r["summary"]["cost"]["cost"] or 0
                     for r in sub
-                    if r["summary"]["cost"]["cost_known"]), 6),
+                    if r["summary"]["cost"]["cost_complete"]), 6),
+            "cost_known_lower_total": round(
+                sum(r["summary"]["cost"]["cost_known_lower"] or 0
+                    for r in sub), 6),
         }
     return out
 

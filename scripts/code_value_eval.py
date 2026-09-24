@@ -24,6 +24,7 @@ run_id 唯一、不覆盖旧记录（目录已存在即拒绝）。
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -52,8 +53,10 @@ MAX_TOKENS_PER_REQUEST = 32768
 G1_RUNS = [("t0", "B"), ("t0", "A"), ("t1", "A"), ("t1", "B"),
            ("t2", "B"), ("t2", "A")]
 G1_TOKEN_ENVELOPE = 480_000
-# 在途超额风险上界：软闸是轮边界语义，最后一轮可再吃一个单请求输出上限
-INFLIGHT_OVERRUN_TOKENS = MAX_TOKENS_PER_REQUEST
+# 在途超额风险上界（工单 01R：须含输入与输出，不能只算输出上限）。
+# 软闸是轮边界语义：最后一轮请求可再消耗 max_tokens 输出 + 该轮完整
+# 输入（上界取包络内单 run 软闸值——一个 run 的全部已知输入预算）。
+INFLIGHT_OVERRUN_TOKENS = MAX_TOKENS_PER_REQUEST + RUN_LIMITS["max_total_tokens"]
 
 API_KEY_ENV = "CODE_VALUE_KEY"
 
@@ -234,21 +237,24 @@ def build_config(task: str, arm: str, wd: Path, base_url: str, model: str,
 
 
 def run_binary(cfg_path: Path, task_text: str, run_dir: Path, env: dict,
-               timeout_s: int):
+               timeout_s: int, seatbelt_profile: Path = None):
     """跑一次 headless run，封存 events.ndjson / stderr.log / result.json。
 
+    seatbelt_profile 非空时经 sandbox-exec 启动（P1-04 答案隔离）。
     返回 (rc, wall_seconds)。进程外超时：杀进程、如实记 timeout（产物在
     终止后按现状评分——截止后的补写不接收，因为进程已死）。
     """
     t0 = time.time()
+    argv = [str(BIN), "--config", str(cfg_path), "--task", task_text,
+            "--session", "none", "--json", "--output",
+            str(run_dir / "result.json")]
+    if seatbelt_profile is not None:
+        argv = ["sandbox-exec", "-f", str(seatbelt_profile), *argv]
     with open(run_dir / "events.ndjson", "w") as evf, \
          open(run_dir / "stderr.log", "w") as logf:
         try:
-            p = subprocess.run(
-                [str(BIN), "--config", str(cfg_path), "--task", task_text,
-                 "--session", "none", "--json", "--output",
-                 str(run_dir / "result.json")],
-                stdout=evf, stderr=logf, env=env, timeout=timeout_s)
+            p = subprocess.run(argv, stdout=evf, stderr=logf, env=env,
+                               timeout=timeout_s)
             rc = p.returncode
         except subprocess.TimeoutExpired:
             rc = 124
@@ -266,7 +272,11 @@ def score_run(run_dir: Path, task: str, arm: str, fixture_root: Path,
     result = {}
     rp = run_dir / "result.json"
     if rp.exists():
-        result = json.load(open(rp, encoding="utf-8"))
+        try:
+            result = json.load(open(rp, encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            # P1-01：损坏的 result 与缺失同罪——不崩、不归零，events 核账
+            result = {}
     gold = scorer.load_gold(fixture_root / task)
     validation = scorer.validate_artifact(run_dir / "wd" / "answer.jsonl",
                                           gold, task)
@@ -324,9 +334,7 @@ def mock_plumbing_run(batch_dir: Path, fixture_root: Path, name: str,
     run_code_live 等），失败大声报错——G0 要的是证明，不是绿灯。
     """
     run_dir = batch_dir / "runs" / f"{name}"
-    if run_dir.exists():
-        sys.exit(f"run_id 已存在，拒绝覆盖：{run_dir}")
-    run_dir.mkdir(parents=True)
+    claim_run_slot(run_dir)   # P1-03：原子 started 登记 + 中断记录不可覆盖
     wd = run_dir / "wd"
     fixture.stage_workdir(task, wd, fixture_root)
     server_log = run_dir / "server_events.ndjson"
@@ -337,8 +345,13 @@ def mock_plumbing_run(batch_dir: Path, fixture_root: Path, name: str,
         cfg_path = run_dir / "config_redacted.json"
         write_json(cfg_path, cfg)
         env = isolated_env({"CODE_VALUE_KEY": "mock-not-a-real-key"})
+        # P1-04：mock 联通同样过 Seatbelt——证明隔离下装置全链路可用
+        sb = seatbelt_profile(run_dir, wd)
+        sb_check = verify_seatbelt(sb, wd)
+        write_json(run_dir / "seatbelt_check.json", sb_check)
         rc, wall = run_binary(cfg_path, fixture.TASK_TEXTS[task], run_dir,
-                              env, timeout_s=RUN_LIMITS["timeout_secs"] + 60)
+                              env, timeout_s=RUN_LIMITS["timeout_secs"] + 60,
+                              seatbelt_profile=sb)
     finally:
         proc.terminate()
         proc.wait(timeout=5)
@@ -346,7 +359,10 @@ def mock_plumbing_run(batch_dir: Path, fixture_root: Path, name: str,
     result = {}
     rp = run_dir / "result.json"
     if rp.exists():
-        result = json.load(open(rp, encoding="utf-8"))
+        try:
+            result = json.load(open(rp, encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            result = {}   # 损坏与缺失同罪：events 核账，不崩不归零
     summary = score_run(run_dir, task, arm, fixture_root, price=None)
     summary.update({"wall_s": wall, "rc": rc, "provider": "mock",
                     "paid_model_requests": 0,
@@ -385,6 +401,8 @@ def mock_plumbing_run(batch_dir: Path, fixture_root: Path, name: str,
         check("run_code_absent_error", ok is expect["run_code_absent_error"],
               f"run_code calls: {names}")
     check("events_recorded", (run_dir / "events.ndjson").stat().st_size > 0)
+    check("seatbelt_isolation", sb_check["ok"],
+          json.dumps(sb_check))
     check("abnormal_end", summary["abnormal_end"]
           is expect.get("abnormal_end", False), summary["end_reason"])
     if expect.get("usage_positive"):
@@ -396,6 +414,7 @@ def mock_plumbing_run(batch_dir: Path, fixture_root: Path, name: str,
               and summary["usage"]["unknown_reserve_tokens"] > 0,
               json.dumps(summary["cost"]))
     write_json(run_dir / "apparatus_checks.json", checks)
+    mark_run_completed(run_dir)   # P1-03：completed 独立记录
     bad = [k for k, v in checks.items() if not v["ok"]]
     if bad:
         print(f"[g0] PLUMBING FAIL {name}: {bad}", file=sys.stderr)
@@ -499,15 +518,32 @@ def budget_gate(ledger_tokens: int, unknown_reserve: int, envelope: int,
 
 
 def require_paid_prereqs(manifest: dict) -> list:
-    """付费执行前置（方案 §4.1：不填价表不开付费运行）。返回缺失项。"""
-    missing = []
-    if not manifest.get("price_snapshot"):
-        missing.append("price_snapshot")
-    if not manifest.get("cost_currency"):
-        missing.append("cost_currency")
-    if not manifest.get("cost_stop"):
-        missing.append("cost_stop")
-    return missing
+    """付费执行前置（方案 §4.1 + 工单 01R P1-01）。返回缺失/非法项。
+
+    价表：五项齐全、单价有限非负、币种非空且与 cost_currency 一致；
+    停止值：有限正数。存在性检查不够——负价/NaN 同样拒绝。
+    """
+    problems = []
+    price = manifest.get("price_snapshot")
+    ok, why = scorer.validate_price_snapshot(price)
+    if not ok:
+        problems.append(f"price_snapshot({why})")
+    cur = manifest.get("cost_currency")
+    if not isinstance(cur, str) or not cur.strip():
+        problems.append("cost_currency")
+    elif ok and price.get("currency") != cur:
+        problems.append("cost_currency_mismatch")
+    stop = manifest.get("cost_stop")
+    if (not isinstance(stop, (int, float)) or isinstance(stop, bool)
+            or not math.isfinite(stop) or stop <= 0):
+        problems.append("cost_stop")
+    # P1-02：价表补全必须经显式 finalize-g1——手改 manifest 填价表
+    # （无 config_hashes / final_frozen_at）不得进付费循环。
+    if not manifest.get("config_hashes"):
+        problems.append("config_hashes(final_freeze_missing)")
+    if not manifest.get("final_frozen_at"):
+        problems.append("final_frozen_at(final_freeze_missing)")
+    return problems
 
 
 def load_price_snapshot(path) -> dict:
@@ -519,10 +555,8 @@ def load_price_snapshot(path) -> dict:
     if not p.exists():
         return None
     raw = json.load(open(p, encoding="utf-8"))
-    keys = ("input", "output", "cache_creation", "cache_read", "currency")
-    if any(k not in raw for k in keys):
-        return None
-    return raw
+    ok, _why = scorer.validate_price_snapshot(raw)
+    return raw if ok else None
 
 
 # ── manifest（方案 §6.1 必填字段全集）───────────────────────────────────────
@@ -970,6 +1004,246 @@ def cmd_prepare_g1(args):
     return 0
 
 
+def seatbelt_profile(run_dir: Path, wd: Path) -> Path:
+    """P1-04 答案隔离：macOS Seatbelt（sandbox-exec）配置，评测进程的
+    shell 不可达答案面。
+
+    机制：allow default + 对答案面的显式 deny（实测本机 macOS 27 语义：
+    deny 按 realpath 匹配，/tmp 符号链接须写 /private/tmp）。答案面 =
+    fixture 快照（gold digest）、全部历史批次（mock 场景明文答案 +
+    wd/answer.jsonl）、参考解脚本与方案文档、网关凭证文件。
+    workdir 与 run_dir（events/result 落盘处）保持可写。
+    返回 profile 路径；非 macOS 或 sandbox-exec 缺失返回 None（调用方
+    必须视为阻塞——工单 01R：无法隔离就明确回报，不静默降级）。
+    """
+    if sys.platform != "darwin":
+        return None
+    import shutil as _sh
+    if not _sh.which("sandbox-exec"):
+        return None
+    # 当前批次名：run_dir = ART/<batch>/runs/<id>（parent 是 "runs" 不是批次）
+    try:
+        batch_name = run_dir.resolve().relative_to(
+            ART.resolve()).parts[0]
+    except ValueError:
+        batch_name = run_dir.parent.name
+    deny_dirs = [FIXTURE_ROOT] + sorted(
+        d for d in ART.iterdir()
+        if d.is_dir() and d.name not in ("fixture", "xdg-isolated",
+                                         batch_name))
+    lines = ["(version 1)", "(allow default)",
+             ";; P1-04 答案隔离：答案面不可读（gold digest / 历史 mock"
+             " 场景明文 / 参考解 / 凭证）"]
+    for d in deny_dirs:
+        lines.append(f'(deny file-read* (subpath "{d.resolve()}"))')
+    # 同批次兄弟 run 目录：已完成 run 的 wd/answer.jsonl 是 gold 明文，
+    # 后续 run 经 shell 可读即批次内答案泄漏——逐个拒绝（本 run 目录
+    # 保持可写：events/result/wd 落盘处）。
+    runs_root = run_dir.parent
+    if runs_root.is_dir() and runs_root.name == "runs" \
+            and runs_root.parent.parent.resolve() == ART.resolve():
+        for sib in sorted(runs_root.iterdir()):
+            if sib.is_dir() and sib.resolve() != run_dir.resolve():
+                lines.append(f'(deny file-read* (subpath "{sib.resolve()}"))')
+    for d in (ROOT / "docs", ROOT / "scripts", ROOT / "src", ROOT / "tests"):
+        lines.append(f'(deny file-read* (subpath "{d.resolve()}"))')
+    # git 历史：GOLD_T0 字面量与 fixture 生成器（含 solve_*）已进提交——
+    # 不拒绝 .git 则模型可 `git show HEAD:scripts/...` 直读答案
+    lines.append(f'(deny file-read* (subpath "{(ROOT / ".git").resolve()}"))')
+    lines.append(f'(deny file-read* (literal "'
+                 f'{(ROOT / "测试模型.md").resolve()}"))')
+    prof = run_dir / "seatbelt.sb"
+    prof.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return prof
+
+
+def verify_seatbelt(profile: Path, wd: Path) -> dict:
+    """P1-04：隔离不是「配置写了」而是「实测不可达」。启动前用真实
+    sandbox-exec 探针验证：答案面读不出内容 + workdir 可写。"""
+    if profile is None:
+        return {"ok": False, "reason": "seatbelt_unavailable",
+                "note": "非 macOS 或无 sandbox-exec——按工单 01R 视为阻塞"}
+    probe_secret = FIXTURE_ROOT / "gen_stats.json"
+    r = subprocess.run(["sandbox-exec", "-f", str(profile), "/bin/cat",
+                        str(probe_secret)], capture_output=True, text=True)
+    secret_leaks = r.returncode == 0 and bool(r.stdout.strip())
+    w = subprocess.run(["sandbox-exec", "-f", str(profile), "/bin/sh", "-c",
+                        f'echo x > "{wd}/.sb_probe" && cat "{wd}/.sb_probe"'],
+                       capture_output=True, text=True)
+    wd_ok = w.returncode == 0 and "x" in w.stdout
+    ok = (not secret_leaks) and wd_ok
+    return {"ok": ok, "secret_leaks": secret_leaks, "workdir_writable": wd_ok,
+            "probe_rc": r.returncode}
+
+
+def reserve_cost(reserve_tokens: int, price) -> float:
+    """未知预留 token 折算成货币风险（按最贵适用单价——输出价）。
+
+    预留是保守上界：输入/输出构成未知，按价表里最贵的分项折算。
+    价表缺失时返回 0 并由调用方的完整性检查兜底（无价表不会进付费循环）。
+    """
+    if not price or not reserve_tokens:
+        return 0.0
+    top = max(price.get(k, 0) or 0
+              for k in ("input", "output", "cache_creation", "cache_read"))
+    return reserve_tokens * top
+
+
+def verify_frozen_recipe(batch_dir: Path, manifest: dict) -> list:
+    """P1-02：执行时封存校验——任何模型请求前核对实际执行内容。
+
+    记录过哈希 ≠ 通过校验：这里对当前环境重算并逐项比对 manifest。
+    漂移项列表非空 → cmd_run_g1 拒绝执行（不进入 run 循环）。
+    校验面（工单 01R 第二项）：
+      二进制哈希 / 逐 run 配置内容哈希 / 任务文本哈希 / prompt 哈希 /
+      工具清单合法（inventory problems == []）/ 模型与网关身份 /
+      六跑顺序与冻结 schedule 一致 / 价表经最终冻结步骤补全。
+    无关文档提交或历史目录变化不使批次失效（不比对 HEAD）。
+    """
+    problems = []
+    fp = fingerprint()
+    if manifest.get("binary_hash") and fp["binary_hash"] != manifest["binary_hash"]:
+        problems.append("binary_hash_drift: 实际二进制与冻结记录不一致")
+    if manifest.get("fixture_hash"):
+        cur = {}
+        froot = FIXTURE_ROOT
+        if (froot / "gen_stats.json").exists():
+            cur = json.load(open(froot / "gen_stats.json",
+                                 encoding="utf-8")).get("file_sha256", {})
+        if cur != manifest["fixture_hash"]:
+            problems.append("fixture_drift: 快照哈希与冻结记录不一致")
+    if manifest.get("task_hash"):
+        cur_tasks = {k: hashlib.sha256(v.encode()).hexdigest()
+                     for k, v in fixture.TASK_TEXTS.items()}
+        if cur_tasks != manifest["task_hash"]:
+            problems.append("task_text_drift: 任务文本与冻结记录不一致")
+    if manifest.get("prompt_hashes"):
+        _, _, recipe = prompt_parts()
+        if recipe != manifest["prompt_hashes"]:
+            problems.append("prompt_drift: 提示词配方与冻结记录不一致")
+    inv_path = batch_dir / "inventory_analysis.json"
+    if not inv_path.exists():
+        problems.append("inventory_missing: 批次无工具清单分析")
+    else:
+        inv = json.load(open(inv_path, encoding="utf-8"))
+        if inv.get("problems"):
+            problems.append(f"inventory_invalid: {inv['problems']}")
+    # 逐 run 配置：内容哈希 + 模型一致（防手改清单绕过冻结）
+    for s in manifest.get("run_schedule", []):
+        cfg_path = batch_dir / "configs" / f"{s['run_id']}.json"
+        if not cfg_path.exists():
+            problems.append(f"config_missing: {s['run_id']}")
+            continue
+        cfg = json.load(open(cfg_path, encoding="utf-8"))
+        if cfg.get("model") != manifest.get("model"):
+            problems.append(
+                f"config_model_drift: {s['run_id']} 模型 "
+                f"{cfg.get('model')!r} != 冻结 {manifest.get('model')!r}")
+        frozen_hash = (manifest.get("config_hashes") or {}).get(s["run_id"])
+        if frozen_hash:
+            cur_hash = hashlib.sha256(
+                json.dumps(cfg, sort_keys=True, ensure_ascii=False)
+                .encode()).hexdigest()
+            if cur_hash != frozen_hash:
+                problems.append(f"config_drift: {s['run_id']} 配置被改动")
+    # schedule 顺序与冻结时一致
+    if manifest.get("run_schedule"):
+        expect = [(s["task"], s["arm"]) for s in manifest["run_schedule"]]
+        if expect != G1_RUNS:
+            problems.append(f"schedule_drift: {expect} != 冻结顺序 {G1_RUNS}")
+    return problems
+
+
+def freeze_final(batch_dir: Path, manifest: dict, price: dict,
+                 cost_stop: float) -> dict:
+    """P1-02：价格补全的显式最终冻结步骤。
+
+    价表/停止值不是「手改 manifest 就生效」：经此函数写入时同步登记
+    config_hashes（逐 run 配置内容哈希）与冻结时间，run-g1 执行时按
+    verify_frozen_recipe 重算比对。
+    """
+    manifest = dict(manifest)
+    manifest["price_snapshot"] = price
+    manifest["cost_currency"] = price.get("currency")
+    manifest["cost_stop"] = cost_stop
+    manifest["config_hashes"] = {
+        s["run_id"]: hashlib.sha256(
+            json.dumps(json.load(open(batch_dir / "configs" /
+                                      f"{s['run_id']}.json",
+                                      encoding="utf-8")),
+                       sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        for s in manifest["run_schedule"]}
+    manifest["final_frozen_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    return manifest
+
+
+def claim_run_slot(run_dir: Path) -> None:
+    """P1-03：启动前原子登记 started；中断记录不可覆盖。
+
+    判据不是「有没有 summary」——已有 started/events/result/产物而未正常
+    封存的 run 是「进程已工作但崩溃」的中断态，证据必须保留。新尝试用
+    新 run_id；准备阶段的空 workdir（无任何证据文件）可以复用。
+    started.json 用 O_EXCL 原子创建：并发双执行者只有一个能登记成功。
+    """
+    if run_dir.exists():
+        evidence = [n for n in ("started.json", "events.ndjson",
+                                "result.json", "summary.json")
+                    if (run_dir / n).exists()]
+        if evidence:
+            sys.exit(
+                f"run 目录已有证据文件 {evidence}，拒绝覆盖（中断/已完成"
+                f"记录必须保留，新尝试用新 run_id）：{run_dir}")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    started = run_dir / "started.json"
+    try:
+        # O_EXCL：原子「不存在即创建」——并发第二个执行者在此失败
+        fd = os.open(started, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        sys.exit(f"run 已被其他执行者登记（并发禁止）：{started}")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump({"started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                   "pid": os.getpid()}, f, ensure_ascii=False)
+
+
+def mark_run_completed(run_dir: Path) -> None:
+    """P1-03：completed 独立记录（summary.json 落盘后调用）。"""
+    write_json(run_dir / "completed.json",
+               {"finished_at": time.strftime("%Y-%m-%d %H:%M:%S")})
+
+
+def cmd_finalize_g1(args):
+    """P1-02：价格补全的显式最终冻结步骤（不是手改 manifest）。
+
+    读价表文件 + 停止值 → 校验 → freeze_final 写回 manifest（含逐 run
+    配置哈希与冻结时间）。之后 run-g1 --execute 才可能通过校验。
+    """
+    batch_dir = Path(args.batch)
+    manifest_path = batch_dir / "manifest.json"
+    if not manifest_path.exists():
+        sys.exit(f"没有冻结的 manifest：{manifest_path}（先 prepare-g1）")
+    manifest = json.load(open(manifest_path, encoding="utf-8"))
+    if manifest.get("stage") != "g1":
+        sys.exit(f"manifest stage != g1：{manifest.get('stage')}")
+    price = load_price_snapshot(args.price)
+    if price is None:
+        sys.exit("价表缺失/非法（需五项：input/output/cache_creation/"
+                 "cache_read/currency，单价有限非负）")
+    if args.cost_stop is None or args.cost_stop <= 0:
+        sys.exit("费用停止值必须为有限正数")
+    drift = verify_frozen_recipe(batch_dir, manifest)
+    if drift:
+        for d in drift:
+            print(f"[finalize-g1] RECIPE DRIFT: {d}", file=sys.stderr)
+        sys.exit("冻结配方已漂移 —— 重新 prepare-g1 后再 finalize")
+    manifest = freeze_final(batch_dir, manifest, price, args.cost_stop)
+    manifest["blocked_paid"] = False
+    write_json(manifest_path, manifest)
+    print(f"[finalize-g1] {batch_dir.name} 最终冻结完成：价表 "
+          f"{price['currency']}，停止值 {args.cost_stop}；"
+          "run-g1 --execute 将按此校验")
+    return 0
+
+
 def cmd_run_g1(args):
     """执行冻结的 G1 配方。付费执行三重门：--execute、价表齐备、预算闸。"""
     batch_dir = Path(args.batch)
@@ -986,14 +1260,24 @@ def cmd_run_g1(args):
         return 0
     missing = require_paid_prereqs(manifest)
     if missing:
-        sys.exit(f"付费前置缺失 {missing} —— 方案 §4.1：不填价表不开付费运行")
+        sys.exit(f"付费前置缺失/非法 {missing} —— 方案 §4.1：不填价表不开付费运行")
+
+    # P1-02：执行时封存校验——任何模型请求前核对实际执行内容。
+    # 记录过哈希不等于通过校验；漂移即拒绝（不进入 run 循环）。
+    drift = verify_frozen_recipe(batch_dir, manifest)
+    if drift:
+        for d in drift:
+            print(f"[run-g1] RECIPE DRIFT: {d}", file=sys.stderr)
+        sys.exit("冻结配方校验失败 —— 拒绝执行（重新 prepare-g1 或显式 finalize-g1）")
 
     price = manifest["price_snapshot"]
     cost_stop = manifest["cost_stop"]
     currency = manifest["cost_currency"]
     ledger_tokens, unknown_reserve = 0, 0
-    known_cost_total = 0.0
+    known_lower_total = 0.0
+    reserve_cost_total = 0.0
     runs_done = []
+    stop_reason = None
     for s in manifest["run_schedule"]:
         gate = budget_gate(ledger_tokens, unknown_reserve,
                            manifest["token_stop"]["stage_envelope"],
@@ -1001,14 +1285,10 @@ def cmd_run_g1(args):
         if not gate["ok"]:
             print(f"[run-g1] 预算闸拒绝启动 {s['run_id']}：{gate}",
                   file=sys.stderr)
+            stop_reason = "budget_gate"
             break
         run_dir = batch_dir / "runs" / s["run_id"]
-        if run_dir.exists() and (run_dir / "summary.json").exists():
-            sys.exit(f"run 已有记录，不覆盖：{run_dir}（新 run_id 重派）")
-        # prepare-g1 预创建了 runs/<id>/wd（Config::load 校验 workdir 存在
-        # 性），这里只建到 run_dir 层且容忍已存在——判重靠上面的
-        # summary.json 检查，不靠目录不存在。
-        run_dir.mkdir(parents=True, exist_ok=True)
+        claim_run_slot(run_dir)   # P1-03：原子登记 started，拒绝覆盖中断记录
         wd = run_dir / "wd"
         fixture.stage_workdir(s["task"], wd, FIXTURE_ROOT)
         cfg_path = batch_dir / "configs" / f"{s['run_id']}.json"
@@ -1018,10 +1298,19 @@ def cmd_run_g1(args):
         write_json(cfg_path, cfg)
         _, secret = gateway_identity()
         env = isolated_env({"CODE_VALUE_KEY": secret["api_key"]})
+        # P1-04：答案隔离——Seatbelt 实测不可达才启动；不可用即阻塞，
+        # 不静默降级（工单 01R：无法隔离就回报，不把答案可达当盲测）
+        sb = seatbelt_profile(run_dir, wd)
+        sb_check = verify_seatbelt(sb, wd)
+        write_json(run_dir / "seatbelt_check.json", sb_check)
+        if not sb_check["ok"]:
+            sys.exit(f"[run-g1] 答案隔离不可用/未通过（{sb_check}）——"
+                     "阻塞：本机无法提供隔离时不启动有答案泄漏的盲测")
         print(f"[run-g1] {s['run_id']} ...", flush=True)
         rc, wall = run_binary(cfg_path, fixture.TASK_TEXTS[s["task"]],
                               run_dir, env,
-                              timeout_s=RUN_LIMITS["timeout_secs"] + 60)
+                              timeout_s=RUN_LIMITS["timeout_secs"] + 60,
+                              seatbelt_profile=sb)
         summary = score_run(run_dir, s["task"], s["arm"], FIXTURE_ROOT, price)
         summary.update({"wall_s": wall, "rc": rc, "provider": "real",
                         "order": s["order"], "instance_id": 1,
@@ -1029,34 +1318,56 @@ def cmd_run_g1(args):
                         "paid_model_requests":
                             summary["usage"]["turns"] or 1})
         write_json(run_dir / "summary.json", summary)
+        mark_run_completed(run_dir)   # P1-03：completed 独立于 started
         runs_done.append({"run_id": s["run_id"], "task": s["task"],
                           "arm": s["arm"], "summary": summary})
         ledger_tokens += summary["usage"]["total_tokens"]
         unknown_reserve += summary["usage"]["unknown_reserve_tokens"]
-        if summary["cost"]["cost_known"]:
-            known_cost_total += summary["cost"]["cost"]
-        # 费用停止值是运行中闸（方案 §4.1）：已知费用累计越线即停止启动
-        # 新 run——已起的不杀（在途成本如实入账）。
+        # 已知费用下界永远累计（P1-01：部分未知不抹掉已知费用）；
+        # 未知预留按价表折算成货币风险一并进停止判断。
+        known_lower_total += summary["cost"]["cost_known_lower"] or 0
+        reserve_cost_total += reserve_cost(
+            summary["usage"]["unknown_reserve_tokens"], price)
         print(f"[run-g1] {s['run_id']}：delivered="
               f"{summary['delivered_exact']} end={summary['end_reason']} "
               f"tokens={summary['usage']['total_tokens']} "
-              f"cost_known_total={known_cost_total:.4f} {currency}")
-        if known_cost_total >= cost_stop:
-            print(f"[run-g1] 费用停止值触发：{known_cost_total:.4f} ≥ "
-                  f"{cost_stop} {currency} —— 不再启动后续 run",
-                  file=sys.stderr)
+              f"cost_lower={known_lower_total:.4f} "
+              f"reserve={reserve_cost_total:.4f} {currency}")
+        # 停止判断（工单 01R 首轮保守策略）：
+        #   a) 费用：已知下界 + 未知预留折算 ≥ 停止值 → 停；
+        #   b) 完整性：任一 run 出现无法核账的用量（usage_missing /
+        #      partial_unknown）→ 立即停止启动后续 run，保留证据回报。
+        # 这是 run 间停止线，不是供应商扣费硬上限（在途风险另列）。
+        if known_lower_total + reserve_cost_total >= cost_stop:
+            print(f"[run-g1] 费用停止线触发：lower="
+                  f"{known_lower_total:.4f} + reserve="
+                  f"{reserve_cost_total:.4f} ≥ {cost_stop} {currency}"
+                  " —— 不再启动后续 run", file=sys.stderr)
+            stop_reason = "cost_stop"
+            break
+        if not summary["usage"]["usage_complete"]:
+            print(f"[run-g1] 用量无法完整核账（"
+                  f"{summary['cost'].get('reason')}）——保守停止后续 run，"
+                  "证据已封存，交评测负责人裁决", file=sys.stderr)
+            stop_reason = "usage_incomplete"
             break
     if runs_done:
         ledger = scorer.aggregate(runs_done)
         ledger["budget_gate_final"] = budget_gate(
             ledger_tokens, unknown_reserve,
             manifest["token_stop"]["stage_envelope"], 0)
-        ledger["cost_stop"] = {"limit": cost_stop, "currency": currency,
-                               "known_cost_total": round(known_cost_total, 6),
-                               "triggered": known_cost_total >= cost_stop}
+        ledger["cost_stop"] = {
+            "limit": cost_stop, "currency": currency,
+            "known_lower_total": round(known_lower_total, 6),
+            "unknown_reserve_cost": round(reserve_cost_total, 6),
+            "triggered": stop_reason == "cost_stop",
+            "stop_reason": stop_reason,
+            "kind": "run 间停止线；非供应商扣费硬上限（在途风险见 "
+                    "budget_gate_final.inflight_overrun_risk_tokens）"}
         write_json(batch_dir / "ledger.json", ledger)
-    print(f"[run-g1] 完成 {len(runs_done)} runs；不自动诊断、不自动进入 G2"
-          "（方案 §4.3：读完六次才由评测负责人决定）")
+    print(f"[run-g1] 完成 {len(runs_done)} runs"
+          + (f"（停止原因：{stop_reason}）" if stop_reason else "")
+          + "；不自动诊断、不自动进入 G2（方案 §4.3：读完六次才由评测负责人决定）")
     return 0
 
 
@@ -1074,6 +1385,12 @@ def main():
     pg1.add_argument("--cost-stop", type=float, default=None,
                      help="阶段费用停止值（与价表同币种）")
     pg1.set_defaults(func=cmd_prepare_g1)
+    fg1 = sub.add_parser("finalize-g1",
+                         help="价格补全的显式最终冻结步骤（P1-02）")
+    fg1.add_argument("--batch", required=True)
+    fg1.add_argument("--price", required=True)
+    fg1.add_argument("--cost-stop", type=float, required=True)
+    fg1.set_defaults(func=cmd_finalize_g1)
     rg1 = sub.add_parser("run-g1", help="执行冻结配方（默认 dry-run）")
     rg1.add_argument("--batch", required=True, help="prepare-g1 的批次目录")
     rg1.add_argument("--execute", action="store_true",
