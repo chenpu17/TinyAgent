@@ -22,7 +22,7 @@
 
 用法（被 code_value_eval.py 调用；也可单独 CLI 验一份产物）：
   python3 scripts/code_value_score.py --artifact wd/answer.jsonl \
-      --gold fixture/t1/gold.json --task t1 --result result.json
+      --gold fixture/t1 --task t1 --result result.json   (任务目录：从快照现算)
 """
 import argparse
 import json
@@ -37,12 +37,44 @@ TASK_SCHEMAS = {
 }
 
 
-def load_gold(gold_path):
-    """gold.json → {id_key: {id_value: count}}；t0 的 value 恒为 None（无计数）。"""
-    target = json.load(open(gold_path, encoding="utf-8"))["target"]
-    if target and isinstance(target[0], str):
-        return {"id": {t: None for t in target}}
-    return {"user_id": {r["user_id"]: r["event_count"] for r in target}}
+def load_gold(fixture_task_dir: Path):
+    """外部判卷进程：从快照现算 gold（方案 §2.1——gold 不落盘，shell
+    看不见现成答案文件）。算完与 gen_stats.gold_digest 对账，防快照被
+    篡改后静默判错。返回 {id_key: {id_value: count}}；t0 value 恒 None。
+    """
+    fixture_task_dir = Path(fixture_task_dir)
+    root = fixture_task_dir.parent
+    stats = json.load(open(root / "gen_stats.json", encoding="utf-8"))
+    digest = stats["gold_digest"][fixture_task_dir.name]
+    import hashlib
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import code_value_fixture as _fx
+
+    task = fixture_task_dir.name
+    if task == "t0":
+        gold = _fx.solve_t0(_fx.load_jsonl(fixture_task_dir / "records.jsonl"))
+        if gold != digest["ids"]:
+            raise RuntimeError("t0 recomputed gold disagrees with digest")
+        return {"id": {t: None for t in gold}}
+    if task == "t1":
+        subs = _fx.load_jsonl(fixture_task_dir / "subscriptions.jsonl")
+        evs = _fx.load_jsonl(fixture_task_dir / "events.jsonl")
+        gold = _fx.solve_join(subs, evs)
+    elif task == "t2":
+        subs = json.load(open(fixture_task_dir / "server" / "subscriptions.json",
+                              encoding="utf-8"))
+        evs = json.load(open(fixture_task_dir / "server" / "events.json",
+                             encoding="utf-8"))
+        gold = _fx.solve_join(subs, evs, sub_key="user_id", ev_key="uid")
+    else:
+        raise ValueError(f"unknown task {task}")
+    if sorted(gold) != digest["user_ids"]:
+        raise RuntimeError(f"{task} recomputed gold ids disagree with digest")
+    if hashlib.sha256(json.dumps(gold, sort_keys=True).encode()).hexdigest() \
+            != digest["counts_sha256"]:
+        raise RuntimeError(f"{task} recomputed gold counts disagree with digest")
+    return {"user_id": dict(gold)}
 
 
 def validate_artifact(artifact_path: Path, gold: dict, task: str):
@@ -141,11 +173,16 @@ def validate_artifact(artifact_path: Path, gold: dict, task: str):
 # 未知用量的保守预留：按「一个完整 run 的软闸 + 单请求输出上限」计 token 风险，
 # 费用换算在最贵适用 token 单价上做（由调用方传入价表后折算）。
 UNKNOWN_RESERVE_TOKENS = 80_000 + 32_768
+# 部分未知（个别请求没报 usage）的每请求预留：单请求输出上限 + 保守输入
+PARTIAL_UNKNOWN_PER_REQUEST_TOKENS = 32_768 + 32_768
 
 
-def usage_from_result(result: dict):
+def usage_from_result(result: dict, events_path=None):
     """从 result.json 抽 usage 账。判定「请求发生过但 usage 缺失」——
     那是未知消耗，不是零成本（§4.1：未知费用预留，不能当 0）。
+    另有 partial_unknown：部分请求没报 usage（如中途 HTTP 500 的失败轮），
+    run 总量 >0 掩盖了那几轮的真实消耗——events 流里 turn 事件每尝试
+    一个、usage 事件每已计费请求一个，差值即「烧了没报账」的请求数。
 
     result.json 的 usage 覆盖全部尝试（失败轮经 RunCost 折入，attempts>1
     即含重试），这里直接采信、不重复累加缓存子项：input_tokens 在
@@ -164,6 +201,23 @@ def usage_from_result(result: dict):
     attempts = result.get("attempts") or 0
     requests_happened = turns > 0 or attempts > 0
     usage_missing = requests_happened and total == 0
+
+    # 部分未知：events 流逐请求对账（turn=尝试，usage=已报账请求）
+    unreported_requests = None
+    if events_path is not None and Path(events_path).exists():
+        n_turn = n_usage = 0
+        with open(events_path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if ev.get("type") == "turn":
+                    n_turn += 1
+                elif ev.get("type") == "usage":
+                    n_usage += 1
+        unreported_requests = max(0, n_turn - n_usage)
+    partial_unknown = bool(unreported_requests)
     inner = 0
     inner_unknown = 0
     for tc in result.get("tool_calls") or []:
@@ -180,8 +234,15 @@ def usage_from_result(result: dict):
         "attempts": attempts,
         "requests_happened": requests_happened,
         "usage_missing": usage_missing,
-        # 未知消耗的显式标记：缺失即预留，绝不当 0（§5.2）
-        "unknown_reserve_tokens": UNKNOWN_RESERVE_TOKENS if usage_missing else 0,
+        "partial_unknown": partial_unknown,
+        "unreported_requests": unreported_requests,
+        # 未知消耗的显式标记：缺失即预留，绝不当 0（§5.2）。
+        # 整轮缺按完整 run 预留；部分缺按缺报请求数 × 每请求预留
+        # （单请求输出上限 + 保守输入——宁可高估不可漏计）。
+        "unknown_reserve_tokens": (
+            UNKNOWN_RESERVE_TOKENS if usage_missing
+            else (unreported_requests or 0) * PARTIAL_UNKNOWN_PER_REQUEST_TOKENS
+            if partial_unknown else 0),
         "inner_llm": ({"known_usage": inner, "unknown_calls": inner_unknown}
                       if (inner or inner_unknown) else None),
     }
@@ -202,6 +263,13 @@ def cost_from_usage(usage: dict, price_snapshot):
         return {"cost": None, "cost_known": False,
                 "reason": "usage_missing",
                 "unknown_reserve_tokens": usage["unknown_reserve_tokens"]}
+    if usage.get("partial_unknown"):
+        # 部分请求没报 usage：已知部分能算，但 run 总费用不可判——
+        # 按 §4.1「未知不能当 0」，cost=null + 预留，已知 token 单列参考
+        return {"cost": None, "cost_known": False,
+                "reason": "partial_usage_missing",
+                "unknown_reserve_tokens": usage["unknown_reserve_tokens"],
+                "known_tokens": usage["total_tokens"]}
     t = usage["tokens"]
     cost = (t["input_tokens"] * price_snapshot["input"]
             + t["output_tokens"] * price_snapshot["output"]
@@ -223,6 +291,11 @@ def summarize_run(run: dict, validation: dict, usage: dict, cost: dict,
         "run_id": run["run_id"],
         "task": run["task"],
         "arm": run["arm"],
+        # §6.1 per-run 字段：instance/repetition/order 由调用方给（G1
+        # 六跑各一实例一重复，order 来自冻结的 run_schedule）
+        "instance_id": run.get("instance_id", 1),
+        "repetition": run.get("repetition", 1),
+        "order": run.get("order"),
         "delivered_exact": validation["delivered_exact"],
         "reject_reasons": validation["reasons"],
         "validation_details": validation["details"],
@@ -244,6 +317,11 @@ def aggregate(runs: list) -> dict:
     unknown = [r["run_id"] for r in runs
                if not r["summary"]["cost"]["cost_known"]]
     total_known = sum(r["summary"]["cost"]["cost"] or 0 for r in known)
+    # cost_per_success 口径（§5.2）：分子=全部尝试的已知费用，分母=
+    # delivered_exact 数。有未知费用 run 时该值偏保守（分子缺它）——
+    # known_delivered_count 单列，报告里必须连同 unknown_cost_runs 一起读。
+    delivered_known = [r for r in delivered
+                       if r["summary"]["cost"]["cost_known"]]
     return {
         "runs": len(runs),
         "delivered_exact_count": len(delivered),
@@ -252,9 +330,12 @@ def aggregate(runs: list) -> dict:
                           if known else None),
         "cost_per_success": (round(total_known / len(delivered), 6)
                              if delivered and known else None),
+        "known_delivered_count": len(delivered_known),
         "unknown_cost_runs": unknown,
         "usage_missing_runs": [r["run_id"] for r in runs
                                if r["summary"]["usage"]["usage_missing"]],
+        "partial_unknown_runs": [r["run_id"] for r in runs
+                                 if r["summary"]["usage"].get("partial_unknown")],
         "failed_runs": [r["run_id"] for r in runs
                         if r["summary"]["abnormal_end"]],
         "by_arm": _by_arm(runs),

@@ -351,11 +351,6 @@ def stage_workdir(task: str, wd: Path, root: Path):
 
 # ── 生成与自检 ──────────────────────────────────────────────────────────────
 
-def _write_gold(path: Path, gold):
-    path.write_text(json.dumps(gold, ensure_ascii=False, indent=1),
-                    encoding="utf-8")
-
-
 def generate(root: Path) -> dict:
     root.mkdir(parents=True, exist_ok=True)
     (root / "t0").mkdir(parents=True, exist_ok=True)
@@ -364,14 +359,12 @@ def generate(root: Path) -> dict:
 
     t0 = t0_records()
     dump_jsonl(root / "t0" / "records.jsonl", t0)
-    _write_gold(root / "t0" / "gold.json", {"target": solve_t0(t0)})
+    t0_gold = solve_t0(t0)
 
     t1_subs, t1_events = t1_data()
     dump_jsonl(root / "t1" / "subscriptions.jsonl", t1_subs)
     dump_jsonl(root / "t1" / "events.jsonl", t1_events)
-    _write_gold(root / "t1" / "gold.json",
-                {"target": [{"user_id": u, "event_count": c}
-                            for u, c in solve_join(t1_subs, t1_events).items()]})
+    t1_gold = solve_join(t1_subs, t1_events)
 
     t2_subs, t2_events = t2_data()
     (root / "t2" / "server" / "subscriptions.json").write_text(
@@ -380,9 +373,19 @@ def generate(root: Path) -> dict:
         json.dumps(t2_events, ensure_ascii=False), encoding="utf-8")
     # T2 的 gold 必须来自 MCP 许可入口上的参考解（方案 §4.2 第 1 条）
     t2_gold, reach = solve_t2_via_mcp(root)
-    _write_gold(root / "t2" / "gold.json",
-                {"target": [{"user_id": u, "event_count": c}
-                            for u, c in t2_gold.items()]})
+
+    # 方案 §2.1：gold 不落盘——「产物封存后由外部判卷进程根据快照计算，
+    # 避免 shell 看见现成答案文件」。这里只记 gold 计数与参考解摘要哈希
+    # 进 gen_stats（判卷进程重算后据此对账），答案本体永不进 fixture 目录。
+    gold_digest = {
+        "t0": {"ids": t0_gold},
+        "t1": {"user_ids": sorted(t1_gold),
+               "counts_sha256": hashlib.sha256(
+                   json.dumps(t1_gold, sort_keys=True).encode()).hexdigest()},
+        "t2": {"user_ids": sorted(t2_gold),
+               "counts_sha256": hashlib.sha256(
+                   json.dumps(t2_gold, sort_keys=True).encode()).hexdigest()},
+    }
 
     stats = {
         "version": FIXTURE_VERSION,
@@ -397,19 +400,24 @@ def generate(root: Path) -> dict:
         "t2": {"subs": len(t2_subs), "events": len(t2_events),
                "gold_count": len(t2_gold),
                "reach": reach},
+        "gold_digest": gold_digest,
         "task_text_sha256": {k: hashlib.sha256(v.encode()).hexdigest()
                              for k, v in TASK_TEXTS.items()},
         "file_sha256": {str(p.relative_to(root)): sha256_file(p)
                         for p in sorted(root.rglob("*")) if p.is_file()
                         and p.name != "gen_stats.json"},
     }
-    stats["selfcheck_problems"] = selfcheck(root)
+    stats["selfcheck_problems"] = selfcheck(root, gold_digest)
     (root / "gen_stats.json").write_text(
         json.dumps(stats, ensure_ascii=False, indent=1), encoding="utf-8")
     return stats
 
-def selfcheck(root: Path):
-    """离线自检（方案 §2 实施约束 + §4.2 放行表第 1 条）。返回问题列表。"""
+def selfcheck(root: Path, gold_digest=None):
+    """离线自检（方案 §2 实施约束 + §4.2 放行表第 1 条）。返回问题列表。
+
+    gold_digest：generate() 传入的内存摘要（此时 gen_stats 尚未落盘）；
+    --selfcheck 独立跑时为 None——从盘上 gen_stats 读。
+    """
     problems = []
     t0 = load_jsonl(root / "t0" / "records.jsonl")
     if len(t0) != 12:
@@ -423,6 +431,8 @@ def selfcheck(root: Path):
         problems.append("t0 gold is full set")
     if g0 != ["r-01", "r-02", "r-09"]:
         problems.append(f"t0 boundary samples wrong: {g0}")
+    if (root / "t0" / "gold.json").exists():
+        problems.append("t0 gold.json exists on disk (must not — §2.1)")
 
     t1_subs = load_jsonl(root / "t1" / "subscriptions.jsonl")
     t1_events = load_jsonl(root / "t1" / "events.jsonl")
@@ -442,13 +452,22 @@ def selfcheck(root: Path):
                 "u-9901", "u-9902"):
         if uid in g1:
             problems.append(f"t1 {uid} must not be in gold")
-    gold1 = json.load(open(root / "t1" / "gold.json", encoding="utf-8"))["target"]
-    if {r["user_id"]: r["event_count"] for r in gold1} != g1:
-        problems.append("t1 gold.json disagrees with reference solver")
+    # gold 不落盘（方案 §2.1）：对账 = 重算结果 vs gold 摘要
+    # （generate() 内存传入；独立 --selfcheck 时从盘上 gen_stats 读）
+    digest = gold_digest if gold_digest is not None else \
+        json.load(open(root / "gen_stats.json",
+                       encoding="utf-8")).get("gold_digest", {})
+    if sorted(g1) != digest.get("t1", {}).get("user_ids"):
+        problems.append("t1 recomputed gold ids disagree with gen_stats digest")
+    if hashlib.sha256(json.dumps(g1, sort_keys=True).encode()).hexdigest() \
+            != digest.get("t1", {}).get("counts_sha256"):
+        problems.append("t1 recomputed gold counts disagree with digest")
+    if (root / "t1" / "gold.json").exists():
+        problems.append("t1 gold.json exists on disk (must not — §2.1)")
     return problems
 
 
-def selfcheck_t2(root: Path):
+def selfcheck_t2(root: Path, gold_digest=None):
     """T2 专项自检：MCP 许可入口可解性 + 分页契约 + 隔离。返回 (problems, reach)。"""
     problems = []
     t2_subs = json.load(open(root / "t2" / "server" / "subscriptions.json",
@@ -477,9 +496,16 @@ def selfcheck_t2(root: Path):
         problems.append(f"t2 events pages != 8: {pages}")
     if reach["total_body_bytes"] > T2_MAX_BODY_BYTES:
         problems.append(f"t2 body {reach['total_body_bytes']}B exceeds 40KB cap")
-    gold_file = json.load(open(root / "t2" / "gold.json", encoding="utf-8"))["target"]
-    if {r["user_id"]: r["event_count"] for r in gold_file} != gold2:
-        problems.append("t2 gold.json disagrees with MCP reference solver")
+    digest = gold_digest if gold_digest is not None else \
+        json.load(open(root / "gen_stats.json",
+                       encoding="utf-8")).get("gold_digest", {})
+    if sorted(gold2) != digest.get("t2", {}).get("user_ids"):
+        problems.append("t2 recomputed gold ids disagree with gen_stats digest")
+    if hashlib.sha256(json.dumps(gold2, sort_keys=True).encode()).hexdigest() \
+            != digest.get("t2", {}).get("counts_sha256"):
+        problems.append("t2 recomputed gold counts disagree with digest")
+    if (root / "t2" / "gold.json").exists():
+        problems.append("t2 gold.json exists on disk (must not — §2.1)")
     return problems, reach
 
 
@@ -522,7 +548,8 @@ def main():
     if root.exists():
         shutil.rmtree(root)
     stats = generate(root)
-    problems = stats["selfcheck_problems"] + selfcheck_t2(root)[0]
+    problems = stats["selfcheck_problems"] \
+        + selfcheck_t2(root, stats.get("gold_digest"))[0]
     if problems:
         for p in problems:
             print("[fixture] PROBLEM: " + p, file=sys.stderr)

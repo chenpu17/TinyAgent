@@ -255,21 +255,27 @@ def run_binary(cfg_path: Path, task_text: str, run_dir: Path, env: dict,
     return rc, round(time.time() - t0, 1)
 
 
-def score_run(run_dir: Path, task: str, fixture_root: Path, price) -> dict:
-    """验收 + 计账（score 模块），写 validation/usage/summary.json。"""
+def score_run(run_dir: Path, task: str, arm: str, fixture_root: Path,
+              price) -> dict:
+    """验收 + 计账（score 模块），写 validation/usage/summary.json。
+
+    arm 由调用方显式传入（run_id 尾段是 normal/failure 等场景名，不是臂）。
+    events.ndjson 一并传入：usage_from_result 用 turn/usage 事件差检出
+    「部分请求没报账」的未知消耗（§4.1）。
+    """
     result = {}
     rp = run_dir / "result.json"
     if rp.exists():
         result = json.load(open(rp, encoding="utf-8"))
-    gold = scorer.load_gold(fixture_root / task / "gold.json")
+    gold = scorer.load_gold(fixture_root / task)
     validation = scorer.validate_artifact(run_dir / "wd" / "answer.jsonl",
                                           gold, task)
-    usage = scorer.usage_from_result(result)
+    usage = scorer.usage_from_result(result, run_dir / "events.ndjson")
     cost = scorer.cost_from_usage(usage, price)
     write_json(run_dir / "validation.json", validation)
     write_json(run_dir / "usage.json", usage)
     summary = scorer.summarize_run(
-        {"run_id": run_dir.name, "task": task, "arm": run_dir.name.split("-")[-1]},
+        {"run_id": run_dir.name, "task": task, "arm": arm},
         validation, usage, cost,
         end_reason=result.get("stop_reason") or "no_result")
     write_json(run_dir / "summary.json", summary)
@@ -277,13 +283,18 @@ def score_run(run_dir: Path, task: str, fixture_root: Path, price) -> dict:
 
 
 def gold_as_answer_lines(fixture_root: Path, task: str) -> str:
-    """把 gold 渲染成 answer.jsonl 的正确内容（mock「完美模型」写出用）。"""
-    target = json.load(open(fixture_root / task / "gold.json",
-                            encoding="utf-8"))["target"]
+    """把 gold 渲染成 answer.jsonl 的正确内容（mock「完美模型」写出用）。
+
+    gold 从快照现算（scorer.load_gold 同源——方案 §2.1 gold 不落盘）。
+    """
+    gold = scorer.load_gold(fixture_root / task)
+    id_key = next(iter(gold))
     if task == "t0":
         return "".join(json.dumps({"id": t}, ensure_ascii=False) + "\n"
-                       for t in target)
-    return "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in target)
+                       for t in gold[id_key])
+    return "".join(
+        json.dumps({"user_id": u, "event_count": c}, ensure_ascii=False) + "\n"
+        for u, c in gold[id_key].items())
 
 
 # 模块级初始化（build_config 引用；须在 prompt_parts 定义后执行）
@@ -336,9 +347,10 @@ def mock_plumbing_run(batch_dir: Path, fixture_root: Path, name: str,
     rp = run_dir / "result.json"
     if rp.exists():
         result = json.load(open(rp, encoding="utf-8"))
-    summary = score_run(run_dir, task, fixture_root, price=None)
+    summary = score_run(run_dir, task, arm, fixture_root, price=None)
     summary.update({"wall_s": wall, "rc": rc, "provider": "mock",
-                    "paid_model_requests": 0})
+                    "paid_model_requests": 0,
+                    "instance_id": 1, "repetition": 1})
 
     # 装置断言：证据不够即 fail（G0 放行表 3/4 条）
     checks = {}
@@ -349,6 +361,17 @@ def mock_plumbing_run(batch_dir: Path, fixture_root: Path, name: str,
           "; ".join(summary["reject_reasons"])[:300])
     check("usage_missing", summary["usage"]["usage_missing"]
           is expect.get("usage_missing", False))
+    if "partial_unknown" in expect:
+        # 失败轮（HTTP 500 无 usage 帧）烧了没报账：必须检出并预留，
+        # cost=null 而非把失败请求当 0（§4.1）
+        check("partial_unknown",
+              summary["usage"]["partial_unknown"]
+              is expect["partial_unknown"]
+              and summary["usage"]["unknown_reserve_tokens"] > 0
+              and summary["cost"]["cost"] is None,
+              json.dumps({"unreported": summary["usage"]["unreported_requests"],
+                          "reserve": summary["usage"]["unknown_reserve_tokens"],
+                          "cost_reason": summary["cost"].get("reason")}))
     tool_calls = result.get("tool_calls") or []
     names = [(c.get("name"), c.get("is_error")) for c in tool_calls]
     if "run_code_live" in expect:  # A 臂：run_code 真实执行成功
@@ -688,7 +711,7 @@ def cmd_g0(args):
                 {"kind": "http_error", "status": 500, "body": "mock boom"},
             ]},
         expect={"delivered": True, "usage_positive": True,
-                "abnormal_end": True}))
+                "abnormal_end": True, "partial_unknown": True}))
     plumbing.append(mock_plumbing_run(
         batch_dir, FIXTURE_ROOT, "t0-B-missing-usage", "t0", "B",
         scenario={
@@ -774,6 +797,15 @@ def cmd_g0_finish(ctx) -> int:
             and fail_kept["summary"]["usage"]["total_tokens"] > 0
             and fail_kept["summary"]["delivered_exact"]
             and fail_kept["summary"]["abnormal_end"]
+            # 失败轮没报 usage 的请求：检出 partial_unknown 并预留，
+            # cost=null（失败请求的真实消耗不当 0——§4.1）。
+            # G0 无价表时 cost_reason 是 price_snapshot_missing（价表闸
+            # 先触发）——断言只钉「cost=null + partial 检出 + 预留>0」，
+            # partial_usage_missing 路径由 pytest 单测钉住。
+            and fail_kept["summary"]["usage"]["partial_unknown"]
+            and fail_kept["summary"]["usage"]["unreported_requests"] >= 1
+            and fail_kept["summary"]["cost"]["cost"] is None
+            and fail_kept["summary"]["usage"]["unknown_reserve_tokens"] > 0
             # 缺 usage 不当零计：cost=null + 预留 > 0
             and miss_kept["summary"]["usage"]["usage_missing"]
             and miss_kept["summary"]["cost"]["cost"] is None
@@ -781,7 +813,8 @@ def cmd_g0_finish(ctx) -> int:
         ),
         "evidence": "ledger.json 含全部 4 run（无剔除）；"
                     "t0-A-failure 在 failed_runs 且 usage>0、"
-                    "delivered+abnormal_end；"
+                    "delivered+abnormal_end、partial_unknown 检出"
+                    "（unreported≥1，cost=null reason=partial_usage_missing）；"
                     "t0-B-missing-usage cost=null 且 reserve>0"}
     # G0 零付费：价表三件合法为空（显式 null + 原因，不是漏填）；
     # 其余字段必须全有值。G1 冻结时价表缺失 → blocked_paid，run-g1 拒绝。
@@ -956,7 +989,10 @@ def cmd_run_g1(args):
         sys.exit(f"付费前置缺失 {missing} —— 方案 §4.1：不填价表不开付费运行")
 
     price = manifest["price_snapshot"]
+    cost_stop = manifest["cost_stop"]
+    currency = manifest["cost_currency"]
     ledger_tokens, unknown_reserve = 0, 0
+    known_cost_total = 0.0
     runs_done = []
     for s in manifest["run_schedule"]:
         gate = budget_gate(ledger_tokens, unknown_reserve,
@@ -969,7 +1005,10 @@ def cmd_run_g1(args):
         run_dir = batch_dir / "runs" / s["run_id"]
         if run_dir.exists() and (run_dir / "summary.json").exists():
             sys.exit(f"run 已有记录，不覆盖：{run_dir}（新 run_id 重派）")
-        run_dir.mkdir(parents=True)
+        # prepare-g1 预创建了 runs/<id>/wd（Config::load 校验 workdir 存在
+        # 性），这里只建到 run_dir 层且容忍已存在——判重靠上面的
+        # summary.json 检查，不靠目录不存在。
+        run_dir.mkdir(parents=True, exist_ok=True)
         wd = run_dir / "wd"
         fixture.stage_workdir(s["task"], wd, FIXTURE_ROOT)
         cfg_path = batch_dir / "configs" / f"{s['run_id']}.json"
@@ -983,23 +1022,38 @@ def cmd_run_g1(args):
         rc, wall = run_binary(cfg_path, fixture.TASK_TEXTS[s["task"]],
                               run_dir, env,
                               timeout_s=RUN_LIMITS["timeout_secs"] + 60)
-        summary = score_run(run_dir, s["task"], FIXTURE_ROOT, price)
+        summary = score_run(run_dir, s["task"], s["arm"], FIXTURE_ROOT, price)
         summary.update({"wall_s": wall, "rc": rc, "provider": "real",
-                        "order": s["order"], "paid_model_requests":
+                        "order": s["order"], "instance_id": 1,
+                        "repetition": 1,
+                        "paid_model_requests":
                             summary["usage"]["turns"] or 1})
         write_json(run_dir / "summary.json", summary)
         runs_done.append({"run_id": s["run_id"], "task": s["task"],
                           "arm": s["arm"], "summary": summary})
         ledger_tokens += summary["usage"]["total_tokens"]
         unknown_reserve += summary["usage"]["unknown_reserve_tokens"]
+        if summary["cost"]["cost_known"]:
+            known_cost_total += summary["cost"]["cost"]
+        # 费用停止值是运行中闸（方案 §4.1）：已知费用累计越线即停止启动
+        # 新 run——已起的不杀（在途成本如实入账）。
         print(f"[run-g1] {s['run_id']}：delivered="
               f"{summary['delivered_exact']} end={summary['end_reason']} "
-              f"tokens={summary['usage']['total_tokens']}")
+              f"tokens={summary['usage']['total_tokens']} "
+              f"cost_known_total={known_cost_total:.4f} {currency}")
+        if known_cost_total >= cost_stop:
+            print(f"[run-g1] 费用停止值触发：{known_cost_total:.4f} ≥ "
+                  f"{cost_stop} {currency} —— 不再启动后续 run",
+                  file=sys.stderr)
+            break
     if runs_done:
         ledger = scorer.aggregate(runs_done)
         ledger["budget_gate_final"] = budget_gate(
             ledger_tokens, unknown_reserve,
             manifest["token_stop"]["stage_envelope"], 0)
+        ledger["cost_stop"] = {"limit": cost_stop, "currency": currency,
+                               "known_cost_total": round(known_cost_total, 6),
+                               "triggered": known_cost_total >= cost_stop}
         write_json(batch_dir / "ledger.json", ledger)
     print(f"[run-g1] 完成 {len(runs_done)} runs；不自动诊断、不自动进入 G2"
           "（方案 §4.3：读完六次才由评测负责人决定）")

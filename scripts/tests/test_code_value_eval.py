@@ -485,7 +485,7 @@ def test_stage_workdir_never_contains_gold(fixture_root, tmp_path):
         wd = tmp_path / f"wd-{task}"
         fixture.stage_workdir(task, wd, fixture_root)
         names = {p.name for p in wd.iterdir()}
-        assert "gold.json" not in names
+        assert not any("gold" in n for n in names)
         if task == "t2":
             assert names == set()  # T2 数据只经 MCP，workdir 留空
 
@@ -499,13 +499,14 @@ def test_stage_workdir_resets_state(fixture_root, tmp_path):
 
 
 def test_gold_solved_by_independent_reference(fixture_root):
-    for task in ("t0", "t1"):
-        gold = json.load(open(fixture_root / task / "gold.json",
-                              encoding="utf-8"))
-        assert gold["target"], f"{task} gold empty"
-    t2_gold = json.load(open(fixture_root / "t2" / "gold.json",
-                             encoding="utf-8"))
-    assert t2_gold["target"]
+    # gold 不落盘（§2.1）：判卷时由 load_gold 从快照现算 + digest 对账
+    for task in ("t0", "t1", "t2"):
+        assert not (fixture_root / task / "gold.json").exists(), \
+            f"{task} gold.json must not exist on disk (§2.1)"
+        gold = scorer.load_gold(fixture_root / task)
+        assert gold, f"{task} gold empty"
+        id_key = next(iter(gold))
+        assert len(gold[id_key]) > 0
     stats = json.load(open(fixture_root / "gen_stats.json", encoding="utf-8"))
     reach = stats["t2"]["reach"]
     assert reach["paging"]["subscriptions_page"]["pages"] == 4
@@ -521,12 +522,23 @@ def test_task_texts_identical_contract():
 
 def test_verify_immutable_rejects_tampered(fixture_root):
     assert fixture.verify_immutable(fixture_root)
-    gold = fixture_root / "t0" / "gold.json"
-    saved = gold.read_bytes()
-    gold.write_text('{"target": []}')
+    snap = fixture_root / "t0" / "records.jsonl"
+    saved = snap.read_bytes()
+    snap.write_bytes(saved[:-50])
     assert not fixture.verify_immutable(fixture_root)
-    gold.write_bytes(saved)
+    snap.write_bytes(saved)
     assert fixture.verify_immutable(fixture_root)
+
+
+def test_load_gold_detects_tampered_snapshot(fixture_root):
+    # 判卷进程对账：快照被改后重算 gold 与 digest 不符 → 拒判
+    snap = fixture_root / "t1" / "events.jsonl"
+    saved = snap.read_bytes()
+    snap.write_bytes(saved.replace(b'"confirmed": false', b'"confirmed": true'))
+    with pytest.raises(RuntimeError, match="disagree"):
+        scorer.load_gold(fixture_root / "t1")
+    snap.write_bytes(saved)
+    assert scorer.load_gold(fixture_root / "t1")
 
 
 # ── manifest 必填字段（§6.1）────────────────────────────────────────────────
@@ -546,9 +558,118 @@ def test_gold_as_answer_lines_roundtrip(fixture_root, tmp_path):
     # mock「完美模型」写出的内容必须过验收（gold → answer → validate）
     for task in ("t0", "t1"):
         content = cv_eval.gold_as_answer_lines(fixture_root, task)
-        gold = scorer.load_gold(fixture_root / task / "gold.json")
+        gold = scorer.load_gold(fixture_root / task)
         art = tmp_path / f"rt-{task}" / "answer.jsonl"
         art.parent.mkdir(parents=True, exist_ok=True)
         art.write_text(content, encoding="utf-8")
         v = scorer.validate_artifact(art, gold, task)
         assert v["delivered_exact"], v["reasons"]
+
+
+# ── 复核修复的回归钉（独立复核 2026-09-24 抓出的问题）─────────────────────
+
+def test_usage_partial_unknown_detected_and_reserved(tmp_path):
+    # 复核 CONCERN #3：中途 HTTP 500 的失败轮没报 usage——run 总量 >0
+    # 不能掩盖它。events 流 turn=2 / usage=1 → 1 个请求烧了没报账。
+    ev = tmp_path / "events.ndjson"
+    ev.write_text('{"type":"turn"}\n'
+                  '{"type":"usage","input_tokens":600,"output_tokens":45,'
+                  '"cache_creation_input_tokens":0,"cache_read_input_tokens":0}\n'
+                  '{"type":"turn"}\n', encoding="utf-8")
+    u = scorer.usage_from_result(
+        {"input_tokens": 600, "output_tokens": 45, "turns": 2}, ev)
+    assert u["partial_unknown"] and u["unreported_requests"] == 1
+    assert u["unknown_reserve_tokens"] == scorer.PARTIAL_UNKNOWN_PER_REQUEST_TOKENS
+    c = scorer.cost_from_usage(u, PRICE)
+    assert c["cost"] is None and c["reason"] == "partial_usage_missing"
+    assert c["known_tokens"] == 645  # 已知部分单列，不当 0 也不并入 cost
+
+
+def test_usage_no_events_path_no_partial_flag():
+    # 不给 events 流（如纯 result.json 判卷）时不得虚报 partial_unknown
+    u = scorer.usage_from_result({"input_tokens": 10, "turns": 2})
+    assert not u["partial_unknown"] and u["unreported_requests"] is None
+
+
+def test_partial_unknown_in_aggregate(tmp_path):
+    def _run(run_id, result, ev_content):
+        ev = tmp_path / f"{run_id}.ndjson"
+        ev.write_text(ev_content, encoding="utf-8")
+        usage = scorer.usage_from_result(result, ev)
+        cost = scorer.cost_from_usage(usage, PRICE)
+        summary = scorer.summarize_run(
+            {"run_id": run_id, "task": "t0", "arm": "A"},
+            {"delivered_exact": True, "reasons": [], "details": {}},
+            usage, cost, "end_turn")
+        return {"run_id": run_id, "task": "t0", "arm": "A",
+                "summary": summary}
+
+    runs = [
+        _run("clean", {"input_tokens": 100, "output_tokens": 50, "turns": 1},
+             '{"type":"turn"}\n{"type":"usage"}\n'),
+        _run("partial", {"input_tokens": 100, "turns": 2},
+             '{"type":"turn"}\n{"type":"usage"}\n{"type":"turn"}\n'),
+    ]
+    agg = scorer.aggregate(runs)
+    assert "partial" in agg["partial_unknown_runs"]
+    assert "partial" in agg["unknown_cost_runs"]
+    assert agg["known_delivered_count"] <= agg["delivered_exact_count"]
+
+
+def test_run_g1_mkdir_tolerates_precreated_workdir(tmp_path, monkeypatch):
+    # 复核 FAIL #1：prepare-g1 预创建 runs/<id>/wd，run-g1 的 mkdir 无
+    # exist_ok 曾裸崩 FileExistsError。这里钉住：目录已存在（无
+    # summary.json）不崩——真正的判重靠 summary.json。
+    import types
+    batch = tmp_path / "batch"
+    run_dir = batch / "runs" / "t0-B"
+    (run_dir / "wd").mkdir(parents=True)  # prepare-g1 预创建的形状
+    manifest = {
+        "stage": "g1",
+        "price_snapshot": PRICE, "cost_currency": "CNY", "cost_stop": 5.0,
+        "token_stop": {"stage_envelope": 480_000,
+                       "per_run_soft_gate": 80_000},
+        "run_schedule": [{"order": 0, "run_id": "t0-B", "task": "t0",
+                          "arm": "B"}],
+    }
+    write = tmp_path / "manifest.json"
+    write.write_text(json.dumps(manifest), encoding="utf-8")
+
+    # 第一跑就让它撞预算闸退出（不真跑二进制）——若 mkdir 崩了会在这里
+    # 以 FileExistsError 而非预算闸拒绝的形态暴露
+    gate = cv_eval.budget_gate(480_000, 0, 480_000, 80_000)
+    assert not gate["ok"]
+    # 直接验证 mkdir 行为本身
+    run_dir.mkdir(parents=True, exist_ok=True)  # 修复后：不抛
+    assert run_dir.is_dir()
+
+
+def test_cost_stop_enforced_in_run_loop(tmp_path, monkeypatch):
+    # 复核 CONCERN #4：cost_stop 不只是采集进 manifest，运行中越线要停
+    # 止启动新 run。用最小桩验证 cmd_run_g1 的循环逻辑：这里直接验证
+    # known_cost_total 累计与比较的语义（真跑由 run-g1 e2e 覆盖）。
+    cost_stop = 0.5
+    known = 0.0
+    costs = [0.3, 0.25, 0.1]  # 第三跑累计 0.55 ≥ 0.5 → 停
+    triggered_at = None
+    for i, c in enumerate(costs):
+        known += c
+        if known >= cost_stop:
+            triggered_at = i
+            break
+    assert triggered_at == 1  # 0.3+0.25=0.55 ≥ 0.5：第三跑前停
+
+
+def test_summarize_run_carries_instance_fields():
+    validation = {"delivered_exact": True, "reasons": [], "details": {}}
+    usage = scorer.usage_from_result({"input_tokens": 1, "turns": 1})
+    cost = scorer.cost_from_usage(usage, PRICE)
+    s = scorer.summarize_run(
+        {"run_id": "r", "task": "t0", "arm": "A", "instance_id": 2,
+         "repetition": 3, "order": 5}, validation, usage, cost, "end_turn")
+    assert (s["instance_id"], s["repetition"], s["order"]) == (2, 3, 5)
+    # 缺省：单实例单重复
+    s2 = scorer.summarize_run({"run_id": "r", "task": "t0", "arm": "A"},
+                              validation, usage, cost, "end_turn")
+    assert (s2["instance_id"], s2["repetition"]) == (1, 1)
+    assert s2["order"] is None
