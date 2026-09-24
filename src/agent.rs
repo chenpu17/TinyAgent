@@ -955,6 +955,22 @@ impl Agent {
         self.tool_defs.iter().map(|d| d.name.clone()).collect()
     }
 
+    /// The fully assembled system prompt (env header + user base + skill
+    /// intro), exactly as sent to the provider. Read-only introspection so
+    /// an eval host can diff what each arm's model actually sees instead of
+    /// reconstructing assembly logic (which would drift).
+    pub fn system_prompt(&self) -> Option<&str> {
+        self.system.as_deref()
+    }
+
+    /// Every tool definition (name / description / schema) the model sees —
+    /// the same defs serialized into each request. Read-only introspection,
+    /// same motivation as [`Agent::system_prompt`]: pin the tool-table diff
+    /// between arms from the live agent, not from config strings.
+    pub fn tool_defs(&self) -> &[ToolDef] {
+        &self.tool_defs
+    }
+
     /// Attach one MCP server at runtime: spawn the child (stdio) or open the
     /// HTTP transport, run the handshake, and add the tools to the NEXT
     /// request. Returns the new display names (`mcp_<server>_<tool>`).
