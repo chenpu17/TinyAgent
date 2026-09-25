@@ -1247,7 +1247,7 @@ src/
 │   ├── openai.rs         ( 1657)  # OpenAI 兼容（include_usage；400 回退：max_tokens→max_completion_tokens / 丢 stream_options）
 │   ├── anthropic.rs      ( 1111)  # Anthropic 原生（message_start/message_delta usage）
 │   └── mock.rs           (  345)  # 测试用脚本化 Provider（cfg(any(test, feature="mock"))）
-├── agent.rs          ( 3418)  # 核心 loop + usage 累计 + cancel + 上下文压缩（前馈/溢出双触发 + 滚动分块摘要）+ 相邻消息归一 + 同 turn 多 task 并行
+├── agent.rs          ( 3434)  # 核心 loop + usage 累计 + cancel + 上下文压缩（前馈/溢出双触发 + 滚动分块摘要）+ 相邻消息归一 + 同 turn 多 task 并行
 ├── agent_tests.rs    ( 8823)  # 核心 loop 回归测试（provider::mock 脚本化，不连网）
 ├── compress.rs       (  810)  # 压缩引擎（find_safe_cut / 分块摘要 / saturating usage 合并 + block 级计费原语）
 ├── context_report.rs (  785)  # 上下文构成分解（ContextBreakdown 估算口径：system 三段 / 工具四类 / 消息分型 + 锚点校准）
