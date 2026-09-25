@@ -1042,6 +1042,20 @@ trim → 剥一层包裹引号/反引号 → 大小写折叠的最小归一）�
 测量协议）见 [评测装配文档](docs/code_llm_eval_assembly.md)；装置漂移由
 `scripts/check_eval_apparatus.py` 在 CI 红灯把守。
 
+**何时开启（价值验证结论，2026-09）**：24 次付费 A/B 对照（单模型、合成任务、
+`docs/code_value_reports/` 全程报告）给出的启用指引——
+
+- **值得开的形态**：数据只经分页 API（MCP 等）、`shell` 不可达、需全量聚合的任务。
+  该形态下 run_code 自然采用带来稳定费用优势（三实例费用比 0.51×/0.55×/0.58×，
+  墙钟 0.55×~0.97×；机制：12 次外层逐页调用收进 1 次沙箱内循环）。
+  用 `agentic-code.md` 全量提示词——其中的能力段指引正是模型采用 run_code 的触发面。
+- **开了不亏（但别用全量提示词）**：任务带 `shell` 时模型自然选 shell 直解、
+  run_code 零采用；此时 `agentic-code.md` 的能力段是纯披露开销（实测费用比最高 1.43×），
+  去掉能力段只留工具面后回落到 ~1.0×~1.2×。带 shell 的部署用 `agentic.md` 即可。
+- **默认关维持**：验证未发现质量回归（全部配对双臂同交付、采用路径零错误），
+  但样本是单模型 + 合成任务（`demand_unverified`），不足以支持默认开启或普遍降本宣称。
+  「无 shell 分页聚合」形态之外的费用结论未验证。
+
 **沙箱内环境**：纯同步 ES2023——无 async/Promise/timer/`import`/`fetch`，`Date.now`/`Math.random`
 不可用（评测可复现）。API 五个：`tools.call(name, args)`（失败 throw、可 try/catch 后继续，异常带
 结构化字段 `e.kind`/`e.tool`/`e.retryable`——`denied`/`hooks`/`budget`/`deadline`/`unknown_tool`/`lib`

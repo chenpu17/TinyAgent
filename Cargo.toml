@@ -1,6 +1,6 @@
 [package]
 name = "tiny-agent"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 # MSRV floor of the DEFAULT (headless) build, set by the dependency chain:
 # the LOCKED icu_* 2.2.0 family (reqwest → url → idna → idna_adapter) needs

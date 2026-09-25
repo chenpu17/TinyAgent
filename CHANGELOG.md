@@ -3,6 +3,28 @@
 本文件记录 TinyAgent 的版本演化。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)（0.x 阶段 minor 即破坏性窗口）。
 
+## [0.4.1] - 2026-09-25
+
+### Added
+
+- **库侧只读 introspection getter（c03158a）**：`Agent::system_prompt()`（装配后的完整系统提示词：
+  env 头 + 用户 base + skill intro）与 `Agent::tool_defs()`（模型可见的每个工具定义）——评测装置
+  （run_code 价值验证 G0）需要从真实构造的 Agent 导出两臂差分，而不是靠配置白名单字符串推测。
+  纯只读，不改任何装配语义。
+- **run_code 价值验证全程结论（README 使用指引）**：24 次付费 A/B 对照（G1 六跑 + T2 重跑 +
+  G2 十二跑 + G2C 候选四跑，0.245 CNY，单模型合成任务）——「无 shell 的多源分页聚合」形态
+  run_code 自然采用带来稳定费用优势（三实例 0.51×/0.55×/0.58×）；带 shell 任务模型自然选
+  shell、run_code 零采用，全量能力段提示词是纯披露开销（最高 1.43×），去掉能力段回落
+  ~1.0×~1.2×。默认关维持（样本不足以支持默认开启）。完整报告与逐跑工件见
+  `docs/code_value_reports/`；README run_code 专节新增「何时开启」指引。
+
+### Fixed
+
+- README 代码结构树补齐 c03158a 漏跑的 `gen_structure`（agent.rs 行数漂移，CI fmt 门禁会红灯）。
+- 主包 `optionalDependencies` 的五个平台子包版本引用从 0.3.0 同步到与主包同版本（v0.4.0 只 bump
+  了主包 `version`，漏了这五条——README 分发契约是「引用同版本子包」，release workflow 的子包
+  版本单源也是主包 `version`，错配会让 registry 消费者装到 0.3.0 子包）。
+
 ## [0.4.0] - 2026-09-24
 
 ### Added

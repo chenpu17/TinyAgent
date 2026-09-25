@@ -1,6 +1,6 @@
 {
   "name": "tiny-agent",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Node.js / TypeScript bindings for TinyAgent",
   "license": "MIT",
   "main": "wrapper.js",
@@ -24,10 +24,10 @@
     "index.d.ts"
   ],
   "optionalDependencies": {
-    "tiny-agent-darwin-x64": "0.3.0",
-    "tiny-agent-darwin-arm64": "0.3.0",
-    "tiny-agent-linux-x64-gnu": "0.3.0",
-    "tiny-agent-linux-x64-musl": "0.3.0",
-    "tiny-agent-win32-x64-msvc": "0.3.0"
+    "tiny-agent-darwin-x64": "0.4.1",
+    "tiny-agent-darwin-arm64": "0.4.1",
+    "tiny-agent-linux-x64-gnu": "0.4.1",
+    "tiny-agent-linux-x64-musl": "0.4.1",
+    "tiny-agent-win32-x64-msvc": "0.4.1"
   }
 }
