@@ -23,6 +23,12 @@ code_value_fixture.py，T2 数据源在 code_value_mcp_server.py。
   run-g2      执行冻结的 G2 配方。付费三重门与 run-g1 同款；判卷用
               g2_gold（实例级），预算闸对 G2 包络 0.96M 并按 G1+G2 ≤1.76M
               联合封顶（G1 已用额度从既有批次 ledger 读出）。
+  prepare-g2c 冻结 G2C 候选配方（G2 报告的下一可证伪假设：披露按需化）。
+              T1 类同两实例 × A/B 四跑；A' = 系统提示词去能力段（== 冻结
+              公共段），工具面/code.enabled/on_demand 技能索引不变——
+              候选经实验配置显式门控，不动共享提示词与已关档配方。
+  run-g2c     执行冻结的 G2C 候选配方。付费三重门 + 联合封顶同 run-g2
+              （先行读数 = G1+G2 已用）；判卷用实例级 g2_gold。
 
 工件：artifacts/code_value/批次目录（manifest.json、configs/、runs/、
 ledger.json、g0_gate.json）+ docs/code_value_reports/批次.md。
@@ -70,7 +76,21 @@ G2_RUNS = [("t0", "g2i1", "A"), ("t0", "g2i1", "B"),
            ("t2", "g2i1", "A"), ("t2", "g2i1", "B"),
            ("t2", "g2i2", "B"), ("t2", "g2i2", "A")]
 G2_TOKEN_ENVELOPE = 960_000
+# G2C 候选修订验证（方案 §4.3 候选纪律；G2 报告的下一可证伪假设）：
+# T1 类同两实例 × A/B 配对。A' = 披露按需化——系统提示词去掉能力段
+# （== 冻结公共段），code.enabled / 工具面 / on_demand 技能索引全部不变
+# （工具 schema 是协议必须的最小披露面，无法归零）；B 与 G2 原配方
+# 逐字相同。同实例重跑使「A'(候选) vs A(G2 原版)」可直接配对差分，
+# 旧候选与新候选数据分栏（方案 §4.3）。第一实例 A'B'、第二实例 B'A'
+# （位置偏置控制同 G2 纪律）。4×80K=0.32M。
+G2C_RUNS = [("t1", "g2i1", "A"), ("t1", "g2i1", "B"),
+            ("t1", "g2i2", "B"), ("t1", "g2i2", "A")]
+G2C_TOKEN_ENVELOPE = 320_000
 G1_G2_COMBINED_CAP = 1_760_000
+# 各 stage 的冻结 schedule 与联合封顶的「先行 stage」读数面：
+# g2 的联合封顶只算 G1；g2c 是诊断性质，计入 G1+G2 已用。
+EXPECT_RUNS = {"g1": G1_RUNS, "g2": G2_RUNS, "g2c": G2C_RUNS}
+PRIOR_STAGES = {"g1": (), "g2": ("g1",), "g2c": ("g1", "g2")}
 # 在途超额风险上界（工单 01R：须含输入与输出，不能只算输出上限）。
 # 软闸是轮边界语义：最后一轮请求可再消耗 max_tokens 输出 + 该轮完整
 # 输入（上界取包络内单 run 软闸值——一个 run 的全部已知输入预算）。
@@ -216,7 +236,8 @@ def isolated_env(extra: dict = None) -> dict:
 
 def build_config(task: str, arm: str, wd: Path, base_url: str, model: str,
                  fixture_root: Path, server_log: Path = None,
-                 g2_instance: str = None, g2_data_dir: Path = None) -> dict:
+                 g2_instance: str = None, g2_data_dir: Path = None,
+                 candidate: bool = False) -> dict:
     """A/B 配置：唯一差异 = code 可用包（enabled + on_demand skill）。
 
     A/B 用同一个 code-feature 二进制、同模型、同 limits、同公共任务文本
@@ -224,6 +245,10 @@ def build_config(task: str, arm: str, wd: Path, base_url: str, model: str,
     B 不在 tools 白名单里列 run_code（成员资格由 code.enabled 驱动）。
     g2_instance/g2_data_dir：G2 的 t2 run 用实例专属数据文件（MCP 服务器
     读 g2_data_dir 下的 subscriptions.json/events.json——铺设与封存同源）。
+    candidate（G2C 候选修订，方案 §4.3「通过实验配置显式门控候选」）：
+    True 时 A 臂系统提示词用冻结公共段（去掉能力段）——披露按需化的
+    候选变体；code.enabled / 工具面 / on_demand 技能索引不变。B 臂
+    恒用原配方（candidate 开关对 B 无影响——候选只改 A 的披露面）。
     """
     tools = (["shell", "read_file", "write_file", "edit_file", "list_dir"]
              if task in ("t0", "t1")
@@ -234,7 +259,8 @@ def build_config(task: str, arm: str, wd: Path, base_url: str, model: str,
         "api_key_env": API_KEY_ENV,
         "model": model,
         "max_tokens": MAX_TOKENS_PER_REQUEST,
-        "system_prompt": (PROMPT_A if arm == "A" else PROMPT_COMMON),
+        "system_prompt": (PROMPT_A if arm == "A" and not candidate
+                          else PROMPT_COMMON),
         "workdir": str(wd),
         "tools": tools,
         "restrict_to_workdir": True,
@@ -493,7 +519,7 @@ def collect_inventory(batch_dir: Path, configs: list) -> dict:
     return json.load(open(out_path, encoding="utf-8"))
 
 
-def analyze_inventory(inventory: dict) -> dict:
+def analyze_inventory(inventory: dict, candidate: bool = False) -> dict:
     """只读差分检查（方案 §3：除能力披露及 code 可用性外的意外差异一律阻止）。
 
     工具面：A − B 必须恰好等于 run_code + read_skill + list_skill（skill
@@ -501,6 +527,8 @@ def analyze_inventory(inventory: dict) -> dict:
     系统提示词：B == 公共段（B 无技能索引，assemble 不追加任何内容）；
     A == 公共段 + 能力段 + 技能索引 intro（render_intro 追加）。
     guest 可调用工具只在 A 有；T2-A 的 guest registry 必须含 MCP 工具。
+    candidate（G2C）：A 臂提示词 == 公共段 + 技能索引 intro（能力段
+    去掉——披露按需化候选）；工具面差分与原配方完全同款。
     """
     problems = []
     diff_summary = {}
@@ -552,13 +580,18 @@ def analyze_inventory(inventory: dict) -> dict:
         sa, sb = a["system_prompt"] or "", b["system_prompt"] or ""
         if sb != PROMPT_COMMON:
             problems.append(f"{task}-B: system prompt != frozen common base")
-        if not sa.startswith(PROMPT_A):
-            problems.append(f"{task}-A: system prompt lacks frozen capability "
-                            "section prefix")
+        # A 臂提示词基线：原配方 = 公共段 + 能力段（前缀）；候选 = 公共段
+        # （能力段去掉）。两者都追加技能索引 intro（render_intro）。
+        a_base = PROMPT_COMMON if candidate else PROMPT_A
+        if not sa.startswith(a_base):
+            problems.append(
+                f"{task}-A: system prompt lacks frozen "
+                + ("common base (candidate: capability section removed)"
+                   if candidate else "capability section prefix"))
         diff_summary[task] = {
             "a_only_tools": sorted(extra), "b_only_tools": sorted(missing),
             "a_system_len": len(sa), "b_system_len": len(sb),
-            "a_skill_intro_len": len(sa) - len(PROMPT_A),
+            "a_skill_intro_len": len(sa) - len(a_base),
             "guest_tool_count": len(a["guest_tools"] or []),
         }
     return {"problems": problems, "per_task": diff_summary}
@@ -672,7 +705,9 @@ def build_manifest(batch_id: str, stage: str, fp: dict, fixture_stats: dict,
                        "stage_envelope": (G1_TOKEN_ENVELOPE
                                           if stage == "g1"
                                           else G2_TOKEN_ENVELOPE
-                                          if stage == "g2" else 0),
+                                          if stage == "g2"
+                                          else G2C_TOKEN_ENVELOPE
+                                          if stage == "g2c" else 0),
                        "inflight_overrun_risk": INFLIGHT_OVERRUN_TOKENS,
                        "kind": "soft (turn-boundary); not a billing hard cap"},
         "turn_limit": RUN_LIMITS["max_turns"],
@@ -1303,12 +1338,14 @@ def verify_frozen_recipe(batch_dir: Path, manifest: dict) -> list:
     # 新任务/臂组合或乱序，但允许只跑受影响的子集。
     if manifest.get("run_schedule"):
         expect = [(s["task"], s["arm"]) for s in manifest["run_schedule"]]
-        if manifest.get("stage") == "g2":
-            expect_g2 = [(s["task"], s.get("instance"), s["arm"])
-                         for s in manifest["run_schedule"]]
-            if expect_g2 != G2_RUNS:
-                problems.append(f"schedule_drift: {expect_g2} != 冻结顺序 "
-                                f"{G2_RUNS}（G2）")
+        if manifest.get("stage") in ("g2", "g2c"):
+            # G2/G2C：schedule 带 instance 段，与冻结常量全等比对
+            expect_inst = [(s["task"], s.get("instance"), s["arm"])
+                           for s in manifest["run_schedule"]]
+            frozen = EXPECT_RUNS[manifest["stage"]]
+            if expect_inst != frozen:
+                problems.append(f"schedule_drift: {expect_inst} != 冻结顺序 "
+                                f"{frozen}（{manifest['stage']}）")
         elif manifest.get("retry_of"):
             it = iter(G1_RUNS)
             subseq = all(pair in it for pair in expect)
@@ -1319,7 +1356,8 @@ def verify_frozen_recipe(batch_dir: Path, manifest: dict) -> list:
             problems.append(f"schedule_drift: {expect} != 冻结顺序 {G1_RUNS}")
     # G2 实例数据封存校验：铺设字节哈希与冻结记录一致（防生成模块改动
     # 后旧批次静默换数据——方案 §4.4「不得中途调 schema」的执行面）。
-    if manifest.get("stage") == "g2" and manifest.get("g2_data_hashes"):
+    if manifest.get("stage") in ("g2", "g2c") \
+            and manifest.get("g2_data_hashes"):
         cur = {}
         for key, want in manifest["g2_data_hashes"].items():
             inst, task = key.rsplit("-", 1)
@@ -1423,11 +1461,11 @@ def cmd_finalize_g1(args):
 
 # ── prepare-g2 / run-g2（方案 §4.4 / 工单 04：新实例信号确认）──────────────
 
-def g1_spent_tokens() -> int:
-    """G1 已消耗 token（ledger_tokens + unknown_reserve，全部 g1 批次）。
+def prior_spent_tokens(stages: tuple) -> int:
+    """先行 stage 已消耗 token（ledger_tokens + unknown_reserve）。
 
-    G1+G2 ≤1.76M 的联合封顶需要 G1 侧真实读数——从既有批次 ledger 读，
-    不靠手记。无 ledger 的批次（未执行）不计。
+    联合封顶需要先行 stage 的真实读数——从既有批次 ledger 读，不靠手记。
+    无 ledger 的批次（未执行）不计。g2 只算 g1；g2c（诊断批）算 g1+g2。
     """
     spent = 0
     for d in sorted(ART.iterdir()):
@@ -1438,13 +1476,18 @@ def g1_spent_tokens() -> int:
             m = json.load(open(d / "manifest.json", encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
-        if m.get("stage") != "g1":
+        if m.get("stage") not in stages:
             continue
         lg = json.load(open(ledger, encoding="utf-8"))
         gate = lg.get("budget_gate_final", {})
         spent += gate.get("ledger_tokens", 0) + gate.get(
             "unknown_reserve_tokens", 0)
     return spent
+
+
+def g1_spent_tokens() -> int:
+    """G1 已消耗 token（g2 联合封顶的先行读数）。"""
+    return prior_spent_tokens(("g1",))
 
 
 def cmd_prepare_g2(args):
@@ -1717,6 +1760,279 @@ def cmd_run_g2(args):
     return 0
 
 
+# ── prepare-g2c / run-g2c（G2 报告的候选修订验证：披露按需化）───────────────
+
+def cmd_prepare_g2c(args):
+    """冻结 G2C 四跑候选配方（不执行）。
+
+    候选 = A 臂披露按需化（系统提示词去能力段，== 冻结公共段）；工具面、
+    code.enabled、on_demand 技能索引全部不变（方案 §4.3「通过实验配置
+    显式门控候选」——不动共享提示词文件，不改已关档的 G1/G2 配方）。
+    实例沿用 G2 的 t1 两实例（g2i1/g2i2）：同实例重跑使候选 A' 与 G2
+    原版 A 可直接配对差分；判卷沿用实例级 g2_gold + digest 对账。
+    """
+    check_global_skills_clean()
+    batch_id = args.batch_id or time.strftime("g2c-%Y%m%d-%H%M%S")
+    batch_dir = ART / batch_id
+    if batch_dir.exists():
+        sys.exit(f"batch 目录已存在，拒绝覆盖：{batch_dir}")
+    batch_dir.mkdir(parents=True)
+    fp = fingerprint()
+    if "code" not in (fp["binary_manifest"].get("features") or []):
+        sys.exit("二进制缺 code feature")
+    write_json(batch_dir / "fingerprint.json", fp)
+
+    gateway, secret = gateway_identity()
+    if not gateway["model"] or not gateway["base_url_host"]:
+        sys.exit("测试模型.md 缺 base url / 模型名称 —— 无法冻结网关身份")
+
+    price = load_price_snapshot(args.price)
+    schedule = [{"order": i, "run_id": f"{task}-{instance}-{arm}",
+                 "task": task, "instance": instance, "arm": arm}
+                for i, (task, instance, arm) in enumerate(G2C_RUNS)]
+
+    # 实例数据封存：t1 数据在 run 时 stage_workdir_g2 现铺（字节与
+    # g2_data_hashes 一致，verify_frozen_recipe 对账）。G2C 只有 t1，
+    # 无 t2 → 不落 g2-data/ 目录。
+    g2_data_hashes = {}
+    for instance in fixture.G2_INSTANCE_IDS:
+        for task in ("t0", "t1", "t2"):
+            blobs = fixture.g2_serialize(instance, task)
+            g2_data_hashes[f"{instance}-{task}"] = {
+                name: hashlib.sha256(blob).hexdigest()
+                for name, blob in blobs.items()}
+
+    # 逐 run 配置：A 臂 candidate=True（提示词 = 公共段），B 臂原配方
+    configs_spec = []
+    for s in schedule:
+        run_dir = batch_dir / "runs" / s["run_id"]
+        wd = run_dir / "wd"
+        wd.mkdir(parents=True, exist_ok=True)
+        cfg = build_config(s["task"], s["arm"], wd, secret["base_url"],
+                           gateway["model"], FIXTURE_ROOT,
+                           run_dir / "server_events.ndjson",
+                           candidate=(s["arm"] == "A"))
+        p = batch_dir / "configs" / f"{s['run_id']}.json"
+        write_json(p, cfg)
+        configs_spec.append({"key": s["run_id"], "path": str(p),
+                             "task": s["task"], "arm": s["arm"]})
+
+    inventory = collect_inventory(batch_dir, configs_spec)
+    inv_analysis = analyze_inventory(inventory, candidate=True)
+    write_json(batch_dir / "inventory_analysis.json", inv_analysis)
+    if inv_analysis["problems"]:
+        for p in inv_analysis["problems"]:
+            print(f"[prepare-g2c] INVENTORY PROBLEM: {p}", file=sys.stderr)
+
+    fixture_stats = json.load(open(FIXTURE_ROOT / "gen_stats.json",
+                                   encoding="utf-8"))
+    manifest = build_manifest(batch_id, "g2c", fp, fixture_stats, inventory,
+                              model=gateway["model"], gateway=gateway,
+                              price=price, run_schedule=schedule)
+    manifest["cost_stop"] = args.cost_stop
+    manifest["g2_data_hashes"] = g2_data_hashes
+    manifest["g2_gold_digest"] = fixture.g2_gold_digest()
+    manifest["g2_instances"] = list(fixture.G2_INSTANCE_IDS)
+    manifest["candidate"] = {
+        "kind": "on-demand disclosure (capability section removed from A "
+                "system prompt; tool schema / code.enabled / on_demand "
+                "skill index unchanged)",
+        "hypothesis": "T1 超线由能力披露的固定开销引发；A' 与 B 首请求"
+                      "输入差归零后，T1 费用比回落 ≤1.2",
+        "falsified_if": "任一实例费用比仍 >1.2（维持缩窄裁决）",
+        "baseline_batch": "g2-20260924-r1（旧候选数据分栏，不覆盖）",
+    }
+    prior = prior_spent_tokens(PRIOR_STAGES["g2c"])
+    manifest["prior_spent_tokens_at_freeze"] = prior
+    missing = require_paid_prereqs(manifest)
+    manifest["blocked_paid"] = bool(missing)
+    manifest["blocked_paid_missing"] = missing
+    write_json(batch_dir / "manifest.json", manifest)
+
+    gate = budget_gate(0, 0, G2C_TOKEN_ENVELOPE,
+                       RUN_LIMITS["max_total_tokens"])
+    gate["prior_spent_tokens"] = prior
+    gate["combined_cap"] = G1_G2_COMBINED_CAP
+    gate["combined_headroom"] = G1_G2_COMBINED_CAP - prior
+    write_json(batch_dir / "budget_gate.json", gate)
+    print(f"[prepare-g2c] {batch_id}：schedule {len(schedule)} runs，"
+          f"envelope {G2C_TOKEN_ENVELOPE}，先行（G1+G2）已用 "
+          f"{prior}（联合上限 {G1_G2_COMBINED_CAP}），"
+          f"blocked_paid={manifest['blocked_paid']}({missing or '无'})")
+    if missing:
+        print("[prepare-g2c] 补齐价表（--price，含 input/output/cache_creation/"
+              "cache_read/currency 五项）与 --cost-stop 后方可 run-g2c --execute",
+              file=sys.stderr)
+    return 0
+
+
+def cmd_finalize_g2c(args):
+    """G2C 的显式最终冻结（P1-02 同款纪律：不是手改 manifest）。"""
+    batch_dir = Path(args.batch)
+    manifest_path = batch_dir / "manifest.json"
+    if not manifest_path.exists():
+        sys.exit(f"没有冻结的 manifest：{manifest_path}（先 prepare-g2c）")
+    manifest = json.load(open(manifest_path, encoding="utf-8"))
+    if manifest.get("stage") != "g2c":
+        sys.exit(f"manifest stage != g2c：{manifest.get('stage')}")
+    price = load_price_snapshot(args.price)
+    if price is None:
+        sys.exit("价表缺失/非法（需五项：input/output/cache_creation/"
+                 "cache_read/currency，单价有限非负）")
+    if args.cost_stop is None or args.cost_stop <= 0:
+        sys.exit("费用停止值必须为有限正数")
+    drift = verify_frozen_recipe(batch_dir, manifest)
+    if drift:
+        for d in drift:
+            print(f"[finalize-g2c] RECIPE DRIFT: {d}", file=sys.stderr)
+        sys.exit("冻结配方已漂移 —— 重新 prepare-g2c 后再 finalize")
+    manifest = freeze_final(batch_dir, manifest, price, args.cost_stop)
+    manifest["blocked_paid"] = False
+    write_json(manifest_path, manifest)
+    print(f"[finalize-g2c] {batch_dir.name} 最终冻结完成：价表 "
+          f"{price['currency']}，停止值 {args.cost_stop}；"
+          "run-g2c --execute 将按此校验")
+    return 0
+
+
+def cmd_run_g2c(args):
+    """执行冻结的 G2C 候选配方。付费三重门 + 联合封顶与 run-g2 同款；
+    判卷用实例级 g2_gold（与 G2 同源）。"""
+    batch_dir = Path(args.batch)
+    manifest_path = batch_dir / "manifest.json"
+    if not manifest_path.exists():
+        sys.exit(f"没有冻结的 manifest：{manifest_path}（先 prepare-g2c）")
+    manifest = json.load(open(manifest_path, encoding="utf-8"))
+    if manifest.get("stage") != "g2c":
+        sys.exit(f"manifest stage != g2c：{manifest.get('stage')}")
+    if not args.execute:
+        print("[run-g2c] dry-run（默认）：只打印将执行的顺序，不发起任何请求")
+        for s in manifest["run_schedule"]:
+            print(f"  order {s['order']}: {s['run_id']}")
+        return 0
+    missing = require_paid_prereqs(manifest)
+    if missing:
+        sys.exit(f"付费前置缺失/非法 {missing} —— 方案 §4.1：不填价表不开付费运行")
+
+    drift = verify_frozen_recipe(batch_dir, manifest)
+    if drift:
+        for d in drift:
+            print(f"[run-g2c] RECIPE DRIFT: {d}", file=sys.stderr)
+        sys.exit("冻结配方校验失败 —— 拒绝执行（重新 prepare-g2c 或显式 finalize-g2c）")
+
+    price = manifest["price_snapshot"]
+    cost_stop = manifest["cost_stop"]
+    currency = manifest["cost_currency"]
+    # 联合封顶：先行 stage（G1+G2）已用（冻结时读数 + 本机现算取大）
+    # + G2C 已跑 ≤ 1.76M
+    prior_now = max(manifest.get("prior_spent_tokens_at_freeze", 0),
+                    prior_spent_tokens(PRIOR_STAGES["g2c"]))
+    ledger_tokens, unknown_reserve = 0, 0
+    known_lower_total = 0.0
+    reserve_cost_total = 0.0
+    runs_done = []
+    stop_reason = None
+    for s in manifest["run_schedule"]:
+        gate = budget_gate(ledger_tokens, unknown_reserve,
+                           manifest["token_stop"]["stage_envelope"],
+                           manifest["token_stop"]["per_run_soft_gate"])
+        combined = prior_now + ledger_tokens + unknown_reserve
+        if not gate["ok"]:
+            print(f"[run-g2c] 预算闸拒绝启动 {s['run_id']}：{gate}",
+                  file=sys.stderr)
+            stop_reason = "budget_gate"
+            break
+        if combined + manifest["token_stop"]["per_run_soft_gate"] \
+                > G1_G2_COMBINED_CAP:
+            print(f"[run-g2c] 联合封顶拒绝启动 {s['run_id']}：先行已用 "
+                  f"{prior_now} + G2C 已用 {ledger_tokens + unknown_reserve} "
+                  f"+ 单 run 预留 > {G1_G2_COMBINED_CAP}", file=sys.stderr)
+            stop_reason = "combined_cap"
+            break
+        run_dir = batch_dir / "runs" / s["run_id"]
+        claim_run_slot(run_dir)   # P1-03：原子登记 started，拒绝覆盖中断记录
+        wd = run_dir / "wd"
+        fixture.stage_workdir_g2(s["instance"], s["task"], wd)
+        cfg_path = batch_dir / "configs" / f"{s['run_id']}.json"
+        cfg = json.load(open(cfg_path, encoding="utf-8"))
+        cfg["workdir"] = str(wd)          # 指到本 run 的全新 workdir
+        cfg_path = run_dir / "config_redacted.json"
+        write_json(cfg_path, cfg)
+        _, secret = gateway_identity()
+        env = isolated_env({"CODE_VALUE_KEY": secret["api_key"]})
+        # P1-04：答案隔离（G2C 只有 t1，无 MCP 服务器）
+        sb = seatbelt_profile(run_dir, wd)
+        sb_check = verify_seatbelt(sb, wd)
+        write_json(run_dir / "seatbelt_check.json", sb_check)
+        if not sb_check["ok"]:
+            sys.exit(f"[run-g2c] 答案隔离不可用/未通过（{sb_check}）——"
+                     "阻塞：本机无法提供隔离时不启动有答案泄漏的盲测")
+        print(f"[run-g2c] {s['run_id']} ...", flush=True)
+        rc, wall = run_binary(cfg_path, fixture.TASK_TEXTS[s["task"]],
+                              run_dir, env,
+                              timeout_s=RUN_LIMITS["timeout_secs"] + 60,
+                              seatbelt_profile=sb)
+        summary = score_run(run_dir, s["task"], s["arm"], FIXTURE_ROOT, price,
+                            g2_instance=s["instance"])
+        summary.update({"wall_s": wall, "rc": rc, "provider": "real",
+                        "order": s["order"],
+                        "instance_id": s["instance"], "repetition": 1,
+                        "paid_model_requests":
+                            summary["usage"]["turns"] or 1})
+        write_json(run_dir / "summary.json", summary)
+        mark_run_completed(run_dir)
+        runs_done.append({"run_id": s["run_id"], "task": s["task"],
+                          "arm": s["arm"], "instance": s["instance"],
+                          "summary": summary})
+        ledger_tokens += summary["usage"]["total_tokens"]
+        unknown_reserve += summary["usage"]["unknown_reserve_tokens"]
+        known_lower_total += summary["cost"]["cost_known_lower"] or 0
+        reserve_cost_total += reserve_cost(
+            summary["usage"]["unknown_reserve_tokens"], price)
+        print(f"[run-g2c] {s['run_id']}：delivered="
+              f"{summary['delivered_exact']} end={summary['end_reason']} "
+              f"tokens={summary['usage']['total_tokens']} "
+              f"cost_lower={known_lower_total:.4f} "
+              f"reserve={reserve_cost_total:.4f} {currency}")
+        if known_lower_total + reserve_cost_total >= cost_stop:
+            print(f"[run-g2c] 费用停止线触发：lower="
+                  f"{known_lower_total:.4f} + reserve="
+                  f"{reserve_cost_total:.4f} ≥ {cost_stop} {currency}"
+                  " —— 不再启动后续 run", file=sys.stderr)
+            stop_reason = "cost_stop"
+            break
+        if not summary["usage"]["usage_complete"]:
+            print(f"[run-g2c] 用量无法完整核账（"
+                  f"{summary['cost'].get('reason')}）——保守停止后续 run，"
+                  "证据已封存，交评测负责人裁决", file=sys.stderr)
+            stop_reason = "usage_incomplete"
+            break
+    if runs_done:
+        ledger = scorer.aggregate(runs_done)
+        ledger["budget_gate_final"] = budget_gate(
+            ledger_tokens, unknown_reserve,
+            manifest["token_stop"]["stage_envelope"], 0)
+        ledger["combined_cap"] = {
+            "prior_spent_tokens": prior_now,
+            "g2c_spent_tokens": ledger_tokens + unknown_reserve,
+            "cap": G1_G2_COMBINED_CAP,
+            "stop_reason": stop_reason if stop_reason == "combined_cap"
+            else None}
+        ledger["cost_stop"] = {
+            "limit": cost_stop, "currency": currency,
+            "known_lower_total": round(known_lower_total, 6),
+            "unknown_reserve_cost": round(reserve_cost_total, 6),
+            "triggered": stop_reason == "cost_stop",
+            "stop_reason": stop_reason,
+            "kind": "run 间停止线；非供应商扣费硬上限（在途风险见 "
+                    "budget_gate_final.inflight_overrun_risk_tokens）"}
+        write_json(batch_dir / "ledger.json", ledger)
+    print(f"[run-g2c] 完成 {len(runs_done)} runs"
+          + (f"（停止原因：{stop_reason}）" if stop_reason else "")
+          + "；不自动诊断、不自动进入 G3（方案 §4.3：候选读数交评测负责人裁决）")
+    return 0
+
+
 def cmd_run_g1(args):
     """执行冻结的 G1 配方。付费执行三重门：--execute、价表齐备、预算闸。"""
     batch_dir = Path(args.batch)
@@ -1893,6 +2209,27 @@ def main():
     rg2.add_argument("--execute", action="store_true",
                      help="付费执行开关；缺省永远 dry-run")
     rg2.set_defaults(func=cmd_run_g2)
+    pg2c = sub.add_parser("prepare-g2c",
+                          help="冻结 G2C 候选配方（披露按需化，不执行）")
+    pg2c.add_argument("--batch-id", default=None)
+    pg2c.add_argument("--price", default=None,
+                      help="价表 JSON（input/output/cache_creation/cache_read/"
+                           "currency，per-token 单价）")
+    pg2c.add_argument("--cost-stop", type=float, default=None,
+                      help="阶段费用停止值（与价表同币种）")
+    pg2c.set_defaults(func=cmd_prepare_g2c)
+    fg2c = sub.add_parser("finalize-g2c",
+                          help="G2C 价格补全的显式最终冻结步骤")
+    fg2c.add_argument("--batch", required=True)
+    fg2c.add_argument("--price", required=True)
+    fg2c.add_argument("--cost-stop", type=float, required=True)
+    fg2c.set_defaults(func=cmd_finalize_g2c)
+    rg2c = sub.add_parser("run-g2c",
+                          help="执行冻结的 G2C 候选配方（默认 dry-run）")
+    rg2c.add_argument("--batch", required=True, help="prepare-g2c 的批次目录")
+    rg2c.add_argument("--execute", action="store_true",
+                      help="付费执行开关；缺省永远 dry-run")
+    rg2c.set_defaults(func=cmd_run_g2c)
     args = ap.parse_args()
     sys.exit(args.func(args))
 

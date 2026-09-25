@@ -1527,3 +1527,199 @@ def test_retry_batch_subseq_schedule(tmp_path):
     (batch / "manifest.json").write_text(json.dumps(m2), encoding="utf-8")
     assert any("schedule_drift" in p
                for p in cv_eval.verify_frozen_recipe(batch, m2))
+
+
+# ── G2C 候选修订（披露按需化）：装置与执行回路 ─────────────────────────────
+
+def test_g2c_schedule_order_and_parity():
+    """G2C 顺序封存：T1 类同两实例 × A/B 四跑，第一实例 A'B'、第二实例
+    B'A'（位置偏置控制同 G2 纪律）；实例沿用 G2 的 g2i1/g2i2。"""
+    assert cv_eval.G2C_RUNS == [("t1", "g2i1", "A"), ("t1", "g2i1", "B"),
+                                ("t1", "g2i2", "B"), ("t1", "g2i2", "A")]
+    assert len({(t, i, a) for t, i, a in cv_eval.G2C_RUNS}) == 4
+
+
+def test_g2c_envelope_within_combined_cap():
+    """G2C 包络 0.32M；G1(0.48M) + G2(0.96M) + G2C(0.32M) 计划包络
+    ≤ 1.76M 联合上限（g2c 是诊断批，读数仍受联合封顶约束）。"""
+    assert cv_eval.G2C_TOKEN_ENVELOPE \
+        == len(cv_eval.G2C_RUNS) * cv_eval.RUN_LIMITS["max_total_tokens"]
+    assert (cv_eval.G1_TOKEN_ENVELOPE + cv_eval.G2_TOKEN_ENVELOPE
+            + cv_eval.G2C_TOKEN_ENVELOPE) <= cv_eval.G1_G2_COMBINED_CAP
+
+
+def test_build_config_candidate_removes_capability_for_a_only():
+    """候选门控：candidate=True 时 A 臂提示词 == 冻结公共段（能力段
+    去掉）；B 臂不受 candidate 影响（恒原配方公共段）；code 包与工具
+    白名单两臂逐字段不变——候选只改 A 的披露面。"""
+    wd = tmp = None
+    import tempfile
+    tmp = tempfile.mkdtemp()
+    wd = Path(tmp) / "wd"
+    wd.mkdir()
+    a = cv_eval.build_config("t1", "A", wd, "http://x", "m", tmp,
+                             candidate=True)
+    b = cv_eval.build_config("t1", "B", wd, "http://x", "m", tmp,
+                             candidate=True)
+    a_orig = cv_eval.build_config("t1", "A", wd, "http://x", "m", tmp)
+    # A'（候选）== 公共段：能力段被去掉
+    assert a["system_prompt"] == cv_eval.PROMPT_COMMON
+    # 原配方 A 仍带能力段（候选不污染原配方）
+    assert a_orig["system_prompt"] == cv_eval.PROMPT_A
+    # B 臂不受 candidate 影响
+    assert b["system_prompt"] == cv_eval.PROMPT_COMMON
+    # code 包与工具面：候选不改变（披露按需化只动系统提示词）
+    assert a["code"] == a_orig["code"]
+    assert a["tools"] == a_orig["tools"]
+    shutil.rmtree(tmp)
+
+
+def test_analyze_inventory_candidate_a_uses_common_base():
+    """候选批的 inventory 差分：A 臂提示词基线 = 公共段（非 PROMPT_A），
+    工具面差分仍必须恰为 run_code + read_skill + list_skill。"""
+    def one(arm):
+        tools = ["shell", "read_file", "write_file", "edit_file", "list_dir"]
+        guest = None
+        if arm == "A":
+            tools = tools + ["run_code", "read_skill", "list_skill"]
+            guest = [{"name": n} for n in ("run_code", "read_file",
+                                           "write_file", "edit_file",
+                                           "list_dir")]
+        # 候选 A 的真实提示词 = 公共段 + 技能索引 intro（render_intro）
+        sp = (cv_eval.PROMPT_COMMON + "\n## 可用技能 (skills)\n- run-code: x\n"
+              if arm == "A" else cv_eval.PROMPT_COMMON)
+        return {"task": "t1", "arm": arm, "agent_tool_names": tools,
+                "request_tool_names": [tools], "guest_tools": guest,
+                "system_prompt": sp}
+    inv = {f"t1-g2i{i}-{arm}": one(arm)
+           for i in (1, 2) for arm in ("A", "B")}
+    r = cv_eval.analyze_inventory(inv, candidate=True)
+    assert r["problems"] == [], r["problems"]
+    # 原配方口径下同一 inventory 必须报错（A 缺能力段前缀）——
+    # candidate 开关真实改变校验基线，不是无操作
+    r_orig = cv_eval.analyze_inventory(inv)
+    assert any("capability section" in p for p in r_orig["problems"])
+
+
+def _make_g2c_batch(tmp_path, price=None, cost_stop=None, finalize=False):
+    """构造可执行的 g2c 批次（manifest + configs + inventory）。"""
+    batch = tmp_path / "g2cbatch"
+    batch.mkdir(parents=True)
+    schedule = [{"order": i, "run_id": f"{t}-{inst}-{a}", "task": t,
+                 "instance": inst, "arm": a}
+                for i, (t, inst, a) in enumerate(cv_eval.G2C_RUNS)]
+    manifest = {
+        "stage": "g2c", "run_schedule": schedule,
+        "token_stop": {"stage_envelope": cv_eval.G2C_TOKEN_ENVELOPE,
+                       "per_run_soft_gate": 80_000},
+        "model": "stub-model",
+        "price_snapshot": price, "cost_currency":
+            (price or {}).get("currency"), "cost_stop": cost_stop,
+        "binary_hash": None, "fixture_hash": None, "task_hash": None,
+        "prompt_hashes": None,
+        "g2_data_hashes": {
+            f"{inst}-{task}": {
+                name: hashlib.sha256(blob).hexdigest()
+                for name, blob in fixture.g2_serialize(inst, task).items()}
+            for inst in fixture.G2_INSTANCE_IDS
+            for task in ("t0", "t1", "t2")},
+        "prior_spent_tokens_at_freeze": 0,
+    }
+    for s in schedule:
+        cfg_dir = batch / "configs"
+        cfg_dir.mkdir(exist_ok=True)
+        cfg = {"model": "stub-model", "workdir":
+               str(batch / "runs" / s["run_id"] / "wd"),
+               "code": {"enabled": s["arm"] == "A"}}
+        (cfg_dir / f"{s['run_id']}.json").write_text(
+            json.dumps(cfg), encoding="utf-8")
+    (batch / "inventory_analysis.json").write_text(
+        json.dumps({"problems": [], "per_task": {}}), encoding="utf-8")
+    (batch / "manifest.json").write_text(json.dumps(manifest),
+                                         encoding="utf-8")
+    if finalize:
+        price_path = tmp_path / "price.json"
+        price_path.write_text(json.dumps(price), encoding="utf-8")
+        args = type("A", (), {"batch": str(batch), "price": str(price_path),
+                              "cost_stop": cost_stop})()
+        cv_eval.cmd_finalize_g2c(args)
+    return batch
+
+
+def test_run_g2c_executes_four_and_scores_per_instance(
+        tmp_path, monkeypatch):
+    """G2C 执行回路：4 runs 全跑、判卷用实例级 gold（g2i1 的答案在
+    g2i2 必须判错——与 run-g2 同款实例级判卷纪律）。"""
+    batch = _make_g2c_batch(tmp_path, TEST_PRICE, 100.0, finalize=True)
+    _patch_for_stub(monkeypatch, "normal")
+    monkeypatch.setattr(cv_eval, "run_binary",
+                        _stub_run_binary_g2("g2i1"))
+    args = type("A", (), {"batch": str(batch), "execute": True})()
+    cv_eval.cmd_run_g2c(args)
+    ledger = json.load(open(batch / "ledger.json", encoding="utf-8"))
+    assert ledger["runs"] == 4
+    for s in batch_manifest(batch)["run_schedule"]:
+        summary = json.load(open(batch / "runs" / s["run_id"] /
+                                 "summary.json", encoding="utf-8"))
+        want = s["instance"] == "g2i1"
+        assert summary["delivered_exact"] is want, s["run_id"]
+    assert ledger["combined_cap"]["g2c_spent_tokens"] > 0
+
+
+def test_run_g2c_combined_cap_reads_g1_and_g2(tmp_path, monkeypatch):
+    """联合封顶的先行读数：g2c 计入 g1+g2 两个先行 stage 的 ledger。"""
+    art = tmp_path / "art"
+    for name, stage, tokens in (("g1-a", "g1", 100),
+                                ("g2-x", "g2", 200),
+                                ("g0-y", "g0", 777),
+                                ("g2c-z", "g2c", 999)):
+        d = art / name
+        d.mkdir(parents=True)
+        (d / "manifest.json").write_text(
+            json.dumps({"stage": stage}), encoding="utf-8")
+        (d / "ledger.json").write_text(json.dumps({
+            "budget_gate_final": {"ledger_tokens": tokens,
+                                  "unknown_reserve_tokens": 0}}),
+            encoding="utf-8")
+    monkeypatch.setattr(cv_eval, "ART", art)
+    # g2 联合封顶只算 g1；g2c 算 g1+g2
+    assert cv_eval.g1_spent_tokens() == 100
+    assert cv_eval.prior_spent_tokens(cv_eval.PRIOR_STAGES["g2c"]) == 300
+
+
+def test_run_g2c_refuses_hand_edited_price(tmp_path, monkeypatch):
+    """P1-02 同款：手改 manifest 填价表（无 config_hashes）→ 拒绝执行。"""
+    batch = _make_g2c_batch(tmp_path, TEST_PRICE, 100.0, finalize=False)
+    _patch_for_stub(monkeypatch, "normal")
+    args = type("A", (), {"batch": str(batch), "execute": True})()
+    with pytest.raises(SystemExit, match="付费前置缺失"):
+        cv_eval.cmd_run_g2c(args)
+
+
+def test_verify_frozen_recipe_g2c_schedule():
+    """G2C 批次：schedule 必须与 G2C_RUNS 全等；乱序拒绝。"""
+    batch = Path(tempfile.mkdtemp())
+    schedule = [{"order": i, "run_id": f"{t}-{inst}-{a}", "task": t,
+                 "instance": inst, "arm": a}
+                for i, (t, inst, a) in enumerate(cv_eval.G2C_RUNS)]
+    manifest = {"stage": "g2c", "run_schedule": schedule,
+                "g2_data_hashes": {
+                    f"{inst}-{task}": {
+                        name: hashlib.sha256(blob).hexdigest()
+                        for name, blob in
+                        fixture.g2_serialize(inst, task).items()}
+                    for inst in fixture.G2_INSTANCE_IDS
+                    for task in ("t0", "t1", "t2")},
+                "model": "m"}
+    (batch / "inventory_analysis.json").write_text(
+        json.dumps({"problems": [], "per_task": {}}), encoding="utf-8")
+    for s in schedule:
+        (batch / "configs").mkdir(exist_ok=True)
+        (batch / "configs" / f"{s['run_id']}.json").write_text(
+            json.dumps({"model": "m"}), encoding="utf-8")
+    assert cv_eval.verify_frozen_recipe(batch, manifest) == []
+    bad = dict(manifest)
+    bad["run_schedule"] = list(reversed(schedule))
+    probs = cv_eval.verify_frozen_recipe(batch, bad)
+    assert any("schedule_drift" in p for p in probs)
+    shutil.rmtree(batch)
