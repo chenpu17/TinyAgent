@@ -11,6 +11,27 @@
 
 修订记录（历史不作为现行规格）：
 
+- **v0.7.2（外部审核缺陷修复轮：lib 家族三项）**：读数来源 = 外部代码审核
+  报告（基线 c555074 / 0.4.1；与本轮配套的 llm/批侧修复见姊妹稿 v0.7.5）。
+  ① **MD-2 补注：lib 家族遵守 Hooks::Modify（审核 P1-2）**——`lib_reserved_call`
+  原先把 Modify 当 Allow、仍执行原始路径（宿主把 lib/unsafe.js 重定向到
+  lib/safe.js 时实际执行的是 unsafe）。现对**改后路径**重跑 ①lib/ 边界
+  ②deny_paths，失败 → kind="denied" 拒绝（与 deny/fs 层同语义：不发
+  after_tool）；执行用改后路径，after_tool 恒用原始参数，trace 补
+  `in_hash_eff` 双哈希（与 host_call_tool 对齐）。
+  ② **MD-10 补注：saveLib 的 INDEX 读取错误分诊（审核 P1-3）**——原先
+  `readAll("lib/INDEX.md")` 的所有异常被空 catch 吞掉、按空索引 upsert，
+  一次性抹掉全部既有登记与批准还报成功。现只有**确定的文件不存在**可初始化
+  空索引（匹配 "No such file or directory"，Windows 腿 "cannot find the
+  file"）；hooks 拒绝、IO 错误、分页异常一律中止并保留旧索引（fail-closed：
+  无法识别的错误文本也中止）。库文件半态（已写、INDEX 未动）与既有
+  partial-failure 语义一致。
+  ③ **登记键规范化（审核 P2-6）**——`__hash_file` 输出增补 `"rel"` 字段
+  （canonical workdir 相对路径，与 lib_sessions 登记键同源）；saveLib 的
+  manifest 键改用 `h.rel`（`lib/./x.js`、`lib/../lib/z.js` 落规范 `path=`
+  键，不再写出 parser 拒收的毒行）。写回前对既有 ta-lib 行做镜像宿主
+  parser 的轻校验（结构五键齐全、path 值干净、跨行去重），畸形则中止不写。
+  新增模型可见错误文案（saveLib 抛出的 JS Error）登记于本条。
 - **v0.7.1（M1 落码定稿）**：助手改名 **writeVerified → saveLib**——代码基线 prelude
   已有 `writeVerified(path, content)`（v2 P1 字节保真写助手，模型可见契约在册），
   设计稿同名新助手会静默改掉既有语义，改名消除冲突（本条即修订记录，附录同步）。

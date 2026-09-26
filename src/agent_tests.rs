@@ -8515,6 +8515,66 @@ fn run_code_switch_face_none_branch() {
     }
 }
 
+/// External audit P2-5: set_code_config is a trusted config entrance — it
+/// runs the same llm tier invariants the load-time path enforces BEFORE
+/// replacing (a default outside the allowlist used to install silently,
+/// and the first omitted-model llm call dispatched to the unlisted model).
+#[cfg(feature = "code")]
+#[test]
+fn set_code_config_rejects_invalid_llm_tier() {
+    let cfg: Config = serde_json::from_str(
+        r#"{"provider":"openai","api_key_env":"MOCK_API_KEY","model":"m",
+            "inject_environment":false,"tools":["read_file"],"code":{"enabled":true}}"#,
+    )
+    .unwrap();
+    let mut agent = crate::build_agent_with_provider(
+        &cfg,
+        Box::new(MockProvider::new(vec![mock::resp_text("x", None)]).0),
+        vec![],
+        &reqwest::blocking::Client::new(),
+        vec![],
+        "k",
+    )
+    .unwrap();
+    assert!(agent.tool_names().contains(&"run_code".to_string()));
+
+    // 1. default outside the allowlist → Err naming the invariant.
+    let mut bad = cfg.code.clone();
+    bad.llm.enabled = true;
+    bad.llm.default_model = Some("outside".into());
+    bad.llm.models = vec!["allowed".into()];
+    let err = agent.set_code_config(bad).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("code.llm.default_model") && msg.contains("code.llm.models"),
+        "actionable error naming the invariant: {msg}"
+    );
+
+    // 2. enabled with an empty allowlist → Err.
+    let mut bad = cfg.code.clone();
+    bad.llm.enabled = true;
+    bad.llm.default_model = Some("m1".into());
+    bad.llm.models = vec![];
+    let err = agent.set_code_config(bad).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("non-empty code.llm.models"),
+        "{}",
+        format!("{err:#}")
+    );
+
+    // 3. The failed writes left the installed config untouched — the tool
+    // table still agrees with the original enabled state.
+    assert!(agent.tool_names().contains(&"run_code".to_string()));
+
+    // 4. A valid tier (with duplicate spellings) installs cleanly.
+    let mut good = cfg.code.clone();
+    good.llm.enabled = true;
+    good.llm.default_model = Some("m1".into());
+    good.llm.models = vec!["m1".into(), "m1".into(), "m2".into()];
+    agent.set_code_config(good).unwrap();
+    assert!(agent.tool_names().contains(&"run_code".to_string()));
+}
+
 // ── context_breakdown: composition, calibration, attribution ─────────────
 //
 // The breakdown's own arithmetic (running-floor partition, per-bucket sums)

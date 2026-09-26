@@ -11,6 +11,40 @@
 
 修订记录（历史仅说明演进，当前正文与决策表为规格）：
 
+- **v0.7.5（外部审核缺陷修复轮：终止契约 / setter 验证 / panic 审计 / 批墙钟）**：
+  读数来源 = 外部代码审核报告（基线 c555074 / 0.4.1，7 项可复现运行时缺陷，
+  本轮全部修复；探针与观测在审核方环境）。
+  ① **LD-7/LD-17 终止契约补全（审核 P1-1）**：`provider.chat` 返回 Ok 不等于
+  响应完整——stop_reason ∈ {stream_error, stream_truncated, stream_idle,
+  cancelled, max_tokens}（与外层 agent 的 aborted 词表同源）时，LlmTool 返回
+  **kind="llm" 错误**：消息点名 stop_reason 并附截断文本（过 max_output_chars
+  截断），部分 usage 照实结算并随错误封套折叠（usage_in_shared_budget=true，
+  形状同 llm_output miss 路径）；无 usage 保留预占（LD-17 row 2 同款）。
+  **max_tokens 定约为不完整输出错误**（审核方确认）：调用方的 cap 切断了生成，
+  残缺文本不以成功身份返回，调用方自决是否提高 max_tokens 重问。终止检查位于
+  结算之后、labels 校验之前——截断的 "yes" 不得过词表校验冒充判定。
+  LD-17 矩阵增行「transport Ok 但 stop_reason 异常终止」：charge = actual
+  （有 usage）否则 reserve。新增模型可见错误文案登记于本条：
+  `llm: response ended abnormally (stop_reason={sr}) — the output is incomplete
+  and was not returned as a result; partial text: {text}` /
+  `llm: output hit the max_tokens cap (stop_reason=max_tokens) — …`。
+  ② **LD-5 入口收敛（审核 P2-5）**：llm 不变式（models 非空、default_model
+  必填且 ∈ models、首现去重）提取为 `CodeConfig::normalize_and_validate_llm`，
+  `Config::validate_and_normalize` 与 `Agent::set_code_config` 共用（**先验证
+  再替换**）；LlmTool 省略 model 分支对最终模型一律校验（注册表快照可能早于
+  任何验证落地）。绑定侧 set_code_config 透传同一 Err，无需各自改动。
+  ③ **批 panic 占位审计（审核 P2-7）**：`Tool` trait 新增
+  `panic_audit_row(input, ctx)`（默认 None）；LlmTool 覆写——从 worker 实际
+  派发的**有效输入**重推 (model, est)，占位 ToolOutput 附 `llm_call` 行
+  （actual:null，不伪造实际用量），经完成尾折叠进 meta.llm，使 ReserveGuard
+  Drop 保留的预占可在总账对账。错误 class 仍 "tool"（worker 崩溃不是 llm
+  分类失败）。release panic=abort 下进程直接结束，本条只覆盖 unwind 构建。
+  ④ **callBatch 墙钟检查点（审核 P2-4）**：波内**每项 inline 执行前、每次
+  worker 派发前**刷新 cancel+deadline 闩锁（新增 `batch_wave_interrupt_refresh`，
+  刻意不短路既有 budget 闩锁——prep 已计数的 admission 不受 call-limit 拒绝
+  牵连）；未启动项以 kind=deadline/cancel halted:true 拒绝并配平事件，在飞
+  调用允许完成。派发对齐：refused-before-spawn 的条目不再与 join 循环 zip
+  错位（`launched` 数组取代 spawn 位置 zip）。
 - **v0.7.4（V0-B 正式轮读数登记：A③ 零效应 + include 零采用；规格文字未动，
   修订讨论开启）**：读数来源 `docs/code_v0b_report.md` §5（四臂主批
   v1.4 / 协议 v2.1 / 外层 deepseek-flash@8192 交错 ×3 + e3 预算复查 + e1

@@ -216,6 +216,55 @@ impl Tool for LlmTool {
         }
     }
 
+    /// External audit P2-7: the batch panic placeholder's audit row. A
+    /// worker running THIS tool that died mid-call held an LD-17 reservation
+    /// its guard's Drop kept — this re-derives (model, est) from the
+    /// EFFECTIVE input the worker was dispatched with, exactly the way
+    /// [`Tool::run`] computes them, so `reserved` matches what the dropped
+    /// guard holds. `None` when the entry never reached the reservation
+    /// (invalid params — run refuses before reserving) or no gate is
+    /// installed (nothing was held).
+    fn panic_audit_row(&self, input: &Value, ctx: &ToolCtx) -> Option<Value> {
+        match ctx.budget.as_ref() {
+            Some(g) if g.cap > 0 => {}
+            // run() reserves only under an installed gate — nothing is held.
+            _ => return None,
+        }
+        let prompt = input.get("prompt").and_then(Value::as_str)?;
+        let system = match input.get("system") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => Some(s.as_str()),
+            Some(_) => return None, // param error — refused pre-reserve
+        };
+        let model: &str = match input.get("model") {
+            None | Some(Value::Null) => {
+                let m = self.cfg.default_model.as_ref()?;
+                if !self.cfg.models.contains(m) {
+                    return None; // refused pre-reserve
+                }
+                m.as_str()
+            }
+            Some(Value::String(s)) => {
+                if !self.cfg.models.iter().any(|m| m == s) {
+                    return None; // refused pre-reserve
+                }
+                s.as_str()
+            }
+            Some(_) => return None,
+        };
+        let max_tokens: u64 = match input.get("max_tokens") {
+            None | Some(Value::Null) => 1024,
+            Some(v) => match v.as_u64() {
+                Some(n) if (1..=8192).contains(&n) => n,
+                _ => return None, // refused pre-reserve
+            },
+        };
+        let est = est_in_tokens(prompt)
+            .saturating_add(system.map_or(0, est_in_tokens))
+            .saturating_add(max_tokens);
+        Some(LlmTool::audit_row(model, est, None, false))
+    }
+
     fn run(&self, input: &Value, ctx: &ToolCtx) -> anyhow::Result<ToolOutput> {
         // ── params — validated on the EFFECTIVE input (§3.1: hooks Modify
         // landed before us; a modified model/max_tokens is re-checked
@@ -236,9 +285,21 @@ impl Tool for LlmTool {
         };
         let model: String = match input.get("model") {
             None | Some(Value::Null) => match &self.cfg.default_model {
-                // Config validation guarantees default_model ∈ models when
-                // enabled — no re-check needed on this arm.
-                Some(m) => m.clone(),
+                // Final-model check (external audit P2-5): every trusted
+                // config entrance validates this invariant now, but the
+                // registry snapshots whatever cfg it was BUILT with — refuse
+                // here rather than dispatch to a model outside the tier,
+                // before any reservation or provider call.
+                Some(m) if self.cfg.models.contains(m) => m.clone(),
+                Some(m) => {
+                    return Ok(err_llm(
+                        format!(
+                            "llm: code.llm.default_model `{m}` is not in the \
+                             code.llm.models allowlist"
+                        ),
+                        None,
+                    ))
+                }
                 None => {
                     return Ok(err_llm(
                         "llm: no `model` given and code.llm.default_model is unset".into(),
@@ -429,7 +490,7 @@ impl Tool for LlmTool {
         };
         let row = LlmTool::audit_row(&model, reserved, actual, over_reserve);
 
-        // ── response text + LD-18 label validation.
+        // ── response text + termination check + LD-18 label validation.
         let text: String = resp
             .blocks
             .iter()
@@ -438,6 +499,51 @@ impl Tool for LlmTool {
                 _ => None,
             })
             .collect();
+        // Transport Ok ≠ response complete (external audit P1-1): providers
+        // normalize mid-stream failures into ChatResponses carrying partial
+        // content, partial usage, and an abort-vocabulary stop_reason — the
+        // outer agent maps these to retryable errors; this tool must not
+        // launder them into successes (a truncated "yes" passing label
+        // validation is exactly the honesty hole). max_tokens is the same
+        // class BY CONTRACT: the caller's cap cut the generation, the
+        // output is incomplete — an error naming the cap, never a partial
+        // success. The check runs AFTER settlement (the call's cost is
+        // real) and BEFORE label validation (termination, not vocabulary,
+        // is the failure being reported).
+        if matches!(
+            resp.stop_reason.as_str(),
+            "stream_error" | "stream_truncated" | "stream_idle" | "cancelled" | "max_tokens"
+        ) {
+            let mut msg = if resp.stop_reason == "max_tokens" {
+                format!(
+                    "llm: output hit the max_tokens cap (stop_reason=max_tokens) — the \
+                     text is cut mid-generation and was not returned as a result; raise \
+                     max_tokens and re-ask if it was needed; partial text: {text}"
+                )
+            } else {
+                format!(
+                    "llm: response ended abnormally (stop_reason={}) — the output is \
+                     incomplete and was not returned as a result; partial text: {text}",
+                    resp.stop_reason
+                )
+            };
+            crate::tools::truncate(&mut msg, ctx.max_output_chars);
+            return Ok(ToolOutput {
+                content: msg,
+                image: None,
+                is_error: true,
+                // The partial generation's cost is real: fold exactly like
+                // the llm_output-miss path (self-settled above — the settle
+                // already adjusted the counter; totals merge without
+                // re-sharing).
+                usage: resp.usage,
+                usage_in_shared_budget: true,
+                meta: Some(json!({
+                    "llm_err": "llm",
+                    "llm_call": row,
+                })),
+            });
+        }
         let label = match &labels {
             None => None,
             Some(ls) => {

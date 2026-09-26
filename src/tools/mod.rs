@@ -493,6 +493,19 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// Failure-audit row for a call that died mid-flight in a callBatch
+    /// worker (a panic): a resource hold that survived the death — the
+    /// sandbox `llm` primitive's LD-17 token reservation, kept by
+    /// `ReserveGuard::Drop` — still needs a ledger row explaining it, or
+    /// the batch placeholder leaves held tokens unattributable. The
+    /// override re-derives the hold from the EFFECTIVE input the worker was
+    /// dispatched with; `actual` stays null (never fabricated). Default
+    /// `None` = the tool holds no such context. run_code's panic-join
+    /// placeholder is the only caller.
+    fn panic_audit_row(&self, _input: &Value, _ctx: &ToolCtx) -> Option<Value> {
+        None
+    }
+
     /// Which source bucket this tool's schema belongs to in
     /// `Agent::context_breakdown`'s tool report. Default `Custom` — the
     /// safe attribution for anything the core didn't ship: a host-injected

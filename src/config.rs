@@ -556,35 +556,7 @@ impl Config {
         // at config time with the config blamed, not at the first sandbox
         // `llm` call with a confusing provider error. Every config entry
         // point (file load, Python inline dict) routes through here.
-        if self.code.llm.enabled {
-            if self.code.llm.models.is_empty() {
-                bail!(
-                    "code.llm.enabled requires a non-empty code.llm.models \
-                     allowlist (the cost tier guest `llm` calls may route within)"
-                );
-            }
-            match &self.code.llm.default_model {
-                None => bail!(
-                    "code.llm.enabled requires code.llm.default_model (the \
-                     model used when a guest llm call omits `model`)"
-                ),
-                Some(m) if !self.code.llm.models.contains(m) => bail!(
-                    "code.llm.default_model `{}` must appear in code.llm.models \
-                     — a default the tier cannot serve is a config typo, not a \
-                     runtime event",
-                    m
-                ),
-                _ => {}
-            }
-        }
-        // Stable first-occurrence dedup (plain `dedup` only collapses
-        // ADJACENT copies): declaration order is preserved for the
-        // batch-overlays intersection and the tool's allowlist never sees
-        // duplicates.
-        {
-            let mut seen = std::collections::HashSet::new();
-            self.code.llm.models.retain(|m| seen.insert(m.clone()));
-        }
+        self.code.normalize_and_validate_llm()?;
         Ok(())
     }
 
@@ -852,6 +824,47 @@ pub struct PartialLlmConfig {
 }
 
 impl CodeConfig {
+    /// `code.llm` normalization + enablement invariants (code_llm_design §5,
+    /// LD-5): stable first-occurrence dedup, then — when enabled — non-empty
+    /// allowlist and `default_model ∈ models`. Shared by EVERY trusted
+    /// config entrance: file load / Python inline dict (via
+    /// [`Config::validate_and_normalize`]) and the runtime
+    /// `Agent::set_code_config` hot replace (external audit P2-5: the setter
+    /// used to bypass this, letting a default outside the allowlist dispatch
+    /// real omitted-model calls).
+    pub(crate) fn normalize_and_validate_llm(&mut self) -> Result<()> {
+        // Stable first-occurrence dedup (plain `dedup` only collapses
+        // ADJACENT copies): declaration order is preserved for the
+        // batch-overlays intersection and the tool's allowlist never sees
+        // duplicates.
+        {
+            let mut seen = std::collections::HashSet::new();
+            self.llm.models.retain(|m| seen.insert(m.clone()));
+        }
+        if self.llm.enabled {
+            if self.llm.models.is_empty() {
+                bail!(
+                    "code.llm.enabled requires a non-empty code.llm.models \
+                     allowlist (the cost tier guest `llm` calls may route within)"
+                );
+            }
+            match &self.llm.default_model {
+                None => bail!(
+                    "code.llm.enabled requires code.llm.default_model (the \
+                     model used when a guest llm call omits `model`)"
+                ),
+                Some(m) if !self.llm.models.contains(m) => bail!(
+                    "code.llm.default_model `{}` must appear in code.llm.models \
+                     — a default the tier cannot serve is a config typo, not a \
+                     runtime event",
+                    m
+                ),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     /// §9 merge table. Exhaustive destructure (no `..`): a field added to
     /// [`PartialCodeConfig`] without a policy here is a compile error — the
     /// same anti-fossil discipline as `PartialLimits`. Fallsible only for

@@ -1255,14 +1255,14 @@ release 下 panic 不触发 `Drop`——调试 destructors（如 TUI 终端还�
 src/
 ├── main.rs           (  930)  # CLI 入口 + 组装（build_agent）+ --session none
 ├── lib.rs            (  551)  # 库根：build_agent* / assemble 装配（工具表、ToolCtx、code 安装、技能注入）
-├── config.rs         ( 1873)  # 配置解析 + 任务片段合并 + 批量覆盖白名单
+├── config.rs         ( 1886)  # 配置解析 + 任务片段合并 + 批量覆盖白名单
 ├── provider/  # LLM 后端
 │   ├── mod.rs            (  938)  # 共享 Message/Block、SSE reader、CancellableSse
 │   ├── openai.rs         ( 1657)  # OpenAI 兼容（include_usage；400 回退：max_tokens→max_completion_tokens / 丢 stream_options）
 │   ├── anthropic.rs      ( 1111)  # Anthropic 原生（message_start/message_delta usage）
 │   └── mock.rs           (  345)  # 测试用脚本化 Provider（cfg(any(test, feature="mock"))）
-├── agent.rs          ( 3434)  # 核心 loop + usage 累计 + cancel + 上下文压缩（前馈/溢出双触发 + 滚动分块摘要）+ 相邻消息归一 + 同 turn 多 task 并行
-├── agent_tests.rs    ( 8823)  # 核心 loop 回归测试（provider::mock 脚本化，不连网）
+├── agent.rs          ( 3440)  # 核心 loop + usage 累计 + cancel + 上下文压缩（前馈/溢出双触发 + 滚动分块摘要）+ 相邻消息归一 + 同 turn 多 task 并行
+├── agent_tests.rs    ( 8883)  # 核心 loop 回归测试（provider::mock 脚本化，不连网）
 ├── compress.rs       (  810)  # 压缩引擎（find_safe_cut / 分块摘要 / saturating usage 合并 + block 级计费原语）
 ├── context_report.rs (  785)  # 上下文构成分解（ContextBreakdown 估算口径：system 三段 / 工具四类 / 消息分型 + 锚点校准）
 ├── retry.rs          (  158)  # batch --retries / 单跑瞬态重试共用的指数退避（±25% jitter 防 lockstep）
@@ -1271,7 +1271,7 @@ src/
 ├── skills.rs         ( 1074)  # 三级技能加载（内置 / 用户目录 / 项目）
 ├── hooks.rs          (  181)  # hooks 闸门（Deny / Modify / 审计）
 ├── tools/  # 工具集：内置工具 + MCP 包装 + task 子 agent + run_code（feature code）
-│   ├── mod.rs            (  960)  # Tool trait + ToolCtx + CallbackTool/SharedTool + build 白名单组装
+│   ├── mod.rs            (  973)  # Tool trait + ToolCtx + CallbackTool/SharedTool + build 白名单组装
 │   ├── shell.rs          (  924)  # shell 工具
 │   ├── file.rs           ( 1345)  # read_file / write_file / edit_file / list_dir
 │   ├── image.rs          (   87)  # load_image 工具
@@ -1280,8 +1280,8 @@ src/
 │   ├── mcp.rs            (  485)  # MCP 工具包装（sanitize_name + wire_name 分发）
 │   ├── subagent.rs       (  917)  # task 子 agent 工具（独立上下文 + turn 封顶；不可递归）
 │   ├── todo.rs           (  310)  # todo 工具（任务计划，全量替换；plan 落 result.json）
-│   ├── run_code.rs       ( 9577)  # run_code 工具（feature code）：QuickJS-in-wasm 沙箱——epoch/fuel/mem 限额、路径拦截、hooks 闸门、审计 meta（双哈希）
-│   └── llm.rs            (  506)  # llm 判别原语（feature code + code.llm 门）：单发无状态内层模型调用——LD-17 预占/结算、LD-18 labels 归一、共享 Provider cell
+│   ├── run_code.rs       (10466)  # run_code 工具（feature code）：QuickJS-in-wasm 沙箱——epoch/fuel/mem 限额、路径拦截、hooks 闸门、审计 meta（双哈希）
+│   └── llm.rs            (  610)  # llm 判别原语（feature code + code.llm 门）：单发无状态内层模型调用——LD-17 预占/结算、LD-18 labels 归一、共享 Provider cell
 ├── mcp.rs            ( 1427)  # MCP 客户端（stdio / Streamable HTTP / 旧版 SSE）
 ├── batch.rs          ( 3047)  # 批量任务 + --retries/--failed + 报告合并
 ├── harness.rs        ( 2003)  # headless 模式 + result.json + NDJSON + exit code

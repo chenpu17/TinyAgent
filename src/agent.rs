@@ -1113,11 +1113,17 @@ impl Agent {
     /// Errors when this agent has no installed instance (feature-off build,
     /// or direct `try_new` construction) — there is nothing to configure.
     #[cfg(feature = "code")]
-    pub fn set_code_config(&mut self, cfg: crate::config::CodeConfig) -> Result<()> {
+    pub fn set_code_config(&mut self, mut cfg: crate::config::CodeConfig) -> Result<()> {
         let tool = self
             .code_tool
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no run_code tool installed on this agent"))?;
+        // Validate BEFORE replacing (external audit P2-5): this setter is a
+        // trusted config entrance too (both bindings route here), so it runs
+        // the same llm invariants every load-time path enforces — a default
+        // outside the allowlist fails HERE, not at the first omitted-model
+        // `llm` call dispatched to a model the tier never admitted.
+        cfg.normalize_and_validate_llm()?;
         let want = cfg.enabled;
         {
             let mut g = tool

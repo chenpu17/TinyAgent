@@ -649,6 +649,11 @@ fn lib_reserved_call(caller: &mut Caller<'_, HostCtx>, name: &str, args: &Value)
     // "hash_file" — MD-2 ③): dunder names are the wire protocol, the
     // policy surface is the tool the action actually is.
     let pseudo = name.trim_start_matches("__");
+    // Dual-hash audit (§8.4): the hooks-Modify effective input's hash, set
+    // only when a Modify actually changed the input (external audit P1-2 —
+    // the lib family used to treat Modify as Allow and left this always
+    // None).
+    let mut in_hash_eff: Option<String> = None;
     let (output, class) = {
         let d = caller.data();
         // SAFETY: same frame-limited alias as in `host_call_tool`.
@@ -695,21 +700,59 @@ fn lib_reserved_call(caller: &mut Caller<'_, HostCtx>, name: &str, args: &Value)
                         notify_tool_after(&d.ctx, pseudo, args, &output, false);
                         (output, "hooks")
                     }
-                    _ => {
-                        if ctx_cancelled(&d.ctx) {
-                            let output = ToolOutput::error(CANCEL_HALTED_WHY.to_string());
-                            notify_tool_after(&d.ctx, pseudo, args, &output, false);
-                            (output, "cancel")
-                        } else {
-                            let rel = confined.expect("policy_err None implies confined");
-                            let path = path.expect("policy_err None implies path");
-                            let (output, class) = if name == INCLUDE_NAME {
-                                include_deliver(d, &rel, path)
-                            } else {
-                                hash_file_register(d, &rel)
-                            };
-                            notify_tool_after(&d.ctx, pseudo, args, &output, true);
-                            (output, class)
+                    decision => {
+                        // Hooks Modify (external audit P1-2): the lib family
+                        // used to treat Modify as Allow and execute the
+                        // ORIGINAL path — a host redirecting lib/unsafe.js to
+                        // lib/safe.js still got unsafe. Mirror
+                        // `host_call_tool`'s shape: re-run the policy layers
+                        // (① confinement ② deny_paths) on the EFFECTIVE
+                        // path; a modified path that fails them is a
+                        // refusal (deny/fs semantics — after_tool does not
+                        // fire), never a silent fallback to the original.
+                        let effective: Value = match &decision {
+                            ToolDecision::Modify(v) => v.clone(),
+                            _ => args.clone(),
+                        };
+                        let eff_path = effective.get("path").and_then(Value::as_str);
+                        let eff_confined = eff_path.and_then(|p| lib_rel(&d.workdir_canon, p));
+                        let eff_err = match (&eff_path, &eff_confined) {
+                            (Some(p), Some(rel)) if !deny_match(&d.snap.deny_paths, rel) => None,
+                            (Some(p), _) => Some(format!(
+                                "run_code: hooks Modify replaced the path with '{p}', \
+                                 which is not an admissible lib path (relative under \
+                                 lib/, not matching code.deny_paths) — refusing rather \
+                                 than falling back to the original"
+                            )),
+                            (None, _) => Some(
+                                "run_code: hooks Modify dropped the string 'path' field \
+                                 the lib helpers need — refusing rather than falling \
+                                 back to the original"
+                                    .to_string(),
+                            ),
+                        };
+                        match eff_err {
+                            Some(err) => (ToolOutput::error(err), "denied"),
+                            None => {
+                                if ctx_cancelled(&d.ctx) {
+                                    let output = ToolOutput::error(CANCEL_HALTED_WHY.to_string());
+                                    notify_tool_after(&d.ctx, pseudo, args, &output, false);
+                                    (output, "cancel")
+                                } else {
+                                    if effective != *args {
+                                        in_hash_eff = Some(hash_input(&effective).1);
+                                    }
+                                    let rel = eff_confined.expect("eff_err None implies confined");
+                                    let eff_path = eff_path.expect("eff_err None implies path");
+                                    let (output, class) = if name == INCLUDE_NAME {
+                                        include_deliver(d, &rel, eff_path)
+                                    } else {
+                                        hash_file_register(d, &rel)
+                                    };
+                                    notify_tool_after(&d.ctx, pseudo, args, &output, true);
+                                    (output, class)
+                                }
+                            }
                         }
                     }
                 },
@@ -720,15 +763,16 @@ fn lib_reserved_call(caller: &mut Caller<'_, HostCtx>, name: &str, args: &Value)
     {
         let d = caller.data_mut();
         // ④ trace (MD-2): the wire name — audit records what the guest
-        // actually called. No `in_hash_eff`: the lib family has no Modify
-        // path (the path IS the input).
+        // actually called; `in_hash_eff` records the hooks-Modify effective
+        // input when it differed (dual-hash discipline, host_call_tool
+        // parity).
         d.calls.push(CallTrace {
             name: name.to_string(),
             ok: !output.is_error,
             ms: started.elapsed().as_millis(),
             in_len,
             in_hash,
-            in_hash_eff: None,
+            in_hash_eff,
         });
     }
     if output.is_error {
@@ -846,7 +890,12 @@ fn hash_file_register(d: &HostCtx, rel: &str) -> (ToolOutput, &'static str) {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert((rel.to_string(), hex.clone()));
     (
-        ToolOutput::text(json!({ "sha256": hex, "bytes": src.len() }).to_string()),
+        // `rel` (external audit P2-6): the CANONICAL workdir-relative path
+        // the registration was keyed under — saveLib's manifest entry must
+        // use this spelling, never a raw `path.slice(4)` of the guest's
+        // spelling ("lib/./x.js" used to write an entry the parser
+        // rejects, poisoning the whole channel).
+        ToolOutput::text(json!({ "sha256": hex, "bytes": src.len(), "rel": rel }).to_string()),
         "tool",
     )
 }
@@ -883,6 +932,47 @@ fn batch_wave_halt_refresh(d: &mut HostCtx) -> Option<HaltState> {
         });
     }
     d.halted.clone()
+}
+
+/// Mid-wave execution checkpoint (external audit P2-4): unlike the
+/// wave-start refresh above, this deliberately does NOT short-circuit on
+/// an existing `halted` latch — a kind="budget" latch from this batch's
+/// own call-limit refusal must not refuse entries that prep already
+/// admitted (the quota counted them at admission; the per-entry budget
+/// arithmetic in the prep loop is the sole judge of that class). It
+/// refreshes ONLY the run-stopping sources — host cancel and the wall
+/// clock — latching interrupt+halted together exactly like the
+/// single-call entry gate, so in-flight calls complete while unstarted
+/// ones refuse with the halt state and keep their event pair.
+fn batch_wave_interrupt_refresh(d: &mut HostCtx) -> Option<HaltState> {
+    if d.interrupt.is_some() {
+        // Already latched (cancel/deadline) — the catchable-envelope retry
+        // discipline: the latch stands.
+        return d.halted.clone();
+    }
+    if ctx_cancelled(&d.ctx) {
+        d.interrupt = Some(Interrupt::Cancel);
+        let h = HaltState {
+            kind: "cancel",
+            why: CANCEL_HALTED_WHY.to_string(),
+        };
+        d.halted = Some(h.clone());
+        return Some(h);
+    }
+    if d.deadline.is_some_and(|w| Instant::now() >= w.at) {
+        let why = format!(
+            "run_code: {} — the sandbox is halted for the rest of this execution",
+            deadline_why(&d.snap, d.deadline.map(|w| w.from_cfg).unwrap_or(false))
+        );
+        d.interrupt = Some(Interrupt::Deadline);
+        let h = HaltState {
+            kind: "deadline",
+            why,
+        };
+        d.halted = Some(h.clone());
+        return Some(h);
+    }
+    None
 }
 
 /// What one announced batch entry carries until it resolves (the audit /
@@ -1311,10 +1401,17 @@ fn call_batch_dispatch(caller: &mut Caller<'_, HostCtx>, args: &Value) -> i64 {
             };
             let emit_ptr = caller.data().emit;
             for (idx, name, input) in inline {
-                // Pre-body cancel re-check — the inline twin of the worker
-                // checkpoint below.
-                if ctx_cancelled(&ctx) {
-                    let output = ToolOutput::error(CANCEL_HALTED_WHY.to_string());
+                // Pre-body latch refresh — the inline twin of the worker
+                // checkpoint below, extended to the WALL CLOCK (external
+                // audit P2-4): the deadline used to be checked only at wave
+                // start, so a wave of slow Sequential tools kept STARTING
+                // new calls long past it (8 × 160ms tools vs an 80ms
+                // deadline all ran). The refresh latches exactly like the
+                // single-call entry gate: in-flight calls complete, unstarted
+                // entries refuse with the halt state and keep their event
+                // pair.
+                if let Some(h) = batch_wave_interrupt_refresh(caller.data_mut()) {
+                    let output = ToolOutput::error(h.why.clone());
                     refuse_batch_entry(
                         caller,
                         &mut metas,
@@ -1322,7 +1419,7 @@ fn call_batch_dispatch(caller: &mut Caller<'_, HostCtx>, args: &Value) -> i64 {
                         idx,
                         EntryFinal {
                             output,
-                            class: "cancel",
+                            class: h.kind,
                             halted: true,
                         },
                         Some(false),
@@ -1373,7 +1470,37 @@ fn call_batch_dispatch(caller: &mut Caller<'_, HostCtx>, args: &Value) -> i64 {
                         armed: true,
                     };
                     let mut handles = Vec::with_capacity(spawn.len());
+                    // The (idx, name, effective input) of every entry that
+                    // actually got a worker — entries refused at the
+                    // pre-spawn latch refresh below push no handle, so the
+                    // join phase must not zip against `spawn` positionally
+                    // (misaligned idx↔handle would attribute panics to the
+                    // wrong entry).
+                    let mut launched: Vec<(usize, String, Value)> = Vec::with_capacity(spawn.len());
                     for (idx, name, input) in &spawn {
+                        // Pre-spawn latch refresh on the MAIN thread
+                        // (external audit P2-4's dispatch leg): the inline
+                        // phase above (or earlier waves) may have spent the
+                        // wall clock — do not dispatch new paid calls past
+                        // the deadline. Refused entries complete here (no
+                        // worker ever existed), keeping the announced event
+                        // pair balanced.
+                        if let Some(h) = batch_wave_interrupt_refresh(caller.data_mut()) {
+                            let output = ToolOutput::error(h.why.clone());
+                            refuse_batch_entry(
+                                caller,
+                                &mut metas,
+                                &mut finals,
+                                *idx,
+                                EntryFinal {
+                                    output,
+                                    class: h.kind,
+                                    halted: true,
+                                },
+                                Some(false),
+                            );
+                            continue;
+                        }
                         let tools = Arc::clone(&tools);
                         let defs = Arc::clone(&defs);
                         let ctx = ctx.clone();
@@ -1381,6 +1508,7 @@ fn call_batch_dispatch(caller: &mut Caller<'_, HostCtx>, args: &Value) -> i64 {
                         let input = input.clone();
                         let tx = tx.clone();
                         let idx = *idx;
+                        launched.push((idx, name.clone(), input.clone()));
                         handles.push(s.spawn(move || {
                             let mut emit = |ev: AgentEvent| {
                                 // Blocks when the funnel is full — the drain
@@ -1432,17 +1560,31 @@ fn call_batch_dispatch(caller: &mut Caller<'_, HostCtx>, args: &Value) -> i64 {
                         }
                     }
                     unwind_guard.armed = false;
-                    // Join in spawn order: a panicked worker never sent Done —
+                    // Join in launch order: a panicked worker never sent Done —
                     // it gets the loop's placeholder shape (an honest error
                     // entry, after_tool(executed=true) on the dispatch that
                     // did happen). The `is_none` guard keeps a pathological
                     // panic-after-Done from overwriting (or double-finishing)
                     // the already-recorded outcome.
-                    for ((idx, _, _), h) in spawn.iter().zip(handles) {
-                        if h.join().is_err() && finals[*idx].is_none() {
-                            let output = ToolOutput::error("batch tool worker panicked");
-                            let meta = metas[*idx].take().expect("worker entry was announced");
-                            finals[*idx] = Some(EntryFinal {
+                    for ((idx, name, effective), h) in launched.into_iter().zip(handles) {
+                        if h.join().is_err() && finals[idx].is_none() {
+                            let mut output = ToolOutput::error("batch tool worker panicked");
+                            // External audit P2-7: a worker that died mid-call
+                            // may leave a resource hold behind (the llm
+                            // primitive's LD-17 reservation, kept by
+                            // ReserveGuard::Drop) — the placeholder carries
+                            // the tool's re-derived audit row so the ledger
+                            // explains those held tokens (model + estimate,
+                            // actual:null — never fabricated).
+                            if let Some(row) = tools
+                                .iter()
+                                .find(|t| t.def().name == name)
+                                .and_then(|t| t.panic_audit_row(&effective, &ctx))
+                            {
+                                output.meta = Some(json!({ "llm_call": row }));
+                            }
+                            let meta = metas[idx].take().expect("worker entry was announced");
+                            finals[idx] = Some(EntryFinal {
                                 output: output.clone(),
                                 class: "tool",
                                 halted: false,
@@ -2879,6 +3021,30 @@ function include(path) {
     catch (e) { delete __ta_libs[path]; throw e; }
     return undefined;
 }
+// Machine-line check mirroring the host parser (saveLib's write-back guard):
+// for a line that LOOKS like a ta-lib entry (<!-- ta-lib: … -->) return its
+// path value when the host parser would ACCEPT it; null when the host would
+// REJECT it (upserting alongside such a line keeps every include broken);
+// undefined when the line is not a machine line (prose — the host skips it).
+function __ta_lib_line_path(line) {
+    var t = line.trim(), toks, seen = {}, pv = null, i, j, k, segs;
+    if (t.substring(0, 12) !== "<!-- ta-lib:" || t.substring(t.length - 3) !== "-->") return undefined;
+    toks = t.substring(12, t.length - 3).trim().split(/\s+/);
+    for (i = 0; i < toks.length; i++) {
+        j = toks[i].indexOf("=");
+        if (j <= 0) return null;
+        k = toks[i].substring(0, j);
+        if (k !== "path" && k !== "sha256" && k !== "needs" && k !== "ver" && k !== "st") return null;
+        if (seen[k]) return null;
+        seen[k] = 1;
+        if (k === "path") pv = toks[i].substring(j + 1);
+    }
+    if (!seen.path || !seen.sha256 || !seen.needs || !seen.ver || !seen.st) return null;
+    if (!pv || pv.substring(0, 1) === "/" || pv.indexOf("..") !== -1) return null;
+    segs = pv.split("/");
+    for (i = 0; i < segs.length; i++) if (!segs[i]) return null;
+    return pv;
+}
 function saveLib(path, src) {
     path = String(path);
     if (path.indexOf("lib/") !== 0) throw new Error("saveLib: path must start with lib/ (got " + path + ")");
@@ -2888,11 +3054,32 @@ function saveLib(path, src) {
     if (/\s/.test(path)) throw new Error("saveLib: path must not contain whitespace — INDEX.md lines are whitespace-tokenized (got " + path + ")");
     tools.call("write_file", {path: path, content: src});
     var h = tools.call("__hash_file", {path: path});
-    var rel = path.slice(4), tok = "path=" + rel;
+    // The host returns the CANONICAL rel path it registered the content
+    // under — the manifest key must be that spelling, never a raw slice of
+    // the guest's input ("lib/./x.js" used to write an entry the parser
+    // rejects, poisoning the whole channel).
+    var rel = h && h.rel && h.rel.indexOf("lib/") === 0 ? h.rel.slice(4) : path.slice(4), tok = "path=" + rel;
     var text = "";
-    try { text = readAll("lib/INDEX.md"); } catch (e) {}
-    var lines = text ? text.split("\n") : [], out = [], hit = false, needs = "-", ver = "1", i, j, seg;
+    try { text = readAll("lib/INDEX.md"); }
+    catch (e) {
+        // Only a definite "file does not exist" may initialize an empty
+        // index; a hooks Deny, an IO error, or a paging anomaly must ABORT —
+        // upserting onto a blank would overwrite every existing registration
+        // and approval and still report success.
+        var em = String(e);
+        if (em.indexOf("No such file or directory") === -1 && em.indexOf("cannot find the file") === -1) throw e;
+        text = "";
+    }
+    var lines = text ? text.split("\n") : [], out = [], hit = false, needs = "-", ver = "1", i, j, seg, seenPaths = {}, checked;
     for (i = 0; i < lines.length; i++) {
+        if (lines[i].indexOf("<!-- ta-lib:") !== -1) {
+            checked = __ta_lib_line_path(lines[i]);
+            if (checked === null) throw new Error("saveLib: lib/INDEX.md has a malformed ta-lib line the host parser rejects — fix it before saving: " + lines[i].trim());
+            if (checked !== undefined) {
+                if (seenPaths[checked]) throw new Error("saveLib: lib/INDEX.md has duplicate ta-lib entries for path " + checked + " — fix it before saving");
+                seenPaths[checked] = 1;
+            }
+        }
         seg = lines[i].split(" ");
         if (lines[i].indexOf("ta-lib:") !== -1 && seg.indexOf(tok) !== -1) {
             for (j = 0; j < seg.length; j++) {
@@ -7505,6 +7692,248 @@ return t.length;"#}),
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// External audit P1-2: the lib family honors Hooks::Modify — the
+    /// EFFECTIVE path is re-validated against the lib boundary and
+    /// deny_paths before execution (a host redirecting unsafe→safe must
+    /// actually land on safe), the trace carries the dual hash, and a
+    /// Modify that produces an inadmissible path refuses (kind="denied")
+    /// instead of silently running the original.
+    #[test]
+    fn lib_modify_revalidated_dual_hashed() {
+        struct Redirect {
+            from: &'static str,
+            to: &'static str,
+        }
+        impl crate::hooks::Hooks for Redirect {
+            fn before_tool(
+                &self,
+                tool: &str,
+                input: &Value,
+                _c: &ToolCtx,
+            ) -> crate::hooks::ToolDecision {
+                if (tool == "include" || tool == "hash_file")
+                    && input.get("path").and_then(Value::as_str) == Some(self.from)
+                {
+                    crate::hooks::ToolDecision::Modify(json!({ "path": self.to }))
+                } else {
+                    crate::hooks::ToolDecision::Allow
+                }
+            }
+        }
+        let dir = scratch();
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        std::fs::write(dir.join("lib/unsafe.js"), "globalThis.loaded = 'unsafe';").unwrap();
+        std::fs::write(dir.join("lib/safe.js"), "globalThis.loaded = 'safe';").unwrap();
+        let idx = format!(
+            "<!-- ta-lib: path=unsafe.js sha256={} needs=- ver=1 st=ok -->\n\
+             <!-- ta-lib: path=safe.js sha256={} needs=- ver=1 st=ok -->\n",
+            sha256_hex(b"globalThis.loaded = 'unsafe';"),
+            sha256_hex(b"globalThis.loaded = 'safe';"),
+        );
+        std::fs::write(dir.join(LIB_INDEX_REL), idx).unwrap();
+        let safe_hex = sha256_hex(b"globalThis.loaded = 'safe';");
+        let mut g = ctx(&dir);
+        g.hooks = Some(std::sync::Arc::new(Redirect {
+            from: "lib/unsafe.js",
+            to: "lib/safe.js",
+        }));
+        // ① include: the redirect lands on the EFFECTIVE path.
+        let out = lib_tool()
+            .run_with_emit(
+                &json!({"code": r#"
+                    include("lib/unsafe.js");
+                    return { loaded: globalThis.loaded };"#}),
+                &g,
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        assert_eq!(v["loaded"], json!("safe"), "the host's redirect wins: {v}");
+        // Dual-hash audit: the __include trace records the effective input.
+        let calls = out.meta.as_ref().unwrap()["calls"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let trace = calls
+            .iter()
+            .find(|c| c["name"] == json!("__include"))
+            .expect("lib trace");
+        assert!(
+            trace["in_hash_eff"].is_string(),
+            "dual hash recorded: {trace}"
+        );
+        // ② hash_file family redirects too — the hash is safe.js's.
+        let out = lib_tool()
+            .run_with_emit(
+                &json!({"code": r#"
+                    var h = tools.call("__hash_file", {path: "lib/unsafe.js"});
+                    return { sha: h.sha256 };"#}),
+                &g,
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        assert_eq!(
+            v["sha"],
+            json!(safe_hex),
+            "hash_file hashes the redirected file: {v}"
+        );
+        // ③ A Modify to a path outside lib/ refuses — the original never runs.
+        let mut g2 = ctx(&dir);
+        g2.hooks = Some(std::sync::Arc::new(Redirect {
+            from: "lib/unsafe.js",
+            to: "../evil.js",
+        }));
+        let out = lib_tool()
+            .run_with_emit(
+                &json!({"code": r#"
+                    try { include("lib/unsafe.js"); return { refused: false }; }
+                    catch (e) { return { refused: true, kind: e.kind, msg: String(e) }; }"#}),
+                &g2,
+                &mut |_| {},
+            )
+            .unwrap();
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        assert_eq!(v["refused"], json!(true), "{}", v);
+        assert_eq!(v["kind"], json!("denied"), "{}", v);
+        assert!(
+            v["msg"].as_str().unwrap_or_default().contains("Modify"),
+            "the refusal names the hooks rewrite: {v}"
+        );
+        // ④ A Modify onto a deny_paths pattern refuses the same way.
+        let strict = tool_with_tools(
+            CodeConfig {
+                include: true,
+                deny_paths: vec!["lib/safe.js".to_string()],
+                ..CodeConfig::default()
+            },
+            r#"["read_file","write_file","list_dir"]"#,
+        );
+        let out = strict
+            .run_with_emit(
+                &json!({"code": r#"
+                    try { include("lib/unsafe.js"); return { refused: false }; }
+                    catch (e) { return { refused: true, kind: e.kind, msg: String(e) }; }"#}),
+                &g,
+                &mut |_| {},
+            )
+            .unwrap();
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        assert_eq!(v["refused"], json!(true), "{}", v);
+        assert_eq!(v["kind"], json!("denied"), "{}", v);
+        assert!(
+            v["msg"].as_str().unwrap_or_default().contains("deny_paths"),
+            "the refusal names the policy layer: {v}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P1-3: a saveLib whose INDEX read fails (hooks Deny, IO error, paging
+    /// anomaly) ABORTS — it must not treat the unreadable index as empty
+    /// and overwrite every existing registration and approval. Only a
+    /// definite not-found initializes a fresh index (covered by every
+    /// first-saveLib test above).
+    #[test]
+    fn lib_save_index_read_error_preserves_old_index() {
+        struct DenyIndexRead;
+        impl crate::hooks::Hooks for DenyIndexRead {
+            fn before_tool(
+                &self,
+                tool: &str,
+                input: &Value,
+                _c: &ToolCtx,
+            ) -> crate::hooks::ToolDecision {
+                if tool == "read_file"
+                    && input.get("path").and_then(Value::as_str) == Some("lib/INDEX.md")
+                {
+                    crate::hooks::ToolDecision::Deny("index reads are audited".into())
+                } else {
+                    crate::hooks::ToolDecision::Allow
+                }
+            }
+        }
+        let dir = scratch();
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        std::fs::write(dir.join("lib/a.js"), "globalThis.a = 1;").unwrap();
+        std::fs::write(dir.join("lib/b.js"), "globalThis.b = 2;").unwrap();
+        let idx = format!(
+            "<!-- ta-lib: path=a.js sha256={} needs=- ver=1 st=ok -->\n\
+             <!-- ta-lib: path=b.js sha256={} needs=- ver=1 st=ok -->\n",
+            sha256_hex(b"globalThis.a = 1;"),
+            sha256_hex(b"globalThis.b = 2;"),
+        );
+        std::fs::write(dir.join(LIB_INDEX_REL), &idx).unwrap();
+        let mut g = ctx(&dir);
+        g.hooks = Some(std::sync::Arc::new(DenyIndexRead));
+        let out = lib_tool()
+            .run_with_emit(
+                &json!({"code": r#"
+                    var err = null;
+                    try { saveLib("lib/c.js", "var c = 1;"); } catch (e) { err = String(e); }
+                    var includeOldOk = false;
+                    try { include("lib/a.js"); includeOldOk = true; } catch (e) {}
+                    return { err: err, includeOldOk: includeOldOk };"#}),
+                &g,
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        assert!(
+            v["err"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("index reads are audited"),
+            "the original read error propagates (no silent overwrite): {v}"
+        );
+        assert_eq!(v["includeOldOk"], json!(true), "old lib still admits: {v}");
+        // The INDEX is byte-identical — registrations and approvals intact.
+        assert_eq!(
+            std::fs::read_to_string(dir.join(LIB_INDEX_REL)).unwrap(),
+            idx
+        );
+        // The lib-file half of the write did land (the documented partial
+        // state — same shape as the INDEX-unusable leg above).
+        assert!(dir.join("lib/c.js").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P2-6: saveLib registers under the host's CANONICAL path —
+    /// "lib/./new.js" and "lib/../lib/z.js" both land clean `path=` keys
+    /// the parser accepts, the same-session include under the plain
+    /// spelling works, and no raw spelling leaks into the manifest.
+    #[test]
+    fn lib_savelib_registers_canonical_path() {
+        let dir = scratch();
+        let v = js_out(
+            &lib_tool(),
+            &dir,
+            r#"
+            saveLib("lib/./new.js", "globalThis.n = 1;");
+            saveLib("lib/../lib/z.js", "globalThis.z = 1;");
+            include("lib/new.js");
+            include("lib/z.js");
+            return { n: globalThis.n, z: globalThis.z };"#,
+        );
+        assert_eq!(v["n"], json!(1), "canonical spelling admits: {v}");
+        assert_eq!(v["z"], json!(1), "canonical spelling admits: {v}");
+        let index = std::fs::read_to_string(dir.join(LIB_INDEX_REL)).unwrap();
+        assert!(index.contains("path=new.js"), "canonical key: {index}");
+        assert!(index.contains("path=z.js"), "canonical key: {index}");
+        assert_eq!(
+            index.matches("ta-lib:").count(),
+            2,
+            "no duplicate/spelling-variant entries: {index}"
+        );
+        assert!(
+            !index.contains("./new.js") && !index.contains("../lib"),
+            "no raw spelling leaked: {index}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A-M2 negative legs: the include channel is an INDIRECT eval in global
     /// scope — `function`/`var` declarations leak to globalThis (the export
     /// contract), while lexical declarations (`let`/`const`/`class`) stay in
@@ -8303,6 +8732,251 @@ return t.length;"#}),
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// External audit P2-4, inline leg: the wall clock is refreshed before
+    /// EVERY inline execution — a wave of slow Sequential tools no longer
+    /// STARTS new calls long past the deadline (the audit probe: 80ms
+    /// deadline, 8 × 160ms tools, all 8 ran). The in-flight entry
+    /// completes; the unstarted tail refuses with kind="deadline"
+    /// halted:true and keeps its event pair. Like the cancel twin above,
+    /// TWO legitimate endings exist: the envelope, or the epoch trap's
+    /// wall-clock tombstone (the refusal latches interrupt — the guest's
+    /// epilogue races the next ~10ms tick).
+    #[test]
+    fn batch_deadline_refuses_unstarted_inline_entries() {
+        struct SlowSeq;
+        impl Tool for SlowSeq {
+            fn def(&self) -> ToolDef {
+                ToolDef {
+                    name: "slow_seq".into(),
+                    description: "test: sleeps 150ms".into(),
+                    schema: json!({"type": "object", "properties": {}}),
+                }
+            }
+            fn run(&self, _i: &Value, _c: &ToolCtx) -> Result<ToolOutput> {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                Ok(ToolOutput::text("done"))
+            }
+            fn available_to_code(&self) -> bool {
+                true
+            }
+            fn batchable(&self) -> bool {
+                true
+            }
+        }
+        let dir = scratch();
+        let cfg: Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"K","model":"m","inject_environment":false,
+                "tools":["read_file"],"code":{"enabled":true}}"#,
+        )
+        .unwrap();
+        let tool = RunCodeTool::new(
+            &cfg,
+            Arc::new(RwLock::new(batch_cfg())),
+            &reqwest::blocking::Client::new(),
+            "k",
+            vec![],
+            vec![Arc::new(Box::new(SlowSeq))],
+        );
+        // Warm the process-level module OUTSIDE the armed window — the
+        // test's ctx.deadline is stamped at wall-clock time, and a cold
+        // wasmtime compile (~seconds in debug) would consume it before the
+        // guest starts.
+        tool.run_with_emit(&json!({"code": "return 1;"}), &ctx(&dir), &mut |_| {})
+            .unwrap();
+        let mut c = ctx(&dir);
+        c.deadline = Some(Instant::now() + std::time::Duration::from_millis(100));
+        let out = tool
+            .run_with_emit(
+                &json!({"code": r#"
+                    const entries = [1,2,3,4].map(i => ({name: "slow_seq", args: {}}));
+                    const rs = tools.callBatch(entries);
+                    return rs.map(r => r instanceof Error ? {k: r.kind, h: r.halted} : "ran");"#}),
+                &c,
+                &mut |_| {},
+            )
+            .unwrap();
+        if out.is_error {
+            assert!(
+                out.content.contains("[run_code] terminated:"),
+                "unexpected error shape: {}",
+                out.content
+            );
+            assert!(
+                out.content.contains("wall clock exhausted"),
+                "attributed to the deadline: {}",
+                out.content
+            );
+        } else {
+            let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+            let arr = v.as_array().expect("array result");
+            assert_eq!(arr.len(), 4, "{v}");
+            assert_eq!(
+                arr.iter().filter(|r| r.as_str() == Some("ran")).count(),
+                1,
+                "in-flight entry completes, unstarted tail refused: {v}"
+            );
+            for r in arr.iter().skip(1) {
+                assert_eq!(r["k"], json!("deadline"), "{v}");
+                assert_eq!(r["h"], json!(true), "{v}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P2-4, dispatch leg: after the inline phase spends the wall clock,
+    /// the spawn loop refuses the Parallel (llm) entries BEFORE any worker
+    /// exists — no paid inner model call starts past the deadline.
+    #[test]
+    fn batch_deadline_after_inline_blocks_llm_dispatch() {
+        struct SlowSeq;
+        impl Tool for SlowSeq {
+            fn def(&self) -> ToolDef {
+                ToolDef {
+                    name: "slow_seq".into(),
+                    description: "test: sleeps 150ms".into(),
+                    schema: json!({"type": "object", "properties": {}}),
+                }
+            }
+            fn run(&self, _i: &Value, _c: &ToolCtx) -> Result<ToolOutput> {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                Ok(ToolOutput::text("done"))
+            }
+            fn available_to_code(&self) -> bool {
+                true
+            }
+            fn batchable(&self) -> bool {
+                true
+            }
+        }
+        let dir = scratch();
+        // Empty script: any llm request that slipped past the checkpoint
+        // fails the mock loudly — captured() must stay empty.
+        let (prov, state) = crate::provider::mock::MockProvider::new(vec![]);
+        let cfg: Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"K","model":"m","inject_environment":false,
+                "tools":["read_file"],"code":{"enabled":true}}"#,
+        )
+        .unwrap();
+        let tool = RunCodeTool::new(
+            &cfg,
+            Arc::new(RwLock::new(CodeConfig {
+                call_batch: true,
+                ..llm_cfg()
+            })),
+            &reqwest::blocking::Client::new(),
+            "k",
+            vec![],
+            vec![Arc::new(Box::new(SlowSeq))],
+        );
+        let _ = tool.provider_cell().set(std::sync::Arc::new(prov));
+        tool.run_with_emit(&json!({"code": "return 1;"}), &ctx(&dir), &mut |_| {})
+            .unwrap();
+        let mut c = ctx(&dir);
+        c.deadline = Some(Instant::now() + std::time::Duration::from_millis(100));
+        let out = tool
+            .run_with_emit(
+                &json!({"code": r#"
+                    const rs = tools.callBatch([
+                        {name: "slow_seq", args: {}},
+                        {name: "slow_seq", args: {}},
+                        {name: "llm", args: {prompt: "p1"}},
+                        {name: "llm", args: {prompt: "p2"}}
+                    ]);
+                    return rs.map(r => r instanceof Error ? {k: r.kind, h: r.halted} : "ran");"#}),
+                &c,
+                &mut |_| {},
+            )
+            .unwrap();
+        // The headline assertion holds in BOTH legitimate endings (envelope
+        // or the wall-clock tombstone): no llm dispatch ever happened.
+        assert!(
+            state.captured().is_empty(),
+            "no inner model call may start past the deadline"
+        );
+        if !out.is_error {
+            let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+            let arr = v.as_array().expect("array result");
+            assert_eq!(arr.len(), 4, "{v}");
+            assert_eq!(arr[0], json!("ran"), "in-flight entry completes: {v}");
+            for r in arr.iter().skip(1) {
+                assert_eq!(r["k"], json!("deadline"), "{v}");
+                assert_eq!(r["h"], json!(true), "{v}");
+            }
+        } else {
+            assert!(
+                out.content.contains("wall clock exhausted"),
+                "unexpected error shape: {}",
+                out.content
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P2-7: a provider panic inside a batch WORKER does not propagate —
+    /// the entry completes as the panic placeholder, and the placeholder
+    /// now carries the llm audit row (model + re-derived estimate,
+    /// actual:null) so meta.llm explains the reservation the guard's Drop
+    /// kept. Unknown usage stays unknown — never fabricated.
+    #[test]
+    fn batch_llm_panic_placeholder_keeps_audit() {
+        struct PanicProvider;
+        impl crate::provider::Provider for PanicProvider {
+            fn chat(
+                &self,
+                _req: &crate::provider::ChatRequest,
+                _on_event: &mut dyn FnMut(crate::provider::ChatEvent),
+            ) -> anyhow::Result<crate::provider::ChatResponse> {
+                panic!("custom provider panicked mid-call");
+            }
+        }
+        let dir = scratch();
+        let g = gated_ctx(&dir, 10_000);
+        let out = llm_tool(
+            CodeConfig {
+                call_batch: true,
+                ..llm_cfg()
+            },
+            std::sync::Arc::new(PanicProvider),
+        )
+        .run_with_emit(
+            &json!({"code": r#"
+                const rs = tools.callBatch([{ name: "llm", args: { prompt: "hi" } }]);
+                return rs.map(r => r instanceof Error ? String(r) : "ok");"#}),
+            &g,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(
+            !out.is_error,
+            "the batch completes; the entry carries the panic: {}",
+            out.content
+        );
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        assert!(
+            v.as_array()
+                .and_then(|a| a.first())
+                .and_then(|e| e.as_str())
+                .unwrap_or_default()
+                .contains("batch tool worker panicked"),
+            "{}",
+            v
+        );
+        assert_eq!(
+            g.budget
+                .as_ref()
+                .unwrap()
+                .used
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1088,
+            "ReserveGuard::Drop kept est(\"hi\") = 1088 through the worker unwind"
+        );
+        let llm = out.meta.as_ref().unwrap().get("llm").unwrap();
+        assert_eq!(llm["calls"], json!(1), "the placeholder folds an audit row");
+        assert_eq!(llm["reserved"], json!(1088), "the row explains the hold");
+        assert_eq!(llm["models"]["m1"]["unknown_calls"], json!(1));
+        assert_eq!(llm["models"]["m1"]["known_calls"], json!(0));
+    }
+
     /// A-L4 并行（进程内真实线程版）: a Parallel batchable tool fanned out
     /// over one 8-entry wave MUST overlap in wall time — host-side (start,
     /// end) spans prove it; a batch that quietly serialized still passes
@@ -8829,6 +9503,223 @@ return t.length;"#}),
                 .load(std::sync::atomic::Ordering::Relaxed),
             1088,
             "ReserveGuard::Drop kept the full reservation through the unwind"
+        );
+    }
+
+    /// External audit P1-1: a ChatResponse that is Ok at the transport
+    /// layer but carries an abort-vocabulary stop_reason is NOT a success —
+    /// kind="llm" naming the stop reason, the partial text rides the
+    /// message, the partial usage settles honestly (the truncated
+    /// generation's cost is real), and label validation never runs (a
+    /// truncated "yes" must not pass as a verdict).
+    #[test]
+    fn llm_stream_error_settles_partial_usage_and_kinds_llm() {
+        let dir = scratch();
+        let (prov, _) =
+            crate::provider::mock::MockProvider::new(vec![crate::provider::mock::MockTurn::Ok(
+                crate::provider::ChatResponse {
+                    blocks: vec![crate::provider::Block::Text("par".into())],
+                    stop_reason: "stream_error".into(),
+                    usage: crate::provider::mock::mk_usage(10, 5),
+                },
+            )]);
+        let g = gated_ctx(&dir, 10_000);
+        let out = llm_tool(llm_cfg(), std::sync::Arc::new(prov))
+            .run_with_emit(
+                &json!({"code": r#"
+                    try {
+                        tools.call("llm", {prompt: "hi", labels: ["yes", "no"]});
+                        return { threw: false };
+                    } catch (e) {
+                        return { threw: true, kind: e.kind, msg: String(e) };
+                    }"#}),
+                &g,
+                &mut |_| {},
+            )
+            .unwrap();
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        assert_eq!(v["threw"], json!(true), "{}", out.content);
+        assert_eq!(
+            v["kind"],
+            json!("llm"),
+            "termination, not vocabulary: {}",
+            out.content
+        );
+        let msg = v["msg"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("stream_error") && msg.contains("par"),
+            "stop reason + partial text ride the message: {msg}"
+        );
+        // Settled against the PARTIAL usage (15): the reservation was
+        // replaced by actual — an abnormal end is still a billed call.
+        assert_eq!(
+            g.budget
+                .as_ref()
+                .unwrap()
+                .used
+                .load(std::sync::atomic::Ordering::Relaxed),
+            15
+        );
+        assert_eq!(out.usage.map(|u| u.total()), Some(15));
+        let llm = out.meta.as_ref().unwrap().get("llm").unwrap();
+        assert_eq!(llm["settled"], json!(15));
+        assert_eq!(llm["models"]["m1"]["known_calls"], json!(1));
+        assert_eq!(llm["models"]["m1"]["unknown_calls"], json!(0));
+    }
+
+    /// P1-1, unknown-usage arm: an abnormally-ended response with NO usage
+    /// keeps the reservation (over-hold, never under-hold) and audits an
+    /// unknown call — the same LD-17 row-2 shape as a request error.
+    #[test]
+    fn llm_stream_truncated_without_usage_keeps_reservation() {
+        let dir = scratch();
+        let (prov, _) =
+            crate::provider::mock::MockProvider::new(vec![crate::provider::mock::MockTurn::Ok(
+                crate::provider::ChatResponse {
+                    blocks: vec![crate::provider::Block::Text("partial".into())],
+                    stop_reason: "stream_truncated".into(),
+                    usage: None,
+                },
+            )]);
+        let g = gated_ctx(&dir, 10_000);
+        let out = llm_tool(llm_cfg(), std::sync::Arc::new(prov))
+            .run_with_emit(
+                &json!({"code": r#"
+                    try {
+                        tools.call("llm", {prompt: "hi"});
+                        return { threw: false };
+                    } catch (e) {
+                        return { threw: true, kind: e.kind, msg: String(e) };
+                    }"#}),
+                &g,
+                &mut |_| {},
+            )
+            .unwrap();
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        assert_eq!(v["threw"], json!(true), "{}", out.content);
+        assert_eq!(v["kind"], json!("llm"), "{}", out.content);
+        assert!(
+            v["msg"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("stream_truncated"),
+            "{}",
+            v
+        );
+        assert_eq!(
+            g.budget
+                .as_ref()
+                .unwrap()
+                .used
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1088,
+            "no usage → the reservation stands (est(\"hi\") = 1088)"
+        );
+        let llm = out.meta.as_ref().unwrap().get("llm").unwrap();
+        assert_eq!(llm["models"]["m1"]["unknown_calls"], json!(1));
+    }
+
+    /// P1-1, max_tokens contract: the caller's cap cut the generation —
+    /// kind="llm" naming the cap (NOT llm_output: the failure is
+    /// truncation, not vocabulary), usage settles, no partial success.
+    #[test]
+    fn llm_max_tokens_is_incomplete_output_not_label_miss() {
+        let dir = scratch();
+        let (prov, _) =
+            crate::provider::mock::MockProvider::new(vec![crate::provider::mock::MockTurn::Ok(
+                crate::provider::ChatResponse {
+                    blocks: vec![crate::provider::Block::Text("ye".into())],
+                    stop_reason: "max_tokens".into(),
+                    usage: crate::provider::mock::mk_usage(10, 8),
+                },
+            )]);
+        let g = gated_ctx(&dir, 10_000);
+        let out = llm_tool(llm_cfg(), std::sync::Arc::new(prov))
+            .run_with_emit(
+                &json!({"code": r#"
+                    try {
+                        tools.call("llm", {prompt: "hi", labels: ["yes", "no"], max_tokens: 8});
+                        return { threw: false };
+                    } catch (e) {
+                        return { threw: true, kind: e.kind, msg: String(e) };
+                    }"#}),
+                &g,
+                &mut |_| {},
+            )
+            .unwrap();
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        assert_eq!(v["threw"], json!(true), "{}", out.content);
+        assert_eq!(
+            v["kind"],
+            json!("llm"),
+            "truncation is not a label miss: {}",
+            out.content
+        );
+        let msg = v["msg"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("max_tokens") && msg.contains("ye"),
+            "cap named + partial text: {msg}"
+        );
+        assert_eq!(
+            g.budget
+                .as_ref()
+                .unwrap()
+                .used
+                .load(std::sync::atomic::Ordering::Relaxed),
+            18
+        );
+    }
+
+    /// P2-5, tool-side final check: a registry built with a default_model
+    /// outside the allowlist refuses the omitted-model call BEFORE any
+    /// reservation or provider dispatch (the setter now validates, but the
+    /// registry snapshot is whatever cfg it was built with).
+    #[test]
+    fn llm_default_model_outside_allowlist_refused_at_call() {
+        let dir = scratch();
+        let (prov, state) = crate::provider::mock::MockProvider::new(vec![]);
+        let cfg = CodeConfig {
+            llm: crate::config::LlmConfig {
+                enabled: true,
+                default_model: Some("m3".into()),
+                models: vec!["m1".into()],
+            },
+            ..CodeConfig::default()
+        };
+        let g = gated_ctx(&dir, 10_000);
+        let out = llm_tool(cfg, std::sync::Arc::new(prov))
+            .run_with_emit(
+                &json!({"code": r#"
+                    try {
+                        tools.call("llm", {prompt: "hi"});
+                        return { threw: false };
+                    } catch (e) {
+                        return { threw: true, kind: e.kind, msg: String(e) };
+                    }"#}),
+                &g,
+                &mut |_| {},
+            )
+            .unwrap();
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        assert_eq!(v["threw"], json!(true), "{}", out.content);
+        assert_eq!(v["kind"], json!("llm"), "{}", out.content);
+        let msg = v["msg"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("default_model") && msg.contains("allowlist"),
+            "actionable message: {msg}"
+        );
+        assert!(
+            state.captured().is_empty(),
+            "no request may reach the provider"
+        );
+        assert_eq!(
+            g.budget
+                .as_ref()
+                .unwrap()
+                .used
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "refused before any reservation"
         );
     }
 

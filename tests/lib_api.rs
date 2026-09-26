@@ -788,7 +788,7 @@ fn llm_primitive_rides_the_outer_provider_instance() {
     );
     assert_eq!(captured[1].temperature, Some(0.0), "LD-4 on the inner call");
     assert_eq!(captured[2].max_tokens, 32, "explicit max_tokens forwarded");
-    assert_eq!(captured[1].cache, false, "one-shot, no cache markup");
+    assert!(!captured[1].cache, "one-shot, no cache markup");
     // The guest saw the texts + the honest m3 failure class — they travel in
     // the run_code result record the outer model received.
     let rc = outcome
