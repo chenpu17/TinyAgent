@@ -1258,7 +1258,7 @@ src/
 ├── config.rs         ( 1886)  # 配置解析 + 任务片段合并 + 批量覆盖白名单
 ├── provider/  # LLM 后端
 │   ├── mod.rs            (  938)  # 共享 Message/Block、SSE reader、CancellableSse
-│   ├── openai.rs         ( 1657)  # OpenAI 兼容（include_usage；400 回退：max_tokens→max_completion_tokens / 丢 stream_options）
+│   ├── openai.rs         ( 1683)  # OpenAI 兼容（include_usage；400 回退：max_tokens→max_completion_tokens / 丢 stream_options）
 │   ├── anthropic.rs      ( 1111)  # Anthropic 原生（message_start/message_delta usage）
 │   └── mock.rs           (  345)  # 测试用脚本化 Provider（cfg(any(test, feature="mock"))）
 ├── agent.rs          ( 3440)  # 核心 loop + usage 累计 + cancel + 上下文压缩（前馈/溢出双触发 + 滚动分块摘要）+ 相邻消息归一 + 同 turn 多 task 并行
@@ -1280,8 +1280,8 @@ src/
 │   ├── mcp.rs            (  485)  # MCP 工具包装（sanitize_name + wire_name 分发）
 │   ├── subagent.rs       (  917)  # task 子 agent 工具（独立上下文 + turn 封顶；不可递归）
 │   ├── todo.rs           (  310)  # todo 工具（任务计划，全量替换；plan 落 result.json）
-│   ├── run_code.rs       (10466)  # run_code 工具（feature code）：QuickJS-in-wasm 沙箱——epoch/fuel/mem 限额、路径拦截、hooks 闸门、审计 meta（双哈希）
-│   └── llm.rs            (  610)  # llm 判别原语（feature code + code.llm 门）：单发无状态内层模型调用——LD-17 预占/结算、LD-18 labels 归一、共享 Provider cell
+│   ├── run_code.rs       (10849)  # run_code 工具（feature code）：QuickJS-in-wasm 沙箱——epoch/fuel/mem 限额、路径拦截、hooks 闸门、审计 meta（双哈希）
+│   └── llm.rs            (  622)  # llm 判别原语（feature code + code.llm 门）：单发无状态内层模型调用——LD-17 预占/结算、LD-18 labels 归一、共享 Provider cell
 ├── mcp.rs            ( 1427)  # MCP 客户端（stdio / Streamable HTTP / 旧版 SSE）
 ├── batch.rs          ( 3047)  # 批量任务 + --retries/--failed + 报告合并
 ├── harness.rs        ( 2003)  # headless 模式 + result.json + NDJSON + exit code

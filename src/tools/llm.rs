@@ -499,20 +499,30 @@ impl Tool for LlmTool {
                 _ => None,
             })
             .collect();
-        // Transport Ok ≠ response complete (external audit P1-1): providers
-        // normalize mid-stream failures into ChatResponses carrying partial
-        // content, partial usage, and an abort-vocabulary stop_reason — the
-        // outer agent maps these to retryable errors; this tool must not
-        // launder them into successes (a truncated "yes" passing label
-        // validation is exactly the honesty hole). max_tokens is the same
-        // class BY CONTRACT: the caller's cap cut the generation, the
-        // output is incomplete — an error naming the cap, never a partial
-        // success. The check runs AFTER settlement (the call's cost is
-        // real) and BEFORE label validation (termination, not vocabulary,
-        // is the failure being reported).
-        if matches!(
+        // Transport Ok ≠ response complete (external audit P1-1). This is a
+        // COMPLETE-RESPONSE WHITELIST, not an abort blacklist (external
+        // re-review P1): providers pass unknown finish_reasons through raw
+        // (openai maps stop/tool_calls/length and forwards anything else
+        // verbatim; anthropic forwards its native vocabulary — content_filter,
+        // refusal, pause_turn … — unchanged), so a blacklist can never
+        // enumerate the failing side. Only three reasons PROVE a complete
+        // response: end_turn (canonical clean stop), tool_use (the turn ended
+        // by a tool call — tolerated here even though this tool sends
+        // tools=[]), stop_sequence (the host-configured clean stop — the
+        // output is complete by construction). Everything else — the abort
+        // vocabulary (cancelled/stream_idle/stream_truncated/stream_error),
+        // max_tokens (BY CONTRACT the caller's cap cut the generation), any
+        // filtered/refused/paused/unknown future reason, even "" — fails
+        // CLOSED: an unrecognized termination cannot be proven complete, and
+        // a truncated "yes" passing label validation is exactly the honesty
+        // hole. Custom-provider hosts are unaffected: SimpleChatResponse's
+        // conversion already defaults an omitted stop_reason to end_turn.
+        // The check runs AFTER settlement (the call's cost is real) and
+        // BEFORE label validation (termination, not vocabulary, is the
+        // failure being reported).
+        if !matches!(
             resp.stop_reason.as_str(),
-            "stream_error" | "stream_truncated" | "stream_idle" | "cancelled" | "max_tokens"
+            "end_turn" | "tool_use" | "stop_sequence"
         ) {
             let mut msg = if resp.stop_reason == "max_tokens" {
                 format!(

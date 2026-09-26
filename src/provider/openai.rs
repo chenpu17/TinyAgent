@@ -1237,6 +1237,32 @@ mod tests {
         assert_eq!(resp.stop_reason, "end_turn");
     }
 
+    #[test]
+    fn stream_unknown_finish_reasons_pass_through_raw() {
+        // The LlmTool termination contract is a complete-response WHITELIST
+        // precisely because this provider forwards unrecognized
+        // finish_reasons verbatim (external re-review P1): content_filter,
+        // refusal-like gateway vocabularies, and future reasons arrive at
+        // the consumer as-is, never normalized into "end_turn". Pin the
+        // passthrough so a "helpful" future normalization here cannot
+        // silently launder filtered output into complete responses.
+        for reason in ["content_filter", "refusal", "some_future_reason"] {
+            let raw = format!(
+                concat!(
+                    "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"yes\"}}}}]}}\n\n",
+                    "data: {{\"choices\":[{{\"index\":0,\"finish_reason\":\"{r}\",\"delta\":{{}}}}]}}\n\n",
+                    "data: [DONE]\n\n",
+                ),
+                r = reason,
+            );
+            let resp = OpenAi::parse_stream(raw.as_bytes(), &mut |_| {}).unwrap();
+            assert_eq!(
+                resp.stop_reason, reason,
+                "unknown finish_reason must arrive verbatim"
+            );
+        }
+    }
+
     // ─── HTTP-mock helpers for provider integration tests ───────────────
     //
     // Minimal HTTP/1.1 servers on a loopback port. reqwest::blocking talks

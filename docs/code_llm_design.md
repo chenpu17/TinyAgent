@@ -2,15 +2,36 @@
 
 | 项 | 值 |
 |---|---|
-| 状态 | v0.7.4 读数登记稿（M2/M3/M4 落码；V0-B 四臂主批 + e3 复查 + e1 库臂已跑：e2 一致性增量成立，A③/include 零效应登记）；产品收益部分验收 |
-| 版本 | v0.7.4 |
-| 日期 | 2026-09-23 |
+| 状态 | v0.7.6（M2/M3/M4 落码；V0-B 四臂主批 + e3 复查 + e1 库臂已跑：e2 一致性增量成立，A③/include 零效应登记；外部审核两轮缺陷修复完毕）；产品收益部分验收 |
+| 版本 | v0.7.6 |
+| 日期 | 2026-09-26 |
 | 关联文档 | `docs/run_code_design.md`（D 编号）、`docs/finetune_support_design.md`（FD 编号、附录 A 即规格纪律）、`docs/run_code_routing_report.md`（评测方法论）、`docs/code_memory_design.md`（姊妹稿，共享纪律见 §10） |
-| 代码基线 | master @ edfb9bc（其后行号会漂移，以代码为准） |
+| 代码基线 | master @ 45ad4ae（其后行号会漂移，以代码为准） |
 | 决策编号 | 本文 LD-n 独立编号；引用 run_code_design 写 D-n、finetune_support 写 FD-n |
 
 修订记录（历史仅说明演进，当前正文与决策表为规格）：
 
+- **v0.7.6（外部复审轮：终止契约黑名单收严为完整响应白名单）**：读数来源 =
+  外部代码复审报告（基线 45ad4ae，上一轮 7 项修复全部复核关闭；修复邻接边界
+  新发现 2 P1 + 2 P2 + 1 P3，本条登记其中 llm 侧 1 项，姊妹稿 v0.7.3 登记
+  INDEX 侧 2 项；探针在审核方环境）。
+  **LD-7/LD-17 终止契约由黑名单反转为白名单（复审 P1）**：v0.7.5 的五词
+  黑名单挡不住词表外的异常终止——openai provider 对未识别 finish_reason
+  **原样透传**（仅映射 stop/tool_calls/length），anthropic provider 原样透传
+  其原生词表（refusal/pause_turn 等），`content_filter` 带残留文本命中
+  labels 即可伪装成有效分类结果（探针复现）。定约修订：**只有三个 stop_reason
+  可证明响应完整**——end_turn（规范干净停止）、tool_use（以工具调用收尾的
+  完整轮次，本原语 tools=[] 下不该出现但维持容忍）、stop_sequence（宿主配置
+  的干净停止，输出按构造完整）——其余（aborted 词表四词 + max_tokens +
+  content_filter/refusal/pause_turn + 空串 + 未知未来词表）一律 **kind="llm"
+  错误**（fail-closed：无法证明完整的终止就是错误）。错误形状不动（部分
+  usage 照实结算、无 usage 保预占、meta.llm_call 随错误封套、max_tokens 保留
+  专属文案、终止检查先于 labels 校验）。**自定义 provider 宿主零影响**（核实
+  结论）：`SimpleChatResponse::from_simple` 本就把缺省 stop_reason 默认为
+  end_turn，绑定/回调宿主不会产出空串。回归面：`llm_stop_reason_whitelist_table`
+  表驱动（13 词表全枚举）+ openai provider
+  `stream_unknown_finish_reasons_pass_through_raw`（钉住白名单所防御的透传面，
+  防未来"善意"归一化把被过滤输出洗成完整响应）。
 - **v0.7.5（外部审核缺陷修复轮：终止契约 / setter 验证 / panic 审计 / 批墙钟）**：
   读数来源 = 外部代码审核报告（基线 c555074 / 0.4.1，7 项可复现运行时缺陷，
   本轮全部修复；探针与观测在审核方环境）。

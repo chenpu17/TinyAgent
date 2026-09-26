@@ -64,6 +64,19 @@ const BUDGET_NAME: &str = "__budget";
 /// also call the names directly (same checks either way).
 const INCLUDE_NAME: &str = "__include";
 const HASH_FILE_NAME: &str = "__hash_file";
+/// Reserved names of saveLib's INDEX step (external re-review P1/P2). Unlike
+/// the gated lib family above, both are read-only/introspection class (same
+/// class as [`BUDGET_NAME`] — no gate/audit/quota): `__lib_index_state`
+/// reports whether [`LIB_INDEX_REL`] exists (a filesystem fact, NOT parsed
+/// out of an error string — a hooks denial whose text happens to contain an
+/// OS "not found" phrasing cannot spoof the empty-index initialization),
+/// and `__lib_update_index` is a PURE text-in/text-out merge (the upsert)
+/// validated by the same line parser the admission uses — one parser, no
+/// guest/host drift. The real IO around them stays with the ordinary gated
+/// tools: saveLib reads INDEX via `read_file` (hooks can deny) and writes it
+/// via `write_file` (hooks can deny/modify).
+const LIB_INDEX_STATE_NAME: &str = "__lib_index_state";
+const LIB_UPDATE_INDEX_NAME: &str = "__lib_update_index";
 /// Reserved name behind `tools.callBatch(entries)` (code_llm_design §4/LD-19,
 /// M2): one batched dispatch of read-only calls. The reserved name is only
 /// the ENTRANCE — every entry runs the exact single-call sequence (entry
@@ -511,6 +524,92 @@ struct LibEntry {
     st: String,
 }
 
+/// One validated `ta-lib` machine line, fields exactly as written (MD-11).
+/// Shared by [`parse_lib_index`] (admission) and [`lib_upsert_index`]
+/// (saveLib's merge) so the manifest grammar has ONE parser — external
+/// re-review P2: a guest-side near-copy had already drifted (missing the
+/// sha/st/ver rules), letting a poisoned line through the write-back guard.
+struct LibLine {
+    path: String,
+    sha256: String,
+    needs: String,
+    ver: String,
+    st: String,
+}
+
+/// Validate one `lib/INDEX.md` line (1-based `no` is for error copy).
+/// `Ok(None)` = not a machine line (prose/comments are free-form and pass
+/// through untouched). Same strictness both directions: a malformed line is
+/// a HARD error whether it is being read for admission or merged by saveLib.
+fn parse_lib_line(no: usize, raw: &str) -> Result<Option<LibLine>, String> {
+    let line = raw.trim();
+    if !(line.starts_with("<!-- ta-lib:") && line.ends_with("-->")) {
+        return Ok(None);
+    }
+    let body = line
+        .strip_prefix("<!-- ta-lib:")
+        .and_then(|s| s.strip_suffix("-->"))
+        .unwrap_or("");
+    let mut path: Option<String> = None;
+    let mut sha256: Option<String> = None;
+    let mut needs: Option<String> = None;
+    let mut ver: Option<String> = None;
+    let mut st: Option<String> = None;
+    for tok in body.split_whitespace() {
+        let (k, v) = tok.split_once('=').unwrap_or(("", ""));
+        let v = v.to_string();
+        match k {
+            "path" if path.is_none() => path = Some(v),
+            "sha256" if sha256.is_none() => sha256 = Some(v),
+            "needs" if needs.is_none() => needs = Some(v),
+            "ver" if ver.is_none() => ver = Some(v),
+            "st" if st.is_none() => st = Some(v),
+            _ => {
+                return Err(format!(
+                    "line {}: unknown or duplicated field {:?}",
+                    no,
+                    if k.is_empty() { tok } else { k }
+                ))
+            }
+        }
+    }
+    let (Some(path), Some(sha256), Some(needs), Some(ver), Some(st)) =
+        (path, sha256, needs, ver, st)
+    else {
+        return Err(format!(
+            "line {}: a ta-lib line needs all five fields \
+             (path/sha256/needs/ver/st)",
+            no
+        ));
+    };
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.contains("..")
+        || path.split('/').any(|s| s.is_empty())
+    {
+        return Err(format!(
+            "line {}: path must be a clean lib/-relative path",
+            no
+        ));
+    }
+    if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("line {}: sha256 must be 64 hex chars", no));
+    }
+    if st != "ok" && st != "draft" {
+        return Err(format!("line {}: st must be ok or draft, got {st:?}", no));
+    }
+    if ver.is_empty() || !ver.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!("line {}: ver must be a number, got {ver:?}", no));
+    }
+    Ok(Some(LibLine {
+        path,
+        sha256,
+        needs,
+        ver,
+        st,
+    }))
+}
+
 /// Parse the manifest (MD-11). Strict by design — a malformed, duplicated or
 /// conflicting entry is a HARD error, never a silent pick: INDEX is the
 /// cross-session trust list, and "which entry won" is exactly the ambiguity
@@ -518,72 +617,17 @@ struct LibEntry {
 /// admission error), not a parse error.
 fn parse_lib_index(text: &str) -> Result<std::collections::HashMap<String, LibEntry>, String> {
     let mut map: std::collections::HashMap<String, LibEntry> = std::collections::HashMap::new();
-    for (no, raw) in text.lines().enumerate() {
-        let line = raw.trim();
-        if !(line.starts_with("<!-- ta-lib:") && line.ends_with("-->")) {
-            continue; // prose/comments are free-form; only ta-lib lines parse
-        }
-        let body = line
-            .strip_prefix("<!-- ta-lib:")
-            .and_then(|s| s.strip_suffix("-->"))
-            .unwrap_or("");
-        let mut path: Option<String> = None;
-        let mut sha256: Option<String> = None;
-        let mut needs: Option<String> = None;
-        let mut ver: Option<String> = None;
-        let mut st: Option<String> = None;
-        for tok in body.split_whitespace() {
-            let (k, v) = tok.split_once('=').unwrap_or(("", ""));
-            let v = v.to_string();
-            match k {
-                "path" if path.is_none() => path = Some(v),
-                "sha256" if sha256.is_none() => sha256 = Some(v),
-                "needs" if needs.is_none() => needs = Some(v),
-                "ver" if ver.is_none() => ver = Some(v),
-                "st" if st.is_none() => st = Some(v),
-                _ => {
-                    return Err(format!(
-                        "line {}: unknown or duplicated field {:?}",
-                        no + 1,
-                        if k.is_empty() { tok } else { k }
-                    ))
-                }
-            }
-        }
-        let (Some(path), Some(sha256), Some(needs), Some(ver), Some(st)) =
-            (path, sha256, needs, ver, st)
+    for (idx, raw) in text.lines().enumerate() {
+        let Some(LibLine {
+            path,
+            sha256,
+            needs,
+            ver,
+            st,
+        }) = parse_lib_line(idx + 1, raw)?
         else {
-            return Err(format!(
-                "line {}: a ta-lib line needs all five fields \
-                 (path/sha256/needs/ver/st)",
-                no + 1
-            ));
+            continue;
         };
-        if path.is_empty()
-            || path.starts_with('/')
-            || path.contains("..")
-            || path.split('/').any(|s| s.is_empty())
-        {
-            return Err(format!(
-                "line {}: path must be a clean lib/-relative path",
-                no + 1
-            ));
-        }
-        if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(format!("line {}: sha256 must be 64 hex chars", no + 1));
-        }
-        if st != "ok" && st != "draft" {
-            return Err(format!(
-                "line {}: st must be ok or draft, got {st:?}",
-                no + 1
-            ));
-        }
-        if ver.is_empty() || !ver.chars().all(|c| c.is_ascii_digit()) {
-            return Err(format!(
-                "line {}: ver must be a number, got {ver:?}",
-                no + 1
-            ));
-        }
         if map
             .insert(
                 path.clone(),
@@ -598,11 +642,81 @@ fn parse_lib_index(text: &str) -> Result<std::collections::HashMap<String, LibEn
         {
             return Err(format!(
                 "line {}: duplicate ta-lib entry for path {path:?}",
-                no + 1
+                idx + 1
             ));
         }
     }
     Ok(map)
+}
+
+/// saveLib's INDEX merge (MD-10, host side since external re-review P1/P2):
+/// validate `text` with the SAME line parser the admission uses, then upsert
+/// the `(rel, sha256)` entry — in-place replacement of the same-path line
+/// (preserving its `needs`/`ver`), else append at the end. Pure function:
+/// text in, merged text out; the caller does the IO through the ordinary
+/// gated file tools. Output is byte-identical to the merge the prelude used
+/// to do in JS (the format-pinning tests hold it to that).
+fn lib_upsert_index(rel: &str, sha256: &str, text: &str) -> Result<String, String> {
+    // The registration key must satisfy the same grammar a parsed line's
+    // path does — plus no whitespace (machine lines are whitespace-tokenized;
+    // the prelude rejects whitespace spellings first, this is the host-side
+    // backstop for direct reserved-name callers).
+    if rel.is_empty()
+        || rel.starts_with('/')
+        || rel.contains("..")
+        || rel.split('/').any(|s| s.is_empty())
+        || rel.chars().any(|c| c.is_whitespace())
+    {
+        return Err(format!(
+            "saveLib: registration key must be a clean lib/-relative path, got {rel:?}"
+        ));
+    }
+    if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "saveLib: registration digest must be 64 hex chars, got {sha256:?}"
+        ));
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut needs = "-".to_string();
+    let mut ver = "1".to_string();
+    let mut hit = false;
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (idx, line) in text.lines().enumerate() {
+        let parsed = parse_lib_line(idx + 1, line)?;
+        if let Some(entry) = &parsed {
+            if !seen.insert(entry.path.clone()) {
+                return Err(format!(
+                    "lib/INDEX.md line {}: duplicate ta-lib entry for path {:?} — \
+                     fix the index before saving",
+                    idx + 1,
+                    entry.path
+                ));
+            }
+            if entry.path == rel {
+                // Preserve the existing entry's metadata; st goes back to
+                // draft (the content just changed, approvals reset — MD-10).
+                needs = entry.needs.clone();
+                ver = entry.ver.clone();
+                out.push(format!(
+                    "<!-- ta-lib: path={rel} sha256={sha256} needs={needs} ver={ver} st=draft -->"
+                ));
+                hit = true;
+                continue;
+            }
+        }
+        out.push(line.to_string());
+    }
+    if !hit {
+        if !out.is_empty() && out.last().is_some_and(|l| !l.is_empty()) {
+            out.push(String::new());
+        }
+        out.push(format!(
+            "<!-- ta-lib: path={rel} sha256={sha256} needs={needs} ver={ver} st=draft -->"
+        ));
+    }
+    let mut merged = out.join("\n");
+    merged.push('\n');
+    Ok(merged)
 }
 
 /// Full-hex sha256 of delivered bytes (MD-12 — hashed on what the guest will
@@ -1976,6 +2090,92 @@ fn host_call_tool(
         return envelope_or_trap(caller, true, &payload);
     }
 
+    if name == LIB_INDEX_STATE_NAME {
+        // saveLib's existence probe (external re-review P1): classification
+        // by FILESYSTEM FACT, never by parsing an error string — a hooks
+        // denial whose text happens to contain an OS "not found" phrasing
+        // cannot spoof the empty-index initialization. Read-only
+        // introspection class (same as `__budget` above): no gate/audit/
+        // quota; the actual INDEX read/write stay with the ordinary gated
+        // file tools the prelude calls.
+        let denied = {
+            let d = caller.data();
+            if !d.snap.include {
+                Some(format!(
+                    "run_code: {name} is not available in this configuration \
+                     (code.include=false) — the lib helpers are disabled"
+                ))
+            } else {
+                None
+            }
+        };
+        if let Some(msg) = denied {
+            return envelope_err(caller, "denied", Some(name.as_str()), Some(false), &msg);
+        }
+        let payload = {
+            let d = caller.data();
+            match std::fs::metadata(d.workdir_canon.join(LIB_INDEX_REL)) {
+                Ok(_) => json!({ "state": "exists" }),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    json!({ "state": "missing" })
+                }
+                Err(e) => {
+                    return envelope_err(
+                        caller,
+                        "lib",
+                        Some(name.as_str()),
+                        Some(false),
+                        &format!("run_code: cannot stat {LIB_INDEX_REL}: {e}"),
+                    )
+                }
+            }
+        };
+        return envelope_or_trap(caller, true, &payload.to_string());
+    }
+
+    if name == LIB_UPDATE_INDEX_NAME {
+        // saveLib's merge (external re-review P1/P2): a PURE text→text
+        // upsert validated by the SAME line parser the admission uses
+        // (`parse_lib_line`) — one grammar, no guest/host drift. The IO
+        // stays with the caller: the prelude reads INDEX through the gated
+        // read_file (hooks can deny) and writes the returned text through
+        // the gated write_file. Read-only class like `__budget`.
+        let denied = {
+            let d = caller.data();
+            if !d.snap.include {
+                Some(format!(
+                    "run_code: {name} is not available in this configuration \
+                     (code.include=false) — the lib helpers are disabled"
+                ))
+            } else {
+                None
+            }
+        };
+        if let Some(msg) = denied {
+            return envelope_err(caller, "denied", Some(name.as_str()), Some(false), &msg);
+        }
+        let merged = {
+            let (rel, sha, text) = (
+                args.get("rel").and_then(Value::as_str),
+                args.get("sha256").and_then(Value::as_str),
+                args.get("text").and_then(Value::as_str),
+            );
+            match (rel, sha, text) {
+                (Some(r), Some(s), Some(t)) => lib_upsert_index(r, s, t),
+                _ => Err(format!(
+                    "run_code: {name} needs string fields 'rel', 'sha256' and 'text'"
+                )),
+            }
+        };
+        // The merged text rides inside an object on purpose: `content` is
+        // auto-JSON-parsed guest-side, and a degenerate INDEX whose whole
+        // text parses as JSON must still arrive as the STRING it is.
+        return match merged {
+            Ok(s) => envelope_or_trap(caller, true, &json!({ "index": s }).to_string()),
+            Err(e) => envelope_err(caller, "lib", Some(name.as_str()), Some(false), &e),
+        };
+    }
+
     if name == INCLUDE_NAME || name == HASH_FILE_NAME {
         // Lib-family reserved names (MD-2): REAL gated host actions, not the
         // read-only introspection class above — routed to their own dispatch
@@ -3004,13 +3204,20 @@ tools.budget = function () { return tools.call("__budget", {}); };
 ///
 /// `saveLib` = the MD-10 write path: `write_file` (full write policy
 /// applies) → `__hash_file` (host hashes the delivered bytes AND registers
-/// the session admission) → INDEX upsert (st always `draft`; existing
-/// `needs`/`ver` preserved, ver=1/needs=- on create). The manifest write
-/// goes through the ordinary file tools — the host only ever PARSES INDEX
-/// (see [`parse_lib_index`]). The pre-existing `writeVerified` (byte-fidelity
-/// write, v2 P1) is a different helper and stays untouched: the design doc's
-/// "writeVerified" naming collided with it, the M1 helper is `saveLib`
-/// (revision note in docs/code_memory_design.md).
+/// the session admission) → `__lib_index_state` (host reports whether INDEX
+/// exists — a filesystem fact, so no error-string parsing can spoof the
+/// empty-index initialization) → read INDEX via the ordinary gated
+/// `read_file` when it exists (a hooks Deny or IO error aborts the save,
+/// preserving every existing registration) → `__lib_update_index` (host-side
+/// merge, the SAME parser the admission uses — st always `draft`; existing
+/// `needs`/`ver` preserved, ver=1/needs=- on create) → write the merged
+/// text back through the ordinary gated `write_file`. The host parses AND
+/// merges; the file writes stay with the caller's ordinary file tools (see
+/// [`parse_lib_line`], [`lib_upsert_index`]). The pre-existing
+/// `writeVerified` (byte-fidelity write, v2 P1) is a different helper and
+/// stays untouched: the design doc's "writeVerified" naming collided with
+/// it, the M1 helper is `saveLib` (revision note in
+/// docs/code_memory_design.md).
 const PRELUDE_LIB_SRC: &str = r#"
 var __ta_libs = Object.create(null);
 function include(path) {
@@ -3020,30 +3227,6 @@ function include(path) {
     try { (0, eval)(src); }
     catch (e) { delete __ta_libs[path]; throw e; }
     return undefined;
-}
-// Machine-line check mirroring the host parser (saveLib's write-back guard):
-// for a line that LOOKS like a ta-lib entry (<!-- ta-lib: … -->) return its
-// path value when the host parser would ACCEPT it; null when the host would
-// REJECT it (upserting alongside such a line keeps every include broken);
-// undefined when the line is not a machine line (prose — the host skips it).
-function __ta_lib_line_path(line) {
-    var t = line.trim(), toks, seen = {}, pv = null, i, j, k, segs;
-    if (t.substring(0, 12) !== "<!-- ta-lib:" || t.substring(t.length - 3) !== "-->") return undefined;
-    toks = t.substring(12, t.length - 3).trim().split(/\s+/);
-    for (i = 0; i < toks.length; i++) {
-        j = toks[i].indexOf("=");
-        if (j <= 0) return null;
-        k = toks[i].substring(0, j);
-        if (k !== "path" && k !== "sha256" && k !== "needs" && k !== "ver" && k !== "st") return null;
-        if (seen[k]) return null;
-        seen[k] = 1;
-        if (k === "path") pv = toks[i].substring(j + 1);
-    }
-    if (!seen.path || !seen.sha256 || !seen.needs || !seen.ver || !seen.st) return null;
-    if (!pv || pv.substring(0, 1) === "/" || pv.indexOf("..") !== -1) return null;
-    segs = pv.split("/");
-    for (i = 0; i < segs.length; i++) if (!segs[i]) return null;
-    return pv;
 }
 function saveLib(path, src) {
     path = String(path);
@@ -3058,43 +3241,21 @@ function saveLib(path, src) {
     // under — the manifest key must be that spelling, never a raw slice of
     // the guest's input ("lib/./x.js" used to write an entry the parser
     // rejects, poisoning the whole channel).
-    var rel = h && h.rel && h.rel.indexOf("lib/") === 0 ? h.rel.slice(4) : path.slice(4), tok = "path=" + rel;
-    var text = "";
-    try { text = readAll("lib/INDEX.md"); }
-    catch (e) {
-        // Only a definite "file does not exist" may initialize an empty
-        // index; a hooks Deny, an IO error, or a paging anomaly must ABORT —
-        // upserting onto a blank would overwrite every existing registration
-        // and approval and still report success.
-        var em = String(e);
-        if (em.indexOf("No such file or directory") === -1 && em.indexOf("cannot find the file") === -1) throw e;
-        text = "";
-    }
-    var lines = text ? text.split("\n") : [], out = [], hit = false, needs = "-", ver = "1", i, j, seg, seenPaths = {}, checked;
-    for (i = 0; i < lines.length; i++) {
-        if (lines[i].indexOf("<!-- ta-lib:") !== -1) {
-            checked = __ta_lib_line_path(lines[i]);
-            if (checked === null) throw new Error("saveLib: lib/INDEX.md has a malformed ta-lib line the host parser rejects — fix it before saving: " + lines[i].trim());
-            if (checked !== undefined) {
-                if (seenPaths[checked]) throw new Error("saveLib: lib/INDEX.md has duplicate ta-lib entries for path " + checked + " — fix it before saving");
-                seenPaths[checked] = 1;
-            }
-        }
-        seg = lines[i].split(" ");
-        if (lines[i].indexOf("ta-lib:") !== -1 && seg.indexOf(tok) !== -1) {
-            for (j = 0; j < seg.length; j++) {
-                if (seg[j].indexOf("needs=") === 0) needs = seg[j].slice(6);
-                if (seg[j].indexOf("ver=") === 0) ver = seg[j].slice(4);
-            }
-            out.push("<!-- ta-lib: path=" + rel + " sha256=" + h.sha256 + " needs=" + needs + " ver=" + ver + " st=draft -->");
-            hit = true;
-        } else { out.push(lines[i]); }
-    }
-    if (!hit) {
-        if (out.length && out[out.length - 1] !== "") out.push("");
-        out.push("<!-- ta-lib: path=" + rel + " sha256=" + h.sha256 + " needs=" + needs + " ver=" + ver + " st=draft -->");
-    }
-    tools.call("write_file", {path: "lib/INDEX.md", content: out.join("\n") + "\n"});
+    var rel = h && h.rel && h.rel.indexOf("lib/") === 0 ? h.rel.slice(4) : path.slice(4);
+    // Existence is a HOST filesystem fact (never inferred from an error
+    // string — a hooks denial whose text contains "No such file or
+    // directory" must not wipe the index). When the index exists it is read
+    // through the ordinary gated read_file: a hooks Deny, an IO error or a
+    // paging anomaly throws here and the save ABORTS with every existing
+    // registration intact.
+    var state = tools.call("__lib_index_state", {});
+    var text = state && state.state === "missing" ? "" : readAll("lib/INDEX.md");
+    // The merge is host-side and uses the SAME parser the admission uses:
+    // a pre-existing malformed or duplicated ta-lib line is rejected HERE
+    // (the old guest-side near-copy of the parser had drifted and let
+    // poisoned lines through). Errors throw; the index is untouched.
+    var merged = tools.call("__lib_update_index", {rel: rel, sha256: h.sha256, text: text});
+    tools.call("write_file", {path: "lib/INDEX.md", content: merged.index});
     return {path: rel, sha256: h.sha256, st: "draft"};
 }
 // The prelude's declarations live in the OUTER eval's scope — an indirectly
@@ -7927,10 +8088,135 @@ return t.length;"#}),
             2,
             "no duplicate/spelling-variant entries: {index}"
         );
-        assert!(
-            !index.contains("./new.js") && !index.contains("../lib"),
-            "no raw spelling leaked: {index}"
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// External re-review P1: a hooks denial whose TEXT happens to contain
+    /// an OS "not found" phrasing must not spoof the empty-index
+    /// initialization. The old guest-side saveLib classified by string
+    /// matching (`indexOf("No such file or directory")`), so this denial
+    /// wiped every existing registration; the existence probe is now a host
+    /// filesystem fact (`__lib_index_state`), and an EXISTING index is read
+    /// through the gated read_file — the denial aborts the save instead.
+    #[test]
+    fn lib_spoofed_not_found_hooks_message_preserves_index() {
+        struct SpoofingDeny;
+        impl crate::hooks::Hooks for SpoofingDeny {
+            fn before_tool(
+                &self,
+                tool: &str,
+                input: &Value,
+                _c: &ToolCtx,
+            ) -> crate::hooks::ToolDecision {
+                if tool == "read_file"
+                    && input.get("path").and_then(Value::as_str) == Some("lib/INDEX.md")
+                {
+                    // The exact probe shape from the re-review: a plausible
+                    // approval-backend message embedding the ENOENT text.
+                    crate::hooks::ToolDecision::Deny(
+                        "approval backend unavailable: No such file or directory".into(),
+                    )
+                } else {
+                    crate::hooks::ToolDecision::Allow
+                }
+            }
+        }
+        let dir = scratch();
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        std::fs::write(dir.join("lib/unsafe.js"), "globalThis.u = 1;").unwrap();
+        std::fs::write(dir.join("lib/safe.js"), "globalThis.s = 2;").unwrap();
+        let idx = format!(
+            "<!-- ta-lib: path=unsafe.js sha256={} needs=- ver=1 st=ok -->\n\
+             <!-- ta-lib: path=safe.js sha256={} needs=- ver=1 st=ok -->\n",
+            sha256_hex(b"globalThis.u = 1;"),
+            sha256_hex(b"globalThis.s = 2;"),
         );
+        std::fs::write(dir.join(LIB_INDEX_REL), &idx).unwrap();
+        let mut g = ctx(&dir);
+        g.hooks = Some(std::sync::Arc::new(SpoofingDeny));
+        let out = lib_tool()
+            .run_with_emit(
+                &json!({"code": r#"
+                    var err = null;
+                    try { saveLib("lib/spoof.js", "var sp = 1;"); } catch (e) { err = String(e); }
+                    var includeOldOk = false;
+                    try { include("lib/safe.js"); includeOldOk = true; } catch (e) {}
+                    return { err: err, includeOldOk: includeOldOk };"#}),
+                &g,
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        assert!(
+            v["err"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("approval backend unavailable"),
+            "the spoofing denial propagates (no empty-index overwrite): {v}"
+        );
+        assert_eq!(v["includeOldOk"], json!(true), "old lib still admits: {v}");
+        // Both original registrations intact, byte-identical — this is the
+        // exact wipe the probe used to cause.
+        assert_eq!(
+            std::fs::read_to_string(dir.join(LIB_INDEX_REL)).unwrap(),
+            idx
+        );
+        assert!(dir.join("lib/spoof.js").exists(), "documented half state");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// External re-review P2: a pre-existing INDEX line the HOST parser
+    /// rejects (short sha, non-numeric ver, st outside {ok,draft}) must
+    /// abort the save — the old guest-side near-copy of the parser only
+    /// checked the five keys' presence, let the poisoned line through the
+    /// write-back, and every later include died on the host parse. The
+    /// merge now runs the SAME parser (`parse_lib_line` via
+    /// `lib_upsert_index`), so the poison is named and the index is left
+    /// untouched for the still-valid entries.
+    #[test]
+    fn lib_malformed_index_line_rejected_at_save() {
+        let dir = scratch();
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        std::fs::write(dir.join("lib/good.js"), "globalThis.g = 1;").unwrap();
+        let idx = format!(
+            "<!-- ta-lib: path=bad.js sha256=xyz needs=- ver=abc st=approved -->\n\
+             <!-- ta-lib: path=good.js sha256={} needs=- ver=1 st=ok -->\n",
+            sha256_hex(b"globalThis.g = 1;"),
+        );
+        std::fs::write(dir.join(LIB_INDEX_REL), &idx).unwrap();
+        let v = js_out(
+            &lib_tool(),
+            &dir,
+            r#"
+            var err = null;
+            try { saveLib("lib/new.js", "var nw = 1;"); } catch (e) { err = String(e); }
+            var includeOldOk = false;
+            try { include("lib/good.js"); includeOldOk = true; } catch (e) {}
+            return { err: err, includeOldOk: includeOldOk };"#,
+        );
+        assert!(
+            v["err"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("line 1: sha256 must be 64 hex chars"),
+            "the host parser names the poisoned line: {v}"
+        );
+        // The poisoned index legitimately blocks admission for EVERY entry
+        // (parse_lib_index is strict by design) — which is exactly why the
+        // save must refuse instead of writing a new registration alongside
+        // the poison and reporting success.
+        assert_eq!(
+            v["includeOldOk"],
+            json!(false),
+            "a poisoned index blocks all includes (pre-existing strictness): {v}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(LIB_INDEX_REL)).unwrap(),
+            idx,
+            "rejected merge leaves the index untouched"
+        );
+        assert!(dir.join("lib/new.js").exists(), "documented half state");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -9721,6 +10007,101 @@ return t.length;"#}),
             0,
             "refused before any reservation"
         );
+    }
+
+    /// External re-review P1: the termination contract is a COMPLETE-RESPONSE
+    /// WHITELIST, not an abort blacklist. Providers forward unknown
+    /// finish_reasons verbatim (openai maps stop/tool_calls/length only;
+    /// anthropic forwards its native vocabulary), so `content_filter` /
+    /// `refusal` / `pause_turn` / a future reason — even with residual text
+    /// that hits a label — must come back kind="llm", never a verdict.
+    /// end_turn / tool_use / stop_sequence are the three provably-complete
+    /// terminations and stay successes.
+    #[test]
+    fn llm_stop_reason_whitelist_table() {
+        let cases: &[(&str, bool)] = &[
+            // Complete by construction — success.
+            ("end_turn", false),
+            ("tool_use", false),
+            ("stop_sequence", false),
+            // Abort vocabulary (agent.rs's own list).
+            ("max_tokens", true),
+            ("stream_error", true),
+            ("stream_truncated", true),
+            ("stream_idle", true),
+            ("cancelled", true),
+            // Filtered / refused / paused — no valid result exists.
+            ("content_filter", true),
+            ("refusal", true),
+            ("pause_turn", true),
+            // Unprovable: empty and an unknown future reason fail closed.
+            ("", true),
+            ("future_reason_xyz", true),
+        ];
+        for (sr, should_err) in cases {
+            let dir = scratch();
+            let (prov, state) = crate::provider::mock::MockProvider::new(vec![
+                crate::provider::mock::MockTurn::Ok(crate::provider::ChatResponse {
+                    // Residual text that WOULD pass the labels check — the
+                    // laundering probe's exact shape.
+                    blocks: vec![crate::provider::Block::Text("yes".into())],
+                    stop_reason: (*sr).into(),
+                    usage: crate::provider::mock::mk_usage(3, 2),
+                }),
+            ]);
+            let g = gated_ctx(&dir, 10_000);
+            let out = llm_tool(llm_cfg(), std::sync::Arc::new(prov))
+                .run_with_emit(
+                    &json!({"code": r#"
+                        try {
+                            var r = tools.call("llm", {prompt: "hi", labels: ["yes", "no"]});
+                            return { threw: false, label: r.label };
+                        } catch (e) {
+                            return { threw: true, kind: e.kind, msg: String(e) };
+                        }"#}),
+                    &g,
+                    &mut |_| {},
+                )
+                .unwrap();
+            let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+            let msg = v["msg"].as_str().unwrap_or_default();
+            if *should_err {
+                assert_eq!(v["threw"], json!(true), "(stop_reason={sr:?}) {v}");
+                assert_eq!(
+                    v["kind"],
+                    json!("llm"),
+                    "(stop_reason={sr:?}) termination, not vocabulary: {v}"
+                );
+                if !sr.is_empty() {
+                    assert!(msg.contains(sr), "(stop_reason={sr:?}) names it: {msg}");
+                }
+                if *sr == "max_tokens" {
+                    assert!(
+                        msg.contains("max_tokens cap"),
+                        "the cap keeps its dedicated copy: {msg}"
+                    );
+                }
+                // The call was real and billed: settle against the usage.
+                assert_eq!(
+                    g.budget
+                        .as_ref()
+                        .unwrap()
+                        .used
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    5,
+                    "(stop_reason={sr:?}) partial usage settles"
+                );
+            } else {
+                assert_eq!(v["threw"], json!(false), "(stop_reason={sr:?}) {v}");
+                assert_eq!(v["label"], json!("yes"), "(stop_reason={sr:?}) {v}");
+            }
+            assert_eq!(
+                state.captured().len(),
+                1,
+                "(stop_reason={sr:?}) exactly one provider call"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// A-L2c/A-L3, unstarted arm: hooks Deny lands BEFORE dispatch — zero

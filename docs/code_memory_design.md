@@ -2,15 +2,40 @@
 
 | 项 | 值 |
 |---|---|
-| 状态 | v0.7.1；M1（include v1）与 M2（模板/skill 生命周期教学）均已落码（§8 里程碑表）；V0-B 验收见姊妹稿 v0.7.4 读数登记 |
-| 版本 | v0.7.1 |
-| 日期 | 2026-09-22 |
+| 状态 | v0.7.3；M1（include v1）与 M2（模板/skill 生命周期教学）均已落码（§8 里程碑表）；V0-B 验收见姊妹稿读数登记；外部审核两轮缺陷修复完毕 |
+| 版本 | v0.7.3 |
+| 日期 | 2026-09-26 |
 | 关联文档 | `docs/run_code_design.md`（D 编号、prelude 封闭清单纪律 D18）、`docs/finetune_support_design.md`（附录 A 即规格纪律）、`docs/code_llm_design.md`（姊妹稿——统一边界句、责任与权限边界、共享纪律见其 §6/§10） |
-| 代码基线 | master @ 0579564（其后行号会漂移，以代码为准） |
+| 代码基线 | master @ 45ad4ae（其后行号会漂移，以代码为准） |
 | 决策编号 | 本文 MD-n 独立编号；引用 run_code_design 写 D-n、finetune_support 写 FD-n |
 
 修订记录（历史不作为现行规格）：
 
+- **v0.7.3（外部复审轮：INDEX 通道存在性结构化 + 合并统一宿主）**：读数来源 =
+  外部代码复审报告（基线 45ad4ae；探针在审核方环境，本轮固化为回归测试）。
+  ① **MD-10 存在性判定结构化（复审 P1）**：v0.7.2 的「INDEX 读取错误分诊」
+  靠异常文本匹配（`indexOf("No such file or directory")`），hooks 拒绝文案
+  内嵌该子串即可伪造「不存在」→ 空索引初始化覆盖既有登记（探针：拒绝文案
+  "approval backend unavailable: No such file or directory" 清空全部登记）。
+  修订：新增保留名 `__lib_index_state`（与 `__budget` 同为只读内省类——无
+  gate/审计/配额），宿主以 **fs::metadata 的文件系统事实**回答
+  exists/missing；存在时 saveLib 照旧经普通 gated read_file 读取（hooks
+  Deny/IO 错误仍中止保存），guest 不再解析任何错误文本。
+  ② **MD-11 单一 parser（复审 P2）**：v0.7.2 的 guest 侧 `__ta_lib_line_path`
+  只镜像了五键存在性与路径形状，未镜像宿主的 sha256=64hex / st∈{ok,draft} /
+  ver 数字规则——毒行可随写回进入 INDEX，随后所有 include 被宿主 parser
+  拒绝（探针复现）。修订：单行校验提取为宿主 `parse_lib_line`，
+  `parse_lib_index`（admission）与新 `lib_upsert_index`（saveLib 合并，纯
+  函数 text→text）共用——**按构造消灭 guest/host parser 漂移**（guest 侧
+  近似副本已删除）。合并语义与原 guest 实现逐字节同形：同 path 原位替换
+  （needs/ver 取旧行，st 恒回 draft）、无则尾部追加（空行分隔）、
+  join("\n")+"\n"；rel/sha 入参同规则校验。新保留名
+  `__lib_update_index` 同为只读内省类（纯函数无副作用），返回
+  {"index": merged} 包装（防 content 自动 JSON 解析吃掉恰好合法 JSON 的
+  退化 INDEX 文本）；真正 IO（读 read_file / 写 write_file）仍走普通 gated
+  工具，hooks 面不变。回归：`lib_spoofed_not_found_hooks_message_
+  preserves_index` + `lib_malformed_index_line_rejected_at_save`（探针固化）。
+  姊妹稿 v0.7.6 同轮登记 llm 终止白名单。
 - **v0.7.2（外部审核缺陷修复轮：lib 家族三项）**：读数来源 = 外部代码审核
   报告（基线 c555074 / 0.4.1；与本轮配套的 llm/批侧修复见姊妹稿 v0.7.5）。
   ① **MD-2 补注：lib 家族遵守 Hooks::Modify（审核 P1-2）**——`lib_reserved_call`
