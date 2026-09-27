@@ -3,6 +3,50 @@
 本文件记录 TinyAgent 的版本演化。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)（0.x 阶段 minor 即破坏性窗口）。
 
+## [0.4.2] - 2026-09-27
+
+run_code v1 结项版本：三轮外部复审的运行时修复 + 价值验证收口（G3）+ 文档状态统一。
+
+### Fixed
+
+- **llm 终止契约改白名单 fail-closed（45ad4ae / 9c3db9b）**：内层 `chat()` 的 Ok 不再等于
+  完整成功——仅 `end_turn`/`tool_use`/`stop_sequence` 三个可证明完整的终止走成功；
+  `max_tokens` 定约为不完整输出，`stream_error`/`stream_truncated`/`stream_idle`/
+  `cancelled`/`content_filter`/`refusal` 及未知未来词表一律 `kind="llm"` 错误
+  （原五词黑名单下 content_filter/refusal 的残留文本可命中 labels 伪装成有效分类）。
+  部分 usage 诚实结算（有则 settle、无则保留预占），错误输出带 `meta.llm_call` 审计行；
+  终止检查先于 label 校验。
+- **include/hash_file 尊重 Hooks::Modify（45ad4ae）**：lib 家族入口补齐 Modify 形状——
+  对 effective 参数重跑 `lib_rel` 边界与 deny 检查，执行用 effective 路径，
+  `after_tool` 审计留原始输入，CallTrace 补 `in_hash_eff` 双哈希。
+- **saveLib/INDEX 通道加固（45ad4ae / 9c3db9b / cbda304）**：INDEX 读取错误分诊——
+  只有确定的"文件不存在"才初始化空索引，hooks 拒绝/IO 错误中止保存而不再按空索引
+  覆盖既有登记；存在性判定改走宿主结构化保留名 `__lib_index_state`（不再靠异常文本
+  子串分诊）；登记键统一为宿主规范路径（`lib/./x`、`lib/../lib/x` 不再毒化 manifest）；
+  INDEX 单行 parser 收敛为宿主单源（guest 侧近似副本删除，按构造消灭 parser 漂移）；
+  `__include` 交付改 `{"src": …}` 包装（整文件恰为合法 JSON 的库不再被 guest
+  auto-parse 静默 no-op）。
+- **callBatch 波内三源刷新（45ad4ae / cbda304）**：波内每项执行前与 worker spawn 前
+  改查 interrupt/cancel/deadline；多波 wave-start halt 时未启动条目逐项
+  `{kind:"cancel", halted:true}` 且事件配平；`MAX_BATCH_ENTRIES=4096` 超界整批预检拒绝；
+  批内 image 返回落 `kind:"image"` 错误信封。
+- **`set_code_config` 与启动期同一 llm 验证（45ad4ae）**：llm 片段省略 model 时
+  default_model 属于 models 白名单的终检不再被热更新路径绕过。
+- **batch panic 占位补 llm 审计（45ad4ae）**：worker panic 占位在错误输出上附
+  `meta.llm_call` 审计行，unknown_calls/预占对账不丢。
+
+### Added
+
+- **G3 分支验证与 run_code v1 结项（e58955b / d65502c）**：按需披露装配下 T2 采用成立
+  （费用比 0.567×/0.571×，与全量提示词原配方不可区分）——README「何时开启」指引更新为
+  **默认 `skill_injection: "on_demand"` 装配即足够触发采用**，能力段全量提示词降为可选
+  增益。评测装置新增 `prepare-g3`/`run-g3` 与费用停止线续批机制（`--continue-of`）。
+  `docs/code_review_brief.md` 改造为特性族唯一状态总表（六项能力逐一标定
+  已交付/可选保留/研究归档），两份设计稿补结项状态，全部评测工单（G0–G3）关档。
+- **门禁加固（cbda304）**：README code 配置表交叉核对扩展到布尔字段与嵌套 LlmConfig
+  默认值；设计稿冻结块与代码常量补逐字断言测试；双绑定补钉 include/call_batch/llm
+  三新键的 serde 形状测试。
+
 ## [0.4.1] - 2026-09-25
 
 ### Added
