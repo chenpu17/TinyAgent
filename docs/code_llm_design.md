@@ -2,15 +2,45 @@
 
 | 项 | 值 |
 |---|---|
-| 状态 | v0.7.6（M2/M3/M4 落码；V0-B 四臂主批 + e3 复查 + e1 库臂已跑：e2 一致性增量成立，A③/include 零效应登记；外部审核两轮缺陷修复完毕）；产品收益部分验收 |
-| 版本 | v0.7.6 |
-| 日期 | 2026-09-26 |
+| 状态 | v0.7.6（M2/M3/M4 落码；V0-B 四臂主批 + e3 复查 + e1 库臂已跑：e2 一致性增量成立，A③/include 零效应登记；外部审核三轮收口完毕）；产品收益部分验收 |
+| 版本 | v0.7.7 |
+| 日期 | 2026-09-27 |
 | 关联文档 | `docs/run_code_design.md`（D 编号）、`docs/finetune_support_design.md`（FD 编号、附录 A 即规格纪律）、`docs/run_code_routing_report.md`（评测方法论）、`docs/code_memory_design.md`（姊妹稿，共享纪律见 §10） |
-| 代码基线 | master @ 45ad4ae（其后行号会漂移，以代码为准） |
+| 代码基线 | master @ 9c3db9b（其后行号会漂移，以代码为准） |
 | 决策编号 | 本文 LD-n 独立编号；引用 run_code_design 写 D-n、finetune_support 写 FD-n |
 
 修订记录（历史仅说明演进，当前正文与决策表为规格）：
 
+- **v0.7.7（全链审核收口轮：预占位置备案 + halted 作用域 + 冻结面同步）**：读数来源 =
+  外部全链审核（基线 9c3db9b；工程层判定收口，9 项 P3 本条登记 llm/batch 侧，
+  姊妹稿 v0.7.4 登记 lib 侧）。
+  ① **§4 预占位置差异备案（审核 P3）**：§4 称批量 llm 条目的 token 预占在
+  "串行派发准备段完成"，实现为 **worker 内原子 reserve**（llm.rs）——est 由
+  输入推导、reserve 原子、与派发序无关，账目保证（预占先于 provider 调用、
+  Drop 保预占）与 prep 段串行预占**等价**，非缺陷，本条备案差异。
+  ② **halted 作用域说明（审核 P3）**：单次调用错误封套不带 `halted`（修订⑨
+  定案），但 prelude 批量面把 `e.halted` 教给了 guest——泛化到单次调用见
+  undefined→falsy→误判沙箱存活。补注两处：skill「批量调用」段失败条目判别
+  bullet（`e.halted` 仅 callBatch 条目携带；单次停机判定用 `e.kind`）与
+  附录 A④ 外围 prose（LLM 可见文案变更：skill 哈希在 sync manifest，
+  `--write` 重生成）。
+  ③ **A④/A⑤ 冻结块 verbatim 修正（审核 P3）**：A④ 此前缺常量尾句且误冻结
+  运行时替换后拼写（`read_file / llm 等`——常量原文是 `read_file 等`，llm
+  追加是运行时 replace）——已改为常量逐字原文（单行）+ 替换规则 prose 注；
+  A⑤ 同步单行化核对。run_code.rs tests 新增常量↔文档逐字断言（A①/A④/A⑤，
+  见姊妹稿 v0.7.4 ③）。
+  ④ **附录 A⑤ 后无主重复 callBatch 块删除（审核 P3）**：编辑残留，与 A④
+  旧文逐字相同、无标题归属。
+  ⑤ **覆盖补测 + 实名注记（审核 P3/薄弱点）**：新增
+  `batch_wave_start_halt_refuses_second_wave`（多波边界 wave-start 闩锁刷新——
+  v0.7.5 ④ `batch_wave_interrupt_refresh` 的波内检查点覆盖测试为
+  `batch_deadline_refuses_unstarted_inline_entries` /
+  `batch_deadline_after_inline_blocks_llm_dispatch`，实名补注）、
+  `batch_hooks_deny_and_fs_deny_entry_shapes`（批内 hooks Deny 发
+  after_tool(executed=false)、deny/fs 层不发）、
+  `batch_over_entry_cap_refused_whole`（4096 上限 prep 段整批拒绝）、
+  `batch_image_entry_gets_image_envelope`（批内 image 信封臂）。
+  绑定键回归与 README 布尔默认交叉核对见 sync 脚本与绑定测试（同轮收口）。
 - **v0.7.6（外部复审轮：终止契约黑名单收严为完整响应白名单）**：读数来源 =
   外部代码复审报告（基线 45ad4ae，上一轮 7 项修复全部复核关闭；修复邻接边界
   新发现 2 P1 + 2 P2 + 1 P3，本条登记其中 llm 侧 1 项，姊妹稿 v0.7.3 登记
@@ -719,12 +749,16 @@ V0-A→M1/M2/M3 最小实现→M4→V0-B；M0 与 V0-A 可并行，M2 依赖 M0 
 
 **④ callBatch 的 prelude/描述行**（同源同步进描述与 skill）：
 
+（冻结面为 `BATCH_DESC_SUFFIX` 常量逐字原文，含尾句。运行时当 code.llm.enabled
+开启时，`read_file 等 batchable 工具` 替换为 `read_file / llm 等 batchable 工具`
+（`BATCH_DESC_SUFFIX.replace`）——此前本块误冻结了替换后的拼写。）
+
+（`e.halted` 作用域：**仅批量条目封套携带**；单次 `tools.call` 错误无此字段
+（undefined 判 falsy 会误判沙箱存活），单次调用的停机判定用 `e.kind`
+（cancel/deadline/budget）——修订⑨/⑪的单次面定案，skill「批量调用」段同句同步。）
+
 ```
-tools.callBatch([{name, args}, …])：并发执行一批只读工具调用（read_file / llm 等
-batchable 工具；按提交序返回数组；无原子性、无回滚、部分执行是正常结果——逐条
-检查）。单项失败不抛、该条目为 Error 实例带 e.kind/e.tool——用 instanceof 判别，
-不要 JSON.stringify 失败条目。并发上限 8/波；分页拉取与逐项判别是理想对象；
-副作用调用不在批内——写顺序 for 循环。
+【批量】（仅 code.call_batch 开启时；关闭时无此助手）tools.callBatch([{name, args}, …])：并发执行一批只读工具调用（read_file 等 batchable 工具；按提交序返回数组；无原子性、无回滚、部分执行是正常结果——逐条检查）。单项失败不抛、该条目为 Error 实例带 e.kind/e.tool——用 instanceof 判别，不要 JSON.stringify 失败条目（Error 序列化成 {}，细节丢失）。并发上限 8/波；分页拉取与逐项判别是理想对象；副作用调用不在批内——写顺序 for 循环。详见 run-code 技能的「批量调用」段。
 ```
 
 **⑤ run_code 描述的【LLM 判别】overlay 段**（v0.7.3 钉住；仅 code.llm.enabled
@@ -732,12 +766,4 @@ batchable 工具；按提交序返回数组；无原子性、无回滚、部分�
 
 ```
 【LLM 判别】（仅 code.llm.enabled 开启时；关闭时无此工具）tools.call("llm", {prompt, system?, model?, max_tokens?, labels?})：单次模型调用（无工具、无历史、无流式）——大量同构的逐项语义判断（分类/抽取/校对/打标）用代码循环 + llm 承接；model 须在 code.llm.models 内（缺省 default_model）。声明 labels（封闭词表，≤16 项）时宿主校验输出并返回规范 label，未命中 e.kind="llm_output"、其余失败 e.kind="llm"（均无 retryable，读 message 自判）；词表要求必须同时写进 prompt（宿主不注入）。返回 {text, label?, usage, model}。token 成本发前预占、也计调用额度。判别纪律/成本纪律/级联详见 run-code 技能的「LLM 判别」段。
-```
-
-```
-tools.callBatch([{name, args}, …])：并发执行一批只读工具调用（read_file / llm 等
-batchable 工具；按提交序返回数组；无原子性、无回滚、部分执行是正常结果——逐条
-检查）。单项失败不抛、该条目为 Error 实例带 e.kind/e.tool——用 instanceof 判别，
-不要 JSON.stringify 失败条目。并发上限 8/波；分页拉取与逐项判别是理想对象；
-副作用调用不在批内——写顺序 for 循环。
 ```

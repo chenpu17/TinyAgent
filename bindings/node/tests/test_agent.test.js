@@ -728,6 +728,34 @@ test('runCode: setCodeConfig applies the dict; unknown keys error', { skip: !COD
   assert.ok(seen[0].includes('run_code'), 'setCodeConfig drives the switch too');
 });
 
+test('runCode: setCodeConfig accepts the include/call_batch/llm keys; malformed llm errors', { skip: !CODE_BUILT }, async (t) => {
+  const { cfgPath } = providerConfig(t);
+  const a = new Agent(cfgPath, {
+    provider: (request) => ({ text: 'done', stop_reason: 'end_turn' }),
+  });
+  a.disableCode();
+  // The newer keys ride the same serde shape as the config file's "code"
+  // section — the full dict is accepted...
+  a.setCodeConfig({
+    enabled: true,
+    include: true,
+    call_batch: true,
+    llm: { enabled: true, default_model: 'm', models: ['m'] },
+  });
+  // ...and a malformed llm subkey errors instead of being silently ignored:
+  // enabled without default_model is a validation-rejected config typo...
+  assert.throws(
+    () => a.setCodeConfig({ llm: { enabled: true, models: ['m'] } }),
+    /requires code\.llm\.default_model/,
+  );
+  // ...and a wrong-typed default_model is rejected by serde itself (napi
+  // surfaces the type mismatch without the field path).
+  assert.throws(
+    () => a.setCodeConfig({ llm: { enabled: true, default_model: 42 } }),
+    /invalid type/,
+  );
+});
+
 test('runCode: busy error when called during run(); works again after (A-10c)', { skip: !CODE_BUILT }, async (t) => {
   // The code methods ride the same try_lock path as the other sync methods:
   // called from the provider callback (which runs on the JS thread while the

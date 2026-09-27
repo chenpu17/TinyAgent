@@ -936,8 +936,17 @@ fn include_deliver(d: &HostCtx, rel: &str, spelling: &str) -> (ToolOutput, &'sta
     }
     let src = String::from_utf8_lossy(&bytes).into_owned();
     let hex = sha256_hex(src.as_bytes());
-    let index_text =
-        std::fs::read_to_string(d.workdir_canon.join(LIB_INDEX_REL)).unwrap_or_default();
+    let index_text = match std::fs::read_to_string(d.workdir_canon.join(LIB_INDEX_REL)) {
+        Ok(t) => t,
+        // A missing index is the legitimate "nothing registered yet" case.
+        // Any OTHER IO error (permissions, a directory in the way…) is
+        // reported as what it is — the old `unwrap_or_default()` folded it
+        // into "no entry", sending the guest to saveLib for an index it
+        // cannot even read (external re-review P3; same triage as
+        // `__lib_index_state`).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return err(format!("run_code: cannot read {LIB_INDEX_REL}: {e}")),
+    };
     let index = match parse_lib_index(&index_text) {
         Ok(m) => m,
         Err(e) => return err(format!("run_code: {LIB_INDEX_REL} is malformed: {e}")),
@@ -969,7 +978,14 @@ fn include_deliver(d: &HostCtx, rel: &str, spelling: &str) -> (ToolOutput, &'sta
              the library and set st=ok in {LIB_INDEX_REL}"
         ));
     }
-    (ToolOutput::text(src), "tool")
+    // The source rides inside an object on purpose (same shape as
+    // `__lib_update_index`'s {"index": …}): the guest glue auto-JSON-parses
+    // envelope content, and a library whose WHOLE text parses as JSON (a
+    // data-file lib) would arrive as an object — `(0, eval)(object)` is a
+    // silent no-op, the include "succeeds" while loading nothing (external
+    // re-review P3). Wrapped, the parse lands on the envelope object and
+    // the source always arrives as the string it is.
+    (ToolOutput::text(json!({ "src": src }).to_string()), "tool")
 }
 
 /// `__hash_file` (MD-12/MD-14): hash the delivered bytes of a lib file and
@@ -3222,7 +3238,11 @@ const PRELUDE_LIB_SRC: &str = r#"
 var __ta_libs = Object.create(null);
 function include(path) {
     if (__ta_libs[path]) return undefined;
-    var src = tools.call("__include", {path: path});
+    // The host wraps the delivered source as {"src": S} — the envelope glue
+    // auto-JSON-parses content, and a whole-file-JSON library would arrive
+    // as an object (eval of which is a silent no-op). The wrapper takes the
+    // parse; the source always lands here as the string it is.
+    var src = tools.call("__include", {path: path}).src;
     __ta_libs[path] = true;
     try { (0, eval)(src); }
     catch (e) { delete __ta_libs[path]; throw e; }
@@ -7400,6 +7420,22 @@ return t.length;"#}),
         tool_with_tools(include_cfg(), r#"["read_file","write_file","list_dir"]"#)
     }
 
+    /// [`lib_tool`] with the batch channel on (tests that need callBatch AND
+    /// the lib/file registry in one guest).
+    fn lib_tool_batch() -> RunCodeTool {
+        tool_with_tools(
+            CodeConfig {
+                call_batch: true,
+                ..include_cfg()
+            },
+            r#"["read_file","write_file","list_dir"]"#,
+        )
+    }
+
+    /// after_tool observation sink for the batch deny-shape test (statics are
+    /// fine here: the test clears it on entry and nothing else pushes).
+    static AFTER_SEEN: std::sync::Mutex<Vec<(String, bool)>> = std::sync::Mutex::new(Vec::new());
+
     /// Hand-write a lib + a matching st=ok INDEX entry Rust-side (the
     /// "human-reviewed library" leg — no session registration involved).
     fn plant_lib(dir: &std::path::Path, rel: &str, src: &str, st: &str) -> String {
@@ -8065,6 +8101,55 @@ return t.length;"#}),
     /// "lib/./new.js" and "lib/../lib/z.js" both land clean `path=` keys
     /// the parser accepts, the same-session include under the plain
     /// spelling works, and no raw spelling leaks into the manifest.
+    /// The design docs' frozen copy blocks must be VERBATIM the code
+    /// constants (external review round 3, biggest gate blind spot: the two
+    /// design docs are not in the sync manifest's hashed paths, so the A①/A④
+    /// freeze blocks had drifted — a missing tail sentence, and A④ froze the
+    /// RUNTIME-replaced spelling instead of the constant). A hash only
+    /// proves "changed"; this proves "identical to the constant".
+    #[test]
+    fn frozen_doc_blocks_match_desc_constants_verbatim() {
+        fn first_fenced_block_after(doc: &str, anchor: &str) -> String {
+            let i = doc
+                .find(anchor)
+                .unwrap_or_else(|| panic!("anchor {anchor:?} missing"));
+            let f0 = doc[i..].find("```").expect("no fence after anchor") + i;
+            let b = doc[f0..].find('\n').expect("fence not closed on same line") + f0 + 1;
+            let e = doc[b..].find("```").expect("unterminated fence") + b;
+            doc[b..e].trim_end_matches('\n').to_string()
+        }
+        let lib_doc = std::fs::read_to_string("docs/code_memory_design.md")
+            .expect("docs/code_memory_design.md (run tests from the crate root)");
+        let llm_doc = std::fs::read_to_string("docs/code_llm_design.md")
+            .expect("docs/code_llm_design.md (run tests from the crate root)");
+        let cases: [(&str, String, &str); 3] = [
+            (
+                "A① 【库】段",
+                first_fenced_block_after(&lib_doc, "**① 描述（run_code 工具描述）的【库】段**"),
+                LIB_DESC_SUFFIX,
+            ),
+            (
+                "A④ callBatch 描述行",
+                first_fenced_block_after(&llm_doc, "**④ callBatch 的 prelude/描述行**"),
+                BATCH_DESC_SUFFIX,
+            ),
+            (
+                "A⑤ 【LLM 判别】overlay 段",
+                first_fenced_block_after(&llm_doc, "**⑤ run_code 描述的【LLM 判别】overlay 段**"),
+                LLM_DESC_SUFFIX,
+            ),
+        ];
+        for (name, block, constant) in cases {
+            assert_eq!(
+                block,
+                constant.trim_start_matches("\n\n"),
+                "{name}: the doc's frozen block must be the constant verbatim \
+                 (fix the DOC to match the constant — the constant is the \
+                 shipped copy)"
+            );
+        }
+    }
+
     #[test]
     fn lib_savelib_registers_canonical_path() {
         let dir = scratch();
@@ -8217,6 +8302,91 @@ return t.length;"#}),
             "rejected merge leaves the index untouched"
         );
         assert!(dir.join("lib/new.js").exists(), "documented half state");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// External re-review P3: `__include` delivers the source wrapped as
+    /// {"src": S}. The envelope glue auto-JSON-parses content, so a library
+    /// whose WHOLE text is valid JSON (a data-file lib) used to arrive as an
+    /// object — `(0, eval)(object)` is a silent no-op, the include
+    /// "succeeded" while loading nothing. Wrapped, the parse lands on the
+    /// envelope and the source lands as the string it is; an object-shaped
+    /// JSON lib then evals honestly (SyntaxError in statement position)
+    /// instead of vanishing.
+    #[test]
+    fn lib_whole_file_json_source_arrives_as_string() {
+        let dir = scratch();
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        let json_src = "{\"marker\": 7}";
+        let plain_src = "globalThis.fromPlain = 'yes';";
+        std::fs::write(dir.join("lib/data.json"), json_src).unwrap();
+        std::fs::write(dir.join("lib/plain.js"), plain_src).unwrap();
+        std::fs::write(
+            dir.join(LIB_INDEX_REL),
+            format!(
+                "<!-- ta-lib: path=data.json sha256={} needs=- ver=1 st=ok -->\n\
+                 <!-- ta-lib: path=plain.js sha256={} needs=- ver=1 st=ok -->\n",
+                sha256_hex(json_src.as_bytes()),
+                sha256_hex(plain_src.as_bytes()),
+            ),
+        )
+        .unwrap();
+        let v = js_out(
+            &lib_tool(),
+            &dir,
+            r#"
+            var direct = tools.call("__include", {path: "lib/data.json"});
+            var threw = false, err = null;
+            try { include("lib/data.json"); } catch (e) { threw = true; err = String(e); }
+            include("lib/plain.js");
+            return {
+                directIsStr: typeof direct === "object" && typeof direct.src === "string",
+                srcExact: direct && direct.src === '{"marker": 7}',
+                threw: threw, err: err,
+                plain: typeof globalThis.fromPlain };"#,
+        );
+        // The wire shape: source arrives as the exact string, never
+        // auto-parsed into the JSON value.
+        assert_eq!(v["directIsStr"], json!(true), "{}", v);
+        assert_eq!(v["srcExact"], json!(true), "{}", v);
+        // Statement-position object literal: an honest SyntaxError, not the
+        // old silent no-op success.
+        assert_eq!(v["threw"], json!(true), "{}", v);
+        // Control leg: a plain JS lib through the SAME wrapped channel still
+        // lands its declarations.
+        assert_eq!(v["plain"], json!("string"), "{}", v);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// External re-review P3: an INDEX that exists but cannot be READ
+    /// (permissions, a directory in the way) reports the IO error as what it
+    /// is — the old `unwrap_or_default()` folded it into "no entry",
+    /// misdirecting the guest to saveLib for an index it cannot even read.
+    #[test]
+    fn lib_index_read_error_is_not_no_entry() {
+        let dir = scratch();
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        std::fs::write(dir.join("lib/a.js"), "globalThis.a = 1;").unwrap();
+        // A directory where INDEX.md should be: read_to_string fails with
+        // EISDIR — an IO error that is definitively not NotFound.
+        std::fs::create_dir_all(dir.join(LIB_INDEX_REL)).unwrap();
+        let v = js_out(
+            &lib_tool(),
+            &dir,
+            r#"
+            var err = null;
+            try { include("lib/a.js"); } catch (e) { err = String(e); }
+            return { err: err };"#,
+        );
+        let err = v["err"].as_str().unwrap_or_default();
+        assert!(
+            err.contains("cannot read lib/INDEX.md"),
+            "the IO error is named as an IO error: {err}"
+        );
+        assert!(
+            !err.contains("has no entry"),
+            "not misdirected to saveLib: {err}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -9198,7 +9368,300 @@ return t.length;"#}),
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// P2-7: a provider panic inside a batch WORKER does not propagate —
+    /// Coverage gap (external review round 3): the WAVE-START halt refresh
+    /// on the multi-wave boundary. Wave 1 fully launches (parallel tool,
+    /// cancel lands mid-flight from inside one worker); the wave-2 start
+    /// must then refuse every not-yet-started entry with
+    /// {kind:"cancel", halted:true} — event pairing intact, wave-1 entries
+    /// all complete.
+    #[test]
+    fn batch_wave_start_halt_refuses_second_wave() {
+        struct CancellingPar;
+        impl Tool for CancellingPar {
+            fn def(&self) -> ToolDef {
+                ToolDef {
+                    name: "cancelling_par".into(),
+                    description: "test: sleeps, then sets cancel".into(),
+                    schema: json!({"type": "object", "properties": {}}),
+                }
+            }
+            fn run(&self, _i: &Value, c: &ToolCtx) -> Result<ToolOutput> {
+                std::thread::sleep(std::time::Duration::from_millis(120));
+                if let Some(f) = &c.cancel {
+                    f.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(ToolOutput::text("done"))
+            }
+            fn available_to_code(&self) -> bool {
+                true
+            }
+            fn batchable(&self) -> bool {
+                true
+            }
+            fn concurrency(&self) -> crate::tools::ToolConcurrency {
+                crate::tools::ToolConcurrency::Parallel
+            }
+        }
+        let dir = scratch();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cfg: Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"K","model":"m","inject_environment":false,
+                "tools":["read_file"],"code":{"enabled":true}}"#,
+        )
+        .unwrap();
+        let tool = RunCodeTool::new(
+            &cfg,
+            Arc::new(RwLock::new(batch_cfg())),
+            &reqwest::blocking::Client::new(),
+            "k",
+            vec![],
+            vec![Arc::new(Box::new(CancellingPar))],
+        );
+        // Warm the module outside the guest run (debug-build compile time).
+        tool.run_with_emit(&json!({"code": "return 1;"}), &ctx(&dir), &mut |_| {})
+            .unwrap();
+        let mut c = ctx(&dir);
+        c.cancel = Some(Arc::clone(&cancel));
+        let out = tool
+            .run_with_emit(
+                &json!({"code": r#"
+                    const entries = [];
+                    for (let i = 0; i < 12; i++) entries.push({name: "cancelling_par", args: {}});
+                    const rs = tools.callBatch(entries);
+                    return rs.map(r => r instanceof Error ? {k: r.kind, h: r.halted} : "ran");"#}),
+                &c,
+                &mut |_| {},
+            )
+            .unwrap();
+        // The guest's tail calls hit the entry-gate latch after the halt —
+        // both legitimate endings carry the refusal shape or the tombstone.
+        if out.is_error {
+            assert!(
+                out.content.contains("[run_code] terminated:"),
+                "unexpected error shape: {}",
+                out.content
+            );
+        } else {
+            let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+            let arr = v.as_array().expect("array result");
+            assert_eq!(arr.len(), 12, "{v}");
+            assert_eq!(
+                arr.iter().filter(|r| r.as_str() == Some("ran")).count(),
+                8,
+                "wave 1 (8 parallel) fully completes: {v}"
+            );
+            for r in arr.iter().skip(8) {
+                assert_eq!(r["k"], json!("cancel"), "wave-2 refused at wave start: {v}");
+                assert_eq!(r["h"], json!(true), "{v}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Coverage gap (external review round 3): the deny/fs branches INSIDE a
+    /// batch. A hooks Deny fires `after_tool(executed=false)` (the Hooks
+    /// contract reserves it for before_tool Deny); the deny/fs policy layer
+    /// does NOT fire after_tool at all. Both legs land as per-entry Error
+    /// envelopes with their own kinds — the batch keeps its shape.
+    #[test]
+    fn batch_hooks_deny_and_fs_deny_entry_shapes() {
+        struct Recorder;
+        impl crate::hooks::Hooks for Recorder {
+            fn before_tool(
+                &self,
+                tool: &str,
+                input: &Value,
+                _c: &ToolCtx,
+            ) -> crate::hooks::ToolDecision {
+                if tool == "read_file"
+                    && input
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .is_some_and(|p| p.ends_with("secret.js"))
+                {
+                    crate::hooks::ToolDecision::Deny("no secrets in batch".into())
+                } else {
+                    crate::hooks::ToolDecision::Allow
+                }
+            }
+            fn after_tool(
+                &self,
+                tool: &str,
+                _input: &Value,
+                _output: &ToolOutput,
+                executed: bool,
+                _c: &ToolCtx,
+            ) {
+                AFTER_SEEN
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((tool.to_string(), executed));
+            }
+        }
+        AFTER_SEEN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        let dir = scratch();
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        std::fs::write(dir.join("lib/a.js"), "globalThis.a = 1;").unwrap();
+        AFTER_SEEN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        let mut g = ctx(&dir);
+        g.hooks = Some(Arc::new(Recorder));
+        let tool = tool_with_tools(
+            CodeConfig {
+                call_batch: true,
+                deny_paths: vec!["lib/blocked.js".into()],
+                ..include_cfg()
+            },
+            r#"["read_file","write_file","list_dir"]"#,
+        );
+        let out = tool
+            .run_with_emit(
+                &json!({"code": r#"
+                    const rs = tools.callBatch([
+                        {name: "read_file", args: {path: "lib/a.js"}},
+                        {name: "read_file", args: {path: "lib/secret.js"}},
+                        {name: "read_file", args: {path: "lib/blocked.js"}}
+                    ]);
+                    return rs.map(r => r instanceof Error
+                        ? {k: r.kind, m: String(r).slice(0, 60)} : "ran");"#}),
+                &g,
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(!out.is_error, "guest failed: {}", out.content);
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        let arr = v.as_array().expect("array result");
+        assert_eq!(arr.len(), 3, "{v}");
+        assert_eq!(arr[0], json!("ran"), "clean entry unaffected: {v}");
+        assert_eq!(arr[1]["k"], json!("hooks"), "hooks Deny kind: {v}");
+        assert!(
+            arr[1]["m"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no secrets in batch"),
+            "{}",
+            v
+        );
+        assert_eq!(arr[2]["k"], json!("denied"), "deny/fs layer kind: {v}");
+        let seen = AFTER_SEEN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let ran = seen.iter().filter(|(t, e)| t == "read_file" && *e).count();
+        assert_eq!(
+            ran, 1,
+            "exactly the clean entry reports after_tool(executed=true): {seen:?}"
+        );
+        assert!(
+            seen.contains(&("read_file".to_string(), false)),
+            "hooks Deny is the ONE denied class that still fires after_tool(executed=false): {seen:?}"
+        );
+        // The deny/fs leg never executed the tool and never passed the
+        // hooks gate — exactly TWO after_tool rows total (ran + hooks-deny).
+        assert_eq!(
+            seen.len(),
+            2,
+            "the deny/fs layer does NOT fire after_tool (its executed=false is reserved for before_tool Deny): {seen:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Coverage gap (external review round 3): the batch shape guard fires
+    /// in the serial prep phase — a 4097-entry batch is refused whole, zero
+    /// entries dispatched.
+    #[test]
+    fn batch_over_entry_cap_refused_whole() {
+        let dir = scratch();
+        let v = js_out(
+            &lib_tool_batch(),
+            &dir,
+            r#"
+            const entries = [];
+            for (let i = 0; i < 4097; i++) entries.push({name: "read_file", args: {path: "nope" + i}});
+            try { tools.callBatch(entries); return { threw: false }; }
+            catch (e) { return { threw: true, k: e.kind, m: String(e) } }"#,
+        );
+        assert_eq!(v["threw"], json!(true), "{}", v);
+        let msg = v["m"].as_str().unwrap_or_default();
+        assert!(msg.contains("4096"), "the cap is named: {msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Coverage gap (external review round 3): an entry whose tool returns
+    /// an IMAGE gets the per-entry "image" error envelope (run_code cannot
+    /// carry images into the sandbox) — the batch keeps its shape and the
+    /// other entries are unaffected.
+    #[test]
+    fn batch_image_entry_gets_image_envelope() {
+        struct ImageTool;
+        impl Tool for ImageTool {
+            fn def(&self) -> ToolDef {
+                ToolDef {
+                    name: "pic_out".into(),
+                    description: "test: returns an image".into(),
+                    schema: json!({"type": "object", "properties": {}}),
+                }
+            }
+            fn run(&self, _i: &Value, _c: &ToolCtx) -> Result<ToolOutput> {
+                Ok(ToolOutput {
+                    content: "a picture".into(),
+                    image: Some(crate::provider::Block::Image {
+                        media_type: "image/png".into(),
+                        data: "bm90LXJlYWxseS1wbmc".into(),
+                    }),
+                    is_error: false,
+                    usage: None,
+                    usage_in_shared_budget: false,
+                    meta: None,
+                })
+            }
+            fn available_to_code(&self) -> bool {
+                true
+            }
+            fn batchable(&self) -> bool {
+                true
+            }
+        }
+        let dir = scratch();
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        std::fs::write(dir.join("lib/a.js"), "globalThis.a = 1;").unwrap();
+        let cfg: Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"K","model":"m","inject_environment":false,
+                "tools":["read_file"],"code":{"enabled":true}}"#,
+        )
+        .unwrap();
+        let tool = RunCodeTool::new(
+            &cfg,
+            Arc::new(RwLock::new(batch_cfg())),
+            &reqwest::blocking::Client::new(),
+            "k",
+            vec![],
+            vec![Arc::new(Box::new(ImageTool))],
+        );
+        let out = tool
+            .run_with_emit(
+                &json!({"code": r#"
+                    const rs = tools.callBatch([
+                        {name: "read_file", args: {path: "lib/a.js"}},
+                        {name: "pic_out", args: {}}
+                    ]);
+                    return rs.map(r => r instanceof Error ? {k: r.kind} : "ran");"#}),
+                &ctx(&dir),
+                &mut |_| {},
+            )
+            .unwrap();
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        let arr = v.as_array().expect("array result");
+        assert_eq!(arr.len(), 2, "{v}");
+        assert_eq!(arr[0], json!("ran"), "{}", v);
+        assert_eq!(arr[1]["k"], json!("image"), "image entry envelope: {v}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     /// the entry completes as the panic placeholder, and the placeholder
     /// now carries the llm audit row (model + re-derived estimate,
     /// actual:null) so meta.llm explains the reservation the guard's Drop

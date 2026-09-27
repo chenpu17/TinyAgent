@@ -770,6 +770,30 @@ def test_set_code_config_rejects_unknown_keys(tmp_path):
     assert "run_code" in seen[0], "set_code_config drives the switch too"
 
 
+def test_set_code_config_new_keys_shape(tmp_path):
+    """Feature build: the include/call_batch/llm keys ride the same serde
+    shape as the config file's `code` section — the full dict is accepted,
+    and a malformed llm subkey errors instead of being silently ignored."""
+    agent = _mock_agent(tmp_path, provider=lambda r: {"text": "done", "stop_reason": "end_turn"})
+    if not _probe_code_feature(agent):
+        pytest.skip("wheel built without the code feature")
+    agent.set_code_config(
+        {
+            "enabled": True,
+            "include": True,
+            "call_batch": True,
+            "llm": {"enabled": True, "default_model": "m", "models": ["m"]},
+        }
+    )
+    # llm.enabled without default_model — validation rejects the config typo.
+    with pytest.raises(RuntimeError, match="requires code.llm.default_model"):
+        agent.set_code_config({"llm": {"enabled": True, "models": ["m"]}})
+    # default_model of the wrong type — serde rejects the field itself
+    # (pyo3 surfaces the type mismatch without the field path).
+    with pytest.raises(RuntimeError, match="unexpected type"):
+        agent.set_code_config({"llm": {"enabled": True, "default_model": 42}})
+
+
 def test_code_method_from_callback_raises_instead_of_deadlocking(tmp_path):
     """A-10c busy semantics: the code methods ride the same with_agent lock
     path as the other sync methods — calling one from an on_event callback

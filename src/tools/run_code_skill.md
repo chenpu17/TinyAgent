@@ -89,7 +89,7 @@ return classifyTier(150);           // "medium"
 
 - **无事务语义（三句话）**：无原子性；无回滚；部分执行是正常结果。批量结果必须**逐条检查**结果数组——哪些条目跑了、哪些被拒纳，数组里如实可见。次序保证仅存在于顺序 for 循环（副作用批量）。
 - **只读面**：仅 batchable 工具可入批（read_file 等纯只读工具）。混入非只读工具（write_file/shell 等）→ 该条目为 `e.kind="batch"` 错误条目，单条不中止；**副作用调用写顺序 for 循环**。
-- **失败条目判别**：单项失败不 throw，该条目为 `Error` 实例带 `e.kind`/`e.tool`——用 `instanceof Error` 判别，细节取 `.kind`/`.message`，**不要 `JSON.stringify` 失败条目**（Error 序列化成 `{}`，细节全丢）。成功条目就是工具结果本体（JSON 自动解析，同 `tools.call`）。
+- **失败条目判别**：单项失败不 throw，该条目为 `Error` 实例带 `e.kind`/`e.tool`——用 `instanceof Error` 判别，细节取 `.kind`/`.message`，**不要 `JSON.stringify` 失败条目**（Error 序列化成 `{}`，细节全丢）。成功条目就是工具结果本体（JSON 自动解析，同 `tools.call`）。**`e.halted` 仅 callBatch 条目携带**——单次 `tools.call` 的错误无此字段（`undefined` 判 falsy 会误判沙箱还活着），单次调用的停机判定用 `e.kind`（`cancel`/`deadline`/`budget` 即停机，沙箱只剩 return 收尾）。
 - **额度**：K 条计 K 次调用计数（失败条目也计）；撞调用额度时尾部条目得 `e.kind="budget"`（`e.halted=true`，沙箱已停只能 return 收尾）。token 预算面的 `e.halted=false`（预占拒绝、沙箱活着、可落盘收尾）由 llm 工具引入，见「LLM 判别」段。
 - **超时预算**：`timeout_secs ≈ 单调用预期时长 × ceil(批量规模 / 有效并发度) + 计算与限流余量`；有效并发度不大于 8。仅作规划估算，不是最坏时延保证。
 

@@ -2,15 +2,38 @@
 
 | 项 | 值 |
 |---|---|
-| 状态 | v0.7.3；M1（include v1）与 M2（模板/skill 生命周期教学）均已落码（§8 里程碑表）；V0-B 验收见姊妹稿读数登记；外部审核两轮缺陷修复完毕 |
-| 版本 | v0.7.3 |
-| 日期 | 2026-09-26 |
+| 状态 | v0.7.3；M1（include v1）与 M2（模板/skill 生命周期教学）均已落码（§8 里程碑表）；V0-B 验收见姊妹稿读数登记；外部审核三轮收口完毕 |
+| 版本 | v0.7.4 |
+| 日期 | 2026-09-27 |
 | 关联文档 | `docs/run_code_design.md`（D 编号、prelude 封闭清单纪律 D18）、`docs/finetune_support_design.md`（附录 A 即规格纪律）、`docs/code_llm_design.md`（姊妹稿——统一边界句、责任与权限边界、共享纪律见其 §6/§10） |
-| 代码基线 | master @ 45ad4ae（其后行号会漂移，以代码为准） |
+| 代码基线 | master @ 9c3db9b（其后行号会漂移，以代码为准） |
 | 决策编号 | 本文 MD-n 独立编号；引用 run_code_design 写 D-n、finetune_support 写 FD-n |
 
 修订记录（历史不作为现行规格）：
 
+- **v0.7.4（全链审核收口轮：交付包装 + 读取分诊 + 冻结面 verbatim 同步）**：读数来源 =
+  外部全链审核（基线 9c3db9b；M1–M4 + 两轮修复复查，工程层无 P1/P2，9 项 P3 本条
+  登记其中 lib 侧 4 项，姊妹稿 v0.7.7 登记其余）。
+  ① **MD-14 交付包装（审核 P3）**：`__include` 成功交付从裸源码文本改为
+  `{"src": S}` 包装——envelope glue 对 content 做 auto-JSON-parse，整文件恰为
+  合法 JSON 的库会以对象身份到达，`(0, eval)(object)` 是**静默 no-op**（include
+  "成功"却什么都没加载）；包装后 parse 落在信封上，源码恒以字符串到达
+  （与 `__lib_update_index` 的 {"index": …} 同款）。对象形 JSON 文本 eval 如实
+  报 SyntaxError 而非消失。回归 `lib_whole_file_json_source_arrives_as_string`。
+  ② **MD-11 读取分诊（审核 P3）**：include 侧读 INDEX 从 `unwrap_or_default()`
+  改为 NotFound→空索引（合法）/ 其余 IO 错误→`run_code: cannot read
+  lib/INDEX.md: <e>`（fail-closed 且文案诚实，与 `__lib_index_state` 同款）。
+  回归 `lib_index_read_error_is_not_no_entry`。
+  ③ **A① 冻结块 verbatim 修正（审核 P3）**：附录 A① 冻结块此前缺常量尾句
+  「建库/用库/修库生命周期详见…」——已改为与 `LIB_DESC_SUFFIX` 逐字一致
+  （单行原样）；run_code.rs tests 新增**常量↔文档逐字断言**
+  （A①/A④/A⑤ 三块，锚标记提取 fenced 块与常量全等），结构性消灭此漂移
+  （哈希门禁只测"变过"，逐字断言测"与常量一致"）。
+  ④ **机器侧文案补登（审核 P3）**：两轮修复新增的 lib 错误文案此前未入
+  A① 冻结清单——已全量补登（索引畸形/不可读、Modify 改写与丢字段拒绝、
+  新保留名门关与探测/入参/登记键/摘要/重复条目，共 10 条）。
+  ⑤ **A-M9 实名修正**：trace 记录 name 为 `__include`（wire 名），hooks 伪工具
+  面才是 "include"。
 - **v0.7.3（外部复审轮：INDEX 通道存在性结构化 + 合并统一宿主）**：读数来源 =
   外部代码复审报告（基线 45ad4ae；探针在审核方环境，本轮固化为回归测试）。
   ① **MD-10 存在性判定结构化（复审 P1）**：v0.7.2 的「INDEX 读取错误分诊」
@@ -404,7 +427,7 @@ skills are part of the task's environment"），三条行为说明即闭合：
 | A-M6 生命周期 e2e | 起草登记→新会话直接加载 draft 拒绝→负责人批准相同 hash→加载→局部覆写→写回回 draft、原质量证据过期→重新验证/批准；会话登记不跨 resume 恢复 |
 | A-M7 batch 行为 | copy 模式沙箱内 workdir 根 `lib/` 随行可达（COPY_EXCLUDE 四项不含它；A-M 系列跑在隔离目录下）。`.tinyagent/` 随行是技能系统事实、其 guest 侧可达性归 Tier-2（M3）验收 |
 | A-M8 verify 探针 | 判别库 verify(n)：全过返回摘要、任一错例 throw；批量前 verify 失败 → 外层收到明确错误不进批量；verify 的 llm 调用进 trace 与额度（mock 按 model 分流）。✅ 2026-09-22 随姊妹稿 M3 落码：`am8_verify_probe_passes_then_batch_fanout_proceeds` / `am8_verify_probe_failure_blocks_the_batch`（include × llm × callBatch 三通道合流，失败腿钉住"批次未派发 + 失败出口审计"） |
-| A-M9 通道边界（v0.4） | `__include`：lib/ 外路径拒（含 `../` 拼写逃逸与符号链接——既有路径拦截走查三纪律全过一遍）；hooks Deny include → `kind="hooks"`；trace 记录（name="include"） |
+| A-M9 通道边界（v0.4） | `__include`：lib/ 外路径拒（含 `../` 拼写逃逸与符号链接——既有路径拦截走查三纪律全过一遍）；hooks Deny include → `kind="hooks"`；trace 记录（name="__include"——wire 名；hooks 伪工具面才是 "include"） |
 | A-M10 注册制/hash 闭环（v0.4） | 未登记文件 include → 硬拒（文案指向 writeVerified）；writeVerified 后成功；篡改文件一字节 → `kind="include"` 硬错（文案含期望/实际哈希前缀）；删 INDEX 条目 → 硬拒；**显式 readAll+eval 仍可行**（记录 include 门控不覆盖全部执行路径的限制） |
 | A-M11 manifest 解析（v0.7） | 仅解析机器行；缺失/重复冲突拒绝；多库 upsert 不串条目；部分写入失败报错，未完成登记不冒充可用 |
 | A-M12 流程准入与限制（v0.7） | 新/更新均 draft；同会话正确 path+hash 可用，跨会话直接加载拒；ok 库修改重登回 draft；**旧 draft 读出后重新登记可在新会话执行、可写 st 被伪造后默认可能放行**，作为限制测试，不宣称已阻断；宿主可信配置另测受保护批准记录/内容校验与拒绝路径 |
@@ -441,10 +464,7 @@ A-M8 需要姊妹稿 M3 的 LlmTool（及 M0 的 mock 分流），不阻塞 incl
 （门关时不存在，基础描述不动；见 `run_code.rs` 的 `LIB_DESC_SUFFIX`，单源）：
 
 ```
-【库】（仅 code.include 开启时；关闭时上句成立、无以下助手）include(path)：加载 lib/
-下已登记的代码库到全局作用域（幂等，循环依赖自动截断，失败 throw）；saveLib(path, src)：
-写库文件并在 lib/INDEX.md 登记（恒 st=draft，本会话即可 include；跨会话复用需人工审校
-后将该行 st 改为 ok）。库校验失败（未登记/内容与登记不符/超限）e.kind="lib"，重试无意义。
+【库】（仅 code.include 开启时；关闭时上句成立、无以下助手）include(path)：加载 lib/ 下已登记的代码库到全局作用域（幂等，循环依赖自动截断，失败 throw）；saveLib(path, src)：写库文件并在 lib/INDEX.md 登记（恒 st=draft，本会话即可 include；跨会话复用需人工审校后将该行 st 改为 ok）。库校验失败（未登记/内容与登记不符/超限）e.kind="lib"，重试无意义。建库/用库/修库生命周期详见 run-code 技能的「库与复用」段。
 ```
 
 机器侧错误文案（同一冻结面，单源 `run_code.rs`）：
@@ -462,6 +482,29 @@ A-M8 需要姊妹稿 M3 的 LlmTool（及 M0 的 mock 分流），不阻塞 incl
 - 超限：`run_code: '<path>' is <n> bytes, over the 1048576-byte include read
   cap — split the library (a lib file shares the size budget of one run_code
   program)`（kind="lib"）。
+- 索引畸形：`run_code: lib/INDEX.md is malformed: <parse错误>`（kind="lib"）；
+- 索引不可读（存在但读取失败，区别于"无登记"）：`run_code: cannot read
+  lib/INDEX.md: <io错误>`（kind="lib"；不存在仍是合法的空索引，不报错）；
+- Hooks Modify 改写 lib 路径后不可采纳：`run_code: hooks Modify replaced the
+  path with '<p>', which is not an admissible lib path (relative under lib/,
+  not matching code.deny_paths) — refusing rather than falling back to the
+  original`（kind="denied"）；
+- Hooks Modify 丢弃 path 字段：`run_code: hooks Modify dropped the string
+  'path' field the lib helpers need — refusing rather than falling back to
+  the original`（kind="denied"）；
+- 新保留名门关（`__lib_index_state` / `__lib_update_index`，同 `__include`
+  的门关句式）：`run_code: <name> is not available in this configuration
+  (code.include=false) — the lib helpers are disabled`（kind="denied"）；
+- 存在性探测失败：`run_code: cannot stat lib/INDEX.md: <io错误>`
+  （kind="lib"）；
+- 合并入参缺字段：`run_code: __lib_update_index needs string fields 'rel',
+  'sha256' and 'text'`（kind="lib"）；
+- 登记键不合规：`saveLib: registration key must be a clean lib/-relative
+  path, got <rel>`（kind="lib"）；
+- 登记摘要不合规：`saveLib: registration digest must be 64 hex chars, got
+  <sha>`（kind="lib"）；
+- 索引内同路径重复：`lib/INDEX.md line <n>: duplicate ta-lib entry for path
+  '<path>' — fix the index before saving`（kind="lib"）。
 
 **② skill（run-code）新增"库与复用"段落草案**（M2 落地时按本要点成文并冻结；正文
 中 writeVerified 一律按 v0.7.1 改名读作 saveLib）：

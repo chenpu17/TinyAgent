@@ -74,6 +74,56 @@ def cross_check_readme_spec(section):
                 "Update the README block (or revert config.rs), then re-run."
             )
 
+    # Boolean/nested knobs (external review round 3): a flipped default here
+    # is invisible to BOTH gates above — the numeric check skips bools and
+    # config.rs is not a hashed file. The README documents each knob's
+    # default in its table row's default column (`key` | `value`).
+    def default_of(block: str, name: str) -> str:
+        m = re.search(rf"\b{name}:\s*([^,\n]+)", block)
+        if not m:
+            raise SystemExit(f"config.rs: default field {name} not found (extractor drift)")
+        return m.group(1).strip()
+
+    for name in ("enabled", "include", "call_batch", "precheck"):
+        value = default_of(body, name)
+        if f"`{name}` | `{value}`" not in section:
+            raise SystemExit(
+                f"README code-config spec is stale: {name} default is {value} in "
+                "config.rs but the README table row does not carry that default. "
+                "Update the README block (or revert config.rs), then re-run."
+            )
+    # LlmConfig derives Default (no impl block): the nested defaults come
+    # from the field types — bool → false, Option → null, Vec → [].
+    lm = re.search(r"struct LlmConfig \{(.*?)\n\}", src, re.S)
+    if not lm:
+        raise SystemExit("config.rs: `struct LlmConfig` not found (extractor drift)")
+    lbody = lm.group(1)
+
+    def derived_default(name: str) -> str:
+        m = re.search(rf"\b{name}:\s*([A-Za-z\[\]<>:: ]+)", lbody)
+        if not m:
+            raise SystemExit(f"config.rs: LlmConfig field {name} not found (extractor drift)")
+        ty = m.group(1).strip()
+        if ty == "bool":
+            return "false"
+        if ty.startswith("Option"):
+            return "null"
+        if ty.startswith("Vec"):
+            return "[]"
+        raise SystemExit(f"config.rs: LlmConfig field {name} has unexpected type {ty}")
+
+    nested = (
+        f"enabled:{derived_default('enabled')}, "
+        f"default_model:{derived_default('default_model')}, "
+        f"models:{derived_default('models')}"
+    )
+    if nested not in section:
+        raise SystemExit(
+            "README code-config spec is stale: the `llm` row's nested default "
+            f"literal does not match config.rs ({nested}). Update the README "
+            "block (or revert config.rs), then re-run."
+        )
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
