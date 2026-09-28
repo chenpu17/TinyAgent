@@ -4,8 +4,8 @@
   "files": {
     "examples/prompts/agentic.md": "ffda2b99649344b5cdee1386c0c14612009beea3446a48a375bd6e0291f5d866",
     "examples/prompts/agentic-code.md": "a9a49a503ffcd79934b4440c21dcce3be9b8db634424214299c57775a2846956",
-    "src/tools/run_code.rs": "477524da0207d2dcb402777803af4b0e651260f98c144c0b6a40659f2d17d096",
-    "src/tools/run_code_skill.md": "028b088529fd7a171df01e2427fd5f69e087ea95cb98a87e627d6f0e29c45975",
+    "src/tools/run_code.rs": "924ea51f75d3c0c01ea5919549ff85012d2ebc18dce0c1f3763e3e33617d69f5",
+    "src/tools/run_code_skill.md": "04490a6b29633687feafaaa157317d673d61b7882ed0cf18a71fb326b5171942",
     "src/tools/skill.rs": "2bf76c9e0f8ff261d71d41ea4805757878bb1ab9ba7204797e752fdfeb192dca",
     "docs/finetune_support_design.md": "7bfc8a388ad6b189ff778aadee4e9ef1be56097933688107b94f1241cbeb237d"
   },

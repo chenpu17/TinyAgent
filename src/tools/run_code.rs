@@ -3995,7 +3995,7 @@ const LIB_DESC_SUFFIX: &str = "\n\n【库】（仅 code.include 开启时；关�
 /// registry until M3; naming it now would break the closed-list
 /// anti-hallucination contract, so v1 says "read_file 等" (M3 revisits,
 /// through this file's doc + the design revision log).
-const BATCH_DESC_SUFFIX: &str = "\n\n【批量】（仅 code.call_batch 开启时；关闭时无此助手）tools.callBatch([{name, args}, …])：并发执行一批只读工具调用（read_file 等 batchable 工具；按提交序返回数组；无原子性、无回滚、部分执行是正常结果——逐条检查）。单项失败不抛、该条目为 Error 实例带 e.kind/e.tool——用 instanceof 判别，不要 JSON.stringify 失败条目（Error 序列化成 {}，细节丢失）。并发上限 8/波；分页拉取与逐项判别是理想对象；副作用调用不在批内——写顺序 for 循环。详见 run-code 技能的「批量调用」段。";
+const BATCH_DESC_SUFFIX: &str = "\n\n【批量】（仅 code.call_batch 开启时；关闭时无此助手）tools.callBatch([{name, args}, …])：批量调用独立只读工具（read_file 等 batchable 工具；按提交序返回数组；无原子性、无回滚、部分执行是正常结果——逐条检查）。单项失败不抛、该条目为 Error 实例带 e.kind/e.tool——用 instanceof 判别，不要 JSON.stringify 失败条目（Error 序列化成 {}，细节丢失）。支持并行的工具最多 8/波，当前 read_file/MCP 仍顺序执行；依赖上一页游标的分页须顺序循环。副作用调用不在批内——写顺序 for 循环。详见 run-code 技能的「批量调用」段。";
 
 /// The llm gate-ON description overlay (code_llm_design 附录 A，LD-15 同款
 /// gate 三同源纪律：描述行 / prelude 说明 / skill 段随 gate 整体出现/消失)。
@@ -4003,7 +4003,7 @@ const BATCH_DESC_SUFFIX: &str = "\n\n【批量】（仅 code.call_batch 开启�
 /// The tool's OWN entry in `tools.list()` carries appendix A① verbatim
 /// (see `llm.rs`); this overlay only adds the routing pointer to the
 /// run_code surface.
-const LLM_DESC_SUFFIX: &str = "\n\n【LLM 判别】（仅 code.llm.enabled 开启时；关闭时无此工具）tools.call(\"llm\", {prompt, system?, model?, max_tokens?, labels?})：单次模型调用（无工具、无历史、无流式）——大量同构的逐项语义判断（分类/抽取/校对/打标）用代码循环 + llm 承接；model 须在 code.llm.models 内（缺省 default_model）。声明 labels（封闭词表，≤16 项）时宿主校验输出并返回规范 label，未命中 e.kind=\"llm_output\"、其余失败 e.kind=\"llm\"（均无 retryable，读 message 自判）；词表要求必须同时写进 prompt（宿主不注入）。返回 {text, label?, usage, model}。token 成本发前预占、也计调用额度。判别纪律/成本纪律/级联详见 run-code 技能的「LLM 判别」段。";
+const LLM_DESC_SUFFIX: &str = "\n\n【LLM 判别】（仅 code.llm.enabled 开启时；关闭时无此工具）tools.call(\"llm\", {prompt, system?, model?, max_tokens?, labels?})：单次模型调用（无工具、无历史、无流式）——同构的逐项语义判断（分类/抽取/校对/打标）可用代码循环 + llm 承接，按任务质量与总成本选择；model 须在 code.llm.models 内（缺省 default_model）。声明 labels（封闭词表，≤16 项）时宿主校验输出并返回规范 label，未命中 e.kind=\"llm_output\"；参数/provider/响应异常终止（含 max_tokens 截断）为 e.kind=\"llm\"，均无 retryable，读 message 自判。词表要求必须同时写进 prompt（宿主不注入）。返回 {text, label?, usage, model}。token 成本发前预占、也计调用额度；预占拒绝为 e.kind=\"budget\"，与调用次数耗尽的恢复方式不同。判别纪律/成本纪律/级联详见 run-code 技能的「LLM 判别」段。";
 
 impl Tool for RunCodeTool {
     fn origin(&self) -> ToolOrigin {

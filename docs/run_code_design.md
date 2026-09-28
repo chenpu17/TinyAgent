@@ -2,11 +2,12 @@
 
 | 项 | 值 |
 |---|---|
-| 状态 | v0.8（外部审核第 3 轮单点落地，见修订 v0.8） |
-| 版本 | v0.8 |
-| 日期 | 2026-09-08 |
+| 状态 | v0.9（v1 使用教学维护；结项状态以 code_review_brief.md 为准） |
+| 版本 | v0.9 |
+| 日期 | 2026-09-28 |
 | 关联文档 | `docs/run_code_requirements.md`（需求规格，FR/NFR 编号在本文引用） |
-| 代码基线 | master @ 4024fa0（其后行号会漂移，以代码为准） |
+| 代码基线 | master @ 91a8e6e（其后行号会漂移，以代码为准） |
+| 修订（v0.9） | **使用教学维护（2026-09-28）**：新增面向使用者的 `run_code_guide.md`，串联配置、演示、工具接入、扩展及故障处理；skill 的落盘纪律改为“产物落盘并完成必要校验后收尾”，消除与实际输出核验的冲突。预算错误区分调用次数耗尽与 LLM token 预占拒绝，单次/批量错误的教学见 code_llm_design v0.7.8；同时说明批量调度与实际并发的区别。运行时接口、默认值、基础工具短描述和路由 teaser 不变，扩展描述同步澄清并发与预占拒绝；skill/本附录/manifest 同源同步。 |
 | 修订（v0.8） | **外部审核第 3 轮单点落地（2026-09）**：guest→host 工具调用的 args 解析失败从静默 `json!({})` 降级改为 `host` 类结构化错误（`parse_guest_args` 纯函数 + 单测；对称于 Phase A 坏指针错误）。可达性：shipped glue 恒发合法 JSON，失败仅限绕过 JS 包装直戳 wasm import 的 guest——模型可见契约（描述/skill/附录 A 的 kind 词汇表）不变，**零资产重建**。 |
 | 修订（v0.7） | **外部评审核实落地（2026-09）**：① `__budget` 增 `tokens_left`（run 级 token 预算剩余，无闸门时 null，与 wall/fuel 同一 nullable 约定）——载体 `ToolCtx::budget` 从裸计数器 `Option<Arc<AtomicU64>>` 重构为 `Option<BudgetGate{used, cap}>`（lib.rs 门面 re-export；guest ctx clone 的是 gate，used 为 Arc，读数是活的；gate 侧饱和求差，过顶报 0 不回绕）；② registry 构造期快照 vs MCP 热增删的边界**文档化**（§2 既有口径 + README 热增删节 + CLAUDE.md；评审报 P1，核实为与 SubAgent 同款既定快照语义——热增不可见、热删仍可调，连接活到 registry drop，最坏退出延迟一次 CALL_TIMEOUT，无孤儿）；③ 评审另两条 P1 核实**不成立/误定级**：`SharedTool` 不转发 `set_shutdown` 不是 MCP 回收缺口（reaper 武装在共享 `Arc<McpClient>` 上、顶层列表持有同 client 克隆，覆盖「run_code 阻塞 MCP + 会话退出」场景；`&mut self` 经 Arc 本就无法转发，设计取舍在案），versioned registry 与 H3 单构造点 + 克隆共享缓存设计相抵。 |
 | 修订（v0.6） | **AppWorld 高循环波评审落地（2026-09）**：① guest 注册表滤除改用独立能力标记 `Tool::available_to_code()`（默认 false；文件四件套/shell/McpTool 显式 true——MCP 漏覆写即断 AppWorld 机制；此前搭 available_to_subagent 便车）；② assemble 的 extra_tools 经 `SharedTool`（Arc 共享同一实例）进注册表，`CallbackTool::with_code_access()` 逐工具授权（§2 的 v2 备选项落地）；③ guest-only 原语 `copy_bytes(src,dst)`——host 流式字节保真复制，策略面在拦截层 copy 臂（src 读规则/dst 写规则）；④ 保留名 `__budget` + prelude `tools.budget()`（剩余调用/墙钟/燃料，查询免费）；⑤ 错误封套结构化字段 kind/tool/retryable（§5.1，glue 重建 sha256 3c1c8790…）；⑥ prelude 增 tools.budget（封闭清单纪律：描述/skill/附录 A 三处同步） |
@@ -658,7 +659,7 @@ function responseRows(r) {
 - **先计划再执行**：先在回复中明确实体层级、AND/OR 谓词和边界案例；大清单在变量/文件里构造并在修改前检查集合与计数。规则无歧义且操作已授权时，可在同次代码中检查后执行，随后返回计数、少量样例及已落盘路径。新集合仍需模型判断或用户确认时，先返回计划，判断或确认后再执行。不要为了列清单把所有中间数据搬回对话。
 
 ## 编排成本与校验范围
-- **产物分块增量写**：要产出大文件（predictions、导出、报表等）时，每完成一段就 `writeVerified` 落盘一次，不要把全部结果攒到最后一次性写——中途截断或额度烧穿时，已落盘的部分就是真实进度。写完产物后任何进一步打磨（复核、排版、扩写）都是亏的，产物完整落盘即收尾。
+- **产物分块增量写**：要产出大文件（predictions、导出、报表等）时，每完成一段就 `writeVerified` 落盘一次，不要把全部结果攒到最后一次性写——中途截断或额度烧穿时，已落盘的部分就是真实进度。产物完整落盘并完成任务要求的必要校验后收尾；不要继续无目标的排版、扩写或重复复核。写入读回只验证文件内容一致，不替代数据完整性和业务正确性校验。
 - 只写当前任务需要的短流程，不照抄整套示例框架。已取得的少量完整数据可直接带入；大量数据通过代码收集，避免在自然语言和代码间反复转写。只因迁移到代码不必重查已确认、仍有效的数据；数据不完整或可能变化时重新查询。
 - `console.log` 和 `return` 都进入结果；只报计数、异常和少量样例，不打印完整 KEEP/ACT 集合。续批、恢复或任务要求才保存文件；局部变量可承载单次流程。清理文件必须使用实际可用工具，不能猜 `delete_file`。
 - 最终校验须独立读取真实状态，比较目标与保留集合。若完整分页列表已提供所需字段，可一次集合比较验证，不再对同一状态逐项查询；字段不足才补查。代码已完成这项校验且无后续写入/新疑点时，直接使用其验证摘要，不在外层再查一遍。不能只比较数量，不能用操作成功响应代替状态读回。
@@ -681,13 +682,13 @@ function responseRows(r) {
 <!-- BEGIN LIB SECTION（code.include=true 时保留；=false 时装配端整段剔除，见
      run_code.rs::run_code_skill_md —— 门关时模型可见契约与旧二进制一致） -->
 ## 库与复用（需配置开启 code.include；未开启时 include/saveLib 不存在、保留名直调被拒）
-跨任务会重用的逻辑（判别函数、聚合骨架、格式转换）沉淀为 `lib/` 下的库，不要每次重写。生命周期：**建库 → 用库 → 修库**，状态由 `lib/INDEX.md` 的机器行（`st=draft/ok` + 内容哈希）承载。
+宿主有明确的跨任务复用需求或已提供现成库时，将相应逻辑（判别函数、聚合骨架、格式转换）放在 `lib/` 下维护；一次性任务不必建库。生命周期：**建库 → 用库 → 修库**，状态由 `lib/INDEX.md` 的机器行（`st=draft/ok` + 内容哈希）承载。
 
 - **建库**：写成函数声明风格 + 内嵌纯断言自测块（判别库另附 `verify(n)` 探针），用 `saveLib("lib/xxx.js", src)` 落盘——写文件、宿主算哈希、登记 INDEX 一条龙，**恒 `st=draft`**。裸 `write_file` 写的文件 `include` 会被拒（未登记）； INDEX 行同步维护人类字段（io 签名、适用条件、质量证据指针、owner/来源）。
 - **用库**：先 `read_file("lib/INDEX.md")` 对照 `needs` 与当前能力，有现成库就 `include("lib/xxx.js")`（幂等、循环依赖自动截断），只写增量胶水。准入 = `st=ok`（负责人核对内容与证据后人工改）或本会话 `saveLib` 登记过相同内容；旧 draft 被拒时提示负责人处理批准，不要用重新登记绕过审批。
 - **修库**：`include` 后重定义同名函数，本次执行即生效（文件不变）；跑通自测后 `saveLib` 写回——新哈希重新登记、回 `st=draft`，**旧批准与质量成绩不沿用**，须重新验证/批准。
 - **纪律**：库只放代码（函数声明、顶部不放 `'use strict'`、保持多行便于检查、命名带库前缀），不塞业务数据；版本历史交给 git。宿主 include 整文件直读（不受 readAll 分页限制），单库上限 1 MiB。纯断言不调用工具；判别探针显式运行、小样例内嵌。库链路校验失败（未登记/内容与登记哈希不符/超限/门未开启直调保留名）统一 `e.kind="lib"`，属确定性错误，重试无意义。
-- **判别库**（若宿主还启用了 llm 原语，级联判别是最高价值的库形态）：批量前先跑 `verify` 做链路健康检查（全过返回摘要、任一错例 throw，外层收到明确错误不进批量）；实际输出仍按场景质量政策核验，区分「已处理」与「已验证」。程序/依赖/模型/标准变化时，旧跑分只作历史证据。
+- **判别库**（需宿主同时启用 llm 原语）：批量前先跑 `verify` 做链路健康检查（全过返回摘要、任一错例 throw，外层收到明确错误不进批量）；实际输出仍按场景质量政策核验，区分「已处理」与「已验证」。程序/依赖/模型/标准变化时，旧跑分只作历史证据。
 
 库源码形态（函数声明 + 自测块；这就是要传给 saveLib 的 src）：
 ```js
@@ -715,16 +716,16 @@ return classifyTier(150);           // "medium"
      run_code.rs::run_code_skill_md —— 门关时模型可见契约与旧二进制一致） -->
 ## 批量调用（需配置开启 code.call_batch；未开启时 tools.callBatch 不存在、直调保留名按未知工具报错）
 
-`tools.callBatch([{name, args}, …])` 并发执行一批**只读**工具调用（分页拉取、逐项判别是理想对象）。并发上限 8/波；结果**按提交序**返回数组。
+`tools.callBatch([{name, args}, …])` 批量执行一组**相互独立的只读**工具调用；支持并行的工具最多 8/波，结果**按提交序**返回数组。实际并发由工具能力决定：当前内置 read_file 与 MCP 工具仍顺序执行；已启用的 LLM 判别可并行，宿主 provider 自身也可能串行处理。依赖上一页返回游标的分页须用顺序循环；只有可独立定位的页才适合预先组成批次。
 
 - **无事务语义（三句话）**：无原子性；无回滚；部分执行是正常结果。批量结果必须**逐条检查**结果数组——哪些条目跑了、哪些被拒纳，数组里如实可见。次序保证仅存在于顺序 for 循环（副作用批量）。
 - **只读面**：仅 batchable 工具可入批（read_file 等纯只读工具）。混入非只读工具（write_file/shell 等）→ 该条目为 `e.kind="batch"` 错误条目，单条不中止；**副作用调用写顺序 for 循环**。
-- **失败条目判别**：单项失败不 throw，该条目为 `Error` 实例带 `e.kind`/`e.tool`——用 `instanceof Error` 判别，细节取 `.kind`/`.message`，**不要 `JSON.stringify` 失败条目**（Error 序列化成 `{}`，细节全丢）。成功条目就是工具结果本体（JSON 自动解析，同 `tools.call`）。**`e.halted` 仅 callBatch 条目携带**——单次 `tools.call` 的错误无此字段（`undefined` 判 falsy 会误判沙箱还活着），单次调用的停机判定用 `e.kind`（`cancel`/`deadline`/`budget` 即停机，沙箱只剩 return 收尾）。
+- **失败条目判别**：单项失败不 throw，该条目为 `Error` 实例带 `e.kind`/`e.tool`——用 `instanceof Error` 判别，细节取 `.kind`/`.message`，**不要 `JSON.stringify` 失败条目**（Error 序列化成 `{}`，细节全丢）。成功条目就是工具结果本体（JSON 自动解析，同 `tools.call`）。**`e.halted` 仅 callBatch 错误条目携带**：检查全部条目，任一 `halted===true` 就不再发工具调用；某一条为 false 不代表整批之后仍可写入。单次 `tools.call` 的错误无此字段，不能把 undefined 当 false；cancel/deadline 停止后续调用，budget 则读文案区分调用次数耗尽（停机）与 token 预占拒绝（明确告知沙箱仍存活）。不明确时返回已知进度，不盲目重试。
 - **额度**：K 条计 K 次调用计数（失败条目也计）；撞调用额度时尾部条目得 `e.kind="budget"`（`e.halted=true`，沙箱已停只能 return 收尾）。token 预算面的 `e.halted=false`（预占拒绝、沙箱活着、可落盘收尾）由 llm 工具引入，见「LLM 判别」段。
 - **超时预算**：`timeout_secs ≈ 单调用预期时长 × ceil(批量规模 / 有效并发度) + 计算与限流余量`；有效并发度不大于 8。仅作规划估算，不是最坏时延保证。
 
 ```js
-// callBatch example: 并发拉多页 + 逐条检查（示意端点）。
+// callBatch example: 批量读取可独立定位的页 + 逐条检查（示意端点，MCP 仍顺序执行）。
 const entries = [1, 2, 3, 4].map(p =>
   ({ name: "mcp_list_items", args: { cursor: null, limit: 100, page: p } }));
 const results = tools.callBatch(entries);
@@ -742,12 +743,12 @@ return { ok, bad };   // bad 非空就如实上报，不吞
      run_code.rs::run_code_skill_md —— 门关时模型可见契约与旧二进制一致） -->
 ## LLM 判别（需配置开启 code.llm.enabled；未开启时 llm 工具不存在）
 
-`tools.call("llm", {prompt, system?, model?, max_tokens?, labels?})` 单次模型调用（无工具、无历史、无流式，一轮返回）。大量同构的逐项语义判断（分类/抽取/校对/打标）用代码循环 + llm 承接；model 须在 code.llm.models 内（缺省 default_model）。返回 `{text, label?, usage, model}`；调用也计工具额度、token 成本发前预占。失败两类：`kind="llm"`（参数/允许列表/provider 失败）与 `kind="llm_output"`（词表未命中，带真实 usage）——均无 retryable，读 message 自判。
+`tools.call("llm", {prompt, system?, model?, max_tokens?, labels?})` 单次模型调用（无工具、无历史、无流式，一轮返回）。大量同构的逐项语义判断（分类/抽取/校对/打标）可用代码循环 + llm 承接，是否采用取决于任务质量与总成本；model 须在 code.llm.models 内（缺省 default_model）。返回 `{text, label?, usage, model}`；调用也计工具额度、token 成本发前预占。模型调用失败包括 `kind="llm"`（参数/允许列表/provider 失败或响应异常终止，含 max_tokens 截断）与 `kind="llm_output"`（词表未命中，带真实 usage）——均无 retryable，读 message 自判；token 预占拒绝为 `kind="budget"`，见下文。截断文本不能当成功判别。
 
 - **判别纪律**：输出词表用 `labels` 声明（含 unsure 显式词），**且 prompt 里同写"输出必须是这些词之一"**（宿主只校验不注入提示）；未声明 labels = 生成模式（任意文本，作结构化抽取须在库内另行校验）；非法输出得 `kind="llm_output"`——分支前先判 label 合法性；unsure 单独计数进聚合摘要；`max_tokens` 用目标模型验证后设小；**首发只产出只读结果**；其他部署的副作用按宿主授权政策执行，外层复判不等于用户授权。
-- **成本纪律**：开工前 `tools.budget()` 查 tokens_left（**含未结算的预占**），循环里定期查；429/5xx 保留失败项并交外层诊断，系统性限流须宿主延后处理；`e.kind === "budget"` 时查 **`e.halted`**：true = 沙箱已停，只能 return 收尾；false = 额度关口拒绝但沙箱活着，可 write_file 落盘部分结果再收尾。单次 `tools.call` 的封套无 `e.halted` 字段——按错误文案判断沙箱是否还活着（预占拒绝的文案自带"沙箱仍在运行"语义）。
+- **成本纪律**：开工前 `tools.budget()` 查 tokens_left（**含未结算的预占**），循环里定期查；429/5xx 保留失败项并交外层诊断，系统性限流须宿主延后处理。单次 `tools.call` 错误**没有 `e.halted`**：`kind="budget"` 的文案若说明 token 预占未派发且 `the sandbox stays alive`，其他限额仍允许时可落盘部分结果再收尾；若说明工具调用次数已耗尽，就不再发工具调用。批量错误条目才有 `halted`，须检查所有条目，任一 true 即停止后续调用。不要循环重试同一笔被拒的预占。
 - **批量形态**：逐项判别的并发形态见「批量调用」段（仅部署开启 code.call_batch 时可用——llm 是 batchable 工具，判别 fan-out 与分页拉取是理想对象）；未开启时写顺序 for 循环。失败条目判别与逐条检查纪律同该段：`instanceof Error`、取 `.kind`/`.message`、**不要 `JSON.stringify` 失败条目**、部分执行是常态。
-- **级联模式**：便宜 model 先判，`unsure`/`llm_output` 错误升级贵 model：
+- **级联模式**：下面演示便宜 model 先判，`unsure` 升级贵 model，词表未命中记为 unresolved。模型名须换成允许列表中的真实名称；示例省略 max_tokens，沿用默认 1024，使用前按目标模型校准（内层允许 1..8192）。输出一个标签也可能消耗较多推理 token，不要直接套用极小上限：
 
 ```js
 // 级联判别 example：便宜模型先判，unsure 升级贵模型（示意模型名）。
@@ -755,13 +756,13 @@ function judge(item) {
   try {
     const r = tools.call("llm", {
       prompt: item.text + "\n\n输出必须是这些词之一：yes / no / unsure",
-      model: "cheap-model", max_tokens: 8,
+      model: "cheap-model",
       labels: ["yes", "no", "unsure"],
     });
     if (r.label === "unsure") {
       const up = tools.call("llm", {
         prompt: item.text + "\n\n输出必须是这些词之一：yes / no",
-        model: "expensive-model", max_tokens: 8,
+        model: "expensive-model",
         labels: ["yes", "no"],
       });
       return up.label;              // 升级后输出未命中 → 走下方 llm_output 分支

@@ -3,6 +3,28 @@
 本文件记录 TinyAgent 的版本演化。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)（0.x 阶段 minor 即破坏性窗口）。
 
+## [Unreleased]
+
+### Added
+
+- **run_code 使用文档三件套**：`docs/run_code_guide.md`（快速上手与最佳实践——配置合并、
+  工具接入、三项扩展示例、失败恢复；README run_code 专节与结项状态总表加使用入口）；
+  入门演示判分加固——每次独立 mktemp 工作区保留历史（不再 `rm -rf`）、请求模型前先验
+  二进制 features 含 `code`、配置由模板生成（`max_tokens` 2048→4096，
+  `TINYAGENT_DEMO_MAX_TOKENS` 可覆盖），判分为类型+值+键集+成功 run_code+end_turn
+  五重判据，不满足即非零退出。
+
+### Changed
+
+- **冻结文案校准**（skill / 工具描述 / 设计附录 / manifest 同源同步，修订记录
+  llm v0.7.8 / memory v0.7.5 / run_code_design v0.9；预检/墓碑文案无变化，
+  finetune_support_design 未动）：callBatch 教学对齐实际并发——并行由工具能力决定，
+  read_file/MCP 仍顺序、llm 可并行、上限 8/波，依赖上一页游标的分页须顺序循环；
+  llm 预算错误区分调用次数耗尽（停机）与 token 预占拒绝（沙箱存活、文案自带
+  `the sandbox stays alive`）；截断/异常终止不作为有效判别，级联示例移除未校准的
+  `max_tokens: 8`（默认 1024）；落盘纪律改为「产物落盘并完成必要校验后收尾」；
+  include 定位收紧为「宿主有明确复用需求才建库」，删除未经验证的价值比较表述。
+
 ## [0.4.2] - 2026-09-27
 
 run_code v1 结项版本：三轮外部复审的运行时修复 + 价值验证收口（G3）+ 文档状态统一。

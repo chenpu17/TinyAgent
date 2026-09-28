@@ -2,15 +2,26 @@
 
 | 项 | 值 |
 |---|---|
-| 状态 | v0.7.6（M2/M3/M4 落码；V0-B 四臂主批 + e3 复查 + e1 库臂已跑：e2 一致性增量成立，A③/include 零效应登记；外部审核三轮收口完毕）；产品收益部分验收 |
-| 版本 | v0.7.7 |
-| 日期 | 2026-09-27 |
+| 状态 | v0.7.8（v1 已交付，可选原语；本次为使用教学维护，最终裁决见 code_review_brief.md） |
+| 版本 | v0.7.8 |
+| 日期 | 2026-09-28 |
 | 关联文档 | `docs/run_code_design.md`（D 编号）、`docs/finetune_support_design.md`（FD 编号、附录 A 即规格纪律）、`docs/run_code_routing_report.md`（评测方法论）、`docs/code_memory_design.md`（姊妹稿，共享纪律见 §10） |
-| 代码基线 | master @ 9c3db9b（其后行号会漂移，以代码为准） |
+| 代码基线 | master @ 91a8e6e（其后行号会漂移，以代码为准） |
 | 决策编号 | 本文 LD-n 独立编号；引用 run_code_design 写 D-n、finetune_support 写 FD-n |
 
 修订记录（历史仅说明演进，当前正文与决策表为规格）：
 
+- **v0.7.8（使用教学维护）**：不改运行时与默认值。skill 与附录 A②/A④
+  区分单次调用错误（无 `halted`）和批量错误条目（带 `halted`）；单次
+  `kind="budget"` 须按文案区分调用次数耗尽与 LLM token 预占拒绝，后者
+  不会停机，不能仅按 kind 或缺失字段推断。批量须检查全部条目，任何
+  `halted=true` 都意味着不能再发工具调用。补充 `callBatch` 的实际并发取决于
+  工具能力，当前内置 read_file/MCP 为顺序执行；依赖上一页游标的分页用顺序
+  循环。级联示例移除未经目标模型验证的 `max_tokens: 8`，沿用默认 1024，
+  并说明截断/异常终止返回 `kind="llm"`，不能当有效判别。新增用户指南入口
+  `run_code_guide.md`；扩展工具描述与附录 A④/A⑤ 同步澄清实际并发及 token
+  预占拒绝，基础工具短描述和 teaser 不变。教学变更同步进 run_code_design
+  附录与 manifest。
 - **v0.7.7（全链审核收口轮：预占位置备案 + halted 作用域 + 冻结面同步）**：读数来源 =
   外部全链审核（基线 9c3db9b；工程层判定收口，9 项 P3 本条登记 llm/batch 侧，
   姊妹稿 v0.7.4 登记 lib 侧）。
@@ -725,15 +736,19 @@ V0-A→M1/M2/M3 最小实现→M4→V0-B；M0 与 V0-A 可并行，M2 依赖 M0 
   **首发只产出只读结果**；其他部署的副作用按宿主授权政策执行，外层复判不等于用户授权（§6.1）；
 - 成本纪律：开工前 `tools.budget()` 查 tokens_left（**含未结算的预占**，LD-17），
   循环里定期查；429/5xx 保留失败项并交外层诊断，系统性限流须宿主延后处理；
-  `e.kind === "budget"` 时查 **`e.halted`**：true = 沙箱已停，只能 return 收尾；
-  false = 额度关口拒绝但沙箱活着，可 write_file 落盘部分结果再收尾；
+  单次 `tools.call` 的错误没有 `halted`；`kind="budget"` 须读文案：调用次数
+  耗尽则不再发工具调用；LLM token 预占拒绝会明确说明未派发且沙箱存活，其他
+  限额允许时可保存部分结果再收尾。批量条目才有 `halted`：检查全部条目，任一
+  true 则不再发工具调用，不能因某一条 false 就推断整个沙箱仍可写入；
 - 批量形态：`callBatch` 并发只读调用（分页拉取、逐项判别），结果按提交序；失败
   条目用 `instanceof Error` 判别，细节取 `.kind`/`.message`——**不要
   `JSON.stringify` 失败条目（Error 序列化成 `{}`，细节丢失）**；**批量结果必须
   逐条检查结果数组**（部分执行是常态而非意外）；**callBatch 不接受副作用工具
   （无原子性/无回滚），副作用批量写顺序 for 循环**；
-- 级联模式：便宜 model 先判，`unsure`/`llm_output` 错误升级贵 model（示例代码
-  块，进 run_code_skill.rs 回归）；
+  实际并发取决于工具能力，当前内置 read_file/MCP 仍顺序执行；依赖上一页
+  返回游标的分页须写顺序循环，不能预造后续页参数；
+- 级联模式：便宜 model 先判，`unsure` 升级贵 model，`llm_output` 记为
+  unresolved；示例使用默认输出上限，部署时按目标模型校准；
 - 质量交付：按预先给定的场景政策抽检本批实际输出（不是重跑 verify）；保留
   原文版本与定位。没有质量政策或未完成复核时标未验证/待复核；抽检通过不等于
   全量正确。unsure、错误与未完成项保留在分母和交付清单。
@@ -764,16 +779,17 @@ V0-A→M1/M2/M3 最小实现→M4→V0-B；M0 与 V0-A 可并行，M2 依赖 M0 
 （`BATCH_DESC_SUFFIX.replace`）——此前本块误冻结了替换后的拼写。）
 
 （`e.halted` 作用域：**仅批量条目封套携带**；单次 `tools.call` 错误无此字段
-（undefined 判 falsy 会误判沙箱存活），单次调用的停机判定用 `e.kind`
-（cancel/deadline/budget）——修订⑨/⑪的单次面定案，skill「批量调用」段同句同步。）
+（undefined 判 falsy 会误判沙箱存活）。单次 cancel/deadline 停止后续调用；
+budget 须按文案区分调用次数耗尽（停机）与 LLM token 预占拒绝（沙箱仍存活）。
+不明确时返回已知进度，不盲目重试——skill「批量调用」段同步。）
 
 ```
-【批量】（仅 code.call_batch 开启时；关闭时无此助手）tools.callBatch([{name, args}, …])：并发执行一批只读工具调用（read_file 等 batchable 工具；按提交序返回数组；无原子性、无回滚、部分执行是正常结果——逐条检查）。单项失败不抛、该条目为 Error 实例带 e.kind/e.tool——用 instanceof 判别，不要 JSON.stringify 失败条目（Error 序列化成 {}，细节丢失）。并发上限 8/波；分页拉取与逐项判别是理想对象；副作用调用不在批内——写顺序 for 循环。详见 run-code 技能的「批量调用」段。
+【批量】（仅 code.call_batch 开启时；关闭时无此助手）tools.callBatch([{name, args}, …])：批量调用独立只读工具（read_file 等 batchable 工具；按提交序返回数组；无原子性、无回滚、部分执行是正常结果——逐条检查）。单项失败不抛、该条目为 Error 实例带 e.kind/e.tool——用 instanceof 判别，不要 JSON.stringify 失败条目（Error 序列化成 {}，细节丢失）。支持并行的工具最多 8/波，当前 read_file/MCP 仍顺序执行；依赖上一页游标的分页须顺序循环。副作用调用不在批内——写顺序 for 循环。详见 run-code 技能的「批量调用」段。
 ```
 
 **⑤ run_code 描述的【LLM 判别】overlay 段**（v0.7.3 钉住；仅 code.llm.enabled
 开启时追加在描述尾部，基字面不动）：
 
 ```
-【LLM 判别】（仅 code.llm.enabled 开启时；关闭时无此工具）tools.call("llm", {prompt, system?, model?, max_tokens?, labels?})：单次模型调用（无工具、无历史、无流式）——大量同构的逐项语义判断（分类/抽取/校对/打标）用代码循环 + llm 承接；model 须在 code.llm.models 内（缺省 default_model）。声明 labels（封闭词表，≤16 项）时宿主校验输出并返回规范 label，未命中 e.kind="llm_output"、其余失败 e.kind="llm"（均无 retryable，读 message 自判）；词表要求必须同时写进 prompt（宿主不注入）。返回 {text, label?, usage, model}。token 成本发前预占、也计调用额度。判别纪律/成本纪律/级联详见 run-code 技能的「LLM 判别」段。
+【LLM 判别】（仅 code.llm.enabled 开启时；关闭时无此工具）tools.call("llm", {prompt, system?, model?, max_tokens?, labels?})：单次模型调用（无工具、无历史、无流式）——同构的逐项语义判断（分类/抽取/校对/打标）可用代码循环 + llm 承接，按任务质量与总成本选择；model 须在 code.llm.models 内（缺省 default_model）。声明 labels（封闭词表，≤16 项）时宿主校验输出并返回规范 label，未命中 e.kind="llm_output"；参数/provider/响应异常终止（含 max_tokens 截断）为 e.kind="llm"，均无 retryable，读 message 自判。词表要求必须同时写进 prompt（宿主不注入）。返回 {text, label?, usage, model}。token 成本发前预占、也计调用额度；预占拒绝为 e.kind="budget"，与调用次数耗尽的恢复方式不同。判别纪律/成本纪律/级联详见 run-code 技能的「LLM 判别」段。
 ```

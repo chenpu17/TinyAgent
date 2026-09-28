@@ -9,7 +9,7 @@
 - **图片输入**：`--image` 参数或 `load_image` 工具（png / jpeg / gif / webp，base64）
 - **PDF 文档输入**：库侧 `Block::Document`（Anthropic 原生 `document` block，逐页"转图 + 抽取文本"处理；`load_document_block` 读取 + `push_user` 推入）
 - **精炼工具集**：`shell`、`read_file`、`write_file`、`edit_file`、`list_dir`、`task`（子 agent；同 turn 多调用并行）、`todo`（任务计划，落进 result.json 的 `plan` 字段）默认启用；`load_image`（视觉）需在 `tools` 显式加入。均可在 config 的 `tools` 里裁剪
-- **沙箱 JS 执行（可选 `code` feature）**：`run_code` 工具让模型在进程内 wasm 沙箱（QuickJS-in-wasm）里写 JS 编排既有工具——能力构造性收敛（无网络 / 无文件系统直访，工具调用全走 hooks 闸门），fuel / 墙钟 / 内存 / 调用数四重限额；两层开关（feature + `code.enabled`）默认都关
+- **沙箱 JS 执行（可选 `code` feature）**：`run_code` 工具让模型在进程内 wasm 沙箱（QuickJS-in-wasm）里写 JS 编排既有工具——能力构造性收敛（无网络 / 无文件系统直访，工具调用全走 hooks 闸门），fuel / 墙钟 / 内存 / 调用数四重限额；两层开关（feature + `code.enabled`）默认都关；[快速上手与最佳实践](docs/run_code_guide.md)
 - **Harness 契约**：`--output result.json` 写结构化结果（含 token 用量、每次工具调用的 input/output），`--json` 流式 NDJSON；exit code 语义化（`0` 成功 / `124` 超时 / `130` 取消 / `1` 其它），可直接进 CI / 评测 pipeline
 - **CLI 覆盖**：`--model` / `--max-turns` / `--timeout` 免改配置做 A/B 对照
 - **批量任务**：`--batch <dir>` 并发跑一组任务片段，`--retries` 对 transient 失败指数退避重试，`--failed` 只重跑上一轮失败的任务并合并进完整报告
@@ -916,6 +916,10 @@ GUI 可渲染"正在构造调用…"（headless 终端不重复打印——完�
 ```
 
 ## run_code（沙箱 JS 执行，可选 `code` feature）
+
+**从这里开始**：[快速上手与最佳实践](docs/run_code_guide.md) ·
+[可运行演示](examples/run-code-demo/README.md) ·
+[模型内置技能全文](src/tools/run_code_skill.md)。下面是配置与接口参考。
 
 `run_code` 让模型把"需要循环 / 批量 / 多步数据处理"的逻辑写成一段 **JS**，在进程内的 wasm 沙箱
 （QuickJS 编译为 wasm、wasmtime 驱动，纯 Rust 宿主不碰 C 工具链）里执行——代码经 `tools.call()`
