@@ -618,6 +618,28 @@ def test_inline_dict_config_validates_workdir():
         tiny_agent.Agent(cfg, api_key=MOCK_KEY)
 
 
+def test_config_accepts_subagent_max_turns(tmp_path):
+    """The host-facing `task` sub-agent turn ceiling (`limits.subagent_max_turns`,
+    default 25, 0 = inherit the parent's max_turns) passes through the binding's
+    config dict. Limits carries deny_unknown_fields, so a stale wheel without
+    the field rejects the key at construction: a constructing + running agent
+    proves the knob shipped to the host."""
+    def first(handler, body):
+        write_sse(handler, text_sse("ceiling ok"))
+
+    mock = ScriptedMock([first]).start()
+    try:
+        cfg = openai_config(mock.url, tools=[], workdir=str(tmp_path))
+        cfg["limits"]["subagent_max_turns"] = 40
+        a = tiny_agent.Agent(cfg, api_key=MOCK_KEY)
+        a.push_user("hi")
+        out = a.run()
+        assert out["stop_reason"] == "end_turn"
+        assert out["final_text"] == "ceiling ok"
+    finally:
+        mock.stop()
+
+
 # ── 14. lock model: no deadlock from callbacks or cross-thread callers ───────
 
 def test_sync_method_from_event_callback_raises_instead_of_deadlocking(tmp_path):

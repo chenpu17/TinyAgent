@@ -35,6 +35,7 @@ function writeConfig(t, mockUrl, opts = {}) {
       stream_idle_secs: opts.streamIdleSecs ?? 30,
       // Undefined entries are dropped by JSON.stringify — opt-in only.
       keep_recent_messages: opts.keepRecentMessages,
+      subagent_max_turns: opts.subagentMaxTurns,
     },
   };
   const cfgPath = path.join(workdir, 'config.json');
@@ -92,6 +93,23 @@ test('Agent multi-turn: events stream, getters reflect state', async (t) => {
   for (const k of ['input_tokens', 'output_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens']) {
     assert.ok(k in u, `usage missing ${k}`);
   }
+});
+
+test('config accepts limits.subagent_max_turns (host-facing task ceiling)', async (t) => {
+  // limits.subagent_max_turns (JSON config, snake_case) is the turn ceiling
+  // for `task` sub-agents — default 25, 0 = inherit the parent's max_turns.
+  // Limits carries deny_unknown_fields, so a stale wheel without the field
+  // rejects the key outright at construction: one mock round-trip proves the
+  // knob shipped through the binding to the host.
+  const mock = await ScriptedMock.start([
+    (_body, res) => respondSse(res, textSse('ceiling ok')),
+  ]);
+  t.after(() => mock.stop());
+
+  const { cfgPath } = writeConfig(t, mock.url, { tools: [], subagentMaxTurns: 40 });
+  const out = await chat(cfgPath, 'hi', { apiKey: MOCK_KEY });
+  assert.strictEqual(out.stop_reason, 'end_turn');
+  assert.strictEqual(out.final_text, 'ceiling ok');
 });
 
 // ── 3. cancel interrupts the run ─────────────────────────────────────────────

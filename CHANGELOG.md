@@ -7,6 +7,16 @@
 
 ### Added
 
+- **子 agent turn 天花板可配置 `limits.subagent_max_turns`（跨核心 + 双绑定）**：`task` 子 agent 的
+  turn 预算天花板从硬编码 `SUBAGENT_MAX_TURNS=25` 提为 `Limits` 字段——外部宿主可自行放宽（GUI 类
+  应用跑千级轮次的场景）或设 `0` 不另设天花板（子 agent 完整继承父 `max_turns`）。语义不变量保持：
+  子预算恒 = `min(父 max_turns, 天花板)`（0 时 = 父预算），**永不高于父自身预算**——`task` 调用不能
+  比生成它的 run 活得更久；父 run 的 `timeout_secs` 与共享 cancel 仍是真正的墙钟护栏。默认 25 = 旧行为
+  （旧配置文件零改动兼容）。批量任务片段按 `Clamp::TightenOrInit` 归类：只允许收紧（片段 `0` 被忽略、
+  不拆基础天花板；基础 `0` 时采纳片段有限值）。核心实现见 916ee3b（`child_max_turns` 纯函数单测、
+  config anti-silence 哨兵与片段收紧五断言）；本条补充双绑定透传测试（py/node 各一：构造 + mock 跑通
+  证明 `deny_unknown_fields` 未拒新键）。
+
 - **run_code 使用文档三件套**：`docs/run_code_guide.md`（快速上手与最佳实践——配置合并、
   工具接入、三项扩展示例、失败恢复；README run_code 专节与结项状态总表加使用入口）；
   入门演示判分加固——每次独立 mktemp 工作区保留历史（不再 `rm -rf`）、请求模型前先验
