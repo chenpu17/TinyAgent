@@ -8118,10 +8118,15 @@ return t.length;"#}),
             let e = doc[b..].find("```").expect("unterminated fence") + b;
             doc[b..e].trim_end_matches('\n').to_string()
         }
+        // Windows checkouts may carry CRLF (core.autocrlf); fold to LF so the
+        // verbatim comparison is against the doc's content, not its on-disk
+        // EOL form (same accommodation as the run_code_skill split tests).
         let lib_doc = std::fs::read_to_string("docs/code_memory_design.md")
-            .expect("docs/code_memory_design.md (run tests from the crate root)");
+            .expect("docs/code_memory_design.md (run tests from the crate root)")
+            .replace("\r\n", "\n");
         let llm_doc = std::fs::read_to_string("docs/code_llm_design.md")
-            .expect("docs/code_llm_design.md (run tests from the crate root)");
+            .expect("docs/code_llm_design.md (run tests from the crate root)")
+            .replace("\r\n", "\n");
         let cases: [(&str, String, &str); 3] = [
             (
                 "A① 【库】段",

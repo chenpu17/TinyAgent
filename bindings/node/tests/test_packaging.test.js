@@ -89,7 +89,11 @@ test('main tarball whitelist: no *.node, loader + types shipped', { timeout: 600
     { cwd: PKG_DIR },
   );
   const tarball = path.join(tmp, JSON.parse(packOut)[0].filename);
-  const files = execFileSync('tar', ['-tzf', tarball], { encoding: 'utf8' })
+  // A colon in `C:\...` makes GNU tar read the path as an rsh host:file
+  // ("Cannot connect to C: resolve failed") — run inside the destination and
+  // pass the bare file name so the invocation is drive-letter-free everywhere
+  // (bsdtar on stock Windows and GNU tar under Git Bash both fine).
+  const files = execFileSync('tar', ['-tzf', path.basename(tarball)], { cwd: tmp, encoding: 'utf8' })
     .trim().split('\n').map((f) => f.replace(/^package\//, ''));
 
   assert.ok(files.includes('index.js'), 'generated loader shipped');

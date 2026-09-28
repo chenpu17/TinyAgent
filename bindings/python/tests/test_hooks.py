@@ -86,7 +86,10 @@ def test_hooks_deny(tmp_path):
     assert hooks.before[0][0] == "shell"
     assert hooks.before[0][1] == {"command": "echo original"}
     assert hooks.before[0][2]["subagent"] is None
-    assert hooks.before[0][2]["workdir"] == str(tmp_path)
+    # Rust canonicalize() on Windows yields the verbatim `\\?\C:\...` form, so
+    # full-path equality is a POSIX-only expectation — compare the tail, same
+    # accommodation as the node hooks test.
+    assert hooks.before[0][2]["workdir"].endswith(tmp_path.name)
 
     # Denied call recorded is_error with the deny message as the tool_result…
     rec = out["tool_calls"][0]
