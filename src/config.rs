@@ -26,6 +26,9 @@ fn default_stream_idle() -> u64 {
 fn default_shell_timeout() -> u64 {
     120
 }
+fn default_subagent_max_turns() -> u32 {
+    25
+}
 fn default_max_tokens() -> u32 {
     8192
 }
@@ -111,6 +114,15 @@ pub struct Limits {
     /// directions (see `Clamp::Replace` — the only limits field with no clamp).
     #[serde(default = "default_shell_timeout")]
     pub shell_timeout_secs: u64,
+    /// Turn ceiling for `task` sub-agents, applied as
+    /// `min(parent max_turns, this)`: a sub-agent is a bounded side-quest, so
+    /// without a ceiling a stuck child keeps burning the parent's loop for as
+    /// long as the parent's own budget allows. `0` = no separate ceiling (the
+    /// child inherits the parent's `max_turns` verbatim) — the LOOSEST value,
+    /// so a batch task fragment may only tighten it (`Clamp::TightenOrInit`).
+    /// Child budgets never exceed the parent's: the cap only ever lowers.
+    #[serde(default = "default_subagent_max_turns")]
+    pub subagent_max_turns: u32,
 }
 
 impl Default for Limits {
@@ -125,6 +137,7 @@ impl Default for Limits {
             max_total_tokens: 0,
             stream_idle_secs: default_stream_idle(),
             shell_timeout_secs: default_shell_timeout(),
+            subagent_max_turns: default_subagent_max_turns(),
         }
     }
 }
@@ -659,6 +672,7 @@ impl Config {
                 max_total_tokens,
                 stream_idle_secs,
                 shell_timeout_secs,
+                subagent_max_turns,
             } = l;
             let li = &mut self.limits;
             li.max_turns = Clamp::Tighten.merge(li.max_turns, max_turns);
@@ -674,6 +688,9 @@ impl Config {
             li.stream_idle_secs = Clamp::Tighten.merge(li.stream_idle_secs, stream_idle_secs);
             // The only Replace: cost/latency knob, not a safety boundary.
             li.shell_timeout_secs = Clamp::Replace.merge(li.shell_timeout_secs, shell_timeout_secs);
+            // 0 = no separate ceiling (loosest), so a fragment may only tighten.
+            li.subagent_max_turns =
+                Clamp::TightenOrInit.merge(li.subagent_max_turns, subagent_max_turns);
         }
         if let Some(v) = mcp_servers {
             self.mcp_servers = v;
@@ -976,6 +993,7 @@ pub struct PartialLimits {
     pub max_total_tokens: Option<u64>,
     pub stream_idle_secs: Option<u64>,
     pub shell_timeout_secs: Option<u64>,
+    pub subagent_max_turns: Option<u32>,
 }
 
 #[cfg(test)]
@@ -1518,14 +1536,16 @@ mod tests {
                 "max_turns":100,"timeout_secs":1000,"max_output_chars":100000,
                 "compress_threshold_chars":1000000,"keep_recent_messages":100,
                 "max_context_tokens":1000000,"max_total_tokens":1000000,
-                "stream_idle_secs":1000,"shell_timeout_secs":10000}}"#,
+                "stream_idle_secs":1000,"shell_timeout_secs":10000,
+                "subagent_max_turns":1000}}"#,
         )
         .unwrap();
         let partial: PartialConfig = serde_json::from_str(
             r#"{"limits":{"max_turns":2,"timeout_secs":3,"max_output_chars":4,
                 "compress_threshold_chars":5,"keep_recent_messages":6,
                 "max_context_tokens":7,"max_total_tokens":8,
-                "stream_idle_secs":9,"shell_timeout_secs":10}}"#,
+                "stream_idle_secs":9,"shell_timeout_secs":10,
+                "subagent_max_turns":11}}"#,
         )
         .unwrap();
         cfg.apply(partial).unwrap();
@@ -1550,6 +1570,55 @@ mod tests {
         );
         assert_eq!(cfg.limits.stream_idle_secs, 9, "Tighten field must land");
         assert_eq!(cfg.limits.shell_timeout_secs, 10, "Replace field must land");
+        assert_eq!(
+            cfg.limits.subagent_max_turns, 11,
+            "TightenOrInit field must land"
+        );
+    }
+
+    #[test]
+    fn subagent_max_turns_fragment_can_only_tighten() {
+        // The sub-agent turn ceiling is a safety boundary, so its Clamp is
+        // TightenOrInit with 0 = "no separate ceiling" (the loosest value):
+        // a fragment's 0 is a no-op, a finite fragment value tightens both a
+        // finite and a 0 (unlimited) base, and the smaller always wins.
+        let base = |turns: u32| {
+            let json = format!(
+                r#"{{"provider":"openai","api_key_env":"K","model":"m",
+                     "limits":{{"subagent_max_turns":{turns}}}}}"#
+            );
+            serde_json::from_str::<Config>(&json).unwrap()
+        };
+        let fragment = |turns: u32| {
+            let json = format!(r#"{{"limits":{{"subagent_max_turns":{turns}}}}}"#);
+            serde_json::from_str::<PartialConfig>(&json).unwrap()
+        };
+
+        // 存量兼容：默认 25（原硬编码常量），未显式配置即拿到它。
+        assert_eq!(Limits::default().subagent_max_turns, 25);
+        assert_eq!(base(25).limits.subagent_max_turns, 25);
+
+        let mut c = base(25);
+        c.apply(fragment(5)).unwrap();
+        assert_eq!(c.limits.subagent_max_turns, 5, "有限收紧必须生效");
+
+        let mut c = base(25);
+        c.apply(fragment(0)).unwrap();
+        assert_eq!(
+            c.limits.subagent_max_turns, 25,
+            "片段的 0 是 no-op，不能关掉基座天花板"
+        );
+
+        let mut c = base(0);
+        c.apply(fragment(5)).unwrap();
+        assert_eq!(
+            c.limits.subagent_max_turns, 5,
+            "基座 0（不另设）可被有限值收紧"
+        );
+
+        let mut c = base(5);
+        c.apply(fragment(25)).unwrap();
+        assert_eq!(c.limits.subagent_max_turns, 5, "放宽被拒（只允许收紧）");
     }
 
     /// §9 per-field merge strategies for `code` fragments — the §13-18-style

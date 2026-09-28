@@ -41,11 +41,6 @@ You are a focused sub-agent. Complete the assigned task using the available \
 tools, verify your work, then return a concise result summary. Do not ask \
 questions — make a reasonable decision and proceed.";
 
-/// Cap on a sub-agent's turn budget, regardless of the parent's `max_turns`,
-/// so a stuck sub-agent can't pin the parent forever. The parent's run is the
-/// real wall-clock guard (shared cancel flag); this bounds the LLM loop.
-const SUBAGENT_MAX_TURNS: u32 = 25;
-
 /// The `task` sub-agent tool. Holds what it needs to build a fresh child agent
 /// (provider config + HTTP client + key), constructed once at `tools::build`.
 /// `mcp_tools` are the parent's SHARED MCP tools (Arc-backed connections): the
@@ -147,7 +142,14 @@ impl Tool for SubAgent {
         // Child config: sub-agent persona + a capped turn budget.
         let mut child_cfg = self.cfg.clone();
         child_cfg.system_prompt = Some(SUBAGENT_SYSTEM_PROMPT.into());
-        child_cfg.limits.max_turns = child_cfg.limits.max_turns.min(SUBAGENT_MAX_TURNS);
+        // Turn ceiling: `min(parent max_turns, limits.subagent_max_turns)` — a
+        // sub-agent is a bounded side-quest, so a stuck child can't pin the
+        // parent's loop for the parent's whole budget. The parent's run is
+        // still the real wall-clock guard (shared cancel flag).
+        child_cfg.limits.max_turns = child_max_turns(
+            child_cfg.limits.max_turns,
+            child_cfg.limits.subagent_max_turns,
+        );
         // Wall-clock inheritance: the child's budget is the parent's REMAINING
         // time, never a fresh full copy — a `task` spawned one second before
         // the parent deadline would otherwise get a whole second
@@ -271,6 +273,18 @@ fn clamp_child_timeout(child_timeout_secs: u64, deadline: Option<std::time::Inst
     match child_timeout_secs {
         0 => remaining,
         t => t.min(remaining),
+    }
+}
+
+/// Child turn budget: `min(parent max_turns, limits.subagent_max_turns)`. A
+/// sub-agent is a bounded side-quest — without a ceiling a stuck child keeps
+/// burning the parent's loop for as long as the parent's own budget allows.
+/// The cap only ever LOWERS (a child never gets more turns than its parent);
+/// `0` means "no separate ceiling", i.e. the parent's `max_turns` verbatim.
+fn child_max_turns(parent_max_turns: u32, ceiling: u32) -> u32 {
+    match ceiling {
+        0 => parent_max_turns,
+        c => parent_max_turns.min(c),
     }
 }
 
@@ -610,6 +624,21 @@ mod tests {
         // not unlimited.
         let unlimited = clamp_child_timeout(0, Some(now + Duration::from_secs(4)));
         assert!((3..=4).contains(&unlimited), "~4s, got {unlimited}");
+    }
+
+    #[test]
+    fn child_max_turns_is_a_ceiling_never_a_floor() {
+        // Default 25 (the old hardcoded constant) caps a looser parent.
+        assert_eq!(child_max_turns(1000, 25), 25);
+        // A parent tighter than the ceiling keeps its own budget (tighten-only).
+        assert_eq!(child_max_turns(8, 25), 8);
+        // 0 = "no separate ceiling": the parent's max_turns stands verbatim.
+        assert_eq!(child_max_turns(1000, 0), 1000);
+        assert_eq!(child_max_turns(7, 0), 7);
+        // Plain min otherwise: `max_turns` carries no 0-sentinel (0 means "no
+        // turn at all"), so a degenerate parent stays degenerate — the ceiling
+        // is a cap, never a raise.
+        assert_eq!(child_max_turns(0, 25), 0);
     }
 
     #[test]

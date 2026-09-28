@@ -633,7 +633,8 @@ tiny-agent --config examples/web-search.json --task "搜一下 Anthropic 最近�
     "max_context_tokens": 0,
     "max_total_tokens": 0,
     "stream_idle_secs": 30,
-    "shell_timeout_secs": 120
+    "shell_timeout_secs": 120,
+    "subagent_max_turns": 25
   }
 }
 ```
@@ -661,6 +662,8 @@ API key 从 `api_key_env` 指定的环境变量读取，不写进配置文件。
 
 `limits.max_total_tokens`（默认 `0` = 不限）：整个 run 的 token 预算上限（input + output + cache 写 + cache 读，跨所有轮次 / 子 agent / 压缩调用累计）。累计超过即以 `stop_reason: "budget_exceeded"`（exit 125）停下，不再开新一轮——语义同 `timeout_secs` 的**轮次边界**停：把总额顶破上限的那一轮照常跑完（工具执行、assistant 消息入历史），上限只阻止**下一轮**开始，故 transcript 与 tool_use/tool_result 配对不受影响。评测 / CI 场景用来给"跑飞钱包"装闸门：usage 累计本就含子 agent、压缩、失败轮（诚实成本，失败也计费），这个闸门只是在地基上加一道关。批量任务片段可设此项**只收紧**（更小值）；`0` 意为"无上限"（最松），任务片段设 0 会被忽略。
 **预算在父与子 agent 之间共享执行**：闸门读的是 run 级共享花费计数器——父与每个在飞 `task` 子 agent 的直接 chat 花费（轮次 chat + 压缩摘要）实时累入同一计数器，父和每个子 agent 都在自己的轮次边界读它，并行子 agent **集体**触顶（不再是各烧满一份预算、join 后才发现）。粒度仍是**轮次边界**：同一轮里已并行启动的兄弟子 agent 互相看不到对方本轮的后续花费，顶破上限的那轮照常跑完；预算是"熔断"不是"预先分片"——严格控成本仍建议留余量或在 config 的 `tools` 里去掉 `task`。
+
+`limits.subagent_max_turns`（默认 25）：`task` 子 agent 的轮次天花板，生效值是 `min(父 max_turns, 本值)`——子 agent 是**有界的支线**，没有天花板时一个卡住的子 agent 会一直烧父的循环预算，直到父自己的 `max_turns` 用尽；父的 run 仍是真正的墙钟护栏（共享取消标志）。设 `0` = **不另设天花板**（子 agent 原样继承父的 `max_turns`）——这是最松取值，故批量任务片段只能**收紧**（更小值），片段设 0 会被忽略、放宽会被 `min` 拒绝。子 agent 的轮次**永不高于父**（本值只降不升）。GUI/长工作流宿主把父 `max_turns` 放宽到千级时，记得同步调大本值，否则子 agent 会被默认的 25 掐回去。
 
 `reasoning_effort`（可选字符串，默认不设）：思考程度，**按字符串原样透传给 provider，不做枚举校验**——各家档位碎片化且随模型代际变动，TinyAgent 不维护映射表，由 provider/server 拒绝未知值。取值参考：OpenAI `none`/`low`/`medium`/`high`/`xhigh`/`max`（随模型代际扩张）、Anthropic `low`/`medium`/`high`/`max`（Claude 4.6+ adaptive thinking；Opus 4.7 起旧 `budget_tokens` 已移除）、DeepSeek `low`/`high`/`xhigh`/`max`、GLM 仅开关（`enabled`/`disabled`）。映射：OpenAI 系直接发 `reasoning_effort` 字段（老网关不认会 400，`body_fix_for_400` 自动 drop 重试，与 `max_tokens`/`stream_options` 同款）；Anthropic 发 `thinking: {"type": "adaptive"}` + `output_config: {"effort": "..."}`（effort 在**独立顶层 `output_config` 对象**里，不在 thinking 内、也不是裸顶层字段——裸顶层会被静默忽略，这是该 API 最常见的坑），`"none"` 发 `{"type": "disabled"}`。
 
@@ -1262,7 +1265,7 @@ release 下 panic 不触发 `Drop`——调试 destructors（如 TUI 终端还�
 src/
 ├── main.rs           (  930)  # CLI 入口 + 组装（build_agent）+ --session none
 ├── lib.rs            (  551)  # 库根：build_agent* / assemble 装配（工具表、ToolCtx、code 安装、技能注入）
-├── config.rs         ( 1886)  # 配置解析 + 任务片段合并 + 批量覆盖白名单
+├── config.rs         ( 1955)  # 配置解析 + 任务片段合并 + 批量覆盖白名单
 ├── provider/  # LLM 后端
 │   ├── mod.rs            (  938)  # 共享 Message/Block、SSE reader、CancellableSse
 │   ├── openai.rs         ( 1683)  # OpenAI 兼容（include_usage；400 回退：max_tokens→max_completion_tokens / 丢 stream_options）
@@ -1285,7 +1288,7 @@ src/
 │   ├── document.rs       (  100)  # PDF → Block::Document 加载（库 API load_document_block）
 │   ├── skill.rs          (  785)  # read_skill / list_skill（不在白名单，由装配注入）
 │   ├── mcp.rs            (  485)  # MCP 工具包装（sanitize_name + wire_name 分发）
-│   ├── subagent.rs       (  917)  # task 子 agent 工具（独立上下文 + turn 封顶；不可递归）
+│   ├── subagent.rs       (  946)  # task 子 agent 工具（独立上下文 + turn 封顶；不可递归）
 │   ├── todo.rs           (  310)  # todo 工具（任务计划，全量替换；plan 落 result.json）
 │   ├── run_code.rs       (11312)  # run_code 工具（feature code）：QuickJS-in-wasm 沙箱——epoch/fuel/mem 限额、路径拦截、hooks 闸门、审计 meta（双哈希）
 │   └── llm.rs            (  622)  # llm 判别原语（feature code + code.llm 门）：单发无状态内层模型调用——LD-17 预占/结算、LD-18 labels 归一、共享 Provider cell

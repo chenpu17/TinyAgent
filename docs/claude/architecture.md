@@ -173,7 +173,8 @@
   与真解析器分歧（IDNA、百分号编码 host、userinfo 边角），别再写字符串版；回归测试钉住反斜杠混淆
   与网络路径变体（`endpoint_resolution_rejects_parser_confusion_bypasses`）。
 - **子 agent（`task` 工具，`tools/subagent.rs`）**：主 agent 把聚焦子任务交给一个全新子 agent
-  （独立历史 + 独立 turn 预算，`SUBAGENT_MAX_TURNS=25` 封顶），只把最终摘要作 tool 结果返回。
+  （独立历史 + 独立 turn 预算，`limits.subagent_max_turns` 封顶——默认 25，`0` = 不另设天花板），
+  只把最终摘要作 tool 结果返回。
   **同 turn 多个 `task` 调用并行**：`agent.rs` 的工具执行分两遍——叶子工具（shell/read_file/…）
   顺序跑，并行能力调用收集后用 `std::thread::scope` fan-out（每个一个 scoped thread），结果按原块序
   拼回（tool_use/tool_result 仍 N:N）。**路由按能力标记、不按名字**：分流依据是
