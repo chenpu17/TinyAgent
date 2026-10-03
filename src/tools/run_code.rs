@@ -749,6 +749,29 @@ fn lib_rel(workdir_canon: &Path, path: &str) -> Option<String> {
     .then_some(rel)
 }
 
+/// Accept the bare spelling saveLib's own return value uses. The wire form is
+/// `lib/…`, but saveLib's return strips the prefix for display ("util.js") —
+/// and a guest that fed that value straight back into include got the
+/// confinement refusal, sending the model on a prefix-fixing detour EVERY
+/// time it trusted the API's own output (observed live twice with different
+/// models). Normalize: a relative name with no prefix, no backslash, no `..`,
+/// and no whitespace is read as `lib/{name}`. Nothing outside lib/ becomes
+/// reachable — confinement ([`lib_rel`]) is unchanged; this only widens the
+/// ACCEPTED SPELLING of the same file.
+fn lib_path_normalize(path: &str) -> String {
+    let bare = !path.starts_with("lib/")
+        && !path.starts_with('/')
+        && !path.contains('\\')
+        && !path.contains("..")
+        && !path.contains(':')
+        && !path.chars().any(char::is_whitespace);
+    if bare {
+        format!("lib/{path}")
+    } else {
+        path.to_string()
+    }
+}
+
 /// Dispatch for the lib-family reserved names — the Phase-B-shaped sequence
 /// with the lib policy layers first (MD-2 order: ① lib/ confinement
 /// ② deny_paths ③ hooks gate as pseudo-tool ④ trace) and the HOST doing the
@@ -786,7 +809,7 @@ fn lib_reserved_call(caller: &mut Caller<'_, HostCtx>, name: &str, args: &Value)
             )
         } else {
             let path = args.get("path").and_then(Value::as_str);
-            let confined = path.and_then(|p| lib_rel(&d.workdir_canon, p));
+            let confined = path.and_then(|p| lib_rel(&d.workdir_canon, &lib_path_normalize(p)));
             // ① confinement + ② deny_paths — ahead of the hooks gate: a path
             // outside the lib root is a guest bug, not a policy question.
             let policy_err = match (&path, &confined) {
@@ -829,7 +852,8 @@ fn lib_reserved_call(caller: &mut Caller<'_, HostCtx>, name: &str, args: &Value)
                             _ => args.clone(),
                         };
                         let eff_path = effective.get("path").and_then(Value::as_str);
-                        let eff_confined = eff_path.and_then(|p| lib_rel(&d.workdir_canon, p));
+                        let eff_confined =
+                            eff_path.and_then(|p| lib_rel(&d.workdir_canon, &lib_path_normalize(p)));
                         let eff_err = match (&eff_path, &eff_confined) {
                             (Some(p), Some(rel)) if !deny_match(&d.snap.deny_paths, rel) => None,
                             (Some(p), _) => Some(format!(
@@ -973,9 +997,12 @@ fn include_deliver(d: &HostCtx, rel: &str, spelling: &str) -> (ToolOutput, &'sta
         .contains(&(rel.to_string(), hex.clone()));
     if entry.st != "ok" && !registered {
         return err(format!(
-            "run_code: '{spelling}' is st=draft and was not written in this session — \
-             admission refused. saveLib it in this session, or have a human review \
-             the library and set st=ok in {LIB_INDEX_REL}"
+            "run_code: '{spelling}' is st=draft and is not registered in this session — \
+             admission refused. If saveLib succeeded for it earlier in this conversation, \
+             the session registration was probably cleared by an app restart: re-run saveLib \
+             with the identical content to re-register (same hash, review state untouched). \
+             Otherwise the library needs a human review and promotion to st=ok before it \
+             works across sessions."
         ));
     }
     // The source rides inside an object on purpose (same shape as
@@ -3355,6 +3382,7 @@ fn prelude_line(include_libs: bool, call_batch: bool) -> String {
 
 fn guest_ctx(ctx: &ToolCtx) -> ToolCtx {
     ToolCtx {
+        tool_absent_notes: ctx.tool_absent_notes.clone(),
         workdir: ctx.workdir.clone(),
         max_output_chars: GUEST_OUTPUT_CHARS,
         restrict_to_workdir: ctx.restrict_to_workdir,
@@ -3986,7 +4014,7 @@ fn read_memory_string(
 /// keeps matching exactly one description. LLM-visible copy is spec: this
 /// text is mirrored in docs/code_memory_design.md's appendix; the two change
 /// together through its revision log.
-const LIB_DESC_SUFFIX: &str = "\n\n【库】（仅 code.include 开启时；关闭时上句成立、无以下助手）include(path)：加载 lib/ 下已登记的代码库到全局作用域（幂等，循环依赖自动截断，失败 throw）；saveLib(path, src)：写库文件并在 lib/INDEX.md 登记（恒 st=draft，本会话即可 include；跨会话复用需人工审校后将该行 st 改为 ok）。库校验失败（未登记/内容与登记不符/超限）e.kind=\"lib\"，重试无意义。建库/用库/修库生命周期详见 run-code 技能的「库与复用」段。";
+const LIB_DESC_SUFFIX: &str = "\n\n【库】（仅 code.include 开启时；关闭时上句成立、无以下助手）include(path)：加载 lib/ 下已登记的代码库到全局作用域（幂等，循环依赖自动截断，失败 throw）；saveLib(path, src)：写库文件并在 lib/INDEX.md 登记（恒 st=draft，本会话即可 include；跨会话复用需人工审校晋升为 ok）。库校验失败（未登记/内容与登记不符/超限）e.kind=\"lib\"，重试无意义。建库/用库/修库生命周期详见 run-code 技能的「库与复用」段。";
 
 /// The call_batch gate-ON description overlay (LD-15/附录 A④): appended when
 /// `code.call_batch` is set, outside the pinned r# literal (same extractor
@@ -4565,6 +4593,7 @@ mod tests {
 
     fn ctx(workdir: &std::path::Path) -> ToolCtx {
         ToolCtx {
+            tool_absent_notes: Vec::new(),
             workdir: workdir.to_path_buf(),
             max_output_chars: 1000,
             restrict_to_workdir: false,
@@ -7594,6 +7623,57 @@ return t.length;"#}),
                 .contains("no entry in lib/INDEX.md"),
             "{v}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// saveLib 的返回值剥掉 lib/ 前缀（展示形态）——把该值原样喂回 include
+    /// 曾经撞上收口拒绝，模型每次信 API 自己的输出都要绕一圈补前缀（实测
+    /// 两个不同模型各栽一次）。裸拼写必须解析到与前缀拼写同一个文件。
+    #[test]
+    fn lib_bare_path_spelling_accepted() {
+        let dir = scratch();
+        let v = js_out(
+            &lib_tool(),
+            &dir,
+            r#"
+            saveLib("lib/bare.js", "globalThis.bareVal = 7;");
+            include("lib/bare.js");
+            include("bare.js");
+            return {bare: globalThis.bareVal};"#,
+        );
+        // 两种拼写都不抛（抛了 js_out 会把错误作为返回值，字段缺失）
+        assert_eq!(v["bare"], json!(7), "{v}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// draft 且本会话未登记的拒绝文案必须说实话：「本会话未登记」+ 重启
+    /// 清登记的可能性 + 原样重存的自愈路径；不再教人手改 lib/INDEX.md
+    /// （晋升入口由宿主引导讲，内核不指定 HOW）。保住 "admission refused"
+    /// 标记短语——宿主引导按它识别这条报错。
+    #[test]
+    fn lib_draft_refusal_names_restart_path_and_skips_hand_edit_teaching() {
+        let dir = scratch();
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        std::fs::write(dir.join("lib/x.js"), "var x = 1;").unwrap();
+        let hex = sha256_hex(b"var x = 1;");
+        std::fs::write(
+            dir.join(LIB_INDEX_REL),
+            format!("<!-- ta-lib: path=x.js sha256={hex} needs=- ver=1 st=draft -->\n"),
+        )
+        .unwrap();
+        let v = js_out(
+            &lib_tool(),
+            &dir,
+            r#"
+            try { include("lib/x.js"); return {refused: false}; }
+            catch (e) { return {refused: true, msg: String(e)}; }"#,
+        );
+        assert_eq!(v["refused"], json!(true), "{v}");
+        let msg = v["msg"].as_str().unwrap_or("");
+        assert!(msg.contains("admission refused"), "{msg}");
+        assert!(msg.contains("app restart"), "{msg}");
+        assert!(msg.contains("re-run saveLib"), "{msg}");
+        assert!(!msg.contains("set st=ok in"), "{msg}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

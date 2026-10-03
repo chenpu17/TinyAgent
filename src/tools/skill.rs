@@ -394,6 +394,7 @@ mod tests {
 
     fn ctx(dir: &std::path::Path) -> ToolCtx {
         ToolCtx {
+            tool_absent_notes: Vec::new(),
             workdir: dir.to_path_buf(),
             max_output_chars: 1000,
             restrict_to_workdir: false,

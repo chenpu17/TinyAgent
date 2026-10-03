@@ -87,6 +87,18 @@ pub struct ToolCtx {
     /// (`shell_timeout_secs`, the MCP call timeout), and host callbacks in
     /// the language bindings cannot be interrupted at all.
     pub deadline: Option<std::time::Instant>,
+    /// Host-registered notes for tool names this build deliberately does NOT
+    /// carry (gate-off run_code, chat permission, an MCP server that failed to
+    /// start). When the model calls such a name, `run_tool` returns the note
+    /// instead of the bare "unknown tool: {name}": the bare message asserts the
+    /// tool never existed, and a model that watched the same tool succeed
+    /// earlier in the SAME conversation has been observed to "correct" its own
+    /// real, verified results as hallucinations (tiny-worker live incident,
+    /// 2026-10). Only the host knows why a name is absent and where to enable
+    /// it — so the host supplies the sentence, the kernel just relays it.
+    /// Cloned into `task` children and the run_code guest ctx like every other
+    /// field.
+    pub tool_absent_notes: Vec<(String, String)>,
 }
 
 /// The run-level token-budget gate (`limits.max_total_tokens`): the fleet-wide
@@ -853,6 +865,78 @@ mod tests {
         assert!(s.contains("[truncated, limit 100 chars]"));
     }
 
+    /// A host-registered absence note replaces the bare "unknown tool" for
+    /// exactly the noted name; every other miss still gets the generic
+    /// message. The bare message asserts the tool never existed — a model
+    /// that watched the same name succeed earlier in the conversation has
+    /// been observed to "correct" its own real, verified results as
+    /// hallucinations (tiny-worker live incident, 2026-10).
+    #[test]
+    fn run_tool_replays_host_absence_note_for_noted_names() {
+        let tool = CallbackTool::new(
+            ToolDef {
+                name: "echo".into(),
+                description: "echo".into(),
+                schema: serde_json::json!({"type":"object"}),
+            },
+            |_input, _ctx| Ok(ToolOutput::text("hi")),
+        );
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(tool)];
+        let defs: Vec<ToolDef> = tools.iter().map(|t| t.def()).collect();
+        let ctx = ToolCtx {
+            tool_absent_notes: vec![(
+                "run_code".to_string(),
+                "run_code 未启用（项目已关闭代码沙箱）；此前成功运行过的结果是真实的".to_string(),
+            )],
+            ..test_ctx_fields()
+        };
+        let mut emitted: Vec<AgentEvent> = Vec::new();
+        let noted = crate::agent::run_tool(
+            &tools,
+            &defs,
+            "run_code",
+            &serde_json::json!({}),
+            &ctx,
+            &mut |ev| emitted.push(ev),
+        );
+        assert!(noted.is_error);
+        assert!(
+            noted.content.contains("run_code 未启用") && noted.content.contains("真实的"),
+            "{noted:?}"
+        );
+        let generic = crate::agent::run_tool(
+            &tools,
+            &defs,
+            "no_such_tool",
+            &serde_json::json!({}),
+            &ctx,
+            &mut |_| {},
+        );
+        assert!(generic.is_error);
+        assert_eq!(generic.content, "unknown tool: no_such_tool");
+        // 挂了 note 的名字也不该误伤：同名工具真实存在时照常执行
+        let real = crate::agent::run_tool(&tools, &defs, "echo", &serde_json::json!({}), &ctx, &mut |_| {});
+        assert!(!real.is_error);
+        assert_eq!(real.content, "hi");
+    }
+
+    /// [`run_tool_replays_host_absence_note_for_noted_names`] 的 ctx 底座：
+    /// 空字段全集，测试按需覆盖。
+    fn test_ctx_fields() -> ToolCtx {
+        ToolCtx {
+            workdir: std::env::temp_dir(),
+            max_output_chars: 1000,
+            restrict_to_workdir: false,
+            cancel: None,
+            shell_timeout_secs: 120,
+            hooks: None,
+            subagent: None,
+            budget: None,
+            deadline: None,
+            tool_absent_notes: Vec::new(),
+        }
+    }
+
     /// A unique, canonicalized temp workdir for confine/resolve tests. confine
     /// compares against a canonicalized workdir (config load canonicalizes it),
     /// so the test must too — on macOS /tmp is a symlink to /private/tmp, and a
@@ -866,6 +950,7 @@ mod tests {
     #[test]
     fn resolve_rejects_dotdot_escape_when_restricted() {
         let ctx = ToolCtx {
+            tool_absent_notes: Vec::new(),
             workdir: workdir("escape"),
             max_output_chars: 1000,
             restrict_to_workdir: true,
@@ -887,6 +972,7 @@ mod tests {
     fn resolve_allows_a_nested_not_yet_existing_path() {
         let dir = workdir("inside");
         let ctx = ToolCtx {
+            tool_absent_notes: Vec::new(),
             workdir: dir.clone(),
             max_output_chars: 1000,
             restrict_to_workdir: true,
@@ -909,6 +995,7 @@ mod tests {
     #[test]
     fn resolve_skips_confinement_when_unrestricted() {
         let ctx = ToolCtx {
+            tool_absent_notes: Vec::new(),
             workdir: std::env::temp_dir(),
             max_output_chars: 1000,
             restrict_to_workdir: false,
@@ -951,6 +1038,7 @@ mod tests {
     fn confine_rejects_an_existing_path_outside_workdir() {
         let dir = workdir("abs");
         let ctx = ToolCtx {
+            tool_absent_notes: Vec::new(),
             workdir: dir.clone(),
             max_output_chars: 1000,
             restrict_to_workdir: true,

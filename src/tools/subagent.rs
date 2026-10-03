@@ -239,6 +239,7 @@ fn child_tools(
 ///   sub-agent's calls from top-level ones.
 fn child_ctx(ctx: &ToolCtx, name: &str) -> ToolCtx {
     ToolCtx {
+        tool_absent_notes: ctx.tool_absent_notes.clone(),
         workdir: ctx.workdir.clone(),
         max_output_chars: ctx.max_output_chars,
         restrict_to_workdir: ctx.restrict_to_workdir,
@@ -442,6 +443,7 @@ mod tests {
         budget: Option<crate::tools::BudgetGate>,
     ) -> Agent {
         let cfg = crate::config::Config {
+            tool_absent_notes: Vec::new(),
             provider: crate::config::ProviderKind::Anthropic,
             base_url: None,
             api_key_env: "X".into(),
@@ -468,6 +470,7 @@ mod tests {
             vec![],
             vec![Message::user(vec![Block::Text("do it".into())])],
             ToolCtx {
+                tool_absent_notes: Vec::new(),
                 workdir: std::env::temp_dir(),
                 max_output_chars: 1000,
                 restrict_to_workdir: false,
@@ -826,6 +829,7 @@ mod tests {
             vec![],
         );
         let ctx = ToolCtx {
+            tool_absent_notes: Vec::new(),
             workdir: std::env::temp_dir(),
             max_output_chars: 1000,
             restrict_to_workdir: false,
@@ -887,6 +891,7 @@ mod tests {
         let hooks: std::sync::Arc<dyn crate::hooks::Hooks> = std::sync::Arc::new(NoopHooks);
         let deadline = std::time::Instant::now();
         let parent = ToolCtx {
+            tool_absent_notes: Vec::new(),
             workdir: std::env::temp_dir(),
             max_output_chars: 1234,
             restrict_to_workdir: true,
@@ -925,6 +930,7 @@ mod tests {
 
     fn fake_cfg() -> Config {
         Config {
+            tool_absent_notes: Vec::new(),
             provider: crate::config::ProviderKind::Anthropic,
             base_url: None,
             api_key_env: "X".into(),

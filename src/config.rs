@@ -525,6 +525,15 @@ pub struct Config {
     /// reject unknown ones. `None` = server default.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// Host-registered absence notes for tool names this build deliberately
+    /// does not carry: `(tool name, note)`. When the model calls such a name,
+    /// dispatch returns the note instead of the bare "unknown tool: {name}"
+    /// (see `ToolCtx::tool_absent_notes` for why the bare message harms).
+    /// `assemble` copies this into the agent's `ToolCtx`, so every dispatch
+    /// path — inline, parallel batch, run_code guest ctx, `task` children —
+    /// relays the same note.
+    #[serde(default)]
+    pub tool_absent_notes: Vec<(String, String)>,
     /// `run_code` sandbox config (plain data — parses on any build; the tool
     /// itself requires the `code` cargo feature, design §9).
     #[serde(default)]

@@ -450,6 +450,7 @@ fn assemble(
         subagent: None,
         budget: None,
         deadline: None,
+        tool_absent_notes: cfg.tool_absent_notes.clone(),
     };
     Ok((tool_list, ctx, cfg, code, eager_pair))
 }

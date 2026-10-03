@@ -626,6 +626,7 @@ fn cfg_with(max_turns: u32, timeout_secs: u64, compress: usize) -> Config {
 
 fn test_ctx() -> ToolCtx {
     ToolCtx {
+        tool_absent_notes: Vec::new(),
         workdir: std::env::current_dir().expect("cwd"),
         max_output_chars: 1000,
         restrict_to_workdir: false,
@@ -7150,6 +7151,7 @@ fn build_ctx(label: &str) -> (ToolCtx, std::path::PathBuf) {
     std::fs::create_dir_all(&dir).unwrap();
     let canon = dir.canonicalize().unwrap();
     let ctx = ToolCtx {
+        tool_absent_notes: Vec::new(),
         workdir: canon.clone(),
         max_output_chars: 10_000,
         restrict_to_workdir: true,
@@ -8140,6 +8142,7 @@ fn run_code_a1_loop_round_trip() {
         mock::resp_text("done", None),
     ]);
     let ctx = ToolCtx {
+        tool_absent_notes: Vec::new(),
         workdir: dir.clone(),
         max_output_chars: 2000,
         restrict_to_workdir: false,
@@ -8269,6 +8272,7 @@ fn run_code_a2_csv_pipeline() {
         mock::resp_text("done", None),
     ]);
     let ctx = ToolCtx {
+        tool_absent_notes: Vec::new(),
         workdir: dir.clone(),
         max_output_chars: 4000,
         restrict_to_workdir: false,
@@ -8356,6 +8360,7 @@ fn run_code_a3_gate_sequence_equivalence() {
         mock::resp_text("done", None),
     ]);
     let ctx = ToolCtx {
+        tool_absent_notes: Vec::new(),
         workdir: dir.clone(),
         max_output_chars: 2000,
         restrict_to_workdir: false,

@@ -295,6 +295,7 @@ mod tests {
     /// Minimal ToolCtx for unit-level exec (no cancel, no workdir needs).
     fn test_ctx() -> ToolCtx {
         ToolCtx {
+            tool_absent_notes: Vec::new(),
             workdir: std::env::temp_dir(),
             max_output_chars: 30000,
             restrict_to_workdir: false,

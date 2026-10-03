@@ -476,7 +476,7 @@ A-M8 需要姊妹稿 M3 的 LlmTool（及 M0 的 mock 分流），不阻塞 incl
 （门关时不存在，基础描述不动；见 `run_code.rs` 的 `LIB_DESC_SUFFIX`，单源）：
 
 ```
-【库】（仅 code.include 开启时；关闭时上句成立、无以下助手）include(path)：加载 lib/ 下已登记的代码库到全局作用域（幂等，循环依赖自动截断，失败 throw）；saveLib(path, src)：写库文件并在 lib/INDEX.md 登记（恒 st=draft，本会话即可 include；跨会话复用需人工审校后将该行 st 改为 ok）。库校验失败（未登记/内容与登记不符/超限）e.kind="lib"，重试无意义。建库/用库/修库生命周期详见 run-code 技能的「库与复用」段。
+【库】（仅 code.include 开启时；关闭时上句成立、无以下助手）include(path)：加载 lib/ 下已登记的代码库到全局作用域（幂等，循环依赖自动截断，失败 throw）；saveLib(path, src)：写库文件并在 lib/INDEX.md 登记（恒 st=draft，本会话即可 include；跨会话复用需人工审校晋升为 ok）。库校验失败（未登记/内容与登记不符/超限）e.kind="lib"，重试无意义。建库/用库/修库生命周期详见 run-code 技能的「库与复用」段。
 ```
 
 机器侧错误文案（同一冻结面，单源 `run_code.rs`）：

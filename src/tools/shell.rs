@@ -535,6 +535,7 @@ mod tests {
         // reports the cancellation distinctly from a timeout.
         let cancel = Arc::new(AtomicBool::new(true));
         let ctx = ToolCtx {
+            tool_absent_notes: Vec::new(),
             workdir: std::env::temp_dir(),
             max_output_chars: 1000,
             restrict_to_workdir: false,
@@ -564,6 +565,7 @@ mod tests {
         // until the shell timeout kills it (and, under a harness, could eat
         // the harness's own piped input).
         let ctx = ToolCtx {
+            tool_absent_notes: Vec::new(),
             workdir: std::env::temp_dir(),
             max_output_chars: 1000,
             restrict_to_workdir: false,
@@ -594,6 +596,7 @@ mod tests {
     #[test]
     fn multibyte_output_marks_truncation_by_chars_not_bytes() {
         let ctx = ToolCtx {
+            tool_absent_notes: Vec::new(),
             workdir: std::env::temp_dir(),
             max_output_chars: 1000,
             restrict_to_workdir: false,
@@ -616,6 +619,7 @@ mod tests {
 
     fn ctx(workdir: std::path::PathBuf, max_output_chars: usize) -> ToolCtx {
         ToolCtx {
+            tool_absent_notes: Vec::new(),
             workdir,
             max_output_chars,
             restrict_to_workdir: false,
@@ -710,6 +714,7 @@ mod tests {
         // shell_timeout_secs is a real knob: 1s must kill `sleep 30` within a
         // poll interval, report an error, and name the configured timeout.
         let ctx = ToolCtx {
+            tool_absent_notes: Vec::new(),
             workdir: std::env::temp_dir(),
             max_output_chars: 1000,
             restrict_to_workdir: false,
@@ -743,6 +748,7 @@ mod tests {
         // being cut by the default 120s (which wouldn't fire here) — and more
         // importantly the Option<Instant> deadline must not treat 0 as "now".
         let ctx = ToolCtx {
+            tool_absent_notes: Vec::new(),
             workdir: std::env::temp_dir(),
             max_output_chars: 1000,
             restrict_to_workdir: false,

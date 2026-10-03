@@ -443,6 +443,7 @@ mod tests {
         // 用它断言「执行」链路通；search_files 也调一次看输出（其 pattern 匹配
         // 语义随 server 版本而异，不强断言）。
         let ctx = ToolCtx {
+            tool_absent_notes: Vec::new(),
             workdir: dir.clone(),
             max_output_chars: 4000,
             restrict_to_workdir: false,

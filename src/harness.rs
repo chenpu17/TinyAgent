@@ -1238,6 +1238,7 @@ mod tests {
             vec![],
             vec![Message::user(vec![Block::Text("go".into())])],
             crate::tools::ToolCtx {
+                tool_absent_notes: Vec::new(),
                 workdir: std::env::current_dir().unwrap(),
                 max_output_chars: 1000,
                 restrict_to_workdir: false,

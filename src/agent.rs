@@ -1135,6 +1135,19 @@ impl Agent {
         self.sync_code_tool(want)
     }
 
+    /// Hot-sync the host's absence notes (see
+    /// [`ToolCtx::tool_absent_notes`]). The master `code_enabled` gate flips
+    /// HOT via [`Self::set_code_enabled`] — no rebuild — so build-time notes
+    /// go stale exactly on the dangerous direction: disabled-after-enabled
+    /// removes the tool while the ctx still carries NO note, and the bare
+    /// "unknown tool" — the message that made a model deny its own real,
+    /// verified results — resurfaces on the very flip that caused the live
+    /// incident. Hosts call this right after `set_code_enabled` with the same
+    /// note they pass at build time.
+    pub fn set_tool_absent_notes(&mut self, notes: Vec<(String, String)>) {
+        self.ctx.tool_absent_notes = notes;
+    }
+
     /// Flip just the `enabled` bit (convenience derivative of
     /// [`Agent::set_code_config`]). Enabling makes `run_code` visible to the
     /// model on the NEXT request (`refresh_tool_defs` rebuilds the mirror);
@@ -2541,7 +2554,17 @@ pub(crate) fn run_tool(
                 ToolOutput::error(msg)
             }
         },
-        None => ToolOutput::error(format!("unknown tool: {name}")),
+        None => {
+            // The name resolved to nothing in THIS build. A host-registered
+            // absence note (see `ToolCtx::tool_absent_notes`) replaces the
+            // bare "unknown tool" when one exists — the note says what
+            // actually happened (gate off, where to enable) instead of
+            // asserting the tool never existed.
+            match ctx.tool_absent_notes.iter().find(|(n, _)| n == name) {
+                Some((_, note)) => ToolOutput::error(note.clone()),
+                None => ToolOutput::error(format!("unknown tool: {name}")),
+            }
+        }
     }
 }
 

@@ -780,6 +780,7 @@ mod tests {
 
     fn ctx_in(dir: &std::path::Path) -> ToolCtx {
         ToolCtx {
+            tool_absent_notes: Vec::new(),
             workdir: dir.to_path_buf(),
             max_output_chars: 1000,
             restrict_to_workdir: false,
@@ -900,6 +901,7 @@ mod tests {
 
     fn ctx_restricted(dir: &std::path::Path) -> ToolCtx {
         ToolCtx {
+            tool_absent_notes: Vec::new(),
             workdir: dir.to_path_buf(),
             max_output_chars: 1000,
             restrict_to_workdir: true,
