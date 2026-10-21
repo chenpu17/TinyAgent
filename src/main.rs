@@ -1,21 +1,24 @@
+mod batch;
+mod harness;
 mod signal;
 #[cfg(feature = "tui")]
 mod tui;
 
-// Core modules live in the `tiny_agent` library (src/lib.rs). Re-export them at
-// this binary's crate root so the rest of main.rs — and `mod tui`, which reaches
-// them as `crate::agent::…` — keeps resolving unchanged. The binary is only the
-// process-level shell: arg parsing, SIGINT, exit codes, and the optional TUI.
-pub(crate) use tiny_agent::{batch, build_agent, config, harness, provider, session, tools};
-// `agent` and `context_report` are only reached by the TUI
-// (`crate::agent::…` / `crate::context_report::…`); gate them so a headless
-// build doesn't warn about unused re-exports. The id helper below is used
-// unconditionally (resume id pre-minting), so it imports directly.
-#[cfg(feature = "tui")]
+// Kernel modules live in the `tiny_agent` library (crates/core). Re-export
+// them at this binary's crate root so the rest of main.rs — and `mod tui` /
+// `mod harness` / `mod batch`, which reach them as `crate::agent::…` — keep
+// resolving unchanged. The binary is only the process-level shell: arg
+// parsing, SIGINT, exit codes, headless rendering, batch orchestration, and
+// the optional TUI. `harness` and `batch` are LOCAL modules of this crate
+// (the headless presentation + batch orchestration layers); `agent` is
+// re-exported unconditionally because the harness drives it, while
+// `context_report` is only reached by the TUI — gate it so a headless build
+// doesn't warn about unused re-exports.
 pub(crate) use tiny_agent::agent;
 use tiny_agent::agent::numeric_id_suffix;
 #[cfg(feature = "tui")]
 pub(crate) use tiny_agent::context_report;
+pub(crate) use tiny_agent::{build_agent, config, fsutil, provider, retry, session, tools};
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
@@ -56,7 +59,9 @@ struct Cli {
     #[arg(long)]
     max_turns: Option<u32>,
 
-    /// Override limits.timeout_secs (0 = no timeout)
+    /// Override limits.timeout_secs (0 = no timeout). The timeout is per
+    /// attempt: with --retries N the total wall time can reach N+1 attempts
+    /// plus backoff sleeps, each attempt getting the full budget.
     #[arg(long)]
     timeout: Option<u64>,
 
@@ -163,8 +168,11 @@ fn compiled_features() -> Vec<&'static str> {
 /// instead of discovering a silent degrade mid-benchmark.
 fn print_version_manifest(json: bool) {
     let features = compiled_features();
+    // Best-effort stdout (harness::note_out, not println!): `--version | head`
+    // closes the pipe right after the first bytes; a bare println! panics on
+    // the EPIPE (exit 101) and CI never gets the exit status it asked for.
     if json {
-        println!(
+        harness::note_out(format_args!(
             "{}",
             serde_json::json!({
                 "name": env!("CARGO_PKG_NAME"),
@@ -172,9 +180,9 @@ fn print_version_manifest(json: bool) {
                 "target": target_label(),
                 "features": features,
             })
-        );
+        ));
     } else {
-        println!(
+        harness::note_out(format_args!(
             "{} {} ({}) features: {}",
             env!("CARGO_PKG_NAME"),
             env!("CARGO_PKG_VERSION"),
@@ -184,7 +192,7 @@ fn print_version_manifest(json: bool) {
             } else {
                 features.join(",")
             }
-        );
+        ));
     }
 }
 
@@ -325,21 +333,23 @@ fn main() -> Result<()> {
         };
         if let Some((model, history, archive)) = session::load_with_archive(path)? {
             if model != cfg.model {
-                eprintln!(
+                harness::note(format_args!(
                     "[warn] session model '{model}' differs from config model '{}'",
                     cfg.model
-                );
+                ));
             }
-            eprintln!(
+            harness::note(format_args!(
                 "resumed {} messages from {}",
                 history.len(),
                 cli.session.display()
-            );
+            ));
             initial = history;
             resumed_archive = archive;
             resumed = true;
         } else {
-            eprintln!("[warn] --resume given but no session file found; starting fresh");
+            harness::note(format_args!(
+                "[warn] --resume given but no session file found; starting fresh"
+            ));
         }
     }
 
@@ -376,13 +386,7 @@ fn main() -> Result<()> {
             // long-folded messages and collide with their archived
             // originals. Pre-assigning here keeps the mint inside the agent
             // unaware of the archive (assign_missing_ids keeps existing ids).
-            let floor = initial
-                .iter()
-                .chain(resumed_archive.iter())
-                .filter_map(|m| m.id.as_deref().and_then(numeric_id_suffix))
-                .max()
-                .unwrap_or(0);
-            msg.id = Some(format!("m{}", floor + 1));
+            msg.id = Some(next_resumed_id(&initial, &resumed_archive));
             initial.push(msg);
         }
     } else if !cli.image.is_empty() {
@@ -566,6 +570,26 @@ fn session_target(raw: &std::path::Path) -> Option<&std::path::Path> {
     }
 }
 
+/// Pre-mint the resumed task message's id above every `mN` id in `initial` +
+/// `archive` (why the archive counts: the agent's mint counter only scans the
+/// live history, so ids of long-folded messages must be outranked here).
+/// Saturating mirror of the kernel's `fresh_message_id` convention
+/// (crates/core/src/agent.rs): a hand-edited or corrupted session file can
+/// carry `m{u64::MAX}`, and the naive `floor + 1` overflow-panics in a debug
+/// build (exit 101, --resume dead on arrival). Pinned at MAX the minted id
+/// duplicates the existing `m{MAX}` — the same lesser evil the kernel accepts
+/// there: no higher u64 suffix exists to hand out, and a duplicate id in an
+/// already-degenerate history beats a crashed resume.
+fn next_resumed_id(initial: &[Message], archive: &[Message]) -> String {
+    let floor = initial
+        .iter()
+        .chain(archive.iter())
+        .filter_map(|m| m.id.as_deref().and_then(numeric_id_suffix))
+        .max()
+        .unwrap_or(0);
+    format!("m{}", floor.saturating_add(1))
+}
+
 /// Outcome of deciding whether a bare (no `--tui`, no initial task) invocation
 /// should default into the TUI. Pure (no env / stdin / cfg), so it is unit-
 /// tested directly; the stdin probe and the `feature = "tui"` gate live in the
@@ -699,9 +723,76 @@ fn missing_config_error(default: Option<&Path>) -> anyhow::Error {
 mod tests {
     use super::{
         choose_config_path, default_config_path_in, default_tui_mode, is_default_report,
-        is_default_session, session_target, TuiDefault,
+        is_default_session, next_resumed_id, session_target, Block, Message, TuiDefault,
     };
     use std::path::{Path, PathBuf};
+
+    /// A message carrying an explicit id (the shape a resumed history gets
+    /// from session files — or a hand edit).
+    fn msg_with_id(id: &str) -> Message {
+        let mut m = Message::assistant(vec![Block::Text("x".into())]);
+        m.id = Some(id.to_string());
+        m
+    }
+
+    #[test]
+    fn next_resumed_id_pre_mints_above_history_and_archive() {
+        // The normal shape: floor = max numeric suffix across BOTH sections
+        // (live history outranked by an archived id — the collision this
+        // pre-mint exists to prevent), id = floor + 1. Empty sections mint
+        // from the kernel counter origin m1; host-supplied non-mN ids don't
+        // move the floor.
+        let hist = vec![msg_with_id("m5"), msg_with_id("m9")];
+        let arch = vec![msg_with_id("m12"), msg_with_id("m2")];
+        assert_eq!(next_resumed_id(&hist, &arch), "m13");
+        assert_eq!(next_resumed_id(&[], &[]), "m1");
+        assert_eq!(next_resumed_id(&[msg_with_id("custom")], &[]), "m1");
+    }
+
+    #[test]
+    fn next_resumed_id_saturates_at_u64_max_without_panicking() {
+        // P2-1: a hand-edited/corrupt session carrying m{u64::MAX} made the
+        // naive `floor + 1` overflow-panic under overflow-checks (debug
+        // builds / `cargo test`, exit 101). Must saturate instead,
+        // re-issuing the MAX id exactly like the kernel's fresh_message_id
+        // does when its counter is pinned (a duplicate id in an
+        // already-degenerate history beats a crashed resume).
+        let max = format!("m{}", u64::MAX);
+        // MAX reached via the archive (a folded message)...
+        assert_eq!(
+            next_resumed_id(&[msg_with_id("m3")], &[msg_with_id(&max)]),
+            max
+        );
+        // ...and via the live history itself.
+        assert_eq!(next_resumed_id(&[msg_with_id(&max)], &[]), max);
+    }
+
+    #[test]
+    fn resume_pre_mint_survives_a_max_id_session_file() {
+        // Walk the --resume path as far as an in-process test can: main()
+        // parses the real argv, so this drives the same pipeline it does —
+        // save a session file whose assistant tail carries m{u64::MAX} (the
+        // exact trigger shape: the pre-mint runs only when the task does NOT
+        // fold into a trailing user message), load it back through the very
+        // session::load_with_archive --resume calls, then run the pre-mint
+        // arithmetic. Under overflow-checks the old `floor + 1` panicked
+        // right here; the new id must come back without incident.
+        let dir = std::env::temp_dir().join(format!("ta-resume-max-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".tinyagent-session.json");
+        let history = vec![
+            Message::user(vec![Block::Text("go".into())]),
+            msg_with_id(&format!("m{}", u64::MAX)),
+        ];
+        super::session::save_with_archive(&path, "m", &history, &[]).unwrap();
+        let Some((_, loaded, archive)) = super::session::load_with_archive(&path).unwrap() else {
+            panic!("session file must load");
+        };
+        assert_eq!(loaded.len(), 2);
+        // No panic + a sane (saturated, not wrapped) id.
+        assert_eq!(next_resumed_id(&loaded, &archive), format!("m{}", u64::MAX));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn is_default_report_accepts_equivalent_spellings() {

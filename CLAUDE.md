@@ -39,7 +39,7 @@ cargo fmt --all                            # 格式化（CI 有 --check 门禁�
 
 ### 语言绑定（workspace 成员 `bindings/python`、`bindings/node`）
 
-两者 path-依赖根库（`features = ["mock"]`），都复用 `CallbackTool` 注入自定义工具、不改核心。**Hooks 拦截层已双绑定暴露**（py `set_hooks`/`hooks=`、node `setHooks`/`hooks=`）：鸭子类型三方法任意子集，`before_tool` 决策 fail-closed（抛异常/非法返回=拒绝），观察类钩子异常吞掉——node 侧观察类 TSFN 是 Fatal 策略、wrapper 必须吞（与 wrapOnEvent 同纪律），决策走 `resolveHooksDecision` round-trip。两者各带一个
+两者 path-依赖内核 crate `crates/core`（`features = ["mock"]`），都复用 `CallbackTool` 注入自定义工具、不改核心。**Hooks 拦截层已双绑定暴露**（py `set_hooks`/`hooks=`、node `setHooks`/`hooks=`）：鸭子类型三方法任意子集，`before_tool` 决策 fail-closed（抛异常/非法返回=拒绝），观察类钩子异常吞掉——node 侧观察类 TSFN 是 Fatal 策略、wrapper 必须吞（与 wrapOnEvent 同纪律），决策走 `resolveHooksDecision` round-trip。两者各带一个
 默认关闭的 `code` **转发 feature**（`code = ["ta_core/code"]`）：编入后 `enable_code`/`disable_code`/
 `set_code_config`（Node 侧 camelCase）真实生效；未编入时三方法返回带重建提示的明确错误（设计 §8.6——
 避免给所有 wheel 强加 ~10MB wasmtime）。绑定测试 build-自适应（探测 wheel 是否带 feature，另一侧 skip）。
@@ -101,7 +101,7 @@ cargo clippy -p tiny-agent-node
 
 ## 架构要点索引（详录：`docs/claude/architecture.md`）
 
-- **bin + lib 双 target**：改 lib 内部不动 bin；`crate::` 在 lib 内指 lib.rs 根。
+- **双 crate（内核 + CLI）**：内核 `crates/core`（package `tiny-agent-core`，lib 名 `tiny_agent`）持 agent loop/工具/provider/装配 + `fsutil` 原子写；根 package `tiny-agent` 是进程壳（main/signal + 本地模块 harness/batch/tui）。改内核内部不动 CLI；CLI 侧 `crate::agent::…` 经 main.rs 的 `pub(crate) use tiny_agent::{…}` 解析。CLI 的 `code`/`mock` 是转发 feature，根目录 `cargo build --features …` 语义不变。
 - **同步模型**：`reqwest::blocking`，无 tokio；每个流式请求必带 per-request timeout 兜底防 reader 线程泄漏。SSE 内存三层限额（单行/单事件聚合/单响应累计）+ 有界背压通道，新增流式读取照抄。
 - **思考/工具参数增量透出**：只发事件、永不进 `text`/`blocks`；新增流式透出项照同款纪律抄。
 - **`reasoning_effort` 按字符串原样透传**，不做枚举校验；anthropic 走独立顶层 `output_config`，别用裸顶层字段。

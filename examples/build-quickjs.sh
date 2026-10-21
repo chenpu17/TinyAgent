@@ -20,7 +20,7 @@
 set -eu
 
 QJS="${QJS:?set QJS to the quickjs-ng v0.15.1 source dir (see header)}"
-OUT="${1:-assets/quickjs.wasm}"
+OUT="${1:-crates/core/assets/quickjs.wasm}"
 GLUE="$(dirname "$0")/quickjs_glue.c"
 
 # -mexec-model=reactor  : no crt main; ctors run via the exported _initialize

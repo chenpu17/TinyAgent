@@ -67,7 +67,7 @@ const COPY_EXCLUDE: [&str; 4] = ["target", "node_modules", ".git", "results"];
 static ISO_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Create a fresh isolation dir `ta-batch-{task}-{pid}-{n}` under `base`.
-/// Same O_EXCL discipline as `harness::atomic_write`: the pid + counter
+/// Same O_EXCL discipline as `fsutil::atomic_write` (kernel crate): the pid + counter
 /// name is unique between concurrent workers but NOT unpredictable — a
 /// hostile `/tmp` can pre-place a symlink at the exact predicted name —
 /// so the defense comes from plain `create_dir` (`mkdir(2)`), which never
@@ -108,6 +108,23 @@ fn create_isolation_dir(
         "no free isolation dir name for task {task_name:?} under {} (8 collisions)",
         base.display()
     )
+}
+
+/// Best-effort removal of the temp dir after a FAILED `git worktree add`.
+/// `remove_dir_all`, not `remove_dir`: a failed add can die mid-checkout and
+/// leave the dir non-empty (the `.git` pointer file, partially written
+/// entries), and the old `let _ = remove_dir` — which only succeeds on EMPTY
+/// dirs — then failed silently on exactly those half-built sandboxes and
+/// leaked them. A removal failure is warned via `harness::note` (best-effort
+/// stderr) but not propagated: the caller's `git worktree add failed` bail is
+/// the load-bearing error.
+fn cleanup_failed_worktree_dir(tmp: &Path) {
+    if let Err(e) = std::fs::remove_dir_all(tmp) {
+        harness::note(format_args!(
+            "[warn] cannot remove failed worktree dir ({}): {e}",
+            tmp.display()
+        ));
+    }
 }
 
 /// Prepare a task's isolated workdir. Returns `Ok(None)` for `IsolateMode::None`
@@ -218,8 +235,11 @@ fn prepare_isolation(
                 ));
             }
             if !added {
-                // The empty dir is ours now — don't leak it on failure.
-                let _ = std::fs::remove_dir(&tmp);
+                // The dir is ours now — don't leak it on failure. It may be
+                // non-empty (partial checkout before git gave up), hence the
+                // recursive helper; see its doc for why plain remove_dir
+                // silently failed exactly here.
+                cleanup_failed_worktree_dir(&tmp);
                 bail!("git worktree add failed: {last_err}");
             }
             Ok(Some(IsolationGuard {
@@ -236,6 +256,7 @@ fn prepare_isolation(
 /// remove_dir_all; git: `worktree remove --force`, falling back to
 /// remove_dir_all if git is unavailable/unwilling). Drop keeps debug-build
 /// panics from leaking the sandbox.
+#[derive(Debug)]
 struct IsolationGuard {
     mode: IsolateMode,
     dir: PathBuf,
@@ -286,6 +307,12 @@ impl Drop for IsolationGuard {
     }
 }
 
+/// Canonical paths of every directory one isolate-copy session has expanded
+/// (see `copy_dir_filtered`). Session-wide, not per-level: it is threaded
+/// through the whole `copy_entry` chain so ANY dereferenced link — at any
+/// depth — that walks back into an already-expanded directory is skipped.
+type VisitedDirs = std::collections::HashSet<PathBuf>;
+
 /// Recursively copy `src` into `dst`, skipping TOP-LEVEL entries named in
 /// `COPY_EXCLUDE`. The exclusion list means "the previous batch run's
 /// artifacts / VCS / build caches at the workdir ROOT" — a nested directory
@@ -294,7 +321,15 @@ impl Drop for IsolationGuard {
 /// tooling layouts); links resolving outside the source tree are skipped
 /// with a warning (see `copy_entry`). Unreadable entries are errors, not
 /// skips — a task that silently misses an input file fails confusingly later.
+///
+/// Seeds a session-wide `VisitedDirs` with the canonical source root: the
+/// root itself is "already expanded" by this walk, so a dereferenced link
+/// back to it (`a → .`) is cut before re-copying the whole tree under itself.
 fn copy_dir_filtered(src: &Path, dst: &Path) -> Result<()> {
+    let mut visited: VisitedDirs = std::collections::HashSet::new();
+    if let Ok(canon) = std::fs::canonicalize(src) {
+        visited.insert(canon);
+    }
     for entry in std::fs::read_dir(src).with_context(|| format!("cannot read {}", src.display()))? {
         let entry = entry?;
         let name = entry.file_name();
@@ -302,13 +337,21 @@ fn copy_dir_filtered(src: &Path, dst: &Path) -> Result<()> {
         if COPY_EXCLUDE.contains(&name.as_ref()) {
             continue;
         }
-        copy_entry(&entry.path(), &dst.join(entry.file_name()), src, 0)?;
+        copy_entry(
+            &entry.path(),
+            &dst.join(entry.file_name()),
+            src,
+            0,
+            &mut visited,
+        )?;
     }
     Ok(())
 }
 
-/// Copy one entry (file / dir / symlink) — no exclusion filter: exclusions
-/// apply only at the workdir root (see `copy_dir_filtered`).
+/// Copy one entry (file / dir / symlink) — no exclusion filter for plain
+/// walks: exclusions apply at the workdir root and inside directories
+/// entered through a dereferenced link (see `copy_dir_filtered` and the
+/// dereference branch below).
 ///
 /// Symlink policy — the copy must not contain a road back to the original
 /// tree: a relative link that stays inside the source tree is RECREATED
@@ -319,8 +362,23 @@ fn copy_dir_filtered(src: &Path, dst: &Path) -> Result<()> {
 /// original path — and an external link reaches beyond the copy); an
 /// ABSOLUTE link resolving INSIDE the tree is dereferenced (its content
 /// copied) because recreated verbatim it would point at the ORIGINAL tree.
-/// `depth` caps pathological self-referential dereference chains.
-fn copy_entry(from: &Path, to: &Path, root: &Path, depth: usize) -> Result<()> {
+/// `depth` caps pathological self-referential dereference chains — their
+/// LENGTH only. `visited` caps their WIDTH: canonical paths of directories
+/// already expanded this session, so a dereference walking back into one
+/// (a root-level `a → .` junction on Windows, where the relative-link
+/// recreate branch is unix-only, so EVERY contained link dereferences) is
+/// skipped instead of re-expanding the tree under itself. Without it, two
+/// such root links multiplied into an exponential copy (2^depth nodes)
+/// that ran until the disk filled. Skipped-on-repeat means the link's NAME
+/// is absent from the copy (no empty dir either): its target's content is
+/// already at the copy's corresponding location.
+fn copy_entry(
+    from: &Path,
+    to: &Path,
+    root: &Path,
+    depth: usize,
+    visited: &mut VisitedDirs,
+) -> Result<()> {
     if depth > 64 {
         eprintln!(
             "[warn] isolate copy: skipping {} (dereference chain deeper than 64)",
@@ -382,12 +440,48 @@ fn copy_entry(from: &Path, to: &Path, root: &Path, depth: usize) -> Result<()> {
         }
         // Absolute + contained + existing: dereference-copy the target.
         if resolved.is_dir() {
+            // Cycle guard (P2): the expansion below walks the PHYSICAL
+            // directory, so a link pointing back into a tree this session
+            // already expanded (the canonical root is seeded by
+            // `copy_dir_filtered`) would re-copy that tree under itself —
+            // width-wise unbounded until the disk fills. First expansion of
+            // a canonical directory wins; a repeat is skipped, which is
+            // exactly cutting the cycle edge. Canonicalize failure (raced
+            // delete between exists() and here) falls back to the lexical
+            // path — still catches the trivial self-loop.
+            let canon = std::fs::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
+            if !visited.insert(canon) {
+                eprintln!(
+                    "[warn] isolate copy: skipping symlink {} → {} (target directory already \
+                     copied in this session)",
+                    from.display(),
+                    target.display()
+                );
+                return Ok(());
+            }
             std::fs::create_dir_all(to)?;
             for entry in std::fs::read_dir(&resolved)
                 .with_context(|| format!("cannot read {}", resolved.display()))?
             {
                 let entry = entry?;
-                copy_entry(&entry.path(), &to.join(entry.file_name()), root, depth + 1)?;
+                // Root-level exclusions apply inside a dereferenced
+                // directory too: the link re-exposes a physical view of the
+                // tree, and without this filter the multi-GB `target/` the
+                // root filter excluded would ride back into the sandbox
+                // through the link. Plain walks below stay root-only — a
+                // nested `sub/target` reached without a link is task input.
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if COPY_EXCLUDE.contains(&name.as_ref()) {
+                    continue;
+                }
+                copy_entry(
+                    &entry.path(),
+                    &to.join(entry.file_name()),
+                    root,
+                    depth + 1,
+                    visited,
+                )?;
             }
         } else {
             std::fs::copy(&resolved, to)?;
@@ -398,7 +492,13 @@ fn copy_entry(from: &Path, to: &Path, root: &Path, depth: usize) -> Result<()> {
             std::fs::read_dir(from).with_context(|| format!("cannot read {}", from.display()))?
         {
             let entry = entry?;
-            copy_entry(&entry.path(), &to.join(entry.file_name()), root, depth + 1)?;
+            copy_entry(
+                &entry.path(),
+                &to.join(entry.file_name()),
+                root,
+                depth + 1,
+                visited,
+            )?;
         }
     } else {
         std::fs::copy(from, to)?;
@@ -472,6 +572,21 @@ pub fn run(
     if jobs == 0 {
         bail!("--jobs must be >= 1");
     }
+    // Pre-flight the report destination BEFORE any task is dispatched: if it
+    // already exists as a DIRECTORY, every task would run to completion and
+    // only then would write_report's atomic rename onto a directory fail —
+    // the whole batch turning Err (exit 1) with the summary report lost
+    // after the full spend. Bail now, loudly. `--failed` is exempt: it reads
+    // report_path as the PRIOR report and already fails early (with its own
+    // message) in read_prior_tasks — that path's behavior stays unchanged.
+    if !failed && report_path.is_dir() {
+        bail!(
+            "--report path {} is an existing directory; the batch report must be \
+             a JSON file path — pass e.g. --report {} (a file name), not a directory",
+            report_path.display(),
+            report_path.join("report.json").display()
+        );
+    }
     // If --report points at a *.json inside the batch dir, a re-run would pick
     // up the prior report.json as a task fragment (it's a *.json sitting in
     // `dir`). Canonicalize lets us skip exactly that file when it already
@@ -482,7 +597,15 @@ pub fn run(
         .with_context(|| format!("cannot read batch dir: {}", dir.display()))?
     {
         let p = e?.path();
-        if p.extension().and_then(|s| s.to_str()) == Some("json") {
+        // Case-insensitive: Windows filesystems treat TASK.JSON and task.json
+        // as the same file, so a strict == silently skipped uppercase
+        // fragments (TASK2.JSON) with no warning in a mixed directory — the
+        // batch simply ran one task fewer than the user could see.
+        let is_json = p
+            .extension()
+            .and_then(|s| s.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
+        if is_json {
             // A DIRECTORY named *.json (a task payload dir, an accidentally
             // nested report dir, …) must not kill the whole batch — the old
             // path fed it to read_to_string, whose "Is a directory" error
@@ -948,7 +1071,13 @@ fn run_one_attempt(
             ),
         );
     }
-    if let Err(e) = cfg.apply(partial.clone()) {
+    // apply_trusted, not apply: the fragment was screened by
+    // forbidden_batch_override just above (its message is the better bad_task
+    // copy — it names the whole overridable set), so this is the host-vetted
+    // overlay path. apply()'s own in-method guard exists for third-party
+    // library hosts that skip the screen; after the screen it would be
+    // unreachable dead defense here.
+    if let Err(e) = cfg.apply_trusted(partial.clone()) {
         return early("bad_task", format!("{e:#}"));
     }
     if cfg.task.is_none() {
@@ -1450,7 +1579,7 @@ fn write_report(path: &Path, reports: &[TaskReport], provider: &str) -> Result<(
         "tasks": tasks,
     });
     let bytes = serde_json::to_string_pretty(&report)?;
-    harness::atomic_write(path, bytes.as_bytes())
+    crate::fsutil::atomic_write(path, bytes.as_bytes())
 }
 
 #[cfg(test)]
@@ -1794,6 +1923,15 @@ mod tests {
         // A spawned thread flips cancel ~50ms in, well inside the 1s first
         // backoff, so the post-sleep check trips deterministically (no race:
         // 50ms ≪ 1s). Mirrors single-run's cancel-during-backoff semantics.
+        //
+        // Load-sensitive, by design: under a fully loaded machine the 50ms
+        // flipper thread can be starved past the 1s backoff window — the
+        // cancel then lands between attempts and the task exits as a normal
+        // transient error instead of "cancelled". Observed once under a
+        // full-matrix parallel run; passes reliably unloaded and in CI. Do
+        // not "fix" by widening the backoff (production timing); if it ever
+        // flakes repeatedly, restructure to flip cancel from inside a
+        // synthetic sleep hook instead of wall-clock timing.
         let dir = std::env::temp_dir().join(format!("ta-batch-bo-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1956,6 +2094,58 @@ mod tests {
     }
 
     #[test]
+    fn report_path_as_directory_bails_before_any_task_runs() {
+        // --report pointing at an existing DIRECTORY used to pass every
+        // pre-flight check, run EVERY task, and only fail at the final
+        // write_report rename (file → directory) — whole batch Err, exit 1,
+        // the summary report lost after the full spend. Now run() bails up
+        // front, loudly (path + suggested file name), before anything
+        // executes: the results dir isn't even created, so no per-task
+        // results file can exist.
+        let root = std::env::temp_dir().join(format!("ta-batch-rpdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("tasks");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("t.json"), r#"{"task":"x"}"#).unwrap();
+        // The report destination exists — as a directory.
+        let report = root.join("out");
+        std::fs::create_dir_all(&report).unwrap();
+
+        let base: Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"MOCK_API_KEY","model":"m"}"#,
+        )
+        .unwrap();
+        let err = run(
+            &base,
+            &dir,
+            1,
+            &report,
+            0,
+            false,
+            IsolateMode::None,
+            Default::default(),
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&report.display().to_string()),
+            "message names the offending path: {msg}"
+        );
+        assert!(
+            msg.contains("report.json"),
+            "message suggests a concrete file name: {msg}"
+        );
+        // No task executed: results/ (report parent + "results") was never
+        // created, so no per-task results file was generated.
+        assert!(
+            !root.join("results").exists(),
+            "pre-flight bail must fire before results/ is created"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn batch_skips_json_named_directories() {
         // C4: a DIRECTORY named *.json inside the batch dir must be skipped
         // with a warning — feeding it to read_to_string errors "Is a
@@ -1986,6 +2176,78 @@ mod tests {
         assert_eq!(tasks[0].name, "task-a");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn json_extension_scan_is_case_insensitive() {
+        // Windows filesystems are case-insensitive, so users drop TASK2.JSON
+        // next to t.json — the scanner's strict `== Some("json")` silently
+        // skipped the uppercase one with no warning in a mixed directory
+        // (the batch just ran one task fewer than the user could see).
+        // Cancel-gate the run (no provider needed): BOTH files must be
+        // scanned and accounted as not-started cancelled entries.
+        let dir = std::env::temp_dir().join(format!("ta-batch-case-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("t.json"), r#"{"task":"lower"}"#).unwrap();
+        std::fs::write(dir.join("UPPER.JSON"), r#"{"task":"upper"}"#).unwrap();
+
+        let base: Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"MOCK_API_KEY","model":"m"}"#,
+        )
+        .unwrap();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(true)); // gate everything
+
+        let report = dir.join("report.json");
+        let code = run(&base, &dir, 1, &report, 0, false, IsolateMode::None, cancel).unwrap();
+        assert_eq!(code, 130);
+
+        let tasks = read_prior_tasks(&report).unwrap();
+        assert_eq!(tasks.len(), 2, "UPPER.JSON must be collected like t.json");
+        let names: Vec<&str> = tasks.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            names.contains(&"t") && names.contains(&"UPPER"),
+            "both case variants scanned, got: {names:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn empty_batch_dir_still_bails_no_json_files() {
+        // The case-insensitive matcher must not loosen the empty-dir guard:
+        // a dir with no *.json at all (any case) still bails with the same
+        // "no *.json task files" message naming the directory.
+        let root = std::env::temp_dir().join(format!("ta-batch-nojson-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("tasks");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("notes.txt"), "not a task").unwrap();
+
+        let base: Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"MOCK_API_KEY","model":"m"}"#,
+        )
+        .unwrap();
+        let report = root.join("report.json"); // a plain file path, not a dir
+        let err = run(
+            &base,
+            &dir,
+            1,
+            &report,
+            0,
+            false,
+            IsolateMode::None,
+            Default::default(),
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no *.json task files"), "got: {msg}");
+        assert!(
+            msg.contains(&dir.display().to_string()),
+            "message names the batch dir: {msg}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -2754,6 +3016,179 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// Create a directory junction via the `mklink /J` cmd builtin — junctions
+    /// need NO admin rights or developer mode (unlike real `/D` symlinks), so
+    /// every Windows box can run the link-cycle regressions below. std sees
+    /// junctions as symlinks (reparse point, name-surrogate tag), which is
+    /// what routes them into `copy_entry`'s dereference branch.
+    #[cfg(windows)]
+    fn make_junction(link: &Path, target: &Path) {
+        let out = std::process::Command::new("cmd")
+            .arg("/c")
+            .arg("mklink")
+            .arg("/J")
+            .arg(link)
+            .arg(target)
+            .output()
+            .expect("cmd /c mklink /J must be available on Windows");
+        assert!(
+            out.status.success(),
+            "mklink /J {} → {} failed: {}",
+            link.display(),
+            target.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+
+    /// Recursively count plain files under `dir` (the copy never creates
+    /// links on Windows, so a plain walk is exact).
+    #[cfg(windows)]
+    fn count_files(dir: &Path) -> usize {
+        let mut n = 0;
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap() {
+                let e = e.unwrap();
+                if e.metadata().unwrap().is_dir() {
+                    stack.push(e.path());
+                } else {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn isolate_copy_survives_root_self_junctions() {
+        // P2 regression: two root-level self-junctions (`a → .`, `b → .`).
+        // On Windows relative links cannot be recreated verbatim (that branch
+        // is unix-only), so EACH junction dereferenced straight back into the
+        // workdir root — and every expansion level re-expanded BOTH links,
+        // doubling per level: 2^depth nodes by the time the depth-64 cap
+        // (which limits chain LENGTH, not width) noticed, i.e. an
+        // unbounded copy that ran until the disk filled. The session visited
+        // set (seeded with the canonical root) cuts the cycle edges: both
+        // junctions are skipped and the copy stays linear.
+        let root = std::env::temp_dir().join(format!("ta-batch-junc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        for n in 1..=3 {
+            std::fs::write(src.join(format!("f{n}.txt")), "x").unwrap();
+        }
+        make_junction(&src.join("a"), &src);
+        make_junction(&src.join("b"), &src);
+        // Precondition: std must see the junction as a symlink, else
+        // copy_entry would take the plain-dir branch and this test would not
+        // exercise the dereference path at all.
+        assert!(
+            std::fs::symlink_metadata(src.join("a"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "junction must be visible as a symlink to copy_entry"
+        );
+
+        let base: Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"K","model":"m","workdir":"SRC"}"#,
+        )
+        .unwrap();
+        let base = {
+            let mut b = base;
+            b.workdir = Some(src.clone());
+            b
+        };
+        let start = std::time::Instant::now();
+        let guard = prepare_isolation(IsolateMode::Copy, &base, "junc")
+            .unwrap()
+            .unwrap();
+        let iso = guard.dir.clone();
+        // Bounded time: with the bug this never finishes (disk-filling
+        // explosion); with the cycle guard it is a handful of files.
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "self-junctions must not explode the copy (took {:?})",
+            start.elapsed()
+        );
+        // Linear content: exactly the three plain files — no `a/`, no `b/`,
+        // no a/b/a/b/... alias expansion.
+        assert_eq!(
+            count_files(&iso),
+            3,
+            "copy stays linear: no alias explosion"
+        );
+        assert!(!iso.join("a").exists(), "cycle edge skipped entirely");
+        assert!(!iso.join("b").exists(), "cycle edge skipped entirely");
+        drop(guard);
+        assert!(!iso.exists(), "guard Drop removes the sandbox");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn isolate_copy_deref_applies_root_exclusions_through_links() {
+        // P2 regression, second half: a directory entered through a
+        // dereferenced link must get the ROOT-level exclusion rules too. A
+        // junction `a → sub` re-exposes `sub`'s physical children; before the
+        // fix the dereference expansion had no filter at all, so a multi-GB
+        // `target/` (excluded at the workdir root) rode back into the sandbox
+        // through the link. A `target` reached WITHOUT a link stays task
+        // input — the exclusion remains a root-level (and link-entry) rule,
+        // not a name blacklist on plain walks.
+        let root = std::env::temp_dir().join(format!("ta-batch-junexc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let src = root.join("src");
+        std::fs::create_dir_all(src.join("sub").join("target")).unwrap();
+        std::fs::write(src.join("sub").join("keep.txt"), "x").unwrap();
+        std::fs::write(src.join("sub").join("target").join("heavy.bin"), "x").unwrap();
+        make_junction(&src.join("a"), &src.join("sub"));
+        assert!(
+            std::fs::symlink_metadata(src.join("a"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "junction must be visible as a symlink to copy_entry"
+        );
+
+        let base: Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"K","model":"m","workdir":"SRC"}"#,
+        )
+        .unwrap();
+        let base = {
+            let mut b = base;
+            b.workdir = Some(src.clone());
+            b
+        };
+        let guard = prepare_isolation(IsolateMode::Copy, &base, "junexc")
+            .unwrap()
+            .unwrap();
+        let iso = guard.dir.clone();
+        // Plain walk: a NESTED target/ is task input — copied in full.
+        assert!(
+            iso.join("sub").join("keep.txt").exists(),
+            "nested files copied"
+        );
+        assert!(
+            iso.join("sub").join("target").join("heavy.bin").exists(),
+            "nested target/ without a link is task input — must be copied"
+        );
+        // Through the junction, the same physical children are filtered.
+        assert!(
+            iso.join("a").join("keep.txt").exists(),
+            "deref expansion copies non-excluded children"
+        );
+        assert!(
+            !iso.join("a").join("target").exists(),
+            "target/ must stay excluded when entered through a link"
+        );
+        drop(guard);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     #[cfg(unix)]
     fn isolation_dir_refuses_symlink_preplacement() {
@@ -2809,6 +3244,81 @@ mod tests {
         assert!(
             create_isolation_dir(&counter, &root, "task").is_err(),
             "8 collisions must give up loudly, not fall back to a guessable name"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn cleanup_failed_worktree_dir_removes_a_half_built_sandbox() {
+        // Semantics of the worktree-add failure cleanup: a failed add can
+        // die mid-checkout and leave the temp dir NON-empty (the `.git`
+        // pointer file + partially written entries). The old
+        // `let _ = remove_dir` only succeeds on EMPTY dirs — on exactly this
+        // shape it failed silently and leaked the half-made sandbox. The
+        // helper must remove the whole tree.
+        let root = std::env::temp_dir().join(format!("ta-batch-wtsem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let tmp = root.join("ta-batch-task-0");
+        std::fs::create_dir_all(tmp.join("sub")).unwrap();
+        std::fs::write(tmp.join(".git"), "gitdir: ../repo/.git/worktrees/x").unwrap();
+        std::fs::write(tmp.join("sub").join("partial.txt"), "half-written").unwrap();
+        cleanup_failed_worktree_dir(&tmp);
+        assert!(
+            !tmp.exists(),
+            "a non-empty half-built worktree dir must be removed entirely"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn worktree_add_failure_cleans_up_the_temp_dir() {
+        // End-to-end over the real failure branch: an empty repo (no
+        // commits) makes `git worktree add --detach` fail ("invalid
+        // reference: HEAD") — a NON-lock failure, so the fast-fail path
+        // runs after our sandbox dir was already created under temp. The
+        // cleanup must remove it: no ta-batch-wtaddfail-{pid}-* litter.
+        // (git-on-PATH is already a test dependency of the git-mode tests.)
+        let root = std::env::temp_dir().join(format!("ta-batch-wtfail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let out = std::process::Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(&repo)
+            .output()
+            .expect("git on PATH (same dependency as the other --isolate git tests)");
+        assert!(
+            out.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let base: Config = serde_json::from_value(json!({
+            "provider": "openai",
+            "api_key_env": "K",
+            "model": "m",
+            "workdir": repo.display().to_string(),
+        }))
+        .unwrap();
+        let err = prepare_isolation(IsolateMode::Git, &base, "wtaddfail").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("git worktree add failed"), "got: {msg}");
+
+        let leftover = std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("ta-batch-wtaddfail-{}", std::process::id()))
+            })
+            .count();
+        assert_eq!(
+            leftover, 0,
+            "a failed worktree add must not leak its temp sandbox dir"
         );
 
         std::fs::remove_dir_all(&root).ok();

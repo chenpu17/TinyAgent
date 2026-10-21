@@ -22,7 +22,7 @@ code = ["ta_core/code"]
 # The core library. Aliased to `ta_core` (and locally `use ta_core as ta;`) so
 # this crate's own lib name `tiny_agent` (the Python import) doesn't collide
 # with the dependency it wraps.
-ta_core = { package = "tiny-agent", path = "../..", features = ["mock"] }
+ta_core = { package = "tiny-agent-core", path = "../../crates/core", features = ["mock"] }
 pyo3 = { version = "0.22", features = ["extension-module", "py-clone"] }
 pythonize = "0.22"
 serde = { version = "1", features = ["derive"] }

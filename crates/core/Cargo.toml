@@ -1,0 +1,76 @@
+[package]
+name = "tiny-agent-core"
+version = "0.4.2"
+edition = "2021"
+# MSRV floor of the DEFAULT build, set by the dependency chain: the LOCKED
+# icu_* 2.2.0 family (reqwest → url → idna → idna_adapter) needs 1.86, above
+# every other default-tree crate (serde_json 1.71 / libc 1.65 sit below). The
+# optional `code` feature stays at the same floor (wasmtime 36 = 1.86). CI's
+# msrv job pins this with a `cargo +1.86 check --locked` at the workspace
+# root — the lockfile, not the resolver-of-the-day, is what users build.
+rust-version = "1.86"
+description = "TinyAgent kernel: the agent loop, tools, providers, and assembly that drive the tiny-agent CLI and the Python/TypeScript bindings"
+license = "MIT"
+# repository/documentation: left unset until the project has a public home —
+# add them at first publish.
+keywords = ["agent", "llm", "mcp", "sandbox", "wasm"]
+categories = ["development-tools"]
+
+# The kernel half of the workspace split: this crate is the library
+# (`tiny_agent`) everything else builds on — the CLI/binary crate is the
+# workspace root package (`tiny-agent`), and bindings/python +
+# bindings/node path-depend on THIS crate. No CLI, TUI, or process-level
+# code lives here (see the root Cargo.toml for that half).
+[lib]
+name = "tiny_agent"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Expose the scripted `provider::mock` (otherwise cfg(test)-only) so binding
+# crates and downstream users can run offline / dry-run loops without a key.
+mock = []
+# `run_code` tool: LLM-written JS executed in an in-process wasm sandbox
+# (quickjs-ng compiled with ZERO wasi imports, driven by wasmtime). Off by
+# default — it adds ≈4.6 MiB to the release binary (M2-measured on the musl
+# static build; design §10) and is a per-deployment trust decision
+# (docs/run_code_design.md §15, milestone M1).
+# sha2: audit-input hashing in run_code's meta trace, truncated to 128 bits
+# (design §8.4) — already in the tree transitively via wasmtime, so this is
+# a feature-gated direct edge over an existing dep, not a new dependency.
+code = ["dep:wasmtime", "dep:sha2"]
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+# Minimal wasmtime: Cranelift compiler + runtime, no async / wat / component
+# model / pooling allocator. Synchronous like the rest of the crate.
+# `cache` (v2 P1): on-disk compilation cache for quickjs.wasm — a fresh
+# process no longer re-pays the lazy compile; any cache failure degrades to
+# "no cache", never blocks the sandbox.
+wasmtime = { version = "36.0.14", optional = true, default-features = false, features = ["cranelift", "runtime", "std", "cache"] }
+# sha256 for run_code's audit meta (dual 128-bit-truncated input hashes).
+sha2 = { version = "0.10", optional = true }
+
+# Windows shell support: cmd.exe (and many legacy programs) emit text in the
+# system OEM code page (GBK/936 on Chinese Windows), not UTF-8 — the shell tool
+# decodes bytes itself, so it needs encoding_rs to interpret non-UTF-8 output
+# and windows-sys to read the active OEM code page (Win32_Globalization). The
+# same tool's process-tree kill runs on a Job Object, which pulls in
+# Win32_System_JobObjects (Create/Assign/Terminate/Query + limit structs;
+# IO_COUNTERS inside the extended-limit struct needs Win32_System_Threading),
+# Win32_Foundation (HANDLE/BOOL/CloseHandle), and Win32_Security (the
+# SECURITY_ATTRIBUTES parameter type of CreateJobObjectW — null at every call
+# site, but the binding's cfg demands the feature). Unix tools are UTF-8 and
+# have process groups, so all of this stays Windows-only.
+[target.'cfg(windows)'.dependencies]
+encoding_rs = "0.8"
+windows-sys = { version = "0.52", features = ["Win32_Globalization", "Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
+# Unix-only process-group machinery (shell timeout kill, MCP child teardown);
+# every libc call site in this crate is #[cfg(unix)].
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

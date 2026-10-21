@@ -4,15 +4,19 @@
 > 修改条目时详情写在这里，并同步更新 CLAUDE.md 的对应索引行。
 
 
-- **bin + lib 同包双 target**：`Cargo.toml` 同时声明 `[lib]`（`tiny_agent`，src/lib.rs）与
-  `[[bin]]`（`tiny-agent`，src/main.rs）。核心模块（agent/compress/config/provider/tools/mcp/
-  harness/batch/session/retry）属 lib，门面 re-export 在 `lib.rs`；`src/main.rs` 只保留进程级薄壳
-  （clap 参数、SIGINT、`process::exit`、可选 `mod tui`），靠 `pub(crate) use tiny_agent::{...}`
-  把 lib 模块拉进 bin crate 根——故 main.rs/tui.rs 里 `crate::agent::...` 等路径仍解析。
-  **改 lib 内部代码不用动 bin**；bin 行为是 lib 之上的薄壳。lib 内 `crate::` 指 lib 根（lib.rs 声明了
-  全部 `pub mod`），所以模块互引零改动。`mock` feature 把 `provider::mock`（否则 `cfg(test)`）放出，
-  供绑定/下游离线 dry-run。自定义工具共享底座 `tools::CallbackTool`（包闭包，impl `Tool`）——Python/TS
-  绑定的 callable 经 GIL/ThreadsafeFunction 闭包塞进来，共享同一 `Tool` impl。
+- **双 crate：内核 + CLI（workspace 拆分）**：内核 crate `crates/core`（package
+  `tiny-agent-core`，lib 名 `tiny_agent`）持有 agent loop、工具、provider、config、skills、
+  MCP、session、压缩、装配（`build_agent*`）与 `fsutil`（原子写，session/write_file/result.json
+  共用）；门面 re-export 在 `crates/core/src/lib.rs`。根 package `tiny-agent` 是 CLI 半边：
+  `src/main.rs`（clap 参数、配置发现、SIGINT、`process::exit`）+ 本地模块 `harness`（headless
+  呈现/result.json/NDJSON/重试梯子）、`batch`（工作池/isolate/报告）、`tui`（feature tui）、
+  `signal`，依赖内核 crate 并 `pub(crate) use tiny_agent::{...}` 把模块拉进 bin crate 根——
+  main/tui/harness/batch 里 `crate::agent::...` 等路径照常解析。**改内核内部不用动 CLI**；
+  CLI 行为是内核之上的薄壳。内核内 `crate::` 指 lib 根。`mock` feature 把 `provider::mock`
+  （否则 `cfg(test)`）放出，供绑定/下游离线 dry-run；CLI 另有转发 feature（`code`/`mock` →
+  `tiny_agent/code|mock`）让根目录的 `cargo build --features ...` 与 `--version` 清单保持拆分前
+  语义。自定义工具共享底座 `tools::CallbackTool`（包闭包，impl `Tool`）——Python/TS 绑定的
+  callable 经 GIL/ThreadsafeFunction 闭包塞进来，共享同一 `Tool` impl。
 
 - **同步**：`reqwest::blocking` + rustls，没有 tokio。流式用一个 worker 线程 + `CancellableSse`
   （chunk 间 ≤200ms 响应 cancel，30s idle 超时）。`sse-reader` 线程阻塞在 reqwest `read()` 里、读不到

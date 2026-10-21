@@ -1,7 +1,8 @@
 use crate::agent::{extract_plan, Agent, AgentEvent, RunCost, RunOutcome};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde_json::{json, Value};
-use std::io::Write;
+use std::fmt;
+use std::io::{self, Write};
 use std::path::Path;
 
 /// Attribution metadata stamped into `result.json` (and, in part, the batch
@@ -201,7 +202,7 @@ pub(crate) fn run_with_retries(
                     l.models.join(",")
                 ));
             }
-            eprintln!("{line}");
+            note(format_args!("{line}"));
         }
     }
     let (mut code, outcome, error) = loop {
@@ -262,7 +263,12 @@ pub(crate) fn run_with_retries(
                         let v = retry_event_json(attempt, retries, backoff, &msg);
                         print_ndjson(&serde_json::to_string(&v).unwrap_or_else(|_| "{}".into()));
                     } else {
-                        eprintln!("[transient] {msg}; retry {attempt}/{retries} in {backoff:?}");
+                        // Best-effort (note, not eprintln!): this sits INSIDE
+                        // the retry loop — a closed stderr panicking here
+                        // aborts before result.json is ever written.
+                        note(format_args!(
+                            "[transient] {msg}; retry {attempt}/{retries} in {backoff:?}"
+                        ));
                     }
                     // Slice the backoff so a Ctrl-C during it is noticed within
                     // ~100ms instead of after the full ~40s sleep. The shared
@@ -314,7 +320,7 @@ pub(crate) fn run_with_retries(
     // structured detail.
     if !json {
         if let Some(err) = &error {
-            eprintln!("{}", terminal_error_line(code, err));
+            note(format_args!("{}", terminal_error_line(code, err)));
         }
     }
     // Always produce a result artifact, even on failure: the previous `?` here
@@ -355,21 +361,28 @@ pub(crate) fn run_with_retries(
             Some(&acc),
             &meta,
         ) {
-            eprintln!("[warn] failed to write {}: {e:#}", path.display());
+            // Best-effort: stderr is already the "nothing more we can do"
+            // channel — a closed pipe here must not mask the exit-code
+            // degradation logic below with a panic.
+            note(format_args!(
+                "[warn] failed to write {}: {e:#}",
+                path.display()
+            ));
             if code == 0 {
                 code = EXIT_ERROR;
             }
         } else if !json {
-            eprintln!("result written to {}", path.display());
+            note(format_args!("result written to {}", path.display()));
         }
     }
     Ok(code)
 }
 
-/// Exit codes. 0 = success; 124 = timed out (GNU `timeout` convention); 130 =
-/// cancelled (128 + SIGINT, the conventional "interrupted" code); 1 = anything
-/// else (max_turns, provider error, …). Scripts can branch on `$?`; the result
-/// JSON carries the precise stop_reason / error for detail.
+/// Exit codes. 0 = success; 124 = timed out (GNU `timeout` convention); 125 =
+/// budget exceeded; 130 = cancelled (128 + SIGINT, the conventional
+/// "interrupted" code); 1 = anything else (max_turns, provider error, …).
+/// Scripts can branch on `$?`; the result JSON carries the precise stop_reason
+/// / error for detail.
 const EXIT_ERROR: i32 = 1;
 const EXIT_TIMEOUT: i32 = 124;
 const EXIT_BUDGET: i32 = 125;
@@ -467,6 +480,10 @@ fn event_json(ev: &AgentEvent) -> Value {
         AgentEvent::Done { stop_reason } => {
             json!({"type": "done", "stop_reason": stop_reason.clone()})
         }
+        // AgentEvent is #[non_exhaustive] in the kernel: from this crate a
+        // wildcard is mandatory. An unknown event still gets a line so NDJSON
+        // consumers never miss the stream shape.
+        _ => json!({"type": "unknown"}),
     }
 }
 
@@ -480,6 +497,33 @@ fn print_ndjson(line: &str) {
     let mut out = std::io::stdout().lock();
     let _ = writeln!(out, "{line}");
     let _ = out.flush();
+}
+
+/// One best-effort line on an arbitrary `Write` sink: write errors are
+/// IGNORED. The bare `eprintln!`/`println!` panic when their stream is a
+/// closed pipe (under Rust's SIGPIPE=SIG_IGN the write returns EPIPE instead
+/// of killing us), a panic in release aborts, and at the in-loop call sites
+/// below that abort means result.json is NEVER written — the exact failure
+/// `print_ndjson` and `HumanRenderer` already guard against. Factored over a
+/// generic sink so the error branch is unit-testable with an explicit
+/// failing writer: a genuinely closed stderr can't be simulated from inside
+/// a parallel test binary (and Windows has no /dev/full to write against).
+fn note_to(mut w: impl Write, args: fmt::Arguments) {
+    let _ = writeln!(w, "{args}");
+}
+
+/// Best-effort stderr note — the harness's (and main.rs's) progress /
+/// warning lines. Takes `format_args!` so call sites read exactly like the
+/// `eprintln!` they replace: `note(format_args!("[warn] {e}"))`.
+pub(crate) fn note(args: fmt::Arguments) {
+    note_to(io::stderr().lock(), args);
+}
+
+/// Best-effort stdout line, same closed-stream discipline as [`note`] — the
+/// `--version` manifest: `tiny-agent --version | head -0` must not die on
+/// the EPIPE after the answer was effectively given.
+pub(crate) fn note_out(args: fmt::Arguments) {
+    note_to(io::stdout().lock(), args);
 }
 
 fn emit_json(ev: &AgentEvent) {
@@ -685,108 +729,10 @@ pub fn write_result(
         result["code"] = code;
     }
     let bytes = serde_json::to_string_pretty(&result)?;
-    atomic_write(path, bytes.as_bytes())
-}
-
-/// Monotonic per-process suffix for atomic_write temp names. Module-level
-/// (not inside the fn) so tests can predict the next allocation.
-static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// `<target>.<pid>.<n>.tmp` sibling of `path` — same directory, so the final
-/// rename stays on one filesystem.
-fn tmp_name(path: &Path, n: u64) -> std::path::PathBuf {
-    match path.file_name() {
-        Some(name) => {
-            let mut base = name.to_os_string();
-            base.push(format!(".{}.{}.tmp", std::process::id(), n));
-            path.with_file_name(base)
-        }
-        None => path.with_extension("tmp"),
-    }
-}
-
-/// Atomically write bytes to `path`: write a temp file in the same
-/// directory, then rename. A crash mid-write never leaves a half-file —
-/// result.json and report.json are read by CI, so they must not corrupt.
-pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-    // The pid + counter suffix avoids collisions between concurrent writers
-    // (batch workers sharing a workdir), but it is NOT unpredictable — a
-    // hostile workdir can pre-place a symlink at the exact predicted name —
-    // so the open is O_EXCL (`create_new`): it fails on ANY pre-existing
-    // path, symlinks included (O_EXCL never follows them), where plain
-    // `File::create` would write THROUGH the link and redirect the write
-    // outside the workdir (write_file / edit_file land here after their own
-    // target-path sandbox check, which can't see the temp sibling). On
-    // collision the counter advances and a fresh suffix is tried; a stale
-    // tmp from a pid-reused predecessor process is skipped the same way.
-    for _ in 0..8 {
-        let n = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp = tmp_name(path, n);
-        let mut f = match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-        {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e).with_context(|| format!("cannot create {}", tmp.display())),
-        };
-        // Write + fsync the temp file before renaming, so a crash after rename
-        // never exposes a zero-length file. (result.json / report.json are read
-        // by CI and must not corrupt on power loss.) A failure anywhere below
-        // removes the temp file first — the rename branch already did, but a
-        // write/sync failure used to leave the stray .tmp behind (visible to
-        // anything globbing the directory, e.g. the next batch round's task
-        // scan).
-        let written = (|| -> Result<()> {
-            // Preserve the existing target's permissions — above all the
-            // executable bit: a fresh default-mode file would silently strip
-            // -x from an edited script. Best-effort no-op when the target
-            // doesn't exist yet (write_file creating a new file).
-            if let Ok(meta) = std::fs::metadata(path) {
-                let _ = f.set_permissions(meta.permissions());
-            }
-            f.write_all(bytes)
-                .with_context(|| format!("cannot write {}", tmp.display()))?;
-            f.sync_all()
-                .with_context(|| format!("cannot sync {}", tmp.display()))?;
-            Ok(())
-        })();
-        if let Err(e) = written {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
-        }
-        if let Err(e) = std::fs::rename(&tmp, path) {
-            let _ = std::fs::remove_file(&tmp); // don't litter on failure
-            return Err(e).with_context(|| format!("cannot save {}", path.display()));
-        }
-        // fsync the parent directory so the rename's directory-entry update
-        // survives a power loss. The file DATA is durable (sync_all above), but
-        // on ext4 (when auto_da_alloc doesn't fire) and xfs the rename itself
-        // can be lost without an explicit directory fsync — a crash could then
-        // expose the pre-rename state (old content, or no file). APFS/NTFS
-        // handle directory durability via their own transaction logs, so this
-        // is Unix-only and the error is ignored: best-effort hardening, and
-        // the rename already succeeded.
-        #[cfg(unix)]
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
-            }
-        }
-        return Ok(());
-    }
-    // Every candidate name was already taken — either a stale-tmp pile-up or
-    // a hostile directory planted across the whole name window.
-    Err(anyhow::anyhow!(
-        "cannot create a temp file next to {} (all candidate names already exist)",
-        path.display()
-    ))
+    // The hardened atomic write (fsync + O_EXCL temp + cleanup) lives in the
+    // kernel crate's fsutil — session save and write_file/edit_file share it,
+    // so result.json gets the same crash safety for free.
+    crate::fsutil::atomic_write(path, bytes.as_bytes())
 }
 
 fn compact(v: &serde_json::Value) -> String {
@@ -1039,6 +985,9 @@ impl<Out: Write, Err: Write> HumanRenderer<Out, Err> {
                     _ => {} // TurnStart/Compressed/Usage/SubAgent: noisy or folded
                 }
             }
+            // AgentEvent is #[non_exhaustive] in the kernel crate — a wildcard
+            // is mandatory from here. Unknown events carry no rendering yet.
+            _ => {}
         }
     }
 }
@@ -1058,112 +1007,6 @@ mod tests {
     use super::*;
     use crate::agent::{CompressTrigger, RunOutcome, TodoItem, ToolCallRecord};
     use serde_json::json;
-
-    #[test]
-    fn atomic_write_roundtrips_and_leaves_no_tmp() {
-        let dir = std::env::temp_dir().join(format!("ta-atomic-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("out.json");
-        atomic_write(&path, b"{\"ok\":true}").unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"ok\":true}");
-        // The temp file must be gone after the rename (the name is now unique
-        // per call, so scan the dir for any *.tmp leftover rather than a fixed
-        // name).
-        let no_tmp = std::fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .all(|e| !e.file_name().to_string_lossy().ends_with(".tmp"));
-        assert!(no_tmp, "temp file must be gone after rename");
-        // Overwriting an existing file is also atomic.
-        atomic_write(&path, b"v2").unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "v2");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn atomic_write_preserves_executable_permissions() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("ta-atomic-x-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("script.sh");
-        // Create the target with the executable bit set.
-        std::fs::write(&path, b"#!/bin/sh\necho old\n").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        // atomic_write must carry the +x through to the new file.
-        atomic_write(&path, b"#!/bin/sh\necho new\n").unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert!(
-            mode & 0o111 != 0,
-            "executable bit lost after atomic_write: mode {mode:o}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "#!/bin/sh\necho new\n"
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn atomic_write_skips_preplaced_symlink_at_predicted_tmp_name() {
-        // P1-1 regression: write_file/edit_file sandbox-check the TARGET path,
-        // but the temp sibling name is predictable (pid + counter). A
-        // pre-placed symlink at that exact name must NOT be written through —
-        // the O_EXCL (`create_new`) open fails on the existing link and the
-        // write retries on a fresh suffix instead of redirecting outside the
-        // workdir. With plain `File::create` the victim received the bytes.
-        let dir = std::env::temp_dir().join(format!("ta-atomic-link-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let target = dir.join("out.json");
-        let victim = dir.join("victim.txt");
-        std::fs::write(&victim, "precious").unwrap();
-        // Cover a few consecutive counter values: a parallel test in this
-        // process may bump TMP_COUNTER between our read and the write under
-        // test.
-        let n = TMP_COUNTER.load(std::sync::atomic::Ordering::Relaxed);
-        for k in n..n + 3 {
-            std::os::unix::fs::symlink(&victim, tmp_name(&target, k)).unwrap();
-        }
-        atomic_write(&target, b"{\"ok\":true}").unwrap();
-        // The write landed on the target…
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "{\"ok\":true}");
-        // …and never went THROUGH any planted link: the victim is untouched
-        // and the link itself still is one.
-        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
-        assert!(
-            std::fs::symlink_metadata(tmp_name(&target, n))
-                .unwrap()
-                .file_type()
-                .is_symlink(),
-            "planted symlink must not be replaced or followed"
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn atomic_write_skips_stale_tmp_file_at_predicted_name() {
-        // The pid-reuse case: a crashed predecessor process with our pid can
-        // leave a stale `<target>.<pid>.<n>.tmp` behind. O_EXCL must skip it
-        // (write to a fresh suffix) rather than truncate-write a name someone
-        // else owns.
-        let dir = std::env::temp_dir().join(format!("ta-atomic-stale-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let target = dir.join("out.json");
-        let n = TMP_COUNTER.load(std::sync::atomic::Ordering::Relaxed);
-        let stale = tmp_name(&target, n);
-        std::fs::write(&stale, "stale junk from a pid-reused predecessor").unwrap();
-        atomic_write(&target, b"fresh").unwrap();
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "fresh");
-        // The stale file is inert garbage — skipped, not written through.
-        assert!(
-            std::fs::read_to_string(&stale)
-                .unwrap()
-                .starts_with("stale junk"),
-            "stale tmp must not be truncated and reused"
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
 
     #[test]
     fn write_result_carries_output_tokens_and_error() {
@@ -1842,24 +1685,53 @@ mod tests {
     }
 
     #[test]
+    fn note_to_writes_the_line_to_a_healthy_sink() {
+        // The observable half of the note contract: on a writable sink the
+        // formatted line lands verbatim with its trailing newline — the same
+        // bytes eprintln! would have produced.
+        let mut buf: Vec<u8> = Vec::new();
+        note_to(
+            &mut buf,
+            format_args!("resumed {} messages from {}", 2, "s.json"),
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&buf),
+            "resumed 2 messages from s.json\n"
+        );
+    }
+
+    #[test]
+    fn note_to_swallows_write_errors_like_a_closed_pipe() {
+        // The load-bearing half: a sink returning EPIPE (what a closed
+        // stderr/stdout pipe looks like under Rust's SIGPIPE=SIG_IGN) must
+        // not panic — at the in-loop call sites a panic aborts the process
+        // and result.json is never written. A genuinely closed stream can't
+        // be simulated from inside a parallel test binary (and this host is
+        // Windows: no /dev/full), so the EPIPE branch is exercised with an
+        // explicit always-failing writer instead. Reaching the end of this
+        // test at all IS the assertion.
+        struct BrokenPipe;
+        impl std::io::Write for BrokenPipe {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+        }
+        note_to(
+            BrokenPipe,
+            format_args!("[transient] {msg}", msg = "503; retrying"),
+        );
+        note_to(BrokenPipe, format_args!("result written to nowhere"));
+    }
+
+    #[test]
     fn compact_previews_a_json_value() {
         // compact feeds a JSON value's string form through agent::preview; for
         // a short value nothing is truncated, so the key survives.
         let s = compact(&json!({"path": "a.txt"}));
         assert!(s.contains("a.txt"), "compact dropped the value: {s}");
-    }
-
-    #[test]
-    fn atomic_write_creates_missing_parent_dirs() {
-        let base = std::env::temp_dir().join(format!("ta-atomic-parent-{}", std::process::id()));
-        std::fs::remove_dir_all(&base).ok();
-        // Neither `a/b` nor `a` exists — atomic_write must mkdir -p them (the
-        // create_dir_all branch the basic test skips by pre-making the dir).
-        let path = base.join("a/b/out.json");
-        atomic_write(&path, b"ok").unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "ok");
-        assert!(!base.join("a/b/out.tmp").exists(), "temp file left behind");
-        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
@@ -2002,3 +1874,11 @@ mod tests {
         );
     }
 }
+
+/// The harness behavior tests (retry ladder, result.json, NDJSON, unix
+/// real-leaf e2e) — moved from the kernel's agent_tests.rs with the harness
+/// itself. A #[path]-mounted sibling so harness.rs's own small test mod stays
+/// focused on the renderer/write_result units.
+#[cfg(test)]
+#[path = "harness_tests.rs"]
+mod harness_tests;

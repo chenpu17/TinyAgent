@@ -47,8 +47,14 @@ pub(crate) fn install_sigint_cancel(flag: std::sync::Arc<std::sync::atomic::Atom
     // main drops the agent then exits — but this removes any doubt).
     std::mem::forget(flag);
 
-    unsafe {
-        libc::signal(libc::SIGINT, handler as *const () as libc::sighandler_t);
+    let installed =
+        unsafe { libc::signal(libc::SIGINT, handler as *const () as libc::sighandler_t) };
+    if installed == libc::SIG_ERR {
+        // Near-impossible (bad handler address / OOM), but a silent default-
+        // terminate Ctrl-C breaks the 130/cancel contract — say so loudly.
+        crate::harness::note(format_args!(
+            "[warn] SIGINT handler install failed; Ctrl-C will terminate without graceful cancel"
+        ));
     }
 }
 
@@ -104,8 +110,11 @@ pub(crate) fn install_sigint_cancel(flag: std::sync::Arc<std::sync::atomic::Atom
             add: i32,
         ) -> i32;
     }
-    unsafe {
-        SetConsoleCtrlHandler(Some(handler), 1);
+    let installed = unsafe { SetConsoleCtrlHandler(Some(handler), 1) };
+    if installed == 0 {
+        crate::harness::note(format_args!(
+            "[warn] console Ctrl-C handler install failed; Ctrl-C will terminate without graceful cancel"
+        ));
     }
 }
 

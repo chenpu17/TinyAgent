@@ -2845,18 +2845,30 @@ name = "tiny-agent"
 version = "0.4.2"
 dependencies = [
  "anyhow",
- "base64",
  "clap",
  "crossterm",
- "encoding_rs",
  "libc",
  "ratatui",
  "reqwest",
  "serde",
  "serde_json",
- "sha2",
+ "tiny-agent-core",
  "tui-markdown",
  "unicode-width",
+]
+
+[[package]]
+name = "tiny-agent-core"
+version = "0.4.2"
+dependencies = [
+ "anyhow",
+ "base64",
+ "encoding_rs",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
  "wasmtime",
  "windows-sys 0.52.0",
 ]
@@ -2871,7 +2883,7 @@ dependencies = [
  "napi-derive",
  "serde",
  "serde_json",
- "tiny-agent",
+ "tiny-agent-core",
 ]
 
 [[package]]
@@ -2883,7 +2895,7 @@ dependencies = [
  "pythonize",
  "serde",
  "serde_json",
- "tiny-agent",
+ "tiny-agent-core",
 ]
 
 [[package]]

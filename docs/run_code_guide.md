@@ -6,7 +6,7 @@
 
 本文适用于 v0.4.2 的接口。先跑下面的入门演示，再按需开启扩展。
 [完整配置参考](../README.md#run_code沙箱-js-执行可选-code-feature)和
-[内置技能全文](../src/tools/run_code_skill.md)可随时查阅。
+[内置技能全文](../crates/core/src/tools/run_code_skill.md)可随时查阅。
 
 ## 1. 跑通第一个任务
 
@@ -170,7 +170,7 @@ return {label: r.label, needs_review: r.label === "unsure"};
 一个标签也可能需要较多 token。输出触顶或异常终止会返回错误，不能当成功结果。
 
 需要并行判断时再同时开启 `call_batch`；级联与失败处理参考
-[技能的 LLM 判别段](../src/tools/run_code_skill.md#llm-判别需配置开启-codellmenabled未开启时-llm-工具不存在)。
+[技能的 LLM 判别段](../crates/core/src/tools/run_code_skill.md#llm-判别需配置开启-codellmenabled未开启时-llm-工具不存在)。
 这类调用会产生额外模型费用，是否采用应看任务质量与总成本。
 
 ### 复用已有处理逻辑：include / saveLib
@@ -241,7 +241,7 @@ return {label: reportCountLabel(3)};
 
 - [演示与运行参数](../examples/run-code-demo/README.md)
 - [配置、权限与 SDK 参考](../README.md#run_code沙箱-js-执行可选-code-feature)
-- [模型实际读取的完整技能与代码配方](../src/tools/run_code_skill.md)
+- [模型实际读取的完整技能与代码配方](../crates/core/src/tools/run_code_skill.md)
 - [特性状态与已有价值证据](code_review_brief.md)
 
 机械分页聚合的实验结论有明确场景边界；不要将其费用比例外推到任意任务，或

@@ -39,6 +39,9 @@ jobs:
     # tests/lib_api.rs 门在 `mock` feature 上（provider::mock 是
     # cfg(any(test, feature="mock"))——integration test 编译时 lib 不带
     # cfg(test)），所以测试命令必须带 mock 才真正跑到它。
+    # 拆分后命令显式圈 -p 内核+CLI 两个包：根目录裸命令只覆盖根 package
+    # （现在是 CLI），feature 按 owner 分开——tui 只在 CLI 包，mock 的
+    # lib_api 集成层在内核包，一条 --features 命令圈不住两包并集。
     strategy:
       fail-fast: false
       matrix:
@@ -52,10 +55,11 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       # 两个 clippy 都带 -D warnings：本地现状零警告，门禁就该硬。
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo clippy --features tui --all-targets -- -D warnings
-      - run: cargo test
-      - run: cargo test --features tui,mock
+      - run: cargo clippy -p tiny-agent-core -p tiny-agent --all-targets -- -D warnings
+      - run: cargo clippy -p tiny-agent --features tui --all-targets -- -D warnings
+      - run: cargo test -p tiny-agent-core -p tiny-agent
+      - run: cargo test -p tiny-agent-core --features mock
+      - run: cargo test -p tiny-agent --features tui,mock
 
   code:
     # `code` feature（run_code 沙箱）门禁：第三个 clippy 配置——run_code.rs
@@ -64,6 +68,9 @@ jobs:
     # 跑到 lib_api 集成层。单独 job 而非并进 test 矩阵：wasmtime+cranelift
     # 依赖树大，3 平台全量构建不划算——沙箱平台中立（quickjs.wasm 资产嵌入、
     # 宿主纯 Rust），ubuntu 单平台钉住，对齐绑定层"先单平台"的先例。
+    # 拆分后 code 是内核 feature，CLI 以转发 feature（code = ["tiny_agent/code"]）
+    # 暴露给根目录构建——`-p` 两包同开 code 等价于拆分前的根命令；tui 只在
+    # CLI 包，交叉配置单独圈。
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -72,11 +79,11 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --features code --all-targets -- -D warnings
+      - run: cargo clippy -p tiny-agent-core -p tiny-agent --features code --all-targets -- -D warnings
       # 第四个 clippy 配置：tui×code 交叉面（TUI 的 CodeLog 渲染、/code 命令、
       # set_code_* 交互）在任一单 feature 配置里都不可见（外审：CI 盲区）。
-      - run: cargo clippy --features tui,code --all-targets -- -D warnings
-      - run: cargo test --features code,mock
+      - run: cargo clippy -p tiny-agent --features tui,code --all-targets -- -D warnings
+      - run: cargo test -p tiny-agent-core -p tiny-agent --features code,mock
 
   e2e:
     # 场景化端到端门（离线、零密钥）：内置 SSE 场景 mock + 真实 CLI/HTTP
@@ -95,11 +102,18 @@ jobs:
       - run: python3 scripts/e2e_scenarios.py
 
   python-binding:
-    # 绑定测试只在 ubuntu 跑：绑定层从未在 Windows 验证过（三次 Windows
-    # 修复全是核心代码），先不做 continue-on-error 的虚假信心，等手动
-    # 在 Windows 跑绿一轮再扩矩阵。
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 2026-10 起扩到 Windows：手动跑绿一轮（CPython 3.12 win_amd64，
+    # maturin develop：39 passed / 4 skipped；--features code：42 passed /
+    # 1 skipped——code 自适应测试全激活）满足了此前"等手动 Windows 绿
+    # 再扩矩阵"的前置条件。venv 接线用显式路径探测而非 activate（POSIX
+    # 与 Windows 的 bin/Scripts 二选一），shell 固定 bash（两平台 runner
+    # 都自带）。
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -110,14 +124,19 @@ jobs:
         with:
           python-version: "3.12"
       # maturin develop 需要 virtualenv；conftest.py 从 __file__ 反解仓库根，
-      # 以 sys.executable 起 examples/mock_openai.py，离线自洽。
-      - run: |
+      # 以 sys.executable 起 examples/mock_openai.py，离线自洽。venv 用显式
+      # 路径接管（VIRTUAL_ENV + PATH），跨平台的 bin/ 与 Scripts/ 二选一。
+      - shell: bash
+        run: |
           python -m venv .venv
-          . .venv/bin/activate
-          pip install maturin pytest
+          VENV="$PWD/.venv"
+          if [ -x "$VENV/Scripts/python.exe" ]; then BIN="$VENV/Scripts"; else BIN="$VENV/bin"; fi
+          export VIRTUAL_ENV="$VENV"
+          export PATH="$BIN:$PATH"
+          "$BIN/python" -m pip install maturin pytest
           cd bindings/python
           maturin develop
-          python -m pytest tests/ -q
+          "$BIN/python" -m pytest tests/ -q
       - run: cargo clippy -p tiny-agent-py --all-targets -- -D warnings
       # The `code` forwarding feature (run_code switch methods) must stay
       # compiling; the behavioral tests for it run against a --features code
@@ -127,11 +146,15 @@ jobs:
       # set_code_config rejects unknown keys): the clippy gate can't see a
       # feature that compiles but no-ops. Second wheel in the same venv;
       # tests are build-adaptive, so this round runs the code suite.
-      - run: |
-          . .venv/bin/activate
+      - shell: bash
+        run: |
+          VENV="$PWD/.venv"
+          if [ -x "$VENV/Scripts/python.exe" ]; then BIN="$VENV/Scripts"; else BIN="$VENV/bin"; fi
+          export VIRTUAL_ENV="$VENV"
+          export PATH="$BIN:$PATH"
           cd bindings/python
           maturin develop --features code
-          python -m pytest tests/ -q
+          "$BIN/python" -m pytest tests/ -q
 
   node-binding:
     runs-on: ubuntu-latest

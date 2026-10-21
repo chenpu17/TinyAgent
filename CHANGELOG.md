@@ -7,6 +7,14 @@
 
 ### Added
 
+- **诊断通道 `diag`（GUI 宿主可见的软失败警告）**：内核里 ~19 处裸 `eprintln!` 直写（技能扫描/装配警告、
+  MCP 握手与读线程降级、session 损坏保留提示、run_code 畸形 marker 回退与沙箱降级）对无控制台的
+  GUI 宿主与语言绑定完全不可见。统一收敛到 `crate::diag::diag_warn!`/`diag_info!`：默认（未装 sink）
+  逐字节回退 stderr（CLI 行为零变化）；宿主可 `tiny_agent::diag::install_diag_sink(Box<dyn Fn
+  (DiagLevel, &str)>)` 把警告作为数据接管（日志面板/文件/自家 facade）。进程级可替换 sink 而非
+  per-agent 管道——最吵的站点在装配期（尚无事件流）与后台线程（无 ToolCtx）。sink 集成断言挂在
+  strip_once 畸形 marker 测试上（TEST_LOCK 串行化）。
+
 - **子 agent turn 天花板可配置 `limits.subagent_max_turns`（跨核心 + 双绑定）**：`task` 子 agent 的
   turn 预算天花板从硬编码 `SUBAGENT_MAX_TURNS=25` 提为 `Limits` 字段——外部宿主可自行放宽（GUI 类
   应用跑千级轮次的场景）或设 `0` 不另设天花板（子 agent 完整继承父 `max_turns`）。语义不变量保持：
@@ -26,6 +34,49 @@
 
 ### Changed
 
+- **python 绑定 CI 矩阵扩到 Windows**：此前绑定层从未在 Windows 验证过，job 只在 ubuntu 跑并注明
+  "等手动跑绿再扩矩阵"。前置条件已满足（2026-10 手动 Windows 全绿：CPython 3.12 win_amd64，
+  `maturin develop` 39 过/4 跳，`--features code` 42 过/1 跳——code 自适应测试全激活），矩阵扩为
+  `ubuntu-latest + windows-latest`（fail-fast 关闭）；venv 接线从 `activate`（POSIX 专用）改为
+  显式路径探测（`bin/` vs `Scripts/` 二选一 + `VIRTUAL_ENV`/`PATH` 导出），两步固定 `shell: bash`。
+
+- **run_code 拆分为模块（纯搬移重构，行为零变化）**：原 11.9k 行单文件按关注点拆为
+  `tools/run_code/` 九个子模块（contract 契约文本 / sandbox wasmtime 沙箱 / guest_api 宿主函数面 /
+  fs_policy 路径与 glob 策略 / lib_index 会话库 / batch callBatch / precheck FR-2 预检 /
+  tool 工具本体 / test_util 共享测试辅助），`run_code.rs` 保留为 103 行门面（mod 声明 + 符号
+  汇回，外部 `run_code::…` 引用路径全部守恒）。函数体逐字搬移，唯一改动为可见性关键字与两处
+  include 路径修正；`run_code` 测试拆分前后精确守恒（150 个），契约四哈希
+  （description/schema/prelude/skill md）逐字节复验不变。门禁随迁：`sync_run_code_contract.py`
+  抽取器重定向至 tool.rs/contract.rs，且 manifest 补钉全部子模块文件（新增子模块须同步脚本与
+  `gen_structure.py` ENTRIES——后者渲染器新增嵌套子目录支持）。
+
+- **shell 工具描述按平台诚实化**：原描述在 Windows 上承诺 POSIX sh 语义（heredoc、/dev/null、
+  `&` 后台）而实际解释器是 `cmd /C`。现按 `cfg` 分平台：unix 说明 `sh -c` 与 heredoc/后台语法；
+  Windows 说明 `cmd /C`、`>nul 2>&1` 重定向、含空格路径双引号、复杂数据处理建议
+  `powershell -NoProfile -Command`。
+
+- **llm 判别与 context_report 漂移守卫（防御性）**：`run()` 与 `panic_audit_row()` 两份平行
+  输入校验收敛到单一 `reserve_params` 源（错误文案逐字不变）；`context_report.rs` 在四个漂移
+  起源点加 `debug_assert!`（system 三段和、工具桶 fold、按型分桶总和、未校准总和 ==
+  `estimate_tokens`；校准后路径文档明示允许舍入漂移、不硬断言），发布构建零开销。
+
+- **workspace 拆分：内核独立成 crate（用户零感知）**：原 bin + lib 同包拆为双 crate——
+  `crates/core`（package `tiny-agent-core`，lib 名仍为 `tiny_agent`，`use tiny_agent::…` 全部
+  免改）持有 agent loop、工具、provider、config、skills、MCP、session、压缩、`build_agent*`
+  装配与新提取的 `fsutil`（原子写原语，session/write_file 与 result/report 共用）；根 package
+  `tiny-agent` 变为纯 CLI（main/signal + 随迁的本地模块 harness/batch/tui——headless 呈现与
+  批量编排本就是应用层）。内核依赖树甩掉 clap 与 TUI 四件套；CLI 的 `code`/`mock` 为转发
+  feature，根目录 `cargo build --features …`、`--version --json` 清单、musl/e2e/release 产物
+  语义不变。绑定 path 依赖改指 `crates/core`（依赖键与转发 feature 不变）。CI 的 clippy/test
+  显式 `-p tiny-agent-core -p tiny-agent` 圈定两包（根目录裸命令拆分后只覆盖根 package），
+  live job 的 `--lib` 同改；`gen_structure.py`（双 crate 结构树）与 `sync_run_code_contract.py`
+  （源文件路径）随路径体系更新。harness 行为测试（重试梯子 / result.json / NDJSON / unix
+  真叶 e2e，约 1000 行）随 harness 迁入 CLI crate（`src/harness_tests.rs`），内核
+  `agent_tests.rs` 相应瘦身。顺带修复三处存量问题：`tests/lib_api.rs` 三处 `ToolCtx` 字面量
+  缺 `tool_absent_notes` 字段（`--features mock` 下编译失败）、新版 clippy 的
+  `manual_checked_ops`（tui.rs）与冗余 match 绑定（agent_tests.rs）告警、`fetch_update`
+  弃用告警以 `#[allow(deprecated)]` 压制（`try_update` 需 >1.86，MSRV 地板 1.86）。
+
 - **冻结文案校准**（skill / 工具描述 / 设计附录 / manifest 同源同步，修订记录
   llm v0.7.8 / memory v0.7.5 / run_code_design v0.9；预检/墓碑文案无变化，
   finetune_support_design 未动）：callBatch 教学对齐实际并发——并行由工具能力决定，
@@ -34,6 +85,144 @@
   `the sandbox stays alive`）；截断/异常终止不作为有效判别，级联示例移除未校准的
   `max_tokens: 8`（默认 1024）；落盘纪律改为「产物落盘并完成必要校验后收尾」；
   include 定位收紧为「宿主有明确复用需求才建库」，删除未经验证的价值比较表述。
+
+### Fixed
+
+- **CLI 观察项快赢批（审读轮坐实的 9 个低垂项，全部带回归测试或文档修正）**：
+  - batch `.JSON` 大写扩展名静默跳过 → 大小写不敏感匹配（Windows 文件系统语义）；
+  - batch `--report` 路径指向目录时批末才失败、丢汇总报告 → 启动前预检立即 bail（任何任务不启动）；
+  - batch `git worktree add` 失败清理用 `remove_dir`（对非空半成品必失败且吞错）→ `remove_dir_all` + best-effort 警告；
+  - TUI CodeLog 行双 `· ` 前缀（推入处与渲染层各加一次）→ 只留渲染层（屏显与 /export 同时修好）；
+  - TUI `ansi_plain` 丢末尾换行（/export 尾随空行与屏显差一行）→ 尾部 flush 补 `ended_with_newline`；
+  - TUI 裸 ESC 后跟 `\n` 时换行被两字符序列分支吞掉 → 仅合法序列引入符才消费下一字符；
+  - `--timeout` 帮助文本声明 per-attempt 语义（与 `--retries` 组合时总墙钟可超预算）；
+  - 退出码文档注释补 125（budget_exceeded，实现与测试本就一致，纯文档遗漏）；
+  - signal.rs 两平台 Ctrl-C 处理器安装失败由静默忽略改为响亮警告（默认终止会破坏 130 契约）。
+
+- **CLI crate 审读修复批（4 分片全量审读坐实 7 个 P2，无 P1；全部带回归测试）**：
+  - **batch Windows `--isolate copy` 链接环**：解引用分支遇自指/祖先相对链接（含 junction）指数级递归
+    复制直至磁盘耗尽，且经链接展开的物理内容绕过 `COPY_EXCLUDE`（target/node_modules 整搬进沙箱）。
+    修复：会话级 visited set（canonical 路径去重剪环）+ deref 分支同样应用根层排除；unix 逐字重建
+    分支零变化。junction 实测无需特权，两个 Windows 原生回归测试钉住线性复制与排除。
+  - **harness/main 关流 panic 丢 result.json**：重试提示等 9 处裸 `eprintln!/println!` 在 stderr/stdout
+    关闭时 panic（release abort），且重试 loop 内的 panic 使 result.json 永不落盘——与本文件自设的
+    best-effort I/O 纪律不一致。统一改 `harness::note/note_out`（`let _ = writeln!`）。
+  - **resume 预铸 id 溢出**：session 含 `m{u64::MAX}` id 时 `floor + 1` 在 debug 构建溢出 panic；
+    镜像内核 `fresh_message_id` 的 saturating 语义（饱和时重复 MAX id 是 lesser evil）。
+  - **TUI MdCache 无界增长**：流式期间每 delta 一条缓存（单消息内 O(文本×delta) 二次方），已提交
+    条目纯死重，resize 换宽度整套重建。改为单槽缓存（有效工作集本就只有当前流式行），提交路径
+    render-once 旁路缓存。
+  - **TUI diag 通道接管**：raw mode 下 MCP 后台线程的警告经默认回退 eprintln 直接涂花视口帧与
+    原生 scrollback（空闲期重绘门控不再覆盖）。TUI 启动安装 sink 转发 `UiMsg::Diag` 渲染成系统行，
+    TerminalGuard Drop 清理（panic unwind 对称）。
+  - **TUI 大单行粘贴 O(n²)**：MB 级单行（base64/长 URL）逐字符 insert 搬移分钟级卡死 UI 线程；
+    改批量分段拼接，与逐字符参考实现全等对账（含 CRLF/CJK/emoji）。
+  - **TUI 嵌套围栏失步**：tui-markdown 把所有围栏归一化为恰 3 反引号，嵌套示例（4 反引号内含 ```）
+    使 fence toggle 错位、后半代码块被当 markdown 重渲染。修复：从原文按 CommonMark 围栏语法派生
+    开/闭/内容分类计划，渲染行流严格对账通过才采用、任一分歧回退原 toggle（零漂移）；残余未建模
+    构造自动回退并已文档化。顺带修 Windows 反斜杠路径的状态栏 cwd 段整段消失。
+
+- **门禁产物对拍修正（真 Python 解释器实测发现）**：本机落地便携 Python 3.12 后实跑三个 CI 门禁
+  脚本，抓到两处此前 node 镜像再生法的漏洞——README 结构树中 provider/mock.rs 描述少一个右括号
+  （镜像转写错，CI `gen_structure.py --check` 会红），已用真脚本 `--write` 修正并将整文件归一回
+  LF（python 在 Windows 文本模式写出 CRLF）；`examples/eval/e0prime-skill/run-code/SKILL.md`
+  在本工作区被翻成 CRLF 而该门禁按**原始字节**哈希（LF 折叠后与登记指纹完全一致，内容从未变过），
+  已归一回 LF。同轮首次在本机全绿：三 Python 门禁、e2e 场景套件（18 断言，含 Windows
+  CTRL_BREAK 取消与 llmbatch 服务端验证真并发）、MSRV 1.86.0 `check --locked`（经镜像装工具链）。
+
+- **MCP stdio 的 Windows shutdown-reaper 补齐**：unix 上 TUI 退出时 reaper 线程对进程组即时
+  `SIGKILL`，卡在阻塞读的 worker 立即解锁；Windows 此前没有 reaper——要等宿主进程退出、OS 关
+  job 句柄（KILL_ON_JOB_CLOSE）才杀整树，正是 unix reaper 要避免的 orphan-until-host-exit。
+  现补齐：`winjob.duplicate()`（DuplicateHandle 复制 job 句柄，LeakIfAlive 策略——复制品只杀
+  不回收，原句柄保留 Terminate-on-drop）交给 Windows 版 reaper（与 unix 逐字同构：100ms 轮询、
+  alive 收摊防误杀、job 缺失/线程失败降级警告）。三测试：shutdown 触发整树及时死、双次 arming
+  幂等、alive 收摊不误杀。
+
+- **MCP Streamable HTTP 202 Accepted 挂死/误判**：POST 收到无 body 的 202（响应走服务端下发
+  的 SSE 流）时，旧实现落入 plain-JSON 分支解析空串报 `invalid JSON response`，auto 模式还会
+  误触发 legacy SSE 回退。现按规范补齐：捕获会话头后向同端点 GET（`Accept: text/event-stream`、
+  带 `Mcp-Session-Id`）建流，复用既有 `sse_response_for_id`（method 守卫/封顶/超时）等到匹配
+  id 的响应。回归测试用最小 HTTP/1.1 mock（含 id 碰撞 decoy）钉住请求头与恰好一 POST + 一 GET。
+
+- **shell Windows 命令引用改写（cmd /C mangling）**：命令串经 std 参数引用传给 `cmd /C` 时，
+  含空格整段被包引号、内嵌 `"` 转义为 `\"`——cmd 剥引号规则不识别该转义，实测
+  `echo "hi"` 输出 `\"hi\"`、`cd "C:\Program Files" && …` 直接报错退出。改用
+  `raw_arg` 逐字传递（等价控制台手敲；实测三种形态全对，引号 exe 路径仍受 cmd 自身两引号
+  保留规则保护），unix `sh -c` 路径不变。
+
+- **内核质量审核修复批（5 分片全量审读坐实的 11 个 P1 + 1 个交互 P2，全部带回归测试）**：
+  - **MCP stdio 写阻塞**（`mcp.rs`）：`request()` 的 `write_all` 移入写线程，主侧 50ms 切片轮询
+    cancel 与 10s `WRITE_TIMEOUT`；超时/取消击杀子进程断管回收写线程（不泄漏常驻阻塞线程），
+    `stdin` 改 `Option` 后续调用快速失败——server 停读 stdin（大帧 + 卡死）不再挂死整个 turn。
+  - **run_code 结果静默丢失**：guest 结果/错误消息超过 16 MiB 单次读帽（`GUEST_READ_CAP_BYTES`）
+    时不再 `unwrap_or_default()` 成「成功但空输出」，改为明确的 read-cap 错误与「写文件再切片读」
+    恢复指引（成功/错误两腿都响亮）。
+  - **run_code 批次主机侧无界累积**：新增 `BATCH_TOTAL_OUTPUT_CHARS`（8M 字符）聚合预算，
+    超限条目降级为带指引的短占位（hooks Deny 文本同样计入预算）；envelope 回退不再把完整
+    payload 二次嵌入（只报尺寸）——默认 200 次调用的批次峰值从 ~1.6 GB 收敛到几十 MB。
+  - **shell Windows 杀进程**（`shell.rs`）：spawn 后立即入 Job Object
+    （`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`），超时/取消 `TerminateJobObject` 杀整进程树——
+    此前只杀 `cmd.exe` 垫片、真正的工作进程继续跑；drop 时 job 已空则关句柄，仍有幸存者则
+    有意泄漏句柄以保住「`start /B` 后台进程跨调用存活」逃生舱（宿主死亡时 OS 关句柄仍全树
+    陪葬）。windows-sys feature 面相应扩充（JobObjects/Threading/Foundation/Security）。
+  - **fsutil Windows rename 兜底**：只读目标先清只读位再覆盖（对齐 posix rename 语义）、
+    AV/索引器共享冲突 3 次 50–100ms 退避重试、失败清理 tmp 前清其只读位——result.json /
+    session 保存不再被这两类瞬态错误直接击穿。
+  - **summary 重试 backoff 尊重取消**（`agent.rs`）：`sleep_cancelable` 返回 true 即以
+    cancelled 形状终止并如实结转 `burned`，不再向已取消的运行重发（可能很大的）摘要请求。
+  - **session archive 字节帽**（`agent.rs`）：新增 `ARCHIVE_MAX_BYTES`（64 MiB）与既有条数帽
+    组成双帽 FIFO 逐出——截图/base64 密集的长会话，会话文件不再无界增长到 GB 级。
+  - **provider 非 2xx 错误体封顶**（`openai.rs` ×2 + `anthropic.rs`）：三处 `resp.text()`
+    换共享 `capped_err_body`（16 KiB + 截断标注，含 loopback HTTP-mock 回归测试）——与 SSE
+    路径 64 MiB 三重上限、mcp 的 16 KiB 错误体帽的威胁模型对齐，恶意网关无法再用无限错误体
+    撑爆内存。
+  - **`McpServerConfig` Debug 脱敏**（`config.rs`）：手写 Debug，`headers`/`env` 只保留 key 名、
+    value 打码——宿主/绑定侧任何 `{:?}` 日志不再全文带出 MCP 凭据（Authorization、
+    GITHUB_PERSONAL_ACCESS_TOKEN 等；与 `api_key_env` 只存变量名的既有间接设计对齐）。
+  - **`PartialConfig::apply` 设防**（`config.rs` + `batch.rs`）：`apply` 对硬字段
+    （provider/base_url/api_key_env/workdir/tools/restrict_to_workdir/mcp_servers）默认拒绝
+    并指路——库消费者误喂不可信任务片段不再能改 endpoint/工具白名单/注入未校验 MCP 服务器；
+    新增 `apply_trusted` 作为宿主已筛查覆盖层（CLI batch 路径）的全字段入口，并补上
+    `mcp_servers` 的 `validate()` 与工具白名单名字校验两个兜底。
+  - **skill 读取 UTF-8 边界**（`tools/skill.rs`）：字节帽切在多字节字符中间时交付合法前缀 +
+    截断标注（照抄 file.rs 既有行为）——纯中文技能文档/资源不再被误报「not valid UTF-8」硬错误。
+  顺带：新增本仓库首批 Windows 原生行为测试（Job Object 孙进程击杀、只读/共享冲突 rename、
+  MCP 写超时与取消）；README 结构树与 run_code 路由 manifest 随行数/文件哈希再生。
+
+- **P2 清理批（同日审核发现的次级问题，25 项，全部带回归测试）**：
+  - **MCP Windows 子进程整树回收**：shell 的 Job Object 逻辑抽取为共享模块 `winjob.rs`
+    （两种 drop 策略显式化：shell 的"幸存者逃生舱"vs MCP 的确定性整树 Terminate），
+    mcp.rs 的 stdio transport 接线——Windows 上 Drop/写失败不再残留 cmd 垫片下的孙进程。
+  - **重试分类**：`is_transient` 纳入 408/425（服务端明示可重发的瞬态码，此前走确定性失败）。
+  - **run_code 沙箱**：`glob_match` 入口折叠连续 `**` 段（Kleene 闭包等价，实测原实现
+    6 连星 × 64 段路径需 131s、指数增长）+ 折叠后 1024 段帽 fail-closed；嵌入资产的
+    `strip_once` 畸形 marker 不再 panic、回退保守输出。
+  - **截断边界族**：read_file 的 limit 参数 32 位 `as usize` 截断改 try_from 报参数错误；
+    read_file 与 read_skill 的"读期间文件生长越过字节帽"stale-stat 形状不再误诊
+    "not valid UTF-8"（共享 `grew_past_cap` 判定，交付合法前缀+截断标注）。
+  - **路径圈界**：`confined_to` 对余量段做词法归一（`.` 丢弃、`..` 弹栈、下溢即逃逸），
+    关掉 `workdir/nonexist/../x` 的非竞态逃逸变体；doc 归位到函数本体。
+  - **上限族**：subagent `prompt` 超限（8× 输出帽）拒绝而非首请求必烧；llm 工具成功路径
+    text 过 max_output_chars 截断（与错误路径对齐）；MCP 工具包装层文本分段边拼边限
+    （16 MiB 硬帽，不再先全量累积）。
+  - **会话保全**：损坏/未来版本的会话文件不再静默丢弃——改名保留现场
+    （`.corrupt`、`.corrupt.1`…）后再 fresh start。
+  - **MCP 协议**：Streamable HTTP 响应匹配加 `method` 守卫（服务端发起的请求不再误配成
+    响应报 protocol violation）；空名工具丢弃+warn；SSE `data:` 只剥一个前导空格（对齐
+    provider 侧与 SSE spec）；读线程/reaper 的 spawn 不再 `expect` panic（线程耗尽是
+    per-call 错误）。
+  - **provider**：openai 锁中毒容忍式统一（对齐 mcp.rs）；anthropic 首次 POST 前检查
+    cancel（取消不再延迟一个往返）；补 openai 无 [DONE]/无 finish_reason 的
+    stream_truncated 归因测试。
+  - **config**：`api_key()` 区分"未设置"与"设置了但非 UTF-8"；`McpServerConfig` 的 url
+    含 userinfo（`scheme://user:pass@host`）时 Debug 打码（手写有界扫描，authority 段内
+    最后一个 `@` 切分 fail-closed）。
+  - **agent 循环**：summary_call 的不可达兜底从 `unreachable!` 改 debug_assert+安全返回；
+    `fresh_message_id` counter 饱和时保证终止；全零 `Usage` 对象不再发零值事件；
+    compress 两处直接切片改防御式 `get`。
+  - **依赖面**：libc 移入 unix target 依赖（两个 crate 的全部用点都是 `#[cfg(unix)]`，
+    Windows 依赖图减重）；内核 Cargo.toml 补 keywords/categories（repository 待有公开
+    仓库后补）。
 
 ## [0.4.2] - 2026-09-27
 

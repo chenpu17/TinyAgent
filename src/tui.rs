@@ -202,6 +202,14 @@ impl Row {
     }
 }
 
+/// AgentEvent::CodeLog payload → transcript row. The payload stays BARE:
+/// the System-Info renderer (build_history_lines) and render_transcript
+/// each draw their own `·` marker, so a prefix baked in here would render
+/// doubled ("· · line") on screen and in /export.
+fn code_log_row(line: String) -> Row {
+    Row::sys_info(line)
+}
+
 /// What a `/`-prefixed input line asks for. `Message` = not a command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SlashCmd {
@@ -467,8 +475,7 @@ fn render_context_report(
         sub(&mut s, label, tokens);
     }
 
-    if max_context_tokens > 0 {
-        let used_pct = total.saturating_mul(100) / max_context_tokens;
+    if let Some(used_pct) = total.saturating_mul(100).checked_div(max_context_tokens) {
         let free = max_context_tokens.saturating_sub(total);
         // Round window numbers read cleaner without a trailing ".0".
         let max_s = fmt_tokens_round(max_context_tokens);
@@ -891,6 +898,16 @@ enum UiMsg {
     /// `/context`: the worker's `context_breakdown()` snapshot, rendered by
     /// the UI loop (which owns the config the window line reads).
     Context(crate::context_report::ContextBreakdown),
+    /// Kernel diagnostics (MCP background-reader warnings, session-recovery
+    /// notes, …) forwarded from the process-global diag sink by
+    /// [`install_diag_bridge`]. Without this the kernel's fallback `eprintln`
+    /// fires from whatever thread hit the warning and paints straight over
+    /// the raw-mode viewport (and the native scrollback), where it stays
+    /// until the next redraw — the redraw gate is `dirty || (busy && tick)`,
+    /// so in idle the garbage frame lingers indefinitely. The message text
+    /// is self-describing ("[warn] …"), so the level only picks the row's
+    /// color; the sink drops the send when the UI thread is already gone.
+    Diag(tiny_agent::diag::DiagLevel, String),
 }
 
 /// Control or text input from the UI to the worker thread. `None` on the
@@ -921,13 +938,37 @@ impl Drop for DoneSignal {
 /// mid-draw strands them in raw mode with no echo. Inline mode lives on the
 /// PRIMARY screen (no alternate screen) and captures no mouse, so teardown is
 /// just bracketed-paste + raw-mode — native selection/scroll keep working.
+/// Drop also clears the diag sink: the sink is process-global, so the
+/// install (in `run`, right after this guard is created) and this clear stay
+/// symmetric on EVERY exit path — normal quit, early `?` failure, and panic
+/// unwind all drop the guard. A sink left installed after the TUI is gone
+/// would keep sending into a dead channel (harmless) — worse, a later
+/// non-TUI phase of the process would silently swallow diagnostics that its
+/// stderr fallback was supposed to print.
 struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = stdout().execute(DisableBracketedPaste);
         let _ = disable_raw_mode();
+        tiny_agent::diag::clear_diag_sink();
     }
+}
+
+/// Install the TUI's diag bridge: every kernel `diag_warn!` / `diag_info!`
+/// (from ANY thread — the MCP readers chief among them) is packaged as a
+/// [`UiMsg::Diag`] on the UI event channel instead of falling back to
+/// `eprintln`, which would write from a foreign thread onto the raw-mode
+/// terminal. Split out of `run` as a named function so the bridge itself is
+/// testable without a terminal (see `diag_sink_forwards_kernel_diag_to_ui`).
+/// Pair with [`TerminalGuard`]'s `clear_diag_sink` on teardown.
+fn install_diag_bridge(out_tx: mpsc::Sender<UiMsg>) {
+    tiny_agent::diag::install_diag_sink(Box::new(move |level, msg| {
+        // A failed send means the UI thread has exited; the message is
+        // dropped — the alternative (falling back to eprintln) would reprint
+        // the exact raw-mode garbage this bridge exists to prevent.
+        let _ = out_tx.send(UiMsg::Diag(level, msg.to_owned()));
+    }));
 }
 
 /// Rebuild a resumed session's messages as display rows, so `--resume` opens
@@ -1059,6 +1100,13 @@ pub fn run(
     // disable is `let _ =`), so creating the guard before some enables have
     // run is harmless.
     let _guard = TerminalGuard;
+    // Take over the kernel's diag channel for as long as raw mode is active:
+    // kernel warnings (the MCP background readers most prominently) must
+    // reach the transcript as UiMsg::Diag rows rendered by the UI thread,
+    // not eprintln from a foreign thread straight onto the raw-mode screen.
+    // The guard above clears the sink on every teardown path, keeping the
+    // global install/clear symmetric.
+    install_diag_bridge(out_tx.clone());
     // Bracketed paste: terminals that support it deliver a pasted blob as one
     // Event::Paste (newlines included) instead of replaying it as keystrokes —
     // which would hit the Enter handler and send each line as a message.
@@ -1367,10 +1415,11 @@ fn ui_loop(
                         ));
                     }
                     // Nothing queued can ever be delivered now: drop the
-                    // pending texts and their ghost rows. Row removal shifts
-                    // indices, so the index-keyed MdCache is reset when
-                    // anything was removed (the watermark stays valid — only
-                    // uncommitted ghosts are ever removed).
+                    // pending texts and their ghost rows. The MdCache slot is
+                    // content-keyed so removal can't alias it, but dropping a
+                    // slot that may reference a removed row is eager hygiene
+                    // (the watermark stays valid — only uncommitted ghosts
+                    // are ever removed).
                     queued.clear();
                     if drop_queued_ghosts(&mut rows) {
                         md_cache.clear();
@@ -1553,8 +1602,10 @@ fn ui_loop(
                         // Sandbox console.log → committed transcript row (design
                         // L6: reviewable in scrollback and `/export`-able — a
                         // render-only transient would lose the execution log).
-                        // sys_info styling keeps it visually apart from replies.
-                        rows.push(Row::sys_info(format!("· {line}")));
+                        // sys_info styling keeps it visually apart from replies;
+                        // the payload stays bare — the renderer and /export
+                        // draw their own `·` marker (see code_log_row).
+                        rows.push(code_log_row(line));
                     }
                     AgentEvent::SubAgent { name, event } => {
                         // Render the child's event tagged with its name so the
@@ -1703,6 +1754,18 @@ fn ui_loop(
                         &bd,
                         cfg.limits.max_context_tokens,
                     )));
+                }
+                UiMsg::Diag(level, msg) => {
+                    // Kernel diag forwarded by the bridge (see UiMsg::Diag):
+                    // reuse the ordinary system-row mechanism — the row rides
+                    // the normal commit path into scrollback, respecting the
+                    // queued-ghost watermark. The text is self-describing
+                    // ("[warn] MCP stdio read stopped: …"), so the level only
+                    // picks the color.
+                    rows.push(match level {
+                        tiny_agent::diag::DiagLevel::Info => Row::sys_info(msg),
+                        tiny_agent::diag::DiagLevel::Warn => Row::sys_warn(msg),
+                    });
                 }
             }
         }
@@ -2446,18 +2509,24 @@ fn push_assistant_body(
     head: bool,
 ) {
     let markdown_width = inner_w.saturating_sub(ROLE_BODY_INDENT).max(1);
-    // M6: reuse the cached render unless this row's text grew since last
-    // frame (streaming). Prior rows and scroll redraws hit the cache; only
-    // the in-flight row (or a first render) re-parses markdown. The cache is
-    // keyed by (text, width), not row index — see MdCache docs for why.
-    let mut rendered = md_cache
-        .get_or_render(t, markdown_width, |txt| {
-            render_markdown(txt, markdown_width)
-                .iter()
-                .map(line_to_owned)
-                .collect()
-        })
-        .to_vec();
+    let render = |txt: &str| -> Vec<Line<'static>> {
+        render_markdown(txt, markdown_width)
+            .iter()
+            .map(line_to_owned)
+            .collect()
+    };
+    // M6: the LIVE streaming row (live != None) re-renders on every redraw —
+    // including busy clock ticks between deltas — so it goes through the
+    // single-slot MdCache keyed by (text, width). The COMMIT path (live ==
+    // None) renders each row exactly once and never re-reads the result, so
+    // it renders directly WITHOUT touching the cache: a committed entry used
+    // to be inserted and then never read again (pure dead weight), and each
+    // insertion would also have evicted the streaming row's live slot.
+    let mut rendered = if live == LiveRow::None {
+        render(t)
+    } else {
+        md_cache.get_or_render(t, markdown_width, render).to_vec()
+    };
     if rendered.is_empty() {
         rendered.push(Line::default());
     }
@@ -2782,7 +2851,8 @@ fn build_history_lines(
 
 /// Remove the oldest ghost Row::Queued (FIFO, matching `queued.pop_front()`).
 /// Returns true when a row was removed — row indices then shifted, so the
-/// caller must clear the index-keyed MdCache.
+/// caller also drops the MdCache slot (content-keyed, so this is eager
+/// hygiene rather than an anti-aliasing necessity).
 fn remove_oldest_queued(rows: &mut Vec<Row>) -> bool {
     let pos = rows.iter().position(|r| matches!(r, Row::Queued(_)));
     if let Some(i) = pos {
@@ -2792,7 +2862,7 @@ fn remove_oldest_queued(rows: &mut Vec<Row>) -> bool {
 }
 
 /// Remove every ghost Row::Queued (the whole queue was dropped). Returns true
-/// when any were removed, for the same MdCache-staleness reason as above.
+/// when any were removed, for the same MdCache-hygiene reason as above.
 fn drop_queued_ghosts(rows: &mut Vec<Row>) -> bool {
     let had = rows.iter().any(|r| matches!(r, Row::Queued(_)));
     rows.retain(|r| !matches!(r, Row::Queued(_)));
@@ -3078,7 +3148,11 @@ fn right_path_seg(path: &str, avail: usize) -> Option<Span<'static>> {
     let (text, tw) = if pw <= budget {
         (path.to_string(), pw)
     } else {
-        let base = path.rsplit('/').next().unwrap_or(path);
+        // Basename after EITHER separator: on Windows the cwd arrives
+        // backslash-delimited, where an rsplit('/')-only "basename" is the
+        // WHOLE path (no split hit) — it then can't fit the budget and the
+        // segment vanishes entirely, taking the cwd out of the status bar.
+        let base = path.rsplit(['/', '\\']).next().unwrap_or(path);
         if base.width() + 1 > budget {
             return None; // even "…" + basename is too wide
         }
@@ -3607,7 +3681,8 @@ enum Flush {
 /// verbatim duplicates. Contract: pop_front ↔ remove the oldest ghost row ↔
 /// append the real Row::User at the END (the finished run's trailing output
 /// may already sit after the ghost, so only an append keeps true send order).
-/// Row removal shifts indices, so the index-keyed MdCache is reset.
+/// Row removal shifts indices, so the MdCache slot is dropped alongside
+/// (content-keyed: hygiene, not an anti-aliasing necessity).
 fn flush_next_queued(
     queued: &mut std::collections::VecDeque<String>,
     rows: &mut Vec<Row>,
@@ -3909,6 +3984,19 @@ fn apply_sgr(style: &mut Style, params: &str) {
     }
 }
 
+/// Second bytes that legitimately introduce a two-char escape sequence
+/// after a bare ESC: the charset-designation/intermediate range 0x20–0x2f
+/// (`(`, `)`, `#`, `%`, …) plus the standalone Fe finals terminals actually
+/// emit (RIS `c`, IND `D`, NEL `E`, RI `M`, DECSC `7`, DECRC `8`, DECKPAM
+/// `=`, DECKPNM `>`). '\n', '\r' and ordinary letters are NOT introducers —
+/// see the ESC arm in ansi_to_lines.
+fn is_two_char_esc_introducer(c: char) -> bool {
+    matches!(
+        c,
+        '\x20'..='\x2f' | '7' | '8' | '=' | '>' | 'c' | 'D' | 'E' | 'M'
+    )
+}
+
 /// Parse tool-output text with ANSI escape sequences into styled lines.
 /// SGR color/style sequences become span styles; every other escape sequence
 /// (non-`m` CSI, OSC hyperlinks/titles, two-char ESC sequences) and every
@@ -3921,6 +4009,14 @@ fn ansi_to_lines(text: &str) -> Vec<Line<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut cur = String::new();
     let mut style = Style::default();
+    // The input's last visible byte is a newline → the final line that
+    // newline opened must be materialized by the tail flush below, or the
+    // join in ansi_plain drops the trailing blank line the user saw on
+    // screen (/export would end one line short of the display). No reset
+    // is needed: the flag is only consulted when cur AND spans are empty,
+    // and any visible char after the last '\n' leaves cur/spans non-empty
+    // (flushing anyway).
+    let mut ended_with_newline = false;
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
@@ -3961,14 +4057,24 @@ fn ansi_to_lines(text: &str) -> Vec<Line<'static>> {
                 }
                 // Two-character ESC sequences (ESC c, ESC ( B, …): strip the
                 // ESC and the introducer, letting any printable tail through
-                // the normal path.
+                // the normal path. The introducer is consumed ONLY when it is
+                // one this parser recognizes — a bare ESC next to ordinary
+                // text must not swallow its neighbor: "a\x1b\nb" keeps the
+                // newline, "\x1bXb" keeps the X. The ESC itself is dropped
+                // either way.
                 _ => {
-                    chars.next();
+                    if chars
+                        .peek()
+                        .is_some_and(|&c2| is_two_char_esc_introducer(c2))
+                    {
+                        chars.next();
+                    }
                 }
             },
             '\n' => {
                 spans.push(Span::styled(std::mem::take(&mut cur), style));
                 lines.push(Line::from(std::mem::take(&mut spans)));
+                ended_with_newline = true;
             }
             // Expand tabs to 2 spaces: unicode-width counts \t as ZERO
             // columns while terminals render it 1–8, so a tabbed line wraps
@@ -3979,7 +4085,7 @@ fn ansi_to_lines(text: &str) -> Vec<Line<'static>> {
             c => cur.push(c),
         }
     }
-    if !cur.is_empty() || !spans.is_empty() {
+    if !cur.is_empty() || !spans.is_empty() || ended_with_newline {
         spans.push(Span::styled(cur, style));
         lines.push(Line::from(spans));
     }
@@ -4050,20 +4156,72 @@ fn is_hrule(text: &str) -> bool {
 /// (tui-markdown emits no language highlighting), and an hr becomes a
 /// full-width dim `─` rule.
 ///
+/// Fence lines are classified from the SOURCE markdown (`fence_plan`): the
+/// renderer normalizes every fence to exactly ``` so a nested example's inner
+/// fences are invisible in the output — the source's marker lengths are the
+/// only thing that keeps them straight. RESIDUAL LIMITATION: constructs the
+/// plan's scan does not model (fences inside list items / blockquotes,
+/// indented 4-space code blocks, entity-escaped info strings) make the plan
+/// fail its verification against the rendered lines and fall back to the plain
+/// toggle, which mis-tracks nested fences in exactly those cases — the
+/// pre-existing behavior, kept as the safe degradation.
+///
 /// `width` is the conversation block's inner width (hr length). NOTE: the
 /// rendered lines are memoized in MdCache keyed by row text, so a terminal
 /// RESIZE keeps hr rules at the old width until the row re-renders — a minor
 /// cosmetic staleness, accepted over keying the cache on width too.
 fn render_markdown(md: &str, width: usize) -> Vec<Line<'_>> {
     let raw = tui_markdown::from_str(md).lines;
+    // Fence classification: prefer the SOURCE-derived plan (fence_plan —
+    // fixes nested fences, whose inner ``` lines the normalized output can't
+    // distinguish from real fences), but only after verifying it against the
+    // actual rendered lines: every fence-looking rendered line must match the
+    // plan's expected text, in order, with no leftovers. Any divergence (a
+    // construct the scan doesn't model) falls back to the plain toggle,
+    // which is exactly the pre-plan behavior.
+    let plan = fence_plan(md);
+    let plan_ok = {
+        let mut plan_iter = plan.iter();
+        let all_match = raw.iter().all(|line| {
+            let first = line.spans.first().map(|s| s.content.as_ref()).unwrap_or("");
+            if !first.trim_start().starts_with("```") {
+                return true; // not fence-looking: doesn't consume the plan
+            }
+            matches!(plan_iter.next(), Some((_, want)) if want == first)
+        });
+        all_match && plan_iter.next().is_none()
+    };
     let mut lines: Vec<Line<'_>> = Vec::with_capacity(raw.len());
     let mut in_fence = false;
+    let mut next_evt = 0usize;
     for line in raw {
         let first: &str = line.spans.first().map(|s| s.content.as_ref()).unwrap_or("");
         if first.trim_start().starts_with("```") {
-            // Fence marker line (``` or ```lang): drop it and toggle.
-            in_fence = !in_fence;
-            continue;
+            // Fence-looking line: with a verified plan, classify from the
+            // SOURCE (a Content line here is a code line wearing a fence's
+            // clothes — it must fall through to the code rendering below,
+            // NOT toggle); without one, the plain toggle.
+            let is_content = if plan_ok {
+                match plan[next_evt].0 {
+                    FenceEvt::Open => {
+                        in_fence = true;
+                        false
+                    }
+                    FenceEvt::Close => {
+                        in_fence = false;
+                        false
+                    }
+                    FenceEvt::Content => true,
+                }
+            } else {
+                in_fence = !in_fence;
+                false
+            };
+            next_evt += 1;
+            if !is_content {
+                // Fence marker line (``` or ```lang): drop it.
+                continue;
+            }
         }
         if in_fence {
             // Code content: a dim `▎ ` border bar is the only signal — the
@@ -4155,46 +4313,161 @@ fn line_to_owned(line: &Line) -> Line<'static> {
     }
 }
 
-/// Per-row cache of rendered-markdown lines (M6). The draw closure re-renders
-/// every assistant message on EVERY frame — including each streamed TextDelta
-/// and each scroll tick — which re-parses the whole conversation's markdown via
-/// `tui_markdown::from_str` each time. That's O(history) per event and gets
-/// slow for long chats. This memoizes the parse keyed by (text, width) — content
-/// addressing, NOT row index. Keying by row index was unsafe across frames:
-/// `build_history_lines` is called with different slices (the commit window vs a
-/// single in-flight row via `from_ref`), so the same relative index pointed at
-/// different rows across calls, and the stale check only compared (text length,
-/// width) — two different messages of equal byte length would alias and the
-/// wrong cached render would be committed into the terminal scrollback.
+/// SINGLE-slot cache of the CURRENT streaming row's rendered-markdown lines
+/// (M6, re-scoped). The live zone re-renders the in-flight Assistant row on
+/// every redraw — including each busy clock tick between deltas — which would
+/// re-parse its markdown via `tui_markdown::from_str` each frame. The slot
+/// memoizes exactly that one render keyed by (text, width); any other key
+/// replaces it, so occupancy is bounded at 1 by construction.
+///
+/// Why one slot suffices (the original design was an unbounded `HashMap`):
+/// the commit path renders each finalized row exactly once — `commit_rows`
+/// runs only when the watermark advances, so a row is never re-rendered —
+/// and those renders now BYPASS the cache (`push_assistant_body` checks
+/// `live`), because a cached committed row is dead weight: its entry was
+/// never read again yet stayed resident, and during streaming every TextDelta
+/// inserted a fresh key (one full `Vec<Line>` of the message-so-far each),
+/// accumulating O(text × deltas) memory per message. The content key keeps
+/// the old anti-aliasing guarantee: equal-length different messages can
+/// never share an entry, so a wrong cached render can't be committed into
+/// the terminal scrollback (the bug the pre-content-key index-keyed cache
+/// had — `build_history_lines` is called with different row slices across
+/// frames, so relative indices pointed at different rows).
 struct MdCache {
-    entries: std::collections::HashMap<(String, usize), Vec<Line<'static>>>,
+    slot: Option<((String, usize), Vec<Line<'static>>)>,
 }
 
 impl MdCache {
     fn new() -> Self {
-        Self {
-            entries: std::collections::HashMap::new(),
-        }
+        Self { slot: None }
     }
     fn clear(&mut self) {
-        self.entries.clear();
+        self.slot = None;
     }
-    /// Cached rendered lines for `text` at `width`, recomputing via `render` on
-    /// a miss. Keyed by (text, width) so equal-length different messages never
-    /// alias. The returned slice's borrow ends at the next `&mut self` call.
+    /// Occupancy: always 0 or 1. Test hook for the unbounded-growth
+    /// regression (`md_cache_bounded_single_slot_and_commit_bypass`).
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        usize::from(self.slot.is_some())
+    }
+    /// Cached rendered lines for `text` at `width`, recomputing via `render`
+    /// when the slot's key differs. Keyed by (text, width) so equal-length
+    /// different messages never alias; width participates because hr rules
+    /// and code bars bake the available measure into their rendered lines
+    /// (a terminal resize must not reuse the old geometry). The returned
+    /// slice's borrow ends at the next `&mut self` call.
     fn get_or_render(
         &mut self,
         text: &str,
         width: usize,
         render: impl FnOnce(&str) -> Vec<Line<'static>>,
     ) -> &[Line<'static>] {
-        // Width participates because Markdown rules and code blocks bake the
-        // available measure into their rendered lines. A terminal resize must
-        // not reuse the old geometry.
-        self.entries
-            .entry((text.to_string(), width))
-            .or_insert_with(|| render(text))
+        let hit = self
+            .slot
+            .as_ref()
+            .is_some_and(|((t, w), _)| t == text && *w == width);
+        if !hit {
+            self.slot = Some(((text.to_string(), width), render(text)));
+        }
+        &self.slot.as_ref().expect("filled above on miss").1
     }
+}
+
+/// How one fence-looking line in tui-markdown's OUTPUT is classified — derived
+/// from the SOURCE markdown by [`fence_plan`], because the output alone cannot
+/// always tell (see `fence_plan` for why).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FenceEvt {
+    /// Opening fence: rendered as `"```" + info string`; enters a code block.
+    Open,
+    /// Closing fence: rendered bare `"```"`; leaves the code block.
+    Close,
+    /// A code CONTENT line that itself looks like a fence (the nested example
+    /// case): rendered verbatim, must NOT toggle the in-code state.
+    Content,
+}
+
+/// Precompute the sequence of fence-looking lines tui-markdown will emit, with
+/// each classified from the SOURCE markdown.
+///
+/// Why the source is needed at all: tui-markdown 0.3 normalizes every fence to
+/// EXACTLY three backticks in its output (`code_block_fence()` = `"```"`,
+/// openers get the info string appended, closers are bare) — the original
+/// marker length is gone. A 4-backtick fence containing a 3-backtick example
+/// therefore renders its inner ``` content line indistinguishably from a real
+/// fence, and a naive rendered-lines toggle flips on it: the rest of the outer
+/// block renders as markdown and everything AFTER the outer close renders as
+/// code. The source keeps the tick counts, so a CommonMark-style scan (backtick
+/// AND tilde fences; a closer must repeat the same char at ≥ the opener's
+/// length with nothing but whitespace after) knows the inner line is content.
+///
+/// The plan is only an ACCELERATION-VERIFIED heuristic, not a second parser:
+/// the caller checks it against the actual rendered lines (count + exact text)
+/// and falls back to the plain toggle on any divergence. Divergence happens
+/// for constructs this scan deliberately does not model — fences nested in
+/// list items or blockquotes (rendered with prefix spans, so not
+/// fence-looking anyway), indented (4-space) code blocks (which tui-markdown
+/// also emits with ``` fence lines), HTML-entity info strings — and for those
+/// the toggle's behavior is unchanged from before this fix.
+fn fence_plan(md: &str) -> Vec<(FenceEvt, String)> {
+    /// Leading-space indent of `line` (spaces only; a tab-indented construct
+    /// falls out of the plan's model and the caller's verification catches it).
+    fn indent_of(line: &str) -> usize {
+        line.len() - line.trim_start_matches(' ').len()
+    }
+    let mut plan = Vec::new();
+    // Open fence: (marker char, marker length). `None` outside code blocks.
+    let mut open: Option<(char, usize)> = None;
+    // Indent (0..=3 spaces) of the currently open fence — stripped from its
+    // content lines, mirroring CommonMark/pulldown-cmark.
+    let mut open_indent = 0usize;
+    for line in md.split('\n') {
+        let indent = indent_of(line);
+        let rest = &line[indent..];
+        let backticks = rest.chars().take_while(|c| *c == '`').count();
+        let tildes = rest.chars().take_while(|c| *c == '~').count();
+        if let Some((ch, need)) = open {
+            // Closer: same char, length ≥ the opener's, whitespace only after.
+            let run = if ch == '`' { backticks } else { tildes };
+            if indent <= 3 && run >= need && rest[run..].trim().is_empty() {
+                plan.push((FenceEvt::Close, "```".to_string()));
+                open = None;
+                continue;
+            }
+            // Content: verbatim except the fence's own indent. Only lines
+            // that LOOK like fences enter the plan (the caller only matches
+            // those); the expected text is the rendered one.
+            let strip = open_indent.min(indent);
+            let stripped = &line[strip..];
+            if stripped.starts_with("```") {
+                plan.push((FenceEvt::Content, stripped.to_string()));
+            }
+        } else if indent <= 3 {
+            // Opener: ≥3 markers; a backtick fence's info string must not
+            // contain backticks (CommonMark).
+            let (ch, run) = if backticks >= 3 {
+                ('`', backticks)
+            } else if tildes >= 3 {
+                ('~', tildes)
+            } else {
+                continue;
+            };
+            let info = rest[run..].trim();
+            if ch == '`' && info.contains('`') {
+                continue;
+            }
+            plan.push((FenceEvt::Open, format!("```{info}")));
+            open = Some((ch, run));
+            open_indent = indent;
+        }
+    }
+    // An unclosed fence at EOF is auto-closed by pulldown-cmark, and
+    // tui-markdown's end_codeblock then emits the bare closer — a streaming
+    // half-written block must still match the rendered line stream.
+    if open.is_some() {
+        plan.push((FenceEvt::Close, "```".to_string()));
+    }
+    plan
 }
 
 /// ATX header level if `s` starts with 1..=6 '#' immediately followed by a
@@ -4274,14 +4547,37 @@ impl InputBuffer {
     /// pastes) is dropped so it doesn't leave a stray CR in the input. A lone
     /// `\r` is kept — swallowing every CR would corrupt content that uses it
     /// deliberately (e.g. progress-redraw snippets).
+    ///
+    /// Runs are inserted in BULK: the old per-char loop hit `put_char`, whose
+    /// `String::insert` shifts the whole tail once PER CHARACTER — O(n²) on a
+    /// MB-scale single-line paste (long URLs, base64, minified JSON), freezing
+    /// the UI thread for minutes. Splitting on the line breaks and splicing
+    /// each run with one `insert_str` makes it linear; the lines/row/col
+    /// semantics are byte-identical to the per-char version (pinned by
+    /// `insert_str_bulk_matches_char_by_char_reference`).
     fn insert_str(&mut self, s: &str) {
-        let mut chars = s.chars().peekable();
-        while let Some(c) = chars.next() {
-            match c {
-                '\n' => self.newline(),
-                '\r' if chars.peek() == Some(&'\n') => {}
-                _ => self.put_char(c),
+        let mut rest = s;
+        while !rest.is_empty() {
+            // Bulk-splice the run up to the next line-break-ish char ('\n'
+            // splits; '\r' may be half of a CRLF pair). No hit = the tail run.
+            let seg_end = rest.find(['\n', '\r']).unwrap_or(rest.len());
+            if seg_end > 0 {
+                let line = &mut self.lines[self.row];
+                line.insert_str(self.col, &rest[..seg_end]);
+                self.col += seg_end;
             }
+            if seg_end == rest.len() {
+                break;
+            }
+            let after = &rest[seg_end + 1..]; // '\n' and '\r' are one byte
+            if rest.as_bytes()[seg_end] == b'\n' {
+                self.newline();
+            } else if !after.starts_with('\n') {
+                // A lone '\r' is ordinary content; the '\r' of a CRLF pair
+                // is dropped here and its '\n' handled on the next turn.
+                self.put_char('\r');
+            }
+            rest = after;
         }
     }
 
@@ -4561,6 +4857,97 @@ mod tests {
             .find(|l| row_text(l).starts_with("after"))
             .expect("the line after the block");
         assert!(after.spans.iter().any(|s| s.style.fg == Some(Color::White)));
+    }
+
+    #[test]
+    fn markdown_nested_fences_render_from_the_source_plan() {
+        // P2-4 regression: tui-markdown normalizes EVERY fence to exactly
+        // three backticks in its output, so within the rendered lines alone
+        // the inner ``` of a 4-backtick example is indistinguishable from a
+        // real fence — the old per-line toggle flipped on it, rendering the
+        // rest of the outer block as markdown and everything after the outer
+        // close as code. The source-derived fence_plan keeps them straight.
+        let md = "intro\n\n````md\nan example:\n```\ncode\n```\n````\n\nafter the block\n";
+        let lines = render_markdown(md, 40);
+        let texts: Vec<String> = lines.iter().map(row_text).collect();
+        // No UNBARRED fence-looking line leaks (the inner ``` pair is real
+        // code content and correctly keeps the `▎ ` code bar).
+        assert!(
+            !texts
+                .iter()
+                .any(|t| t.trim_start().starts_with("```") && !t.starts_with("▎ ")),
+            "fence marker lines leaked: {texts:?}"
+        );
+        // Everything inside the OUTER fence is code — including the lines
+        // between the inner ``` pair, which the toggle used to flip on.
+        for want in ["▎ an example:", "▎ ```", "▎ code"] {
+            assert!(
+                texts.iter().any(|t| t == want),
+                "missing code line {want:?}: {texts:?}"
+            );
+        }
+        // Prose before and after renders WITHOUT the code bar.
+        assert!(texts.iter().any(|t| t == "intro"), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "after the block"), "{texts:?}");
+        // And no line after the block carries the bar (the old bug rendered
+        // the post-block prose as code).
+        let after_idx = texts
+            .iter()
+            .position(|t| t == "after the block")
+            .expect("after line");
+        assert!(
+            !texts[after_idx..].iter().any(|t| t.starts_with("▎ ")),
+            "prose after the block rendered as code: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn fence_plan_classifies_nested_unclosed_and_tilde_fences() {
+        // Simple fenced block: open (with the info string) + close.
+        let plan = fence_plan("```rust\nlet x = 1;\n```\n");
+        assert_eq!(
+            plan,
+            vec![
+                (FenceEvt::Open, "```rust".to_string()),
+                (FenceEvt::Close, "```".to_string()),
+            ]
+        );
+        // Nested: the 3-backtick lines inside a 4-backtick fence are CONTENT
+        // (a closer needs ≥ the opener's length), and the EOF auto-close of
+        // an unclosed fence still yields a Close event.
+        let plan = fence_plan("````\nfoo\n```\n");
+        assert_eq!(
+            plan,
+            vec![
+                (FenceEvt::Open, "```".to_string()),
+                (FenceEvt::Content, "```".to_string()),
+                (FenceEvt::Close, "```".to_string()), // synthesized at EOF
+            ]
+        );
+        // Tilde fences normalize to ``` in the output too; a backtick run
+        // inside one is content, and a tilde run can't close a backtick
+        // fence (different char) — nor can a SHORTER backtick run.
+        let plan = fence_plan("~~~\n```\n~~~\n");
+        assert_eq!(
+            plan,
+            vec![
+                (FenceEvt::Open, "```".to_string()),
+                (FenceEvt::Content, "```".to_string()),
+                (FenceEvt::Close, "```".to_string()),
+            ]
+        );
+        let plan = fence_plan("````\n```\n````\n");
+        assert_eq!(
+            plan,
+            vec![
+                (FenceEvt::Open, "```".to_string()),
+                (FenceEvt::Content, "```".to_string()),
+                (FenceEvt::Close, "```".to_string()),
+            ]
+        );
+        // Prose-only and blank documents produce an empty plan.
+        assert!(fence_plan("plain text\n\n- item").is_empty());
+        assert!(fence_plan("").is_empty());
     }
 
     #[test]
@@ -4845,6 +5232,21 @@ mod tests {
         let lines = history(&[Row::sys_warn("w1\nw2")]);
         assert_eq!(row_text(&lines[0]), "· w1");
         assert_eq!(row_text(&lines[1]), "  w2");
+    }
+
+    #[test]
+    fn code_log_row_renders_with_exactly_one_marker() {
+        // The CodeLog event used to bake a "· " into the sys_info payload
+        // while the renderer (and render_transcript) draw their own marker —
+        // "· · line". The payload must stay bare: exactly one marker on
+        // screen, exactly one in /export.
+        let row = code_log_row("console: hi".into());
+        let lines = history(std::slice::from_ref(&row));
+        assert_eq!(row_text(&lines[0]), "    · console: hi");
+        assert!(!row_text(&lines[0]).contains("· ·"));
+        let out = render_transcript(&[row]);
+        assert!(out.contains("· console: hi"), "transcript: {out:?}");
+        assert!(!out.contains("· ·"), "doubled marker leaked: {out:?}");
     }
 
     #[test]
@@ -5390,6 +5792,21 @@ mod tests {
         assert_eq!(seg.content.width(), 20);
         // Even "…" + the basename exceeds the budget: nothing.
         assert!(right_path_seg("/a/verylongbasename", 12).is_none());
+        // Windows backslash paths: the basename is the segment after EITHER
+        // separator — rsplit('/')-only found no split, took the whole path as
+        // the "basename", and the segment vanished (regression).
+        let seg = right_path_seg(r"D:\work\spaces\tiny-agent", 20).expect("win path truncates");
+        assert!(seg.content.contains('…'), "{:?}", seg.content);
+        assert!(
+            seg.content.ends_with("tiny-agent"),
+            "the project dir tail must survive: {:?}",
+            seg.content
+        );
+        assert_eq!(seg.content.width(), 20);
+        // Mixed separators take the last segment regardless of kind.
+        let seg = right_path_seg(r"C:/mixed\path\proj", 40).expect("fits");
+        assert!(seg.content.ends_with(r"C:/mixed\path\proj"));
+        assert_eq!(seg.content.width(), 40);
         // Empty path (cwd query failed): nothing.
         assert!(right_path_seg("", 40).is_none());
     }
@@ -6363,6 +6780,41 @@ mod tests {
     }
 
     #[test]
+    fn ansi_plain_keeps_the_trailing_blank_line_a_newline_opens() {
+        // "a\n" shows one more (empty) line than "a" on screen; the tail
+        // flush must materialize it or ansi_plain's join drops it and
+        // /export ends one line short of the display.
+        assert_eq!(ansi_plain("a\n"), "a\n");
+        assert_eq!(ansi_plain("a"), "a");
+        let lines = ansi_to_lines("a\n");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(row_text(&lines[1]), "");
+        // No trailing newline → the line count is unchanged.
+        assert_eq!(ansi_to_lines("a").len(), 1);
+        // Every newline opens a line: two newlines, two blank tails.
+        assert_eq!(ansi_plain("a\n\n"), "a\n\n");
+    }
+
+    #[test]
+    fn ansi_to_lines_bare_esc_does_not_eat_its_neighbor() {
+        // A lone ESC followed by '\n': the newline is plain text, not a
+        // sequence introducer — it must survive (two lines), not be
+        // swallowed as the second byte of a two-char escape.
+        let lines = ansi_to_lines("a\x1b\nb");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(row_text(&lines[0]), "a");
+        assert_eq!(row_text(&lines[1]), "b");
+        // An ordinary letter after ESC is not an introducer either: the ESC
+        // is dropped, 'X' stays.
+        assert_eq!(ansi_to_lines("\x1bXb").len(), 1);
+        assert_eq!(row_text(&ansi_to_lines("\x1bXb")[0]), "Xb");
+        // Real introducers still strip: charset selection (ESC ( B) and the
+        // standalone finals (ESC c) keep only their printable tail.
+        assert_eq!(row_text(&ansi_to_lines("\x1b(Bb")[0]), "Bb");
+        assert_eq!(row_text(&ansi_to_lines("\x1bcx")[0]), "x");
+    }
+
+    #[test]
     fn ansi_tabs_expand_to_two_spaces_on_both_paths() {
         // unicode-width counts \t as zero columns, which would wrap tabbed
         // tool output wrong; both the render path (ansi_to_lines) and the
@@ -6734,6 +7186,99 @@ mod tests {
         b.insert_str("你好\n世界");
         assert_eq!(b.text(), "你好\n世界");
         assert_eq!(b.line_count(), 2);
+    }
+
+    /// The pre-batch `insert_str` algorithm: one `put_char` per character.
+    /// Kept as the reference the bulk implementation must match exactly.
+    fn insert_str_char_by_char(b: &mut InputBuffer, s: &str) {
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\n' => b.newline(),
+                '\r' if chars.peek() == Some(&'\n') => {}
+                _ => b.put_char(c),
+            }
+        }
+    }
+
+    #[test]
+    fn insert_str_bulk_matches_char_by_char_reference() {
+        // P2-3: `insert_str` splices whole runs instead of `put_char`-ing
+        // each byte (String::insert shifts the tail per char — O(n²) on a
+        // MB-scale single-line paste). The bulk version must leave the buffer
+        // and cursor byte-identical to the per-char reference on every shape
+        // of paste: CRLF pairs, lone CRs, CJK/emoji (multi-byte), line breaks
+        // at both ends, pastes into a mid-cursor multi-row buffer, and a
+        // large generated blob.
+        let cases: Vec<&str> = vec![
+            "",
+            "\n",
+            "\r",
+            "\r\n",
+            "\r\n\r\n",
+            "a\rb\r\nc",
+            "line1\r\nline2\nline3\r",
+            "\nlead",
+            "tail\n",
+            "你好\r\n世界\r\r🦀x",
+            "start\u{1F980}mid\rlong run of ascii text without breaks end",
+        ];
+        // A large deterministic blob mixing every shape (the O(n²) shape — a
+        // huge single-line run — included).
+        let mut big = String::new();
+        for i in 0..2000 {
+            big.push_str(&format!("chunk{i} "));
+            if i % 37 == 0 {
+                big.push_str("\r\n");
+            }
+            if i % 53 == 0 {
+                big.push('\r');
+            }
+        }
+        let cases = {
+            let mut c = cases;
+            c.push(&big);
+            c
+        };
+        for s in &cases {
+            // Fresh buffers, paste at the end.
+            let mut bulk = InputBuffer::new();
+            bulk.insert_str(s);
+            let mut reference = InputBuffer::new();
+            insert_str_char_by_char(&mut reference, s);
+            assert_eq!(
+                (bulk.text(), bulk.row, bulk.col),
+                (reference.text(), reference.row, reference.col),
+                "end-paste mismatch for {s:.60?}"
+            );
+            // Multi-row buffer, cursor mid-line: set_text parks at the end of
+            // the last line; one move_up lands on row 1 at col 2 → "ab|cd".
+            let mut bulk = InputBuffer::new();
+            let mut reference = InputBuffer::new();
+            for b in [&mut bulk, &mut reference] {
+                b.set_text("xx\nabcd\nyy");
+                b.move_up(); // row 1 ("abcd"), col clamped from 2 → "ab|cd"
+            }
+            bulk.insert_str(s);
+            insert_str_char_by_char(&mut reference, s);
+            assert_eq!(
+                (bulk.text(), bulk.row, bulk.col),
+                (reference.text(), reference.row, reference.col),
+                "mid-paste mismatch for {s:.60?}"
+            );
+            // Repeated pastes into the SAME buffer (state carries over).
+            let mut bulk = InputBuffer::new();
+            let mut reference = InputBuffer::new();
+            for chunk in ["first\n", "\r\nsecond\r", "三\n四", s] {
+                bulk.insert_str(chunk);
+                insert_str_char_by_char(&mut reference, chunk);
+            }
+            assert_eq!(
+                (bulk.text(), bulk.row, bulk.col),
+                (reference.text(), reference.row, reference.col),
+                "sequence mismatch ending {s:.60?}"
+            );
+        }
     }
 
     #[test]
@@ -7430,42 +7975,45 @@ mod tests {
 
     #[test]
     fn md_cache_recomputes_when_text_or_width_changes() {
-        // M6: the cache is keyed by (text, width). A cache hit ignores the new
-        // renderer (returns the old content); a miss uses it. We prove reuse by
-        // swapping renderers between calls.
+        // Single-slot cache keyed by (text, width): a hit returns the cached
+        // render; ANY other key replaces the slot. Prove reuse vs. recompute
+        // by swapping renderers between calls.
         let mut c = MdCache::new();
-        let upper = |t: &str| vec![Line::from(t.to_string())];
-        let lower = |t: &str| vec![Line::from(t.to_string())];
-
-        // Miss → upper renderer used.
-        let r = c.get_or_render("hi", 40, upper);
-        assert_eq!(r[0].spans.first().unwrap().content.as_ref(), "hi");
-
-        // Hit (same text+width): the lower renderer is IGNORED — still "hi".
-        // Swap to a distinguishing renderer to prove the cached value is returned.
         let distinguishing = |t: &str| vec![Line::from(t.to_string() + "!")];
+        let plain = |t: &str| vec![Line::from(t.to_string())];
+
+        // Miss → the renderer ran.
         let r = c.get_or_render("hi", 40, distinguishing);
+        assert_eq!(r[0].spans.first().unwrap().content.as_ref(), "hi!");
+
+        // Hit (same text+width): the plain renderer is IGNORED — still "hi!".
+        let r = c.get_or_render("hi", 40, plain);
         assert_eq!(
             r[0].spans.first().unwrap().content.as_ref(),
-            "hi",
-            "cache hit must NOT re-render (distinguishing renderer ignored)"
+            "hi!",
+            "cache hit must NOT re-render (plain renderer ignored)"
         );
 
-        // Text grew (streaming): miss → distinguishing renderer now applied.
-        let r = c.get_or_render("hi there", 40, distinguishing);
-        assert_eq!(r[0].spans.first().unwrap().content.as_ref(), "hi there!");
-
-        // Same text at a different terminal width is also a miss.
-        let r = c.get_or_render("hi there", 24, lower);
+        // Text grew (streaming): miss → the plain renderer now applies.
+        let r = c.get_or_render("hi there", 40, plain);
         assert_eq!(r[0].spans.first().unwrap().content.as_ref(), "hi there");
 
-        // The first text is still cached at width 40 (independent of width 24).
-        let r = c.get_or_render("hi", 40, distinguishing);
-        assert_eq!(r[0].spans.first().unwrap().content.as_ref(), "hi");
+        // Same text at a different terminal width is also a miss — a resize
+        // must not reuse the old geometry.
+        let r = c.get_or_render("hi there", 24, distinguishing);
+        assert_eq!(r[0].spans.first().unwrap().content.as_ref(), "hi there!");
 
-        // clear() drops entries → next access is a miss.
+        // The slot is SINGLE: the "hi"@40 entry was evicted by the later
+        // keys, so re-requesting it re-renders with the distinguishing
+        // renderer instead of returning the stale "hi!".
+        let r = c.get_or_render("hi", 40, distinguishing);
+        assert_eq!(r[0].spans.first().unwrap().content.as_ref(), "hi!");
+        assert_eq!(c.len(), 1);
+
+        // clear() drops the slot → next access is a miss.
         c.clear();
-        let r = c.get_or_render("hi there", 24, lower);
+        assert_eq!(c.len(), 0);
+        let r = c.get_or_render("hi there", 24, plain);
         assert_eq!(
             r[0].spans.first().unwrap().content.as_ref(),
             "hi there",
@@ -7491,13 +8039,116 @@ mod tests {
         // Same width, same byte length, DIFFERENT content → must NOT alias.
         let r2 = c.get_or_render("BBBB", 80, renderer);
         assert_eq!(r2[0].spans.first().unwrap().content.as_ref(), "BBBB");
-        // The first entry is untouched by the second render.
-        let r1_again = c.get_or_render("AAAA", 80, renderer);
+        // The slot is single, so "BBBB" evicted "AAAA": re-requesting "AAAA"
+        // RE-RENDERS (the distinguishing renderer's output comes through)
+        // rather than returning either stale entry.
+        let distinguishing = |t: &str| vec![Line::from(format!("[{t}]"))];
+        let r1_again = c.get_or_render("AAAA", 80, distinguishing);
         assert_eq!(
             r1_again[0].spans.first().unwrap().content.as_ref(),
-            "AAAA",
-            "equal-length different messages must not alias in the cache"
+            "[AAAA]",
+            "a single-slot cache re-renders an evicted key instead of aliasing"
         );
+    }
+
+    #[test]
+    fn md_cache_bounded_single_slot_and_commit_bypass() {
+        // P2-1 regression: the cache used to be an unbounded HashMap keyed by
+        // (text, width) — during streaming every TextDelta inserted a NEW key
+        // (each holding a full Vec<Line> of the message-so-far, so memory
+        // accumulated quadratically per message), and committed rows were
+        // inserted too despite being rendered exactly once and never read
+        // again. Now: occupancy stays ≤1 across a whole simulated stream, and
+        // the commit path (LiveRow::None inside push_assistant_body) bypasses
+        // the cache so the live entry survives interleaved commits.
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let calls = Rc::new(Cell::new(0usize));
+        let counting = {
+            let calls = calls.clone();
+            move |t: &str| -> Vec<Line<'static>> {
+                calls.set(calls.get() + 1);
+                vec![Line::from(t.to_string())]
+            }
+        };
+        let mut c = MdCache::new();
+        let mut text = String::from("stream head\n");
+        for i in 0..100 {
+            // A new delta grew the streaming row → live render through the
+            // cache (a miss: the key changed).
+            text.push_str(&format!("stream delta {i} …\n"));
+            let _ = c.get_or_render(&text, 80, &counting);
+            assert!(c.len() <= 1, "cache must hold at most one entry");
+            // An incremental commit finalized a chunk this frame: the commit
+            // render (LiveRow::None) must not touch the slot, which the next
+            // live render of the SAME text proves is still a HIT — had the
+            // commit gone through the cache, it would have evicted the live
+            // entry and forced a re-render (calls+1).
+            let committed = vec![Row::Assistant(format!("final paragraph {i}"))];
+            let _ = build_history_lines(&committed, &mut c, 80, LiveRow::None, false, true);
+            let calls_before = calls.get();
+            let _ = c.get_or_render(&text, 80, &counting);
+            assert_eq!(
+                calls.get(),
+                calls_before,
+                "commit-path render must bypass the cache (live entry evicted)"
+            );
+        }
+        assert_eq!(c.len(), 1, "exactly the live streaming entry remains");
+    }
+
+    #[test]
+    fn diag_sink_forwards_kernel_diag_to_ui() {
+        // P2-2: while the TUI owns the terminal, kernel diagnostics must
+        // arrive as UiMsg::Diag on the UI channel instead of eprintln'ing
+        // from a background thread straight over the raw-mode viewport. The
+        // macros are pub(crate) in the kernel, so the emission is driven
+        // through a public API that diag_warn!s synchronously:
+        // session::load on a corrupt file. The sink is process-global, so
+        // the test tolerates (and skips past) unrelated diag from parallel
+        // tests — same stance as the kernel's own sink test.
+        let (tx, rx) = mpsc::channel::<UiMsg>();
+        install_diag_bridge(tx);
+        let dir = std::env::temp_dir().join(format!("tinyagent-tui-diag-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("corrupt-session.json");
+        std::fs::write(&path, "definitely not json").expect("write corrupt session");
+        let loaded = tiny_agent::session::load(&path).expect("corrupt session must not error");
+        assert!(loaded.is_none(), "a corrupt session starts fresh");
+
+        // The kernel's diag warn must arrive on the UI channel as a Warn
+        // payload (send happens synchronously inside load, before recv).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut saw_diag = false;
+        while Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(UiMsg::Diag(tiny_agent::diag::DiagLevel::Warn, text))
+                    if text.contains("session file corrupt") =>
+                {
+                    saw_diag = true;
+                    break;
+                }
+                Ok(_) => continue, // unrelated parallel emission: skip
+                Err(_) => break,   // timeout / disconnected: stop scanning
+            }
+        }
+        assert!(
+            saw_diag,
+            "the kernel diag warn must reach the UI channel as UiMsg::Diag"
+        );
+
+        // clear_diag_sink restores the stderr fallback: a second emission
+        // after the clear must NOT reach the channel (it goes to eprintln).
+        tiny_agent::diag::clear_diag_sink();
+        let path2 = dir.join("corrupt-session-2.json");
+        std::fs::write(&path2, "also not json").expect("write second corrupt session");
+        let _ = tiny_agent::session::load(&path2);
+        assert!(
+            rx.try_recv().is_err(),
+            "no Diag may arrive after clear_diag_sink"
+        );
+        // Best-effort cleanup (load renames the corrupt files aside).
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

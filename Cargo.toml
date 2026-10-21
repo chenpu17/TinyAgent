@@ -2,32 +2,26 @@
 name = "tiny-agent"
 version = "0.4.2"
 edition = "2021"
-# MSRV floor of the DEFAULT (headless) build, set by the dependency chain:
-# the LOCKED icu_* 2.2.0 family (reqwest → url → idna → idna_adapter) needs
-# 1.86, above every other default-tree crate (clap 4.6 = 1.85; reqwest 1.64
-# / serde_json 1.71 / libc 1.65 sit below). Optional features need more and
-# are enforced by their own deps' rust-version: `tui` → 1.88 (ratatui 0.30),
-# `code` → 1.86 (wasmtime 36). CI's msrv job pins this floor with a
+# MSRV floor of the DEFAULT (headless) build: the heavy lifting stays in the
+# kernel crate (crates/core — its icu_* chain needs 1.86); this crate's own
+# default-tree deps sit below it (clap 4.6 = 1.85). Optional features need
+# more and are enforced by their own deps' rust-version: `tui` → 1.88
+# (ratatui 0.30). CI's msrv job pins the floor with a
 # `cargo +1.86 check --locked` — the lockfile, not the resolver-of-the-day,
 # is what users actually build.
 rust-version = "1.86"
 description = "A minimal single-binary AI agent: one JSON config, two modes (headless / TUI)"
 license = "MIT"
 
-# Workspace so the language bindings (bindings/python, bindings/node) are
-# path-dependencies that evolve with the core library. The root package is a
-# member too (it provides the `tiny_agent` lib + `tiny-agent` bin).
+# Workspace split (kernel extraction): the ROOT package is the CLI/binary
+# half — process-level shell only (arg parsing, SIGINT, exit codes, headless
+# rendering, batch orchestration, the optional TUI). The agent loop, tools,
+# providers, config, skills, MCP, session, and compression live in
+# crates/core (`tiny-agent-core`, lib name `tiny_agent`); the Python / Node
+# bindings path-depend on that crate directly.
 [workspace]
-members = [".", "bindings/python", "bindings/node"]
+members = [".", "crates/core", "bindings/python", "bindings/node"]
 resolver = "2"
-
-# bin + lib share this package: the binary (`tiny-agent`) keeps its existing
-# behavior byte-for-byte; the library (`tiny_agent`) exposes the agent loop,
-# tools, and providers for third-party / FFI use. Cargo auto-links the in-package
-# lib to the bin, so main.rs does `use tiny_agent::...`.
-[lib]
-name = "tiny_agent"
-path = "src/lib.rs"
 
 [[bin]]
 name = "tiny-agent"
@@ -36,48 +30,44 @@ path = "src/main.rs"
 [features]
 default = []
 tui = ["dep:ratatui", "dep:crossterm", "dep:tui-markdown", "dep:unicode-width"]
-# Expose the scripted `provider::mock` (otherwise cfg(test)-only) so binding
-# crates and downstream users can run offline / dry-run loops without a key.
-mock = []
-# `run_code` tool: LLM-written JS executed in an in-process wasm sandbox
-# (quickjs-ng compiled with ZERO wasi imports, driven by wasmtime). Off by
-# default — it adds ≈4.6 MiB to the release binary (M2-measured on the musl
-# static build; design §10) and is a per-deployment trust decision
-# (docs/run_code_design.md §15, milestone M1).
-# sha2: audit-input hashing in run_code's meta trace, truncated to 128 bits
-# (design §8.4) — already in the tree transitively via wasmtime, so this is
-# a feature-gated direct edge over an existing dep, not a new dependency.
-code = ["dep:wasmtime", "dep:sha2"]
+# Forwarding features: the binary's --version manifest, the release builds,
+# and the e2e/musl CI jobs drive these at the workspace root exactly as they
+# did when bin + lib shared one package — they just forward into the kernel.
+# `code`: the run_code sandbox (see crates/core/Cargo.toml for the rationale
+# and the ≈4.6 MiB / trust-decision notes).
+code = ["tiny_agent/code"]
+# `mock`: the scripted provider, for offline dry-runs of the binary itself.
+mock = ["tiny_agent/mock"]
 
 [dependencies]
+tiny_agent = { package = "tiny-agent-core", path = "crates/core" }
 anyhow = "1"
-base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
-libc = "0.2"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
+# batch task fragments + report files are serde types; the blocking Client is
+# threaded through batch signatures (built via tiny_agent::provider::new_client).
+# Same versions/features as the kernel crate so the workspace lockfile stays
+# single-sourced.
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
 ratatui = { version = "0.30", optional = true, features = ["scrolling-regions"] }
 crossterm = { version = "0.29", optional = true }
 tui-markdown = { version = "0.3", default-features = false, optional = true }
 unicode-width = { version = "0.2", optional = true }
-# Minimal wasmtime: Cranelift compiler + runtime, no async / wat / component
-# model / pooling allocator. Synchronous like the rest of the crate.
-# `cache` (v2 P1): on-disk compilation cache for quickjs.wasm — a fresh
-# process no longer re-pays the lazy compile; any cache failure degrades to
-# "no cache", never blocks the sandbox.
-wasmtime = { version = "36.0.14", optional = true, default-features = false, features = ["cranelift", "runtime", "std", "cache"] }
-# sha256 for run_code's audit meta (dual 128-bit-truncated input hashes).
-sha2 = { version = "0.10", optional = true }
 
-# Windows shell output decoding: cmd.exe (and many legacy programs) emit text in
-# the system OEM code page (GBK/936 on Chinese Windows), not UTF-8. The shell
-# tool decodes bytes itself, so it needs encoding_rs to interpret non-UTF-8
-# output and windows-sys to read the active OEM code page. Unix tools are UTF-8,
-# so these stay Windows-only and don't touch other platforms.
-[target.'cfg(windows)'.dependencies]
-encoding_rs = "0.8"
-windows-sys = { version = "0.52", features = ["Win32_Globalization"] }
+# SIGINT plumbing in signal.rs is #[cfg(unix)] (Windows uses
+# SetConsoleCtrlHandler); keeping libc here off the Windows dependency graph.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Unit tests inside harness.rs drive the retry ladder with the scripted
+# MockProvider — visible from THIS crate only when the dependency carries the
+# `mock` feature (provider::mock is cfg(any(test, feature="mock")) in the
+# kernel, and "test" there means the kernel's own cfg(test)). Declaring the
+# dep again as a dev-dependency with the feature unifies mock ON for test
+# builds only; plain `cargo build` stays mock-free.
+[dev-dependencies]
+tiny_agent = { package = "tiny-agent-core", path = "crates/core", features = ["mock"] }
 
 [profile.release]
 opt-level = "z"

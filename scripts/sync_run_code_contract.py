@@ -51,7 +51,7 @@ def cross_check_readme_spec(section):
     disagree on the numeric knobs — the drift direction the file-hash alone
     can't see (changing config.rs touches no hashed file). Runs in BOTH
     --write and --check modes."""
-    src = (ROOT / "src/config.rs").read_text(encoding="utf-8")
+    src = (ROOT / "crates/core/src/config.rs").read_text(encoding="utf-8")
     dm = re.search(r"impl Default for CodeConfig \{(.*?)\n\}", src, re.S)
     if not dm:
         raise SystemExit("config.rs: `impl Default for CodeConfig` not found (extractor drift)")
@@ -132,18 +132,22 @@ def main():
     mode.add_argument("--check", action="store_true")
     args = parser.parse_args()
 
-    source = (ROOT / "src/tools/run_code.rs").read_text(encoding="utf-8")
+    # run_code.rs was split into run_code/ submodules: the pinned facade
+    # path stays, but the extracted bytes moved — description + schema live
+    # in tool.rs, PRELUDE_SRC in contract.rs.
+    tool_src = (ROOT / "crates/core/src/tools/run_code/tool.rs").read_text(encoding="utf-8")
     matches = re.findall(
         r'name: "run_code"\.into\(\),\s*description: r#"(.*?)"#\s*'
-        r'\.into\(\),\s*schema: json!\((\{.*?\})\),', source, re.S
+        r'\.into\(\),\s*schema: json!\((\{.*?\})\),', tool_src, re.S
     )
     if len(matches) != 1:
         raise SystemExit("Expected exactly one run_code definition; update the extractor.")
     description, schema = matches[0]
     definition = {"name": "run_code", "description": description, "schema": json.loads(schema)}
-    skill = (ROOT / "src/tools/run_code_skill.md").read_text(encoding="utf-8")
+    skill = (ROOT / "crates/core/src/tools/run_code_skill.md").read_text(encoding="utf-8")
     teaser = re.search(r"^description: (.+)$", skill, re.M).group(1)
-    prelude = re.search(r'const PRELUDE_SRC: &str = r#"(.*?)"#;', source, re.S).group(1)
+    contract_src = (ROOT / "crates/core/src/tools/run_code/contract.rs").read_text(encoding="utf-8")
+    prelude = re.search(r'const PRELUDE_SRC: &str = r#"(.*?)"#;', contract_src, re.S).group(1)
     if len(description) > 1200 or len(teaser) > 1024:
         raise SystemExit(f"Character cap exceeded: description={len(description)}, teaser={len(teaser)}")
 
@@ -165,7 +169,21 @@ def main():
 
     paths = [
         "examples/prompts/agentic.md", "examples/prompts/agentic-code.md",
-        "src/tools/run_code.rs", "src/tools/run_code_skill.md", "src/tools/skill.rs",
+        "crates/core/src/tools/run_code.rs",
+        # The split moved the tool body into run_code/ submodules — pin them
+        # too so any edit there still forces a conscious manifest refresh.
+        # A NEW submodule file must be added here and to gen_structure.py
+        # ENTRIES (both gates key on the explicit list).
+        "crates/core/src/tools/run_code/contract.rs",
+        "crates/core/src/tools/run_code/sandbox.rs",
+        "crates/core/src/tools/run_code/guest_api.rs",
+        "crates/core/src/tools/run_code/fs_policy.rs",
+        "crates/core/src/tools/run_code/lib_index.rs",
+        "crates/core/src/tools/run_code/batch.rs",
+        "crates/core/src/tools/run_code/precheck.rs",
+        "crates/core/src/tools/run_code/tool.rs",
+        "crates/core/src/tools/run_code/test_util.rs",
+        "crates/core/src/tools/run_code_skill.md", "crates/core/src/tools/skill.rs",
         "docs/finetune_support_design.md",
     ]
     manifest = {
