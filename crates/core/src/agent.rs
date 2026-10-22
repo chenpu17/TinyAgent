@@ -38,9 +38,24 @@ pub enum CompressTrigger {
     Manual,
 }
 
+impl CompressTrigger {
+    /// Lowercase wire label for this trigger — the ONE stringification shared
+    /// by the harness NDJSON `event_json` mapping, the human renderer, and
+    /// `CompressionRecord.trigger` (result.json). Keeping the mapping here
+    /// means the three surfaces can't drift (the derive's `"Preflight"`
+    /// capitalization would disagree with the established wire vocabulary).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CompressTrigger::Preflight => "preflight",
+            CompressTrigger::Overflow => "overflow",
+            CompressTrigger::Manual => "manual",
+        }
+    }
+}
+
 /// What a compression pass reports to its caller. Public shape for the
 /// host-initiated [`Agent::compact`]; the run loop consumes the same struct
-/// internally (billing only).
+/// internally (billing + the `CompressionRecord` audit entry).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct CompressOutcome {
     /// Middle messages folded into the summary (`cut - 1`). `0` together with
@@ -52,6 +67,59 @@ pub struct CompressOutcome {
     pub kept: usize,
     /// Usage billed by the summary call(s); `None` = provider reported none.
     pub usage: Option<Usage>,
+    /// [`Agent::estimate_input_tokens`] taken just before the fold — the same
+    /// estimator the preflight gate consults, so `before`/`after` bracket the
+    /// fold with one consistent yardstick. Both values are ESTIMATES.
+    pub estimated_tokens_before: u64,
+    /// The same estimate taken after the fold (anchor voided by the rewrite,
+    /// so this side is always the whole-history heuristic).
+    pub estimated_tokens_after: u64,
+    /// The provider-MEASURED prompt tokens of the request the usage anchor was
+    /// taken on (`UsageAnchor::prompt_tokens`), when that anchor was still
+    /// valid at fold time — `None` means no measurement applied (first turn,
+    /// resumed history, anchor voided by an earlier prune). Never a
+    /// calibrated estimate: this field's only job is to say what the provider
+    /// actually counted for a context of this shape.
+    pub measured_tokens_before: Option<u64>,
+}
+
+/// One completed compression, as recorded in the run's audit trail
+/// (`RunOutcome.compressions` / `RunError.compressions` → result.json's
+/// `compressions`). Mirrors the `Compressed` event's numbers so a consumer
+/// can reconcile the live stream against the artifact; `trigger` is the
+/// lowercase wire label ([`CompressTrigger::as_str`]) rather than the enum so
+/// result.json and the NDJSON spelling stay identical. Lifecycle mirrors
+/// `tool_calls`: a run-local Vec that survives into the outcome on success
+/// and into `RunError` when the run dies later (an audit entry is a bill —
+/// the compression's summary request really burned tokens).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CompressionRecord {
+    pub trigger: String,
+    pub dropped: usize,
+    pub kept: usize,
+    pub estimated_tokens_before: u64,
+    pub estimated_tokens_after: u64,
+    /// Provider-measured prompt tokens behind the `before` estimate; absent
+    /// when no valid anchor existed (see [`CompressOutcome::
+    /// measured_tokens_before`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measured_tokens_before: Option<u64>,
+}
+
+impl CompressionRecord {
+    /// Build the audit entry from a completed fold's outcome. The degenerate
+    /// empty-summary pass (`dropped == 0`) must NOT be recorded — its caller
+    /// filters it out before calling here, symmetric with the (non-)event.
+    pub fn from_outcome(trigger: CompressTrigger, o: &CompressOutcome) -> Self {
+        CompressionRecord {
+            trigger: trigger.as_str().to_string(),
+            dropped: o.dropped,
+            kept: o.kept,
+            estimated_tokens_before: o.estimated_tokens_before,
+            estimated_tokens_after: o.estimated_tokens_after,
+            measured_tokens_before: o.measured_tokens_before,
+        }
+    }
 }
 
 /// A compression that FAILED but still burned tokens — the Err twin of
@@ -152,11 +220,19 @@ pub enum AgentEvent {
         cache_read_input_tokens: u64,
     },
     /// History was compressed: how many middle messages were dropped,
-    /// how many remain, and which path triggered it.
+    /// how many remain, which path triggered it, and the estimated-vs-
+    /// measured context size around the fold (see [`CompressOutcome`] for
+    /// the field semantics — the event carries the same numbers the audit
+    /// record keeps).
     Compressed {
         dropped: usize,
         kept: usize,
         trigger: CompressTrigger,
+        estimated_tokens_before: u64,
+        estimated_tokens_after: u64,
+        /// Provider-measured prompt tokens behind the `before` estimate;
+        /// `null` when no valid usage anchor existed at fold time.
+        measured_tokens_before: Option<u64>,
     },
     /// Stale oversized tool results were replaced with compact placeholders —
     /// the pre-LLM context gate (no request billed). `messages` counts
@@ -212,6 +288,32 @@ pub struct ToolCallRecord {
     /// None, so leaf tools stay byte-identical to before).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub meta: Option<Value>,
+    /// Wall-clock milliseconds the tool BODY ran — timed after the hooks gate
+    /// (an approval wait is not tool time) and around the tool itself, so
+    /// queueing and gating are excluded. `None` = the call never executed (a
+    /// Deny, a cancel checkpoint, or a placeholder for a call whose gate
+    /// passed but never started); serialized as `tool_calls[].duration_ms`
+    /// with the key omitted when None.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+}
+
+/// Per-turn wall-clock timing for a completed run (`RunOutcome.turn_timings`).
+/// One row per turn that STARTED — including wrap-up/salvage turns and a turn
+/// that died mid-request on an Ok-shaped stop (`timeout`) — so `len()` always
+/// equals `RunOutcome.turns`. FAILED runs (`RunError`) carry no per-turn
+/// detail; their total wall clock is still in `elapsed`/`elapsed_secs`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TurnTiming {
+    /// 1-based turn number (matches the `TurnStart` event).
+    pub turn: u32,
+    /// Wall-clock milliseconds from the turn's start (the `turns += 1` point,
+    /// so preflight compression counts toward the turn) to the point the turn
+    /// body ended.
+    pub duration_ms: u64,
+    /// Tool calls recorded during this turn (delta of the run's
+    /// `tool_calls` log).
+    pub tool_calls: usize,
 }
 
 /// One row of the agent's self-tracked task plan, written via the `todo` tool.
@@ -276,6 +378,17 @@ pub struct RunOutcome {
     pub turns: u32,
     pub stop_reason: String,
     pub tool_calls: Vec<ToolCallRecord>,
+    /// Audit trail of the compressions this run completed (see
+    /// [`CompressionRecord`]). The degenerate empty-summary pass is not
+    /// recorded — symmetric with its (absent) `Compressed` event. Empty when
+    /// the run never compressed; the serde skip keeps such results
+    /// byte-identical to before the field existed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub compressions: Vec<CompressionRecord>,
+    /// Per-turn wall-clock timing (see [`TurnTiming`]). One row per started
+    /// turn, so `len() == turns` on every outcome.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub turn_timings: Vec<TurnTiming>,
     /// Token usage summed across every chat request in this run (best-effort:
     /// only the requests whose stream reached the usage frame). The cache_*
     /// fields accumulate prompt-cache writes/reads so the reported cost stays
@@ -303,6 +416,9 @@ pub struct RunError {
     pub usage: Usage,
     /// Tool calls executed in this run before it errored.
     pub tool_calls: Vec<ToolCallRecord>,
+    /// Compressions completed in this run before it errored — same honest
+    /// audit as `tool_calls`: the summary requests really burned tokens.
+    pub compressions: Vec<CompressionRecord>,
     /// Turns completed before the error — surfaced in result.json on failure so
     /// the schema matches the success path (a CI consumer reads `.turns` /
     /// `.elapsed_secs` regardless of `.success`).
@@ -378,10 +494,11 @@ impl RunError {
 impl serde::Serialize for RunError {
     fn serialize<S: serde::Serializer>(&self, ser: S) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut s = ser.serialize_struct("RunError", 5)?;
+        let mut s = ser.serialize_struct("RunError", 6)?;
         s.serialize_field("error", &self.source.to_string())?;
         s.serialize_field("usage", &self.usage)?;
         s.serialize_field("tool_calls", &self.tool_calls)?;
+        s.serialize_field("compressions", &self.compressions)?;
         s.serialize_field("turns", &self.turns)?;
         s.serialize_field("elapsed", &self.elapsed)?;
         s.end()
@@ -397,6 +514,9 @@ impl serde::Serialize for RunError {
 pub struct RunCost {
     pub usage: Usage,
     pub tool_calls: Vec<ToolCallRecord>,
+    /// Compressions completed by failed attempts (same honest audit as
+    /// `tool_calls` — folded into the outcome / result.json).
+    pub compressions: Vec<CompressionRecord>,
     /// Turns accumulated across failed attempts (folded into the outcome so
     /// `result.json`'s `turns`/`elapsed_secs` stay consistent on success).
     pub turns: u32,
@@ -427,6 +547,7 @@ impl RunCost {
             .cache_read_input_tokens
             .saturating_add(re.usage.cache_read_input_tokens);
         self.tool_calls.extend(re.tool_calls.iter().cloned());
+        self.compressions.extend(re.compressions.iter().cloned());
         self.turns = self.turns.saturating_add(re.turns);
         self.elapsed = self.elapsed.saturating_add(re.elapsed);
     }
@@ -447,6 +568,9 @@ impl RunCost {
         // Earlier attempts first, then this attempt's tool calls.
         self.tool_calls.append(&mut o.tool_calls);
         o.tool_calls = std::mem::take(&mut self.tool_calls);
+        // Same chronological order for the compression audit trail.
+        self.compressions.append(&mut o.compressions);
+        o.compressions = std::mem::take(&mut self.compressions);
         o.turns = o.turns.saturating_add(self.turns);
         o.elapsed = o.elapsed.saturating_add(self.elapsed);
     }
@@ -513,6 +637,14 @@ const ARCHIVE_MAX_MESSAGES: usize = 4096;
 /// fsync promptly. Same FIFO eviction as the count cap, both enforced
 /// together: oldest out first, until both hold.
 const ARCHIVE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Milliseconds elapsed since `t`, saturating: `as_millis` returns u128 and a
+/// plain `as u64` would silently truncate an absurd duration to a small lie.
+/// Unreachable in practice — it exists so every timing write-end (per-turn,
+/// per-tool) shares one honest conversion.
+fn ms_since(t: Instant) -> u64 {
+    u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
 
 /// Serialized size (compact JSON bytes) of one message as it will land in the
 /// session file — the unit [`ARCHIVE_MAX_BYTES`] budgets. Computed ONCE per
@@ -1354,13 +1486,14 @@ impl Agent {
     }
 
     /// Wrap a mid-run error with the partial cost burned so far (this run's
-    /// accumulated `usage` + the `records` of tools already executed), so a
-    /// retry loop can bill the failed attempt honestly. Called at every
-    /// error-return point in `run_impl`.
+    /// accumulated `usage` + the `records` of tools already executed + the
+    /// compressions already completed), so a retry loop can bill the failed
+    /// attempt honestly. Called at every error-return point in `run_impl`.
     fn run_error(
         &self,
         source: anyhow::Error,
         records: &[ToolCallRecord],
+        compressions: &[CompressionRecord],
         turns: u32,
         elapsed: Duration,
     ) -> RunError {
@@ -1368,6 +1501,7 @@ impl Agent {
             source,
             usage: self.usage,
             tool_calls: records.to_vec(),
+            compressions: compressions.to_vec(),
             turns,
             elapsed,
         }
@@ -1578,6 +1712,14 @@ impl Agent {
         let mut salvage_used = false;
         let mut final_text = String::new();
         let mut records: Vec<ToolCallRecord> = Vec::new();
+        // Compression audit trail — the CompressionRecord twin of `records`:
+        // run-local, folded into RunOutcome on success and RunError on
+        // failure (an audit entry is a bill; failure doesn't un-burn it).
+        let mut compressions: Vec<CompressionRecord> = Vec::new();
+        // Per-turn wall-clock timing — one TurnTiming row per STARTED turn,
+        // pushed at every non-Err exit of the turn body (so len() == turns
+        // on every Ok outcome). Err returns skip the detail deliberately.
+        let mut turn_timings: Vec<TurnTiming> = Vec::new();
         // 打转检测状态：上一个已决调用的（工具名, 规范化生效参数, 结果指纹）
         // 与其连续重复次数（见 STUCK_NUDGE_AT / STUCK_STOP_AT 的护栏说明）。
         // 没有 stuck_stop 闩锁——轮尾直接读 stuck_len，任何不同键的调用重置
@@ -1651,6 +1793,12 @@ impl Agent {
             }
             turns += 1;
             events(AgentEvent::TurnStart(turns));
+            // This turn's timing row bookkeeping: the timer starts here (so
+            // preflight compression counts toward the turn) and the row is
+            // pushed at the turn body's exit — every non-Err exit pushes one,
+            // so `turn_timings.len() == turns` on every Ok outcome.
+            let turn_started = Instant::now();
+            let turn_records_at_start = records.len();
             // Preflight compression: if the history is large enough that this
             // request would blow the window, summarize first. The summary
             // request is a real billed call; fold its usage into the run totals
@@ -1667,6 +1815,14 @@ impl Agent {
                 Ok(Some(outcome)) => {
                     if let Some(u) = outcome.usage {
                         self.bill_chat(events, &u);
+                    }
+                    // The degenerate empty-summary pass (dropped == 0) is not
+                    // recorded — symmetric with its (absent) Compressed event.
+                    if outcome.dropped > 0 {
+                        compressions.push(CompressionRecord::from_outcome(
+                            CompressTrigger::Preflight,
+                            &outcome,
+                        ));
                     }
                 }
                 Ok(None) => {}
@@ -1762,7 +1918,13 @@ impl Agent {
                     // live in the body — the match guard stays pure.
                     Err(e) if compress::is_context_overflow(&e) => {
                         if overflow_recovered && prune_backstop_used {
-                            return Err(self.run_error(e, &records, turns, start.elapsed()));
+                            return Err(self.run_error(
+                                e,
+                                &records,
+                                &compressions,
+                                turns,
+                                start.elapsed(),
+                            ));
                         }
                         if !overflow_recovered {
                             // Cheapest first: placeholder-prune stale tool output (no
@@ -1802,6 +1964,15 @@ impl Agent {
                                         if let Some(u) = outcome.usage {
                                             self.bill_chat(events, &u);
                                         }
+                                        // Same audit as the Preflight arm (the
+                                        // degenerate dropped == 0 pass is not
+                                        // recorded — no event fired for it).
+                                        if outcome.dropped > 0 {
+                                            compressions.push(CompressionRecord::from_outcome(
+                                                CompressTrigger::Overflow,
+                                                &outcome,
+                                            ));
+                                        }
                                     }
                                     Ok(None) => {}
                                     Err(ce) => {
@@ -1823,7 +1994,13 @@ impl Agent {
                                     continue;
                                 }
                             }
-                            return Err(self.run_error(e, &records, turns, start.elapsed()));
+                            return Err(self.run_error(
+                                e,
+                                &records,
+                                &compressions,
+                                turns,
+                                start.elapsed(),
+                            ));
                         }
                         // overflow_recovered && !prune_backstop_used: the FOLDED
                         // history still overflows. With a small window the kept
@@ -1845,7 +2022,13 @@ impl Agent {
                         if freed > 0 {
                             continue;
                         }
-                        return Err(self.run_error(e, &records, turns, start.elapsed()));
+                        return Err(self.run_error(
+                            e,
+                            &records,
+                            &compressions,
+                            turns,
+                            start.elapsed(),
+                        ));
                     }
                     Err(e) => {
                         // A request that only fails once the run's wall clock
@@ -1858,9 +2041,20 @@ impl Agent {
                         // P2). A pre-deadline failure keeps its real error.
                         if deadline.is_some_and(|d| Instant::now() >= d) {
                             stop_reason = "timeout".into();
+                            turn_timings.push(TurnTiming {
+                                turn: turns,
+                                duration_ms: ms_since(turn_started),
+                                tool_calls: records.len().saturating_sub(turn_records_at_start),
+                            });
                             break 'turns;
                         }
-                        return Err(self.run_error(e, &records, turns, start.elapsed()));
+                        return Err(self.run_error(
+                            e,
+                            &records,
+                            &compressions,
+                            turns,
+                            start.elapsed(),
+                        ));
                     }
                 }
             };
@@ -1925,6 +2119,11 @@ impl Agent {
                 // error keeps the retryable Err below.
                 if deadline.is_some_and(|d| Instant::now() >= d) {
                     stop_reason = "timeout".into();
+                    turn_timings.push(TurnTiming {
+                        turn: turns,
+                        duration_ms: ms_since(turn_started),
+                        tool_calls: records.len().saturating_sub(turn_records_at_start),
+                    });
                     break 'turns;
                 }
                 let msg = resp
@@ -1941,6 +2140,7 @@ impl Agent {
                 return Err(self.run_error(
                     anyhow::Error::msg(msg),
                     &records,
+                    &compressions,
                     turns,
                     start.elapsed(),
                 ));
@@ -1988,8 +2188,18 @@ impl Agent {
                     if let Some(w) = self.push_user(vec![Block::Text(SALVAGE_NUDGE_EMPTY.into())]) {
                         events(AgentEvent::Warning(w));
                     }
+                    turn_timings.push(TurnTiming {
+                        turn: turns,
+                        duration_ms: ms_since(turn_started),
+                        tool_calls: records.len().saturating_sub(turn_records_at_start),
+                    });
                     continue;
                 }
+                turn_timings.push(TurnTiming {
+                    turn: turns,
+                    duration_ms: ms_since(turn_started),
+                    tool_calls: records.len().saturating_sub(turn_records_at_start),
+                });
                 break;
             }
             // Repair tool_use ids BEFORE the assistant message is persisted:
@@ -2079,12 +2289,27 @@ impl Agent {
                     {
                         events(AgentEvent::Warning(w));
                     }
+                    turn_timings.push(TurnTiming {
+                        turn: turns,
+                        duration_ms: ms_since(turn_started),
+                        tool_calls: records.len().saturating_sub(turn_records_at_start),
+                    });
                     continue;
                 }
+                turn_timings.push(TurnTiming {
+                    turn: turns,
+                    duration_ms: ms_since(turn_started),
+                    tool_calls: records.len().saturating_sub(turn_records_at_start),
+                });
                 break;
             }
 
             if !has_tool_use {
+                turn_timings.push(TurnTiming {
+                    turn: turns,
+                    duration_ms: ms_since(turn_started),
+                    tool_calls: records.len().saturating_sub(turn_records_at_start),
+                });
                 break; // end_turn / max_tokens without pending calls
             }
 
@@ -2116,13 +2341,16 @@ impl Agent {
             // for every tool_use) without billing usage or recording a call —
             // matching the pre-parallel behavior. `Ran` is a real ToolOutput
             // (a Sequential tool run inline, or a Parallel one run in the
-            // batch below). Boxed because `ToolOutput` carries an
-            // `Option<Value>` (audit `meta`) and crossed the
-            // `large_enum_variant` threshold — an alloc per tool call is
-            // negligible and keeps `Slot` (one per tool_use, in a Vec) small.
+            // batch below) plus the tool body's wall-clock duration — `None`
+            // when the call never actually executed (Deny / cancel checkpoint
+            // / approved-but-never-started placeholder). Boxed because
+            // `ToolOutput` carries an `Option<Value>` (audit `meta`) and
+            // crossed the `large_enum_variant` threshold — an alloc per tool
+            // call is negligible and keeps `Slot` (one per tool_use, in a
+            // Vec) small.
             enum Slot {
                 Cancelled,
-                Ran(Box<ToolOutput>),
+                Ran(Box<ToolOutput>, Option<u64>),
             }
             let mut slots: Vec<Slot> = (0..tool_uses.len()).map(|_| Slot::Cancelled).collect();
             // Hook-Modify replacements, per ordinal (None = ran with the
@@ -2164,7 +2392,7 @@ impl Agent {
                     // ToolResult event is NOT emitted here — the assembly pass
                     // below owns block order, N:N pairing, and the
                     // cancelled-slot synthesis.
-                    let output = {
+                    let (output, duration_ms) = {
                         let mut fwd = |ev: AgentEvent| events(ev);
                         execute_tool_call(
                             &self.tools,
@@ -2176,7 +2404,7 @@ impl Agent {
                             &mut effective_inputs[i],
                         )
                     };
-                    slots[i] = Slot::Ran(Box::new(output));
+                    slots[i] = Slot::Ran(Box::new(output), duration_ms);
                 }
             }
 
@@ -2247,7 +2475,7 @@ impl Agent {
                             crate::tools::truncate(&mut reason, self.ctx.max_output_chars);
                             let output = ToolOutput::error(reason);
                             notify_tool_after(&self.ctx, name, input, &output, false);
-                            slots[i] = Slot::Ran(Box::new(output));
+                            slots[i] = Slot::Ran(Box::new(output), None);
                         }
                         ToolDecision::Allow => {
                             runnable.push((i, name.clone(), input.clone()));
@@ -2329,10 +2557,15 @@ impl Agent {
                             // cancelled-error shape the sequential gate
                             // checkpoint uses.
                             // Probe + join handle per worker; named to keep the
-                            // batch type readable (clippy::type_complexity).
+                            // batch type readable (clippy::type_complexity). The
+                            // tuple also carries the tool body's wall-clock
+                            // duration (`None` when the body never ran).
                             type Worker<'s> = (
                                 Arc<Mutex<Usage>>,
-                                std::thread::ScopedJoinHandle<'s, Option<ToolOutput>>,
+                                std::thread::ScopedJoinHandle<
+                                    's,
+                                    (Option<ToolOutput>, Option<u64>),
+                                >,
                             );
                             let mut handles: Vec<Worker<'_>> = Vec::with_capacity(wave.len());
                             for (_, name, input) in wave {
@@ -2355,9 +2588,13 @@ impl Agent {
                                         let _ = tx.send(ev);
                                     };
                                     if ctx_cancelled(ctx) {
-                                        return None;
+                                        return (None, None);
                                     }
-                                    Some(run_tool(tools, defs, &name, &input, ctx, &mut emit))
+                                    let started = Instant::now();
+                                    let out = run_tool(tools, defs, &name, &input, ctx, &mut emit);
+                                    let ms = u64::try_from(started.elapsed().as_millis())
+                                        .unwrap_or(u64::MAX);
+                                    (Some(out), Some(ms))
                                 });
                                 handles.push((probe, h));
                             }
@@ -2374,7 +2611,7 @@ impl Agent {
                                                         // its ordinal.
                             for (pos, (probe, h)) in handles.into_iter().enumerate() {
                                 let (i, _, _) = wave[pos];
-                                let output = h.join().unwrap_or_else(|_| {
+                                let (output, duration_ms) = h.join().unwrap_or_else(|_| {
                                     // A worker that panicked mid-run has
                                     // already billed its chats into the SHARED
                                     // fleet counter, and the `usage_probe`
@@ -2392,7 +2629,11 @@ impl Agent {
                                         out.usage = Some(recovered);
                                         out.usage_in_shared_budget = true;
                                     }
-                                    Some(out)
+                                    // A panicked worker never got to stop its
+                                    // own timer cleanly — the duration is not
+                                    // observable, keep the record honest with
+                                    // `None`.
+                                    (Some(out), None)
                                 });
                                 match output {
                                     Some(output) => {
@@ -2403,7 +2644,7 @@ impl Agent {
                                             &output,
                                             true,
                                         );
-                                        slots[i] = Slot::Ran(Box::new(output));
+                                        slots[i] = Slot::Ran(Box::new(output), duration_ms);
                                     }
                                     // Cancelled before the tool body ran: same
                                     // shape as the sequential gate checkpoint —
@@ -2419,7 +2660,7 @@ impl Agent {
                                             &output,
                                             false,
                                         );
-                                        slots[i] = Slot::Ran(Box::new(output));
+                                        slots[i] = Slot::Ran(Box::new(output), None);
                                     }
                                 }
                             }
@@ -2440,7 +2681,7 @@ impl Agent {
                 for &(i, ref name, _) in &runnable[spawned..] {
                     let output = ToolOutput::error("[cancelled by user]");
                     notify_tool_after(&self.ctx, name, &tool_uses[i].2, &output, false);
-                    slots[i] = Slot::Ran(Box::new(output));
+                    slots[i] = Slot::Ran(Box::new(output), None);
                 }
             }
 
@@ -2473,7 +2714,7 @@ impl Agent {
                             is_error: true,
                         })
                     }
-                    Slot::Ran(output) => {
+                    Slot::Ran(output, duration_ms) => {
                         // Tool-billed usage always folds into the run totals
                         // (billing is honest regardless of source); the shared
                         // counter gets it only when the producer did NOT
@@ -2498,6 +2739,7 @@ impl Agent {
                             output: output.content.clone(),
                             is_error: output.is_error,
                             meta: output.meta.clone(),
+                            duration_ms: *duration_ms,
                         });
                         events(AgentEvent::ToolResult {
                             name: name.clone(),
@@ -2540,6 +2782,15 @@ impl Agent {
             if let Some(w) = self.save_session() {
                 events(AgentEvent::Warning(w));
             }
+            // Turn-timing row: the turn body is complete (assistant message +
+            // tool results in history). One push here covers all three exits
+            // below — continue to the next turn, cancel break, stuck_loop
+            // break — so `turn_timings.len() == turns` on every Ok outcome.
+            turn_timings.push(TurnTiming {
+                turn: turns,
+                duration_ms: ms_since(turn_started),
+                tool_calls: records.len().saturating_sub(turn_records_at_start),
+            });
             // 轮尾终止判定：取消优先于打转硬停（外审第四轮 P2——本轮内落下
             // 的 cancel 必须报 "cancelled"/exit 130，不能被 stuck_loop 抢走）；
             // 打转直接读当前连续计数（无闩锁）——历史以本轮 tool_results 收口
@@ -2563,6 +2814,8 @@ impl Agent {
             turns,
             stop_reason,
             tool_calls: records,
+            compressions,
+            turn_timings,
             input_tokens: self.usage.input_tokens,
             output_tokens: self.usage.output_tokens,
             cache_creation_input_tokens: self.usage.cache_creation_input_tokens,
@@ -2692,7 +2945,7 @@ pub(crate) fn execute_tool_call(
     input: &Value,
     emit: &mut dyn FnMut(AgentEvent),
     effective_out: &mut Option<Value>,
-) -> ToolOutput {
+) -> (ToolOutput, Option<u64>) {
     emit(AgentEvent::ToolCall {
         name: name.to_string(),
         input: input.clone(),
@@ -2700,6 +2953,9 @@ pub(crate) fn execute_tool_call(
     // Hooks gate (serial on the caller's thread). Deny → an error output that
     // the caller STILL records (N:N pairing + honest audit log) — the
     // reserved-for-cancel slot semantics live in the caller, not here.
+    // The returned duration covers ONLY the tool body (`run_tool`) — gate
+    // deliberation, cancel checkpoints, and event plumbing are excluded, so
+    // a Deny / checkpointed call reports `None` (nothing executed).
     match gate_tool_call(ctx, name, input) {
         ToolDecision::Deny(mut reason) => {
             // Same output budget as any tool error (run_tool's MCP path): a
@@ -2708,7 +2964,7 @@ pub(crate) fn execute_tool_call(
             crate::tools::truncate(&mut reason, ctx.max_output_chars);
             let output = ToolOutput::error(reason);
             notify_tool_after(ctx, name, input, &output, false);
-            output
+            (output, None)
         }
         decision => {
             // Allow → original input; Modify → replacement. The audit trail
@@ -2722,7 +2978,7 @@ pub(crate) fn execute_tool_call(
             if ctx_cancelled(ctx) {
                 let output = ToolOutput::error("[cancelled by user]");
                 notify_tool_after(ctx, name, input, &output, false);
-                return output;
+                return (output, None);
             }
             let effective: &Value = match &decision {
                 ToolDecision::Modify(v) => v,
@@ -2733,9 +2989,11 @@ pub(crate) fn execute_tool_call(
             if let ToolDecision::Modify(v) = &decision {
                 *effective_out = Some(v.clone());
             }
+            let started = Instant::now();
             let output = run_tool(tools, defs, name, effective, ctx, emit);
+            let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             notify_tool_after(ctx, name, input, &output, true);
-            output
+            (output, Some(duration_ms))
         }
     }
 }
@@ -3262,6 +3520,15 @@ impl Agent {
             Some(c) => c,
             None => return Ok(None),
         };
+        // Snapshot the observability pair BEFORE the fold: the same
+        // whole-history estimate the preflight gate just used to decide this
+        // compress, plus the provider-measured prompt tokens from the live
+        // anchor (`None` when the anchor was voided — e.g. by the prune above
+        // — measured and estimated must never be conflated). `after` is taken
+        // post-fold, so the event/outcome pair quantifies what the fold freed.
+        let estimated_tokens_before =
+            u64::try_from(self.estimate_input_tokens()).unwrap_or(u64::MAX);
+        let measured_tokens_before = self.live_anchor().map(|a| a.prompt_tokens);
 
         let (summary, sum_usage) = match self.summarize_prefix(cut, deadline, instructions) {
             Ok((s, u)) if !s.trim().is_empty() => (s, u),
@@ -3279,9 +3546,14 @@ impl Agent {
                 events(AgentEvent::Warning(
                     "context compression produced an empty summary (disabled for this run)".into(),
                 ));
+                // Degenerate pass: no fold happened, so `after` == `before`;
+                // emits no event and is recorded by no caller (dropped == 0).
                 return Ok(Some(CompressOutcome {
                     dropped: 0,
                     kept: self.messages.len(),
+                    estimated_tokens_before,
+                    estimated_tokens_after: estimated_tokens_before,
+                    measured_tokens_before,
                     usage: u,
                 }));
             }
@@ -3298,6 +3570,8 @@ impl Agent {
         let dropped_middle: Vec<Message> = self.messages[1..cut].to_vec();
         self.archive_messages(dropped_middle);
         self.messages = compress::fold_summary(&self.messages, cut, &summary);
+        let estimated_tokens_after =
+            u64::try_from(self.estimate_input_tokens()).unwrap_or(u64::MAX);
         // The folded history shares no measurement with the pre-fold one —
         // the anchor is void (same as after a prune).
         self.usage_anchor = None;
@@ -3313,6 +3587,9 @@ impl Agent {
             dropped,
             kept: self.messages.len(),
             trigger,
+            estimated_tokens_before,
+            estimated_tokens_after,
+            measured_tokens_before,
         });
         // The summary is a real billed request — `usage` travels in the
         // outcome so the caller decides the ledger: the run loop folds it
@@ -3322,6 +3599,9 @@ impl Agent {
         Ok(Some(CompressOutcome {
             dropped,
             kept: self.messages.len(),
+            estimated_tokens_before,
+            estimated_tokens_after,
+            measured_tokens_before,
             usage: sum_usage,
         }))
     }

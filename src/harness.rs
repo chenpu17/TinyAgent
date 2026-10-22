@@ -449,14 +449,25 @@ fn event_json(ev: &AgentEvent) -> Value {
             dropped,
             kept,
             trigger,
+            estimated_tokens_before,
+            estimated_tokens_after,
+            measured_tokens_before,
         } => {
-            let how = match trigger {
-                crate::agent::CompressTrigger::Preflight => "preflight",
-                crate::agent::CompressTrigger::Overflow => "overflow",
-                crate::agent::CompressTrigger::Manual => "manual",
-            };
-            // Additive field: existing consumers of dropped/kept are unaffected.
-            json!({"type": "compressed", "dropped": *dropped, "kept": *kept, "trigger": how})
+            // `trigger` vocabulary converges on `CompressTrigger::as_str` —
+            // same lowercase labels as result.json's CompressionRecord.
+            let how = trigger.as_str();
+            // Additive fields: existing consumers of dropped/kept are
+            // unaffected. `measured_tokens_before` is null when the run had
+            // no valid usage anchor at fold time.
+            json!({
+                "type": "compressed",
+                "dropped": *dropped,
+                "kept": *kept,
+                "trigger": how,
+                "estimated_tokens_before": estimated_tokens_before,
+                "estimated_tokens_after": estimated_tokens_after,
+                "measured_tokens_before": measured_tokens_before,
+            })
         }
         AgentEvent::Pruned {
             messages,
@@ -631,6 +642,11 @@ pub fn write_result(
                     if let Some(m) = &c.meta {
                         entry["meta"] = m.clone();
                     }
+                    // `duration_ms` is sparse the same way: `None` (Deny /
+                    // cancel placeholder / panicked worker) writes nothing.
+                    if let Some(ms) = c.duration_ms {
+                        entry["duration_ms"] = json!(ms);
+                    }
                     entry
                 })
                 .collect();
@@ -658,6 +674,15 @@ pub fn write_result(
             if let Some(plan) = extract_plan(&o.tool_calls) {
                 result["plan"] = json!(plan);
             }
+            // Compression audit + per-turn timing: sparse the same way — a run
+            // that never compressed / a failure path without turn rows leave
+            // the keys out entirely.
+            if !o.compressions.is_empty() {
+                result["compressions"] = json!(o.compressions);
+            }
+            if !o.turn_timings.is_empty() {
+                result["turn_timings"] = json!(o.turn_timings);
+            }
             result
         }
         None => {
@@ -677,6 +702,10 @@ pub fn write_result(
                     });
                     if let Some(m) = &c.meta {
                         entry["meta"] = m.clone();
+                    }
+                    // `duration_ms` sparse, same rule as the success branch.
+                    if let Some(ms) = c.duration_ms {
+                        entry["duration_ms"] = json!(ms);
                     }
                     entry
                 })
@@ -704,6 +733,13 @@ pub fn write_result(
             // died) is valuable audit info — derive it the same way.
             if let Some(plan) = extract_plan(&acc.tool_calls) {
                 result["plan"] = json!(plan);
+            }
+            // 错误路径也是账单面: failed attempts' compression audit survives —
+            // the run folded history before dying, and result.json must say so.
+            // (`turn_timings` has no failure-path source: RunError carries no
+            // per-turn rows; total wall time lives in `elapsed_secs`.)
+            if !acc.compressions.is_empty() {
+                result["compressions"] = json!(acc.compressions);
             }
             result
         }
@@ -852,12 +888,11 @@ impl<Out: Write, Err: Write> HumanRenderer<Out, Err> {
                 dropped,
                 kept,
                 trigger,
+                ..
             } => {
-                let how = match trigger {
-                    crate::agent::CompressTrigger::Preflight => "preflight",
-                    crate::agent::CompressTrigger::Overflow => "overflow",
-                    crate::agent::CompressTrigger::Manual => "manual",
-                };
+                // Vocabulary converges on `CompressTrigger::as_str` (same
+                // labels as event_json and result.json's CompressionRecord).
+                let how = trigger.as_str();
                 let _ = writeln!(
                     self.out,
                     "\n[context compressed ({how}): dropped {dropped} messages, {kept} kept]"
@@ -1005,7 +1040,9 @@ mod tests {
     }
 
     use super::*;
-    use crate::agent::{CompressTrigger, RunOutcome, TodoItem, ToolCallRecord};
+    use crate::agent::{
+        CompressTrigger, CompressionRecord, RunOutcome, TodoItem, ToolCallRecord, TurnTiming,
+    };
     use serde_json::json;
 
     #[test]
@@ -1022,7 +1059,10 @@ mod tests {
                 output: "hello world".into(),
                 is_error: false,
                 meta: None,
+                duration_ms: None,
             }],
+            compressions: vec![],
+            turn_timings: vec![],
             input_tokens: 100,
             output_tokens: 5,
             cache_creation_input_tokens: 0,
@@ -1198,6 +1238,8 @@ mod tests {
             turns: 1,
             stop_reason: "end_turn".into(),
             tool_calls: vec![],
+            compressions: vec![],
+            turn_timings: vec![],
             input_tokens: 0,
             output_tokens: 0,
             cache_creation_input_tokens: 0,
@@ -1257,6 +1299,7 @@ mod tests {
                     output: "☐ ...".into(),
                     is_error: false,
                     meta: None,
+                    duration_ms: None,
                 },
                 ToolCallRecord {
                     name: "shell".into(),
@@ -1264,8 +1307,11 @@ mod tests {
                     output: "x".into(),
                     is_error: false,
                     meta: None,
+                    duration_ms: None,
                 },
             ],
+            compressions: vec![],
+            turn_timings: vec![],
             input_tokens: 0,
             output_tokens: 0,
             cache_creation_input_tokens: 0,
@@ -1291,7 +1337,10 @@ mod tests {
                 output: "x".into(),
                 is_error: false,
                 meta: None,
+                duration_ms: None,
             }],
+            compressions: vec![],
+            turn_timings: vec![],
             input_tokens: 0,
             output_tokens: 0,
             cache_creation_input_tokens: 0,
@@ -1334,6 +1383,8 @@ mod tests {
             turns: 1,
             stop_reason: "end_turn".into(),
             tool_calls: vec![],
+            compressions: vec![],
+            turn_timings: vec![],
             input_tokens: 0,
             output_tokens: 0,
             cache_creation_input_tokens: 0,
@@ -1385,6 +1436,7 @@ mod tests {
                     meta: Some(
                         json!({"turns":2,"tools":{"shell":1},"tokens":{"in":50,"out":5},"stop_reason":"end_turn"}),
                     ),
+                    duration_ms: None,
                 },
                 ToolCallRecord {
                     name: "shell".into(),
@@ -1392,8 +1444,11 @@ mod tests {
                     output: "x".into(),
                     is_error: false,
                     meta: None,
+                    duration_ms: None,
                 },
             ],
+            compressions: vec![],
+            turn_timings: vec![],
             input_tokens: 0,
             output_tokens: 0,
             cache_creation_input_tokens: 0,
@@ -1442,7 +1497,9 @@ mod tests {
                 output: "a.txt".into(),
                 is_error: false,
                 meta: None,
+                duration_ms: None,
             }],
+            compressions: vec![],
             turns: 3,
             elapsed: std::time::Duration::from_secs(12),
         };
@@ -1588,21 +1645,34 @@ mod tests {
             dropped: 3,
             kept: 5,
             trigger: CompressTrigger::Preflight,
+            estimated_tokens_before: 900,
+            estimated_tokens_after: 300,
+            measured_tokens_before: Some(850),
         });
         assert_eq!(v["type"], "compressed");
         assert_eq!(v["dropped"], 3);
         assert_eq!(v["kept"], 5);
         assert_eq!(v["trigger"], "preflight");
+        assert_eq!(v["estimated_tokens_before"], 900);
+        assert_eq!(v["estimated_tokens_after"], 300);
+        assert_eq!(v["measured_tokens_before"], 850);
         let v = event_json(&AgentEvent::Compressed {
             dropped: 1,
             kept: 2,
             trigger: CompressTrigger::Overflow,
+            estimated_tokens_before: 100,
+            estimated_tokens_after: 40,
+            measured_tokens_before: None,
         });
         assert_eq!(v["trigger"], "overflow");
+        assert_eq!(v["measured_tokens_before"], serde_json::Value::Null);
         let v = event_json(&AgentEvent::Compressed {
             dropped: 1,
             kept: 2,
             trigger: CompressTrigger::Manual,
+            estimated_tokens_before: 100,
+            estimated_tokens_after: 40,
+            measured_tokens_before: None,
         });
         assert_eq!(v["trigger"], "manual");
         // Pruned → {"type":"pruned","messages","chars_freed"}
@@ -1743,6 +1813,8 @@ mod tests {
             turns: 1,
             stop_reason: "end_turn".into(),
             tool_calls: vec![],
+            compressions: vec![],
+            turn_timings: vec![],
             input_tokens: 1000,
             output_tokens: 50,
             cache_creation_input_tokens: 800,
@@ -1758,6 +1830,123 @@ mod tests {
         assert_eq!(parsed["cache_creation_input_tokens"], 800);
         assert_eq!(parsed["cache_read_input_tokens"], 200);
         assert_eq!(parsed["attempts"], 3);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_result_omits_compressions_and_turn_timings_when_empty() {
+        // Sparse observability keys: a run that never compressed / wrote no
+        // turn rows leaves result.json byte-identical to pre-feature (no
+        // null / empty-array keys for consumers that don't know the fields).
+        // The positive case — both keys present and shaped right, plus a
+        // timed tool call's sparse `duration_ms` — rides the same fixture.
+        let dir = std::env::temp_dir().join(format!("ta-res-obs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // No compression, no timings → keys absent (not null, not []).
+        let plain = RunOutcome {
+            final_text: "done".into(),
+            turns: 2,
+            stop_reason: "end_turn".into(),
+            tool_calls: vec![ToolCallRecord {
+                name: "shell".into(),
+                input: json!({"command":"ls"}),
+                output: "x".into(),
+                is_error: false,
+                meta: None,
+                duration_ms: None,
+            }],
+            compressions: vec![],
+            turn_timings: vec![],
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            elapsed: std::time::Duration::from_secs_f64(1.0),
+        };
+        let ppath = dir.join("plain.json");
+        write_result(&ppath, Some(&plain), None, 1, "error", None, &meta()).unwrap();
+        let parsed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&ppath).unwrap()).unwrap();
+        let obj = parsed.as_object().expect("result is a JSON object");
+        assert!(
+            !obj.contains_key("compressions"),
+            "compressions key absent when empty: {obj:?}"
+        );
+        assert!(
+            !obj.contains_key("turn_timings"),
+            "turn_timings key absent when empty"
+        );
+        // A duration-less tool call also stays free of the sparse key.
+        assert!(!parsed["tool_calls"][0]
+            .as_object()
+            .unwrap()
+            .contains_key("duration_ms"));
+
+        // One fold + two turn rows + a timed call → keys present, shaped right.
+        let audited = RunOutcome {
+            final_text: "done".into(),
+            turns: 2,
+            stop_reason: "end_turn".into(),
+            tool_calls: vec![ToolCallRecord {
+                name: "shell".into(),
+                input: json!({"command":"ls"}),
+                output: "x".into(),
+                is_error: false,
+                meta: None,
+                duration_ms: Some(12),
+            }],
+            compressions: vec![CompressionRecord {
+                trigger: CompressTrigger::Preflight.as_str().into(),
+                dropped: 2,
+                kept: 1,
+                estimated_tokens_before: 900,
+                estimated_tokens_after: 300,
+                measured_tokens_before: Some(850),
+            }],
+            turn_timings: vec![
+                TurnTiming {
+                    turn: 1,
+                    duration_ms: 1500,
+                    tool_calls: 1,
+                },
+                TurnTiming {
+                    turn: 2,
+                    duration_ms: 200,
+                    tool_calls: 0,
+                },
+            ],
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            elapsed: std::time::Duration::from_secs_f64(2.0),
+        };
+        let apath = dir.join("audited.json");
+        write_result(&apath, Some(&audited), None, 1, "error", None, &meta()).unwrap();
+        let parsed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&apath).unwrap()).unwrap();
+        let cs = parsed["compressions"]
+            .as_array()
+            .expect("compressions key present");
+        assert_eq!(cs.len(), 1);
+        assert_eq!(cs[0]["trigger"], "preflight");
+        assert_eq!(cs[0]["dropped"], 2);
+        assert_eq!(cs[0]["kept"], 1);
+        assert_eq!(cs[0]["estimated_tokens_before"], 900);
+        assert_eq!(cs[0]["estimated_tokens_after"], 300);
+        assert_eq!(cs[0]["measured_tokens_before"], 850);
+        let ts = parsed["turn_timings"]
+            .as_array()
+            .expect("turn_timings key present");
+        assert_eq!(ts.len(), 2);
+        assert_eq!(ts[0]["turn"], 1);
+        assert_eq!(ts[0]["duration_ms"], 1500);
+        assert_eq!(ts[0]["tool_calls"], 1);
+        assert_eq!(ts[1]["turn"], 2);
+        // duration_ms sparse-positive: the timed call carries the key.
+        assert_eq!(parsed["tool_calls"][0]["duration_ms"], 12);
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1802,6 +1991,9 @@ mod tests {
             dropped: 3,
             kept: 5,
             trigger: CompressTrigger::Preflight,
+            estimated_tokens_before: 900,
+            estimated_tokens_after: 300,
+            measured_tokens_before: None,
         });
         r.render(&AgentEvent::Done {
             stop_reason: "end_turn".into(),

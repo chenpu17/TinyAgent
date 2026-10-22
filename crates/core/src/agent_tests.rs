@@ -4125,6 +4125,7 @@ fn api_status_error_retry_taxonomy() {
             .into(),
             usage: Usage::default(),
             tool_calls: vec![],
+            compressions: vec![],
             turns: 1,
             elapsed: std::time::Duration::ZERO,
         }
@@ -4145,6 +4146,7 @@ fn api_status_error_retry_taxonomy() {
         source: api_err.context("request to API failed"),
         usage: Usage::default(),
         tool_calls: vec![],
+        compressions: vec![],
         turns: 1,
         elapsed: std::time::Duration::ZERO,
     };
@@ -4155,6 +4157,7 @@ fn api_status_error_retry_taxonomy() {
         source: anyhow::anyhow!("connection reset by peer"),
         usage: Usage::default(),
         tool_calls: vec![],
+        compressions: vec![],
         turns: 1,
         elapsed: std::time::Duration::ZERO,
     };
@@ -4178,6 +4181,7 @@ fn is_transient_treats_408_request_timeout_and_425_too_early_as_retryable() {
             .into(),
             usage: Usage::default(),
             tool_calls: vec![],
+            compressions: vec![],
             turns: 1,
             elapsed: std::time::Duration::ZERO,
         }
@@ -4393,14 +4397,20 @@ fn cache_usage_propagates_to_run_outcome_and_event() {
 fn compress_folds_history_and_emits_event() {
     // History over threshold + a safe cut → summarize runs (an extra chat
     // call), the middle folds into message[0], a Compressed event fires,
-    // and the main request sees the shorter folded history.
+    // and the main request sees the shorter folded history. The middle
+    // assistant message is big enough that the fold really shrinks the
+    // estimated context — the head is retained verbatim and middle user
+    // texts are quoted back, so only the dropped assistant bulk is freed
+    // against the fixed summary scaffold (a tiny fixture would show a
+    // larger estimate AFTER the fold, with no honest before>after signal).
     let mut cfg = cfg_with(5, 0, 30);
     cfg.limits.keep_recent_messages = 2;
     let long = "x".repeat(40);
+    let bulk = "y".repeat(2000);
     // 5 messages → n > keep_recent+2; cut candidate 3 = assistant → Some(3)
     let initial = vec![
         user_text(&long),
-        Message::assistant(vec![Block::Text("a1".into())]),
+        Message::assistant(vec![Block::Text(bulk)]),
         user_text("u1"),
         Message::assistant(vec![Block::Text("a2".into())]),
         user_text("u2"),
@@ -4420,7 +4430,8 @@ fn compress_folds_history_and_emits_event() {
             AgentEvent::Compressed {
                 dropped: 2,
                 kept: 3,
-                trigger: CompressTrigger::Preflight
+                trigger: CompressTrigger::Preflight,
+                ..
             }
         )),
         "compress should drop 2 middle messages, keep 3, tagged preflight"
@@ -4428,6 +4439,335 @@ fn compress_folds_history_and_emits_event() {
     // The main (2nd) request saw the folded history: 3 messages.
     let cap = state.captured();
     assert_eq!(cap[1].message_count, 3);
+    // Observability pair (A2): this compress ran on turn 1 — before ANY
+    // provider-reported usage — so there is no valid anchor and
+    // `measured_tokens_before` must stay None (an estimate must never be
+    // passed off as a measurement). The estimate pair still moved: the fold
+    // shrank the context.
+    for e in &events {
+        if let AgentEvent::Compressed {
+            estimated_tokens_before,
+            estimated_tokens_after,
+            measured_tokens_before,
+            ..
+        } = e
+        {
+            assert!(
+                estimated_tokens_before > estimated_tokens_after,
+                "fold must shrink the estimate: {estimated_tokens_before} -> {estimated_tokens_after}"
+            );
+            assert_eq!(
+                *measured_tokens_before, None,
+                "turn-1 compress has no anchor: measured must be None"
+            );
+        }
+    }
+    // ...and the run-level audit record mirrors the event exactly.
+    assert_eq!(o.compressions.len(), 1);
+    let c = &o.compressions[0];
+    assert_eq!(c.trigger, "preflight");
+    assert_eq!((c.dropped, c.kept), (2, 3));
+    assert_eq!(c.measured_tokens_before, None);
+}
+
+#[test]
+fn compress_records_anchor_backed_measured_tokens() {
+    // (A) A compress that fires on turn 3 — after two usage-bearing main
+    // calls — reports the provider-MEASURED prompt tokens of the live anchor
+    // alongside the estimates. The estimate pair still brackets the fold
+    // (before > after), and the run-level CompressionRecord matches the
+    // event field for field.
+    let mut cfg = cfg_with(5, 0, 30);
+    cfg.limits.keep_recent_messages = 2;
+    let t1 = "x".repeat(40);
+    let t2 = "y".repeat(40);
+    // Turn 1/2: big assistant text + a tool call, each with usage (so the
+    // anchor is live and current when turn 3's preflight compress runs).
+    // History: turn-2 preflight trips the 30-char gate but finds no cut
+    // (3 messages <= keep+2); turn-3 preflight trips again with 5 messages.
+    let (prov, _) = MockProvider::new(vec![
+        MockTurn::Ok(ChatResponse {
+            blocks: vec![
+                Block::Text(t1),
+                Block::ToolUse {
+                    id: "a".into(),
+                    name: "echo".into(),
+                    input: json!({}),
+                },
+            ],
+            stop_reason: "tool_use".into(),
+            usage: mock::mk_usage(50, 5),
+        }),
+        MockTurn::Ok(ChatResponse {
+            blocks: vec![
+                Block::Text(t2),
+                Block::ToolUse {
+                    id: "b".into(),
+                    name: "echo".into(),
+                    input: json!({}),
+                },
+            ],
+            stop_reason: "tool_use".into(),
+            usage: mock::mk_usage(60, 5),
+        }),
+        mock::resp_text("SUMMARY", None), // summarize_prefix call
+        mock::resp_text("final answer", None), // main call
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(EchoTool::new("echo"))],
+        vec![user_text("hi")],
+        test_ctx(),
+    );
+    let mut events = Vec::new();
+    let o = agent.run(&mut |e| events.push(e)).unwrap();
+    assert_eq!(o.stop_reason, "end_turn");
+    let event_vals = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Compressed {
+                dropped,
+                kept,
+                trigger,
+                estimated_tokens_before,
+                estimated_tokens_after,
+                measured_tokens_before,
+            } => Some((
+                *dropped,
+                *kept,
+                *trigger,
+                *estimated_tokens_before,
+                *estimated_tokens_after,
+                *measured_tokens_before,
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(event_vals.len(), 1, "exactly one compress event");
+    let (dropped, kept, trigger, est_before, est_after, measured) = event_vals[0];
+    assert_eq!((dropped, kept), (2, 3));
+    assert!(matches!(trigger, CompressTrigger::Preflight));
+    assert!(
+        est_before > est_after,
+        "fold shrinks the estimate: {est_before} -> {est_after}"
+    );
+    // The anchor from turn 2's response (60↑) is live at the fold — the
+    // provider-measured prompt tokens ride along honestly.
+    assert_eq!(
+        measured,
+        Some(60),
+        "measured = the live anchor's prompt_tokens"
+    );
+    // Run-level audit record: same story, stringified trigger.
+    assert_eq!(o.compressions.len(), 1);
+    let c = &o.compressions[0];
+    assert_eq!(c.trigger, "preflight");
+    assert_eq!((c.dropped, c.kept), (2, 3));
+    assert_eq!(c.estimated_tokens_before, est_before);
+    assert_eq!(c.estimated_tokens_after, est_after);
+    assert_eq!(c.measured_tokens_before, Some(60));
+}
+
+#[test]
+fn failed_run_error_still_carries_compressions() {
+    // (B) 错误路径也是账单面: the run compressed its history, then the main
+    // call died — the RunError must carry the compression audit so the
+    // harness's failure-path result.json can report the fold that happened
+    // before the death. The prefix is big enough for a real fold (see the
+    // compress_folds test — the estimate must shrink through it).
+    let mut cfg = cfg_with(5, 0, 30);
+    cfg.limits.keep_recent_messages = 2;
+    let long = "x".repeat(40);
+    let bulk = "y".repeat(2000);
+    let initial = vec![
+        user_text(&long),
+        Message::assistant(vec![Block::Text(bulk)]),
+        user_text("u1"),
+        Message::assistant(vec![Block::Text("a2".into())]),
+        user_text("u2"),
+    ];
+    let (prov, _) = MockProvider::new(vec![
+        mock::resp_text("SUMMARY", None), // summarize_prefix call
+        MockTurn::Err("provider blew up".into()),
+    ]);
+    let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+    let mut events = Vec::new();
+    // Match by hand: RunOutcome isn't Debug, so unwrap_err() won't compile.
+    let err = match agent.run(&mut |e| events.push(e)) {
+        Err(e) => e,
+        Ok(_) => panic!("main-call failure must propagate as RunError"),
+    };
+    assert_eq!(err.compressions.len(), 1, "audit survives the failure");
+    let c = &err.compressions[0];
+    assert_eq!(c.trigger, "preflight");
+    assert_eq!((c.dropped, c.kept), (2, 3));
+    assert!(
+        c.estimated_tokens_before > c.estimated_tokens_after,
+        "fold shrank the estimate before the run died"
+    );
+}
+
+#[test]
+fn turn_timings_count_turns_and_tool_calls() {
+    // (C) One tool turn + one text turn: rows per turn, len == turns, and
+    // each row's tool_calls is THAT turn's records delta (1, then 0).
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, _) = MockProvider::new(vec![
+        mock::resp_tool("t", "echo", json!({}), None),
+        mock::resp_text("final", None),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(EchoTool::new("echo"))],
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    let mut events = Vec::new();
+    let o = agent.run(&mut |e| events.push(e)).unwrap();
+    assert_eq!(o.stop_reason, "end_turn");
+    assert_eq!(o.turns, 2);
+    assert_eq!(o.turn_timings.len(), 2, "one row per turn, len == turns");
+    assert_eq!(o.turn_timings[0].turn, 1);
+    assert_eq!(o.turn_timings[0].tool_calls, 1);
+    assert_eq!(o.turn_timings[1].turn, 2);
+    assert_eq!(o.turn_timings[1].tool_calls, 0);
+}
+
+#[test]
+fn tool_call_records_carry_execution_duration() {
+    // (D1) A real execution's record carries its wall-clock duration —
+    // inline-Sequential (60ms) and parallel-worker (2×60ms overlapping) both.
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, _) = MockProvider::new(vec![
+        MockTurn::Ok(ChatResponse {
+            blocks: vec![
+                Block::ToolUse {
+                    id: "a".into(),
+                    name: "slow".into(),
+                    input: json!({"label": "go"}),
+                },
+                Block::ToolUse {
+                    id: "b".into(),
+                    name: "pslow".into(),
+                    input: json!({"label": "go"}),
+                },
+                Block::ToolUse {
+                    id: "c".into(),
+                    name: "pslow".into(),
+                    input: json!({"label": "go"}),
+                },
+            ],
+            stop_reason: "tool_use".into(),
+            usage: None,
+        }),
+        mock::resp_text("done", None),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![
+            Box::new(SlowTool::custom("slow", 60, ToolConcurrency::Sequential)),
+            Box::new(SlowTool::custom("pslow", 60, ToolConcurrency::Parallel)),
+        ],
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    let mut events = Vec::new();
+    let o = agent.run(&mut |e| events.push(e)).unwrap();
+    assert_eq!(o.stop_reason, "end_turn");
+    assert_eq!(o.tool_calls.len(), 3);
+    // All three really ran: durations present and at least ~2/3 of the sleep
+    // (wall-clock jitter slack — the assertion is a floor, not a pin).
+    for rec in &o.tool_calls {
+        let d = rec
+            .duration_ms
+            .expect("executed tool carries Some(duration_ms)");
+        assert!(d >= 40, "60ms sleep must read >= 40ms, got {d}");
+    }
+    // The two parallel workers' 60ms sleeps overlap: their total wall time
+    // is far below the serialized 3×60ms (existing timing tests pin the
+    // parallelism itself; here it just sanity-checks the durations).
+    assert_eq!(o.turn_timings.len(), 2, "one row per turn");
+    assert_eq!(o.turn_timings[0].turn, 1);
+    assert_eq!(
+        o.turn_timings[0].tool_calls, 3,
+        "all three calls recorded in turn 1"
+    );
+    assert_eq!(o.turn_timings[1].tool_calls, 0);
+}
+
+#[test]
+fn cancelled_call_records_no_duration() {
+    // (D2) A call that passed its gate but was stopped by the gate→execution
+    // cancel checkpoint never executed: its record reports duration_ms None
+    // (and the error output), while the earlier real execution keeps its
+    // measured duration. Deterministic: the hook flips cancel during the
+    // SECOND call's gate, so the checkpoint (not a race) stops it.
+    struct CancelOnGate;
+    impl Hooks for CancelOnGate {
+        fn before_tool(&self, tool: &str, _input: &Value, ctx: &ToolCtx) -> ToolDecision {
+            if tool == "echo" {
+                if let Some(c) = &ctx.cancel {
+                    c.store(true, Ordering::Relaxed);
+                }
+            }
+            ToolDecision::Allow
+        }
+    }
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, _) = MockProvider::new(vec![MockTurn::Ok(ChatResponse {
+        blocks: vec![
+            Block::ToolUse {
+                id: "a".into(),
+                name: "slow".into(),
+                input: json!({"label": "go"}),
+            },
+            Block::ToolUse {
+                id: "b".into(),
+                name: "echo".into(),
+                input: json!({}),
+            },
+        ],
+        stop_reason: "tool_use".into(),
+        usage: None,
+    })]);
+    let flag = Arc::new(AtomicBool::new(false));
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![
+            Box::new(SlowTool::custom("slow", 60, ToolConcurrency::Sequential)),
+            Box::new(EchoTool::new("echo")),
+        ],
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    agent.set_hooks(Arc::new(CancelOnGate));
+    agent.set_cancel(flag);
+    let mut events = Vec::new();
+    let o = agent.run(&mut |e| events.push(e)).unwrap();
+    assert_eq!(o.stop_reason, "cancelled");
+    assert_eq!(o.tool_calls.len(), 2);
+    // The slow tool really ran.
+    let d = o.tool_calls[0]
+        .duration_ms
+        .expect("executed tool carries Some(duration_ms)");
+    assert!(d >= 40, "60ms sleep must read >= 40ms, got {d}");
+    // The echo call never executed: no duration, error output.
+    assert_eq!(o.tool_calls[1].duration_ms, None);
+    assert!(o.tool_calls[1].is_error);
+    assert_eq!(o.tool_calls[1].output, "[cancelled by user]");
+    // History still answers both tool_use 1:1.
+    assert_eq!(
+        agent.trailing_tool_result_contents(),
+        vec!["slow-go".to_string(), "[cancelled by user]".to_string()]
+    );
+    // The cancelled turn still got its timing row (the row lands at the
+    // turn body's natural end, before the cancel check breaks the loop).
+    assert_eq!(o.turn_timings.len(), 1);
+    assert_eq!(o.turn_timings[0].tool_calls, 2);
 }
 
 #[test]
@@ -4507,7 +4847,8 @@ fn compress_with_keep_recent_zero_folds_everything() {
             AgentEvent::Compressed {
                 dropped: 4,
                 kept: 1,
-                trigger: CompressTrigger::Preflight
+                trigger: CompressTrigger::Preflight,
+                ..
             }
         )),
         "empty-tail cut: drop the 4 non-head messages, keep exactly the summary head"
@@ -4930,7 +5271,8 @@ fn compact_between_runs_folds_reports_and_does_not_bill_run_totals() {
         AgentEvent::Compressed {
             dropped: 2,
             kept: 3,
-            trigger: CompressTrigger::Manual
+            trigger: CompressTrigger::Manual,
+            ..
         }
     )));
     assert_eq!(
@@ -6270,7 +6612,8 @@ fn overflow_error_triggers_force_compress_then_retry() {
             AgentEvent::Compressed {
                 dropped: 2,
                 kept: 3,
-                trigger: CompressTrigger::Overflow
+                trigger: CompressTrigger::Overflow,
+                ..
             }
         )),
         "forced compression after the overflow error must be tagged overflow"
@@ -6892,6 +7235,7 @@ fn todo_rec(todos: Value, is_error: bool) -> ToolCallRecord {
         output: "rendered".into(),
         is_error,
         meta: None,
+        duration_ms: None,
     }
 }
 
@@ -6905,6 +7249,7 @@ fn extract_plan_picks_last_nonerror_todo() {
             output: "y".into(),
             is_error: false,
             meta: None,
+            duration_ms: None,
         },
         todo_rec(
             json!({"todos":[
@@ -6941,6 +7286,7 @@ fn extract_plan_none_when_no_todo() {
         output: "y".into(),
         is_error: false,
         meta: None,
+        duration_ms: None,
     }];
     assert!(extract_plan(&recs).is_none());
 }
