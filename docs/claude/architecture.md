@@ -147,8 +147,9 @@
   run 账单是对偶的两条路径，改 billing 的人别合并它们。`compact` 入口清陈旧 cancel + compress_failed
   （手动调用是新的显式尝试）；内部 `compress(events, deadline, trigger)` 的失败通道归调用方（run 循环发
   Warning 事件、compact 透传 Err——内部发会双报），空摘要退化路径返回 `dropped:0` + usage 不吞账。
-  `CompressTrigger::{Preflight,Overflow,Manual}` 非 non_exhaustive（tui.rs 穷尽 match 是想要的编译期点名），
-  加变体要同步 harness ×2 + tui ×1 的 match。
+  `CompressTrigger::{Preflight,Overflow,Manual}` 非 non_exhaustive（TUI 对**枚举变体**仍穷尽 match——
+  编译期点名；`Compressed` 的**结构字段**带 `..`，新字段对 TUI 可选可见），加变体要同步
+  harness ×2 + tui ×1 的 match。
 - **MCP 运行时热增删（`Agent::add_mcp_server` / `remove_mcp_server` / `tool_names`，同属热更新面）**：
   路由按 `Tool::mcp_server()` **能力标记**（`tools/mod.rs` trait 默认 None，`McpTool` 覆写返回**配置名**
   ——未消毒，与展示名/wire 名三方独立；agent 侧零 downcast 零前缀解析，第三方工具同理可参与）。易错点：
@@ -161,7 +162,13 @@
   ④ **子 agent 不感知**（SubAgent 持构造期 `mcp_tools` 快照：热增 server 对本 agent 生命周期内任何时点
   spawn 的子 agent 都不可见——产品决策「文档化不传播」，共享槽位留 v2）；remove 一个仍被子 agent 快照
   持有的 server 时连接活到最后持有者 drop（armed reaper 会话末兜底杀 child）；⑤ add 时若已
-  `set_shutdown` 则新工具补挂同一 flag（临近退出热增不遗留孤儿）。**run_code 的 guest registry 同样
+  `set_shutdown` 则新工具补挂同一 flag（临近退出热增不遗留孤儿）；⑥ **HTTP/SSE 读线程有界回收**
+  （2026-10）：standing GET 流与 legacy SSE 的每次阻塞读带 `STREAM_ROUND`（30s）轮次上限——健康流
+  按轮静默轮转重连（到期立即重连不退避、真读错照旧告警+退避；超时经 io::Error 内层
+  `reqwest::Error::is_timeout()` 判别，`ErrorKind` 恒 Other 不可用）；`shutdown_stream_reader`
+  置停标志后有界等待（≤2s）join、超时静默 detach——热删残留的「一线程+一 TCP 连接」从活到进程
+  退出收敛为至多一轮自回收。已知取舍：跨轮边界的大响应被切断由 pending 表重投（最坏延迟一轮）；
+  reqwest blocking 无逐读 read_timeout，请求级 `.timeout` 是 body 总时限。**run_code 的 guest registry 同样
   不感知**（与 ④ 同一条政策，外部评审曾当 P1 报过——实为既定快照语义）：registry 按构造期四件套在
   `Arc<OnceLock>` 里惰性建一次、跨克隆共享，热增的 server JS 看不到；热删的 server 仍可被已建 registry
   调用（连接活到 registry drop；该 server 已不在顶层列表 → shutdown 不再经它武装 reaper，最坏退出时
@@ -276,7 +283,14 @@
   `estimate_tokens`，必须短）②全文（SKILL.md 正文）经 `read_skill` 读进 **history**（tool_result，可被压缩回收，**不**常驻
   system）③资源文件（`scripts/`/`references/`/`assets/` 等子目录）。**`read_skill` 放开子目录**：`file` 用 `safe_relative_path`
   （允许 `/`，禁 `..`/绝对/`\`/空/`.` 组件）+ `confined_to(dir, full, "skill directory")` 双层沙盒——后者复用 `tools/mod.rs`
-  抽出的 `pub(crate) confined_to(root, full, label)`（`confine` 委托它，root 在内 canonicalize；TOCTOU caveat 同 workdir 沙盒）。
+  抽出的 `pub(crate) confined_to(root, full, label)`（`confine` 委托它，root 在内 canonicalize；
+  **2026-10 起尾段逐组件解析走查**：最深已存在祖先 canonicalize 后，余下组件按源序推进——存在组件
+  canonicalize 着陆 canonical 真身、`..` 词法弹出、缺失组件词法累积，**每步重新落地真实盘面
+  （canonicalize 成功）即复检包含性**；初始祖先自身也先复检（`root/../x`、`out_link/../..` 类拼写
+  的祖先可落 root 外）。旧「尾段词法折叠」会把 `missing/../out_link`（已存在外向 symlink）折叠进
+  返回值——Ok 且物理逃逸 + 再入漂移 Err，性质 fuzz（5 万次随机路径汤）抓到后重写。Ok 返回值永不背
+  `..`/`.`、再入是不动点；内核解析真穿过外向 symlink 的拼写一律 Err，内向 symlink 尾段返回真身。
+  TOCTOU caveat 同 workdir 沙盒）。
   **`list_skill` 工具**列技能目录树（`walk_skill`，`file_type` 不跟随 symlink 防逃逸、深度封顶 4、跳隐藏），供模型 level-3 自主
   发现资源。**内置（embedded）skill（v2 P2）**：`SkillEntry.source` 是 `SkillSource::{Dir, Embedded(String)}`
   枚举——`skills::embedded_entry(text)` 按同款 frontmatter 校验建条目；`read_skill` 对 Embedded 直接吐全文
@@ -440,6 +454,12 @@
   `write_result` 的 None 分支（`write_result(..., Some(&acc))`）写入 token + tool_calls，而不是清零；batch 的
   `TaskReport` 同样带 4 个 token 字段，失败任务的 report.json 照计 acc（`run_one_attempt` 的 Err 路径用 `&acc.usage`，
   取消路径亦然）。`RunCost::add_failed`/`fold_into` 是共用的累加原语。改重试/返回类型/写结果文件的人要保住这条。
+  **2026-10 可观测性**：`RunOutcome`/`RunError` 带 `compressions`（压缩审计：trigger/dropped/kept/
+  压缩前后估算、最近锚点请求实测值；`RunError` 的手写 Serialize 恒写该键——错误信封 schema 稳定
+  惯例，result.json 侧空仍不插键）；`RunOutcome.turn_timings` 逐轮耗时+工具数（失败路径不落行，
+  总耗时看 `elapsed_secs`）；`tool_calls[].duration_ms` 只盖真实执行的工具体（排队/取消检查点不计，
+  未启动占位 None）。NDJSON `Compressed` 事件带 `estimated_tokens_before/after` 与
+  `measured_tokens_before`（锚点请求的 provider 实测，非校准估算——语义见字段文档）。
   **batch 终态落盘单出口**（`batch::write_terminal_result`，外部评审 P2-5）：不经 `run_one_attempt`
   正常完成的终态（退避中取消、bad_task/setup_error 早退、未启动即取消、worker panic）**也必须写
   `results/<name>.json`**——否则 report.json 说 cancelled 而 results 里留着上一次尝试（或上一轮运行）
@@ -497,7 +517,9 @@
   serde Value + wrapper.d.ts 同步两件套纪律）；TUI `/context` 是第一个消费端（worker channel 模式，
   busy 拒绝与 /clear 同款——worker 在 run 里不泵 in_rx）。
 - **TUI 是可选 feature**（`ratatui` + `crossterm` + `tui-markdown` + `unicode-width`），
-  `src/tui.rs` 在 `#[cfg(feature = "tui")]` 后。默认 headless 版不含它，保持体积。
+  `src/tui/`（模块根 `tui.rs` + app/transcript/markdown/slash/render/input/theme/tests）在
+  `#[cfg(feature = "tui")]` 后——2026-10 由 8.7k 行单文件按关注点拆分（纯搬移零行为变更，
+  148 个测试随迁；`crate::tui::run` 入口不变）。默认 headless 版不含它，保持体积。
   **内联/流式渲染**（非全屏 alternate-screen，与 Claude Code / Codex 同款）：
   `Terminal::with_options(Viewport::Inline(INLINE_HEIGHT=8))` 在主屏底部锚定一个固定高度 live 区
   （流式 zone + 输入框 + 状态行），每帧 `term.draw` 重绘；已定稿的对话块经 `term.insert_before`

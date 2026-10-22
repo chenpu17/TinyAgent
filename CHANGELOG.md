@@ -7,6 +7,33 @@
 
 ### Added
 
+- **运行成本可观测性（压缩审计 + 逐轮/逐工具计时）**：`result.json` 新增三类字段（均稀疏插入，无压缩/计时的旧结果文件逐字节不变）——
+  `compressions`（压缩审计：触发路径 preflight/overflow/manual、折叠/保留消息数、压缩前后 token 估算
+  与最近锚点请求的 provider 实测值；失败轮已发生的压缩同样入账）；`turn_timings`（每轮耗时与该轮
+  工具调用数）；`tool_calls[].duration_ms`（工具真实执行耗时，排队与取消检查点不计，未启动的取消
+  占位不带该键）。NDJSON `Compressed` 事件同步携带三个新字段（`estimated_tokens_before/after`、
+  `measured_tokens_before`），压缩「该不该触发」从此可用估算 vs 实测对照复盘。
+
+- **run_code/文件工具路径包含性质测试（5 万次随机迭代）**：`fs_policy.rs` 路径汤四性质（包含性 /
+  symlink 物理不可逃逸 / 幂等 / 不动点）、`write_traverses_symlink` 双侧性质；`mcp.rs` Windows
+  argv 引号链路 oracle（MSVC 切分 + cmd 剥引号，CommandLineToArgvW 文档向量钉死）+ 编码×切分互逆
+  fuzz + `#[cfg(windows)]` 真 SUT 整链往返（Windows CI 验证）。迭代次数 `TA_FUZZ_ITERS` 可调。
+
+### Changed
+
+- **TUI 拆分为模块目录 `src/tui/`**：8.7k 行单文件按关注点拆为 app（会话装配/ui_loop）/
+  transcript（Row 模型与流式渲染）/ markdown / slash（斜杠命令+补全）/ render（scrollback 提交
+  与 chrome）/ input（InputBuffer）/ theme 七个内容模块 + tests（148 个测试逐一对应零丢失）；
+  `crate::tui::run` 入口不变，纯机械搬移零行为变更。
+
+- **MCP HTTP/SSE 读线程有界回收**：standing GET 流与 legacy SSE 的每次阻塞读带 30s 轮次上限
+  （`STREAM_ROUND`），健康流按轮静默轮转重连（到期不退避、真读错照旧告警+退避）；teardown 改为
+  置停标志 + 有界等待（≤2s）join。热移除 MCP 服务器的「一线程 + 一 TCP 连接活到进程退出」泄漏
+  收敛为「至多一轮 + backoff 自回收」，detach 不再告警。已知取舍：跨轮边界的大响应会被切断由
+  pending 表重投（最坏延迟一轮）；带活读者的 transport 退出时多等 ≤2s。
+
+### Fixed
+
 - **诊断通道 `diag`（GUI 宿主可见的软失败警告）**：内核里 ~19 处裸 `eprintln!` 直写（技能扫描/装配警告、
   MCP 握手与读线程降级、session 损坏保留提示、run_code 畸形 marker 回退与沙箱降级）对无控制台的
   GUI 宿主与语言绑定完全不可见。统一收敛到 `crate::diag::diag_warn!`/`diag_info!`：默认（未装 sink）
@@ -101,6 +128,21 @@
   include 定位收紧为「宿主有明确复用需求才建库」，删除未经验证的价值比较表述。
 
 ### Fixed
+
+- **confined_to 路径包含逃逸（性质测试 5 万次迭代抓到）**：拼写含「不存在组件 + `..` + 已存在
+  symlink」时（如 `missing/../out_link`，out_link 指向 workdir 外），旧实现把已存在 symlink 当
+  「不存在尾段」词法折叠进返回值——`Ok(root/out_link)` 物理落在 workdir 外，写穿即逃逸沙箱，且
+  返回值再入得 Err（非不动点）。修复：最深已存在祖先之后的尾段改为**逐组件解析走查**（`..` 词法
+  弹出、存在组件 canonicalize 着陆真身），每步重新落地真实盘面即复检包含性；语义收紧为「内核解析
+  真穿过外向 symlink 的拼写一律 Err」，内向 symlink 返回 canonical 真身，Ok 返回值永不背 `..`/`.`、
+  再入是不动点。同族边角一并堵住：最深已存在祖先自身落在 root 外（`root/../x`、`out_link/../..`）
+  的拼写不再给词法假 Ok。
+
+- **MCP stdio Windows 引号触发集缺 cmd 元字符**：`windows_cmd_tail` 的加引号触发集原本只有
+  空白/引号/非 ASCII——`& | < > ^ ( )` 是 ASCII 非空白、裸露引号外，cmd /C 解析层把它们当命令
+  分隔符/重定向/转义/分组，MCP args 含 URL query（`?a=1&b=2`）之类在 cmd 层即被拆碎、子进程永远
+  看不到完整参数。十个元字符（含保守表意的 `%`/`!`）进触发集；`%VAR%` 展开连引号也挡不住，文档
+  契约段写明为限制而非保证。定性：用户配置信任面的正确性修复，非安全边界。
 
 - **外部复审确认项修复（估算 / 计费 / 热更可见性 / 线程回收 / 测试与发布）**：
   - **token 预检估算对 CJK 严重低估**：原口径是 JSON 字面字节数/4，1000 个汉字（UTF-8 3000 字节）

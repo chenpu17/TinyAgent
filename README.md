@@ -505,8 +505,8 @@ stdio server 可注入环境变量（`env`，叠加在宿主环境之上、同�
 | 传输 | 说明 |
 |---|---|
 | **stdio** | `command` + `args`，spawn 本地子进程（NDJSON / JSON-RPC 2.0） |
-| **http** | Streamable HTTP（2025-03-26 现行标准）：单端点 POST，支持 JSON / SSE 响应、Mcp-Session-Id；202 异步响应经常驻 GET 流收回（server→client 推送）。长连接 GET 在服务器不关流时无法中断，teardown 会显式 diag 警告「读取线程随进程退出回收」 |
-| **sse** | 旧版 HTTP+SSE（2024-11-05 已废弃协议）：GET 收事件流 + endpoint POST。注意其长连接 GET 在服务器不关流时读取线程只能等进程退出回收（teardown 同样有 diag 警告）——长驻批量作业优先 stdio / http |
+| **http** | Streamable HTTP（2025-03-26 现行标准）：单端点 POST，支持 JSON / SSE 响应、Mcp-Session-Id；202 异步响应经常驻 GET 流收回（server→client 推送）。GET 流的每次读取带 30s 轮次上限，健康流按轮静默轮转重连；teardown 有界等待（≤2s）join，残留读取线程与 TCP 连接至多一轮内自回收（不再依赖进程退出） |
+| **sse** | 旧版 HTTP+SSE（2024-11-05 已废弃协议）：GET 收事件流 + endpoint POST。读取与 http 同款 30s 轮次上限 + 有界 teardown 回收；长驻批量作业仍优先 stdio / http |
 | **auto**（默认） | 先按 Streamable HTTP 探测，失败自动回落旧版 SSE |
 
 不支持的边角：server-initiated request（sampling、roots/list 等，带 `method` 的请求）会被丢弃——本客户端只消费响应帧。`examples/mcp_echo.py`（stdio）与 `examples/mcp_http_echo.py`（/mcp + /sse 双端点）是零依赖测试服务器，也是协议参考实现。内置工具白名单（`tools`）与 MCP 工具互不影响。
@@ -814,7 +814,14 @@ TinyAgent 的定位是**可审计、可无人值守的 agent 执行单元**—�
   "cache_read_input_tokens": 1500,
   "summary": "agent 的最终文本回复",
   "tool_calls": [
-    { "name": "write_file", "input": {...}, "output": "wrote 42 bytes", "is_error": false }
+    { "name": "write_file", "input": {...}, "output": "wrote 42 bytes", "is_error": false, "duration_ms": 3 }
+  ],
+  "turn_timings": [
+    { "turn": 1, "duration_ms": 2100, "tool_calls": 1 },
+    { "turn": 2, "duration_ms": 950, "tool_calls": 0 }
+  ],
+  "compressions": [
+    { "trigger": "preflight", "dropped": 8, "kept": 6, "estimated_tokens_before": 152000, "estimated_tokens_after": 41000, "measured_tokens_before": 148220 }
   ],
   "plan": [
     { "subject": "跑测试", "status": "completed" },
@@ -832,6 +839,7 @@ TinyAgent 的定位是**可审计、可无人值守的 agent 执行单元**—�
   `model`/`provider` 来自实际运行的配置（批量任务片段覆盖了 `model` 就记覆盖后的值）；`provider` 记
   配置声明的协议族（anthropic / openai），绑定层注入自定义 provider 回调时仍是配置声明值。
 - `plan`（可选）：agent 通过 `todo` 工具记录的任务计划与每步状态（末次调用的全量列表）。**仅当 agent 用过 `todo` 才出现**，否则该键不存在——不用 `todo` 的结果文件与启用前逐字节相同。`tool_calls[]` 里 `task`（子 agent）条目另带一个可选 `meta` 字段（`turns`/`tools`/`tokens`/`stop_reason` 的紧凑 trace），同理仅在子 agent 调用时出现
+- `turn_timings`：每轮耗时（毫秒）与该轮工具调用数，逐轮对齐 `turns`；`duration_ms` 是该工具真实执行的耗时（排队与取消检查点不计入；因取消/打转未启动的占位记录不带该键）。`compressions`（可选）：上下文压缩审计——触发路径（`preflight`/`overflow`/`manual`）、折叠/保留消息数、压缩前后 token 估算（与 preflight 闸门同口径）及最近锚点请求的 provider 实测值（`measured_tokens_before`，无锚点时为 null）；**仅当发生过压缩才出现**。失败轮里已发生的压缩同样进审计（错误路径也是账单面）
 - `attempts` 是实际执行的 agent 运行次数（`>1` 表示发生了瞬态重试，见下文「单跑瞬态重试」）
 - `input_tokens` / `output_tokens` 是本次运行累计的 token 用量；`cache_creation_input_tokens` /
   `cache_read_input_tokens` 是 prompt 缓存写/读累计（Anthropic 两者都报，OpenAI 只报读）。`input_tokens`
@@ -1275,8 +1283,8 @@ crates/core/src/  # 内核 crate（package tiny-agent-core，lib 名 tiny_agent�
 │   ├── openai.rs         ( 1814)  # OpenAI 兼容（include_usage；400 回退：max_tokens→max_completion_tokens / 丢 stream_options）
 │   ├── anthropic.rs      ( 1213)  # Anthropic 原生（message_start/message_delta usage）
 │   └── mock.rs           (  345)  # 测试用脚本化 Provider（cfg(any(test, feature="mock"))）
-├── agent.rs          ( 3645)  # 核心 loop + usage 累计 + cancel + 上下文压缩（前馈/溢出双触发 + 滚动分块摘要）+ 相邻消息归一 + 同 turn 多 task 并行
-├── agent_tests.rs    ( 8223)  # 核心 loop 回归测试（provider::mock 脚本化，不连网）
+├── agent.rs          ( 3925)  # 核心 loop + usage 累计 + cancel + 上下文压缩（前馈/溢出双触发 + 滚动分块摘要）+ 相邻消息归一 + 同 turn 多 task 并行
+├── agent_tests.rs    ( 8569)  # 核心 loop 回归测试（provider::mock 脚本化，不连网）
 ├── usage_probe.rs    (   77)  # 并行 worker 的线程本地 usage 侧信道：panic unwind 后把已计费 usage 带回 join 点（防 result.json 与共享计数器分叉）
 ├── compress.rs       (  962)  # 压缩引擎（find_safe_cut / 分块摘要 / saturating usage 合并 + block 级计费原语）
 ├── context_report.rs (  874)  # 上下文构成分解（ContextBreakdown 估算口径：system 三段 / 工具四类 / 消息分型 + 锚点校准）
@@ -1285,14 +1293,14 @@ crates/core/src/  # 内核 crate（package tiny-agent-core，lib 名 tiny_agent�
 ├── skills.rs         ( 1074)  # 三级技能加载（内置 / 用户目录 / 项目）
 ├── hooks.rs          (  181)  # hooks 闸门（Deny / Modify / 审计）
 ├── tools/  # 工具集：内置工具 + MCP 包装 + task 子 agent + run_code（feature code）
-│   ├── mod.rs            ( 1210)  # Tool trait + ToolCtx + CallbackTool/SharedTool + build 白名单组装
+│   ├── mod.rs            ( 1279)  # Tool trait + ToolCtx + CallbackTool/SharedTool + build 白名单组装
 │   ├── shell.rs          ( 1250)  # shell 工具（unix: sh -c；Windows: cmd /C + raw_arg 命令逐字传递，防 std 引用改写）
 │   ├── file.rs           ( 1524)  # read_file / write_file / edit_file / list_dir
 │   ├── image.rs          (   87)  # load_image 工具
 │   ├── document.rs       (  100)  # PDF → Block::Document 加载（库 API load_document_block）
 │   ├── skill.rs          (  975)  # read_skill / list_skill（不在白名单，由装配注入）
 │   ├── mcp.rs            (  627)  # MCP 工具包装（sanitize_name + wire_name 分发）
-│   ├── subagent.rs       ( 1042)  # task 子 agent 工具（独立上下文 + turn 封顶；不可递归）
+│   ├── subagent.rs       ( 1053)  # task 子 agent 工具（独立上下文 + turn 封顶；不可递归）
 │   ├── todo.rs           (  311)  # todo 工具（任务计划，全量替换；plan 落 result.json）
 │   ├── run_code.rs       (  103)  # run_code 门面（feature code）：mod 声明 + 符号汇回；实现在 run_code/ 子模块
 │   ├── llm.rs            (  736)  # llm 判别原语（feature code + code.llm 门）：单发无状态内层模型调用——LD-17 预占/结算、LD-18 labels 归一、共享 Provider cell
@@ -1300,13 +1308,13 @@ crates/core/src/  # 内核 crate（package tiny-agent-core，lib 名 tiny_agent�
 │       ├── contract.rs       (  747)  # 对客契约文本：保留名/CODE marker/字节上限、PRELUDE 三源、技能 md 装载、strip_once
 │       ├── sandbox.rs        (  799)  # wasmtime 沙箱：QuickJS 模块装载与缓存、epoch/fuel/MemLimiter、CallTrace、HostCtx、墙钟、guest 内存读上限
 │       ├── guest_api.rs      ( 3587)  # 宿主函数面：unpack/read/write、host_call_tool 分发、内层结果信封、llm marker 解析折叠、审计 meta
-│       ├── fs_policy.rs      ( 1504)  # fs/glob 策略：路径拦截与词法归一、写目录约束、symlink 检查、glob 匹配（** 折叠 + 段数上限）
+│       ├── fs_policy.rs      ( 1907)  # fs/glob 策略：路径拦截与词法归一、写目录约束、symlink 检查、glob 匹配（** 折叠 + 段数上限）
 │       ├── lib_index.rs      ( 2013)  # lib 家族：会话库索引/读写封顶、sha256、保留名、include 投递
 │       ├── batch.rs          ( 2288)  # callBatch：wave 调度、输出准入（总量封顶降级）、条目信封
 │       ├── precheck.rs       (  858)  # FR-2 预检：lexer + 关键词命中渲染
 │       ├── tool.rs           ( 1090)  # 工具本体：RunCodeTool 状态机 + Tool impl（被钉哈希的 description/schema）
 │       └── test_util.rs      (  123)  # 共享测试辅助（cfg(test)：scratch/ctx/llm 装配）
-├── mcp.rs            ( 3524)  # MCP 客户端（stdio / Streamable HTTP 含 202→GET 流 / 旧版 SSE）
+├── mcp.rs            ( 4755)  # MCP 客户端（stdio / Streamable HTTP 含 202→GET 流 / 旧版 SSE）
 ├── winjob.rs         (  413)  # Windows Job Object 进程树击杀（shell 超时/取消 + MCP 子进程回收共用；两种 drop 策略）
 └── m0_probes.rs      (  337)  # M0 机制探针（cfg(test)，#[path] 声明于 lib.rs）：reserve/settle 账本、共享 Provider cell、按请求 model 分路的进程内原型（A-L2b/2c/9——M3 llm 原语直接沿用）
 
@@ -1314,8 +1322,17 @@ src/  # CLI crate（package tiny-agent，bin tiny-agent）：进程壳 + headles
 ├── main.rs           ( 1021)  # CLI 入口 + 组装（build_agent）+ --session none
 ├── signal.rs         (  123)  # headless SIGINT → cancel（首次优雅 / 二次硬退 130）
 ├── batch.rs          ( 3577)  # 批量任务 + --retries/--failed + 报告合并
-├── harness.rs        ( 1884)  # headless 模式 + result.json + NDJSON + exit code
+├── harness.rs        ( 2076)  # headless 模式 + result.json + NDJSON + exit code
 ├── harness_tests.rs  ( 1122)  # harness 行为测试（重试梯子 / result.json / NDJSON；自内核 agent_tests.rs 随 harness 迁入）
-└── tui.rs            ( 8752)  # TUI（feature tui）：内联流式渲染（对话进原生 scrollback）/ InputBuffer 多行输入 / 斜杠命令+补全 / markdown 渲染 / bracketed paste
+├── tui.rs            (   20)  # TUI 模块根（feature tui）：mod 声明 + 对外出口（run / transcript_rows）
+└── tui/  # TUI 子模块（同 tui 门）：从原 8.7k 行单文件按关注点拆分
+    ├── app.rs            ( 1625)  # 会话装配：run 入口 / worker 线程 / 事件与输入通道 / ui_loop 事件处理主体 / Ctrl-C 双击窗口
+    ├── input.rs          (  356)  # 多行输入 InputBuffer 编辑器 / 输入历史回溯 / 输入框横向滚动
+    ├── slash.rs          (  543)  # 斜杠命令：classify 文法 / 只读回复 / 补全弹窗状态机 / /context 报告
+    ├── theme.rs          (  147)  # 主题：历史行与 chrome 配色单一来源 / 明暗旋钮 TINYAGENT_TUI_THEME / 数字格式化助手
+    ├── markdown.rs       (  632)  # markdown 与 ANSI 渲染：render_markdown / 转义解析 / fence 扫描（与流式切分共享）/ MdCache 单槽缓存
+    ├── transcript.rs     ( 1190)  # 对话 Row 模型与全部构建/变更逻辑：历史渲染 / 流式增量与增量切分 / /export 转储 / resume 重建
+    ├── render.rs         (  490)  # 终端绘制：scrollback 提交 commit_rows / live 区渲染 / 输入与状态条 chrome / 宽度与控制字符工具
+    └── tests.rs          ( 3862)  # TUI 回归测试（TestBackend 抓 cell grid + 输入 / 补全 / 流式切分逻辑）
 ```
 <!-- END CODE STRUCTURE -->
