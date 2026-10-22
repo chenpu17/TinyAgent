@@ -1835,27 +1835,21 @@ mod tests {
 
     #[test]
     fn write_result_omits_compressions_and_turn_timings_when_empty() {
-        // Sparse observability keys: a run that never compressed / wrote no
-        // turn rows leaves result.json byte-identical to pre-feature (no
-        // null / empty-array keys for consumers that don't know the fields).
-        // The positive case — both keys present and shaped right, plus a
-        // timed tool call's sparse `duration_ms` — rides the same fixture.
+        // Sparse observability keys, pinned on REACHABLE shapes (audit
+        // 2026-10): the empty-key path is real for zero-turn outcomes
+        // (cancel before the first turn completes) and failure runs — every
+        // turns>=1 success necessarily carries turn_timings, so the old
+        // "byte-identical result files" claim only ever covered those. Each
+        // fixture below is a run the loop can actually produce.
         let dir = std::env::temp_dir().join(format!("ta-res-obs-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
-        // No compression, no timings → keys absent (not null, not []).
+        // Zero-turn cancelled outcome → both keys absent (not null, not []).
         let plain = RunOutcome {
-            final_text: "done".into(),
-            turns: 2,
-            stop_reason: "end_turn".into(),
-            tool_calls: vec![ToolCallRecord {
-                name: "shell".into(),
-                input: json!({"command":"ls"}),
-                output: "x".into(),
-                is_error: false,
-                meta: None,
-                duration_ms: None,
-            }],
+            final_text: String::new(),
+            turns: 0,
+            stop_reason: "cancelled".into(),
+            tool_calls: vec![],
             compressions: vec![],
             turn_timings: vec![],
             input_tokens: 0,
@@ -1865,7 +1859,7 @@ mod tests {
             elapsed: std::time::Duration::from_secs_f64(1.0),
         };
         let ppath = dir.join("plain.json");
-        write_result(&ppath, Some(&plain), None, 1, "error", None, &meta()).unwrap();
+        write_result(&ppath, Some(&plain), None, 1, "cancelled", None, &meta()).unwrap();
         let parsed: Value =
             serde_json::from_str(&std::fs::read_to_string(&ppath).unwrap()).unwrap();
         let obj = parsed.as_object().expect("result is a JSON object");
@@ -1877,7 +1871,39 @@ mod tests {
             !obj.contains_key("turn_timings"),
             "turn_timings key absent when empty"
         );
-        // A duration-less tool call also stays free of the sparse key.
+
+        // Cancel landed after the gate (placeholder record, unmeasured): the
+        // run DOES carry its turn row — but the unmeasured call stays free of
+        // the sparse duration_ms key.
+        let partial = RunOutcome {
+            final_text: String::new(),
+            turns: 1,
+            stop_reason: "cancelled".into(),
+            tool_calls: vec![ToolCallRecord {
+                name: "shell".into(),
+                input: json!({"command":"ls"}),
+                output: "x".into(),
+                is_error: false,
+                meta: None,
+                duration_ms: None,
+            }],
+            compressions: vec![],
+            turn_timings: vec![TurnTiming {
+                turn: 1,
+                duration_ms: 40,
+                tool_calls: 1,
+            }],
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            elapsed: std::time::Duration::from_secs_f64(1.0),
+        };
+        let upath = dir.join("partial.json");
+        write_result(&upath, Some(&partial), None, 1, "cancelled", None, &meta()).unwrap();
+        let parsed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&upath).unwrap()).unwrap();
+        assert!(parsed["turn_timings"].as_array().is_some());
         assert!(!parsed["tool_calls"][0]
             .as_object()
             .unwrap()

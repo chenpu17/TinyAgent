@@ -4926,6 +4926,120 @@ fn compress_records_anchor_backed_measured_tokens() {
 }
 
 #[test]
+fn compress_reports_none_measured_after_anchor_voiding_prune() {
+    // (C) The third anchor state, between "never had one" (None) and "live"
+    // (Some): the anchor was MINTED (turn 1 reported usage), then the
+    // preflight prune rewrote history and voided it (try_prune_protect:
+    // "History rewritten ⇒ the usage anchor … is void") — but freed too
+    // little for the gate to clear, so the fold still ran. The Compressed
+    // event / audit record must carry measured=None: a provider measurement
+    // of a history that no longer exists must never be passed off as the
+    // new history's size (诚实边界).
+    //
+    // Geometry: turn 2 reports NO usage, so the anchor stays turn-1's
+    // (msg_count 1) — its prefix is ONLY message[0] ("hi"), which the prune
+    // never touches (original-task head + keep_recent tail are protected).
+    // All four liveness conditions would therefore still hold after the
+    // prune; ONLY the explicit `usage_anchor = None` in try_prune_protect
+    // keeps `measured` honest here — remove it and this test sees the
+    // stale turn-1 measurement (Some(50)) instead of None.
+    let mut cfg = cfg_with(5, 0, 30);
+    cfg.limits.keep_recent_messages = 2;
+    let t1 = "x".repeat(400);
+    let pad = "z".repeat(30_000);
+    let (prov, state) = MockProvider::new(vec![
+        // Turn 1: usage (mints the anchor) + a tool call whose 30k-char
+        // echo result is the prune fuel (history: hi / t1+tool_use a /
+        // tool_result a BIG).
+        MockTurn::Ok(ChatResponse {
+            blocks: vec![
+                Block::Text(t1),
+                Block::ToolUse {
+                    id: "a".into(),
+                    name: "bulk".into(),
+                    input: json!({"pad": pad}),
+                },
+            ],
+            stop_reason: "tool_use".into(),
+            usage: mock::mk_usage(50, 5),
+        }),
+        // Turn 2: a plain tool call, no usage — the anchor must stay stale
+        // (msg_count 1) so the prune's void is observable. History grows to
+        // 5 messages; the BIG result is now outside the protected window.
+        mock::resp_tool("b", "echo", json!({}), None),
+        // Turn 3 preflight: prune frees ~30k (anchor voided) but the 30-char
+        // gate still trips → summarize_prefix call → the fold.
+        mock::resp_text("SUMMARY", None),
+        mock::resp_text("final answer", None), // main call on the folded history
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![
+            Box::new(EchoTool::new("echo")),
+            Box::new(InputEchoTool { name: "bulk" }),
+        ],
+        vec![user_text("hi")],
+        test_ctx(),
+    );
+    let mut events = Vec::new();
+    let o = agent.run(&mut |e| events.push(e)).unwrap();
+    assert_eq!(o.stop_reason, "end_turn");
+    assert_eq!(state.calls(), 4);
+    // The main request ran on the folded history (3 messages).
+    let cap = state.captured();
+    assert_eq!(cap[3].message_count, 3);
+    // Precondition, observable side: turn 1's usage minted the anchor —
+    // the None below is only meaningful because a measurement existed.
+    assert!(
+        events.iter().any(|e| matches!(e, AgentEvent::Usage { .. })),
+        "turn-1 usage must mint the anchor before the prune voids it"
+    );
+    // The voiding path really ran, in order: prune (history rewritten ⇒
+    // anchor voided) strictly before the fold.
+    let pruned_idx = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Pruned { .. }))
+        .expect("prune must fire before the compress");
+    let compressed_idx = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Compressed { .. }))
+        .expect("fold must still run: the prune freed too little to clear the gate");
+    assert!(
+        pruned_idx < compressed_idx,
+        "anchor-voiding prune must precede the compress"
+    );
+    for e in &events {
+        if let AgentEvent::Compressed {
+            trigger,
+            dropped,
+            kept,
+            estimated_tokens_before,
+            estimated_tokens_after,
+            measured_tokens_before,
+        } = e
+        {
+            assert!(matches!(trigger, CompressTrigger::Preflight));
+            assert_eq!((*dropped, *kept), (2, 3));
+            assert!(
+                estimated_tokens_before > estimated_tokens_after,
+                "fold must shrink the estimate: {estimated_tokens_before} -> {estimated_tokens_after}"
+            );
+            assert_eq!(
+                *measured_tokens_before, None,
+                "anchor voided by the prune: measured must be None, not the stale 50"
+            );
+        }
+    }
+    // Run-level audit record mirrors the event.
+    assert_eq!(o.compressions.len(), 1);
+    let c = &o.compressions[0];
+    assert_eq!(c.trigger, "preflight");
+    assert_eq!((c.dropped, c.kept), (2, 3));
+    assert_eq!(c.measured_tokens_before, None);
+}
+
+#[test]
 fn failed_run_error_still_carries_compressions() {
     // (B) 错误路径也是账单面: the run compressed its history, then the main
     // call died — the RunError must carry the compression audit so the
