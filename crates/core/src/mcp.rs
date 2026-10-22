@@ -25,6 +25,21 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// GET). This round bound is what makes reader-thread teardown bounded and
 /// caps the thread + TCP connection a teardown leaves behind at
 /// ~one round + backoff instead of "until process exit".
+///
+/// Declared behavior change (2026-10): a healthy stream now reconnects every
+/// round — a fresh GET every [`STREAM_ROUND`] that the old
+/// single-connection-until-death client never sent. That is new periodic
+/// request/log load on the server, accepted in exchange for bounded teardown
+/// and a bounded no-connection window.
+///
+/// Delivery across a rotation, honestly stated: a response whose push lands
+/// in a rotation (or any reconnect) gap is delivered ONLY if the SERVER
+/// re-sends it on the fresh connection — our GETs carry no Last-Event-ID and
+/// JSON-RPC over SSE has no re-send obligation. The pending table dispatches
+/// whatever arrives on the live connection and never re-delivers anything
+/// itself; a response the server does not re-send is lost, and the caller
+/// waits out the full [`CALL_TIMEOUT`]. Rotation shrinks the delivery gap,
+/// it does not provide redelivery.
 const STREAM_ROUND: Duration = Duration::from_secs(30);
 /// Reconnect backoff after a stream ended EARLY (server closed it / real
 /// read error / failed reconnect connect). Deadline rotations skip it: the
@@ -533,6 +548,16 @@ fn write_frame_cancelable<W: Write + Send + 'static>(
 /// 定性：用户配置信任面的正确性修复，非安全边界——`%VAR%` 展开连引号也
 /// 挡不住（cmd 在引号内仍展开环境变量）、`!` 仅延迟扩展开启时特殊，对这
 /// 两类加引号只是保守表意，不构成保证。
+///
+/// 引号+元字符同现限制（文档化限制，非保证）：token 同时含字面 `"` 与
+/// 触发集元字符、且元字符落在第一个内嵌引号之后时，内嵌 `"` 写成的
+/// `\"` 只对子进程的 MSVCRT argv 解析生效——cmd 层不认 `\"`（反斜杠对
+/// cmd 是字面量、挡不住引号开关），第一个内嵌引号即切出 cmd 的引号区，
+/// 其后的元字符裸露给 cmd 解析层被拆碎（如 `--filter "x&y"` 的 `&`）。
+/// cmd 对字面 `"` 无通用转义（BatBadBut 一族），此处不改编码、按限制
+/// 记录；触发面 = 用户配置的 args 同时含 `"` 与元字符。测试侧以 cmd
+/// 引号区 oracle（`cmd_bare_metachars`）钉住两面：无引号 token 的引号区
+/// 全覆盖（判例 + fuzz），含引号 token 显式豁免。
 ///
 /// 若拼好的尾段以 `"` 开头（命令路径被包裹——cmd 剥引号唯一可能发生的形
 /// 态），整段再包一层外引号：cmd 的剥除规则拿掉的正是这层外包装，剥完剩下
@@ -1426,7 +1451,10 @@ enum StandaloneRound {
     /// reconnect immediately, no backoff. This is the standing stream's
     /// routine cadence now (the round bound is what keeps teardown and the
     /// delivery path bounded), and skipping the sleep keeps the window where
-    /// a server push finds no connected stream down to a reconnect RTT.
+    /// a server push finds no connected stream down to a reconnect RTT. A
+    /// push that lands in that window is only recovered if the SERVER
+    /// re-sends it on the fresh GET (no Last-Event-ID, no protocol re-send
+    /// obligation — see [`STREAM_ROUND`]).
     Expired,
     /// The stream ended early (server closed it / read error) or the connect
     /// failed: retry after a backoff — waiters may still be owed responses,
@@ -3101,6 +3129,168 @@ mod tests {
         }
     }
 
+    // ── cmd 引号区 oracle（第四层判据）────────────────────────────────
+    //
+    // 现有双 oracle（MSVC 切分 + cmd 剥引号）都没有 cmd 的引号区语义：
+    // `\"` 只对子进程的 MSVCRT argv 解析生效，cmd 层不认 `\"`（反斜杠是
+    // 字面量、挡不住引号开关），token 同时含 `"` 与 cmd 元字符且元字符落
+    // 在第一个内嵌引号之后时裸露给 cmd 解析层被拆碎——往返照样全绿，双
+    // oracle 结构性测不出（同池同种子 5 万迭代约 14% 向量属此形态）。
+    // 本节补第四层判据：cmd 引号区模型 + 无引号面的全覆盖（判例 + fuzz）
+    // + 含引号面的显式豁免钉子。SUT 是 `#[cfg(windows)]` 的，平台无关面
+    // 走文档编码镜像（同上方整链镜像测试的既有做法）。
+
+    /// cmd 引号区 oracle（测试内判据，平台无关）：线性扫描 cmd 将解析的
+    /// 命令行，`"` 无条件切换引号区；任一 cmd 元字符（触发集：
+    /// `& | < > ^ ( ) % !`）出现在引号区外即「裸露」。只判引号区内外，
+    /// 不建模重定向/管道/`%VAR%` 展开的后续语义（后两者见
+    /// windows_cmd_tail 契约段的限制记录）。
+    fn cmd_bare_metachars(tail: &str) -> bool {
+        let mut in_quotes = false;
+        for c in tail.chars() {
+            if c == '"' {
+                in_quotes = !in_quotes;
+            } else if !in_quotes && matches!(c, '&' | '|' | '<' | '>' | '^' | '(' | ')' | '%' | '!')
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 性质（判例，平台无关）：不含 `"` 的 token 经文档编码镜像 + 外层
+    /// 包装后，cmd 将解析的串（**剥引号之后**——cmd /C 先剥外层包装、再
+    /// 按引号区解析命令行，扫描裸尾段会把剥掉的外层 `""` 误判成裸露）
+    /// 引号区必须覆盖一切元字符——无裸露。覆盖形态：纯元字符、元字符+
+    /// 空白、元字符+非 ASCII、URL query 活体、命令路径同时含空格与元字
+    /// 符（走外层包装 + 剥引号支）、`%`/`!` 保守表意等。
+    #[test]
+    fn windows_cmd_tail_quote_zones_cover_metachars_without_embedded_quotes() {
+        for toks in [
+            vec!["node".to_string(), "&|<>^()".to_string()],
+            vec!["node".to_string(), "a&b c|d".to_string()],
+            vec!["node".to_string(), "服务器&.js".to_string()],
+            vec![
+                "node".to_string(),
+                "https://api.example.com/?a=1&b=2".to_string(),
+            ],
+            vec!["node".to_string(), "100%".to_string(), "hi!".to_string()],
+            vec!["a&b.exe".to_string()],
+            vec!["C:\\Program Files\\a&b.exe".to_string(), "x".to_string()],
+            vec![
+                "node".to_string(),
+                "--flag".to_string(),
+                "a&b".to_string(),
+                String::new(),
+                "服务器.js".to_string(),
+            ],
+        ] {
+            let mut tail = toks
+                .iter()
+                .map(|t| doc_reference_msvc_encode(t))
+                .collect::<Vec<_>>()
+                .join(" ");
+            if tail.starts_with('"') {
+                tail = format!("\"{tail}\"");
+            }
+            let stripped = cmd_c_strip_quotes(&tail);
+            assert!(
+                !cmd_bare_metachars(&stripped),
+                "无内嵌引号 token 的尾段引号区必须覆盖一切元字符: {toks:?} tail={tail:?} stripped={stripped:?}"
+            );
+        }
+    }
+
+    /// 性质（fuzz，同池同种子于整链镜像测试
+    /// `documented_tail_chain_roundtrips_through_both_oracles_fuzz`）：
+    /// 不含 `"` 的 token 向量，引号化后 cmd 引号区无裸露；含 `"` 的向量
+    /// 显式豁免（`\"` 挡不住 cmd 的引号区开关——文档化限制，见
+    /// windows_cmd_tail 契约段）并计数，断言豁免面非空，钉住盲区的存在
+    /// 性，防止将来误以为全覆盖。
+    #[test]
+    fn windows_cmd_tail_cmd_quote_zone_fuzz_exempts_embedded_quote_tokens() {
+        const POOL: &[char] = &[
+            'a', 'Z', '9', '.', '_', '-', ' ', '"', '\\', '&', '|', '<', '>', '^', '(', ')', '标',
+            '図', 'ü',
+        ];
+        let mut rng = TailRng(0x5EED_0035);
+        let mut exempt = 0usize;
+        for _ in 0..tail_fuzz_iters() {
+            let n = 1 + rng.hbelow(4);
+            let toks: Vec<String> = (0..n)
+                .map(|_| {
+                    let len = rng.hbelow(7);
+                    (0..len).map(|_| *rng.hpick(POOL)).collect()
+                })
+                .collect();
+            if toks.iter().any(|t| t.contains('"')) {
+                // `\"` 只转义 MSVCRT：cmd 引号区在其第一个内嵌引号处即告
+                // 切换，其后元字符可裸露——结构上超出编码可保证的面，豁免。
+                exempt += 1;
+                continue;
+            }
+            let mut tail = toks
+                .iter()
+                .map(|t| doc_reference_msvc_encode(t))
+                .collect::<Vec<_>>()
+                .join(" ");
+            if tail.starts_with('"') {
+                tail = format!("\"{tail}\"");
+            }
+            let stripped = cmd_c_strip_quotes(&tail);
+            assert!(
+                !cmd_bare_metachars(&stripped),
+                "无内嵌引号向量引号区必须覆盖一切元字符: {toks:?} tail={tail:?} stripped={stripped:?}"
+            );
+        }
+        assert!(
+            exempt > 0,
+            "豁免面为空：同池同种子没探到含 `\"` 的向量——盲区钉子失效，先核对池与种子"
+        );
+    }
+
+    /// 文档化限制的确定性反例钉子（活标本）：token 同时含 `"` 与元字符、
+    /// 元字符落在第一个内嵌引号之后。MSVC 双 oracle 面往返照样全绿
+    /// （`\"` 在 MSVC 切分层还原为字面量 `"`）——现有判据结构性测不出；
+    /// cmd 引号区面则裸露（真实 cmd 会把 `&` 当命令分隔符拆碎）。cmd 对
+    /// 字面 `"` 无通用转义（BatBadBut 一族），正解是建模 + 收窄文档而非
+    /// 改编码——本钉子只钉形态，不改产品行为。
+    #[test]
+    fn windows_cmd_tail_cmd_quote_zone_blind_spot_specimen() {
+        let toks = vec!["node".to_string(), "--filter \"x&y\"".to_string()];
+        let tail = toks
+            .iter()
+            .map(|t| doc_reference_msvc_encode(t))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            !tail.starts_with('"'),
+            "判例前提：命令 token 未被包裹、尾段无外层包装: {tail:?}"
+        );
+        let stripped = cmd_c_strip_quotes(&tail);
+        assert_eq!(
+            msvc_argv_split(&stripped),
+            toks,
+            "MSVC 往返全绿——现有双 oracle 结构性测不出该形态"
+        );
+        assert!(
+            cmd_bare_metachars(&stripped),
+            "第一个内嵌引号之后的元字符必须裸露给 cmd 层: {tail:?}"
+        );
+        // 边界对照：元字符全部落在第一个内嵌引号**之前**时仍在引号区内
+        // （限制的触发面是「之后」）。
+        let toks2 = ["node".to_string(), "a<b \"c\"".to_string()];
+        let tail2 = toks2
+            .iter()
+            .map(|t| doc_reference_msvc_encode(t))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            !cmd_bare_metachars(&cmd_c_strip_quotes(&tail2)),
+            "第一个内嵌引号之前的元字符仍在引号区内: {tail2:?}"
+        );
+    }
+
     /// 性质（fuzz + 判例，#[cfg(windows)]）：真 SUT 的整链往返——
     /// windows_cmd_tail 输出经剥引号 oracle、MSVC 切分 oracle 后必须还原
     /// [cmd]+args。字符池同整链镜像（`& | < > ^ ( )` 触发集扩展后可进池；
@@ -4242,9 +4432,13 @@ mod tests {
     /// Mock for the ROTATION-delivery case: POST → 202 (+ session id); EVERY
     /// GET connection delivers response #1 immediately, then — once the
     /// SECOND POST exists (shared log) — delivers response #2 on whichever
-    /// connection is live at that moment. If a rotation cuts the first
-    /// delivery, the next connection re-delivers and the shared pending table
-    /// hands it to the still-waiting caller. Bounded like the siblings.
+    /// connection is live at that moment. Note what this mock deliberately
+    /// does SERVER-side: it re-sends response #1 on every fresh GET, because
+    /// that re-send is the server's job (no Last-Event-ID on our GETs, no
+    /// re-send obligation in JSON-RPC over SSE) — the pending table only
+    /// dispatches whatever arrives, so a rotation-cut response the server
+    /// never re-sends is simply lost and the caller sits out CALL_TIMEOUT.
+    /// Bounded like the siblings.
     fn mock_202_rotating_stream() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
         use std::io::Read;
         use std::net::TcpListener;
@@ -4332,8 +4526,10 @@ mod tests {
     #[test]
     fn http_202_delivery_survives_standing_stream_rotations() {
         // 到期轮转不得弄丢 202 投递：小轮时长下跨至少两次轮转，第二条响应
-        // 仍送达——落在轮转后仍活着的连接上；投递若被轮转切断，下一条连接
-        // 经共享 pending 表重投。
+        // 仍送达——落在轮转后仍活着的连接上。轮转切断的投递能否找回完全取
+        // 决于服务器是否在新连接上重发（本 mock 刻意在每个 GET 上重发响应
+        // #1，正是在替服务器履行这份协议并未要求的重发）；pending 表只分发
+        // 到达的消息、自己不重投——服务器不重发时调用方坐满 CALL_TIMEOUT。
         let (url, log) = mock_202_rotating_stream();
         let cfg = McpServerConfig {
             name: "rot-202".into(),
@@ -4407,8 +4603,12 @@ mod tests {
     /// Mock for the legacy ROTATION-delivery case: POST → 202; every GET
     /// connection sends the `endpoint` event, waits for the POST to exist
     /// (shared log), then delivers response #1 — on whichever connection is
-    /// live at that moment (rotation-cut deliveries are re-delivered by the
-    /// next connection; the pending table dedups).
+    /// live at that moment. Same server-side caveat as the standing-stream
+    /// sibling: the MOCK re-sends on every fresh GET (that re-send is the
+    /// server's job and no protocol obligation); the pending table only
+    /// dispatches what arrives — a late duplicate finds its slot already
+    /// reclaimed and is dropped, a never-re-sent response is lost to
+    /// CALL_TIMEOUT.
     fn mock_legacy_rotating_stream() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
         use std::io::Read;
         use std::net::TcpListener;
