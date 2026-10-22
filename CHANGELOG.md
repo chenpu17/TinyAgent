@@ -7,17 +7,23 @@
 
 ### Added
 
-- **运行成本可观测性（压缩审计 + 逐轮/逐工具计时）**：`result.json` 新增三类字段（均稀疏插入，无压缩/计时的旧结果文件逐字节不变）——
+- **运行成本可观测性（压缩审计 + 逐轮/逐工具计时）**：`result.json` 新增三类字段（均稀疏插入）——
   `compressions`（压缩审计：触发路径 preflight/overflow/manual、折叠/保留消息数、压缩前后 token 估算
   与最近锚点请求的 provider 实测值；失败轮已发生的压缩同样入账）；`turn_timings`（每轮耗时与该轮
   工具调用数）；`tool_calls[].duration_ms`（工具真实执行耗时，排队与取消检查点不计，未启动的取消
   占位不带该键）。NDJSON `Compressed` 事件同步携带三个新字段（`estimated_tokens_before/after`、
-  `measured_tokens_before`），压缩「该不该触发」从此可用估算 vs 实测对照复盘。
+  `measured_tokens_before`），压缩「该不该触发」从此可用估算 vs 实测对照复盘。键缺席语义（审计
+  2026-10 校准）：`compressions` 仅当发生过压缩才出现、`duration_ms` 仅实测过的调用携带——这两类
+  键缺席时旧消费方不受影响；`turn_timings` 在任何 `turns>=1` 的成功 run **必然出现**（逐轮落行是
+  机制本身），无键状态只在零转结果（轮前取消/超时/预算尽）与失败路径存在。
 
 - **run_code/文件工具路径包含性质测试（5 万次随机迭代）**：`fs_policy.rs` 路径汤四性质（包含性 /
   symlink 物理不可逃逸 / 幂等 / 不动点）、`write_traverses_symlink` 双侧性质；`mcp.rs` Windows
-  argv 引号链路 oracle（MSVC 切分 + cmd 剥引号，CommandLineToArgvW 文档向量钉死）+ 编码×切分互逆
-  fuzz + `#[cfg(windows)]` 真 SUT 整链往返（Windows CI 验证）。迭代次数 `TA_FUZZ_ITERS` 可调。
+  argv 引号链路 oracle（MSVC 切分 + cmd 剥引号，CommandLineToArgvW 文档向量钉死）+ cmd 引号区
+  第四层 oracle（`\"` 只转义 MSVCRT、不转义 cmd 引号区开关——token 同时含 `"` 与 cmd 元字符且
+  元字符在首个内嵌引号之后时对 cmd 裸露，属文档化限制；oracle 钉住无引号面的全覆盖（判例+fuzz）
+  与含引号面的显式豁免 + 确定性反例钉子）+ 编码×切分互逆 fuzz + `#[cfg(windows)]` 真 SUT 整链
+  往返（Windows CI 验证）。迭代次数 `TA_FUZZ_ITERS` 可调。
 
 ### Changed
 
@@ -29,8 +35,11 @@
 - **MCP HTTP/SSE 读线程有界回收**：standing GET 流与 legacy SSE 的每次阻塞读带 30s 轮次上限
   （`STREAM_ROUND`），健康流按轮静默轮转重连（到期不退避、真读错照旧告警+退避）；teardown 改为
   置停标志 + 有界等待（≤2s）join。热移除 MCP 服务器的「一线程 + 一 TCP 连接活到进程退出」泄漏
-  收敛为「至多一轮 + backoff 自回收」，detach 不再告警。已知取舍：跨轮边界的大响应会被切断由
-  pending 表重投（最坏延迟一轮）；带活读者的 transport 退出时多等 ≤2s。
+  收敛为「至多一轮 + backoff 自回收」，detach 不再告警。已知取舍：① 跨轮边界被切断的响应依赖
+  **服务器**在新连接上重发（GET 不带 Last-Event-ID，JSON-RPC over SSE 无重发义务）——不重发则
+  该响应丢失、调用方坐满 120s CALL_TIMEOUT（最坏是丢到超时，不是延迟一轮）；② 健康流每 30s 主动
+  轮转重连对服务器是新增的周期性 GET/日志负载（旧实现单连接挂到死）；③ 带活读者的 transport
+  退出时多等 ≤2s。
 
 ### Fixed
 
@@ -136,13 +145,21 @@
   弹出、存在组件 canonicalize 着陆真身），每步重新落地真实盘面即复检包含性；语义收紧为「内核解析
   真穿过外向 symlink 的拼写一律 Err」，内向 symlink 返回 canonical 真身，Ok 返回值永不背 `..`/`.`、
   再入是不动点。同族边角一并堵住：最深已存在祖先自身落在 root 外（`root/../x`、`out_link/../..`）
-  的拼写不再给词法假 Ok。
+  的拼写不再给词法假 Ok。**present-but-unresolvable fail-closed（独立审计 2026-10 抓到）**：悬空
+  symlink（目标不存在的链）canonicalize 失败曾被当「缺失组件」词法放行——`root/dang -> outside/x`
+  且 `outside/x` 不存在时返回 Ok，`std::fs::write` 写返回值后 root 外真实出现目标文件（O_CREAT
+  语义穿链）；现改为 lstat 分诊：仅 ENOENT 真缺失走词法累积，悬空链与 EACCES/ENOTDIR 等存在但
+  不可解析的组件一律 Err（调用方 I/O 会撞同一障碍）。fuzz 沙盘补悬空外指链入池、symlink 不可逃逸
+  性质去掉 `exists()` 门改 lstat 直检（旧门把悬空链整类拱出断言面）。
 
 - **MCP stdio Windows 引号触发集缺 cmd 元字符**：`windows_cmd_tail` 的加引号触发集原本只有
   空白/引号/非 ASCII——`& | < > ^ ( )` 是 ASCII 非空白、裸露引号外，cmd /C 解析层把它们当命令
   分隔符/重定向/转义/分组，MCP args 含 URL query（`?a=1&b=2`）之类在 cmd 层即被拆碎、子进程永远
   看不到完整参数。十个元字符（含保守表意的 `%`/`!`）进触发集；`%VAR%` 展开连引号也挡不住，文档
-  契约段写明为限制而非保证。定性：用户配置信任面的正确性修复，非安全边界。
+  契约段写明为限制而非保证。定性：用户配置信任面的正确性修复，非安全边界。已知限制：token
+  同时含字面 `"` 与元字符时，`\"` 只转义子进程的 MSVCRT、不转义 cmd 的引号区开关（cmd 层不认
+  `\"`），第一个内嵌引号之后的元字符可裸露——cmd 对字面 `"` 无通用转义，契约段按文档化限制
+  记录；测试侧以 cmd 引号区 oracle 钉住无引号面的全覆盖与含引号面的豁免。
 
 - **外部复审确认项修复（估算 / 计费 / 热更可见性 / 线程回收 / 测试与发布）**：
   - **token 预检估算对 CJK 严重低估**：原口径是 JSON 字面字节数/4，1000 个汉字（UTF-8 3000 字节）

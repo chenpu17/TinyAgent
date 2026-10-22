@@ -167,8 +167,11 @@
   按轮静默轮转重连（到期立即重连不退避、真读错照旧告警+退避；超时经 io::Error 内层
   `reqwest::Error::is_timeout()` 判别，`ErrorKind` 恒 Other 不可用）；`shutdown_stream_reader`
   置停标志后有界等待（≤2s）join、超时静默 detach——热删残留的「一线程+一 TCP 连接」从活到进程
-  退出收敛为至多一轮自回收。已知取舍：跨轮边界的大响应被切断由 pending 表重投（最坏延迟一轮）；
-  reqwest blocking 无逐读 read_timeout，请求级 `.timeout` 是 body 总时限。**run_code 的 guest registry 同样
+  退出收敛为至多一轮自回收。已知取舍：跨轮边界被切断的响应依赖**服务器**在新连接上重发
+  （GET 不带 Last-Event-ID，JSON-RPC over SSE 无重发义务）——不重发即丢失、调用方坐满
+  CALL_TIMEOUT（最坏是丢到超时，不是延迟一轮）；健康流每 30s 轮转重连对服务器是新增的周期性
+  GET/日志负载（旧实现单连接挂到死）。reqwest blocking 无逐读 read_timeout，请求级 `.timeout`
+  是 body 总时限。**run_code 的 guest registry 同样
   不感知**（与 ④ 同一条政策，外部评审曾当 P1 报过——实为既定快照语义）：registry 按构造期四件套在
   `Arc<OnceLock>` 里惰性建一次、跨克隆共享，热增的 server JS 看不到；热删的 server 仍可被已建 registry
   调用（连接活到 registry drop；该 server 已不在顶层列表 → shutdown 不再经它武装 reaper，最坏退出时
@@ -290,6 +293,12 @@
   的祖先可落 root 外）。旧「尾段词法折叠」会把 `missing/../out_link`（已存在外向 symlink）折叠进
   返回值——Ok 且物理逃逸 + 再入漂移 Err，性质 fuzz（5 万次随机路径汤）抓到后重写。Ok 返回值永不背
   `..`/`.`、再入是不动点；内核解析真穿过外向 symlink 的拼写一律 Err，内向 symlink 尾段返回真身。
+  **present-but-unresolvable 一律 fail-closed（审计 2026-10 追加）**：尾段组件 canonicalize 失败后经
+  `symlink_metadata` 分诊——仅 ENOENT 真缺失走词法累积；悬空 symlink（目标不存在的链，写穿可在
+  目标出现时落到 root 外——审计员实测 `std::fs::write` 真逃逸过）与 EACCES/ENOTDIR 等存在但不可
+  解析的组件一律 Err（调用方 I/O 会撞同一障碍，早拒是诚实不是损失）；fuzz 沙盘的 `dangle_out`
+  （悬空且外指）与去掉 `exists()` 门的 lstat 直检性质同批落地——`exists()`=false 曾把悬空链整类
+  拱出断言面。
   TOCTOU caveat 同 workdir 沙盒）。
   **`list_skill` 工具**列技能目录树（`walk_skill`，`file_type` 不跟随 symlink 防逃逸、深度封顶 4、跳隐藏），供模型 level-3 自主
   发现资源。**内置（embedded）skill（v2 P2）**：`SkillEntry.source` 是 `SkillSource::{Dir, Embedded(String)}`

@@ -99,6 +99,9 @@ cargo clippy -p tiny-agent-node
   即编译错误，禁止为省事加回 `..`。
 - **LLM 可见文案即规格**：run_code 预检拒答/墓碑文案在 `docs/finetune_support_design.md` 附录 A
   （微调数据有依赖），改一个字先走该文档修订记录；run_code 工具描述/skill 正文同理三处同源同步。
+- **bisect 可编译性**：同批拆多个 commit 时，消费侧事件/枚举加字段与消费方 match 臂改动必须
+  落**同一个 commit**（9bdabdf 给 `Compressed` 加三字段、cb81197 才给 TUI 臂补 `..`——落在这
+  两个提交之间的 bisect 点 `--features tui` 编不过）；一个提交自身要能过四配置 clippy。
 
 ## 架构要点索引（详录：`docs/claude/architecture.md`）
 
@@ -131,7 +134,7 @@ cargo clippy -p tiny-agent-node
 - **headless Ctrl-C**：首次翻 cancel 优雅收尾（exit 130），二次硬退；批量模式 worker gate 同款。
 - **消息稳定 id**：ingest 点分配（非构造时）；`next_msg_id` 不随 `clear_messages` 重置。
 - **TUI**：inline viewport + scrollback 提交模型；新增"在飞行"必须同步 holdback/inflight/LiveRow 三件套；新暗色元素用 `dim_fg()`；源码按关注点拆在 `src/tui/`（app/transcript/markdown/slash/render/input/theme + tests，`tui.rs` 只是模块根）。
-- **文件工具 workdir 沙盒（`tools::confined_to`）**：尾段**逐组件解析走查、着陆即复检**——`缺失目录/../<外向 symlink>` 类拼写一律 Err（词法折叠会 Ok 逃逸，性质 fuzz 抓过），Ok 永不背 `..`/`.`、再入不动点，内向 symlink 返回真身；文件工具与 skill 沙盒共用，改它两边的语义测试都要过。
+- **文件工具 workdir 沙盒（`tools::confined_to`）**：尾段**逐组件解析走查、着陆即复检**——`缺失目录/../<外向 symlink>` 类拼写一律 Err（词法折叠会 Ok 逃逸，性质 fuzz 抓过）；**present-but-unresolvable 一律 fail-closed**（悬空 symlink/不可穿过的前缀只放行 ENOENT 真缺失——悬空外向链曾词法放行、写穿真逃逸，审计抓过），Ok 永不背 `..`/`.`、再入不动点，内向 symlink 返回真身；文件工具与 skill 沙盒共用，改它两边的语义测试都要过。
 
 ## 容易踩的坑索引（详录：`docs/claude/pitfalls.md`）
 

@@ -1293,7 +1293,7 @@ crates/core/src/  # 内核 crate（package tiny-agent-core，lib 名 tiny_agent�
 ├── skills.rs         ( 1074)  # 三级技能加载（内置 / 用户目录 / 项目）
 ├── hooks.rs          (  181)  # hooks 闸门（Deny / Modify / 审计）
 ├── tools/  # 工具集：内置工具 + MCP 包装 + task 子 agent + run_code（feature code）
-│   ├── mod.rs            ( 1279)  # Tool trait + ToolCtx + CallbackTool/SharedTool + build 白名单组装
+│   ├── mod.rs            ( 1358)  # Tool trait + ToolCtx + CallbackTool/SharedTool + build 白名单组装
 │   ├── shell.rs          ( 1250)  # shell 工具（unix: sh -c；Windows: cmd /C + raw_arg 命令逐字传递，防 std 引用改写）
 │   ├── file.rs           ( 1524)  # read_file / write_file / edit_file / list_dir
 │   ├── image.rs          (   87)  # load_image 工具
@@ -1308,13 +1308,13 @@ crates/core/src/  # 内核 crate（package tiny-agent-core，lib 名 tiny_agent�
 │       ├── contract.rs       (  747)  # 对客契约文本：保留名/CODE marker/字节上限、PRELUDE 三源、技能 md 装载、strip_once
 │       ├── sandbox.rs        (  799)  # wasmtime 沙箱：QuickJS 模块装载与缓存、epoch/fuel/MemLimiter、CallTrace、HostCtx、墙钟、guest 内存读上限
 │       ├── guest_api.rs      ( 3587)  # 宿主函数面：unpack/read/write、host_call_tool 分发、内层结果信封、llm marker 解析折叠、审计 meta
-│       ├── fs_policy.rs      ( 1907)  # fs/glob 策略：路径拦截与词法归一、写目录约束、symlink 检查、glob 匹配（** 折叠 + 段数上限）
+│       ├── fs_policy.rs      ( 1938)  # fs/glob 策略：路径拦截与词法归一、写目录约束、symlink 检查、glob 匹配（** 折叠 + 段数上限）
 │       ├── lib_index.rs      ( 2013)  # lib 家族：会话库索引/读写封顶、sha256、保留名、include 投递
 │       ├── batch.rs          ( 2288)  # callBatch：wave 调度、输出准入（总量封顶降级）、条目信封
 │       ├── precheck.rs       (  858)  # FR-2 预检：lexer + 关键词命中渲染
 │       ├── tool.rs           ( 1090)  # 工具本体：RunCodeTool 状态机 + Tool impl（被钉哈希的 description/schema）
 │       └── test_util.rs      (  123)  # 共享测试辅助（cfg(test)：scratch/ctx/llm 装配）
-├── mcp.rs            ( 4755)  # MCP 客户端（stdio / Streamable HTTP 含 202→GET 流 / 旧版 SSE）
+├── mcp.rs            ( 4955)  # MCP 客户端（stdio / Streamable HTTP 含 202→GET 流 / 旧版 SSE）
 ├── winjob.rs         (  413)  # Windows Job Object 进程树击杀（shell 超时/取消 + MCP 子进程回收共用；两种 drop 策略）
 └── m0_probes.rs      (  337)  # M0 机制探针（cfg(test)，#[path] 声明于 lib.rs）：reserve/settle 账本、共享 Provider cell、按请求 model 分路的进程内原型（A-L2b/2c/9——M3 llm 原语直接沿用）
 
@@ -1322,7 +1322,7 @@ src/  # CLI crate（package tiny-agent，bin tiny-agent）：进程壳 + headles
 ├── main.rs           ( 1021)  # CLI 入口 + 组装（build_agent）+ --session none
 ├── signal.rs         (  123)  # headless SIGINT → cancel（首次优雅 / 二次硬退 130）
 ├── batch.rs          ( 3577)  # 批量任务 + --retries/--failed + 报告合并
-├── harness.rs        ( 2076)  # headless 模式 + result.json + NDJSON + exit code
+├── harness.rs        ( 2102)  # headless 模式 + result.json + NDJSON + exit code
 ├── harness_tests.rs  ( 1122)  # harness 行为测试（重试梯子 / result.json / NDJSON；自内核 agent_tests.rs 随 harness 迁入）
 ├── tui.rs            (   20)  # TUI 模块根（feature tui）：mod 声明 + 对外出口（run / transcript_rows）
 └── tui/  # TUI 子模块（同 tui 门）：从原 8.7k 行单文件按关注点拆分
