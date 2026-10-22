@@ -769,35 +769,20 @@ pub(crate) fn resolve(ctx: &ToolCtx, path: &str) -> Result<PathBuf> {
 /// stored field read.
 const MAX_ANYOS_PATH_BYTES: usize = 96 * 1024;
 
-/// Lexically normalize a not-yet-existing tail collected deepest-first by
-/// [`confined_to`]'s ancestor walk: `.` drops, `..` pops the component in
-/// front of it; `None` when a pop underflows — the spelling escapes the
-/// deepest existing ancestor, so it must be refused rather than spliced.
-/// The missing components did not exist at check time, so treating them as
-/// plain directories (lexical popping) is the non-racy semantics: the
-/// returned path never carries a `..` that a LATER symlink at one of those
-/// components could resolve outside `root`.
-fn normalize_tail(rest: &[std::ffi::OsString]) -> Option<Vec<std::ffi::OsString>> {
-    let mut stack: Vec<std::ffi::OsString> = Vec::new();
-    for comp in rest.iter().rev() {
-        if comp.as_os_str() == std::ffi::OsStr::new("..") {
-            // `?` propagates the underflow: a pop past the deepest existing
-            // ancestor is the lexical escape.
-            stack.pop()?;
-        } else if comp.as_os_str() != std::ffi::OsStr::new(".") {
-            stack.push(comp.clone());
-        }
-    }
-    Some(stack)
-}
-
-/// Check that `full` stays inside `root`. Canonicalizes `root` first, then the
-/// deepest existing ancestor of `full` (so writes to not-yet-existing files are
-/// checked too) and re-appends the LEXICALLY NORMALIZED remainder (`.` drops,
-/// `..` pops; a pop past the deepest ancestor is an escape); a plain prefix
-/// comparison against the canonicalized root is then sound. `label` is plugged
-/// into the escape error message (e.g. "working directory", "skill directory")
-/// so the user knows which boundary was crossed.
+/// Check that `full` stays inside `root`. Canonicalizes `root` first, then
+/// finds the deepest existing ancestor of `full` (so writes to
+/// not-yet-existing files are checked too) and walks the remaining tail
+/// COMPONENT BY COMPONENT from it: a component that exists is canonicalized
+/// (the kernel resolves symlinks, and every landing back on the real disk is
+/// re-checked against `root`); a missing one accumulates lexically, with `.`
+/// dropping and `..` popping (a pop past the deepest ancestor — or past
+/// `root` itself — is an escape). The component-wise prefix comparison
+/// against the canonicalized root is then sound, and the returned path never
+/// carries `..`/`.` segments: fully-existing tails come back in canonical
+/// (physically resolved) form, not-yet-existing tails in lexical form —
+/// either way, I/O through the returned path stays inside `root`. `label` is
+/// plugged into the escape error message (e.g. "working directory", "skill
+/// directory") so the user knows which boundary was crossed.
 ///
 /// Shared by the workdir sandbox (`confine`, via [`ToolCtx::workdir`]) and the
 /// per-skill-directory sandbox (`read_skill`/`list_skill` file reads), which is
@@ -822,32 +807,63 @@ pub fn confined_to(root: &Path, full: &Path, label: &str) -> Result<PathBuf> {
     let mut rest: Vec<std::ffi::OsString> = Vec::new();
     loop {
         match ancestor.canonicalize() {
-            Ok(mut resolved) => {
-                // Lexically normalize the not-yet-existing tail (see
-                // [`normalize_tail`]) BEFORE re-appending it: the tail used
-                // to be spliced back verbatim, so `workdir/nonexist/../x`
-                // passed the prefix check yet RETURNED a path still carrying
-                // a literal `..` — and once `nonexist` later materializes as
-                // a symlink pointing outside `root`, that returned path
-                // resolves out of the sandbox (the non-race variant of the
-                // symlink escape: the ancestor walk never saw the `..`,
-                // because it stops at the deepest EXISTING ancestor). On
-                // Windows this arm is belt-and-suspenders — `PathBuf::join`
-                // onto a prefixed (canonicalized `\\?\`) base already folds
-                // `x/..` lexically, and verbatim canonicalize refuses
-                // `..`-suffixed ancestors outright; on unix join is a pure
-                // append and realpath resolves component-by-component, so
-                // the `..` genuinely reaches `rest` there.
-                let stack = normalize_tail(&rest).ok_or_else(|| {
-                    anyhow::anyhow!("path escapes the {label}: {}", full.display())
-                })?;
-                for comp in &stack {
-                    resolved.push(comp);
+            Ok(resolved) => {
+                // Walk the not-yet-existing tail COMPONENT BY COMPONENT from
+                // the canonicalized ancestor instead of lexically folding it:
+                // the old lexical fold collapsed `missing/..` and spliced the
+                // rest back verbatim, so `missing/../out_link` (out_link an
+                // EXISTING symlink pointing outside `root`) returned
+                // Ok(`root/out_link`) — physically outside `root`, and Err on
+                // re-entry. Here every step that re-lands on the real disk
+                // (canonicalize succeeds) is re-checked for containment;
+                // joins and pops over the lexically-accumulated missing tail
+                // are re-checked at their next landing. Platform-uniform: the
+                // walk joins single components and pops via `parent()`, so
+                // no `PathBuf::join` folding semantics are involved.
+                if !resolved.starts_with(&root_c) {
+                    // The deepest existing ancestor itself can sit OUTSIDE
+                    // `root` (`root/../x` spellings): with an all-lexical
+                    // tail no landing step ever fires, so check it here.
+                    bail!("path escapes the {label}: {}", full.display());
                 }
-                if resolved.starts_with(&root_c) {
-                    return Ok(resolved);
+                let mut cur = resolved;
+                // `rest` was collected deepest-first; walk in source order.
+                for comp in rest.iter().rev() {
+                    if comp.as_os_str() == std::ffi::OsStr::new("..") {
+                        // Lexical pop: `cur` is canonical (or canonical plus
+                        // a missing lexical tail), so `parent()` is the
+                        // physical parent; a pop past `root` is caught by
+                        // the re-check below. `None` only at the filesystem
+                        // root — also an escape.
+                        cur = match cur.parent() {
+                            Some(p) => p.to_path_buf(),
+                            None => bail!("path escapes the {label}: {}", full.display()),
+                        };
+                    } else if comp.as_os_str() != std::ffi::OsStr::new(".") {
+                        let cand = cur.join(comp);
+                        cur = match cand.canonicalize() {
+                            // The component really exists: the kernel
+                            // resolves the whole chain (symlinks included)
+                            // and the walk lands on the canonical body —
+                            // inner symlinks resolve to their target;
+                            // outbound landings are rejected below.
+                            Ok(landed) => landed,
+                            // Doesn't exist (at check time) → lexical
+                            // accumulation, re-checked at the next landing.
+                            Err(_) => cand,
+                        };
+                    }
+                    // Re-check: canonicalize `cur`; success means the
+                    // spelling is back on the real disk and must stay inside
+                    // `root`.
+                    if let Ok(c) = cur.canonicalize() {
+                        if !c.starts_with(&root_c) {
+                            bail!("path escapes the {label}: {}", full.display());
+                        }
+                        cur = c;
+                    }
                 }
-                bail!("path escapes the {label}: {}", full.display());
+                return Ok(cur);
             }
             Err(_) => {
                 // `Path::file_name()` returns None for paths ending in `..`
@@ -1095,12 +1111,12 @@ mod tests {
         );
     }
 
-    /// P2: the not-yet-existing tail is LEXICALLY NORMALIZED before being
-    /// re-appended, so a `..` riding over a missing component can neither
-    /// leak into the returned path (where a later symlink at the missing
-    /// component would resolve it outside the sandbox — the non-race variant
-    /// of the symlink escape) nor underflow past the root.
-    /// `nonexist/../x` normalizes to plain `x` and passes.
+    /// P2: the not-yet-existing tail is walked component by component, where
+    /// `..` pops lexically, so a `..` riding over a missing component can
+    /// neither leak into the returned path (where a later symlink at the
+    /// missing component would resolve it outside the sandbox — the non-race
+    /// variant of the symlink escape) nor underflow past the root.
+    /// `nonexist/../x` folds to plain `x` and passes.
     #[test]
     fn confined_to_normalizes_dotdot_over_missing_components_in_the_returned_path() {
         let dir = workdir("norm");
@@ -1132,11 +1148,11 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A `..` that pops PAST the deepest existing ancestor (normalize-stack
-    /// underflow) is an escape, not a path to splice: `nonexist/../../x`
-    /// would leave the root once the `..`s resolve — missing components or
-    /// not. (`../../x` over EXISTING dirs is already caught by the
-    /// canonicalize-then-prefix-check arm; this pins the lexical arm.)
+    /// A `..` that pops PAST the deepest existing ancestor is an escape, not
+    /// a path to splice: `nonexist/../../x` would leave the root once the
+    /// `..`s resolve — missing components or not. (`../../x` over EXISTING
+    /// dirs is already caught by the canonicalize-then-prefix-check arm;
+    /// this pins the lexical arm.)
     #[test]
     fn confined_to_rejects_dotdot_that_pops_past_the_deepest_ancestor() {
         let dir = workdir("norm-esc");
@@ -1149,38 +1165,91 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// normalize_tail in isolation — the platform-honest discriminator for
-    /// the `..`-over-missing-components fix: on Windows `PathBuf::join` onto
-    /// a canonicalized (prefixed `\\?\`) base folds `x/..` lexically before
-    /// confined_to ever runs, so the integration tests above exercise the
-    /// same contract on pre-folded input there; on unix the `..` genuinely
-    /// reaches `rest` and this pins the algorithm either way. Input is
-    /// deepest-first (the order the ancestor walk collects it in).
+    /// Regression (real containment escape, the fuzz's minimal-repro shape):
+    /// with `out_link` an EXISTING symlink pointing outside `root`, the old
+    /// tail lexical fold collapsed `missing/..` away and spliced `out_link`
+    /// back verbatim — `missing/../out_link` returned Ok(`root/out_link`)
+    /// whose canonicalize lands OUTSIDE `root` (writing through it escapes),
+    /// and re-entry drifted to Err. The per-component walk re-lands on the
+    /// real disk mid-tail and re-checks containment there, so every spelling
+    /// whose kernel resolution truly passes through the outbound link must
+    /// Err — including the direct spellings the buggy code's would-be return
+    /// value would have re-entered as.
+    #[cfg(unix)]
     #[test]
-    fn normalize_tail_drops_dots_pops_dotdot_and_reports_underflow() {
-        let os = |v: &[&str]| -> Vec<std::ffi::OsString> {
-            v.iter().map(std::ffi::OsString::from).collect()
-        };
-        // `nonexist/../x` → rest [x, .., nonexist] (deepest first) → [x].
-        assert_eq!(
-            normalize_tail(&os(&["x", "..", "nonexist"])),
-            Some(os(&["x"]))
-        );
-        // `a/b/../c` → rest [c, .., b, a] → [a, c].
-        assert_eq!(
-            normalize_tail(&os(&["c", "..", "b", "a"])),
-            Some(os(&["a", "c"]))
-        );
-        // `nonexist/../../x` → rest [x, .., .., nonexist]: the second pop
-        // underflows → escape.
-        assert_eq!(normalize_tail(&os(&["x", "..", "..", "nonexist"])), None);
-        // `.` components drop (unreachable via file_name(), pinned anyway).
-        assert_eq!(
-            normalize_tail(&os(&["c", ".", "b", "a"])),
-            Some(os(&["a", "b", "c"]))
-        );
-        // An empty tail stays empty (the fully-existing-path case).
-        assert_eq!(normalize_tail(&[]), Some(vec![]));
+    fn confined_to_rejects_dotdot_over_missing_component_reaching_outbound_symlink() {
+        let base = workdir("sym-esc");
+        let root = base.join("root");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "s").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("out_link")).unwrap();
+        std::fs::create_dir(root.join("exists")).unwrap();
+        for spelling in [
+            "missing/../out_link",
+            "missing/../out_link/inner.txt",
+            // A REAL dir under the missing-free prefix: the ancestor walk
+            // stops even higher, the tail re-lands on the link all the same.
+            "exists/../out_link",
+            // Direct pass-throughs (already rejected before the fix — guards
+            // against a loosening regression and pins the Err re-entry side).
+            "out_link",
+            "out_link/secret.txt",
+        ] {
+            let err = confined_to(&root, &root.join(spelling), "working directory").unwrap_err();
+            assert!(
+                err.to_string().contains("escapes the working directory"),
+                "{spelling}: {err}"
+            );
+        }
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Fixed point + inner-symlink semantics: an Ok return re-fed into
+    /// `confined_to` comes back unchanged (canonical prefix + lexical tail
+    /// replay), and a tail component that exists as an INSIDE symlink
+    /// resolves to its canonical body (`missing/../inner_link/inside.txt` →
+    /// `root/a/inside.txt`) — the kernel-honest answer, re-entry stable.
+    #[cfg(unix)]
+    #[test]
+    fn confined_to_ok_return_is_a_fixed_point_and_inner_symlink_resolves_to_body() {
+        let base = workdir("sym-fix");
+        let root = base.join("root");
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::write(root.join("a/inside.txt"), "i").unwrap();
+        std::os::unix::fs::symlink(root.join("a"), root.join("inner_link")).unwrap();
+        let root_c = root.canonicalize().unwrap();
+        for spelling in [
+            "nonexist/../x",
+            "missing/missing2/../y",
+            "missing/../inner_link/inside.txt",
+        ] {
+            let first = confined_to(&root, &root.join(spelling), "working directory").unwrap();
+            assert!(first.starts_with(&root_c), "{spelling}: {first:?}");
+            assert!(
+                !first
+                    .components()
+                    .any(|c| c == std::path::Component::ParentDir
+                        || c == std::path::Component::CurDir),
+                "no `..`/`.` may survive into the returned path: {spelling} → {first:?}"
+            );
+            let again = confined_to(&root, &first, "working directory").unwrap();
+            assert_eq!(
+                again, first,
+                "{spelling}: return value must be a fixed point"
+            );
+        }
+        // The inner-link spelling returns the canonical body, not the link
+        // spelling.
+        let via_link = confined_to(
+            &root,
+            &root.join("missing/../inner_link/inside.txt"),
+            "working directory",
+        )
+        .unwrap();
+        assert_eq!(via_link, root_c.join("a/inside.txt"), "{via_link:?}");
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]

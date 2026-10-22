@@ -1444,7 +1444,9 @@ mod tests {
             // (b) stability — repeat both entry points verbatim.
             assert_eq!(deny_match(&pats, &path), set_ans, "{pats:?} × {path:?}");
             // (c) any-of composition: set answer == OR of member answers.
-            let or_of_set = pats.iter().any(|p| deny_match(&[p.clone()], &path));
+            let or_of_set = pats
+                .iter()
+                .any(|p| deny_match(std::slice::from_ref(p), &path));
             assert_eq!(or_of_set, set_ans, "{pats:?} × {path:?}");
             // (d) a no-slash `*` matches exactly single-segment paths.
             assert_eq!(
@@ -1500,5 +1502,406 @@ mod tests {
             // Idempotence.
             assert_eq!(seg_match("*a*", &s), seg_match("*a*", &s));
         }
+    }
+
+    // ── confined_to / write_traverses_symlink 路径汤性质测试（固定种子 LCG）──
+
+    /// Fuzz 迭代数：`TA_FUZZ_ITERS` 覆盖默认值（缺省 2_000，离线小而确定；
+    /// 大迭代回归用 `TA_FUZZ_ITERS=50000 cargo test ...`）。
+    fn fuzz_iters() -> usize {
+        std::env::var("TA_FUZZ_ITERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2_000)
+    }
+
+    /// confined_to / 走查性质测试的 symlink 沙盘：root 内预置真目录链
+    /// `a/b`、文件 `f.txt`、指向 root 外的 `out_link`、指向 root 内的
+    /// `inner_link`、悬空的 `dangle`；root 外放 `outside` 目录（含
+    /// secret.txt）。返回 (root, canonical root)。
+    #[cfg(unix)]
+    fn soup_sandbox() -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = scratch();
+        let outside = root.parent().unwrap().join(format!(
+            "{}-outside",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(root.join("f.txt"), "f").unwrap();
+        std::fs::write(outside.join("secret.txt"), "s").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("out_link")).unwrap();
+        std::os::unix::fs::symlink(root.join("a"), root.join("inner_link")).unwrap();
+        std::os::unix::fs::symlink("no_such", root.join("dangle")).unwrap();
+        let root_c = root.canonicalize().unwrap();
+        (root, root_c)
+    }
+
+    /// #[cfg(unix)] 沙盘的 outside 目录路径（与 [`soup_sandbox`] 的拼法
+    /// 一致，供收尾清理）。
+    #[cfg(unix)]
+    fn soup_outside(root: &Path) -> std::path::PathBuf {
+        root.parent().unwrap().join(format!(
+            "{}-outside",
+            root.file_name().unwrap().to_string_lossy()
+        ))
+    }
+
+    /// 本节两个路径汤 fuzz 专用的抽样 helper：取 LCG **高 32 位**再取模。
+    /// 共享的 [`Lcg::below`] 直接取状态低位——mod 2^k 抽样的周期只有 2^k，
+    /// 变长重抽循环会与它锁步共振（0x5EED_0034 实测：below(4) 前 24 抽 =
+    /// [3,2,1,0]×6，而真侧每轮恰好消耗 4 次 below(4) = 整周期 → 每次尝试
+    /// 完全相同 → 死循环；precheck/fs_policy 既有 fuzz 未触发纯属种子侥幸，
+    /// 不在本节改动面内）。高半字有全周期，可变消费模式不共振。
+    #[cfg(unix)]
+    fn hbelow(rng: &mut Lcg, n: usize) -> usize {
+        ((rng.next_u64() >> 32) % n as u64) as usize
+    }
+
+    /// [`hbelow`] 的 slice 版（对应共享的 [`Lcg::pick`]）。
+    #[cfg(unix)]
+    fn hpick<'a, T>(rng: &mut Lcg, xs: &'a [T]) -> &'a T {
+        &xs[hbelow(rng, xs.len())]
+    }
+
+    /// 性质（fuzz，固定种子，#[cfg(unix)]）：随机路径汤（真目录/文件/`.`/
+    /// `..`/外向 symlink/内向 symlink/悬空 symlink/不存在名，深度 1..=6，
+    /// 相对与绝对拼写混给）过 confined_to——
+    ///
+    /// (a) 包含性：Ok 结果必须落在 canonical root 内，且不携带 `..`/`.`
+    ///     残段（normalize_tail 契约：返回路径永不背 `..`）；
+    /// (b) symlink 不可逃逸：Ok 结果若已存在，物理 canonicalize 后仍在
+    ///     root 内——out_link 直指 root 外，凡解析真穿过它的拼写只能 Err
+    ///     （含 `out_link/../..` 与绝对拼写混搭；canonicalize 按内核真值
+    ///     穿 symlink，折叠回 root 内的拼写同样被识破）；
+    /// (c) 幂等：同一路径重复调用结果一致（Ok 同路径 / 同为 Err）；
+    /// (d) 不动点：Ok(p) 再喂回 confined_to 原样返回 p（canonical 前缀 +
+    ///     词典化尾段的重放语义）。
+    ///
+    /// 注意「拼写含 out_link ⟹ 必 Err」不是契约：`missing/out_link` 解析
+    /// 到 root/missing/out_link（全新路径，真 out_link 从未被穿过），Ok 是
+    /// 正确判定——上面的性质面恰是这个正确判定。TOCTOU 与「检查时不存在、
+    /// 尾段稍后变成 symlink」是文档声明的 best-effort 边界，不在断言面内。
+    ///
+    /// **回归史注**：`missing/../<已存在 symlink>` 类拼写曾被 confined_to
+    /// 判 Ok 且返回值物理落在 root 外、再入漂移为 Err（性质 (b)/(d) 被产品
+    /// 违反）——2026-10 由 pathfix 修复（尾段不再折叠引用已存在 symlink），
+    /// 本测试随之转正常态全量运行；最小复现样例保留在
+    /// [`confined_to_missing_dotdot_tail_folds_existing_symlink_into_return`]
+    /// 作为回归守卫。
+    #[cfg(unix)]
+    #[test]
+    fn confined_to_path_soup_fuzz_containment_idempotence_fixedpoint() {
+        let (root, root_c) = soup_sandbox();
+        // 白名单池：真目录 ×2、文件、不存在名、外向/内向/悬空 symlink
+        // 加权、`..` 加权、`.`。
+        const POOL: &[&str] = &[
+            "a",
+            "b",
+            "a",
+            "f.txt",
+            "missing",
+            "out_link",
+            "out_link",
+            "inner_link",
+            "dangle",
+            "..",
+            "..",
+            ".",
+        ];
+        let mut rng = Lcg(0x5EED_0031);
+
+        // 确定性逃生向量先导（不靠随机抽中）：out_link 直穿、link/../..
+        // 混搭、绝对拼写坍缩回 root、内向 link 不得误伤、纯词典折叠照常
+        // 放行。全部走同一性质检查，另钉两枚无歧义判例。
+        for v in [
+            "out_link",
+            "out_link/x",
+            "./out_link",
+            "out_link/./x",
+            "out_link/../..",
+            "out_link/../secret.txt",
+            "out_link/../out_link/x",
+            "out_link/../../secret",
+            "a/../out_link/x",
+            "a/./../out_link",
+            "inner_link/f.txt",
+            "inner_link/../f.txt",
+            "a/../f.txt",
+            "a/b/../../f.txt",
+            "dangle/x",
+            "dangle/../f.txt",
+            "a/..",
+            "../f.txt",
+        ] {
+            check_one(&root, &root_c, v);
+        }
+        assert!(
+            crate::tools::confined_to(&root, &root.join("out_link"), "fuzz").is_err(),
+            "外向 symlink 直穿必须 Err"
+        );
+        assert_eq!(
+            crate::tools::confined_to(&root, &root.join("inner_link/f.txt"), "fuzz").unwrap(),
+            root_c.join("a/f.txt"),
+            "内向 symlink 不得误伤：Ok 落到 canonical 真身"
+        );
+
+        for _ in 0..fuzz_iters() {
+            let depth = 1 + hbelow(&mut rng, 6);
+            let spelling = (0..depth)
+                .map(|_| *hpick(&mut rng, POOL))
+                .collect::<Vec<_>>()
+                .join("/");
+            let path = match hbelow(&mut rng, 5) {
+                0 => spelling,
+                1 => format!("./{spelling}"),
+                2 => root.join(&spelling).to_string_lossy().into_owned(),
+                3 => root_c.join(&spelling).to_string_lossy().into_owned(),
+                _ => format!("{spelling}/.."),
+            };
+            check_one(&root, &root_c, &path);
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(soup_outside(&root)).ok();
+
+        /// 单条拼写的四性质检查（a–d，见外层测试文档）。
+        fn check_one(root: &Path, root_c: &Path, spelling: &str) {
+            use std::path::Component;
+            let full = absolutize(root, spelling);
+            let r1 = crate::tools::confined_to(root, &full, "fuzz");
+            if let Ok(p) = &r1 {
+                assert!(
+                    p.starts_with(root_c),
+                    "包含性: {spelling:?} → Ok 但落在 root 外: {}",
+                    p.display()
+                );
+                assert!(
+                    p.components()
+                        .all(|c| !matches!(c, Component::ParentDir | Component::CurDir)),
+                    "返回值携带 ../ . 残段: {spelling:?} → {}",
+                    p.display()
+                );
+                if p.exists() {
+                    let pc = p.canonicalize().unwrap_or_else(|e| {
+                        panic!("已存在的 Ok 结果应可 canonicalize: {spelling:?}: {e}")
+                    });
+                    assert!(
+                        pc.starts_with(root_c),
+                        "symlink 不可逃逸: {spelling:?} → Ok 但物理落在 root 外: {}",
+                        p.display()
+                    );
+                }
+            }
+            let r2 = crate::tools::confined_to(root, &full, "fuzz");
+            match (&r1, &r2) {
+                (Ok(a), Ok(b)) => assert_eq!(a, b, "非幂等: {spelling:?}"),
+                (Err(_), Err(_)) => {}
+                _ => panic!("非幂等（Ok/Err 漂移）: {spelling:?}: {r1:?} vs {r2:?}"),
+            }
+            if let Ok(p) = &r1 {
+                let again = crate::tools::confined_to(root, p, "fuzz");
+                assert_eq!(
+                    again.as_ref().ok().map(|q| q.as_path()),
+                    Some(p.as_path()),
+                    "不动点破坏: {spelling:?} → {p:?} 再入得 {again:?}"
+                );
+            }
+        }
+    }
+
+    /// 回归守卫（曾为存量缺陷的最小复现，2026-10 随修复转正常态）。
+    ///
+    /// 输入 `missing/../out_link`：`missing` 不存在使「最深已存在祖先」
+    /// 走查停在 root；旧实现的 normalize_tail 把词典化尾段
+    /// `[out_link, .., missing]` 折叠成 `[out_link]` 原样拼回——**已存在
+    /// 的、指向 root 外的 symlink** 被当成尚不存在组件进了返回值：
+    /// Ok(root/out_link) 且 canonicalize 落在 root 外（confine() 的返回值
+    /// 就是文件工具的落盘路径，写穿即逃逸 workdir），再入又得 Err（非
+    /// 不动点）。修复（尾段逐组件解析走查、着陆即复检）后本拼写判 Err。
+    ///
+    /// 断言面即契约的正确形态：Err，或 Ok(p) 且 canonicalize(p) 仍在
+    /// root 内、再入是不动点。
+    #[cfg(unix)]
+    #[test]
+    fn confined_to_missing_dotdot_tail_folds_existing_symlink_into_return() {
+        let (root, root_c) = soup_sandbox();
+        let full = root.join("missing/../out_link");
+        match crate::tools::confined_to(&root, &full, "repro") {
+            // 按契约拒绝也算修复（Err 与 Ok-真身二选一皆可）。
+            Err(e) => eprintln!("缺陷已按契约修复为 Err: {e}"),
+            Ok(p) => {
+                assert!(
+                    p.exists(),
+                    "复现前提失效：Ok 路径应存在（symlink 沙盘被破坏）: {}",
+                    p.display()
+                );
+                let pc = p
+                    .canonicalize()
+                    .unwrap_or_else(|e| panic!("Ok 路径应可 canonicalize: {}: {e}", p.display()));
+                assert!(
+                    pc.starts_with(&root_c),
+                    "物理逃逸: {full:?} → Ok({})，canonicalize 落在 root 外 ({pc:?})",
+                    p.display()
+                );
+                let again = crate::tools::confined_to(&root, &p, "repro");
+                assert!(
+                    again.is_ok(),
+                    "不动点破坏: {full:?} → Ok({}) 再入得 {again:?}",
+                    p.display()
+                );
+            }
+        }
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(soup_outside(&root)).ok();
+    }
+
+    /// 性质（fuzz，固定种子，#[cfg(unix)]）：write_traverses_symlink 的
+    /// 原始拼写走查，两侧都要——
+    ///
+    /// 真侧：symlink 组件（外向/内向/悬空都算——中-1 拒绝一切 symlink
+    ///     组件，不看目标）出现在走查真的到达的位置（前缀词典折叠落回
+    ///     root 且全程不下溢——symlink 只预置在 root）时必须报 true；
+    ///     尾段可混 `..` 但折叠不得弹出 root（P1 修复面：折叠先行的旧
+    ///     实现把 link/../ 从走查里抹掉漏报；弹出 root 的拼写由 escape
+    ///     屏判 false，不属真侧——见下方 escape 屏判例）；约半数走绝对
+    ///     拼写（root 之上取 canonical 拼写，祖先链是已 canonicalize 的
+    ///     真目录）。
+    /// 假侧：拼写只含真目录/文件/不存在名/`.`/`..` 且折叠全程不出 root
+    ///     时必须报 false（无误报——`..` 过真目录是普通拼写噪声）。
+    ///     假侧只投相对拼写：绝对拼写的走查锚在文件系统根，root 之上的
+    ///     祖先链自身是 symlink（macOS /tmp → /private/tmp）时按文档语义
+    ///     一律报 true，会撞平台差异。
+    #[cfg(unix)]
+    #[test]
+    fn write_traverses_symlink_walk_fuzz_two_sided() {
+        let (root, root_c) = soup_sandbox();
+        const DIRS: &[&str] = &["a", "b", ".", ".."];
+        const LINKS: &[&str] = &["out_link", "inner_link", "dangle"];
+        const TAIL: &[&str] = &[
+            "a", "b", "f.txt", "missing", "..", ".", "out_link", "dangle",
+        ];
+        const FALSE_POOL: &[&str] = &["a", "b", "f.txt", "missing", ".", ".."];
+        let mut rng = Lcg(0x5EED_0034);
+
+        // 确定性先导：P1 的 link/../ 形态两向各钉一组。
+        for s in [
+            "out_link/../x.txt",
+            "a/../out_link/x",
+            "inner_link/../f.txt",
+            "dangle/../f.txt",
+        ] {
+            assert!(
+                write_traverses_symlink(&root_c, s),
+                "走查必须到达 symlink: {s:?}"
+            );
+        }
+        // escape 屏判例：词典折叠出 root 的拼写不归走查管——先导屏幕直接
+        // 判 false，写随后由 outside-workdir 规则拒绝（安全，语义见函数
+        // 文档）。注意两个 `..` 会把 root 自己的两级也弹掉：
+        // out_link/../.. 折叠成 /tmp 而非 root 本身。
+        for s in ["out_link/../../x", "out_link/../..", "../out_link"] {
+            assert!(
+                !write_traverses_symlink(&root_c, s),
+                "折叠出 root 的拼写应由 escape 屏判 false: {s:?}"
+            );
+        }
+        for s in [
+            "a/../f.txt",
+            "a/b/../../f.txt",
+            "missing/../f.txt",
+            "./a/./b",
+        ] {
+            assert!(
+                !write_traverses_symlink(&root_c, s),
+                "真目录 .. 不得误报: {s:?}"
+            );
+        }
+
+        for _ in 0..fuzz_iters() {
+            // 真侧：前缀词典折叠全程 ≥0 且终值 =0（落回 root——symlink
+            // 预置点），下溢或没落回的整条重抽；接 link（折叠深度 +1），
+            // 尾段继续带深度约束——`..` 只能弹到 root 为止（弹出的拼写
+            // 折叠出 root，escape 屏判 false，不属真侧），失败整条重抽。
+            // 抽样全走 hbelow/hpick（见其文档——低位锁步共振实测死循环）。
+            let spelling = loop {
+                let mut depth = 0usize;
+                let mut parts: Vec<&str> = Vec::new();
+                let mut failed = false;
+                for _ in 0..hbelow(&mut rng, 4) {
+                    let c = *hpick(&mut rng, DIRS);
+                    match c {
+                        ".." if depth == 0 => {
+                            failed = true;
+                            break;
+                        }
+                        ".." => depth -= 1,
+                        "." => {}
+                        _ => depth += 1,
+                    }
+                    parts.push(c);
+                }
+                if failed || depth != 0 {
+                    continue;
+                }
+                parts.push(*hpick(&mut rng, LINKS));
+                depth += 1;
+                for _ in 0..hbelow(&mut rng, 3) {
+                    let c = *hpick(&mut rng, TAIL);
+                    match c {
+                        ".." if depth == 0 => {
+                            failed = true;
+                            break;
+                        }
+                        ".." => depth -= 1,
+                        "." => {}
+                        _ => depth += 1,
+                    }
+                    parts.push(c);
+                }
+                if failed {
+                    continue;
+                }
+                break parts.join("/");
+            };
+            // 真侧对祖先链 symlink 不敏感（期望就是 true），绝对拼写随机混入。
+            let s = if hbelow(&mut rng, 2) == 0 {
+                root_c.join(&spelling).to_string_lossy().into_owned()
+            } else {
+                spelling.clone()
+            };
+            assert!(write_traverses_symlink(&root_c, &s), "真侧漏报: {s:?}");
+
+            // 假侧：只含非 symlink 组件，折叠全程 ≥0（不出 root）才断
+            // false；下溢拼写的走查会游出沙盘，不在断言面内，重抽。
+            let spelling = loop {
+                let mut depth = 0usize;
+                let mut parts: Vec<&str> = Vec::new();
+                let mut failed = false;
+                for _ in 0..(1 + hbelow(&mut rng, 5)) {
+                    let c = *hpick(&mut rng, FALSE_POOL);
+                    match c {
+                        ".." if depth == 0 => {
+                            failed = true;
+                            break;
+                        }
+                        ".." => depth -= 1,
+                        "." => {}
+                        _ => depth += 1,
+                    }
+                    parts.push(c);
+                }
+                if !failed {
+                    break parts.join("/");
+                }
+            };
+            assert!(
+                !write_traverses_symlink(&root_c, &spelling),
+                "假侧误报: {spelling:?}"
+            );
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(soup_outside(&root)).ok();
     }
 }
