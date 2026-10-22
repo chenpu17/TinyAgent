@@ -7,7 +7,7 @@ use crate::tools::{BudgetGate, Tool, ToolConcurrency, ToolCtx, ToolOutput};
 use anyhow::Result;
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Per-request timeout used as a leak backstop when the run has no deadline
@@ -630,8 +630,9 @@ pub struct Agent {
     session_archive_bytes: usize,
     /// Real prompt size the provider reported for the last main-chat request,
     /// plus what it was measured against — the preflight compaction estimate
-    /// anchors to it instead of the whole-history chars-per-token heuristic
-    /// (which under-counts CJK 2–3× and would delay compaction until the
+    /// anchors to it instead of the whole-history heuristic (the heuristic is
+    /// CJK-aware but still model-agnostic; the provider's own tokenizer can
+    /// still disagree, and a late preflight would delay compaction until the
     /// provider rejects the request). `None` until the first billed response;
     /// voided whenever the measured history/prompt shape no longer matches
     /// (prune/fold rewrite, system or tool-table hot-swap, prefix edit).
@@ -1155,6 +1156,15 @@ impl Agent {
     ///
     /// Errors when this agent has no installed instance (feature-off build,
     /// or direct `try_new` construction) — there is nothing to configure.
+    ///
+    /// The `code.llm` half is pinned by the sandbox registry at its FIRST
+    /// execution (LD-14 snapshot boundary, same class as MCP hot add/remove).
+    /// Once that registry is built, a later change to `llm.enabled` /
+    /// `default_model` / `models` still lands in the shared config (in-flight
+    /// and future outer executions see the new values) but can no longer
+    /// reach guest `llm` calls — the registry cached its tool table. That
+    /// silent no-op now emits a `diag_warn` naming the freeze; applying it
+    /// requires rebuilding the agent.
     #[cfg(feature = "code")]
     pub fn set_code_config(&mut self, mut cfg: crate::config::CodeConfig) -> Result<()> {
         let tool = self
@@ -1167,6 +1177,12 @@ impl Agent {
         // outside the allowlist fails HERE, not at the first omitted-model
         // `llm` call dispatched to a model the tier never admitted.
         cfg.normalize_and_validate_llm()?;
+        // Compare AFTER validation (normalization can reorder/dedupe). The
+        // tool decides whether this is a NEW frozen-llm change (it also
+        // remembers the last warned value so repeat full-config pushes stay
+        // quiet); before the first execution there is no pin, so the new
+        // config simply becomes the one it pins.
+        let llm_update_frozen = tool.should_warn_frozen_llm(cfg.llm.enabled.then_some(&cfg.llm));
         let want = cfg.enabled;
         {
             let mut g = tool
@@ -1174,6 +1190,13 @@ impl Agent {
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             *g = cfg;
+        }
+        if llm_update_frozen {
+            crate::diag::diag_warn!(
+                "[run_code] code.llm update cannot reach guest `llm` calls: the sandbox \
+                 registry was already built and pinned the previous gate/config (LD-14 \
+                 snapshot boundary). Rebuild the agent to apply it."
+            );
         }
         self.sync_code_tool(want)
     }
@@ -1321,6 +1344,11 @@ impl Agent {
     /// budget) — see the [`ToolOutput::usage_in_shared_budget`] split at the
     /// fold site.
     fn bill_chat(&mut self, events: &mut dyn FnMut(AgentEvent), u: &Usage) {
+        // Parallel-worker side channel: if this chat runs inside a worker
+        // thread and that worker panics later, the join arm reads this probe
+        // to recover the spend that would otherwise die with the thread (see
+        // `usage_probe`). No-op outside a parallel worker.
+        crate::usage_probe::record(u);
         self.share_budget(u.total());
         self.fold_usage(events, u);
     }
@@ -2300,14 +2328,26 @@ impl Agent {
                             // None, which the join below turns into the same
                             // cancelled-error shape the sequential gate
                             // checkpoint uses.
-                            let mut handles: Vec<
-                                std::thread::ScopedJoinHandle<Option<ToolOutput>>,
-                            > = Vec::with_capacity(wave.len());
+                            // Probe + join handle per worker; named to keep the
+                            // batch type readable (clippy::type_complexity).
+                            type Worker<'s> = (
+                                Arc<Mutex<Usage>>,
+                                std::thread::ScopedJoinHandle<'s, Option<ToolOutput>>,
+                            );
+                            let mut handles: Vec<Worker<'_>> = Vec::with_capacity(wave.len());
                             for (_, name, input) in wave {
                                 let name = name.clone();
                                 let input = input.clone();
                                 let tx = tx.clone();
-                                handles.push(s.spawn(move || {
+                                // Per-worker usage side channel: if this worker
+                                // panics after billing a chat but before it can
+                                // return the ToolOutput that carries the usage,
+                                // the join arm below still recovers it. See
+                                // `usage_probe` for why this is thread-local.
+                                let probe = Arc::new(Mutex::new(Usage::default()));
+                                let worker_probe = Arc::clone(&probe);
+                                let h = s.spawn(move || {
+                                    crate::usage_probe::install(worker_probe);
                                     let mut emit = |ev: AgentEvent| {
                                         // Blocks when the funnel is full — the
                                         // drain loop in this same scope is the
@@ -2318,7 +2358,8 @@ impl Agent {
                                         return None;
                                     }
                                     Some(run_tool(tools, defs, &name, &input, ctx, &mut emit))
-                                }));
+                                });
+                                handles.push((probe, h));
                             }
                             drop(tx); // workers hold the last clones; rx ends when they drop
                                       // Forward child events to the parent sink as they arrive
@@ -2331,20 +2372,27 @@ impl Agent {
                                                         // hooks with the ORIGINAL input (from tool_uses, never
                                                         // the Modify replacement), then place each result at
                                                         // its ordinal.
-                            for (pos, h) in handles.into_iter().enumerate() {
+                            for (pos, (probe, h)) in handles.into_iter().enumerate() {
                                 let (i, _, _) = wave[pos];
                                 let output = h.join().unwrap_or_else(|_| {
-                                    // Usage note (external review, known
-                                    // divergence): a sub-agent that panicked
-                                    // mid-run has already billed its chats
-                                    // into the SHARED fleet counter, but the
-                                    // ToolOutput carrying its usage died with
-                                    // the thread — so result.json totals never
-                                    // see it. Counter-vs-totals can disagree
-                                    // for a panicked parallel child; recovering
-                                    // the partial usage would need a side
-                                    // channel out of the panicking thread.
-                                    Some(ToolOutput::error("parallel tool worker panicked"))
+                                    // A worker that panicked mid-run has
+                                    // already billed its chats into the SHARED
+                                    // fleet counter, and the `usage_probe`
+                                    // side channel carries those numbers out
+                                    // of the unwinding thread. Attach them to
+                                    // the synthesized error output so totals
+                                    // (RunOutcome / result.json) match the
+                                    // counter instead of silently dropping the
+                                    // spend. `usage_in_shared_budget: true`
+                                    // tells the fold the counter half is done.
+                                    let recovered = crate::usage_probe::read(&probe);
+                                    let mut out =
+                                        ToolOutput::error("parallel tool worker panicked");
+                                    if recovered.total() > 0 {
+                                        out.usage = Some(recovered);
+                                        out.usage_in_shared_budget = true;
+                                    }
+                                    Some(out)
                                 });
                                 match output {
                                     Some(output) => {

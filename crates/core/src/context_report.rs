@@ -5,8 +5,9 @@
 //! `/context` and binding-side equivalents of Claude Code's context report).
 //!
 //! Yardstick discipline: every number here is a HEURISTIC ESTIMATE (text
-//! chars/4, image payloads len/100, PDF pages × 3000 — the same rules
-//! [`crate::compress::estimate_tokens`] uses), never a provider measurement.
+//! units/4 — ASCII 1 unit, CJK 9 units — image payloads len/100, PDF pages ×
+//! 3000 — the same rules [`crate::compress::estimate_tokens`] uses), never a
+//! provider measurement.
 //! The billing authority is always `AgentEvent::Usage` / [`Agent::usage`]
 //! (crate::agent::Agent::usage). That is why the breakdown is a pull-only
 //! read query ([`crate::agent::Agent::context_breakdown`]) and NOT an event:
@@ -30,7 +31,8 @@
 //! scaling the components may differ from their totals by rounding.
 
 use crate::compress::{
-    block_chars, block_pdf_tokens, estimate_tokens, image_payload_len, CHARS_PER_TOKEN,
+    block_chars, block_pdf_tokens, char_units, estimate_tokens, image_payload_len, text_units,
+    CHARS_PER_TOKEN,
 };
 use crate::provider::{Block, Message, Role, ToolDef};
 use crate::tools::{Tool, ToolOrigin};
@@ -158,7 +160,8 @@ pub struct MessageKinds {
 ///
 /// Uniform scaling is a HEURISTIC — it assumes the estimate error is
 /// proportionally similar across components, which is usually true (the
-/// dominant error, CJK undercounting, is) but not guaranteed. The measured
+/// residual error is dominated by tokenizer differences between models and
+/// scripts) but not guaranteed. The measured
 /// `measured_prompt_tokens` is from the ANCHOR request; `total_tokens` is
 /// the CURRENT context's scaled estimate — they legitimately differ (the
 /// history has grown since).
@@ -169,6 +172,18 @@ pub struct Calibration {
     pub measured_prompt_tokens: u64,
     /// measured ÷ estimated at the anchor; every component × scale.
     pub scale: f64,
+}
+
+/// Units in the byte prefix `s[..byte_end]` (the end need not be a char
+/// boundary: a straddling character is attributed to the earlier segment).
+/// The segment offsets come from byte lengths of whole string prefixes, so in
+/// practice the boundaries are clean; this stays panic-free if a hand-built
+/// `ContextBreakdown` input disagrees.
+fn units_upto(s: &str, byte_end: usize) -> usize {
+    s.char_indices()
+        .take_while(|(i, _)| *i < byte_end)
+        .map(|(_, c)| char_units(c))
+        .sum()
 }
 
 /// Build the breakdown. Pure function over the agent's parts (no `&Agent`
@@ -212,14 +227,24 @@ pub(crate) fn build(
     // ── System prompt: three segments ─────────────────────────────────────
     // Kept as its own binding: `system` below is shadowed by the breakdown
     // struct, and the uncalibrated sum assert at the end needs the original.
+    // The byte offsets locate the segments; the ALLOCATED units are CJK-aware
+    // (`text_units`), matching `compress::estimate_tokens`'s token channel.
     let system_text = system;
     let sys_len = system.map_or(0, str::len);
     let env_len = env_header_chars.min(sys_len);
     let base_len = skill_intro_base_chars.min(sys_len - env_len);
+    let sys_units = system.map(text_units).unwrap_or(0);
+    let env_units = system.map(|s| units_upto(s, env_len)).unwrap_or(0);
+    let base_units = system
+        .map(|s| units_upto(s, env_len + base_len).saturating_sub(env_units))
+        .unwrap_or(0);
+    let intro_units = sys_units
+        .saturating_sub(env_units)
+        .saturating_sub(base_units);
     let mut system = SystemBreakdown {
-        env: alloc(env_len, &mut acc, &mut prev_q),
-        base: alloc(base_len, &mut acc, &mut prev_q),
-        skill_intro: alloc(sys_len - env_len - base_len, &mut acc, &mut prev_q),
+        env: alloc(env_units, &mut acc, &mut prev_q),
+        base: alloc(base_units, &mut acc, &mut prev_q),
+        skill_intro: alloc(intro_units, &mut acc, &mut prev_q),
         tokens: 0,
     };
     system.tokens = system
@@ -227,11 +252,11 @@ pub(crate) fn build(
         .saturating_add(system.base)
         .saturating_add(system.skill_intro);
     // Invariant: the three segments are the FIRST allocations in the single
-    // running-floor division, so their sum is exactly floor(sys_len/4) — the
+    // running-floor division, so their sum is exactly floor(sys_units/4) — the
     // split exhausts the whole prompt with no remainder and no double count.
     debug_assert_eq!(
         system.tokens,
-        (sys_len / CHARS_PER_TOKEN) as u64,
+        (sys_units / CHARS_PER_TOKEN) as u64,
         "system segments must sum to the whole prompt's floor share"
     );
 
@@ -302,7 +327,7 @@ pub(crate) fn build(
         for b in &m.content {
             match b {
                 Block::Text(t) => {
-                    let tok = alloc(t.len(), &mut acc, &mut prev_q);
+                    let tok = alloc(text_units(t), &mut acc, &mut prev_q);
                     match m.role {
                         Role::User => add(&mut kinds.user_text, tok, &mut messages_tokens),
                         Role::Assistant => {
@@ -337,7 +362,7 @@ pub(crate) fn build(
                     ..
                 } => {
                     let is_skill = use_names.get(tool_use_id.as_str()) == Some(&"read_skill");
-                    let tok = alloc(content.len(), &mut acc, &mut prev_q);
+                    let tok = alloc(text_units(content), &mut acc, &mut prev_q);
                     if is_skill {
                         add(&mut kinds.skill_content, tok, &mut messages_tokens);
                     } else {

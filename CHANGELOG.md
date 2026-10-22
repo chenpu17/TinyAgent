@@ -102,6 +102,37 @@
 
 ### Fixed
 
+- **外部复审确认项修复（估算 / 计费 / 热更可见性 / 线程回收 / 测试与发布）**：
+  - **token 预检估算对 CJK 严重低估**：原口径是 JSON 字面字节数/4，1000 个汉字（UTF-8 3000 字节）
+    只估 750 token，实际约 1500–2500——中文历史要等 provider 拒绝才知道超长。改为字符单位制
+    （ASCII 1、CJK 9、其他非 ASCII 4，仍在总和处除 4）：同一段汉字估 2250；`context_report`
+    同步单位口径，三段 system 分解与等和不变量保持逐位一致。ASCII 历史数值完全不变。
+  - **并行工具 worker panic 时已计费 usage 丢失**：worker 在 panic 前已把 chat 账单加进共享预算
+    计数器，但承载 usage 的 `ToolOutput` 随线程消失，`RunOutcome`/`result.json` 总量与计数器分叉。
+    新增线程本地 `usage_probe`：父线程给每个并行 worker 装探针，`bill_chat` 与沙箱 `llm` 原语
+    计入已知 usage，join 失败时读出并挂到合成错误输出（`usage_in_shared_budget=true`）。
+    回归测试断言 panic 前的 100/20 token 仍进 outcome 总量。
+  - **run_code `set_code_config` 热更 `code.llm` 静默无效**：沙箱注册表首次执行即冻结 llm 开关与
+    模型档，此后的热变更返回 Ok 却永远到不了 guest。注册表构建时钉住 llm 快照，检测到「已冻结且
+    请求值不同」就发 diag 警告（同一目标值只提醒一次，普通 limits/路径热更保持安静），错误文案
+    指向「重建 agent」；README 与 Python/Node 绑定文档同步。
+  - **MCP 长连接读取线程 teardown 静默 detach**：HTTP standing stream 与旧版 SSE 的读取线程在
+    服务器不关流时无法 join，Drop 只能 detach——此前无任何提示，长驻宿主每次重建客户端都泄漏
+    一个线程 + TCP 连接。两条 Drop 路径各发一条 diag 警告（已完成线程仍静默 join），新增两条
+    回归测试钉住「活线程警告 / 死线程安静」，README 传输表同步（并修正「不支持 HTTP GET 流」
+    的过期说明）。
+  - **MCP stdio 末行无换行时被丢弃**：`read_capped_line` 在 EOF 直接返回 0，把已累积的
+    无换行尾行留在 buffer 里丢掉（旧 `read_line` 会交付）。现 EOF 且 buffer 非空时按一条
+    完整行返回，下轮再报 EOF；NDJSON 性质测试（随机分行/CRLF/坏 UTF-8/请求帧）钉住。
+  - **`confined_to` 对 `nonexist/../x` 误报「无法解析路径」**：向上找已存在祖先的循环用
+    `Path::file_name()` 取末组件，而该 API 对以 `..` 结尾的路径返回 `None`——walk 在第一轮
+    就把正常路径 bail 掉。改用最后一个 `Component`，把 `..`/`.` 交回 `normalize_tail` 词法归一；
+    仓库中原本红着的 3 个 `confined_to_*` 回归测试转绿。
+  - **测试与发布覆盖补齐**：解析器链路（SSE/NDJSON framing、precheck lexer、glob、lib INDEX
+    round-trip）增加零依赖确定性随机性质测试；TUI 的 `est_display_rows` / `fmt_tokens_round` /
+    `compact` / `apply_flush` 补直接单测；release workflow 增加 Python sdist + wheel 构建并附
+    GitHub Release（不发布 PyPI，待产品决策）。
+
 - **多 agent 修复轮（run_code 协议 / MCP Windows / 平台门 / TUI / diag / fs_policy，全部带回归测试）**：
   - **precheck 词法器模板插值无界互递归**：`${…}` 插值与模板体扫描互相递归且无深度界，深嵌套输入
     可打穿宿主进程栈（overflow 杀死整个宿主、不可捕获）。加 `MAX_TEMPLATE_DEPTH = 64` 深度帽，超限的

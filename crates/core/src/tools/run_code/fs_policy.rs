@@ -1388,4 +1388,117 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("dst.bin")).unwrap(), bytes);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ── glob 匹配性质测试（固定种子 LCG，零依赖） ───────────────────────────
+
+    /// Deterministic 64-bit LCG (fixed seed): the property tests' only source
+    /// of randomness. Same seed → same draws on every run and platform.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next_u64() % n as u64) as usize
+        }
+        fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
+            &xs[self.below(xs.len())]
+        }
+    }
+
+    /// Property (fuzz, fixed seed): glob matching over random pattern/path
+    /// boards is (a) total — no input panics (CJK, `..`, dots, empty path),
+    /// (b) stable — the same (pattern set, path) answers identically across
+    /// repeats, (c) compositional — `deny_match` over a set equals the OR of
+    /// the single-pattern answers, (d) `*` stays in-segment — a no-slash `*`
+    /// pattern matches exactly the single-segment spellings, (e) `**/T`
+    /// oracle — matches exactly the paths whose last segment is T.
+    #[test]
+    fn glob_fuzz_total_stable_and_compositional() {
+        const PATTERNS: &[&str] = &[
+            "*", "**", "a", "b", ".env*", "x*", "*z", ".aws", "*.js", "*a*", "a/**/b", "**/zz",
+            "工具*", "*工具",
+        ];
+        const SEGS: &[&str] = &[
+            "a", "b", "ab", "x", "z", ".env", ".aws", "x.js", "zab", "工具", "zz", "..", ".",
+        ];
+        let mut rng = Lcg(0x5EED_0010);
+        for _ in 0..500 {
+            let n_seg = 1 + rng.below(4);
+            let path = (0..n_seg)
+                .map(|_| *rng.pick(SEGS))
+                .collect::<Vec<_>>()
+                .join("/");
+            let pats: Vec<String> = (0..1 + rng.below(3))
+                .map(|_| (*rng.pick(PATTERNS)).to_string())
+                .collect();
+            let single: Vec<bool> = PATTERNS
+                .iter()
+                .map(|p| deny_match(&[(*p).to_string()], &path))
+                .collect();
+            let set_ans = deny_match(&pats, &path);
+            // (b) stability — repeat both entry points verbatim.
+            assert_eq!(deny_match(&pats, &path), set_ans, "{pats:?} × {path:?}");
+            // (c) any-of composition: set answer == OR of member answers.
+            let or_of_set = pats.iter().any(|p| deny_match(&[p.clone()], &path));
+            assert_eq!(or_of_set, set_ans, "{pats:?} × {path:?}");
+            // (d) a no-slash `*` matches exactly single-segment paths.
+            assert_eq!(
+                deny_match(&["*".to_string()], &path),
+                path.split('/').count() == 1,
+                "`*` vs {path:?}"
+            );
+            // (e) `**/T` == "last segment is T" (zero segments included).
+            assert_eq!(
+                deny_match(&["**/zz".to_string()], &path),
+                path == "zz" || path.ends_with("/zz"),
+                "`**/zz` vs {path:?}"
+            );
+            // Pure matcher, same oracles without deny_match's pattern
+            // cleaning in the loop — 2 runs for stability.
+            let pat_segs: Vec<&str> = vec!["**", "zz"];
+            let want = path == "zz" || path.ends_with("/zz");
+            assert_eq!(
+                glob_match(&pat_segs, &path.split('/').collect::<Vec<_>>()),
+                want
+            );
+            assert_eq!(
+                glob_match(&pat_segs, &path.split('/').collect::<Vec<_>>()),
+                want
+            );
+            // Sanity: the board itself still produces both answers, or the
+            // oracles above are vacuous.
+            assert!(single.iter().any(|b| *b) || !set_ans);
+        }
+    }
+
+    /// Property (fuzz, fixed seed): `seg_match`'s one-segment wildcard
+    /// semantics — `*` is any run of chars, everything else is literal, so
+    /// `x*` / `*z` / `*a*` answer exactly the prefix / suffix / contains
+    /// predicates, identically on every repeat.
+    #[test]
+    fn seg_match_wildcard_oracles_hold_on_random_segments() {
+        const CHARS: &[char] = &['a', 'b', 'x', 'z', '0', '9', '工', '*', '.'];
+        let mut rng = Lcg(0x5EED_0011);
+        for _ in 0..500 {
+            let s: String = (0..rng.below(6)).map(|_| *rng.pick(CHARS)).collect();
+            assert_eq!(seg_match("x*", &s), s.starts_with('x'), "x* vs {s:?}");
+            assert_eq!(seg_match("*z", &s), s.ends_with('z'), "*z vs {s:?}");
+            assert_eq!(seg_match("*a*", &s), s.contains('a'), "*a* vs {s:?}");
+            assert_eq!(
+                seg_match("a*b", &s),
+                s.starts_with('a') && s.ends_with('b'),
+                "a*b vs {s:?}"
+            );
+            // Literal patterns match only themselves; `*` alone matches all.
+            assert_eq!(seg_match("ab", &s), s == "ab", "ab vs {s:?}");
+            assert!(seg_match("*", &s), "* matches every segment");
+            // Idempotence.
+            assert_eq!(seg_match("*a*", &s), seg_match("*a*", &s));
+        }
+    }
 }

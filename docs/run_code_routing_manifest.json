@@ -8,11 +8,11 @@
     "crates/core/src/tools/run_code/contract.rs": "8204a22fdcc82e727546e778656fcbbe68a1c3058a1ff76c303cfd85bded0078",
     "crates/core/src/tools/run_code/sandbox.rs": "34e3ab56b8463f918884446fa2ddc03e3a8a97f780cd0f2d3a59836e649f70c3",
     "crates/core/src/tools/run_code/guest_api.rs": "f645daaf5cd444ea5e059ea2f625cacce6a4f52fbb28219395994234dfd782cb",
-    "crates/core/src/tools/run_code/fs_policy.rs": "018fc0d0e43815ae8a055ccf19f780a12c790b22b174e6d7141bf67a4beb6888",
-    "crates/core/src/tools/run_code/lib_index.rs": "f12f958f57824c97d837fe725fe3576b2914f35b30b8d853d735b721c4643a0e",
+    "crates/core/src/tools/run_code/fs_policy.rs": "0821c4d82af803f781ee689d591a5a7c68178e683bbfd3779072a6b91dc280e4",
+    "crates/core/src/tools/run_code/lib_index.rs": "c201b666c297ac5659950d2f233b12184aa7aa83cbd11a67f709f983238a0f77",
     "crates/core/src/tools/run_code/batch.rs": "4e960d3ff1901e389cbaa34aa31144648559663c720e998ca26a889935b10e5d",
-    "crates/core/src/tools/run_code/precheck.rs": "ed5ba194248c0047010682ce22193f4048fb74bc1a0546ea728c125f9ab7b55b",
-    "crates/core/src/tools/run_code/tool.rs": "5bab8ed69935ea6ee99d6cd7546df816a50a2b1f2edca26d81df6b4f1c5e2a68",
+    "crates/core/src/tools/run_code/precheck.rs": "fa59312c184bafdc63d645ed7e1735055f5e05281d66cff688e186450945b728",
+    "crates/core/src/tools/run_code/tool.rs": "afa3bd6af10da7f60f70af974885314ae014e4ded09db2390b2079696a8e3cce",
     "crates/core/src/tools/run_code/test_util.rs": "4aa1cc87def60ae0b40eb646eb409cd0bd97a276f27b9e92217c52e1ded666dd",
     "crates/core/src/tools/run_code_skill.md": "04490a6b29633687feafaaa157317d673d61b7882ed0cf18a71fb326b5171942",
     "crates/core/src/tools/skill.rs": "6285240569389e118587bb832a32f5e53c171d7211b16f6edc1bf28023a0f70a",
@@ -33,6 +33,6 @@
   "tool_schema_sha256": "5b3f1b33e6566f016571ca227808dea3a3f4adc117a79a8c4284bf457ea1e2c3",
   "prelude_source_sha256": "d9a488bf2e17c39338336dd190c500f44d3f38a14657facbcd984d9ff21af723",
   "readme_code_spec": {
-    "sha256": "461f9ebbcc8d28ad8bf3f9f3cd5873dbc6d55932490275c7dce07cd6139d7d1a"
+    "sha256": "7fc8df8739f7ad5491ac76b95b0cee88553c0ef00fc55b2012790382d85a8dc9"
   }
 }

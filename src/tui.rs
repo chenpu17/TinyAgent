@@ -6547,6 +6547,28 @@ mod tests {
     }
 
     #[test]
+    fn est_display_rows_wraps_per_logical_line_with_ceil() {
+        // Empty text still occupies one (blank) row — the per-line floor.
+        assert_eq!(est_display_rows("", 40), 1);
+        // Width 0 is clamped to 1 instead of dividing by zero.
+        assert_eq!(est_display_rows("ab", 0), 2);
+        // Short ASCII fits one row; the ceil kicks in at the boundary.
+        assert_eq!(est_display_rows("hello", 40), 1);
+        assert_eq!(est_display_rows("0123456789", 10), 1);
+        assert_eq!(est_display_rows("0123456789A", 10), 2);
+        // Wide (CJK) chars count 2 display columns each: 12 cols fit one row
+        // at width 12 but wrap into 3 rows at width 5.
+        assert_eq!(est_display_rows("看来离谱的测", 12), 1);
+        assert_eq!(est_display_rows("看来离谱的测", 5), 3);
+        // Rows are summed per logical line; an empty line keeps its floor
+        // row (a trailing newline leaves an empty last line).
+        assert_eq!(est_display_rows("ab\nabcdefgh", 3), 4);
+        assert_eq!(est_display_rows("a\n", 40), 2);
+        // Zero-width chars (combining marks) add no columns.
+        assert_eq!(est_display_rows("e\u{0301}", 1), 1);
+    }
+
+    #[test]
     fn soft_cut_offset_keeps_tail_rows_and_tracks_fences() {
         // Too short to cut (and keep=0 is rejected outright).
         assert_eq!(soft_cut_offset("a\nb", 80, 2), None);
@@ -7040,6 +7062,65 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn apply_flush_sent_starts_a_run_and_idle_flushes_clear_state() {
+        // Sent arms the busy state exactly like a freshly submitted run.
+        let mut busy = false;
+        let mut run_start = None;
+        let mut activity = String::new();
+        let mut thinking = false;
+        apply_flush(
+            Flush::Sent,
+            &mut busy,
+            &mut run_start,
+            &mut activity,
+            &mut thinking,
+        );
+        assert!(busy);
+        assert!(run_start.is_some());
+        assert_eq!(activity, "thinking");
+        assert!(thinking);
+        let first_start = run_start.unwrap();
+
+        // A second Sent re-arms with a fresh timestamp (the next run's
+        // elapsed timer starts at the flush, not at the previous run).
+        apply_flush(
+            Flush::Sent,
+            &mut busy,
+            &mut run_start,
+            &mut activity,
+            &mut thinking,
+        );
+        assert!(run_start.unwrap() >= first_start);
+
+        // Empty (nothing queued) drops the session to idle — but leaves the
+        // activity label untouched (the status bar gates it on busy).
+        apply_flush(
+            Flush::Empty,
+            &mut busy,
+            &mut run_start,
+            &mut activity,
+            &mut thinking,
+        );
+        assert!(!busy);
+        assert!(run_start.is_none());
+        assert!(!thinking);
+        assert_eq!(activity, "thinking");
+
+        // Undeliverable clears the same idle triple.
+        apply_flush(
+            Flush::Undeliverable,
+            &mut busy,
+            &mut run_start,
+            &mut activity,
+            &mut thinking,
+        );
+        assert!(!busy);
+        assert!(run_start.is_none());
+        assert!(!thinking);
+        assert_eq!(activity, "thinking");
     }
 
     #[test]
@@ -7977,6 +8058,64 @@ mod tests {
         assert_eq!(fmt_tokens(999_999), "1000.0k");
         assert_eq!(fmt_tokens(1_000_000), "1.0M");
         assert_eq!(fmt_tokens(1_500_000), "1.5M");
+    }
+
+    #[test]
+    fn fmt_tokens_round_drops_only_the_trailing_point_zero() {
+        // Below 1k the number prints as-is (nothing to drop).
+        assert_eq!(fmt_tokens_round(0), "0");
+        assert_eq!(fmt_tokens_round(999), "999");
+        // Exact k boundary collapses to the bare integer ("256k" style).
+        assert_eq!(fmt_tokens_round(1_000), "1k");
+        // 1001 still rounds to 1.0k → "1k"; 1500 keeps its decimal.
+        assert_eq!(fmt_tokens_round(1_001), "1k");
+        assert_eq!(fmt_tokens_round(1_500), "1.5k");
+        // Non-.0 decimals are untouched.
+        assert_eq!(fmt_tokens_round(1_100), "1.1k");
+        // fmt_tokens rounds 9.999k up to "10.0k", so the .0 drop applies too.
+        assert_eq!(fmt_tokens_round(9_999), "10k");
+        assert_eq!(fmt_tokens_round(12_000), "12k");
+        // 999_999 renders as "1000.0k" (not 1.0M) — the k/M threshold quirk.
+        assert_eq!(fmt_tokens_round(999_999), "1000k");
+        // The M range mirrors the k range.
+        assert_eq!(fmt_tokens_round(1_000_000), "1M");
+        assert_eq!(fmt_tokens_round(1_500_000), "1.5M");
+        assert_eq!(fmt_tokens_round(2_000_000), "2M");
+        assert_eq!(fmt_tokens_round(1_500_000_000), "1500M");
+    }
+
+    #[test]
+    fn compact_truncates_json_at_two_hundred_chars() {
+        // Short values serialize verbatim (serde_json compact form).
+        assert_eq!(compact(&serde_json::json!(null)), "null");
+        assert_eq!(compact(&serde_json::json!({})), "{}");
+        assert_eq!(
+            compact(&serde_json::json!({"cmd": "ls"})),
+            r#"{"cmd":"ls"}"#
+        );
+        // The cap is 200 CHARS: exactly 200 serialized chars (198 x's + 2
+        // quotes) pass through with no ellipsis.
+        let full = serde_json::Value::String("x".repeat(198));
+        assert_eq!(compact(&full), format!("\"{}\"", "x".repeat(198)));
+        // One char over → hard cut at 200 chars + '…'. The closing quote is
+        // dropped mid-string: the preview is display-only, not valid JSON.
+        let over = serde_json::Value::String("x".repeat(199));
+        let out = compact(&over);
+        assert_eq!(out.chars().count(), 201);
+        assert!(out.ends_with('…'));
+        assert!(!out.ends_with('"'));
+        // Chars, not bytes: 150 CJK chars serialize to 450+ bytes but only
+        // 152 chars — well under the cap, so nothing is cut.
+        let cjk = serde_json::Value::String("看".repeat(150));
+        assert_eq!(compact(&cjk), format!("\"{}\"", "看".repeat(150)));
+        // 250 CJK chars (252 serialized chars) cut at char 200: the result
+        // is 1 quote + 199 wide chars + '…' = 601 bytes, no multibyte tear.
+        let wide = serde_json::Value::String("看".repeat(250));
+        let out = compact(&wide);
+        assert_eq!(out.chars().count(), 201);
+        assert!(out.starts_with('"'));
+        assert!(out.ends_with('…'));
+        assert_eq!(out.len(), 1 + 199 * 3 + 3);
     }
 
     /// Helper: a single-span line with one style.

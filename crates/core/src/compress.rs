@@ -63,9 +63,24 @@ pub(crate) const COMPRESS_RESERVE: Duration = Duration::from_secs(20);
 /// buffer; we fix it at 15% to keep the config surface small.)
 pub(crate) const COMPACT_UTILIZATION_PCT: u64 = 85;
 
-/// Rough chars-per-token for the preflight size estimate (matches OpenCode's
-/// "JSON-serialize the request and assume four characters per token").
+/// Rough units-per-token for the preflight size estimate. One ASCII byte is
+/// one unit (OpenCode's "JSON-serialize the request and assume four
+/// characters per token"); CJK code points weigh more (see [`char_units`]) so
+/// a Chinese-heavy history is not under-counted 2–3× as it was when this
+/// divisor ran over raw UTF-8 bytes.
 pub(crate) const CHARS_PER_TOKEN: usize = 4;
+
+/// Unit weight of a CJK code point. Four units = one token, so 9 units ≈
+/// 2.25 tokens per character — the conservative end of the measured 1.5–2.5
+/// token/character range for Han, kana and Hangul. Over-estimating compacts
+/// slightly early (the safe direction); under-estimating lets the provider
+/// reject an over-long request before the next preflight.
+const CJK_UNITS: usize = 9;
+
+/// Unit weight of a non-ASCII, non-CJK code point (accented Latin, Cyrillic,
+/// Arabic, emoji, …): one token per character, a mild over-estimate for most
+/// scripts and the safe direction for the ones that tokenize poorly.
+const OTHER_UNITS: usize = 4;
 
 /// Conservative per-page token estimate for a PDF document block, feeding the
 /// preflight compaction heuristic. Anthropic documents 1,500–3,000 tokens per
@@ -229,6 +244,61 @@ pub(crate) const OVERFLOW_PHRASES: &[&str] = &[
                                    // guard in `is_context_overflow` instead.
 ];
 
+/// Unit weight of one character under the `/4` token yardstick. ASCII keeps
+/// the historical 1 unit/byte; CJK code points weigh [`CJK_UNITS`] because
+/// UTF-8 bytes alone under-count them (1000 Han characters are 3000 bytes —
+/// 750 tokens by the old bytes/4 rule, versus ~1500–2500 real tokens).
+/// Fullwidth punctuation, kana, Hangul, CJK compatibility ideographs and the
+/// supplementary-plan CJK blocks are all included; everything else non-ASCII
+/// gets [`OTHER_UNITS`].
+pub(crate) fn char_units(c: char) -> usize {
+    match c as u32 {
+        // CJK punctuation, kana, Hangul compatibility jamo, CJK Ext A +
+        // unified ideographs, Hangul syllables, compatibility ideographs &
+        // fullwidth forms, and the supplementary-plane ideograph blocks.
+        0x3000..=0x303F
+        | 0x3040..=0x30FF
+        | 0x3130..=0x318F
+        | 0x31F0..=0x31FF
+        | 0x3400..=0x4DBF
+        | 0x4E00..=0x9FFF
+        | 0xA960..=0xA97F
+        | 0xAC00..=0xD7FF
+        | 0xF900..=0xFAFF
+        | 0xFE30..=0xFE4F
+        | 0xFF00..=0xFF60
+        | 0xFFE0..=0xFFE6
+        | 0x20000..=0x2FFFD
+        | 0x30000..=0x3FFFD => CJK_UNITS,
+        _ if c.is_ascii() => 1,
+        _ => OTHER_UNITS,
+    }
+}
+
+/// Unit size of a string under [`char_units`] (the `/4` happens once on the
+/// SUM — see [`estimate_tokens`]).
+pub(crate) fn text_units(s: &str) -> usize {
+    s.chars().map(char_units).sum()
+}
+
+/// Size of a single block under the token-estimate yardstick. This is the
+/// token-channel twin of [`block_chars`]: text-bearing content goes through
+/// [`text_units`] (CJK-aware), while images, PDFs and tool-use JSON keep
+/// their byte-derived weights. Kept a separate function from `block_chars`
+/// ON PURPOSE — the legacy `compress_threshold_chars` gate and prune/quote
+/// budgets still speak bytes (`total_chars`), and changing them would alter
+/// thresholds unrelated to the CJK under-count.
+pub(crate) fn block_units(b: &Block) -> usize {
+    match b {
+        Block::Text(t) => text_units(t),
+        // A tool result may carry an image payload (e.g. load_image).
+        Block::ToolResult { content, image, .. } => {
+            text_units(content) + image.as_deref().map(image_payload_len).unwrap_or(0)
+        }
+        _ => block_chars(b),
+    }
+}
+
 /// Size of a single block under the shared chars yardstick (the `/4` happens
 /// once on the SUM — see [`estimate_tokens`]). `total_chars` and
 /// `context_report`'s per-bucket attribution both route through this one
@@ -280,15 +350,27 @@ pub(crate) fn total_chars(messages: &[Message]) -> usize {
 
 /// Rough token estimate of what the next request will cost the model: message
 /// content + system prompt + advertised tool schemas, divided by the
-/// chars-per-token heuristic. Used ONLY for the preflight "should I compact
+/// units-per-token heuristic. Used ONLY for the preflight "should I compact
 /// before this request?" decision — never billed or reported; the provider's
 /// real usage is the source of truth for accounting.
+///
+/// Text goes through [`block_units`] / [`text_units`], not raw bytes: the
+/// bytes/4 rule under-counted CJK 2–3× and let a Chinese-heavy history reach
+/// the provider before the preflight noticed. Tool schemas stay byte-counted
+/// (they are overwhelmingly ASCII JSON) so `context_report` can keep using
+/// the same `tool_schema_chars` yardstick.
 pub(crate) fn estimate_tokens(
     messages: &[Message],
     system: Option<&str>,
     tool_schema_chars: usize,
 ) -> usize {
-    let chars = total_chars(messages) + system.map(|s| s.len()).unwrap_or(0) + tool_schema_chars;
+    let units = messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .map(block_units)
+        .sum::<usize>()
+        + system.map(text_units).unwrap_or(0)
+        + tool_schema_chars;
     // PDF document blocks are estimated per PAGE (Anthropic processes each
     // page as text + image, 1.5–3k tokens/page), not by payload size — a
     // 10 MiB text PDF is hundreds of pages, which any bytes-per-token
@@ -301,7 +383,7 @@ pub(crate) fn estimate_tokens(
         .flat_map(|m| &m.content)
         .map(block_pdf_tokens)
         .sum();
-    chars / CHARS_PER_TOKEN + pdf_tokens
+    units / CHARS_PER_TOKEN + pdf_tokens
 }
 
 /// True if a provider error looks like "the request was too long for the
@@ -814,5 +896,67 @@ pub(crate) fn merge_usage(a: Option<Usage>, b: Option<Usage>) -> Option<Usage> {
                 .saturating_add(y.cache_read_input_tokens);
             Some(x)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::Role;
+
+    fn user_text(text: &str) -> Message {
+        Message {
+            id: None,
+            role: Role::User,
+            content: vec![Block::Text(text.to_string())],
+        }
+    }
+
+    /// The regression this weighting exists for: 1000 Han characters are 3000
+    /// UTF-8 bytes (750 tokens under the old bytes/4 rule) but ~1500–2500 real
+    /// tokens. The CJK-aware estimate must land in that band, not at 750.
+    #[test]
+    fn cjk_text_is_not_under_counted_by_utf8_bytes() {
+        let text = "汉".repeat(1_000);
+        let est = estimate_tokens(&[user_text(&text)], None, 0);
+        assert_eq!(est, 2_250, "9 units/char ÷ 4 units/token");
+        assert!(est > text.len() / CHARS_PER_TOKEN * 2);
+    }
+
+    /// CJK ranges (Han, kana, Hangul, fullwidth forms) weigh 9 units; other
+    /// non-ASCII code points weigh 4 (one token each); ASCII stays 1.
+    #[test]
+    fn char_units_cover_cjk_and_other_scripts() {
+        for c in ['汉', 'あ', 'ア', '가', 'Ａ', '、', '。'] {
+            assert_eq!(char_units(c), CJK_UNITS, "{c:?}");
+        }
+        for c in ['é', 'Ж', 'م', '😀'] {
+            assert_eq!(char_units(c), OTHER_UNITS, "{c:?}");
+        }
+        assert_eq!(char_units('a'), 1);
+        assert_eq!(text_units("a汉b"), 1 + CJK_UNITS + 1);
+    }
+
+    /// English and ASCII tool schemas keep the historical numbers — the
+    /// change is additive for CJK, not a global shift that would move every
+    /// preflight threshold.
+    #[test]
+    fn ascii_estimate_is_unchanged() {
+        let text = "hello world";
+        assert_eq!(
+            estimate_tokens(&[user_text(text)], None, 0),
+            text.len() / CHARS_PER_TOKEN
+        );
+        assert_eq!(
+            estimate_tokens(&[], Some(text), text.len()),
+            2 * text.len() / CHARS_PER_TOKEN
+        );
+    }
+
+    /// The floor happens once on the whole SUM, not per block/segment.
+    #[test]
+    fn units_floor_once_on_the_total() {
+        // "a汉b" = 11 units; 11/4 = 2 (per-segment division would give 0+2+0).
+        assert_eq!(estimate_tokens(&[user_text("a汉b")], None, 0), 2);
     }
 }

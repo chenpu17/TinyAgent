@@ -116,6 +116,55 @@ jobs:
           name: ${{ matrix.pkg }}
           path: bindings/node/npm-stage/**/*.tgz
 
+  # Python 绑定（0.4.x）：sdist + wheel（CPython manylinux2014 /
+  # manylinux_2_17 x86_64）附 GitHub
+  # Release，不发布 PyPI（产品决策未定）。不带 code feature——标准 wheel 不携带
+  # wasmtime（~10MB）是既定口径（bindings/python/Cargo.toml 注释 / 设计 §8.6 D9 /
+  # README run_code 节），与 musl 二进制"产物带 code"是两条不同产物线；未编入时
+  # enable_code 等三方法返回带重建提示的明确错误。wheel 是 CPython 单版本 ABI
+  # （pyo3 未开 abi3），其他解释器走 sdist 自行构建。
+  bindings-python:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: python
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # wheel 走 manylinux2014 容器：宿主机直接构建只能按宿主 glibc 打
+      # `linux_x86_64` 标签，`--compatibility manylinux2014` 又会因子过新被
+      # auditwheel 拒绝；容器内构建 + 修复才能得到可移植的 manylinux_2_17。
+      # 版本号单源 = pyproject.toml（5 处同步约定），maturin 自动写入
+      # wheel/sdist 文件名，不从 tag 解析、不硬编码。
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: bindings/python
+          command: build
+          args: --release --out dist --find-interpreter
+          manylinux: manylinux2014
+
+      # sdist 与解释器/ABI 无关，宿主直接打（内含 crates/core 路径依赖，
+      # 使用者在目标平台自行编译）。
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: bindings/python
+          command: sdist
+          args: --out dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_notes: false
+          files: |
+            bindings/python/dist/*
+
   bindings-node-publish:
     needs: bindings-node
     runs-on: ubuntu-latest

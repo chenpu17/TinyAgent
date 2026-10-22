@@ -1846,4 +1846,168 @@ mod tests {
         assert_eq!(v, json!("POSITIVE"), "re-register same bytes revives: {v}");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ── INDEX 解析/登记性质测试（固定种子 LCG，零依赖，纯函数） ──────────────
+
+    /// Deterministic 64-bit LCG (fixed seed): the property tests' only source
+    /// of randomness. Same seed → same draws on every run and platform.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next_u64() % n as u64) as usize
+        }
+        fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
+            &xs[self.below(xs.len())]
+        }
+    }
+
+    fn fuzz_hex(rng: &mut Lcg) -> String {
+        const HEX: &[char] = &['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'f'];
+        (0..64).map(|_| *rng.pick(HEX)).collect()
+    }
+
+    fn fuzz_rel(rng: &mut Lcg) -> String {
+        // 合法登记键：1-3 段，段内 [a-z0-9_-]，无空白、无 `..`、无空段。
+        const SEGS: &[&str] = &["a", "b1", "lib-x", "z_9", "tool.js", "n.json"];
+        (0..1 + rng.below(3))
+            .map(|_| *rng.pick(SEGS))
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    /// Property (fuzz, fixed seed): 随机合法五元组渲染成机器行 →
+    /// parse_lib_line 原样解析回同样的 (path, sha256, needs, ver, st)；
+    /// parse_lib_index 聚合多行不串行；lib_upsert_index 的输出再解析回
+    /// 预期的登记（新条目 st=draft/needs=-/ver=1，覆盖保 needs/ver），
+    /// prose 行逐字节保留，重复 upsert 幂等。
+    #[test]
+    fn lib_index_roundtrip_and_upsert_properties() {
+        let mut rng = Lcg(0x5EED_0030);
+        for _ in 0..200 {
+            let (rel, sha) = (fuzz_rel(&mut rng), fuzz_hex(&mut rng));
+            let needs = *rng.pick(&["-", "a", "a,b", "dep1,dep2"]);
+            let ver: String = (0..1 + rng.below(3))
+                .map(|_| *rng.pick(&['1', '2', '7', '9']))
+                .collect();
+            let st = *rng.pick(&["ok", "draft"]);
+
+            // 1) 单行 round-trip：渲染 → 解析 → 字段逐一相等。
+            let line =
+                format!("<!-- ta-lib: path={rel} sha256={sha} needs={needs} ver={ver} st={st} -->");
+            let parsed = parse_lib_line(1, &line)
+                .expect("legal line parses")
+                .unwrap();
+            assert_eq!(parsed.path, rel);
+            assert_eq!(parsed.sha256, sha);
+            assert_eq!(parsed.needs, needs);
+            assert_eq!(parsed.ver, ver);
+            assert_eq!(parsed.st, st);
+
+            // 2) 多行聚合不串行：prose + 两条登记，映射键值各自精确。
+            let mut rel2 = fuzz_rel(&mut rng);
+            while rel2 == rel {
+                rel2 = fuzz_rel(&mut rng);
+            }
+            let sha2 = fuzz_hex(&mut rng);
+            let line2 = format!("<!-- ta-lib: path={rel2} sha256={sha2} needs=- ver=3 st=ok -->");
+            let text = format!("# index\n{line}\n自由文本,可含 | 与空格\n{line2}\n");
+            let map = parse_lib_index(&text).expect("multi-entry parses");
+            assert_eq!(map.len(), 2, "{text:?}");
+            assert_eq!(map[&rel].sha256, sha);
+            assert_eq!(map[&rel].st, st);
+            assert_eq!(map[&rel2].sha256, sha2);
+            assert_eq!(map[&rel2].st, "ok");
+
+            // 3) upsert 空文本 → 追加一行，字段按 MD-10 默认（needs=- ver=1
+            //    st=draft），输出再解析回同样的登记。
+            let merged = lib_upsert_index(&rel, &sha, "").expect("upsert empty");
+            let got = parse_lib_index(&merged).expect("merged parses");
+            assert_eq!(got.len(), 1);
+            assert_eq!(got[&rel].sha256, sha);
+            assert_eq!(got[&rel].st, "draft");
+            assert_eq!(got[&rel].needs, "-");
+            assert_eq!(got[&rel].ver, "1");
+
+            // 4) upsert 已有文本：同名条目原位替换（保 needs/ver、st 归
+            //    draft），其余行（含 prose）逐字节保留。
+            let new_sha = fuzz_hex(&mut rng);
+            let merged2 = lib_upsert_index(&rel, &new_sha, &text).expect("upsert existing");
+            for l in text.lines() {
+                if l.contains(&format!("path={rel} ")) {
+                    assert!(!merged2.contains(l), "old line must be replaced: {l:?}");
+                } else {
+                    assert!(
+                        merged2.contains(l),
+                        "unrelated line preserved byte-exact: {l:?}"
+                    );
+                }
+            }
+            let got2 = parse_lib_index(&merged2).expect("merged2 parses");
+            assert_eq!(got2[&rel].sha256, new_sha);
+            assert_eq!(got2[&rel].st, "draft");
+            assert_eq!(got2[&rel].needs, needs, "needs preserved on replace");
+            assert_eq!(got2[&rel].ver, ver, "ver preserved on replace");
+            assert_eq!(got2[&rel2].sha256, sha2, "other entry untouched");
+
+            // 5) 幂等：对 upsert 结果重复同一 upsert，输出不变。
+            let merged3 = lib_upsert_index(&rel, &new_sha, &merged2).expect("re-upsert");
+            assert_eq!(merged3, merged2);
+        }
+    }
+
+    /// Property (fuzz, fixed seed): 随机劣化机器行（缺字段/重复字段/bad
+    /// sha/bad st/bad ver/bad path）一律硬错误而非静默通过——INDEX 是信任
+    /// 清单，畸形行绝不静默吞;随机 prose 行（不含机器行前后缀）一律
+    /// Ok(None)。
+    #[test]
+    fn lib_index_fuzz_mutations_are_hard_errors_never_silent() {
+        let mut rng = Lcg(0x5EED_0031);
+        for _ in 0..200 {
+            let (rel, sha) = (fuzz_rel(&mut rng), fuzz_hex(&mut rng));
+            let base = format!("<!-- ta-lib: path={rel} sha256={sha} needs=- ver=1 st=draft -->");
+            // 逐字段劣化,每一种都必须 Err（带行号文案）。
+            let broken: Vec<String> =
+                vec![
+                base.replace(" st=draft", ""),                    // 缺 st
+                base.replace("needs=- ", ""),                     // 缺 needs
+                base.replace("ver=1", "foo=1"),                   // 未知字段
+                format!("<!-- ta-lib: path={rel} path={rel} sha256={sha} needs=- ver=1 st=draft -->"), // 重复字段
+                base.replace(&sha, &sha[..63]),                   // sha 短一位
+                base.replace("st=draft", "st=paused"),            // 非法 st
+                base.replace("ver=1", "ver="),                    // 空 ver
+                base.replace(&format!("path={rel}"), "path=/abs"), // 绝对路径
+                base.replace(&format!("path={rel}"), "path=x/../y"), // `..`
+                base.replace(&format!("path={rel}"), "path="),    // 空 path
+            ];
+            for b in &broken {
+                assert!(
+                    parse_lib_line(1, b).is_err(),
+                    "mutation must be a hard error: {b:?}"
+                );
+            }
+            // 非 ta-lib 前缀/后缀的随机文本不是机器行 → Ok(None)，绝不 panic。
+            const PROSE: &[&str] = &[
+                "# my lib",
+                "自由段落。",
+                "<!-- 另一种注释 -->",
+                "<!-- ta-lib: 未闭合",
+                "ta-lib: path=x -->",
+                "",
+            ];
+            let p = *rng.pick(PROSE);
+            assert!(
+                parse_lib_line(1, p)
+                    .expect("prose is Ok(None), never Err")
+                    .is_none(),
+                "{p:?} must not parse as a machine line"
+            );
+        }
+    }
 }

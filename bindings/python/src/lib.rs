@@ -826,6 +826,11 @@ impl Agent {
     /// unknown keys error, missing keys reset to their DEFAULTS (they do not
     /// retain previous values — send the full dict to keep a knob). Takes
     /// effect for the next execution; an in-flight one keeps its snapshot.
+    ///
+    /// The `llm` sub-object is pinned by the sandbox registry at its first
+    /// execution: after that, changing `llm` here still succeeds but cannot
+    /// reach guest `llm` calls, and the kernel emits a diag warning telling
+    /// the host to rebuild the agent. Limits / paths / `enabled` stay hot.
     fn set_code_config(&self, cfg: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<()> {
         #[cfg(feature = "code")]
         {

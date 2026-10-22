@@ -109,8 +109,8 @@ cargo clippy -p tiny-agent-node
 - **压缩**：`find_safe_cut` 空尾是合法切点；`summary_call` 空正文（思考烧穿）预算加倍重试一次，effort 恒 `None`。
 - **`salvage_on_max_tokens`**：max_tokens 截断且无 tool_use 时一次性 wrap-up nudge；带 tool_use 不 salvage。
 - **打转护栏**：键 =（工具名， canon 生效参数， 结果指纹），同参不同果即进展、不计数；canon 数值统一经 f64 归一（1 与 1.0 同键）；第 3 次 nudge 进历史块、第 6 次 `stuck_loop` 收尾；无闩锁（轮尾直读当前连续计数），轮尾 cancel 优先于 stuck_loop。
-- **token 预算闸门**：run 级共享计数器父子同读；turn 边界比较的 cap 以 `BudgetGate::cap` 为单源（自身 limits 快照只能收紧）；工具账单按 `ToolOutput::usage_in_shared_budget` 分流——子 agent（已自计）只折 totals，其余工具的 usage 由 fold 代入计数器。
-- **宿主热更新面**：`set_model` 等不传播给已构造的子 agent 快照（既定决策）；`compact()` 成本绝不进 `self.usage`。
+- **token 预算闸门**：run 级共享计数器父子同读；turn 边界比较的 cap 以 `BudgetGate::cap` 为单源（自身 limits 快照只能收紧）；工具账单按 `ToolOutput::usage_in_shared_budget` 分流——子 agent（已自计）只折 totals，其余工具的 usage 由 fold 代入计数器；并行 worker panic 时已计费 usage 由线程本地 `usage_probe` 回收进合成错误输出。
+- **宿主热更新面**：`set_model` 等不传播给已构造的子 agent 快照（既定决策）；`compact()` 成本绝不进 `self.usage`；run_code 注册表首次执行即冻结 `code.llm`，之后热更改到它发 diag 警告（需重建 agent），普通 limits/路径热更不打扰。
 - **上下文构成分解**：`context_breakdown()` 是拉取式估算查询（system 三段/工具四类 `Tool::origin()`/消息分型），与 Usage 实测口径刻意不混流；等和不变量靠单趟 running-floor；锚点 scale 校准、失效即回 None。
 - **MCP 热增删**：撞名 = Err + 回滚；热增路径不打印；子 agent 与 run_code registry 都不感知（快照语义）。
 - **MCP SSE 同源闸门**：endpoint 解析与 POST 发送共用 `reqwest::Url`（真解析器）——别写字符串版 origin 切分，反斜杠混淆可绕过。

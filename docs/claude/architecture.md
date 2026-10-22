@@ -128,7 +128,10 @@
   会把有效预算砍半），父 fold 只进 totals 不进计数器；其余任何上报 usage 的工具（宿主 CallbackTool
   计量上游 API 等）默认 false——那笔花费没进过任何计数器，fold 时由 agent 代为 `share_budget` 进闸门
   （外部评审 P2-3：此前一律不进计数器，工具花费只进账单不进闸门，预算可被绕过）。run_code 的 guest
-  内层调用在内层 fold 点就地 `share`（混合来源聚合后统一置 true 上报）。**cap 单源**（2026-09 外审）：
+  内层调用在内层 fold 点就地 `share`（混合来源聚合后统一置 true 上报）。**并行 worker panic 的
+  usage 回收**：worker 线程在 `bill_chat` / guest `llm` 结算时把已知 usage 记进父装好的线程本地
+  `usage_probe`；`join` 返回 Err 时父读出探针并挂到合成的错误 `ToolOutput`（`usage_in_shared_budget:
+  true`），`RunOutcome`/`result.json` 总量与共享计数器不再分叉。**cap 单源**（2026-09 外审）：
   turn 边界的比较读 `BudgetGate::cap`（装闸时的 fleet 上限），自身 `limits.max_total_tokens` 快照只能
   把它**收紧**（`min`）——子 agent 快照一旦与父 cap 分叉，比较快照会让 fleet 预算被静默放大
   （`budget_gate_cap_outranks_a_looser_limits_snapshot` 钉住）。闸门超限以 `stop_reason:
@@ -162,7 +165,10 @@
   不感知**（与 ④ 同一条政策，外部评审曾当 P1 报过——实为既定快照语义）：registry 按构造期四件套在
   `Arc<OnceLock>` 里惰性建一次、跨克隆共享，热增的 server JS 看不到；热删的 server 仍可被已建 registry
   调用（连接活到 registry drop；该 server 已不在顶层列表 → shutdown 不再经它武装 reaper，最坏退出时
-  等满一次 MCP CALL_TIMEOUT 后由 `StdioTransport::drop` 杀进程组——延迟，无孤儿）。**活的握手/调用/冲突回滚/进程回收链路**
+  等满一次 MCP CALL_TIMEOUT 后由 `StdioTransport::drop` 杀进程组——延迟，无孤儿）。**`code.llm` 的
+  开关与模型档同样在 registry 首次构建时钉死**：`set_code_config` 之后改 llm 不再静默成功——
+  `RunCodeTool::should_warn_frozen_llm` 对每个新的目标值发一次 diag 警告（普通 limits/路径/开关热更
+  保持安静），文案指向「重建 agent」；`pinned_llm` 与 `warned_llm` 都随克隆共享。**活的握手/调用/冲突回滚/进程回收链路**
   只在 `agent_tests.rs::hot_add_remove_mcp_server_live`（`#[ignore]`，本地 python3 起
   `examples/mcp_echo.py`，`cargo test hot_add_remove -- --ignored --nocapture`；末尾 pgrep 断言 child
   零残留）；hermetic 用例只钉路由/错误形状/无变异三件事。

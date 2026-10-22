@@ -2318,6 +2318,15 @@ impl Tool for PanicOnMarkTool {
     fn run(&self, input: &Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
         let label = input["label"].as_str().unwrap_or("?");
         if label == "boom" {
+            // Model `bill_chat` having already shared this usage into the
+            // run-wide counter: the probe is the only channel that survives
+            // the unwind, and the join arm must recover it into the totals.
+            crate::usage_probe::record(&Usage {
+                input_tokens: 100,
+                output_tokens: 20,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            });
             panic!("worker body blew up");
         }
         Ok(ToolOutput::text(format!("ok-{label}")))
@@ -2361,6 +2370,12 @@ fn parallel_worker_panic_becomes_an_error_slot_and_siblings_survive() {
     assert_eq!(o.tool_calls[1].output, "parallel tool worker panicked");
     assert!(o.tool_calls[1].is_error);
     assert_eq!(o.tool_calls[2].output, "ok-c");
+    assert_eq!(
+        (o.input_tokens, o.output_tokens),
+        (100, 20),
+        "usage billed before the worker panicked must still reach the totals \
+         (recovered through the per-worker probe)"
+    );
     let tool_msg = agent
         .messages()
         .iter()
@@ -4835,15 +4850,15 @@ fn overflow_backstop_prunes_the_protected_tail() {
 
 #[test]
 fn preflight_estimates_from_provider_reported_usage() {
-    // chars/4 under-counts CJK ~2–3×, so a heuristic preflight trips too
-    // late on Chinese-heavy histories. After one real request the anchor
-    // (the provider's own prompt-token count) takes over: run 2's preflight
-    // sees est ≈ 10k tokens on a 3k-char history and compacts, where the
-    // heuristic would have said 750 and skipped.
+    // The heuristic is model-agnostic: on a Chinese-heavy history its CJK
+    // weighting is close, but the provider's own tokenizer can still disagree.
+    // After one real request the anchor (the provider's own prompt-token
+    // count) takes over: run 2's preflight sees est ≈ 10k tokens on a 3k-byte
+    // history and compacts, where the heuristic's ~2250 would have skipped.
     let mut cfg = cfg_with(5, 0, 0);
-    cfg.limits.max_context_tokens = 10_000; // trip at 85% = 8500
+    cfg.limits.max_context_tokens = 20_000; // trip at 85% = 17_000
     cfg.limits.keep_recent_messages = 0;
-    let cjk = "汉".repeat(1_000); // 3000 bytes → heuristic est ≈ 750
+    let cjk = "汉".repeat(1_000); // 3000 bytes → CJK-aware heuristic ≈ 2250
     let initial = vec![user_text(&cjk)];
     let (prov, state) = MockProvider::new(vec![
         mock::resp_text("r1", mock::mk_usage(10_000, 5)), // run 1: the provider measured the prompt at 10k tokens
@@ -4857,7 +4872,7 @@ fn preflight_estimates_from_provider_reported_usage() {
         !events
             .iter()
             .any(|e| matches!(e, AgentEvent::Compressed { .. })),
-        "run 1: heuristic estimate (750 + max_tokens) is under the cap — no compact"
+        "run 1: heuristic estimate (≈2250 + max_tokens) is under the cap — no compact"
     );
     // A follow-up turn (new run — the anchor must survive run boundaries,
     // TUI follow-ups being exactly where it pays).
@@ -7816,6 +7831,89 @@ fn set_code_config_rejects_invalid_llm_tier() {
     assert!(agent.tool_names().contains(&"run_code".to_string()));
 }
 
+/// LD-14 snapshot boundary, made audible: once the sandbox registry is
+/// built, `set_code_config` can no longer change what guest `llm` calls
+/// see — before this pin the update returned Ok and silently did nothing.
+/// The warning fires only when the llm half actually differs, so ordinary
+/// hot updates (limits, paths, enabled) stay quiet.
+#[cfg(feature = "code")]
+#[test]
+fn set_code_config_warns_when_llm_was_pinned_by_the_registry() {
+    use std::sync::Mutex;
+
+    let cfg: Config = serde_json::from_str(
+        r#"{"provider":"openai","api_key_env":"MOCK_API_KEY","model":"m",
+            "inject_environment":false,"tools":["read_file"],"code":{"enabled":true}}"#,
+    )
+    .unwrap();
+    let mut agent = crate::build_agent_with_provider(
+        &cfg,
+        Box::new(MockProvider::new(vec![mock::resp_text("x", None)]).0),
+        vec![],
+        &reqwest::blocking::Client::new(),
+        vec![],
+        "k",
+    )
+    .unwrap();
+    // First execution boundary: the registry caches its tool table (without
+    // the llm primitive, since the gate was off at build time).
+    agent
+        .code_tool
+        .as_ref()
+        .unwrap()
+        .ensure_registry_for_test()
+        .unwrap();
+
+    let warnings = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink = Arc::clone(&warnings);
+    let _guard = crate::diag::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    crate::diag::install_diag_sink(Box::new(move |level, msg| {
+        if level == crate::diag::DiagLevel::Warn {
+            sink.lock().unwrap().push(msg.to_string());
+        }
+    }));
+
+    // A non-llm hot update: no freeze warning. (Filter by content: the sink
+    // is process-global, so unrelated tests' skill/assembly warnings can land
+    // here too.)
+    let mut quiet = cfg.code.clone();
+    quiet.max_tool_calls = quiet.max_tool_calls.saturating_add(1);
+    agent.set_code_config(quiet).unwrap();
+    let llm_warnings = |w: &[String]| w.iter().filter(|m| m.contains("code.llm")).count();
+    let quiet_seen = warnings.lock().unwrap().clone();
+    assert_eq!(
+        llm_warnings(&quiet_seen),
+        0,
+        "limits-only update must not warn: {quiet_seen:?}"
+    );
+
+    // Enabling the guest llm primitive after the freeze: warn.
+    let mut frozen = cfg.code.clone();
+    frozen.llm.enabled = true;
+    frozen.llm.default_model = Some("m1".into());
+    frozen.llm.models = vec!["m1".into()];
+    agent.set_code_config(frozen.clone()).unwrap();
+    let frozen_seen = warnings.lock().unwrap().clone();
+    assert_eq!(
+        llm_warnings(&frozen_seen),
+        1,
+        "exactly one freeze warning, got {frozen_seen:?}"
+    );
+    let msg = frozen_seen.iter().find(|m| m.contains("code.llm")).unwrap();
+    assert!(
+        msg.contains("Rebuild the agent"),
+        "warning must name the freeze and the remedy: {msg}"
+    );
+
+    // Re-applying the SAME config is not a change: no repeat warning.
+    agent.set_code_config(frozen).unwrap();
+    let repeat_seen = warnings.lock().unwrap().clone();
+    assert_eq!(llm_warnings(&repeat_seen), 1, "{repeat_seen:?}");
+    crate::diag::clear_diag_sink();
+}
+
 // ── context_breakdown: composition, calibration, attribution ─────────────
 //
 // The breakdown's own arithmetic (running-floor partition, per-bucket sums)
@@ -7863,12 +7961,13 @@ fn context_breakdown_uncalibrated_matches_estimate() {
 
 #[test]
 fn context_breakdown_calibrates_after_billed_run() {
-    // CJK-heavy history: chars/4 under-counts it, so the anchor's measured/
+    // CJK-heavy history: the CJK-aware heuristic is much closer than bytes/4,
+    // but the provider's tokenizer still disagrees, so the anchor's measured/
     // estimated scale exceeds 1 and the breakdown's components scale past
     // their raw estimates. The anchor survives the run boundary (a follow-up
     // push_user keeps the prefix intact — that's the TUI's main use).
     let cfg = cfg_with(5, 0, 0);
-    let cjk = "中文内容估算校准锚点".repeat(150); // 1200 chars → ~300 raw est
+    let cjk = "中文内容估算校准锚点".repeat(150); // 1500 chars → ~3375 raw est
     let (prov, state) = MockProvider::new(vec![mock::resp_text("done", mock::mk_usage(10_000, 5))]);
     let mut agent = Agent::new(
         &cfg,
@@ -7893,14 +7992,14 @@ fn context_breakdown_calibrates_after_billed_run() {
     assert_eq!(cal.measured_prompt_tokens, 10_000);
     assert!(
         cal.scale > 1.0,
-        "chars/4 under-counts CJK, scale={}",
+        "provider tokenizer disagrees with the CJK-aware heuristic, scale={}",
         cal.scale
     );
     assert_eq!(cal.scale, 10_000.0 / raw_prefix as f64);
     // The scaled total towers over the raw estimate (that's the point of
     // calibrating) and still splits across the three sections.
     assert!(
-        bd.total_tokens > raw_prefix * 5,
+        bd.total_tokens > raw_prefix * 2,
         "scaled={}, raw={}",
         bd.total_tokens,
         raw_prefix

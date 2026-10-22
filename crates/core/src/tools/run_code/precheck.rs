@@ -660,4 +660,199 @@ mod tests {
         let code = format!("{}await x", "`${".repeat(65));
         assert_eq!(precheck(&code), None);
     }
+
+    // ── lexer / precheck 性质测试（固定种子 LCG，零依赖） ────────────────────
+
+    /// Deterministic 64-bit LCG (fixed seed): the property tests' only source
+    /// of randomness. Same seed → same draws on every run and platform.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next_u64() % n as u64) as usize
+        }
+        fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
+            &xs[self.below(xs.len())]
+        }
+    }
+
+    /// Property (fuzz, fixed seed): lexer + precheck are TOTAL on random
+    /// ASCII/CJK/quote/comment/template soup — no panic, no error. A lexer
+    /// stack overflow here would kill the whole host process (the precheck
+    /// runs before any wasm limiter exists), so completion IS the assertion;
+    /// unterminated strings/templates/regex/comments are all in the corpus.
+    /// Every reported hit carries a plausible 1-based line number.
+    #[test]
+    fn precheck_fuzz_total_on_random_code_soup() {
+        const FRAGMENTS: &[&str] = &[
+            "await",
+            "async",
+            "import",
+            "Date",
+            "Math",
+            "fetch",
+            "Promise",
+            "setTimeout",
+            "tools",
+            "call",
+            "x",
+            "_t",
+            "const",
+            "let",
+            "new",
+            "=",
+            "(",
+            ")",
+            "{",
+            "}",
+            "[",
+            "]",
+            ".",
+            "/",
+            ";",
+            "1",
+            " ",
+            "\n",
+            "\r\n",
+            "//c\n",
+            "/*x*/",
+            "'",
+            "\"",
+            "`",
+            "${",
+            "}",
+            "\\",
+            "中文注释",
+            "工具",
+        ];
+        let mut rng = Lcg(0x5EED_0020);
+        for _ in 0..300 {
+            let code: String = (0..rng.below(60)).map(|_| *rng.pick(FRAGMENTS)).collect();
+            let toks = lex(&code); // must not panic (stack overflow aborts the process)
+                                   // Every token line is a plausible 1-based line of this code.
+            let n_lines = code.lines().count().max(1);
+            for t in &toks {
+                let line = match t {
+                    Tok::Ident(_, l) | Tok::Str(_, l) => *l,
+                    Tok::Punct(_) => continue,
+                };
+                assert!(
+                    (1..=n_lines).contains(&line),
+                    "token line {line} out of 1..={n_lines} for {code:?}"
+                );
+            }
+            if let Some(msg) = precheck(&code) {
+                // Reported line numbers parse back into range too.
+                let mut rest = msg.as_str();
+                while let Some(p) = rest.find("（第 ") {
+                    let after = &rest[p + "（第 ".len()..];
+                    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    let n: usize = digits.parse().expect("digits");
+                    assert!(
+                        (1..=n_lines).contains(&n),
+                        "hit line {n} out of 1..={n_lines} for {code:?} → {msg}"
+                    );
+                    rest = after;
+                }
+            }
+        }
+    }
+
+    /// 禁用写法固定样本逐一命中（检出集合 FD-9 三类各有代表），多行样本的
+    /// 命中行号指向真实所在行；纯安全样本（循环/常量/字符串操作/CJK 注释/
+    /// 无插值模板/声明豁免/空代码）零命中。
+    #[test]
+    fn precheck_fixed_forbidden_samples_hit_and_safe_samples_pass() {
+        for (code, needle) in [
+            ("async function f() {}", "async"),
+            ("await x;", "await"),
+            ("import('m')", "import"),
+            ("let t = Date.now();", "Date.now"),
+            ("let r = Math.random();", "Math.random"),
+            ("tools.call('run_code', {})", "run_code"),
+            ("tools.call(\"task\", {})", "task"),
+            ("tools.call(\"todo\", {})", "todo"),
+            ("new Promise(r => r(1));", "Promise"),
+            ("setTimeout(f, 10);", "setTimeout"),
+            ("fetch('/x');", "fetch"),
+        ] {
+            let msg = precheck(code).unwrap_or_else(|| panic!("{code:?} must be flagged"));
+            assert!(msg.starts_with("run_code precheck:"), "{code:?} → {msg}");
+            assert!(msg.contains(&format!("\"{needle}\"")), "{code:?} → {msg}");
+        }
+        // 命中行号：第 3 行的 await 报第 3 行（不串行）。
+        let msg = precheck("let a = 1;\nlet b = 2;\nawait a;").expect("flagged");
+        assert!(msg.contains("\"await\"（第 3 行）"), "{msg}");
+        for safe in [
+            "",
+            "let s = 0;\nfor (let i = 0; i < 10; i++) { s += i; }\nreturn s;",
+            "const greeting = \"你好，世界\";\nreturn greeting.length;",
+            "// Date.now 在注释里\n/* await import 也在这里 */\nlet ok = 1;",
+            "let t = `plain template no interpolation`;\nreturn t;",
+            "let n = \"not Date.now, not Math.random\";\nreturn n;",
+            "function fetch(x) { return x; }\nreturn fetch(1);", // FD-10 声明豁免
+        ] {
+            assert_eq!(precheck(safe), None, "{safe:?}");
+        }
+    }
+
+    /// Property (fuzz, fixed seed): 检出词进字符串/模板/注释/正则字面量是
+    /// 文本不是语法——随机毒词 × 随机容器 300 轮一律不命中（真 lexer 非
+    /// 子串匹配）；同毒词的裸写形式必命中（证明检测器没有整体失效）。
+    #[test]
+    fn precheck_poison_in_literates_never_hits_and_bare_poison_always_hits() {
+        const POISONS: &[&str] = &[
+            "await",
+            "import",
+            "async",
+            "Date.now",
+            "Math.random",
+            "fetch",
+            "setTimeout",
+            "Promise",
+            "tools.call",
+        ];
+        const FILLER: &[&str] = &["x9", "哦", " 1 ", "abc", "0", "工具"];
+        let mut rng = Lcg(0x5EED_0021);
+        for _ in 0..300 {
+            let poison = *rng.pick(POISONS);
+            let f1 = *rng.pick(FILLER);
+            let f2 = *rng.pick(FILLER);
+            // 随机前缀保证毒词在容器内的位置不固定；不含引号/反斜杠/`${`，
+            // 容器边界不会被 filler 打开。
+            let wrapped = match rng.below(7) {
+                0 => format!("let s = \"{p}{f1}\";", p = poison, f1 = f1),
+                1 => format!("let s = '{f1}{p}{f2}';", f1 = f1, p = poison, f2 = f2),
+                2 => format!("let s = `{p}` + `{f1}`;", p = poison, f1 = f1),
+                3 => format!("// {p} {f1}\nlet s = 1;", p = poison, f1 = f1),
+                4 => format!("/* {f1} {p} */let s = 1;", f1 = f1, p = poison),
+                5 => format!("let re = /{p}{f1}/i;", p = poison, f1 = f1), // 表达式位置 → 正则字面量
+                _ => format!("let s = \"a {p} b\"; let t = '{p}';", p = poison),
+            };
+            assert_eq!(
+                precheck(&wrapped),
+                None,
+                "poison {poison:?} in a literal leaked:\n{wrapped}"
+            );
+            // 裸写必命中——逐类给出最小命中形态。
+            let bare = match poison {
+                "await" => "await x;".to_string(),
+                "import" => "import('m');".to_string(),
+                "async" => "async function f() {}".to_string(),
+                "Date.now" => "Date.now();".to_string(),
+                "Math.random" => "Math.random();".to_string(),
+                "Promise" => "new Promise(r => r(1));".to_string(),
+                "tools.call" => "tools.call(\"task\", {});".to_string(),
+                other => format!("{other}();"),
+            };
+            let hit = precheck(&bare).unwrap_or_else(|| panic!("bare {poison:?} must be flagged"));
+            assert!(hit.starts_with("run_code precheck:"), "{hit}");
+        }
+    }
 }

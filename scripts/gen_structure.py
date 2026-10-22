@@ -49,6 +49,7 @@ ENTRIES = [
     ("crates/core/src", "provider/mock.rs", "测试用脚本化 Provider（cfg(any(test, feature=\"mock\"))）"),
     ("crates/core/src", "agent.rs", "核心 loop + usage 累计 + cancel + 上下文压缩（前馈/溢出双触发 + 滚动分块摘要）+ 相邻消息归一 + 同 turn 多 task 并行"),
     ("crates/core/src", "agent_tests.rs", "核心 loop 回归测试（provider::mock 脚本化，不连网）"),
+    ("crates/core/src", "usage_probe.rs", "并行 worker 的线程本地 usage 侧信道：panic unwind 后把已计费 usage 带回 join 点（防 result.json 与共享计数器分叉）"),
     ("crates/core/src", "compress.rs", "压缩引擎（find_safe_cut / 分块摘要 / saturating usage 合并 + block 级计费原语）"),
     ("crates/core/src", "context_report.rs", "上下文构成分解（ContextBreakdown 估算口径：system 三段 / 工具四类 / 消息分型 + 锚点校准）"),
     ("crates/core/src", "retry.rs", "batch --retries / 单跑瞬态重试共用的指数退避（±25% jitter 防 lockstep）"),

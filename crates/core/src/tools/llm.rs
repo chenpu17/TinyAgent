@@ -481,7 +481,7 @@ impl Tool for LlmTool {
         // ── settle exactly once (§3.1 matrix). Labels validation happens
         // AFTER: a failed validation still settles actual — the call
         // happened, its cost is real.
-        let total = resp.usage.map(|u| u.total());
+        let total = resp.usage.as_ref().map(|u| u.total());
         let (reserved, actual, over_reserve) = match (guard.take(), total) {
             (Some(g), Some(t)) => {
                 let s = g.settle(t);
@@ -497,6 +497,14 @@ impl Tool for LlmTool {
             (None, Some(t)) => (0, Some(t), false),
             (None, None) => (0, None, false),
         };
+        // Parallel-worker side channel (see `usage_probe`): if this worker
+        // panics after settling but before returning its ToolOutput, the
+        // parent's join arm can still recover the billed usage. Only KNOWN
+        // usage is recorded — the unknown-usage arm deliberately keeps its
+        // reservation without inventing an actual.
+        if let Some(u) = resp.usage.as_ref() {
+            crate::usage_probe::record(u);
+        }
         let row = LlmTool::audit_row(&model, reserved, actual, over_reserve);
 
         // ── response text + termination check + LD-18 label validation.

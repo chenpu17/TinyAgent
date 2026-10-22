@@ -65,6 +65,18 @@ pub struct RunCodeTool {
     /// Lazily-built inner registry, shared across clones. The failure (bad
     /// cfg.tools) is cached too — reported identically on every call.
     registry: Arc<OnceLock<Result<Registry, String>>>,
+    /// The `code.llm` snapshot the registry was BUILT with (LD-14 snapshot
+    /// boundary): `Some(cfg)` when the `llm` primitive was admitted at build
+    /// time, `None` when it was not. Written once inside `registry()`;
+    /// `Agent::set_code_config` reads it to warn when a later hot update
+    /// changes the llm gate/config that the cached registry can no longer
+    /// follow (silently ineffective before this pin existed).
+    pinned_llm: Arc<OnceLock<Option<crate::config::LlmConfig>>>,
+    /// Last post-freeze `code.llm` value we already warned the host about.
+    /// `Some(None)` = warned for "disabled", `Some(Some(cfg))` = warned for
+    /// that exact config. Shared across clones so repeated full-config pushes
+    /// (the common binding pattern) warn once per actual change, not per call.
+    warned_llm: Arc<std::sync::Mutex<Option<Option<crate::config::LlmConfig>>>>,
     /// Session registration set for the lib family (MD-14): shared across
     /// clones — every execution of this lineage admits against one set.
     lib_sessions: LibSessions,
@@ -94,6 +106,8 @@ impl RunCodeTool {
             mcp_tools,
             extra_tools,
             registry: Arc::new(OnceLock::new()),
+            pinned_llm: Arc::new(OnceLock::new()),
+            warned_llm: Arc::new(std::sync::Mutex::new(None)),
             lib_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             provider_cell: Arc::new(OnceLock::new()),
         }
@@ -105,6 +119,55 @@ impl RunCodeTool {
     /// `LlmTool` the registry builds.
     pub(crate) fn provider_cell(&self) -> &Arc<OnceLock<Arc<dyn crate::provider::Provider>>> {
         &self.provider_cell
+    }
+
+    /// Whether the inner registry has been built (successfully or not) for
+    /// this lineage; after that the llm gate/config is frozen (LD-14).
+    pub(crate) fn registry_built(&self) -> bool {
+        self.registry.get().is_some()
+    }
+
+    /// The `code.llm` snapshot the registry pinned at build time: `None`
+    /// means the `llm` primitive was NOT admitted (either the gate was off
+    /// or the registry has not been built yet — pair with
+    /// [`Self::registry_built`]).
+    pub(crate) fn pinned_llm(&self) -> Option<&crate::config::LlmConfig> {
+        self.pinned_llm.get().and_then(Option::as_ref)
+    }
+
+    /// Decide whether a post-freeze `code.llm` change should emit the
+    /// "pinned by the registry" warning. True only when the registry exists,
+    /// the requested state differs from what it pinned, AND we have not
+    /// already warned for this exact requested state (repeated full-config
+    /// pushes stay quiet; changing the model list again warns again).
+    pub(crate) fn should_warn_frozen_llm(
+        &self,
+        requested: Option<&crate::config::LlmConfig>,
+    ) -> bool {
+        if !self.registry_built() || self.pinned_llm() == requested {
+            return false;
+        }
+        let mut last = self
+            .warned_llm
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let already = match (&*last, requested) {
+            (Some(None), None) => true,
+            (Some(Some(seen)), Some(req)) => seen == req,
+            _ => false,
+        };
+        if already {
+            return false;
+        }
+        *last = Some(requested.cloned());
+        true
+    }
+
+    /// Test hook: force the lazy registry build without executing guest code,
+    /// so agent-level tests can exercise the post-freeze config paths.
+    #[cfg(test)]
+    pub(crate) fn ensure_registry_for_test(&self) -> Result<()> {
+        self.registry().map(|_| ())
     }
 
     /// Read-lock → clone → release: the snapshot an execution runs with for
@@ -123,6 +186,15 @@ impl RunCodeTool {
     fn registry(&self) -> Result<&Registry> {
         let cell = &*self.registry;
         cell.get_or_init(|| {
+            let llm_snapshot = self.snapshot().llm;
+            // Pin what the registry is about to bake in, even if the build
+            // fails: `set_code_config` uses this to tell the host that a
+            // later llm update cannot reach the cached registry.
+            let _ = self.pinned_llm.set(if llm_snapshot.enabled {
+                Some(llm_snapshot.clone())
+            } else {
+                None
+            });
             let build = || -> Result<Registry> {
                 let mut tools = crate::tools::build(
                     &self.build_cfg.tools,
@@ -169,7 +241,7 @@ impl RunCodeTool {
                 // caches the decision for the lineage's lifetime, so a
                 // later hot flip is not sensed (documented snapshot
                 // boundary, same class as the MCP hot add/remove).
-                if self.snapshot().llm.enabled {
+                if llm_snapshot.enabled {
                     // LD-3 name reservation, guest side: an admitted tool
                     // already named "llm" (an MCP server, an injected
                     // opt-in) must not be silently shadowed — dispatch is
@@ -186,7 +258,7 @@ impl RunCodeTool {
                         ));
                     }
                     tools.push(Box::new(crate::tools::llm::LlmTool::new(
-                        self.snapshot().llm.clone(),
+                        llm_snapshot.clone(),
                         Arc::clone(&self.provider_cell),
                     )));
                 }

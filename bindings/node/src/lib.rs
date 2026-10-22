@@ -1067,6 +1067,11 @@ impl Agent {
     /// (they do not retain previous values — send the full object to keep
     /// a knob). Takes effect for the next execution; an in-flight one keeps
     /// its snapshot. Busy-errors while `run()` is in flight.
+    ///
+    /// The `llm` sub-object is pinned by the sandbox registry at its first
+    /// execution: after that, changing `llm` here still succeeds but cannot
+    /// reach guest `llm` calls, and the kernel emits a diag warning telling
+    /// the host to rebuild the agent. Limits / paths / `enabled` stay hot.
     #[napi]
     pub fn set_code_config(&self, cfg: Value) -> Result<()> {
         #[cfg(feature = "code")]

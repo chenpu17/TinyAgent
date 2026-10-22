@@ -49,6 +49,10 @@ pub(crate) mod winjob;
 #[path = "m0_probes.rs"]
 mod m0_probes;
 
+/// Per-worker usage side channel for the parallel tool batch (recovers the
+/// spend that used to die with a panicking worker thread).
+mod usage_probe;
+
 // ── Facade re-exports (the library's public face) ──────────────────────────
 pub use agent::{
     extract_plan, Agent, AgentEvent, CompressError, CompressOutcome, CompressTrigger, RunCost,

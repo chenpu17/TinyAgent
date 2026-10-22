@@ -849,15 +849,25 @@ pub fn confined_to(root: &Path, full: &Path, label: &str) -> Result<PathBuf> {
                 }
                 bail!("path escapes the {label}: {}", full.display());
             }
-            Err(_) => match ancestor.file_name() {
-                Some(name) => {
-                    rest.push(name.to_os_string());
-                    ancestor = ancestor.parent().ok_or_else(|| {
-                        anyhow::anyhow!("cannot resolve path: {}", full.display())
-                    })?;
+            Err(_) => {
+                // `Path::file_name()` returns None for paths ending in `..`
+                // (and the walk starts on the FULL path, which may itself end
+                // in a not-yet-existing `x/..` tail), so match the last
+                // COMPONENT instead: `..`/`.` are still path pieces to carry
+                // into `rest` for lexical normalization. Using file_name here
+                // bailed with "cannot resolve path" on a perfectly normal
+                // `workdir/nonexist/../x`.
+                use std::path::Component;
+                match ancestor.components().next_back() {
+                    Some(Component::ParentDir) => rest.push("..".into()),
+                    Some(Component::CurDir) => rest.push(".".into()),
+                    Some(Component::Normal(name)) => rest.push(name.to_os_string()),
+                    _ => bail!("cannot resolve path: {}", full.display()),
                 }
-                None => bail!("cannot resolve path: {}", full.display()),
-            },
+                ancestor = ancestor
+                    .parent()
+                    .ok_or_else(|| anyhow::anyhow!("cannot resolve path: {}", full.display()))?;
+            }
         }
     }
 }

@@ -59,6 +59,11 @@ const MCP_ERR_BODY_MAX: u64 = 16 * 1024;
 /// `max_bytes`. Reads in `fill_buf` chunks (not byte-by-byte) and accumulates
 /// raw bytes, validating UTF-8 only at the call site — so a multi-byte char
 /// split across reads isn't misdecoded mid-accumulation.
+///
+/// EOF with a NON-EMPTY `buf` returns that tail as a final line (what
+/// `BufRead::read_line` did before this helper existed): a last NDJSON
+/// message without a trailing newline must not be silently dropped. The NEXT
+/// call sees an empty buf + EOF and returns 0.
 fn read_capped_line<R: BufRead>(
     reader: &mut R,
     buf: &mut Vec<u8>,
@@ -70,7 +75,7 @@ fn read_capped_line<R: BufRead>(
         let (consumed, done) = {
             let available = reader.fill_buf().context("MCP read failed")?;
             if available.is_empty() {
-                return Ok(0); // clean EOF
+                return Ok(buf.len()); // clean EOF; deliver any unterminated tail
             }
             let (take, found_nl) = match available.iter().position(|&c| c == b'\n') {
                 Some(i) => (&available[..=i], true),
@@ -1341,8 +1346,21 @@ impl Drop for HttpTransport {
         // server keeps its stream open indefinitely, and blocking here would
         // hang teardown on exactly the servers we're giving up on).
         self.stream_shutdown.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.stream_reader.take().filter(|h| h.is_finished()) {
-            let _ = handle.join();
+        if let Some(handle) = self.stream_reader.take() {
+            if handle.is_finished() {
+                let _ = handle.join();
+            } else {
+                // Detaching is the only non-blocking option (a healthy server
+                // holds the GET open indefinitely). Say so instead of letting
+                // a long-lived host leak one thread + TCP connection per
+                // client teardown silently.
+                drop(handle);
+                crate::diag::diag_warn!(
+                    "[mcp] HTTP standing-stream reader detached on teardown: the server kept \
+                     the stream open, so the reader thread and its TCP connection survive \
+                     until process exit"
+                );
+            }
         }
     }
 }
@@ -1751,8 +1769,21 @@ impl Drop for SseTransport {
         // would hang teardown on exactly the servers we're giving up on).
         // Joining the finished case reclaims it deterministically instead of
         // leaving it to the runtime's unjoined-thread reclamation.
-        if let Some(handle) = self.reader.take().filter(|h| h.is_finished()) {
-            let _ = handle.join();
+        if let Some(handle) = self.reader.take() {
+            if handle.is_finished() {
+                let _ = handle.join();
+            } else {
+                // Same honest-detach note as HttpTransport: the reader blocked
+                // in a reqwest read cannot be interrupted, and a healthy idle
+                // server keeps the stream open — teardown must not hang, so
+                // the thread outlives us until process exit. Surface it.
+                drop(handle);
+                crate::diag::diag_warn!(
+                    "[mcp] legacy SSE reader detached on teardown: the server kept the stream \
+                     open, so the reader thread and its TCP connection survive until process \
+                     exit (prefer stdio MCP servers where clean teardown matters)"
+                );
+            }
         }
     }
 }
@@ -3157,5 +3188,337 @@ mod tests {
             2,
             "the dropped stream must have been reopened, got {log:?}"
         );
+    }
+
+    /// A live reader cannot be joined (the server holds the GET open), so
+    /// Drop detaches it. That used to be silent — a long-lived host would
+    /// leak one thread + TCP connection per teardown with no trace. Pin the
+    /// diagnostic on the detach path and its absence on the finished path.
+    #[test]
+    fn http_transport_warns_when_a_live_stream_reader_is_detached() {
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(30));
+        });
+        let cfg = McpServerConfig {
+            name: "detach".into(),
+            command: None,
+            args: vec![],
+            env: HashMap::new(),
+            url: Some("http://127.0.0.1:1/mcp".into()),
+            transport: Some(McpTransport::Http),
+            headers: HashMap::new(),
+        };
+        let mut t =
+            HttpTransport::new("http://127.0.0.1:1/mcp", &cfg).expect("transport construction");
+        t.stream_reader = Some(handle);
+
+        let warnings = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&warnings);
+        let _guard = crate::diag::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::diag::install_diag_sink(Box::new(move |level, msg| {
+            if level == crate::diag::DiagLevel::Warn {
+                sink.lock().unwrap().push(msg.to_string());
+            }
+        }));
+        drop(t);
+        let captured = warnings.lock().unwrap().clone();
+        crate::diag::clear_diag_sink();
+        let _ = release_tx.send(()); // let the detached thread exit promptly
+
+        assert!(
+            captured
+                .iter()
+                .any(|m| m.contains("HTTP standing-stream reader detached")),
+            "live reader detach must be announced, got {captured:?}"
+        );
+    }
+
+    /// The finished-reader branch joins deterministically and must NOT emit
+    /// the detach warning (no leak to report).
+    #[test]
+    fn http_transport_joins_a_finished_reader_without_warning() {
+        let handle = std::thread::spawn(|| {});
+        // Make sure the thread is finished before Drop inspects it.
+        while !handle.is_finished() {
+            std::thread::yield_now();
+        }
+        let cfg = McpServerConfig {
+            name: "joined".into(),
+            command: None,
+            args: vec![],
+            env: HashMap::new(),
+            url: Some("http://127.0.0.1:1/mcp".into()),
+            transport: Some(McpTransport::Http),
+            headers: HashMap::new(),
+        };
+        let mut t =
+            HttpTransport::new("http://127.0.0.1:1/mcp", &cfg).expect("transport construction");
+        t.stream_reader = Some(handle);
+
+        let warnings = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&warnings);
+        let _guard = crate::diag::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::diag::install_diag_sink(Box::new(move |level, msg| {
+            if level == crate::diag::DiagLevel::Warn {
+                sink.lock().unwrap().push(msg.to_string());
+            }
+        }));
+        drop(t);
+        let captured = warnings.lock().unwrap().clone();
+        crate::diag::clear_diag_sink();
+
+        assert!(
+            !captured
+                .iter()
+                .any(|m| m.contains("standing-stream reader detached")),
+            "finished reader must be joined silently, got {captured:?}"
+        );
+    }
+
+    // ── 解析器性质测试（固定种子 LCG，零依赖） ──────────────────────────────
+
+    /// Deterministic 64-bit LCG (fixed seed): the property tests' only source
+    /// of randomness. Same seed → same bytes on every run and platform.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next_u64() % n as u64) as usize
+        }
+        fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
+            &xs[self.below(xs.len())]
+        }
+    }
+
+    /// Property (fuzz, fixed seed): `read_sse_event` over randomly assembled
+    /// SSE streams must (a) never panic and never error (every line is far
+    /// under the cap), (b) keep event boundaries — each generated event
+    /// reparses to exactly its own (event, data) across CRLF/blank-line
+    /// variants, multi-line data and the missing-trailing-blank EOF flush,
+    /// (c) skip invalid lines (invalid UTF-8, comments, unknown fields, a
+    /// lone `event:`) WITHOUT swallowing the events around them.
+    #[test]
+    fn sse_fuzz_event_boundaries_and_garbage_skipped() {
+        const DATA_PAYLOADS: &[&str] = &[
+            "alpha",
+            "{\"n\":1}",
+            "γ gamma",    // multibyte payload
+            " two-space", // spec: strip at most ONE space after `data:`
+            "e=4:5",      // colons/equals inside the payload
+        ];
+        const EVENT_NAMES: &[&str] = &["message", "endpoint", "ping/2024"];
+        const GARBAGE: &[&[u8]] = &[
+            b":a comment line\n",
+            b"unknown-field: whatever\n",
+            b"\xff\xfe invalid utf8\n",
+            b"event: lonely\n", // no data before the blank line → reset
+            b"\r\n",            // a CR-only blank line
+        ];
+        let mut rng = Lcg(0x5EED_0001);
+        for _ in 0..200 {
+            let n_events = 1 + rng.below(5);
+            // The oracle: one entry per generated event.
+            let mut expected: Vec<(String, String)> = Vec::new();
+            let mut raw: Vec<u8> = Vec::new();
+            for i in 0..n_events {
+                let name = *rng.pick(EVENT_NAMES);
+                let n_data = 1 + rng.below(3);
+                let mut datas = Vec::new();
+                for _ in 0..n_data {
+                    let payload = rng.pick(DATA_PAYLOADS).to_string();
+                    // `data: {payload}` — the parser strips exactly one space,
+                    // so the payload round-trips verbatim (incl. its own
+                    // leading space, which must NOT be stripped twice).
+                    datas.push(payload.clone());
+                    raw.extend_from_slice(format!("data: {payload}").as_bytes());
+                    raw.extend_from_slice(if rng.below(4) == 0 { b"\r\n" } else { b"\n" });
+                }
+                if name != "message" {
+                    raw.extend_from_slice(format!("event: {name}\n").as_bytes());
+                }
+                expected.push((name.to_string(), datas.join("\n")));
+                // Terminator: blank line, or nothing on the last event
+                // (EOF must flush the buffered event, not drop it).
+                let is_last = i + 1 == n_events;
+                if !is_last || rng.below(2) == 0 {
+                    raw.extend_from_slice(if rng.below(3) == 0 { b"\r\n" } else { b"\n" });
+                }
+                // Garbage strictly BETWEEN events (never adjacent to real
+                // data: lines): must be skipped without starting an event.
+                // A blank line follows every garbage slice so a lone
+                // `event:` line resets instead of leaking onto the next
+                // event's name.
+                if !is_last && rng.below(2) == 0 {
+                    raw.extend_from_slice(rng.pick(GARBAGE));
+                    raw.push(b'\n');
+                }
+            }
+            let parse = |bytes: &[u8]| -> Vec<(String, String)> {
+                let mut r = BufReader::new(bytes);
+                let mut got = Vec::new();
+                while let Some((e, d)) = read_sse_event(&mut r, MCP_EVENT_MAX).expect("no error") {
+                    got.push((e, d));
+                }
+                got
+            };
+            assert_eq!(
+                parse(&raw),
+                expected,
+                "stream: {:?}",
+                String::from_utf8_lossy(&raw)
+            );
+            // Idempotence: a fresh reader over the same bytes answers the same.
+            assert_eq!(parse(&raw), parse(&raw));
+        }
+    }
+
+    /// Property (fuzz, fixed seed): `sse_response_for_id`'s JSON-RPC framing —
+    /// noise frames (non-JSON payloads, server-initiated REQUESTS that carry
+    /// the target id, responses for other ids) are skipped without ending the
+    /// scan, and the one matching response is returned verbatim.
+    #[test]
+    fn sse_jsonrpc_framing_skips_noise_and_routes_the_target_response() {
+        let mut rng = Lcg(0x5EED_0002);
+        for _ in 0..200 {
+            let target = 10 + rng.below(5) as u64; // 10..=14 — decoys stay below
+            let n_noise = rng.below(5);
+            let mut raw: Vec<u8> = Vec::new();
+            for _ in 0..n_noise {
+                let noise = match rng.below(4) {
+                    0 => "not json at all".to_string(),
+                    // A request carrying the TARGET id must NOT match.
+                    1 => {
+                        json!({"id": target, "method": "sampling/create", "params": {}}).to_string()
+                    }
+                    2 => json!({"id": rng.below(10) as u64, "result": {"decoy": true}}).to_string(),
+                    _ => json!({"id": 9000 + rng.below(10) as u64,
+                                "error": {"code": -1, "message": "e"}})
+                    .to_string(),
+                };
+                raw.extend_from_slice(format!("data: {noise}\n\n").as_bytes());
+            }
+            let want = json!({"id": target, "result": {"n": target}});
+            raw.extend_from_slice(format!("data: {}\n\n", want).as_bytes());
+            let mut r = BufReader::new(&raw[..]);
+            let got = sse_response_for_id(&mut r, target, "tools/call").expect("response found");
+            assert_eq!(got, want);
+        }
+        // Exhausted stream without a match is a clean error, not a hang.
+        let mut r = BufReader::new(&b"data: {\"id\":1}\n\n"[..]);
+        assert!(sse_response_for_id(&mut r, 2, "tools/call").is_err());
+    }
+
+    /// Property (fuzz, fixed seed): the stdio reader loop's per-line handling
+    /// (read_capped_line → UTF-8/JSON validate → pending_dispatch) over
+    /// randomly framed NDJSON must deliver each response frame to exactly its
+    /// own waiter — CRLF endings, blank/garbage/invalid-UTF-8 lines, request
+    /// frames carrying a live id, and late frames with no waiter are all
+    /// routed or skipped without cross-delivery.
+    #[test]
+    fn stdio_ndjson_fuzz_lines_route_without_cross_delivery() {
+        let mut rng = Lcg(0x5EED_0003);
+        for _ in 0..200 {
+            let n = 1 + rng.below(6);
+            let pending = pending_new();
+            let mut waiters: Vec<(u64, mpsc::Receiver<Value>)> = Vec::new();
+            let mut raw: Vec<u8> = Vec::new();
+            for i in 0..n {
+                let id = i as u64 * 2 + 1; // sparse, unique per round
+                let msg = json!({"id": id, "result": {"n": i}});
+                let (tx, rx) = mpsc::channel();
+                pending.lock().unwrap().insert(id, tx);
+                waiters.push((id, rx));
+                // One frame = one line regardless of internal spacing; \r\n
+                // is a legal terminator (from_str sees `s.trim()`).
+                let mut line = msg.to_string();
+                if rng.below(4) == 0 {
+                    line = format!("  {line}  "); // surrounding whitespace trimmed
+                }
+                raw.extend_from_slice(line.as_bytes());
+                raw.extend_from_slice(if rng.below(3) == 0 { b"\r\n" } else { b"\n" });
+                // Garbage between frames — none of it may dispatch anything.
+                match rng.below(5) {
+                    0 => raw.extend_from_slice(b"\n"),
+                    1 => raw.extend_from_slice(b"server log noise, not json\n"),
+                    2 => raw.extend_from_slice(b"\xff\xfe broken utf8\n"),
+                    3 => raw.extend_from_slice(b"{\"id\":9999,\"result\":{}}\n"), // no waiter
+                    // A REQUEST frame carrying a LIVE id must not dispatch.
+                    _ => raw.extend_from_slice(
+                        format!("{{\"id\":{},\"method\":\"x\",\"params\":{{}}}}\n", id).as_bytes(),
+                    ),
+                }
+            }
+            // Final frame also newline-terminated here; the unterminated-tail
+            // case has its own regression test below.
+
+            // The exact per-line handling of wire_readers' stdout thread.
+            let mut reader = BufReader::new(&raw[..]);
+            let mut buf: Vec<u8> = Vec::new();
+            loop {
+                buf.clear();
+                match read_capped_line(&mut reader, &mut buf, MCP_LINE_MAX) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if let Ok(s) = std::str::from_utf8(&buf) {
+                            if let Ok(msg) = serde_json::from_str::<Value>(s.trim()) {
+                                pending_dispatch(&pending, msg);
+                            }
+                        }
+                    }
+                    Err(_) => break, // over-cap line ends the stream (not reachable here)
+                }
+            }
+            // Every waiter got exactly its OWN message; nothing else arrives.
+            for (id, rx) in waiters {
+                let got = rx.try_recv().expect("frame dispatched exactly once");
+                assert_eq!(got["id"], json!(id), "cross-delivered: {got}");
+                rx.try_recv().expect_err("no second frame");
+            }
+        }
+    }
+
+    /// Regression: a COMPLETE JSON-RPC frame as the final stdio line WITHOUT
+    /// a trailing newline must still dispatch. `read_capped_line` used to
+    /// answer `Ok(0)` at EOF even with a buffered tail, and the wire_readers
+    /// loop treats `Ok(0)` as clean EOF — silently dropping the last frame.
+    /// It now returns `buf.len()` so the tail is delivered as a final line
+    /// (matching the SSE path, which flushes the buffered event at EOF).
+    #[test]
+    fn stdio_ndjson_final_frame_without_trailing_newline_dispatches() {
+        let pending = pending_new();
+        let (tx, rx) = mpsc::channel();
+        pending.lock().unwrap().insert(7, tx);
+        let raw = b"{\"id\":7,\"result\":{\"ok\":true}}"; // no trailing \n
+        let mut reader = BufReader::new(&raw[..]);
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            buf.clear();
+            match read_capped_line(&mut reader, &mut buf, MCP_LINE_MAX) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if let Ok(s) = std::str::from_utf8(&buf) {
+                        if let Ok(msg) = serde_json::from_str::<Value>(s.trim()) {
+                            pending_dispatch(&pending, msg);
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let got = rx
+            .try_recv()
+            .expect("final unterminated frame must dispatch");
+        assert_eq!(got["id"], json!(7));
     }
 }
