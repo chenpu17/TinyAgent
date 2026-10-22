@@ -1533,6 +1533,9 @@ mod tests {
         std::os::unix::fs::symlink(&outside, root.join("out_link")).unwrap();
         std::os::unix::fs::symlink(root.join("a"), root.join("inner_link")).unwrap();
         std::os::unix::fs::symlink("no_such", root.join("dangle")).unwrap();
+        // 悬空且外指：目标不存在、解析体在 root 外——存在性门住的旧性质
+        // (b) 结构上测不到的形态（审计 2026-10），现与已存在外向链同权。
+        std::os::unix::fs::symlink(outside.join("pwned.txt"), root.join("dangle_out")).unwrap();
         let root_c = root.canonicalize().unwrap();
         (root, root_c)
     }
@@ -1573,7 +1576,13 @@ mod tests {
     /// (b) symlink 不可逃逸：Ok 结果若已存在，物理 canonicalize 后仍在
     ///     root 内——out_link 直指 root 外，凡解析真穿过它的拼写只能 Err
     ///     （含 `out_link/../..` 与绝对拼写混搭；canonicalize 按内核真值
-    ///     穿 symlink，折叠回 root 内的拼写同样被识破）；
+    ///     穿 symlink，折叠回 root 内的拼写同样被识破）。**不再用
+    ///     `p.exists()` 门住本性质**（审计 2026-10：悬空 symlink 的
+    ///     `exists()`=false 会把整类拼写出断言面）——改 lstat 直检：Ok
+    ///     结果要么真存在（不得是 symlink 本体、canonicalize 必落 root
+    ///     内），要么真缺失（NotFound，词法尾段），其余 lstat 失败直接红；
+    ///     悬空外向链（dangle_out → outside/pwned.txt，目标不存在）因此
+    ///     与已存在外向链同权入面。
     /// (c) 幂等：同一路径重复调用结果一致（Ok 同路径 / 同为 Err）；
     /// (d) 不动点：Ok(p) 再喂回 confined_to 原样返回 p（canonical 前缀 +
     ///     词典化尾段的重放语义）。
@@ -1605,6 +1614,7 @@ mod tests {
             "out_link",
             "inner_link",
             "dangle",
+            "dangle_out",
             "..",
             "..",
             ".",
@@ -1631,6 +1641,9 @@ mod tests {
             "a/b/../../f.txt",
             "dangle/x",
             "dangle/../f.txt",
+            "dangle_out",
+            "dangle_out/x",
+            "dangle_out/../secret.txt",
             "a/..",
             "../f.txt",
         ] {
@@ -1682,15 +1695,33 @@ mod tests {
                     "返回值携带 ../ . 残段: {spelling:?} → {}",
                     p.display()
                 );
-                if p.exists() {
-                    let pc = p.canonicalize().unwrap_or_else(|e| {
-                        panic!("已存在的 Ok 结果应可 canonicalize: {spelling:?}: {e}")
-                    });
-                    assert!(
-                        pc.starts_with(root_c),
-                        "symlink 不可逃逸: {spelling:?} → Ok 但物理落在 root 外: {}",
-                        p.display()
-                    );
+                // 无存在性门的不可逃逸（审计 2026-10 加强，取代旧的
+                // `if p.exists()` 门——悬空链 exists()=false 会整类跳出
+                // 断言面）：lstat 直检 Ok 结果——真存在则不得是 symlink
+                // 本体、canonicalize 必落 root 内；真缺失（NotFound，词法
+                // 尾段）放行；其余 lstat 失败（悬空链所在的前缀、权限面
+                // 等）一律红。
+                match std::fs::symlink_metadata(p) {
+                    Ok(md) => {
+                        assert!(
+                            !md.file_type().is_symlink(),
+                            "Ok 结果是 symlink 本体: {spelling:?} → {}",
+                            p.display()
+                        );
+                        let pc = p.canonicalize().unwrap_or_else(|e| {
+                            panic!("lstat 成功的 Ok 结果应可 canonicalize: {spelling:?}: {e}")
+                        });
+                        assert!(
+                            pc.starts_with(root_c),
+                            "symlink 不可逃逸: {spelling:?} → Ok 但物理落在 root 外: {}",
+                            p.display()
+                        );
+                    }
+                    Err(e) => assert_eq!(
+                        e.kind(),
+                        std::io::ErrorKind::NotFound,
+                        "Ok 结果 lstat 失败且非缺失: {spelling:?}: {e}"
+                    ),
                 }
             }
             let r2 = crate::tools::confined_to(root, &full, "fuzz");

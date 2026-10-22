@@ -776,13 +776,18 @@ const MAX_ANYOS_PATH_BYTES: usize = 96 * 1024;
 /// (the kernel resolves symlinks, and every landing back on the real disk is
 /// re-checked against `root`); a missing one accumulates lexically, with `.`
 /// dropping and `..` popping (a pop past the deepest ancestor — or past
-/// `root` itself — is an escape). The component-wise prefix comparison
-/// against the canonicalized root is then sound, and the returned path never
-/// carries `..`/`.` segments: fully-existing tails come back in canonical
-/// (physically resolved) form, not-yet-existing tails in lexical form —
-/// either way, I/O through the returned path stays inside `root`. `label` is
-/// plugged into the escape error message (e.g. "working directory", "skill
-/// directory") so the user knows which boundary was crossed.
+/// `root` itself — is an escape). A tail component that cannot be resolved
+/// but IS present — a dangling symlink above all — is rejected fail closed
+/// (an O_CREAT-style open would follow that final link wherever its target
+/// eventually appears, possibly outside `root`; a write through such an Ok
+/// return really did escape in the audit 2026-10 probe). The component-wise
+/// prefix comparison against the canonicalized root is then sound, and the
+/// returned path never carries `..`/`.` segments: fully-existing tails come
+/// back in canonical (physically resolved) form, not-yet-existing tails in
+/// lexical form — either way, I/O through the returned path stays inside
+/// `root`. `label` is plugged into the escape error message (e.g. "working
+/// directory", "skill directory") so the user knows which boundary was
+/// crossed.
 ///
 /// Shared by the workdir sandbox (`confine`, via [`ToolCtx::workdir`]) and the
 /// per-skill-directory sandbox (`read_skill`/`list_skill` file reads), which is
@@ -848,9 +853,30 @@ pub fn confined_to(root: &Path, full: &Path, label: &str) -> Result<PathBuf> {
                             // inner symlinks resolve to their target;
                             // outbound landings are rejected below.
                             Ok(landed) => landed,
-                            // Doesn't exist (at check time) → lexical
-                            // accumulation, re-checked at the next landing.
-                            Err(_) => cand,
+                            // Not resolvable at check time. Probe the entry
+                            // itself: a truly missing component (ENOENT on
+                            // the entry, not just on its resolution) is the
+                            // only thing allowed to accumulate lexically.
+                            // Anything PRESENT that cannot be resolved — a
+                            // dangling symlink above all — is rejected fail
+                            // closed: containment cannot be proven, and an
+                            // O_CREAT-style open would follow that final
+                            // link wherever its target eventually lands
+                            // (audit 2026-10: `root/dang -> outside/x` with
+                            // `outside/x` absent used to pass lexically and
+                            // std::fs::write through the Ok path really
+                            // created the outside file). The same arm covers
+                            // traversal failures (EACCES on a `--x`-less
+                            // parent, ENOTDIR under a file): the caller's
+                            // I/O would fail on exactly the same obstacle,
+                            // so an early reject is honest, not lossy.
+                            Err(c_err) => match cand.symlink_metadata() {
+                                Err(l) if l.kind() == std::io::ErrorKind::NotFound => cand,
+                                stat => {
+                                    let _ = stat;
+                                    bail!("cannot resolve path: {} ({})", full.display(), c_err);
+                                }
+                            },
                         };
                     }
                     // Re-check: canonicalize `cur`; success means the
@@ -1249,6 +1275,55 @@ mod tests {
         )
         .unwrap();
         assert_eq!(via_link, root_c.join("a/inside.txt"), "{via_link:?}");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Present-but-unresolvable tail components are rejected fail closed
+    /// (audit 2026-10): a DANGLING symlink (`root/dang -> outside/pwned.txt`
+    /// with `pwned.txt` absent) used to pass lexically — canonicalize fails
+    /// on it exactly like a missing component — and `std::fs::write` through
+    /// the Ok return really created the outside file (O_CREAT follows the
+    /// final link once the target appears). Now: dangling link direct, with
+    /// a tail, or as an intermediate "directory" all Err; the uniform rule
+    /// also rejects an in-root dangling link (resolution, not spelling, is
+    /// the contract) and ENOTDIR-under-a-file (the caller's I/O would hit
+    /// the same obstacle). Truly-missing deep tails must stay Ok — the
+    /// lexical-accumulation lane is unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn confined_to_rejects_present_but_unresolvable_tail_components() {
+        let base = workdir("dang-esc");
+        let root = base.join("root");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        // Dangling: the TARGET does not exist (on either side of root).
+        std::os::unix::fs::symlink(outside.join("pwned.txt"), root.join("dang")).unwrap();
+        std::os::unix::fs::symlink(root.join("no_such"), root.join("dang_in")).unwrap();
+        std::fs::write(root.join("f.txt"), "f").unwrap();
+        for spelling in [
+            "dang",
+            "dang/inner.txt",
+            "dang/deeper/dir/x",
+            // In-root dangling link: same unresolvable shape, uniform reject.
+            "dang_in",
+            // ENOTDIR: a file in the tail's path — present, unresolvable.
+            "f.txt/x",
+        ] {
+            let err = confined_to(&root, &root.join(spelling), "working directory").unwrap_err();
+            assert!(
+                err.to_string().contains("cannot resolve path"),
+                "{spelling}: {err}"
+            );
+        }
+        // The lexical lane itself is untouched: genuinely absent components
+        // keep accumulating into an Ok (the not-yet-existing-file case every
+        // write tool relies on).
+        let root_c = root.canonicalize().unwrap();
+        let ok = confined_to(&root, &root.join("new1/new2/f.txt"), "working directory").unwrap();
+        assert!(ok.starts_with(&root_c), "{ok:?}");
+        assert!(ok.ends_with("new1/new2/f.txt"), "{ok:?}");
+        assert!(!ok.exists(), "{ok:?}");
         std::fs::remove_dir_all(&base).ok();
     }
 
