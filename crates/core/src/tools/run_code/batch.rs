@@ -7,10 +7,12 @@ use super::*;
 /// `MAX_PARALLEL_TOOL_WORKERS` so sandbox and outer fan-out share one
 /// blast-radius convention.
 pub(super) const BATCH_WAVE: usize = 8;
-/// Shape guard on one batch (not a spec'd number): the 1 MiB code cap
-/// already bounds entries to ~10⁴; this keeps the per-entry error-envelope
-/// build for a degenerate all-refused batch cheap and the guest's result
-/// array sane. Larger work = smaller batches + checkpoint files.
+/// Shape guard on one batch (not a spec'd number): the serialized `entries`
+/// array travels as ONE guest→host argument read, so the 1 MiB args cap
+/// (`MAX_GUEST_READ_BYTES`, guest_api.rs) already bounds entries to ~10⁴;
+/// this keeps the per-entry error-envelope build for a degenerate
+/// all-refused batch cheap and the guest's result array sane. Larger work =
+/// smaller batches + checkpoint files.
 pub(super) const MAX_BATCH_ENTRIES: usize = 4096;
 /// Aggregate char budget across ALL waves of one callBatch — the host-side
 /// twin of the per-entry cap. Each entry's content is individually bounded
@@ -180,20 +182,33 @@ pub(super) fn finish_batch_entry(
 /// must still bill and audit honestly. The placeholder keeps the envelope
 /// shape legal (a short string where the content was) and names the
 /// recovery, mirroring how the image class says "the call ran, the result
-/// just cannot be carried". Degraded placeholders do not re-spend the
-/// budget — they are bounded by construction (MAX_BATCH_ENTRIES × ~200
-/// chars ≈ 0.8 MB worst case).
-pub(super) fn admit_batch_output(output: &mut ToolOutput, agg_left: &mut usize) {
+/// just cannot be carried". `ran` picks the placeholder's CLAIM: real
+/// completions say the entry ran; refusal texts — which share the budget
+/// because a hooks Deny reason can be `GUEST_OUTPUT_CHARS` long — get
+/// wording that does not claim execution (hooks-Deny / deadline / cancel
+/// entries never started; the envelope's `kind` still carries the class).
+/// Degraded placeholders do not re-spend the budget — they are bounded by
+/// construction (MAX_BATCH_ENTRIES × ~200 chars ≈ 0.8 MB worst case).
+pub(super) fn admit_batch_output(output: &mut ToolOutput, ran: bool, agg_left: &mut usize) {
     let n = output.content.chars().count();
     if n <= *agg_left {
         *agg_left -= n;
     } else {
-        output.content = format!(
-            "run_code: batch aggregate output cap ({BATCH_TOTAL_OUTPUT_CHARS} chars) \
-             exceeded — this entry ran but its result ({n} chars) is not carried; \
-             re-run it as a single tools.call or make earlier entries read \
-             narrower slices"
-        );
+        output.content = if ran {
+            format!(
+                "run_code: batch aggregate output cap ({BATCH_TOTAL_OUTPUT_CHARS} chars) \
+                 exceeded — this entry ran but its result ({n} chars) is not carried; \
+                 re-run it as a single tools.call or make earlier entries read \
+                 narrower slices"
+            )
+        } else {
+            format!(
+                "run_code: batch aggregate output cap ({BATCH_TOTAL_OUTPUT_CHARS} chars) \
+                 exceeded — this entry was refused before running and its refusal \
+                 text is not carried; re-run it as a single tools.call for the \
+                 real reason"
+            )
+        };
         *agg_left = 0;
     }
 }
@@ -202,10 +217,11 @@ pub(super) fn admit_batch_output(output: &mut ToolOutput, agg_left: &mut usize) 
 /// ([`finish_batch_entry`]) — the entry was announced and gated, so it owes
 /// the event stream its ToolResult and the audit ledger its trace whatever
 /// the refusal class; only the after_tool policy varies by class. The final
-/// outcome travels as the [`EntryFinal`] it becomes. Refusal texts share the
-/// same aggregate budget as real outputs (a hooks Deny reason is capped at
-/// `GUEST_OUTPUT_CHARS` per entry — same unbounded-total shape without this),
-/// so every final passes through [`admit_batch_output`] here.
+/// outcome travels as the [`EntryFinal`] it becomes. Refusal texts share
+/// the same aggregate budget as real outputs (a hooks Deny reason is capped
+/// at `GUEST_OUTPUT_CHARS` per entry — same unbounded-total shape without
+/// this), so every final passes through [`admit_batch_output`] here — with
+/// `ran:false` so a degraded refusal never claims the entry ran.
 pub(super) fn refuse_batch_entry(
     caller: &mut Caller<'_, HostCtx>,
     metas: &mut [Option<BatchEntryMeta>],
@@ -215,7 +231,7 @@ pub(super) fn refuse_batch_entry(
     after: AfterFlag,
     agg_left: &mut usize,
 ) {
-    admit_batch_output(&mut final_.output, agg_left);
+    admit_batch_output(&mut final_.output, false, agg_left);
     let output = final_.output.clone();
     let meta = metas[idx].take().expect("announced entry has meta");
     finals[idx] = Some(final_);
@@ -609,7 +625,7 @@ pub(super) fn call_batch_dispatch(caller: &mut Caller<'_, HostCtx>, args: &Value
                 // the run that happened), then the aggregate-budget admission
                 // decides what of the content survives into finals, the event
                 // pair and the audit tail — one degraded story everywhere.
-                admit_batch_output(&mut output, &mut agg_left);
+                admit_batch_output(&mut output, true, &mut agg_left);
                 finals[idx] = Some(EntryFinal {
                     output: output.clone(),
                     class,
@@ -719,7 +735,7 @@ pub(super) fn call_batch_dispatch(caller: &mut Caller<'_, HostCtx>, args: &Value
                                 let class = real_run_class(&tools, &meta.name, true, &output);
                                 // Same order as the inline twin: real class,
                                 // then admission — see the comment there.
-                                admit_batch_output(&mut output, &mut agg_left);
+                                admit_batch_output(&mut output, true, &mut agg_left);
                                 finals[idx] = Some(EntryFinal {
                                     output: output.clone(),
                                     class,
@@ -1230,6 +1246,101 @@ mod tests {
         assert_eq!(
             meta["call_count"], 5,
             "degraded entries still ran and audited: {meta}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F4 regression: a refusal that lands AFTER the aggregate budget is
+    /// exhausted must degrade with honest copy. The old single placeholder
+    /// claimed "this entry ran but its result is not carried" for refusal
+    /// texts too — a hooks-Deny / deadline / cancel entry NEVER started, so
+    /// the degraded refusal says refused, not ran. Staging: prep is serial
+    /// per wave and the inline executions only run AFTER the wave's prep, so
+    /// the wave-1 denials (entries 5-7) complete while the budget is still
+    /// full — their short texts ride whole — and only the wave-2 denial
+    /// (entry 8, past the 5 big_out spends) sees the exhausted budget. The
+    /// degraded 5th big_out is a SUCCESS slot carrying the placeholder text
+    /// (truncation never flips is_error) — the ran wording lives there.
+    #[test]
+    fn batch_exhausted_budget_degrades_refused_entry_honestly() {
+        use crate::hooks::{Hooks, ToolDecision};
+
+        struct DenyReads;
+        impl Hooks for DenyReads {
+            fn before_tool(&self, tool: &str, _i: &Value, _c: &ToolCtx) -> ToolDecision {
+                if tool == "read_file" {
+                    ToolDecision::Deny("no reads today".into())
+                } else {
+                    ToolDecision::Allow
+                }
+            }
+        }
+        let dir = scratch();
+        std::fs::write(dir.join("a.txt"), "A").unwrap();
+        let mut c = ctx(&dir);
+        c.hooks = Some(Arc::new(DenyReads));
+        let out = big_batch_tool(batch_cfg())
+            .run_with_emit(
+                &json!({"code": r#"
+                    var entries = [];
+                    for (var i = 0; i < 5; i++) entries.push({name: "big_out", args: {}});
+                    for (var i = 0; i < 4; i++) entries.push({name: "read_file", args: {path: "a.txt"}});
+                    const rs = tools.callBatch(entries);
+                    return rs.map(r => r instanceof Error
+                        ? {k: r.kind, m: String(r.message)}
+                        : (typeof r === "string" && r.length > 100000 ? "ok" : String(r)));"#}),
+                &c,
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(!out.is_error, "guest failed: {}", out.content);
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        let arr = v.as_array().expect("array result").clone();
+        assert_eq!(arr.len(), 9, "{v}");
+        // Wave 1: four whole payloads, the fifth degrades with the RAN
+        // wording (it did run — a short success-string placeholder), and
+        // the three prep-time denials keep their real reason (the budget
+        // was still full at their gate).
+        assert_eq!(
+            arr.iter()
+                .take(4)
+                .filter(|r| r.as_str() == Some("ok"))
+                .count(),
+            4,
+            "budget admits four full payloads: {v}"
+        );
+        assert!(
+            arr[4]
+                .as_str()
+                .unwrap_or_default()
+                .contains("this entry ran"),
+            "a real run keeps the ran wording: {v}"
+        );
+        for r in &arr[5..8] {
+            assert_eq!(r["k"], json!("hooks"), "{v}");
+            assert!(
+                r["m"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("no reads today"),
+                "pre-exhaustion denials keep their real text: {v}"
+            );
+        }
+        // Wave 2: the denial past the exhausted budget — honest copy, the
+        // class preserved, and never a claim that the entry ran.
+        assert_eq!(
+            arr[8]["k"],
+            json!("hooks"),
+            "the refusal class survives: {v}"
+        );
+        let m = arr[8]["m"].as_str().unwrap_or_default();
+        assert!(
+            m.contains("was refused before running"),
+            "a degraded refusal must say refused: {m}"
+        );
+        assert!(
+            !m.contains("ran but") && !m.contains("no reads today"),
+            "a never-run entry must not be said to have run, and the replaced text is gone: {m}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

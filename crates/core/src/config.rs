@@ -635,12 +635,60 @@ pub struct Config {
     pub code: CodeConfig,
 }
 
+/// Strip the `\\?\` verbatim prefix Windows' `canonicalize()` produces:
+/// `\\?\UNC\server\share` → `\\server\share`, `\\?\D:\a\b` → `D:\a\b`,
+/// anything else (already-plain paths, `\\?\Volume{…}` device spellings)
+/// returned unchanged. Motivation: the workdir string flows into the system
+/// prompt's "Working directory:" line (agent.rs's env header), which the
+/// model echoes into built-in `cd`/`copy` commands — and cmd.exe rejects
+/// the verbatim form outright (`cd /d \\?\D:\…` fails with 卷标语法不正确);
+/// error messages and the TUI get the readable spelling too. Long-path
+/// protection: the prefix is kept when the STRIPPED result would be ≥ 240
+/// chars — a plain path that close to the 260-char MAX_PATH limit can fail
+/// resolution in non-`\\?\`-aware APIs all over again, so near-limit paths
+/// stay in the verbatim form (which is good past 32k). Pure string mapping,
+/// so it is testable on every platform.
+fn strip_verbatim(s: &str) -> Cow<'_, str> {
+    // The UNC form cannot be produced by slicing (the two leading `\` of the
+    // result are not adjacent in the input), hence the one Owned allocation;
+    // every other case borrows.
+    let stripped = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        Cow::Owned(format!(r"\\{rest}"))
+    } else {
+        // Drive-letter form only — a `X:` second byte distinguishes it from
+        // device paths (`Volume{guid}\`, `Pipe\`, …) whose plain form would
+        // not be usable anyway.
+        match s.strip_prefix(r"\\?\") {
+            Some(rest)
+                if rest.as_bytes().get(1) == Some(&b':')
+                    && rest.as_bytes()[0].is_ascii_alphabetic() =>
+            {
+                Cow::Borrowed(rest)
+            }
+            _ => return Cow::Borrowed(s),
+        }
+    };
+    if stripped.len() < 240 {
+        stripped
+    } else {
+        Cow::Borrowed(s)
+    }
+}
+
 /// Canonicalize + validate a workdir (must exist and be a directory). Shared
 /// by `Config::load` and `Config::apply` (previously two hand-copied copies).
 fn resolve_workdir(dir: PathBuf) -> Result<PathBuf> {
     let dir = dir
         .canonicalize()
         .with_context(|| format!("workdir does not exist: {}", dir.display()))?;
+    // Strip Windows' `\\?\` verbatim prefix (see `strip_verbatim`) so the
+    // stored sandbox root is the plain spelling the model, error messages,
+    // and the TUI can all use. No-op elsewhere: unix canonicalize never
+    // emits the prefix, so the call is an unconditional cheap string
+    // compare that only ever transforms on Windows. The sandbox itself is
+    // unaffected — `confined_to` canonicalizes both sides independently, so
+    // prefix vs plain never changes which directory the root IS.
+    let dir = PathBuf::from(strip_verbatim(&dir.display().to_string()).into_owned());
     if !dir.is_dir() {
         bail!("workdir is not a directory: {}", dir.display());
     }
@@ -1240,14 +1288,67 @@ mod tests {
         let tmp = std::env::temp_dir(); // may itself sit behind a symlink (/tmp)
         cfg.workdir = Some(tmp.clone());
         cfg.validate_and_normalize().unwrap();
+        // Expected = canonicalize + the same verbatim-prefix strip resolve_workdir
+        // applies (a Windows-only transformation; a no-op string on unix), so
+        // the assertion holds on both platform families.
+        let expected = tmp.canonicalize().unwrap();
+        let expected = PathBuf::from(strip_verbatim(&expected.display().to_string()).into_owned());
         assert_eq!(
             cfg.workdir.as_deref(),
-            Some(tmp.canonicalize().unwrap().as_path()),
+            Some(expected.as_path()),
             "workdir is canonicalized"
         );
         cfg.workdir = Some(tmp.join("definitely-not-a-real-dir-for-config-tests"));
         let err = cfg.validate_and_normalize().unwrap_err();
         assert!(format!("{err:#}").contains("workdir"), "{err:#}");
+    }
+
+    #[test]
+    fn strip_verbatim_maps_drive_and_unc_forms_to_plain() {
+        // Windows canonicalize() output shapes: drive-letter and UNC. Both must
+        // come out as the plain spelling cmd.exe and friends accept (the system
+        // prompt's "Working directory:" line feeds model-written `cd` commands,
+        // which reject `\\?\…` with 卷标语法不正确).
+        assert_eq!(strip_verbatim(r"\\?\D:\work\repo"), r"D:\work\repo");
+        assert_eq!(
+            strip_verbatim(r"\\?\UNC\server\share\repo"),
+            r"\\server\share\repo"
+        );
+    }
+
+    #[test]
+    fn strip_verbatim_leaves_plain_and_device_paths_untouched() {
+        // No prefix → unchanged; `\\?\Volume{…}`/`\\?\Pipe\…` device spellings
+        // are NOT drive paths, so their prefix stays (a plain form would not
+        // be usable anyway).
+        assert_eq!(strip_verbatim(r"D:\work\repo"), r"D:\work\repo");
+        assert_eq!(
+            strip_verbatim(r"\\server\share\repo"),
+            r"\\server\share\repo"
+        );
+        assert_eq!(strip_verbatim("/tmp/x"), "/tmp/x");
+        assert_eq!(
+            strip_verbatim(r"\\?\Volume{12345678-0000}\dir"),
+            r"\\?\Volume{12345678-0000}\dir"
+        );
+    }
+
+    #[test]
+    fn strip_verbatim_keeps_near_max_path_verbatim_forms() {
+        // Long-path guard: stripping is only safe while the PLAIN result stays
+        // comfortably under MAX_PATH (260); at/over the 240 threshold the
+        // verbatim form is kept — it is the spelling that survives long paths.
+        // Input `\\?\C:\xxx…` strips to `C:\xxx…`, so n repeats of `x` make the
+        // stripped length len("C:\") + n.
+        let tail = |stripped_len: usize| "x".repeat(stripped_len - r"C:\".len());
+        // Just under the boundary (stripped length 239) strips …
+        let just_under = format!(r"\\?\C:\{}", tail(239));
+        assert_eq!(strip_verbatim(&just_under).as_ref(), &just_under[4..]);
+        // … exactly at it (stripped length 240) and far past it keep the prefix.
+        let at_boundary = format!(r"\\?\C:\{}", tail(240));
+        assert_eq!(strip_verbatim(&at_boundary).as_ref(), at_boundary.as_str());
+        let long = format!(r"\\?\C:\{}", tail(300));
+        assert_eq!(strip_verbatim(&long).as_ref(), long.as_str());
     }
 
     #[test]

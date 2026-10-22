@@ -3,6 +3,23 @@
 
 use super::*;
 
+/// The guest-side [`ToolCtx`]: the outer call's ctx with the `__code__`
+/// marker. Hooks Arc-clone along (a tool denied at the top level stays denied
+/// inside the sandbox — no bypass), the budget counter and deadline are
+/// shared, same as the `task` child ctx.
+///
+/// `max_output_chars` is deliberately NOT inherited: that knob is a
+/// DISPLAY-scale budget for what enters the MODEL's context, while guest tool
+/// outputs land in JS heap memory (bounded by `code.mem_mb` via the store
+/// limiter) and never enter the context at all — the design's own example
+/// (`SELECT … LIMIT 5000` feeding a JS aggregation) assumes data-scale
+/// outputs. Real-journey A/B found the inheritance defeating the feature's
+/// core value: `tools.call("read_file")` inside the sandbox returned one
+/// 1000-char page no matter the requested limit, so the model fell back to 17
+/// manual read_file pages through its own context and burned the run's whole
+/// token budget re-reading its own history. Char unit stays (so truncate() /
+/// the read_file byte-window math keep working); only the scale changes —
+/// the guest value is `GUEST_OUTPUT_CHARS` (contract.rs).
 pub(super) fn guest_ctx(ctx: &ToolCtx) -> ToolCtx {
     ToolCtx {
         tool_absent_notes: ctx.tool_absent_notes.clone(),
@@ -591,7 +608,7 @@ impl Tool for RunCodeTool {
         // 【批量】 section, LD-15; the closed-list sentence stays true because
         // each overlay explicitly scopes itself).
         let base = ToolDef {
-        name: "run_code".into(),
+            name: "run_code".into(),
             description: r#"在进程内 JS 沙箱（QuickJS，同步 ES2023）编排 MCP/API 分页、批量操作和大文件处理。规则已明确，剩余仍有跨页/大量对象的同构调用或大量中间数据处理时，先 read_skill({"skill":"run-code"})，再用代码承接。可先直接探查接口，拿到结果后重判；只续做未完成部分。整个剩余任务一次工具调用或一条可用 shell 管道即可完成时直接做；小集合或逐项需语义判断时不必用代码。不能仅凭“所有/批量”触发。
 
 【环境】无 async/await、Promise、timer、import/fetch、网络与文件系统直访（读写经工具）；Date.now/Math.random 不可用。调用次数/内存/时长有限，超限终止；调用额度每次重计，超了分批续跑。

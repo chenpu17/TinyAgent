@@ -3,6 +3,9 @@ use crate::provider::ToolDef;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::io::Read;
+// Only the unix/windows spawn arms construct one; the third-platform arm
+// returns before any Command exists, so the import would be unused there.
+#[cfg(any(unix, windows))]
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -92,7 +95,7 @@ impl Tool for Shell {
                     .process_group(0)
                     .spawn()
             }
-            #[cfg(not(unix))]
+            #[cfg(windows)]
             {
                 // A GUI-subsystem parent (`windows_subsystem = "windows"`) has
                 // no console, so a console child allocates a fresh conhost
@@ -129,6 +132,21 @@ impl Tool for Shell {
                     // /C creates later, so the kill below reaches the REAL
                     // command — a grandchild — not just the cmd wrapper.
                     .map(SpawnedChild::new)
+            }
+            // Third platforms (wasm32 &c.): neither `sh` nor `cmd` exists to
+            // drive. cfg(windows) above (not the old cfg(not(unix))) keeps
+            // CommandExt and winjob out of these targets; this arm returns
+            // the honest error in the function's spawn-failure shape, so the
+            // with_context below reads "failed to spawn shell for …: shell
+            // tool requires unix or windows". The typed Err pins the block's
+            // type to Child (= the third-platform SpawnedChild alias below),
+            // keeping the rest of the run loop compilable.
+            #[cfg(not(any(unix, windows)))]
+            {
+                Err::<std::process::Child, std::io::Error>(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "shell tool requires unix or windows",
+                ))
             }
         }
         .with_context(|| format!("failed to spawn shell for: {cmd}"))?;
@@ -552,7 +570,7 @@ fn kill_process_group(child: &mut std::process::Child) {
 /// [`crate::winjob::JobDrop::LeakIfAlive`] — the background-process escape
 /// hatch (a survivor keeps the job armed by leaking the handle);
 /// winjob::JobDrop contrasts the two drop policies.
-#[cfg(not(unix))]
+#[cfg(windows)]
 struct SpawnedChild {
     child: std::process::Child,
     /// None when job setup failed — the kill degrades to the old
@@ -566,7 +584,13 @@ struct SpawnedChild {
 #[cfg(unix)]
 type SpawnedChild = std::process::Child;
 
-#[cfg(not(unix))]
+/// Third-platform spelling: run() refuses the call before spawning (no
+/// interpreter exists — see the Err arm above), so the alias exists only to
+/// keep the run loop / collect_output below compilable there.
+#[cfg(not(any(unix, windows)))]
+type SpawnedChild = std::process::Child;
+
+#[cfg(windows)]
 impl std::ops::Deref for SpawnedChild {
     type Target = std::process::Child;
     fn deref(&self) -> &std::process::Child {
@@ -574,14 +598,14 @@ impl std::ops::Deref for SpawnedChild {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 impl std::ops::DerefMut for SpawnedChild {
     fn deref_mut(&mut self) -> &mut std::process::Child {
         &mut self.child
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 impl SpawnedChild {
     fn new(child: std::process::Child) -> Self {
         use crate::winjob::{JobDrop, WinJob};
@@ -611,7 +635,7 @@ impl SpawnedChild {
 /// direct-child kill (the same degradation guards mcp's StdioTransport).
 /// The return is ignored like unix ignores ESRCH: a valid job handle
 /// always terminates, and "already all dead" is harmless.
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn kill_process_group(child: &mut SpawnedChild) {
     match child.job.as_ref() {
         Some(job) => job.terminate(),
@@ -620,6 +644,13 @@ fn kill_process_group(child: &mut SpawnedChild) {
         }
     }
 }
+
+/// Third platform: unreachable — run()'s Err arm rejects the call before any
+/// child exists — but the poll loop and collect_output still name the kill,
+/// so this is a typed no-op (same shape as signal.rs's third-platform
+/// install_sigint_cancel no-op).
+#[cfg(not(any(unix, windows)))]
+fn kill_process_group(_child: &mut std::process::Child) {}
 
 #[cfg(test)]
 mod tests {

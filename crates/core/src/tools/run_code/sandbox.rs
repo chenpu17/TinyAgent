@@ -151,7 +151,10 @@ pub(super) fn linker() -> Result<&'static Linker<HostCtx>> {
                     "env",
                     "host_log",
                     |mut caller: Caller<'_, HostCtx>, ptr: i32, len: i32| {
-                        let Some(line) = read_guest(caller.get_export("memory"), &caller, ptr, len)
+                        // Log lines share the 1 MiB read cap; any read
+                        // failure (size or pointer class) drops the line —
+                        // logs are best-effort by contract.
+                        let Ok(line) = read_guest(caller.get_export("memory"), &caller, ptr, len)
                         else {
                             return;
                         };

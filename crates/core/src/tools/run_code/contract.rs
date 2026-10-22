@@ -18,22 +18,12 @@ pub(super) const CODE_MARKER: &str = "__code__";
 /// guest's allocator.
 pub(super) const MAX_CODE_BYTES: usize = 1024 * 1024;
 
-/// The guest-side [`ToolCtx`]: the outer call's ctx with the `__code__`
-/// marker. Hooks Arc-clone along (a tool denied at the top level stays denied
-/// inside the sandbox — no bypass), the budget counter and deadline are
-/// shared, same as the `task` child ctx.
-///
-/// `max_output_chars` is deliberately NOT inherited: that knob is a
-/// DISPLAY-scale budget for what enters the MODEL's context, while guest tool
-/// outputs land in JS heap memory (bounded by `code.mem_mb` via the store
-/// limiter) and never enter the context at all — the design's own example
-/// (`SELECT … LIMIT 5000` feeding a JS aggregation) assumes data-scale
-/// outputs. Real-journey A/B found the inheritance defeating the feature's
-/// core value: `tools.call("read_file")` inside the sandbox returned one
-/// 1000-char page no matter the requested limit, so the model fell back to 17
-/// manual read_file pages through its own context and burned the run's whole
-/// token budget re-reading its own history. Char unit stays (so truncate() /
-/// the read_file byte-window math keep working); only the scale changes.
+/// Data-scale cap for guest tool outputs (2M chars) — the guest ctx's
+/// `max_output_chars`. The design story (why the guest ctx deliberately
+/// does NOT inherit the outer display-scale knob, and the real-journey A/B
+/// that made the split necessary) lives with the code that applies it:
+/// `guest_ctx` in `tool.rs`. Char unit stays (so truncate() / the read_file
+/// byte-window math keep working); only the scale changes.
 pub(super) const GUEST_OUTPUT_CHARS: usize = 2_000_000;
 
 /// Built-in skill carrying run_code's full usage guide (v2 P2). The tool

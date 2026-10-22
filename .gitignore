@@ -34,3 +34,10 @@ artifacts/
 
 # ZCode 会话目录（本地工具状态，同 .claude/）
 /.zcode/
+
+# README 示例命令与 CI 复现流程的运行产物（--output result.json / --report
+# report.json / 批量 results/ 目录 / 复现用 venv——按需再生，不入库）
+/.venv/
+/result.json
+/report.json
+/results/

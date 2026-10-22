@@ -21,7 +21,7 @@
 //! keeps the call sites one-word diffs. `RwLock<Option<..>>` (not a
 //! `OnceLock`) so tests can install, assert, and restore the fallback.
 
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 /// Coarse severity. Most channel traffic is soft-failure warnings; [`Info`]
 /// marks progress notes the CLI prints as-is (e.g. `mcp: server ready`).
@@ -31,15 +31,32 @@ pub enum DiagLevel {
     Warn,
 }
 
+/// The sink as it crosses the install boundary — boxed, the historical
+/// shape (kept so hosts' `install_diag_sink(Box::new(..))` calls compile
+/// unchanged); [`install_diag_sink`] moves it into the shared [`Arc`]
+/// storage right away.
 type Sink = Box<dyn Fn(DiagLevel, &str) + Send + Sync>;
 
-static SINK: RwLock<Option<Sink>> = RwLock::new(None);
+/// The installed sink, behind an [`Arc`] so [`emit`] can clone it out of the
+/// channel's lock and drop the lock BEFORE calling it (re-entrancy safety —
+/// see [`emit`] and [`install_diag_sink`]).
+type SharedSink = Arc<dyn Fn(DiagLevel, &str) + Send + Sync>;
 
-/// Install (replace) the process-global diagnostics sink. The sink is called
-/// on every subsequent `diag::diag_warn!` / `diag::diag_info!` from any thread;
-/// [`clear_diag_sink`] restores the stderr fallback.
+static SINK: RwLock<Option<SharedSink>> = RwLock::new(None);
+
+/// Install (replace) the process-global diagnostics sink. The boxed sink is
+/// moved into the shared [`Arc`] storage, so replacing it later never tears
+/// a call in flight. It is called on every subsequent `diag::diag_warn!` /
+/// `diag::diag_info!` from any thread; [`clear_diag_sink`] restores the
+/// stderr fallback.
+///
+/// Re-entrancy contract: the sink MAY itself call `diag_warn!` /
+/// `diag_info!` (directly or through a library it uses) — the channel's lock
+/// is never held during the call, so the nested emission simply walks the
+/// full [`emit`] path again. A sink that re-enters UNCONDITIONALLY recurses
+/// without bound; bounding its own re-entry is the sink's responsibility.
 pub fn install_diag_sink(sink: Sink) {
-    *SINK.write().unwrap_or_else(|e| e.into_inner()) = Some(sink);
+    *SINK.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::from(sink));
 }
 
 /// Restore the default stderr fallback (what the CLI runs with).
@@ -48,8 +65,14 @@ pub fn clear_diag_sink() {
 }
 
 pub(crate) fn emit(level: DiagLevel, msg: &str) {
-    let guard = SINK.read().unwrap_or_else(|e| e.into_inner());
-    match guard.as_ref() {
+    // Clone the Arc out and DROP the read guard before calling the sink. A
+    // sink that re-enters the channel would otherwise acquire SINK.read()
+    // twice on the same thread, and std's RwLock documents that a recursive
+    // read acquisition may deadlock (a writer queuing between the two
+    // acquisitions blocks the second read). With the guard released, the
+    // re-entrant call takes the unguarded full path above again.
+    let sink = SINK.read().unwrap_or_else(|e| e.into_inner()).clone();
+    match sink {
         Some(f) => f(level, msg),
         None => eprintln!("{msg}"),
     }
@@ -103,5 +126,40 @@ mod tests {
         assert!(got.contains(&(DiagLevel::Warn, "[diag-test] warn payload 42".to_owned())));
         assert!(got.contains(&(DiagLevel::Info, "[diag-test] info payload".to_owned())));
         assert!(!got.iter().any(|(_, m)| m.contains("fallback")));
+    }
+
+    /// A sink that re-enters the channel (a host whose own logging stack —
+    /// or a library it calls — hits `diag_warn!` again) must neither
+    /// deadlock nor lose the nested message: `emit` releases the read guard
+    /// BEFORE calling the sink, so the nested emission re-enters the full
+    /// path with a free lock. The one-shot flag stands in for the host-side
+    /// recursion bound the contract puts in the sink's own hands (a
+    /// deadlock here manifests as this test hanging, not failing).
+    #[test]
+    fn reentrant_sink_completes_nested_emissions_without_deadlock() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let got: std::sync::Arc<Mutex<Vec<(DiagLevel, String)>>> =
+            std::sync::Arc::new(Mutex::new(Vec::new()));
+        let reentered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (g, once) = (got.clone(), reentered.clone());
+        install_diag_sink(Box::new(move |lvl, msg| {
+            g.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((lvl, msg.to_owned()));
+            if !once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                diag_warn!("[diag-test] nested warn");
+            }
+        }));
+        diag_info!("[diag-test] outer info");
+        clear_diag_sink();
+        let got = got.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            got.contains(&(DiagLevel::Info, "[diag-test] outer info".to_owned())),
+            "outer emission must land: {got:?}"
+        );
+        assert!(
+            got.contains(&(DiagLevel::Warn, "[diag-test] nested warn".to_owned())),
+            "re-entrant emission must land via the full emit path: {got:?}"
+        );
     }
 }

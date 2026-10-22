@@ -77,6 +77,7 @@ ENTRIES = [
     ("crates/core/src", "tools/llm.rs", "llm 判别原语（feature code + code.llm 门）：单发无状态内层模型调用——LD-17 预占/结算、LD-18 labels 归一、共享 Provider cell"),
     ("crates/core/src", "mcp.rs", "MCP 客户端（stdio / Streamable HTTP 含 202→GET 流 / 旧版 SSE）"),
     ("crates/core/src", "winjob.rs", "Windows Job Object 进程树击杀（shell 超时/取消 + MCP 子进程回收共用；两种 drop 策略）"),
+    ("crates/core/src", "m0_probes.rs", "M0 机制探针（cfg(test)，#[path] 声明于 lib.rs）：reserve/settle 账本、共享 Provider cell、按请求 model 分路的进程内原型（A-L2b/2c/9——M3 llm 原语直接沿用）"),
     # ── CLI (src) ────────────────────────────────────────────────────────
     ("src", "main.rs", "CLI 入口 + 组装（build_agent）+ --session none"),
     ("src", "signal.rs", "headless SIGINT → cancel（首次优雅 / 二次硬退 130）"),
@@ -168,6 +169,29 @@ def expected_block() -> str:
     return f"{BEGIN}\n```text\n{build_tree()}\n```\n{END}"
 
 
+def check_reverse_integrity() -> None:
+    """The mirror of the existence check: every .rs file under a tracked
+    crate root must be listed in ENTRIES — a new module that misses the
+    list would silently vanish from the README tree and this gate could
+    never notice (both key on the explicit list). Descriptions are
+    human-written, so a miss FAILS with the file list instead of the tree
+    auto-growing a blank row. Runs in BOTH --check and --write modes."""
+    listed = {f"{root}/{path}" for root, path, _ in ENTRIES}
+    missing = []
+    for crate_root, _note in CRATES:
+        for f in sorted((ROOT / crate_root).rglob("*.rs")):
+            rel = f"{crate_root}/{f.relative_to(ROOT / crate_root).as_posix()}"
+            if rel not in listed:
+                missing.append(rel)
+    if missing:
+        raise SystemExit(
+            "gen_structure: .rs files present on disk but missing from "
+            "ENTRIES (they would silently drop out of the README tree) —\n"
+            "add a row with a one-line description for each:\n  "
+            + "\n  ".join(missing)
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group(required=True)
@@ -180,6 +204,8 @@ def main() -> None:
     for crate_root, path, _ in ENTRIES:
         if not (ROOT / crate_root / path).is_file():
             raise SystemExit(f"gen_structure: {crate_root}/{path} does not exist (fix ENTRIES)")
+    # And every module on disk must have an entry (the reverse direction).
+    check_reverse_integrity()
 
     current = README.read_text(encoding="utf-8")
     if BEGIN not in current or END not in current:
@@ -192,7 +218,10 @@ def main() -> None:
 
     if args.write:
         if candidate != current:
-            README.write_text(candidate, encoding="utf-8")
+            # newline="\n" keeps the README byte-identical across platforms
+            # (text-mode default would write CRLF on Windows — same
+            # discipline as sync_run_code_contract.py's --write).
+            README.write_text(candidate, encoding="utf-8", newline="\n")
             print("gen_structure: README tree regenerated.")
         else:
             print("gen_structure: already up to date.")

@@ -434,9 +434,25 @@ pub(super) fn deny_match(patterns: &[String], rel: &str) -> bool {
     let folded: Vec<String> = fold_case(rel).split('/').map(String::from).collect();
     let path: Vec<&str> = folded.iter().map(String::as_str).collect();
     patterns.iter().any(|p| {
-        let folded_pat = fold_case(p);
-        let pat: Vec<&str> = folded_pat.split('/').collect();
-        glob_match(&pat, &path)
+        // Pattern-side cleaning, identical in kind to `under_write_dir`'s
+        // entries (audit follow-up — the two policy faces were asymmetric):
+        // the rel side arrives already normalized to a clean `/`-separated
+        // form, so a raw `./x`, `x/`, or `a//x` spelling, and on Windows the
+        // `lib\x.js` habit, silently became a dead rule — fail-open against
+        // the admin's intent. On unix a backslash is a legal filename byte,
+        // so only Windows folds it as a separator.
+        let cleaned = lexical_normalize(Path::new(p))
+            .to_string_lossy()
+            .into_owned();
+        #[cfg(windows)]
+        let cleaned = cleaned.replace('\\', "/");
+        // A pattern that cleans to nothing matches nothing (same rule as
+        // write-dir entries).
+        !cleaned.is_empty() && {
+            let folded_pat = fold_case(&cleaned);
+            let pat: Vec<&str> = folded_pat.split('/').collect();
+            glob_match(&pat, &path)
+        }
     })
 }
 
@@ -608,6 +624,37 @@ mod tests {
         assert!(m(".env*", ".ENV"), "case-insensitive volumes must fold");
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         assert!(!m(".env*", ".ENV"), "case-sensitive volumes stay exact");
+    }
+
+    /// Pattern-side lexical cleaning (audit follow-up): the rel side arrives
+    /// normalized, so `./x`, `x/`, `a//x` spellings — and on Windows the
+    /// `lib\x.js` separator habit — must behave like their clean forms
+    /// instead of being dead rules; a pattern that cleans to nothing (`.`,
+    /// `/`) matches nothing. On unix a backslash stays a filename byte.
+    #[test]
+    fn deny_match_cleans_pattern_spellings_like_the_entry_side() {
+        let m = |pat: &str, path: &str| deny_match(&[pat.to_string()], path);
+        assert!(
+            m(".aws/", ".aws"),
+            "trailing separator is spelling, not meaning"
+        );
+        assert!(m("./.aws/**", ".aws/config"), "leading ./ is cleaned");
+        assert!(m(".aws//**", ".aws/config"), "double separator collapses");
+        assert!(
+            !m(".", ".aws"),
+            "pattern cleaning to nothing matches nothing"
+        );
+        assert!(!m("/", ".aws"), "bare root pattern matches nothing");
+        #[cfg(windows)]
+        assert!(
+            m(r"lib\x.js", "lib/x.js"),
+            "Windows backslash separator habit is folded"
+        );
+        #[cfg(not(windows))]
+        assert!(
+            !m(r"lib\x.js", "lib/x.js"),
+            "unix backslash is a filename byte, not a separator"
+        );
     }
 
     /// Sec-review P2: consecutive `**` segments are collapsed at the matcher

@@ -53,6 +53,18 @@ pub(super) const EXPR_KEYWORDS: &[&str] = &[
     "instanceof",
 ];
 
+/// Cap on `${…}`-inside-template-inside-`${…}` lexer recursion. `run` and
+/// `template` call each other unbounded otherwise (`` `${ `` × N is one
+/// frame pair per 3 input bytes), and the precheck runs BEFORE the wasm
+/// fuel/mem limits even exist (run_with_emit prechecks first) — a stack
+/// overflow there kills the whole host process, uncatchable. 64 is far
+/// past any real nesting (human or model template code bottoms out in
+/// single digits) while still trivially shallow for the host stack; past
+/// it the interpolation is skipped as template TEXT — a miss is the safe
+/// direction (§4.3: the precheck is an efficiency feature, the runtime
+/// stubs backstop everything it fails to see).
+pub(super) const MAX_TEMPLATE_DEPTH: usize = 64;
+
 pub(super) struct Lexer<'a> {
     b: &'a [u8],
     i: usize,
@@ -62,6 +74,9 @@ pub(super) struct Lexer<'a> {
     /// (ident, string, number, `)`/`]`/`}`, template, regex) → division;
     /// anything else → regex start.
     prev_value: bool,
+    /// Current `${…}` → template → `${…}` nesting depth (see
+    /// [`MAX_TEMPLATE_DEPTH`]) — the mutual recursion's only bound.
+    tmpl_depth: usize,
 }
 
 impl Lexer<'_> {
@@ -211,6 +226,10 @@ impl Lexer<'_> {
     /// Template literal (entry: `self.i` is just past the opening backtick).
     /// Literal parts are skipped; `${…}` expressions are lexed normally via
     /// recursive `run(true)`, so hits inside them get their real line numbers.
+    /// The recursion is depth-capped ([`MAX_TEMPLATE_DEPTH`]): at the cap the
+    /// whole interpolation is skipped as plain template text instead — a
+    /// deliberately simple scan (to the next `}`, backtick or EOF), whose
+    /// misses only leave more text literal (safe direction, §4.3).
     fn template(&mut self) {
         while self.i < self.b.len() {
             match self.b[self.i] {
@@ -220,9 +239,35 @@ impl Lexer<'_> {
                     return;
                 }
                 b'$' if self.b.get(self.i + 1) == Some(&b'{') => {
+                    if self.tmpl_depth >= MAX_TEMPLATE_DEPTH {
+                        // 深度超限：整个插值当普通模板文本跳过，不再递归
+                        // （漏检是安全方向——运行时桩兜底）。扫到 `}` 吃掉它
+                        // 继续模板字面量；扫到反引号留给外层循环收模板；
+                        // EOF 即止。跳过段里的嵌套 `}` 会提前结束扫描，效果
+                        // 只是更多文本保持字面量，仍是漏检方向。
+                        self.i += 2;
+                        while self.i < self.b.len() {
+                            match self.b[self.i] {
+                                b'`' => break,
+                                b'}' => {
+                                    self.i += 1;
+                                    break;
+                                }
+                                b'\\' => self.i = (self.i + 2).min(self.b.len()),
+                                b'\n' => {
+                                    self.line += 1;
+                                    self.i += 1;
+                                }
+                                _ => self.i += 1,
+                            }
+                        }
+                        continue;
+                    }
                     self.i += 2;
                     self.prev_value = false; // expression position starts fresh
+                    self.tmpl_depth += 1;
                     self.run(true);
+                    self.tmpl_depth -= 1;
                 }
                 b'\n' => {
                     self.line += 1;
@@ -241,6 +286,7 @@ pub(super) fn lex(code: &str) -> Vec<Tok> {
         line: 1,
         toks: Vec::new(),
         prev_value: false,
+        tmpl_depth: 0,
     };
     lx.run(false);
     lx.toks
@@ -585,5 +631,33 @@ mod tests {
                 precheck(b).unwrap_or_default()
             );
         }
+    }
+
+    /// 深度上限（词法器栈安全）：`` `${ `` 重复 50 000 次曾是 run↔template 的
+    /// 无界互递归——每 3 字节递归一层，且预检先于 wasm 限流器存在，栈溢出
+    /// 直接中止宿主进程（不可 catch）。加上限后同输入必须正常返回：本测试
+    /// 能跑完本身就通过（溢出会杀死整个测试进程，无从 assert）。
+    #[test]
+    fn precheck_survives_unbounded_template_interpolation_nesting() {
+        let bomb = "`${".repeat(50_000);
+        assert_eq!(precheck(&bomb), None);
+    }
+
+    /// 上限内的嵌套照常词法化：60 层 `` `${ `` 嵌套、最内层 `await`，仍被
+    /// 检出——深度上限只裁病态深度，不碰真实代码的嵌套模板。
+    #[test]
+    fn precheck_flags_await_inside_60_deep_template_nesting() {
+        let code = format!("{}await x", "`${".repeat(60));
+        let msg = precheck(&code).expect("await inside legal nesting is still flagged");
+        assert!(msg.contains("\"await\"（第 1 行）"), "{msg}");
+    }
+
+    /// 超限插值按普通文本跳过：第 65 层 `${` 里的 `await` 不再检出——钉住
+    /// "漏检 = 安全方向"的边界行为（§4.3：预检是效率特性，运行时桩兜底；
+    /// 换来的词法器栈安全是硬约束，缺一不可的取舍写进设计说明）。
+    #[test]
+    fn precheck_skips_await_inside_over_depth_interpolation() {
+        let code = format!("{}await x", "`${".repeat(65));
+        assert_eq!(precheck(&code), None);
     }
 }

@@ -137,10 +137,10 @@ impl McpClient {
         cfg.validate()?;
         let mode = cfg.transport.unwrap_or(McpTransport::Auto);
         match (&cfg.command, &cfg.url) {
-            (Some(_), _) => Self::handshake(StdioTransport::spawn(cfg)?),
+            (Some(_), _) => Self::handshake(StdioTransport::spawn(cfg)?, &cfg.name),
             (None, Some(url)) => match mode {
-                McpTransport::Http => Self::handshake(HttpTransport::new(url, cfg)?),
-                McpTransport::Sse => Self::handshake(SseTransport::connect(url, cfg)?),
+                McpTransport::Http => Self::handshake(HttpTransport::new(url, cfg)?, &cfg.name),
+                McpTransport::Sse => Self::handshake(SseTransport::connect(url, cfg)?, &cfg.name),
                 McpTransport::Auto => {
                     // Try Streamable HTTP via a FULL handshake — a legacy SSE
                     // server 404/405s (or streams nothing usable for) the
@@ -149,14 +149,14 @@ impl McpClient {
                     // Streamable server sees exactly ONE initialize (the old
                     // probe sent a second one). Fall back to legacy SSE on
                     // any HTTP handshake failure.
-                    match Self::handshake(HttpTransport::new(url, cfg)?) {
+                    match Self::handshake(HttpTransport::new(url, cfg)?, &cfg.name) {
                         ok @ Ok(_) => ok,
                         Err(e) => {
                             crate::diag::diag_warn!(
                                 "[warn] MCP '{}': Streamable HTTP handshake failed ({e:#}); falling back to legacy SSE",
                                 cfg.name
                             );
-                            Self::handshake(SseTransport::connect(url, cfg)?)
+                            Self::handshake(SseTransport::connect(url, cfg)?, &cfg.name)
                         }
                     }
                 }
@@ -165,7 +165,10 @@ impl McpClient {
         }
     }
 
-    fn handshake(transport: impl Transport + 'static) -> Result<(Self, Vec<McpToolInfo>)> {
+    fn handshake(
+        transport: impl Transport + 'static,
+        name: &str,
+    ) -> Result<(Self, Vec<McpToolInfo>)> {
         let mut client = Self {
             transport: Box::new(transport),
             next_id: 1,
@@ -182,7 +185,7 @@ impl McpClient {
         client.notify("notifications/initialized", json!({}))?;
 
         let tools = client.call("tools/list", json!({}), /* cancel: */ None)?;
-        Ok((client, bound_tools(tools)))
+        Ok((client, bound_tools(tools, name)))
     }
 
     /// Arm teardown on the underlying transport (stdio servers spawn a reaper
@@ -242,13 +245,15 @@ fn frame(id: u64, method: &str, params: Value) -> Value {
 /// (MCP_TOOL_DESC_MAX chars — same 1024 the skill standard uses), and each
 /// serialized inputSchema (MCP_SCHEMA_MAX bytes). Offenders are dropped with
 /// a stderr warning rather than kept — a garbage schema just moves the
-/// failure into every later request.
-fn bound_tools(tools: Value) -> Vec<McpToolInfo> {
+/// failure into every later request. `server` (the config name) is woven
+/// into each warning: several MCP servers can be configured side by side,
+/// and a cap message without the server's name can't be acted on.
+fn bound_tools(tools: Value, server: &str) -> Vec<McpToolInfo> {
     let mut infos = Vec::new();
     for t in tools["tools"].as_array().cloned().unwrap_or_default() {
         if infos.len() >= MCP_MAX_TOOLS {
             crate::diag::diag_warn!(
-                "[warn] MCP server exposes more than {MCP_MAX_TOOLS} tools; ignoring the rest"
+                "[warn] MCP '{server}': exposes more than {MCP_MAX_TOOLS} tools; ignoring the rest"
             );
             break;
         }
@@ -260,7 +265,7 @@ fn bound_tools(tools: Value) -> Vec<McpToolInfo> {
         // offender below.
         if name.is_empty() {
             crate::diag::diag_warn!(
-                "[warn] MCP tool with missing or empty name; ignoring the tool"
+                "[warn] MCP '{server}': tool with missing or empty name; ignoring the tool"
             );
             continue;
         }
@@ -275,7 +280,7 @@ fn bound_tools(tools: Value) -> Vec<McpToolInfo> {
             > MCP_SCHEMA_MAX
         {
             crate::diag::diag_warn!(
-                "[warn] MCP tool '{name}' inputSchema exceeds {MCP_SCHEMA_MAX} bytes; ignoring the tool"
+                "[warn] MCP '{server}': tool '{name}' inputSchema exceeds {MCP_SCHEMA_MAX} bytes; ignoring the tool"
             );
             continue;
         }
@@ -472,6 +477,88 @@ fn write_frame_cancelable<W: Write + Send + 'static>(
     }
 }
 
+/// 为 Windows 的 `cmd /C` 拼出 /C 之后的完整参数尾（命令 + 参数，按 cmd 的
+/// 习惯加引号后用单个空格连接），供 spawn 处 `.raw_arg` 整段直传。
+///
+/// 为什么不能让 std 的 `.arg`/`.args` 代劳：std 按 MSVCRT 规则编码每个参数
+/// （含空格/引号即整体包裹、内嵌 `"` 写成 `\"`），而 cmd 对 /C 之后的字符串
+/// 有自己的剥引号规则——首字符是 `"` 且全行恰好两个引号、中间是可执行路径
+/// 且无特殊字符 → 引号保留；否则（引号 ≥4 个，或含 `&()< >|^` 等特殊字符）
+/// → 剥掉首个字符和全行最后一个引号。于是「命令含空格（如
+/// `C:\Program Files\nodejs\node.exe`，必被 std 包裹）+ 任一参数也被包裹」
+/// 时，std 拼出的 `cmd /C "C:\Program Files\nodejs\node.exe" "my
+/// project\server.js"`（4 个引号）被 cmd 剥成 `C:\Program Files\nodejs\node.exe"
+/// "my project\server.js`——命令行就此打碎（node 装在 Program Files + 项目
+/// 路径含空格即触发）。同 shell 工具 raw_arg 修复的理由（见 shell.rs 的
+/// spawn 注释）；这里是 argv 形态，需要自己拼好每个参数的引号。
+///
+/// 引号规则：token 为空、含空白/制表符/引号、或含非 ASCII 字符（CJK 等，
+/// 保守处理）时包裹 `"`；内嵌 `"` 写成 `\"`（cmd 不解析反斜杠转义、也不改动
+/// 参数区内容，子进程的 MSVCRT argv 解析按 `\"` 还原原字符——各取所需）；
+/// 收尾引号前的连续反斜杠加倍（MSVCRT 规则：否则 `C:\dir\` 末尾的 `\` 会把
+/// 我们补的 `"` 吃成转义引号，参数边界丢失）。
+///
+/// 若拼好的尾段以 `"` 开头（命令路径被包裹——cmd 剥引号唯一可能发生的形
+/// 态），整段再包一层外引号：cmd 的剥除规则拿掉的正是这层外包装，剥完剩下
+/// 的就是上面拼好的、引号完好的命令行。首字符不是 `"` 时 cmd 从不剥引号，
+/// 原样直传（与旧行为字节一致）。
+#[cfg(windows)]
+fn windows_cmd_tail(cmd: &str, args: &[String]) -> String {
+    /// 按 cmd/MSVCRT 习惯编码单个 token（规则见外层函数文档）。
+    fn quoted(tok: &str) -> String {
+        let needs_quotes = tok.is_empty()
+            || tok
+                .chars()
+                .any(|c| c.is_ascii_whitespace() || c == '"' || !c.is_ascii());
+        if !needs_quotes {
+            return tok.to_string();
+        }
+        let mut out = String::with_capacity(tok.len() + 2);
+        out.push('"');
+        // 反斜杠只在紧邻 `"`（将被转义）或收尾引号前才需要加倍：逐字符攒
+        // 当前连续反斜杠数，遇 `"` 翻倍写出，其他字符原样写出。
+        let mut backslashes: usize = 0;
+        for c in tok.chars() {
+            if c == '\\' {
+                backslashes += 1;
+                continue;
+            }
+            match c {
+                '"' => {
+                    for _ in 0..backslashes * 2 {
+                        out.push('\\');
+                    }
+                    out.push_str("\\\"");
+                }
+                _ => {
+                    for _ in 0..backslashes {
+                        out.push('\\');
+                    }
+                    out.push(c);
+                }
+            }
+            backslashes = 0;
+        }
+        // 尾部连续反斜杠紧邻的是我们补的收尾引号 → 同样翻倍。
+        for _ in 0..backslashes * 2 {
+            out.push('\\');
+        }
+        out.push('"');
+        out
+    }
+
+    let mut tail = quoted(cmd);
+    for a in args {
+        tail.push(' ');
+        tail.push_str(&quoted(a));
+    }
+    if tail.starts_with('"') {
+        format!("\"{tail}\"")
+    } else {
+        tail
+    }
+}
+
 struct StdioTransport {
     child: std::process::Child,
     /// Job-Object tree-kill armed at spawn (Windows only): the direct
@@ -482,7 +569,7 @@ struct StdioTransport {
     /// reclamation, NOT the shell tool's survivor escape hatch
     /// (crate::winjob::JobDrop contrasts the two). None when job setup
     /// failed → degrade to the old kill-the-direct-child.
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     job: Option<crate::winjob::WinJob>,
     /// `None` once a write timed out / was cancelled / failed its spawn: the
     /// writer thread owned the handle and couldn't be reclaimed (it was stuck
@@ -505,6 +592,10 @@ struct StdioTransport {
 }
 
 impl StdioTransport {
+    /// windows/unix 双平台实现（各自的 spawn 形态差异太大，见下方两个 cfg
+    /// 块）；第三平台（wasm 等）由紧随其后的 cfg 兜底版本返回明确错误——
+    /// 参照 signal.rs 的 install_sigint_cancel 拆分法。
+    #[cfg(any(unix, windows))]
     fn spawn(cfg: &McpServerConfig) -> Result<Self> {
         use std::process::{Command, Stdio};
         let cmd = cfg.command.as_ref().expect("validated");
@@ -524,19 +615,22 @@ impl StdioTransport {
                 .process_group(0)
                 .spawn()
         };
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         let child = {
             // Windows: npm 装出来的 bin 多是 .cmd 垫片（npx、各 MCP server），
             // CreateProcess 不会按 PATHEXT 解析 .cmd，直接 Command::new("npx")
-            // 会 "program not found"。经 cmd /C 走 .cmd 解析（同 shell 工具的做法）。
-            // CREATE_NO_WINDOW：GUI 壳（windows_subsystem="windows"）自身无控制台，
-            // spawn 控制台子进程默认闪 conhost 黑框；压掉窗口，stdio 管道不受影响，
-            // node 孙进程继承隐藏控制台不会二次弹窗。
+            // 会 "program not found"。经 cmd /C 走 .cmd 解析（同 shell 工具的
+            // 做法：/C 之后的整段 raw_arg 直传，引号由 windows_cmd_tail 按 cmd
+            // 的规则拼好，绝不经过 std 的 MSVCRT 编码——std 的编码遇上 cmd /C
+            // 的剥引号规则，会把「含空格命令 + 含空格/引号参数」的命令行打
+            // 碎，见 windows_cmd_tail 的文档）。CREATE_NO_WINDOW：GUI 壳
+            // （windows_subsystem="windows"）自身无控制台，spawn 控制台子进程
+            // 默认闪 conhost 黑框；压掉窗口，stdio 管道不受影响，node 孙进程
+            // 继承隐藏控制台不会二次弹窗。
             use std::os::windows::process::CommandExt;
             Command::new("cmd")
                 .arg("/C")
-                .arg(cmd)
-                .args(&cfg.args)
+                .raw_arg(windows_cmd_tail(cmd, &cfg.args))
                 .envs(&cfg.env)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -554,11 +648,11 @@ impl StdioTransport {
         // exclusive long-lived child, so Drop reclaims the tree
         // deterministically — no shell-style survivor escape hatch. Assign
         // failure (None) degrades to the old direct-child kill.
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         let job = crate::winjob::WinJob::assign(&child, crate::winjob::JobDrop::Terminate);
         let mut this = Self {
             child,
-            #[cfg(not(unix))]
+            #[cfg(windows)]
             job,
             stdin: None,
             pending: pending_new(),
@@ -580,6 +674,14 @@ impl StdioTransport {
             return Err(e);
         }
         Ok(this)
+    }
+
+    /// 第三平台（wasm 等）兜底：stdio 传输依赖 unix 进程组或 Windows
+    /// Job Object，其余目标没有可用的子进程机制，明确报错而不是让 cfg
+    /// 谓词失配在编译期炸开（同 signal.rs::install_sigint_cancel 的拆法）。
+    #[cfg(not(any(unix, windows)))]
+    fn spawn(_cfg: &McpServerConfig) -> Result<Self> {
+        bail!("MCP stdio transport requires unix or windows");
     }
 
     /// Take the stdio pipes and start the stderr / stdout reader threads.
@@ -622,6 +724,10 @@ impl StdioTransport {
         let stdin = self.child.stdin.take().expect("stdin piped");
         let pending = self.pending.clone();
         let fail_detail = stderr_buf.clone();
+        // Owned clone for the reader thread's diagnostics: several MCP servers
+        // can run side by side, and a "read stopped" warning without the
+        // server's name can't be attributed to the right config entry.
+        let warn_name = name.to_string();
         std::thread::Builder::new()
             .name("mcp-stdio-stdout".into())
             .spawn(move || {
@@ -645,7 +751,9 @@ impl StdioTransport {
                             // A line over the cap (or a read error) ends the
                             // stream: fail every waiter so callers don't sit
                             // out the full CALL_TIMEOUT on a dead/abusive server.
-                            crate::diag::diag_warn!("[warn] MCP stdio read stopped: {e:#}");
+                            crate::diag::diag_warn!(
+                                "[warn] MCP '{warn_name}' stdio read stopped: {e:#}"
+                            );
                             break;
                         }
                     }
@@ -679,7 +787,7 @@ impl StdioTransport {
         unsafe {
             libc::kill(-(self.child.id() as i32), libc::SIGKILL);
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
             match self.job.as_ref() {
                 Some(job) => job.terminate(),
@@ -744,7 +852,7 @@ fn spawn_reaper(
 /// guards against a reused pgid; on Windows it orders the two kills and lets
 /// Drop's join reclaim the thread). Factored out so the kill-on-shutdown
 /// behavior is unit-testable with a real subprocess, mirroring spawn_reaper.
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn spawn_reaper_job(
     job: crate::winjob::WinJob,
     alive: Arc<AtomicBool>,
@@ -898,27 +1006,39 @@ impl Transport for StdioTransport {
         // Terminate-on-drop policy and remains the deterministic reclaimer; a
         // missing job (assign failed at spawn) or a failed thread spawn
         // degrades exactly like the unix failure branch: warn, rely on Drop
-        // teardown.
-        #[cfg(not(unix))]
-        match self
-            .job
-            .as_ref()
-            .and_then(|job| job.duplicate())
-            .map(|job| spawn_reaper_job(job, self.alive.clone(), shutdown.clone()))
+        // teardown. The two degraded flavors get SEPARATE messages — "assign
+        // failed at spawn" and "handle duplication failed" point at different
+        // layers when triaging a quit that relied on Drop.
+        #[cfg(windows)]
         {
-            Some(Ok(handle)) => self.reaper = Some(handle),
-            Some(Err(e)) => {
-                // Degraded, not dead: same shape as the unix branch above —
-                // without the reaper a quit-time stuck read unblocks only via
-                // Drop (or process exit) instead of the instant job kill.
-                crate::diag::diag_warn!(
-                    "[warn] MCP: cannot spawn shutdown reaper ({e:#}); quit will rely on Drop teardown"
-                );
-            }
-            None => {
-                crate::diag::diag_warn!(
-                    "[warn] MCP: shutdown reaper not armed (no Job Object); quit will rely on Drop teardown"
-                );
+            let dup = match self.job.as_ref() {
+                Some(job) => job.duplicate(),
+                None => {
+                    crate::diag::diag_warn!(
+                        "[warn] MCP: shutdown reaper not armed (no Job Object — assign failed at spawn); quit will rely on Drop teardown"
+                    );
+                    return;
+                }
+            };
+            let dup = match dup {
+                Some(d) => d,
+                None => {
+                    crate::diag::diag_warn!(
+                        "[warn] MCP: shutdown reaper not armed (Job Object handle duplication failed); quit will rely on Drop teardown"
+                    );
+                    return;
+                }
+            };
+            match spawn_reaper_job(dup, self.alive.clone(), shutdown.clone()) {
+                Ok(handle) => self.reaper = Some(handle),
+                Err(e) => {
+                    // Degraded, not dead: same shape as the unix branch above —
+                    // without the reaper a quit-time stuck read unblocks only via
+                    // Drop (or process exit) instead of the instant job kill.
+                    crate::diag::diag_warn!(
+                        "[warn] MCP: cannot spawn shutdown reaper ({e:#}); quit will rely on Drop teardown"
+                    );
+                }
             }
         }
     }
@@ -956,6 +1076,25 @@ struct HttpTransport {
     url: String,
     headers: HashMap<String, String>,
     session_id: Option<String>,
+    /// Shared response-dispatch table (the same plumbing stdio / legacy SSE
+    /// use): rounds of the standing standalone stream dispatch every JSON-RPC
+    /// response into the slot the requesting call registered, so a 202's
+    /// response is deliverable the moment the server pushes it — SSE does not
+    /// queue for a client that hasn't connected, which is exactly the race
+    /// the standing stream exists to close (see [`HttpTransport::request`]).
+    pending: Pending,
+    /// Stop flag for the standing-stream reader thread; set in Drop.
+    stream_shutdown: Arc<AtomicBool>,
+    /// The standing standalone-stream reader thread (see
+    /// [`spawn_standalone_stream`]). `None` until first needed.
+    stream_reader: Option<std::thread::JoinHandle<()>>,
+    /// Set by the reader thread when the server 4xx-REJECTED the standalone
+    /// GET. Damps the pre-POST arming to one rejection per session instead of
+    /// one wasted GET + warning per request against a server without
+    /// standalone-stream support; `force` in [`Self::ensure_standalone_stream`]
+    /// (the 202 branch) still earns a fresh attempt per 202 — matching the old
+    /// one-GET-per-202 wire traffic where the fast 4xx error came from.
+    standalone_rejected: Arc<AtomicBool>,
 }
 
 /// Read at most `cap` bytes of a response body as lossy text. The SSE paths
@@ -976,7 +1115,45 @@ impl HttpTransport {
             url: url.to_string(),
             headers: cfg.headers.clone(),
             session_id: None,
+            pending: pending_new(),
+            stream_shutdown: Arc::new(AtomicBool::new(false)),
+            stream_reader: None,
+            standalone_rejected: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Make sure exactly one standing standalone-stream reader is running,
+    /// (re)spawning it if none is alive. Idempotent while the thread lives; a
+    /// thread that EXITED (its GET was 4xx-rejected — a server without
+    /// standalone-stream support, or one that rotated the session id) earns
+    /// one fresh attempt per future need. `force` bypasses the rejection
+    /// damper: the 202 branch MUST try (its response has no other delivery
+    /// path), while the pre-POST arming (best-effort race insurance) skips
+    /// re-spawning against a server that already said no. The session id is
+    /// snapshotted at spawn: the spec keeps one session id stable for the
+    /// connection's lifetime, and a server that breaks that kills this stream
+    /// with a 4xx — the respawn then carries the refreshed id and heals.
+    fn ensure_standalone_stream(&mut self, force: bool) -> Result<()> {
+        if self
+            .stream_reader
+            .as_ref()
+            .is_some_and(|h| !h.is_finished())
+        {
+            return Ok(());
+        }
+        if !force && self.standalone_rejected.load(Ordering::Relaxed) {
+            return Ok(()); // best-effort arming only — the 202 branch retries
+        }
+        let reader = spawn_standalone_stream(
+            self.url.clone(),
+            self.headers.clone(),
+            self.session_id.clone(),
+            self.pending.clone(),
+            self.stream_shutdown.clone(),
+            self.standalone_rejected.clone(),
+        )?;
+        self.stream_reader = Some(reader);
+        Ok(())
     }
 
     fn post(&self, body: &Value) -> Result<reqwest::blocking::Response> {
@@ -1041,77 +1218,319 @@ impl Transport for HttpTransport {
         id: u64,
         method: &str,
         params: Value,
-        // Cancel is accepted for signature parity but UNUSED here: every
-        // wait is a blocking reqwest round-trip already bounded by the
-        // client's CALL_TIMEOUT total timeout — there is no channel wait to
-        // slice, and a blocking reqwest read cannot be interrupted
-        // mid-response (see SseTransport's Drop note). That now covers the
-        // 202 path too: POST + GET are each one bounded round-trip. The
-        // stdio/SSE waits are the deadlock-shaped ones the 50ms slices
-        // exist for.
-        _cancel: Option<&AtomicBool>,
+        // Cancel is honored on the 202 wait via recv_cancelable's 50ms slices
+        // (same contract as stdio / SSE). The direct POST/GET round-trips are
+        // blocking reqwest calls already bounded by the client's
+        // CALL_TIMEOUT total timeout — there is no channel wait to slice on
+        // those, and a blocking reqwest read cannot be interrupted
+        // mid-response (see SseTransport's Drop note).
+        cancel: Option<&AtomicBool>,
     ) -> Result<Value> {
-        let resp = self.post(&frame(id, method, params))?;
-        if let Some(sid) = resp
-            .headers()
-            .get("Mcp-Session-Id")
-            .and_then(|v| v.to_str().ok())
-        {
-            self.session_id = Some(sid.to_string());
+        // Register the pending slot BEFORE the POST: a server that answers
+        // with 202 delivers the response on the standing stream whenever it
+        // pleases — including between our POST and the wait below — so the
+        // slot must already exist when that push lands.
+        let (tx, rx) = mpsc::channel();
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, tx);
+        // With a session established, connect the standing stream BEFORE the
+        // POST leaves: SSE does not queue for an unconnected client, so a
+        // 202 response the server pushes the instant it processes the POST
+        // is only deliverable if the GET is already open. The old flow
+        // (POST → drop(resp) → only THEN open a fresh GET per 202) lost any
+        // such response permanently and burned the full CALL_TIMEOUT; in
+        // Auto mode an initialize hitting that path mis-probed Streamable as
+        // broken and fell back to legacy SSE. Failure to arm the stream is
+        // NOT fatal here — the 202 branch below still has the inline
+        // one-shot GET as fallback.
+        if self.session_id.is_some() {
+            let _ = self.ensure_standalone_stream(/* force: */ false);
         }
+        let res = (|| -> Result<Value> {
+            let resp = self.post(&frame(id, method, params))?;
+            if let Some(sid) = resp
+                .headers()
+                .get("Mcp-Session-Id")
+                .and_then(|v| v.to_str().ok())
+            {
+                self.session_id = Some(sid.to_string());
+            }
 
-        if resp.status() == 202 {
-            // Spec (2025-03-26 Streamable HTTP): the server MAY answer a
-            // POSTed request with `202 Accepted` and no body — the actual
-            // JSON-RPC response then arrives on the server-initiated SSE
-            // stream, which the client opens with a GET to the same
-            // endpoint ("Listening for messages from the server"). The old
-            // code fell through to the plain-JSON branch below and died on
-            // `serde_json::from_str("")` ("invalid JSON response"); in Auto
-            // mode that failure also mis-triggered the legacy-SSE fallback
-            // against a Streamable server. Reuses the POST-stream response
-            // loop (id + method guard, SSE caps) unchanged.
-            drop(resp); // release the bodyless 202 connection
-            let stream = self.get_event_stream()?;
-            let mut reader = std::io::BufReader::new(stream);
-            let msg = sse_response_for_id(&mut reader, id, method)?;
-            return extract_result(msg, method);
-        }
+            if resp.status() == 202 {
+                // Spec (2025-03-26 Streamable HTTP): the server MAY answer a
+                // POSTed request with `202 Accepted` and no body — the actual
+                // JSON-RPC response then arrives on the server-initiated SSE
+                // stream. That stream is the STANDING standalone GET (see
+                // spawn_standalone_stream): one long-lived connection per
+                // session, opened before the POST that might need it and
+                // shared by every 202, with responses dispatched through the
+                // shared pending table. The wait is therefore cancel-aware.
+                // If arming the stream failed (thread spawn — resource
+                // exhaustion), fall back to the old one-shot GET +
+                // sse_response_for_id, byte-identical to the previous
+                // behavior.
+                drop(resp); // release the bodyless 202 connection
+                if self.ensure_standalone_stream(/* force: */ true).is_ok() {
+                    let msg = recv_cancelable(&rx, method, cancel)?;
+                    return extract_result(msg, method);
+                }
+                let stream = self.get_event_stream()?;
+                let mut reader = std::io::BufReader::new(stream);
+                let msg = sse_response_for_id(&mut reader, id, method)?;
+                return extract_result(msg, method);
+            }
 
-        let ct = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
+            let ct = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
 
-        if ct.contains("text/event-stream") {
-            // Read SSE events until the response with our id arrives. Use the
-            // multi-line-aware event reader: provider::SseReader takes only
-            // the first `data:` line of a multi-line event and would drop the
-            // rest, losing large JSON-RPC results. The id+method response
-            // match lives in sse_response_for_id (see its doc for the guard).
-            let mut reader = std::io::BufReader::new(resp);
-            let msg = sse_response_for_id(&mut reader, id, method)?;
-            extract_result(msg, method)
-        } else {
-            // Plain-JSON response. P2-3: read capped, then parse — resp.json()
-            // buffers the entire body before parsing, and the body's size is
-            // the server's choice (MCP_EVENT_MAX already bounds the SSE
-            // variant of the same result; a body cut at the cap fails the
-            // parse, which is the right outcome for a >64MiB result).
-            let mut resp = resp;
-            let text = capped_text(&mut resp, MCP_EVENT_MAX as u64);
-            let msg: Value =
-                serde_json::from_str(&text).context("MCP HTTP: invalid JSON response")?;
-            extract_result(msg, method)
-        }
+            if ct.contains("text/event-stream") {
+                // Read SSE events until the response with our id arrives. Use
+                // the multi-line-aware event reader: provider::SseReader
+                // takes only the first `data:` line of a multi-line event and
+                // would drop the rest, losing large JSON-RPC results. The
+                // id+method response match lives in sse_response_for_id (see
+                // its doc for the guard).
+                let mut reader = std::io::BufReader::new(resp);
+                let msg = sse_response_for_id(&mut reader, id, method)?;
+                extract_result(msg, method)
+            } else {
+                // Plain-JSON response. P2-3: read capped, then parse —
+                // resp.json() buffers the entire body before parsing, and
+                // the body's size is the server's choice (MCP_EVENT_MAX
+                // already bounds the SSE variant of the same result; a body
+                // cut at the cap fails the parse, which is the right outcome
+                // for a >64MiB result).
+                let mut resp = resp;
+                let text = capped_text(&mut resp, MCP_EVENT_MAX as u64);
+                let msg: Value =
+                    serde_json::from_str(&text).context("MCP HTTP: invalid JSON response")?;
+                extract_result(msg, method)
+            }
+        })();
+        // Reclaim the slot on every exit (success included): a late duplicate
+        // delivery on the standing stream must find no entry (and be dropped
+        // by pending_dispatch) instead of leaking one map entry per call.
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
+        res
     }
 
     fn notify(&mut self, method: &str, params: Value) -> Result<()> {
         // Spec: server answers 202 Accepted (no body) for notifications.
         self.post(&notify_frame(method, params))?;
         Ok(())
+    }
+}
+
+impl Drop for HttpTransport {
+    fn drop(&mut self) {
+        // Stand the standalone-stream reader down. reqwest::blocking reads
+        // cannot be interrupted mid-read, so — exactly like SseTransport's
+        // Drop — the flag only takes effect once the server sends another
+        // event or closes the stream; a fully stuck GET relies on process
+        // exit to reclaim the thread and its TCP connection. Join only an
+        // already-finished reader (never block on a live one: a healthy
+        // server keeps its stream open indefinitely, and blocking here would
+        // hang teardown on exactly the servers we're giving up on).
+        self.stream_shutdown.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.stream_reader.take().filter(|h| h.is_finished()) {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Outcome of one standalone-stream round (connection attempt + read pass).
+enum StandaloneRound {
+    /// The stream ended (server closed it / read error) or the connect
+    /// failed: retry after a backoff — waiters may still be owed responses,
+    /// and the next server push needs a connected stream to land on.
+    Ended,
+    /// A 4xx rejection: the server refuses standalone streams (405 = not
+    /// supported) or the session id is dead (401/404). Retrying can't heal a
+    /// client-side rejection, so the caller gives up permanently.
+    Rejected(String),
+}
+
+/// The standing standalone GET stream (spec 2025-03-26, "Listening for
+/// messages from the server"), supervised by one reader thread per
+/// [`HttpTransport`] session: connect once, read SSE events forever,
+/// dispatch every JSON-RPC response into the shared pending table (the same
+/// plumbing as stdio / legacy SSE — `pending_dispatch`'s `method` guard
+/// drops server-initiated requests). This closes the 202 race: SSE does not
+/// queue for an unconnected client, so the old open-a-fresh-GET-after-each-
+/// 202 flow permanently lost any response the server pushed before that GET
+/// connected (the caller then sat out the full CALL_TIMEOUT).
+///
+/// Residual race, honestly recorded: the very FIRST 202 (an initialize to a
+/// server that 202s it) can only open the stream after the POST returns — a
+/// server that pushes that response before any client GET could connect
+/// still loses it. Post-initialize requests all carry a session id, so
+/// request() arms the stream BEFORE their POSTs and are fully covered.
+///
+/// On stream end / error the loop reconnects after a short backoff (a
+/// restarting server or an idle-connection-dropping proxy must not doom
+/// later 202s); on a 4xx it fails every waiter immediately (so a 202 parked
+/// on this stream errors at once — the old inline path failed fast on the
+/// same 4xx and must not regress into a timeout) and exits permanently; the
+/// next ensure_standalone_stream() gives it one fresh attempt.
+fn spawn_standalone_stream(
+    url: String,
+    headers: HashMap<String, String>,
+    session_id: Option<String>,
+    pending: Pending,
+    shutdown: Arc<AtomicBool>,
+    rejected: Arc<AtomicBool>,
+) -> Result<std::thread::JoinHandle<()>> {
+    // Same builder shape and no-redirect rationale as SseTransport::connect:
+    // connect timeout ONLY (a total timeout would kill a healthy idle
+    // stream at CALL_TIMEOUT), and a redirect-following client would carry
+    // the configured headers (possibly Authorization) off-origin.
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_else(|_| {
+            reqwest::blocking::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("reqwest client build")
+        });
+    std::thread::Builder::new()
+        .name("mcp-http-stream".into())
+        .spawn(move || {
+            while !shutdown.load(Ordering::Relaxed) {
+                match standalone_stream_round(
+                    &client,
+                    &url,
+                    &headers,
+                    &session_id,
+                    &pending,
+                    &shutdown,
+                ) {
+                    StandaloneRound::Rejected(detail) => {
+                        // Latch the rejection: the transport's best-effort
+                        // pre-POST arming stops re-spawning this thread (one
+                        // wasted GET + warning per request would be pure
+                        // noise against a server that simply doesn't offer
+                        // standalone streams); a future 202 forces one fresh
+                        // attempt (ensure_standalone_stream).
+                        rejected.store(true, Ordering::Relaxed);
+                        crate::diag::diag_warn!(
+                            "[warn] MCP HTTP standalone stream rejected ({detail}); \
+                             standing stream disabled"
+                        );
+                        // Fail every waiter NOW so a 202 parked on this stream
+                        // errors immediately instead of sitting out the full
+                        // CALL_TIMEOUT. Inlined rather than pending_fail_all:
+                        // that helper's "its stderr" wording is a stdio-ism —
+                        // the standalone stream's failure reason is right here.
+                        let err = json!({
+                            "error": {"code": -32000, "message": format!("MCP standalone stream rejected ({detail})")}
+                        });
+                        for (_, tx) in pending
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .drain()
+                        {
+                            let _ = tx.send(err.clone());
+                        }
+                        return;
+                    }
+                    StandaloneRound::Ended => {}
+                }
+                // Backoff before reconnecting/retrying: keeps a dead server
+                // from being hot-looped (waiters are bounded by CALL_TIMEOUT
+                // regardless) and staggers naturally behind a restarting
+                // server. The loop condition then re-checks shutdown, so a
+                // dropped transport never opens one more connection on its
+                // way out.
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        })
+        // Same policy as every other reader thread here: thread-resource
+        // exhaustion is a per-connection failure — the caller degrades to
+        // the inline one-shot GET, never a panic.
+        .context("cannot spawn MCP standalone stream reader thread")
+}
+
+/// One connection + read pass of the standing stream (loop body of
+/// [`spawn_standalone_stream`]). Sends the GET with the SSE Accept header
+/// and `Mcp-Session-Id` when one was established ("clients ... MUST include
+/// it in the Mcp-Session-Id header on all of their subsequent HTTP
+/// requests"), then reads events until the stream ends, the read errors, or
+/// `shutdown` fires.
+fn standalone_stream_round(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    headers: &HashMap<String, String>,
+    session_id: &Option<String>,
+    pending: &Pending,
+    shutdown: &AtomicBool,
+) -> StandaloneRound {
+    let mut req = client
+        .get(url)
+        .header("accept", "text/event-stream")
+        .header("MCP-Protocol-Version", PROTOCOL_VERSION);
+    for (k, v) in headers {
+        req = req.header(k, v);
+    }
+    if let Some(sid) = session_id {
+        req = req.header("Mcp-Session-Id", sid);
+    }
+    let mut resp = match req.send() {
+        Ok(r) => r,
+        Err(e) => {
+            // Connect/network failure (server down, proxy reset): retry —
+            // the standing stream is the delivery channel for future 202s,
+            // and the server coming back revives it.
+            crate::diag::diag_warn!(
+                "[warn] MCP HTTP standalone stream connect failed ({e:#}); retrying"
+            );
+            return StandaloneRound::Ended;
+        }
+    };
+    if !resp.status().is_success() {
+        let status = resp.status();
+        // Same error-body cap and rationale as post()/get_event_stream().
+        let text = capped_text(&mut resp, MCP_ERR_BODY_MAX);
+        if status.is_client_error() {
+            return StandaloneRound::Rejected(format!("HTTP {status}: {text}"));
+        }
+        // 5xx: transient server-side — retry after backoff.
+        crate::diag::diag_warn!("[warn] MCP HTTP standalone stream GET error {status}; retrying");
+        return StandaloneRound::Ended;
+    }
+    let mut reader = std::io::BufReader::new(resp);
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return StandaloneRound::Ended;
+        }
+        match read_sse_event(&mut reader, MCP_EVENT_MAX) {
+            Ok(Some((_event, data))) => {
+                if let Ok(msg) = serde_json::from_str::<Value>(&data) {
+                    pending_dispatch(pending, msg);
+                }
+            }
+            Ok(None) => return StandaloneRound::Ended, // server closed: reconnect
+            Err(e) => {
+                // A line over the cap or a read error: same bounded-memory /
+                // anti-runaway policy as every other SSE reader here. The
+                // stream is unusable, but later 202s may still be owed —
+                // reconnect rather than failing the waiters.
+                crate::diag::diag_warn!(
+                    "[warn] MCP HTTP standalone stream read stopped: {e:#}; reconnecting"
+                );
+                return StandaloneRound::Ended;
+            }
+        }
     }
 }
 
@@ -1183,8 +1602,10 @@ impl SseTransport {
                         Err(e) => {
                             // A line over the cap or a read error: the stream is
                             // unusable. Fail every waiter so callers don't block
-                            // until CALL_TIMEOUT on a dead/abusive server.
-                            crate::diag::diag_warn!("[warn] MCP SSE read stopped: {e:#}");
+                            // until CALL_TIMEOUT on a dead/abusive server. The
+                            // URL names WHICH server's stream died — several MCP
+                            // servers can be configured side by side.
+                            crate::diag::diag_warn!("[warn] MCP SSE read stopped for {url}: {e:#}");
                             pending_fail_all(&pending, "");
                             return;
                         }
@@ -1834,7 +2255,7 @@ mod tests {
             "description": "d",
             "inputSchema": {"type": "object", "props": "x".repeat(MCP_SCHEMA_MAX)},
         }));
-        let infos = bound_tools(json!({"tools": tools}));
+        let infos = bound_tools(json!({"tools": tools}), "srv");
         assert_eq!(infos.len(), MCP_MAX_TOOLS, "count capped");
         // The first MCP_MAX_TOOLS entries by list order survive; the
         // fat-schema tool appended past the cap is simply never reached.
@@ -1848,10 +2269,13 @@ mod tests {
 
         // With a short list the same rules apply in isolation: the fat schema
         // tool is dropped even when the count is well under the cap.
-        let short = bound_tools(json!({"tools": [
-            {"name": "ok", "description": "d", "inputSchema": {"type": "object"}},
-            {"name": "fat", "description": "d", "inputSchema": {"type": "object", "props": "x".repeat(MCP_SCHEMA_MAX)}},
-        ]}));
+        let short = bound_tools(
+            json!({"tools": [
+                {"name": "ok", "description": "d", "inputSchema": {"type": "object"}},
+                {"name": "fat", "description": "d", "inputSchema": {"type": "object", "props": "x".repeat(MCP_SCHEMA_MAX)}},
+            ]}),
+            "srv",
+        );
         let names: Vec<&str> = short.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, vec!["ok"]);
     }
@@ -1938,11 +2362,14 @@ mod tests {
         // P2 fix: a missing name used to enter the table as "" — uncallable
         // dead weight in the model-visible list (dispatch is by name), and
         // a second nameless tool would collide with it.
-        let infos = bound_tools(json!({"tools": [
-            {"name": "", "description": "d", "inputSchema": {"type": "object"}},
-            {"description": "nameless", "inputSchema": {"type": "object"}},
-            {"name": "real", "description": "d", "inputSchema": {"type": "object"}},
-        ]}));
+        let infos = bound_tools(
+            json!({"tools": [
+                {"name": "", "description": "d", "inputSchema": {"type": "object"}},
+                {"description": "nameless", "inputSchema": {"type": "object"}},
+                {"name": "real", "description": "d", "inputSchema": {"type": "object"}},
+            ]}),
+            "srv",
+        );
         let names: Vec<&str> = infos.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, vec!["real"]);
     }
@@ -1997,6 +2424,123 @@ mod tests {
             alive, 0,
             "grandchild ping survived StdioTransport drop (job not terminated?)"
         );
+    }
+
+    // ─── Windows cmd /C 参数尾 ────────────────────────────────────────
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cmd_tail_quotes_only_what_needs_it() {
+        // 裸名命令 + 无特殊字符参数：不产生任何引号（与 std 旧行为字节一
+        // 致），cmd 原样执行。
+        let tail = windows_cmd_tail("npx", &["-y".into(), "some-mcp-server".into()]);
+        assert_eq!(tail, "npx -y some-mcp-server");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cmd_tail_wraps_a_quoted_tail_in_an_outer_quote_pair() {
+        // 触发旧 bug 的形态：命令含空格（必被包裹）+ 参数含空格（也被包
+        // 裹）。std 的编码拼出 4 个引号 → cmd /C 的剥除规则剥掉首尾引号，
+        // 命令行打碎；修复后整段外包一层引号——剥掉的正是外包装，内层引
+        // 号完好。
+        let tail = windows_cmd_tail(
+            "C:\\Program Files\\nodejs\\node.exe",
+            &["D:\\my project\\server.js".into()],
+        );
+        assert!(
+            tail.starts_with('"') && tail.ends_with('"'),
+            "must be outer-wrapped: {tail}"
+        );
+        // 剥掉外层包装（cmd /C 剥引号规则实际做的事）后，剩下的必须逐字
+        // 节等于按 cmd 习惯逐参数加引号的结果——命令与参数的引号一个不缺。
+        assert_eq!(
+            &tail[1..tail.len() - 1],
+            "\"C:\\Program Files\\nodejs\\node.exe\" \"D:\\my project\\server.js\"",
+            "inner tail: {tail}"
+        );
+        // 全行 6 个引号（外层 2 + 命令 2 + 参数 2）→ cmd 走"≥4 引号剥首尾"
+        // 分支，且剥的是最外那一对。
+        assert_eq!(tail.matches('"').count(), 6, "tail: {tail}");
+        // 无意外转义：除内嵌引号的 `\"` 外不得出现反斜杠转义。
+        assert!(
+            !tail.contains("\\\\"),
+            "no stray escaped backslashes: {tail}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cmd_tail_leaves_an_unquoted_leading_token_unwrapped() {
+        // 首字符不是 `"` → cmd 的剥除规则根本不触发：无需外包装，含空格
+        // 的参数各自包裹即可（与旧行为一致的形态——旧 bug 只在命令自身被
+        // 包裹时发生）。
+        let tail = windows_cmd_tail("node", &["arg with space".into(), "--flag".into()]);
+        assert_eq!(tail, "node \"arg with space\" --flag");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cmd_tail_escapes_embedded_quotes_and_doubles_trailing_backslashes() {
+        // 内嵌 `"` 写成 `\"`（cmd 不改动参数区内容，子进程的 MSVCRT argv
+        // 解析按 `\"` 还原）；参数尾部的连续反斜杠在收尾引号前加倍（MSVCRT
+        // 规则：否则 `C:\dir\` 末尾的 `\` 会把引号吃成转义引号，参数边界
+        // 丢失）。
+        let tail = windows_cmd_tail(
+            "node",
+            &["say \"hi\"".into(), "C:\\dir with space\\".into()],
+        );
+        assert_eq!(tail, "node \"say \\\"hi\\\"\" \"C:\\dir with space\\\\\"");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cmd_tail_quotes_cjk_and_empty_arguments() {
+        // 非 ASCII（CJK 路径常见）保守包裹；空参数必须成对引号，否则在命
+        // 令行上整个消失。
+        let tail = windows_cmd_tail("npx", &["服务器.js".into(), String::new(), "x".into()]);
+        assert_eq!(tail, "npx \"服务器.js\" \"\" x");
+    }
+
+    /// 端到端往返：真 cmd 子进程 + 含空格的可执行路径（临时 .cmd 批处
+    /// 理——正是 cmd /C 包装为之存在的 npm 垫片形态）。旧行为（std 编码
+    /// 「包裹的命令 + 包裹的参数」= 4 引号被剥首尾）下该形态直接
+    /// "'…' 不是内部或外部命令"；windows_cmd_tail 的外层包装必须让含空
+    /// 路径真正跑起来，参数也到达（批处理 %* 对 `\"` 的再解析有自身怪
+    /// 癖，参数只断言载荷到达，不断言精确引号形态）。
+    #[cfg(windows)]
+    #[test]
+    fn windows_cmd_tail_roundtrips_through_a_real_cmd_spawn() {
+        use std::os::windows::process::CommandExt;
+        // 目录名带空格 → 批处理全路径必被引号包裹（旧 bug 的触发前提）。
+        let dir = std::env::temp_dir().join(format!("ta mcp tail {}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let script_path = dir.join("server.cmd");
+        std::fs::write(&script_path, "@echo off\r\necho tail-ok %*\r\n").expect("write cmd");
+        let script = script_path.to_string_lossy().into_owned();
+        let tail = windows_cmd_tail(&script, &["hello \"world\"".into(), "a b".into()]);
+        let out = std::process::Command::new("cmd")
+            .arg("/C")
+            .raw_arg(tail)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("spawn cmd /C tail");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stdout.contains("tail-ok"),
+            "spaced exe path never ran (command line mangled?): stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            stdout.contains("hello"),
+            "arg 1 payload missing: {stdout:?}"
+        );
+        assert!(
+            stdout.contains("world"),
+            "arg 1 quote content missing: {stdout:?}"
+        );
+        assert!(stdout.contains("a b"), "arg 2 payload missing: {stdout:?}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ─── Windows shutdown-reaper ──────────────────────────────────────
@@ -2196,6 +2740,40 @@ mod tests {
 
     // ─── Streamable HTTP: 202 Accepted gap ────────────────────────────
 
+    /// Read one full HTTP request (headers through the blank line, then
+    /// `content-length` more bytes of POST body) from a mock socket, and
+    /// return the lowercased head — the mocks below route by method/path and
+    /// assert on headers through it. Shared by every Streamable-HTTP mock in
+    /// this module; bounded at 16 KiB so a runaway request can't park the
+    /// mock thread forever.
+    fn mock_read_request(sock: &mut std::net::TcpStream) -> String {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        while !buf.ends_with(b"\r\n\r\n") {
+            match sock.read(&mut byte) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    buf.push(byte[0]);
+                    if buf.len() > 16 * 1024 {
+                        return String::new(); // runaway request — bail out bounded
+                    }
+                }
+            }
+        }
+        let head = String::from_utf8_lossy(&buf).to_lowercase();
+        let clen: usize = head
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0);
+        let mut body = vec![0u8; clen];
+        if clen > 0 {
+            let _ = sock.read_exact(&mut body);
+        }
+        head
+    }
+
     /// Minimal HTTP/1.1 mock standing in for a Streamable HTTP server that
     /// defers responses to the standalone SSE stream: POST → `202 Accepted`
     /// with no body (plus `Mcp-Session-Id`, as an initialize-shaped response
@@ -2209,7 +2787,6 @@ mod tests {
     /// can't park the thread forever), sockets get a read timeout, and the
     /// mock exits after serving the two expected requests.
     fn mock_202_then_sse() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
-        use std::io::Read;
         use std::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
         let url = format!(
@@ -2235,31 +2812,7 @@ mod tests {
                     };
                     sock.set_nonblocking(false).ok();
                     sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
-                    // Read one full request: headers through the blank line,
-                    // then `content-length` more bytes (POST body).
-                    let mut buf = Vec::new();
-                    let mut byte = [0u8; 1];
-                    while !buf.ends_with(b"\r\n\r\n") {
-                        match sock.read(&mut byte) {
-                            Ok(0) | Err(_) => break,
-                            Ok(_) => {
-                                buf.push(byte[0]);
-                                if buf.len() > 16 * 1024 {
-                                    return; // runaway request — bail out bounded
-                                }
-                            }
-                        }
-                    }
-                    let head = String::from_utf8_lossy(&buf).to_lowercase();
-                    let clen: usize = head
-                        .lines()
-                        .find_map(|l| l.strip_prefix("content-length:"))
-                        .and_then(|v| v.trim().parse().ok())
-                        .unwrap_or(0);
-                    let mut body = vec![0u8; clen];
-                    if clen > 0 {
-                        let _ = sock.read_exact(&mut body);
-                    }
+                    let head = mock_read_request(&mut sock);
                     let is_post = head.starts_with("post");
                     log_c.lock().unwrap().push(head);
                     served += 1;
@@ -2333,6 +2886,276 @@ mod tests {
             log[1].contains("mcp-session-id: sess-202"),
             "GET must carry the session id: {}",
             log[1]
+        );
+    }
+
+    /// Mock for the SHARED standing-stream scenario: POST → 202 (+ session
+    /// id); each GET opens an SSE stream that first delivers response #1,
+    /// then — once the SECOND POST has arrived (poll the shared log) —
+    /// delivers response #2 ON THE SAME CONNECTION. Connections are served
+    /// on per-connection threads (a serial accept loop could never keep the
+    /// GET stream alive across the second POST — which is the entire point
+    /// under test). Bounded like the sibling mock: deadline-capped accept
+    /// loop, read timeouts, bounded request reads.
+    fn mock_202_shared_stream() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let url = format!(
+            "http://127.0.0.1:{}/mcp",
+            listener.local_addr().unwrap().port()
+        );
+        let log: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let log_main = log.clone();
+        std::thread::Builder::new()
+            .name("mcp-shared-mock".into())
+            .spawn(move || {
+                listener.set_nonblocking(true).expect("nonblocking");
+                let deadline = Instant::now() + Duration::from_secs(15);
+                while Instant::now() < deadline {
+                    let mut sock = match listener.accept() {
+                        Ok((s, _)) => s,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(20));
+                            continue;
+                        }
+                        Err(_) => return,
+                    };
+                    sock.set_nonblocking(false).ok();
+                    sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                    let log_c = log_main.clone();
+                    std::thread::Builder::new()
+                        .name("mcp-shared-mock-conn".into())
+                        .spawn(move || {
+                            let head = mock_read_request(&mut sock);
+                            if head.is_empty() {
+                                return;
+                            }
+                            let is_post = head.starts_with("post");
+                            log_c.lock().unwrap().push(head);
+                            if is_post {
+                                let resp = "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\n\
+                                            mcp-session-id: sess-shared\r\nconnection: close\r\n\r\n";
+                                let _ = sock.write_all(resp.as_bytes());
+                                let _ = sock.flush();
+                            } else {
+                                // Response #1 rides immediately; response #2 only
+                                // after the second POST exists — proving the same
+                                // connection served two different requests.
+                                let resp = concat!(
+                                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                                     cache-control: no-cache\r\nconnection: close\r\n\r\n",
+                                    "event: message\n",
+                                    "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"n\":1}}\n\n",
+                                );
+                                let _ = sock.write_all(resp.as_bytes());
+                                let _ = sock.flush();
+                                let wait = Instant::now() + Duration::from_secs(10);
+                                while Instant::now() < wait {
+                                    let posts = log_c
+                                        .lock()
+                                        .unwrap()
+                                        .iter()
+                                        .filter(|l| l.starts_with("post"))
+                                        .count();
+                                    if posts >= 2 {
+                                        break;
+                                    }
+                                    std::thread::sleep(Duration::from_millis(20));
+                                }
+                                let resp2 = "event: message\n\
+                                             data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"n\":2}}\n\n";
+                                let _ = sock.write_all(resp2.as_bytes());
+                                let _ = sock.flush();
+                                // Let the client read before the drop closes the
+                                // socket (the response body is close-delimited).
+                                std::thread::sleep(Duration::from_millis(300));
+                            }
+                        })
+                        .expect("spawn conn thread");
+                }
+            })
+            .expect("spawn mock");
+        (url, log)
+    }
+
+    #[test]
+    fn http_202_responses_arrive_on_one_shared_standing_stream() {
+        // The standing standalone stream must be SHARED across 202s: request
+        // #1's response and request #2's response both arrive on the ONE GET
+        // connection opened when the session was established — never a fresh
+        // GET per 202 (the old per-202 GET is also the race surface: each
+        // reopen is a window where the server's push finds nobody connected).
+        let (url, log) = mock_202_shared_stream();
+        let cfg = McpServerConfig {
+            name: "mock-shared".into(),
+            command: None,
+            args: vec![],
+            env: HashMap::new(),
+            url: Some(url.clone()),
+            transport: Some(McpTransport::Http),
+            headers: HashMap::new(),
+        };
+        let mut t = HttpTransport::new(&url, &cfg).expect("transport");
+        let r1 = t
+            .request(1, "tools/list", json!({}), None)
+            .expect("first 202 response arrives via the standing stream");
+        assert_eq!(r1["n"], 1);
+        let r2 = t
+            .request(2, "tools/call", json!({}), None)
+            .expect("second 202 response arrives on the SAME stream");
+        assert_eq!(r2["n"], 2);
+        // The wire shape that proves sharing: exactly POST + GET + POST — one
+        // GET for the whole session. The old behavior would show a second GET
+        // here (and, raced, could lose the response entirely).
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 3, "expected POST + GET + POST, got {log:?}");
+        assert_eq!(
+            log.iter().filter(|l| l.starts_with("get")).count(),
+            1,
+            "exactly one GET may serve both 202s, got {log:?}"
+        );
+    }
+
+    /// Mock for the RECONNECT scenario: the first GET stream delivers
+    /// response #1 and is closed by the SERVER immediately (idle streams do
+    /// get dropped); the reconnect GET (whenever the client retries) waits
+    /// for the second POST to exist, then delivers response #2. Connections
+    /// are routed by request method (not arrival order — the client's
+    // reconnect may legally race the second POST), each on its own thread.
+    fn mock_202_reconnect() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let url = format!(
+            "http://127.0.0.1:{}/mcp",
+            listener.local_addr().unwrap().port()
+        );
+        let log: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let log_main = log.clone();
+        let get_round = Arc::new(std::sync::Mutex::new(0usize));
+        std::thread::Builder::new()
+            .name("mcp-reconn-mock".into())
+            .spawn(move || {
+                listener.set_nonblocking(true).expect("nonblocking");
+                let deadline = Instant::now() + Duration::from_secs(15);
+                while Instant::now() < deadline {
+                    let mut sock = match listener.accept() {
+                        Ok((s, _)) => s,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(20));
+                            continue;
+                        }
+                        Err(_) => return,
+                    };
+                    sock.set_nonblocking(false).ok();
+                    sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                    let log_c = log_main.clone();
+                    let round_c = get_round.clone();
+                    std::thread::Builder::new()
+                        .name("mcp-reconn-mock-conn".into())
+                        .spawn(move || {
+                            let head = mock_read_request(&mut sock);
+                            if head.is_empty() {
+                                return;
+                            }
+                            let is_post = head.starts_with("post");
+                            log_c.lock().unwrap().push(head);
+                            if is_post {
+                                let resp = "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\n\
+                                            mcp-session-id: sess-reconn\r\nconnection: close\r\n\r\n";
+                                let _ = sock.write_all(resp.as_bytes());
+                                let _ = sock.flush();
+                                return;
+                            }
+                            let round = {
+                                let mut g = round_c.lock().unwrap();
+                                *g += 1;
+                                *g
+                            };
+                            if round == 1 {
+                                // Deliver response #1, then close AT ONCE — the
+                                // server-dropped-stream shape the reader must
+                                // survive by reconnecting.
+                                let resp = concat!(
+                                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                                     cache-control: no-cache\r\nconnection: close\r\n\r\n",
+                                    "event: message\n",
+                                    "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"n\":1}}\n\n",
+                                );
+                                let _ = sock.write_all(resp.as_bytes());
+                                let _ = sock.flush();
+                                std::thread::sleep(Duration::from_millis(50));
+                            } else {
+                                // The reconnected stream waits for POST #2 (the
+                                // client's reconnect may beat the second request),
+                                // then delivers response #2.
+                                let wait = Instant::now() + Duration::from_secs(10);
+                                while Instant::now() < wait {
+                                    let posts = log_c
+                                        .lock()
+                                        .unwrap()
+                                        .iter()
+                                        .filter(|l| l.starts_with("post"))
+                                        .count();
+                                    if posts >= 2 {
+                                        break;
+                                    }
+                                    std::thread::sleep(Duration::from_millis(20));
+                                }
+                                let resp = concat!(
+                                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                                     cache-control: no-cache\r\nconnection: close\r\n\r\n",
+                                    "event: message\n",
+                                    "data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"n\":2}}\n\n",
+                                );
+                                let _ = sock.write_all(resp.as_bytes());
+                                let _ = sock.flush();
+                                std::thread::sleep(Duration::from_millis(300));
+                            }
+                        })
+                        .expect("spawn conn thread");
+                }
+            })
+            .expect("spawn mock");
+        (url, log)
+    }
+
+    #[test]
+    fn http_202_standing_stream_reconnects_after_server_drop() {
+        // A server (or idle-connection-dropping proxy) that closes the
+        // standing stream mid-session must not doom later 202s: the reader
+        // thread reconnects, and request #2's response — pushed on the
+        // RECONNECTED stream — still reaches its waiter. Under the old
+        // per-202 GET this exact sequence worked by accident (a fresh GET
+        // per request); the fix must keep it working while sharing.
+        let (url, log) = mock_202_reconnect();
+        let cfg = McpServerConfig {
+            name: "mock-reconn".into(),
+            command: None,
+            args: vec![],
+            env: HashMap::new(),
+            url: Some(url.clone()),
+            transport: Some(McpTransport::Http),
+            headers: HashMap::new(),
+        };
+        let mut t = HttpTransport::new(&url, &cfg).expect("transport");
+        let r1 = t
+            .request(1, "tools/list", json!({}), None)
+            .expect("first response arrives before the stream drop");
+        assert_eq!(r1["n"], 1);
+        let r2 = t
+            .request(2, "tools/call", json!({}), None)
+            .expect("second response arrives on the reconnected stream");
+        assert_eq!(r2["n"], 2);
+        let log = log.lock().unwrap();
+        assert_eq!(
+            log.iter().filter(|l| l.starts_with("post")).count(),
+            2,
+            "two POSTs, got {log:?}"
+        );
+        assert_eq!(
+            log.iter().filter(|l| l.starts_with("get")).count(),
+            2,
+            "the dropped stream must have been reopened, got {log:?}"
         );
     }
 }

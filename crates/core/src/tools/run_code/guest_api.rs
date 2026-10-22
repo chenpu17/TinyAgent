@@ -69,27 +69,90 @@ pub(super) fn unpack(packed: i64) -> (usize, usize) {
     ((packed >> 32) as u32 as usize, packed as u32 as usize)
 }
 
-/// Read a byte range the guest points at. `None` on null/oversized/OOB — the
-/// guest is untrusted, so every pointer/length pair is validated before use.
+/// Host-side cap on ONE import-surface read of guest memory (1 MiB): the
+/// name/args buffers of `host_call_tool` and each `host_log` line. The
+/// guest's own budgets (mem_mb, fuel) bound what it can build, but the HOST
+/// copy is invisible to all of them — this cap keeps a runaway guest payload
+/// from becoming a runaway host allocation. The guest-BOUND results channel
+/// has its own larger cap (`GUEST_READ_CAP_BYTES`, sandbox.rs), so a guest
+/// can receive more in one call than it can send; large guest→host payloads
+/// belong in files (the skill's recipe), which the over-cap error says.
+pub(super) const MAX_GUEST_READ_BYTES: i32 = 1 << 20;
+
+/// Why a guest→host read failed. The two classes get DIFFERENT guest-visible
+/// copy (see [`guest_args_too_large_why`]): `TooLarge` carries the
+/// guest-declared length so the message can name the actual size and the
+/// recovery; `BadPointer` (null / OOB / negative) is the guest breaking the
+/// memory contract — the shipped glue never does.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum GuestReadErr {
+    TooLarge(i32),
+    BadPointer,
+}
+
+/// Classify a guest-declared read length before any memory is touched (the
+/// pure, unit-testable half of [`read_guest`]'s validation — the memory read
+/// itself needs a live `Caller`, same seam note as [`parse_guest_args`]):
+/// over-cap → `TooLarge(len)` (a fixable misrouting), negative →
+/// `BadPointer` (a bogus length is the pointer story, not a size story).
+fn classify_guest_len(len: i32) -> Result<(), GuestReadErr> {
+    if len > MAX_GUEST_READ_BYTES {
+        Err(GuestReadErr::TooLarge(len))
+    } else if len < 0 {
+        Err(GuestReadErr::BadPointer)
+    } else {
+        Ok(())
+    }
+}
+
+/// Read a byte range the guest points at. `Err` classifies the failure
+/// ([`GuestReadErr`]) — the guest is untrusted, so every pointer/length
+/// pair is validated before use.
 pub(super) fn read_guest(
     mem: Option<Extern>,
     caller: &Caller<'_, HostCtx>,
     ptr: i32,
     len: i32,
-) -> Option<String> {
-    if !(0..=(1 << 20)).contains(&len) {
-        return None;
-    }
+) -> Result<String, GuestReadErr> {
+    classify_guest_len(len)?;
     if len == 0 {
-        return Some(String::new());
+        return Ok(String::new());
     }
     if ptr <= 0 {
-        return None;
+        return Err(GuestReadErr::BadPointer);
     }
-    let mem: Memory = mem?.into_memory()?;
+    let mem: Memory = mem
+        .ok_or(GuestReadErr::BadPointer)?
+        .into_memory()
+        .ok_or(GuestReadErr::BadPointer)?;
     let mut buf = vec![0u8; len as usize];
-    mem.read(caller, ptr as usize, &mut buf).ok()?;
-    Some(String::from_utf8_lossy(&buf).into_owned())
+    mem.read(caller, ptr as usize, &mut buf)
+        .map_err(|_| GuestReadErr::BadPointer)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// The over-cap copy for tool ARGUMENTS: names the actual byte count and the
+/// 1 MiB guest→host cap, then the recovery. The old single message folded
+/// this into "bad args pointer from guest" — no size, no recovery, and a
+/// misdiagnosis (the shipped glue always hands valid pointers; an over-cap
+/// blob is the model stuffing data into args, which the file recipe fixes).
+pub(super) fn guest_args_too_large_why(len: i32) -> String {
+    format!(
+        "run_code: tool arguments are {len} bytes — over the 1 MiB \
+         ({MAX_GUEST_READ_BYTES}-byte) guest→host argument cap, so the call did \
+         not run. Large data belongs in a file: write_file the payload and pass \
+         the path, or submit the work in smaller chunks"
+    )
+}
+
+/// The over-cap copy for the tool NAME: a name that long is never data —
+/// point at tools.list() instead of the file recipe.
+pub(super) fn guest_name_too_large_why(len: i32) -> String {
+    format!(
+        "run_code: guest tool name is {len} bytes — over the 1 MiB \
+         ({MAX_GUEST_READ_BYTES}-byte) guest→host read cap, so the call did not \
+         run; no tool name is that long — check tools.list() for the real names"
+    )
 }
 
 /// Write `bytes` into fresh guest memory via the guest's own `alloc` export
@@ -256,10 +319,20 @@ pub(super) fn host_call_tool(
     let mem = caller.get_export("memory");
     // Symmetric explicit errors for both pointers (sec-review n-1): a bad
     // name pointer must report itself, not silently become "" → "unknown
-    // tool" hiding the corruption.
+    // tool" hiding the corruption. Over-cap reads get their own size
+    // diagnosis ([`GuestReadErr`]) instead of the pointer blame.
     let name = match read_guest(mem.clone(), caller, name_ptr, name_len) {
-        Some(s) => s,
-        None => {
+        Ok(s) => s,
+        Err(GuestReadErr::TooLarge(len)) => {
+            return envelope_err(
+                caller,
+                "host",
+                None,
+                Some(false),
+                &guest_name_too_large_why(len),
+            )
+        }
+        Err(GuestReadErr::BadPointer) => {
             return envelope_err(
                 caller,
                 "host",
@@ -270,8 +343,17 @@ pub(super) fn host_call_tool(
         }
     };
     let args_raw = match read_guest(mem, caller, args_ptr, args_len) {
-        Some(s) => s,
-        None => {
+        Ok(s) => s,
+        Err(GuestReadErr::TooLarge(len)) => {
+            return envelope_err(
+                caller,
+                "host",
+                Some(&name),
+                Some(false),
+                &guest_args_too_large_why(len),
+            )
+        }
+        Err(GuestReadErr::BadPointer) => {
             return envelope_err(
                 caller,
                 "host",
@@ -651,7 +733,6 @@ pub(super) fn emit_inner_result(caller: &mut Caller<'_, HostCtx>, name: &str, ou
     });
 }
 
-/// Saturating usage fold for inner-call billing (same shape as the core's).
 /// One `tools.list()` entry: name + description capped at 200 chars (§2 —
 /// 50 tools with long descriptions would bloat the guest's memory for no
 /// value; the model only needs to recognize names).
@@ -1102,6 +1183,82 @@ return t.length;"#}),
             let e = parse_guest_args(garbage).expect_err("garbage must fail, not become {}");
             assert!(e.contains("not valid JSON"), "{e}");
         }
+    }
+
+    /// F2: the over-cap read class carries a SIZE diagnosis, not the pointer
+    /// blame — the actual byte count, the 1 MiB cap, and the recovery (args
+    /// → the file recipe; name → tools.list()). Pure half; the e2e below
+    /// drives the real args path through the guest glue.
+    #[test]
+    fn oversized_guest_read_reports_size_cap_and_recovery() {
+        let m = guest_args_too_large_why((1 << 20) + 123);
+        assert!(m.contains("1048699 bytes"), "the actual size is named: {m}");
+        assert!(m.contains("1048576"), "the cap is named: {m}");
+        assert!(m.contains("write_file"), "the recovery recipe: {m}");
+        assert!(!m.contains("bad args pointer"), "{m}");
+        let n = guest_name_too_large_why(5_000_000);
+        assert!(n.contains("5000000 bytes"), "the actual size is named: {n}");
+        assert!(n.contains("tools.list()"), "names point at the list: {n}");
+        assert!(!n.contains("bad name pointer"), "{n}");
+        // And the pure length classification: over-cap is TooLarge(len),
+        // negative is the pointer class, in-range (0, cap, mid) passes.
+        assert_eq!(
+            classify_guest_len((1 << 20) + 1),
+            Err(GuestReadErr::TooLarge((1 << 20) + 1))
+        );
+        assert_eq!(classify_guest_len(-1), Err(GuestReadErr::BadPointer));
+        for ok in [0, 5, 1 << 20] {
+            assert_eq!(classify_guest_len(ok), Ok(()));
+        }
+    }
+
+    /// F2 e2e: a >1 MiB args blob crosses the REAL guest glue — the host
+    /// read is refused with the size diagnosis (actual bytes + cap + the
+    /// file recipe) as a `host`-class catchable error, not the old
+    /// pointer-corruption blame with no number and no recovery. The
+    /// BadPointer arms keep their original literals byte-for-byte (the full
+    /// pointer path needs a hand-crafted wasm caller the sandbox never
+    /// exposes to JS — same seam note as parse_guest_args).
+    #[test]
+    fn oversized_guest_args_get_size_diagnosis_e2e() {
+        let dir = scratch();
+        let out = tool_with_tools(CodeConfig::default(), r#"["read_file","write_file"]"#)
+            .run_with_emit(
+                &json!({"code": r#"
+                    var msg = "no-error", kind = "", retryable = "";
+                    try {
+                        tools.call("write_file",
+                            {path: "big.txt", content: "y".repeat(2 * 1024 * 1024)});
+                    } catch (e) {
+                        msg = String(e.message); kind = e.kind; retryable = e.retryable;
+                    }
+                    return {msg: msg, kind: kind, retryable: retryable};"#}),
+                &ctx(&dir),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(!out.is_error, "guest failed: {}", out.content);
+        let v: Value = serde_json::from_str(&out.content).unwrap_or(json!(null));
+        assert_eq!(v["kind"], json!("host"), "{}", v);
+        assert_eq!(
+            v["retryable"],
+            json!(false),
+            "host class stays definitive: {v}"
+        );
+        let msg = v["msg"].as_str().unwrap_or_default();
+        assert!(msg.contains("tool arguments are"), "{msg}");
+        assert!(msg.contains("write_file"), "recovery recipe: {msg}");
+        assert!(!msg.contains("bad args pointer"), "{msg}");
+        // The actual byte count is IN the message: serialized args are the
+        // fixed JSON prefix + 2 MiB of 'y', so the number exceeds 2_000_000.
+        let n = msg
+            .split("tool arguments are ")
+            .nth(1)
+            .and_then(|rest| rest.split(" bytes").next())
+            .and_then(|digits| digits.parse::<u64>().ok())
+            .unwrap_or(0);
+        assert!(n > 2_000_000, "the actual size is named: {msg}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// v2 review — structured error fields: `e.kind` / `e.tool` /

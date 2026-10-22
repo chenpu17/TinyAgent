@@ -753,10 +753,11 @@ fn slash_popup_lines(popup: &SlashPopup, max_rows: usize) -> Vec<Line<'static>> 
 /// cut mid-paragraph) folds into the previous block with a single `\n`, so
 /// concatenated chunks reassemble the original text; everything else starts
 /// after a blank line. A tight chunk cut inside a code fence begins with a
-/// synthetic `"```\n"` opener (see `split_streaming_row`) so it renders as
-/// code on its own — stripped here, the model never wrote that line. Corner
-/// case: a model-emitted bare ``` opener landing exactly on a cut line loses
-/// that line in the dump (readability export, not an archive).
+/// synthetic opener — three of the fence's marker char, ``` or ~~~ (see
+/// `split_streaming_row`) — so it renders as code on its own; stripped here,
+/// the model never wrote that line. Corner case: a model-emitted bare fence
+/// opener landing exactly on a cut line loses that line in the dump
+/// (readability export, not an archive).
 fn render_transcript(rows: &[Row]) -> String {
     let mut out = String::new();
     for row in rows {
@@ -770,7 +771,10 @@ fn render_transcript(rows: &[Row]) -> String {
             Row::AssistantCont { text: t, .. } if t.is_empty() => continue,
             Row::AssistantCont { text: t, tight } => {
                 let body = if *tight {
-                    t.strip_prefix("```\n").unwrap_or(t)
+                    // Either marker shape (see split_streaming_row).
+                    t.strip_prefix("```\n")
+                        .or_else(|| t.strip_prefix("~~~\n"))
+                        .unwrap_or(t)
                 } else {
                     t.as_str()
                 };
@@ -3399,24 +3403,28 @@ fn append_delta(rows: &mut Vec<Row>, streaming: &mut bool, text: &str) {
 }
 
 /// Byte offset where the tail of `text` may be split off: the START of the
-/// last paragraph that follows a blank line OUTSIDE any open ``` fence, so
-/// everything before it is final (closed markdown blocks). None when no safe
-/// boundary exists. The offset is where a new paragraph's first line begins;
-/// the `\n\n` separator itself stays with the prefix and is trimmed there.
+/// last paragraph that follows a blank line OUTSIDE any open code fence
+/// (``` or ~~~, tracked by the shared [`fence_step`] scan), so everything
+/// before it is final (closed markdown blocks). None when no safe boundary
+/// exists. The offset is where a new paragraph's first line begins; the
+/// `\n\n` separator itself stays with the prefix and is trimmed there.
 fn last_safe_boundary(text: &str) -> Option<usize> {
     let mut best: Option<usize> = None;
-    let mut fence_open = false;
+    // Open fence (marker char × length) — tilde fences count exactly like
+    // backtick ones (the old flip-on-``` toggle cut ~~~ blocks mid-content).
+    let mut fence: Option<(char, usize)> = None;
     let mut prev_blank = false;
     let mut seen_content = false;
     let mut offset = 0usize;
     for line in text.split('\n') {
         let is_blank = line.trim().is_empty();
-        if prev_blank && !is_blank && !fence_open && seen_content {
+        // A fence line classified BEFORE the boundary check of the NEXT line:
+        // cutting right before an opener is safe, cutting before the line
+        // after a closer only becomes safe once the fence has closed.
+        if prev_blank && !is_blank && fence.is_none() && seen_content {
             best = Some(offset);
         }
-        if line.trim_start().starts_with("```") {
-            fence_open = !fence_open;
-        }
+        fence = fence_next(line, fence);
         seen_content |= !is_blank;
         prev_blank = is_blank;
         offset += line.len() + 1; // +1 for the '\n' split_inclusive-style step
@@ -3452,14 +3460,15 @@ fn est_display_rows(text: &str, width: usize) -> usize {
 /// Byte offset where a DISPLAY-row cut may split `text` so the tail keeps
 /// ~`keep_rows` wrapped rows: the cut always sits on a wrap boundary (a char
 /// that starts a fresh display row — the char after a `\n`, or the char that
-/// overflows the width). Returns (offset, fence_open) — fence_open says the
-/// cut lands INSIDE an unclosed ``` fence; the caller then re-opens the fence
-/// in the tail so both halves render as code. A cut landing exactly ON the
-/// fence's closing line slides past it (the closer joins the prefix, tail
-/// starts fence-free). None while the text is too short. Widths use
-/// unicode-width per char, the same tables the renderer wraps with — drift
-/// only raggeds the seam cosmetically, no text is lost or duplicated.
-fn soft_cut_offset(text: &str, width: usize, keep_rows: usize) -> Option<(usize, bool)> {
+/// overflows the width). Returns (offset, fence) — `fence` is `Some(ch)` when
+/// the cut lands INSIDE an unclosed fence of marker char `ch`; the caller
+/// then re-opens the fence (with its OWN marker char) in the tail so both
+/// halves render as code. A cut landing exactly ON the fence's closing line
+/// slides past it (the closer joins the prefix, tail starts fence-free).
+/// None while the text is too short. Widths use unicode-width per char, the
+/// same tables the renderer wraps with — drift only raggeds the seam
+/// cosmetically, no text is lost or duplicated.
+fn soft_cut_offset(text: &str, width: usize, keep_rows: usize) -> Option<(usize, Option<char>)> {
     let w = width.max(1);
     if keep_rows == 0 {
         return None;
@@ -3468,16 +3477,14 @@ fn soft_cut_offset(text: &str, width: usize, keep_rows: usize) -> Option<(usize,
     if total <= keep_rows {
         return None;
     }
-    let target = total - keep_rows; // rows that stay with the prefix
+    let target = total - keep_rows; // rows that stay with the prefix side
     let mut rows = 0usize; // display rows completed on the prefix side
-    let mut fence_open = false;
+    let mut fence: Option<(char, usize)> = None;
     let mut line_start = 0usize;
     let mut col = 0usize;
     for (i, ch) in text.char_indices() {
         if ch == '\n' {
-            if text[line_start..i].trim_start().starts_with("```") {
-                fence_open = !fence_open;
-            }
+            fence = fence_next(&text[line_start..i], fence);
             rows += 1; // a line always completes exactly one final row
             col = 0;
             line_start = i + 1;
@@ -3486,11 +3493,14 @@ fn soft_cut_offset(text: &str, width: usize, keep_rows: usize) -> Option<(usize,
                 // The tail would start on the fence's closing line — slide
                 // past it (may leave an empty tail when it was the last
                 // line; the caller's empty-tail guard aborts the split).
-                if fence_open && text[at..].starts_with("```") {
+                // fence_step can only say Close for the line that closes
+                // the currently open fence, tilde or backtick alike.
+                let tail_line = text[at..].lines().next().unwrap_or("");
+                if matches!(fence_step(tail_line, fence), FenceLine::Close) {
                     let nl = text[at..].find('\n')?;
-                    return Some((at + nl + 1, false));
+                    return Some((at + nl + 1, None));
                 }
-                return Some((at, fence_open));
+                return Some((at, fence.map(|(ch, _)| ch)));
             }
             continue;
         }
@@ -3499,7 +3509,7 @@ fn soft_cut_offset(text: &str, width: usize, keep_rows: usize) -> Option<(usize,
             rows += 1;
             col = 0;
             if rows == target {
-                return Some((i, fence_open));
+                return Some((i, fence.map(|(ch, _)| ch)));
             }
         }
         col += cw;
@@ -3526,10 +3536,12 @@ fn soft_cut_offset(text: &str, width: usize, keep_rows: usize) -> Option<(usize,
 ///   one-huge-logical-line prose paragraph — would cycle inside the live
 ///   box until it closes (the pre-row-cut behavior). The chunk is
 ///   `tight: true` (mid-paragraph: renders flush, transcript joins with
-///   `\n`). Cutting inside an open ``` fence prepends a synthetic `"```\n"`
-///   opener to the tail: the unclosed prefix still renders as a code
-///   block, and the tail renders as code on its own; thinking rows skip
-///   this (plain prose render, a literal ``` would show).
+///   `\n`). Cutting inside an open code fence prepends a synthetic opener
+///   to the tail — three of the fence's OWN marker char, so a cut ``` block
+///   re-opens as ``` and a cut ~~~ block as ~~~: the unclosed prefix still
+///   renders as a code block, and the tail renders as code on its own;
+///   thinking rows skip this (plain prose render, a literal fence would
+///   show).
 /// - Once a row has been split at all, the threshold drops from viewport
 ///   height to `LIVE_TAIL_ROWS` so every further row commits as written —
 ///   an 8-row re-arm window would cycle visibly between cuts. Paragraph
@@ -3577,7 +3589,7 @@ fn split_streaming_row(rows: &mut Vec<Row>, width: usize) {
             matches!(para, Some(p) if est_display_rows(&text[p..], width) <= threshold);
         let (at, tight, fence_reopen) =
             match (para_usable, soft_cut_offset(text, width, LIVE_TAIL_ROWS)) {
-                (true, _) => (para.expect("para_usable implies Some"), false, false),
+                (true, _) => (para.expect("para_usable implies Some"), false, None),
                 (false, Some((l, fo))) => (l, true, fo),
                 // Unreachable (est > threshold >= LIVE_TAIL_ROWS guarantees a
                 // row cut) — kept as a guard, not a silent no-op path.
@@ -3597,8 +3609,14 @@ fn split_streaming_row(rows: &mut Vec<Row>, width: usize) {
         if tail.is_empty() {
             return;
         }
-        if tight && fence_reopen && !is_thinking {
-            tail = format!("```\n{tail}");
+        // The cut landed inside an open fence (`fence_reopen` carries its
+        // marker char): re-open the tail with the fence's OWN marker — a
+        // cut ~~~ block re-opens as ~~~, not ```. Thinking rows skip this
+        // (plain prose render, a literal fence would show).
+        if !is_thinking {
+            if let Some(ch) = fence_reopen {
+                tail = format!("{ch}{ch}{ch}\n{tail}");
+            }
         }
         (tail, tight)
     };
@@ -4387,6 +4405,81 @@ enum FenceEvt {
     Content,
 }
 
+/// One SOURCE line's classification under the shared CommonMark fence scan
+/// ([`fence_step`]). `Content` covers every line inside an open fence that
+/// does not close it (fence-looking or not); `Plain` is everything outside.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FenceLine {
+    /// Opens a fence: `ch` is the marker char (`` ` `` or `~`), `len` its run
+    /// length (≥ 3).
+    Open { ch: char, len: usize },
+    /// Closes the fence that is currently open.
+    Close,
+    /// A code-content line inside the open fence (it did not close it).
+    Content,
+    /// Not a fence line at all (outside a fence).
+    Plain,
+}
+
+/// Classify one markdown SOURCE line against the currently open fence
+/// (`open` = `(marker char, opener length)` inside a code block, `None`
+/// outside), under CommonMark's fence rules: an OPENER is ≤3 spaces of
+/// indent then ≥3 backticks or tildes — a backtick opener's info string may
+/// not contain a backtick (the tilde-side restriction is deliberately
+/// relaxed, matching the historical scan here); a CLOSER repeats the
+/// opener's OWN character at ≥ its length with nothing but whitespace after.
+/// Backtick and tilde fences never close each other: a ``` line inside a
+/// ~~~ block is Content, and vice versa.
+///
+/// Shared by the render side ([`fence_plan`]) and the streaming split side
+/// ([`last_safe_boundary`] / [`soft_cut_offset`]) so the two cannot drift
+/// apart again — the split side used to flip its fence flag on any ```
+/// prefix, silently cutting ~~~ blocks open mid-content.
+fn fence_step(line: &str, open: Option<(char, usize)>) -> FenceLine {
+    // Spaces-only indent, mirroring the plan's model (a tab-indented
+    // construct is not a fence here; the render caller's verification and
+    // the split side's conservative in-fence treatment both stay safe).
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    let rest = &line[indent..];
+    let backticks = rest.chars().take_while(|c| *c == '`').count();
+    let tildes = rest.chars().take_while(|c| *c == '~').count();
+    if let Some((ch, need)) = open {
+        // Closer: same char, length ≥ the opener's, whitespace only after.
+        let run = if ch == '`' { backticks } else { tildes };
+        if indent <= 3 && run >= need && rest[run..].trim().is_empty() {
+            return FenceLine::Close;
+        }
+        return FenceLine::Content;
+    }
+    if indent > 3 {
+        return FenceLine::Plain;
+    }
+    // Opener: ≥3 markers; a backtick fence's info string must not contain
+    // backticks (CommonMark).
+    let (ch, run) = if backticks >= 3 {
+        ('`', backticks)
+    } else if tildes >= 3 {
+        ('~', tildes)
+    } else {
+        return FenceLine::Plain;
+    };
+    if ch == '`' && rest[run..].trim().contains('`') {
+        return FenceLine::Plain;
+    }
+    FenceLine::Open { ch, len: run }
+}
+
+/// Step the fence state over one SOURCE line: what `fence_step` classifies
+/// translates 1:1 into the new open-fence state (`Some((char, length))`
+/// inside a code block, `None` outside).
+fn fence_next(line: &str, open: Option<(char, usize)>) -> Option<(char, usize)> {
+    match fence_step(line, open) {
+        FenceLine::Open { ch, len } => Some((ch, len)),
+        FenceLine::Close => None,
+        FenceLine::Content | FenceLine::Plain => open,
+    }
+}
+
 /// Precompute the sequence of fence-looking lines tui-markdown will emit, with
 /// each classified from the SOURCE markdown.
 ///
@@ -4397,9 +4490,8 @@ enum FenceEvt {
 /// therefore renders its inner ``` content line indistinguishably from a real
 /// fence, and a naive rendered-lines toggle flips on it: the rest of the outer
 /// block renders as markdown and everything AFTER the outer close renders as
-/// code. The source keeps the tick counts, so a CommonMark-style scan (backtick
-/// AND tilde fences; a closer must repeat the same char at ≥ the opener's
-/// length with nothing but whitespace after) knows the inner line is content.
+/// code. The source keeps the tick counts, so a CommonMark-style scan (see
+/// [`fence_step`]) knows the inner line is content.
 ///
 /// The plan is only an ACCELERATION-VERIFIED heuristic, not a second parser:
 /// the caller checks it against the actual rendered lines (count + exact text)
@@ -4423,42 +4515,28 @@ fn fence_plan(md: &str) -> Vec<(FenceEvt, String)> {
     let mut open_indent = 0usize;
     for line in md.split('\n') {
         let indent = indent_of(line);
-        let rest = &line[indent..];
-        let backticks = rest.chars().take_while(|c| *c == '`').count();
-        let tildes = rest.chars().take_while(|c| *c == '~').count();
-        if let Some((ch, need)) = open {
-            // Closer: same char, length ≥ the opener's, whitespace only after.
-            let run = if ch == '`' { backticks } else { tildes };
-            if indent <= 3 && run >= need && rest[run..].trim().is_empty() {
+        match fence_step(line, open) {
+            FenceLine::Close => {
                 plan.push((FenceEvt::Close, "```".to_string()));
                 open = None;
-                continue;
             }
-            // Content: verbatim except the fence's own indent. Only lines
-            // that LOOK like fences enter the plan (the caller only matches
-            // those); the expected text is the rendered one.
-            let strip = open_indent.min(indent);
-            let stripped = &line[strip..];
-            if stripped.starts_with("```") {
-                plan.push((FenceEvt::Content, stripped.to_string()));
+            FenceLine::Open { ch, len } => {
+                let info = line[indent + len..].trim();
+                plan.push((FenceEvt::Open, format!("```{info}")));
+                open = Some((ch, len));
+                open_indent = indent;
             }
-        } else if indent <= 3 {
-            // Opener: ≥3 markers; a backtick fence's info string must not
-            // contain backticks (CommonMark).
-            let (ch, run) = if backticks >= 3 {
-                ('`', backticks)
-            } else if tildes >= 3 {
-                ('~', tildes)
-            } else {
-                continue;
-            };
-            let info = rest[run..].trim();
-            if ch == '`' && info.contains('`') {
-                continue;
+            FenceLine::Content => {
+                // Content: verbatim except the fence's own indent. Only lines
+                // that LOOK like fences enter the plan (the caller only
+                // matches those); the expected text is the rendered one.
+                let strip = open_indent.min(indent);
+                let stripped = &line[strip..];
+                if stripped.starts_with("```") {
+                    plan.push((FenceEvt::Content, stripped.to_string()));
+                }
             }
-            plan.push((FenceEvt::Open, format!("```{info}")));
-            open = Some((ch, run));
-            open_indent = indent;
+            FenceLine::Plain => {}
         }
     }
     // An unclosed fence at EOF is auto-closed by pulldown-cmark, and
@@ -6322,6 +6400,32 @@ mod tests {
     }
 
     #[test]
+    fn last_safe_boundary_tracks_tilde_fences_and_mixed_markers() {
+        // A blank line inside an open ~~~ fence is NOT a boundary (the old
+        // flip-on-``` toggle never opened on ~~~ and cut the block in two);
+        // the one after the ~~~ closes is.
+        let tilde = "~~~\ncode\n\nstill code\n~~~\n\nafter";
+        assert_eq!(last_safe_boundary(tilde), tilde.find("after"));
+        // ``` and ~~~ never close each other: the foreign fence-looking
+        // line inside the block is content, so the blank line after it
+        // stays unsafe in BOTH directions.
+        let tilde_outer = "~~~\ncode\n```\n\nstill code\n~~~\n\nafter";
+        assert_eq!(last_safe_boundary(tilde_outer), tilde_outer.find("after"));
+        let backtick_outer = "```\ncode\n~~~\n\nstill code\n```\n\nafter";
+        assert_eq!(
+            last_safe_boundary(backtick_outer),
+            backtick_outer.find("after")
+        );
+        // Cutting right BEFORE a fence opener is safe (everything before it
+        // is closed prose), and blank lines after the ~~~ block closed are
+        // boundaries again — tilde fences behave exactly like ``` ones.
+        let pre = "para\n\n~~~\ncode\n";
+        assert_eq!(last_safe_boundary(pre), pre.find("~~~"));
+        let post = "~~~\ncode\n~~~\n\npara2\n\npara3";
+        assert_eq!(last_safe_boundary(post), post.find("para3"));
+    }
+
+    #[test]
     fn split_streaming_row_flushes_prefix_and_keeps_tail_live() {
         let para = |n: usize| format!("l{n}a\nl{n}b\nl{n}c\nl{n}d"); // 4 lines
         let text = format!("{}\n\n{}\n\n{}", para(1), para(2), para(3)); // 12 lines
@@ -6449,23 +6553,43 @@ mod tests {
         assert_eq!(soft_cut_offset("anything", 80, 0), None);
         // Plain short lines (one display row each): the cut is the start of
         // the last-but-one line.
-        assert_eq!(soft_cut_offset("a\nb\nc", 80, 1), Some((4, false)));
-        assert_eq!(soft_cut_offset("a\nb\nc\nd", 80, 2), Some((4, false)));
+        assert_eq!(soft_cut_offset("a\nb\nc", 80, 1), Some((4, None)));
+        assert_eq!(soft_cut_offset("a\nb\nc\nd", 80, 2), Some((4, None)));
         // Cut inside an open fence (opener before, closer after).
         let fenced = "```\ncode1\ncode2\ncode3";
-        assert_eq!(soft_cut_offset(fenced, 80, 1), Some((16, true)));
+        assert_eq!(soft_cut_offset(fenced, 80, 1), Some((16, Some('`'))));
         // Cut landing exactly ON the closing fence slides past it: the
         // closer joins the prefix, the tail starts fence-free.
         let closing = "```\nc1\nc2\n```\nz";
-        assert_eq!(soft_cut_offset(closing, 80, 2), Some((14, false)));
+        assert_eq!(soft_cut_offset(closing, 80, 2), Some((14, None)));
         // A cut after the fence closed is a plain cut.
-        assert_eq!(soft_cut_offset(closing, 80, 1), Some((14, false)));
+        assert_eq!(soft_cut_offset(closing, 80, 1), Some((14, None)));
         // One huge logical line (the common prose shape): the cut sits on a
         // WRAP boundary — 10 chars at width 4 wrap into 3 rows (abcd / efgh /
         // ij); keeping the last row live cuts before "i", keeping two rows
         // cuts before "e".
-        assert_eq!(soft_cut_offset("abcdefghij", 4, 1), Some((8, false)));
-        assert_eq!(soft_cut_offset("abcdefghij", 4, 2), Some((4, false)));
+        assert_eq!(soft_cut_offset("abcdefghij", 4, 1), Some((8, None)));
+        assert_eq!(soft_cut_offset("abcdefghij", 4, 2), Some((4, None)));
+    }
+
+    #[test]
+    fn soft_cut_offset_tracks_tilde_fences_and_mixed_markers() {
+        // Cut inside an open ~~~ fence: the fence flag carries the tilde so
+        // the reopen synthesizes ~~~ (not ```).
+        let tilde = "~~~\ncode1\ncode2\ncode3";
+        assert_eq!(soft_cut_offset(tilde, 80, 1), Some((16, Some('~'))));
+        // A ``` line inside the open ~~~ block is CONTENT, not a closer —
+        // the cut (start of "code3") still reports the tilde fence open.
+        let mixed = "~~~\ncode1\n```\ncode2\ncode3";
+        assert_eq!(soft_cut_offset(mixed, 80, 1), Some((20, Some('~'))));
+        // Mirror image: a ~~~ line inside a ``` block doesn't close it.
+        let mixed_rev = "```\ncode1\n~~~\ncode2\ncode3";
+        assert_eq!(soft_cut_offset(mixed_rev, 80, 1), Some((20, Some('`'))));
+        // Cut landing exactly ON the ~~~ closer slides past it, fence-free
+        // (and a cut after it closed is a plain cut).
+        let closing = "~~~\nc1\nc2\n~~~\nz";
+        assert_eq!(soft_cut_offset(closing, 80, 2), Some((14, None)));
+        assert_eq!(soft_cut_offset(closing, 80, 1), Some((14, None)));
     }
 
     #[test]
@@ -6570,6 +6694,52 @@ mod tests {
         );
         assert!(
             dumped.contains("c9\nc10"),
+            "tight join is a single \\n: {dumped:?}"
+        );
+    }
+
+    #[test]
+    fn split_streaming_row_reopens_a_cut_tilde_fence_with_tildes() {
+        // The ~~~ counterpart: an unclosed tilde block longer than the
+        // viewport must NOT be treated as prose (the old fence toggle only
+        // knew ```), and the tail's synthetic opener uses the fence's OWN
+        // marker — ``` would open a DIFFERENT fence and leave the prefix's
+        // ~~~ unclosed.
+        let code = (0..11).map(|i| format!("t{i}")).collect::<Vec<_>>();
+        let text = format!("~~~\n{}", code.join("\n"));
+        let mut rows = vec![Row::Assistant(text)];
+        split_streaming_row(&mut rows, 80);
+        assert_eq!(rows.len(), 2);
+        assert!(
+            matches!(&rows[0], Row::Assistant(t) if *t == format!("~~~\n{}", code[..9].join("\n"))),
+            "unclosed tilde prefix keeps its lines: {:?}",
+            rows[0]
+        );
+        assert!(
+            matches!(&rows[1], Row::AssistantCont { text: t, .. } if *t == format!("~~~\n{}\n{}", code[9], code[10])),
+            "tail re-opens the TILDE fence with tildes: {:?}",
+            rows[1]
+        );
+        // Both halves render as code (guided `▎ ` bodies, no prose render).
+        let mut cache = MdCache::new();
+        let out = build_history_lines(&rows, &mut cache, TEST_W, LiveRow::None, false, true);
+        let joined: String = out.iter().map(row_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            joined.contains("▎ t8"),
+            "tilde prefix renders as code: {joined:?}"
+        );
+        assert!(
+            joined.contains("▎ t9"),
+            "reopened tilde tail renders as code: {joined:?}"
+        );
+        // The transcript strips the synthetic ~~~ opener back out.
+        let dumped = render_transcript(&rows);
+        assert!(
+            !dumped.contains("\n~~~\nt9"),
+            "synthetic tilde opener leaked: {dumped:?}"
+        );
+        assert!(
+            dumped.contains("t9\nt10"),
             "tight join is a single \\n: {dumped:?}"
         );
     }

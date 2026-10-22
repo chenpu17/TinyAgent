@@ -269,10 +269,13 @@ impl Drop for IsolationGuard {
         match self.mode {
             IsolateMode::Copy => {
                 if let Err(e) = std::fs::remove_dir_all(&self.dir) {
-                    eprintln!(
+                    // note, not eprintln!: Drop can run mid-panic-unwind, where
+                    // a panicking eprintln! (closed stderr) would abort the
+                    // process instead of finishing the cleanup walk.
+                    harness::note(format_args!(
                         "[warn] isolation cleanup failed ({}): {e}",
                         self.dir.display()
-                    );
+                    ));
                 }
             }
             IsolateMode::Git => {
@@ -295,10 +298,10 @@ impl Drop for IsolationGuard {
                     // <repo>/.git/worktrees; removing the dir without git leaves
                     // a stale entry `git worktree prune` will reap.
                     if let Err(e) = std::fs::remove_dir_all(&self.dir) {
-                        eprintln!(
+                        harness::note(format_args!(
                             "[warn] worktree cleanup failed ({}): {e}; run `git worktree prune` in the repo",
                             self.dir.display()
-                        );
+                        ));
                     }
                 }
             }
@@ -380,10 +383,10 @@ fn copy_entry(
     visited: &mut VisitedDirs,
 ) -> Result<()> {
     if depth > 64 {
-        eprintln!(
+        harness::note(format_args!(
             "[warn] isolate copy: skipping {} (dereference chain deeper than 64)",
             from.display()
-        );
+        ));
         return Ok(());
     }
     let ft = std::fs::symlink_metadata(from)
@@ -404,11 +407,11 @@ fn copy_entry(
         // dereference branch below doubles as the fallback for every
         // contained link there.
         if crate::tools::confined_to(root, &resolved, "isolate copy source").is_err() {
-            eprintln!(
+            harness::note(format_args!(
                 "[warn] isolate copy: skipping symlink {} → {} (escapes the source workdir)",
                 from.display(),
                 target.display()
-            );
+            ));
             return Ok(());
         }
         if !resolved.exists() {
@@ -422,11 +425,11 @@ fn copy_entry(
                 })?;
             }
             #[cfg(not(unix))]
-            eprintln!(
+            harness::note(format_args!(
                 "[warn] isolate copy: skipping dangling symlink {} → {}",
                 from.display(),
                 target.display()
-            );
+            ));
             return Ok(());
         }
         #[cfg(unix)]
@@ -451,12 +454,12 @@ fn copy_entry(
             // path — still catches the trivial self-loop.
             let canon = std::fs::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
             if !visited.insert(canon) {
-                eprintln!(
+                harness::note(format_args!(
                     "[warn] isolate copy: skipping symlink {} → {} (target directory already \
                      copied in this session)",
                     from.display(),
                     target.display()
-                );
+                ));
                 return Ok(());
             }
             std::fs::create_dir_all(to)?;
@@ -612,7 +615,10 @@ pub fn run(
             // aborted the run before ANY task started. Skip with a warning;
             // genuinely bad task JSON is still fail-fast below.
             if p.is_dir() {
-                eprintln!("[warn] skipping {}: is a directory", p.display());
+                harness::note(format_args!(
+                    "[warn] skipping {}: is a directory",
+                    p.display()
+                ));
                 continue;
             }
             if matches!(&report_canon, Some(rc) if p.canonicalize().ok().as_ref() == Some(rc)) {
@@ -678,11 +684,11 @@ pub fn run(
         // parses but wasn't in the prior failed set was a prior success —
         // leave it out like any other skipped task.
         bad_json.retain(|(name, _)| failed_names.contains(name));
-        eprintln!(
+        harness::note(format_args!(
             "batch --failed: re-running {} failed task(s); {} prior success(es) kept in report",
             tasks.len(),
             kept_successes
-        );
+        ));
         if tasks.is_empty() {
             bail!(
                 "no previously-failed tasks matched files in {}",
@@ -708,7 +714,9 @@ pub fn run(
     let bad_reports: Vec<TaskReport> = bad_json
         .iter()
         .map(|(name, err)| {
-            eprintln!("[warn] {name}: {err} (marked bad_task; other tasks continue)");
+            harness::note(format_args!(
+                "[warn] {name}: {err} (marked bad_task; other tasks continue)"
+            ));
             write_terminal_result(
                 &results_dir,
                 name,
@@ -750,13 +758,13 @@ pub fn run(
     let max_timeout = base.limits.timeout_secs;
     let client = crate::provider::new_client(max_timeout);
 
-    eprintln!(
+    harness::note(format_args!(
         "batch: {} tasks, {} workers, {} retries, results → {}",
         tasks.len(),
         jobs,
         retries,
         results_dir.display()
-    );
+    ));
     // Concurrent workers all share base.workdir (task fragments can't override
     // it), so jobs>1 with write-file tasks can corrupt each other's results.
     // Surface this at startup so it's an informed choice, not a silent trap.
@@ -769,11 +777,11 @@ pub fn run(
             .as_deref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "<current dir>".to_string());
-        eprintln!(
+        harness::note(format_args!(
             "note: --jobs {jobs} shares one workdir ({wd}); tasks writing the same \
              files can corrupt each other — use --jobs 1, or --isolate copy|git for \
              per-task workdirs."
-        );
+        ));
     }
 
     let (tx, rx) = mpsc::channel::<(String, PartialConfig)>();
@@ -806,12 +814,12 @@ pub fn run(
                 };
                 let report = if cancel.load(Ordering::Relaxed) {
                     if !warned.swap(true, Ordering::Relaxed) {
-                        eprintln!(
+                        harness::note(format_args!(
                             "[warn] Ctrl-C: not-yet-started tasks are skipped and marked \
                              cancelled; in-flight tasks finish on their own — except their \
                              MCP servers, which are shut down immediately; press Ctrl-C \
                              again to force-exit (130)"
-                        );
+                        ));
                     }
                     // Ctrl-C was hit: stop dispatching new tasks. Mark this one
                     // cancelled (not run) so the report still accounts for every
@@ -900,7 +908,13 @@ pub fn run(
                         }
                     }
                 };
-                eprintln!(
+                // note, not eprintln!: this site sits OUTSIDE the
+                // catch_unwind guard below — a closed stderr (Rust ignores
+                // SIGPIPE, so `… | head` closes it) turned the bare
+                // eprintln! into a panic that killed the worker thread and,
+                // via thread::scope, the whole batch — report.json was never
+                // written after every task had already run and been billed.
+                harness::note(format_args!(
                     "[{}] {} ({} turns, {:.1}s{})",
                     report.name,
                     if report.success { "✓" } else { "✗" },
@@ -911,7 +925,7 @@ pub fn run(
                         .as_deref()
                         .map(|e| format!(", {e}"))
                         .unwrap_or_default()
-                );
+                ));
                 reports
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -935,12 +949,12 @@ pub fn run(
     };
     let succeeded = final_reports.iter().filter(|r| r.success).count();
     write_report(report_path, &final_reports, base.provider.as_str())?;
-    eprintln!(
+    harness::note(format_args!(
         "batch done: {}/{} succeeded, report → {}",
         succeeded,
         final_reports.len(),
         report_path.display()
-    );
+    ));
     Ok(if cancel.load(Ordering::Relaxed) {
         130 // cancelled by Ctrl-C — report still written above
     } else if succeeded == final_reports.len() {
@@ -1135,7 +1149,9 @@ fn run_one_attempt(
                 None,
                 &meta,
             ) {
-                eprintln!("[warn] {name}: failed to write result file: {e:#}");
+                harness::note(format_args!(
+                    "[warn] {name}: failed to write result file: {e:#}"
+                ));
                 error = Some(format!("result file not written: {e:#}"));
             }
             let success = error.is_none() && o.stop_reason == "end_turn";
@@ -1199,7 +1215,9 @@ fn run_one_attempt(
                 Some(acc),
                 &meta,
             ) {
-                eprintln!("[warn] {name}: failed to write result file: {e:#}");
+                harness::note(format_args!(
+                    "[warn] {name}: failed to write result file: {e:#}"
+                ));
             }
             // Bill the accumulated cost (this attempt + any prior retries) so a
             // failed task reports honest token totals in report.json, not zero.
@@ -1256,7 +1274,9 @@ fn write_terminal_result(
         acc,
         meta,
     ) {
-        eprintln!("[warn] {name}: failed to write result file: {e:#}");
+        harness::note(format_args!(
+            "[warn] {name}: failed to write result file: {e:#}"
+        ));
     }
 }
 
@@ -1377,14 +1397,14 @@ fn run_one(
     let mut attempt = 0;
     while report.stop_reason == "error" && attempt < retries {
         let backoff = backoff(attempt);
-        eprintln!(
+        harness::note(format_args!(
             "[{}] transient error ({}); retry {}/{} in {:?}",
             name,
             report.error.as_deref().unwrap_or(""),
             attempt + 1,
             retries,
             backoff,
-        );
+        ));
         // Sleep the backoff in ~100ms slices so a Ctrl-C during it (up to ~40s
         // with jitter) is honored within ~100ms instead of after the whole
         // sleep — otherwise the next run_one_attempt runs a full task the user

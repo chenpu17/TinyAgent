@@ -34,6 +34,20 @@
 
 ### Changed
 
+- **MCP Streamable HTTP 常开 standalone GET 流承载 202 响应**：202 由此前的「收到 202 才临时 GET
+  建流」改为会话期常开一条 standalone GET 流（reader 线程轮转分发全部 JSON-RPC 消息、按 id 匹配），
+  根治「首个 202 与临时建流之间」的会话期竞态；残余窗口、重连与服务端 4xx 拒流（`force` 重建、
+  legacy SSE 回退）行为见代码注释。顺带：MCP 诊断告警全部织入服务器名（`MCP '{server}': …`）——
+  多服务器配置下不再需要猜警告属于谁。
+
+- **门禁三件套加固 + 忽略清单补条目**：`gen_structure.py` 新增反向完整性检查——两 crate 根下所有
+  `.rs` 文件必须在 ENTRIES 里，新模块漏列（会静默从 README 结构树消失）即列清单失败（--check 与
+  --write 都执行，描述需人写故不自动补行），m0_probes.rs 补入 ENTRIES；`--write` 的 README 写出补
+  `newline="\n"`（Windows 文本模式不再写出 CRLF，与 sync 脚本同纪律）；`check_eval_apparatus.py`
+  指纹哈希折叠 CRLF（autocrlf=true 检出不再造成假红，同 sync 脚本 sha_file_rel 的理由）。
+  `.gitignore` 补 `/.venv/`、`/result.json`、`/report.json`、`/results/`（README 示例命令与 CI
+  复现流程的运行产物，按需再生不入库）。
+
 - **python 绑定 CI 矩阵扩到 Windows**：此前绑定层从未在 Windows 验证过，job 只在 ubuntu 跑并注明
   "等手动跑绿再扩矩阵"。前置条件已满足（2026-10 手动 Windows 全绿：CPython 3.12 win_amd64，
   `maturin develop` 39 过/4 跳，`--features code` 42 过/1 跳——code 自适应测试全激活），矩阵扩为
@@ -87,6 +101,38 @@
   include 定位收紧为「宿主有明确复用需求才建库」，删除未经验证的价值比较表述。
 
 ### Fixed
+
+- **多 agent 修复轮（run_code 协议 / MCP Windows / 平台门 / TUI / diag / fs_policy，全部带回归测试）**：
+  - **precheck 词法器模板插值无界互递归**：`${…}` 插值与模板体扫描互相递归且无深度界，深嵌套输入
+    可打穿宿主进程栈（overflow 杀死整个宿主、不可捕获）。加 `MAX_TEMPLATE_DEPTH = 64` 深度帽，超限的
+    插值按模板**文本**跳过——漏检是安全方向（§4.3：precheck 是效率特性，运行时 stubs 兜底它看不见的
+    一切），不会误杀合法代码。
+  - **run_code guest→host 参数超 1 MiB 误诊**：超帽读此前统一报 "bad args pointer"——把「量太大」
+    说成「指针坏」，恢复无从谈起。现报实际字节数 + 1 MiB 帽 + 恢复指引（写文件再切片读），工具名
+    超帽同修；批次聚合输出预算耗尽后的降级占位不再对「本就被拒、从未运行」的条目谎称 entry ran
+    （拒绝占位如实说明 refusal text 未携带），相关注释依据同步修正。
+  - **MCP Windows stdio spawn 引号打碎**：命令经 std 参数编码传给 `cmd /C` 时含空格整段被包引号，
+    cmd 只剥首尾引号——`"C:\Program Files\...\node.exe"` 直接裂成碎片。对齐 shell 工具的 raw_arg
+    纪律：`windows_cmd_tail` 纯函数按 cmd 自身规则拼 `/C` 之后的参数尾，spawn 处整段 `.raw_arg`
+    直传，附真 `cmd` 进程往返测试钉住行为。
+  - **Windows workdir 时 `\\?\` verbatim 前缀泄入 system prompt**：`canonicalize()` 产出的 verbatim
+    路径（`cd /d \\?\D:\…` 直接报「卷标语法不正确」）此前原样进 system prompt 与 `cd` 指令。
+    `strip_verbatim` 纯串映射剥前缀（长路径内部形态不受影响——canonicalize 返回值照旧走 verbatim，
+    32k 保护仍在）。
+  - **`cfg(not(unix))` 误门第三平台编译失败**：winjob/shell/mcp 三处 Windows 专用代码误用
+    `cfg(not(unix))`，wasm32 等第三平台被拉入却缺 windows-sys 依赖。改 `cfg(windows)` + 显式
+    `cfg(not(any(unix, windows)))` 的「平台不支持」错误臂。
+  - **CLI batch 18 处裸 `eprintln!` 收敛到 `harness::note`**：与此前 harness/main 的 closed-pipe
+    纪律对齐（`| head` 关闭 stdout 后 batch 的进度/警告输出 panic，release abort 连
+    report.json 都不落盘）；Drop 里的输出也走 note（unwind 中途不再 panic）。
+  - **TUI 流式切分围栏只认 ``` 不认 ~~~**：与 fence_plan 共享 CommonMark 双字符围栏判定
+    （``` 与 ~~~ 同权），被切开的 ~~~ 块重开时用实际围栏字符（不再把 cut ~~~ 块错误重开成 ```）。
+  - **diag 通道 sink 重入死锁**：sink 在读锁内被调用，sink 自身再 emit（写锁排队）即死锁。sink 改
+    `Arc` 存储、clone 出锁外调用，公开签名（`install_diag_sink` / `DiagLevel`）零变化；重入嵌套
+    emit 回归测试钉住。
+  - **run_code `deny_paths` 模式串词法清洗**：`./x` 前缀、尾 `/`、Windows 反斜杠分隔习惯此前造出
+    永不匹配任何路径的静默死规则（管理员以为封了、实际没封）。入口词法归一：`./` 前缀与尾分隔符剥
+    除、Windows `\` 折叠为 `/`（unix 上 `\` 仍是合法文件名字节，不折叠）。
 
 - **CLI 观察项快赢批（审读轮坐实的 9 个低垂项，全部带回归测试或文档修正）**：
   - batch `.JSON` 大写扩展名静默跳过 → 大小写不敏感匹配（Windows 文件系统语义）；

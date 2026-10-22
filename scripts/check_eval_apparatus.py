@@ -38,7 +38,14 @@ def main():
     if not VARIANT.is_file():
         fail(f"missing {VARIANT.relative_to(ROOT)}")
     text = VARIANT.read_text(encoding="utf-8")
-    digest = hashlib.sha256(VARIANT.read_bytes()).hexdigest()
+    # Hash CRLF folded to LF (same rationale as sha_file_rel in
+    # scripts/sync_run_code_contract.py): the fingerprint was registered from
+    # an LF working tree, but a Windows checkout with core.autocrlf=true
+    # materializes the file as CRLF — hashing raw bytes would turn this gate
+    # into a checkout-format detector instead of a content-drift detector.
+    digest = hashlib.sha256(
+        VARIANT.read_bytes().replace(b"\r\n", b"\n")
+    ).hexdigest()
 
     # 1. fingerprint registered in the assembly doc.
     asm = ASSEMBLY.read_text(encoding="utf-8")

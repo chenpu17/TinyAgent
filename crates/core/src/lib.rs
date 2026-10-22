@@ -35,7 +35,10 @@ pub mod retry;
 pub mod session;
 pub mod skills;
 pub mod tools;
-#[cfg(not(unix))]
+// windows, not not(unix): the module is windows-sys all the way down (Job
+// Objects), and windows-sys is a cfg(windows) dependency — a third platform
+// (wasm32 &c.) pulled in by not(unix) would fail on the missing crate.
+#[cfg(windows)]
 pub(crate) mod winjob;
 
 /// M0 mechanism probes (`docs/code_llm_design.md` §7「前置（M0，评测与拓扑的
@@ -524,9 +527,12 @@ const EAGER_TOOL_USE_ID: &str = "eager-run-code";
 /// The synthetic read_skill round-trip injected for `skill_injection =
 /// "eager"` (FD-3/FD-4): assistant tool_use + user tool_result, N:N paired,
 /// byte-identical in shape to a real `read_skill("run-code")` exchange
-/// (agent.rs's assistant/tool_result pushes). Ids are deliberately NOT set —
+/// (agent.rs's assistant/tool_result pushes). The pair's tool_use id IS set
+/// — the fixed [`EAGER_TOOL_USE_ID`] on both halves, making the synthetic
+/// exchange mechanically recognizable — while message-level ids stay unset:
 /// the pair enters via `initial`, and `Agent::try_new`'s ingest point
-/// (`assign_missing_ids`) mints them, the same as any fresh history.
+/// (`assign_missing_ids`) fills only MISSING message ids (existing ones
+/// pass through untouched), the same as any fresh history.
 #[cfg(feature = "code")]
 fn eager_read_skill_pair(body: &str) -> Vec<Message> {
     vec![
