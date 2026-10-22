@@ -15,6 +15,26 @@ use std::time::{Duration, Instant};
 const PROTOCOL_VERSION: &str = "2025-03-26";
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Per-round read deadline for the long-lived SSE GET streams (the standing
+/// standalone stream and the legacy SSE reader share it). A blocked
+/// reqwest::blocking read cannot be interrupted, but a request-level timeout
+/// bounds EVERY read: on a healthy stream the blocking read wakes at least
+/// once per [`STREAM_ROUND`], sees the stop flag (teardown) or rotates the
+/// connection (routine cadence — each rotation also re-establishes the
+/// delivery path a server push needs, instead of trusting one indefinite
+/// GET). This round bound is what makes reader-thread teardown bounded and
+/// caps the thread + TCP connection a teardown leaves behind at
+/// ~one round + backoff instead of "until process exit".
+const STREAM_ROUND: Duration = Duration::from_secs(30);
+/// Reconnect backoff after a stream ended EARLY (server closed it / real
+/// read error / failed reconnect connect). Deadline rotations skip it: the
+/// stream was healthy, and the rotation must re-open the delivery path
+/// immediately.
+const STREAM_BACKOFF: Duration = Duration::from_millis(500);
+/// How long a Drop waits (50ms polls) for its stream reader thread to exit
+/// before detaching. The reader wakes at its current round's deadline at the
+/// latest, so the detached case self-reclaims within ~one round + backoff.
+const READER_JOIN_WAIT: Duration = Duration::from_secs(2);
 /// How long request()/notify() wait for one frame to sink into the server's
 /// stdin before declaring the server dead. A healthy server drains even a
 /// multi-MiB tools/call frame (base64 images) in well under a second — pipes
@@ -307,7 +327,8 @@ fn notify_frame(method: &str, params: Value) -> Value {
 type Pending = std::sync::Arc<std::sync::Mutex<HashMap<u64, mpsc::Sender<Value>>>>;
 
 /// HTTP client with explicit timeouts for request/response calls.
-/// (Not used for the long-lived SSE GET — that one only gets a connect timeout.)
+/// (The long-lived SSE GETs use their own connect-only clients and add a
+/// per-request [`STREAM_ROUND`] round timeout — see the two stream readers.)
 fn http_client(total: Duration) -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
@@ -503,6 +524,16 @@ fn write_frame_cancelable<W: Write + Send + 'static>(
 /// 收尾引号前的连续反斜杠加倍（MSVCRT 规则：否则 `C:\dir\` 末尾的 `\` 会把
 /// 我们补的 `"` 吃成转义引号，参数边界丢失）。
 ///
+/// 触发集 2026-10 扩展（before/after）：**before**——触发集 = 空 / ASCII
+/// 空白 / `"` / 非 ASCII，cmd 元字符 `& | < > ^ ( ) % !` 是 ASCII 非空白、
+/// 裸露在引号外：cmd /C 的解析层把引号外的 `&`、`|` 当命令分隔符、`<`/`>`
+/// 当重定向、`^` 当转义符、`( )` 当分组符，MCP args 里的 URL query
+/// （`?a=1&b=2`）之类在 cmd 层就被拆碎，子进程永远看不到完整参数。
+/// **after**——这十个字符进触发集，引号内它们对 cmd 一律是字面量。
+/// 定性：用户配置信任面的正确性修复，非安全边界——`%VAR%` 展开连引号也
+/// 挡不住（cmd 在引号内仍展开环境变量）、`!` 仅延迟扩展开启时特殊，对这
+/// 两类加引号只是保守表意，不构成保证。
+///
 /// 若拼好的尾段以 `"` 开头（命令路径被包裹——cmd 剥引号唯一可能发生的形
 /// 态），整段再包一层外引号：cmd 的剥除规则拿掉的正是这层外包装，剥完剩下
 /// 的就是上面拼好的、引号完好的命令行。首字符不是 `"` 时 cmd 从不剥引号，
@@ -512,9 +543,17 @@ fn windows_cmd_tail(cmd: &str, args: &[String]) -> String {
     /// 按 cmd/MSVCRT 习惯编码单个 token（规则见外层函数文档）。
     fn quoted(tok: &str) -> String {
         let needs_quotes = tok.is_empty()
-            || tok
-                .chars()
-                .any(|c| c.is_ascii_whitespace() || c == '"' || !c.is_ascii());
+            || tok.chars().any(|c| {
+                c.is_ascii_whitespace()
+                    || c == '"'
+                    || !c.is_ascii()
+                    // cmd 元字符（2026-10 扩展，before/after 见外层函数文档）：
+                    // 引号外会被 cmd /C 解析层当命令分隔符/重定向/转义/分组，
+                    // `&` 活体事故：MCP args 里的 URL query `?a=1&b=2` 被 cmd
+                    // 拆碎，子进程看不到完整参数。`%`/`!` 是保守表意（引号
+                    // 挡不住 cmd 的变量展开）。
+                    || matches!(c, '&' | '|' | '<' | '>' | '^' | '(' | ')' | '%' | '!')
+            });
         if !needs_quotes {
             return tok.to_string();
         }
@@ -1076,6 +1115,30 @@ impl Drop for StdioTransport {
 
 // ─── Streamable HTTP ────────────────────────────────────────────────
 
+/// Tear a stream reader thread down with a BOUNDED wait: set the stop flag,
+/// poll for exit in 50ms slices (at most [`READER_JOIN_WAIT`]), join if it
+/// finished. The reader's blocking read cannot be interrupted, but every read
+/// is bounded by the round timeout ([`STREAM_ROUND`]) — worst case the thread
+/// wakes at its current round's deadline, sees the flag and exits, so a
+/// detached thread + its TCP connection now self-reclaim within ~one round +
+/// [`STREAM_BACKOFF`] instead of living until process exit. Detaching stays
+/// silent: the residual leak is bounded, and routine teardown of a healthy
+/// (mid-round) reader must neither hang nor spam a warning.
+fn shutdown_stream_reader(shutdown: &AtomicBool, reader: &mut Option<std::thread::JoinHandle<()>>) {
+    shutdown.store(true, Ordering::Relaxed);
+    if let Some(handle) = reader.take() {
+        let deadline = Instant::now() + READER_JOIN_WAIT;
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if handle.is_finished() {
+            let _ = handle.join();
+        }
+        // Detached: nothing more to do — the reader self-exits at its
+        // current round's deadline (see doc).
+    }
+}
+
 struct HttpTransport {
     client: reqwest::blocking::Client,
     url: String,
@@ -1100,6 +1163,11 @@ struct HttpTransport {
     /// (the 202 branch) still earns a fresh attempt per 202 — matching the old
     /// one-GET-per-202 wire traffic where the fast 4xx error came from.
     standalone_rejected: Arc<AtomicBool>,
+    /// Per-round read deadline handed to the standing-stream reader; defaults
+    /// to [`STREAM_ROUND`]. A field (not a constant read at the spawn site)
+    /// so tests can inject a small round and observe rotations/teardown in
+    /// milliseconds.
+    stream_round: Duration,
 }
 
 /// Read at most `cap` bytes of a response body as lossy text. The SSE paths
@@ -1124,6 +1192,7 @@ impl HttpTransport {
             stream_shutdown: Arc::new(AtomicBool::new(false)),
             stream_reader: None,
             standalone_rejected: Arc::new(AtomicBool::new(false)),
+            stream_round: STREAM_ROUND,
         })
     }
 
@@ -1156,6 +1225,7 @@ impl HttpTransport {
             self.pending.clone(),
             self.stream_shutdown.clone(),
             self.standalone_rejected.clone(),
+            self.stream_round,
         )?;
         self.stream_reader = Some(reader);
         Ok(())
@@ -1227,8 +1297,9 @@ impl Transport for HttpTransport {
         // (same contract as stdio / SSE). The direct POST/GET round-trips are
         // blocking reqwest calls already bounded by the client's
         // CALL_TIMEOUT total timeout — there is no channel wait to slice on
-        // those, and a blocking reqwest read cannot be interrupted
-        // mid-response (see SseTransport's Drop note).
+        // those. The standing-stream reader is likewise unblockable mid-read,
+        // but every read is round-bounded (STREAM_ROUND), so teardown joins
+        // it within ~one round (see shutdown_stream_reader).
         cancel: Option<&AtomicBool>,
     ) -> Result<Value> {
         // Register the pending slot BEFORE the POST: a server that answers
@@ -1337,37 +1408,27 @@ impl Transport for HttpTransport {
 
 impl Drop for HttpTransport {
     fn drop(&mut self) {
-        // Stand the standalone-stream reader down. reqwest::blocking reads
-        // cannot be interrupted mid-read, so — exactly like SseTransport's
-        // Drop — the flag only takes effect once the server sends another
-        // event or closes the stream; a fully stuck GET relies on process
-        // exit to reclaim the thread and its TCP connection. Join only an
-        // already-finished reader (never block on a live one: a healthy
-        // server keeps its stream open indefinitely, and blocking here would
-        // hang teardown on exactly the servers we're giving up on).
-        self.stream_shutdown.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.stream_reader.take() {
-            if handle.is_finished() {
-                let _ = handle.join();
-            } else {
-                // Detaching is the only non-blocking option (a healthy server
-                // holds the GET open indefinitely). Say so instead of letting
-                // a long-lived host leak one thread + TCP connection per
-                // client teardown silently.
-                drop(handle);
-                crate::diag::diag_warn!(
-                    "[mcp] HTTP standing-stream reader detached on teardown: the server kept \
-                     the stream open, so the reader thread and its TCP connection survive \
-                     until process exit"
-                );
-            }
-        }
+        // Bounded teardown: set the stop flag and wait up to
+        // READER_JOIN_WAIT for the reader to exit. A read blocked on a
+        // healthy stream wakes at the current round's deadline (STREAM_ROUND)
+        // at the latest, sees the flag and exits — so the usual case is a
+        // join within ~one round; the rare over-wait detaches silently, and
+        // the detached thread still self-reclaims (its TCP connection
+        // included) within ~one round + backoff instead of surviving until
+        // process exit.
+        shutdown_stream_reader(&self.stream_shutdown, &mut self.stream_reader);
     }
 }
 
 /// Outcome of one standalone-stream round (connection attempt + read pass).
 enum StandaloneRound {
-    /// The stream ended (server closed it / read error) or the connect
+    /// The round deadline expired on a HEALTHY stream: rotate at once —
+    /// reconnect immediately, no backoff. This is the standing stream's
+    /// routine cadence now (the round bound is what keeps teardown and the
+    /// delivery path bounded), and skipping the sleep keeps the window where
+    /// a server push finds no connected stream down to a reconnect RTT.
+    Expired,
+    /// The stream ended early (server closed it / read error) or the connect
     /// failed: retry after a backoff — waiters may still be owed responses,
     /// and the next server push needs a connected stream to land on.
     Ended,
@@ -1395,7 +1456,11 @@ enum StandaloneRound {
 ///
 /// On stream end / error the loop reconnects after a short backoff (a
 /// restarting server or an idle-connection-dropping proxy must not doom
-/// later 202s); on a 4xx it fails every waiter immediately (so a 202 parked
+/// later 202s); a HEALTHY stream now rotates on its own — every GET carries
+/// the round timeout, so the read unblocks at least once per [`STREAM_ROUND`]
+/// and the loop reconnects immediately, without the backoff (the stream was
+/// healthy; the rotation must re-open the delivery path at once). On a 4xx it
+/// fails every waiter immediately (so a 202 parked
 /// on this stream errors at once — the old inline path failed fast on the
 /// same 4xx and must not regress into a timeout) and exits permanently; the
 /// next ensure_standalone_stream() gives it one fresh attempt.
@@ -1406,6 +1471,7 @@ fn spawn_standalone_stream(
     pending: Pending,
     shutdown: Arc<AtomicBool>,
     rejected: Arc<AtomicBool>,
+    round: Duration,
 ) -> Result<std::thread::JoinHandle<()>> {
     // Same builder shape and no-redirect rationale as SseTransport::connect:
     // connect timeout ONLY (a total timeout would kill a healthy idle
@@ -1432,6 +1498,7 @@ fn spawn_standalone_stream(
                     &session_id,
                     &pending,
                     &shutdown,
+                    round,
                 ) {
                     StandaloneRound::Rejected(detail) => {
                         // Latch the rejection: the transport's best-effort
@@ -1462,15 +1529,25 @@ fn spawn_standalone_stream(
                         }
                         return;
                     }
+                    StandaloneRound::Expired => {
+                        // Healthy-stream rotation: reconnect at once — no
+                        // backoff (see StandaloneRound::Expired). The loop
+                        // condition re-checks shutdown before the next GET,
+                        // so a dropped transport never re-opens a connection.
+                        continue;
+                    }
                     StandaloneRound::Ended => {}
                 }
-                // Backoff before reconnecting/retrying: keeps a dead server
-                // from being hot-looped (waiters are bounded by CALL_TIMEOUT
-                // regardless) and staggers naturally behind a restarting
-                // server. The loop condition then re-checks shutdown, so a
-                // dropped transport never opens one more connection on its
-                // way out.
-                std::thread::sleep(Duration::from_millis(500));
+                // Backoff before reconnecting/retrying — ONLY the early-end
+                // path lands here (deadline rotations `continue` above): a
+                // stream that merely reached its round deadline was healthy
+                // and must not be penalized with a dead gap. The backoff
+                // keeps a genuinely dead server from being hot-looped
+                // (waiters are bounded by CALL_TIMEOUT regardless) and
+                // staggers naturally behind a restarting server. The loop
+                // condition then re-checks shutdown, so a dropped transport
+                // never opens one more connection on its way out.
+                std::thread::sleep(STREAM_BACKOFF);
             }
         })
         // Same policy as every other reader thread here: thread-resource
@@ -1484,7 +1561,10 @@ fn spawn_standalone_stream(
 /// and `Mcp-Session-Id` when one was established ("clients ... MUST include
 /// it in the Mcp-Session-Id header on all of their subsequent HTTP
 /// requests"), then reads events until the stream ends, the read errors, or
-/// `shutdown` fires.
+/// the ROUND deadline expires. The request-level timeout bounds every read,
+/// so a healthy stream yields [`StandaloneRound::Expired`] at least once per
+/// [`STREAM_ROUND`] (rotation cadence) and a wedged read cannot outlive it —
+/// the bound that keeps teardown bounded.
 fn standalone_stream_round(
     client: &reqwest::blocking::Client,
     url: &str,
@@ -1492,6 +1572,7 @@ fn standalone_stream_round(
     session_id: &Option<String>,
     pending: &Pending,
     shutdown: &AtomicBool,
+    round: Duration,
 ) -> StandaloneRound {
     let mut req = client
         .get(url)
@@ -1503,7 +1584,13 @@ fn standalone_stream_round(
     if let Some(sid) = session_id {
         req = req.header("Mcp-Session-Id", sid);
     }
-    let mut resp = match req.send() {
+    // The round timeout: reqwest applies a request-level timeout to the
+    // blocking Response's every read (and the async body's total deadline),
+    // so this single bound both rotates a healthy stream and wakes a wedged
+    // read. Expiry surfaces as an io::Error wrapping a reqwest::Error —
+    // classified by is_stream_round_timeout below, never by ErrorKind
+    // (into_io pins that to Other).
+    let mut resp = match req.timeout(round).send() {
         Ok(r) => r,
         Err(e) => {
             // Connect/network failure (server down, proxy reset): retry —
@@ -1539,10 +1626,15 @@ fn standalone_stream_round(
             }
             Ok(None) => return StandaloneRound::Ended, // server closed: reconnect
             Err(e) => {
-                // A line over the cap or a read error: same bounded-memory /
-                // anti-runaway policy as every other SSE reader here. The
-                // stream is unusable, but later 202s may still be owed —
-                // reconnect rather than failing the waiters.
+                // Round deadline on a healthy stream: silent rotation (no
+                // diag — this is the routine cadence now, and a warning per
+                // round would be pure noise). Anything else — a line over
+                // the cap or a real read error — keeps the bounded-memory /
+                // anti-runaway policy: warn, and reconnect since later 202s
+                // may still be owed.
+                if is_stream_round_timeout(&e) {
+                    return StandaloneRound::Expired;
+                }
                 crate::diag::diag_warn!(
                     "[warn] MCP HTTP standalone stream read stopped: {e:#}; reconnecting"
                 );
@@ -1550,6 +1642,26 @@ fn standalone_stream_round(
             }
         }
     }
+}
+
+/// Is this SSE read failure the ROUND deadline expiring (as opposed to a
+/// real read error)? reqwest surfaces a request-timeout read failure as
+/// `io::Error::new(ErrorKind::Other, reqwest::Error)` (its `into_io`
+/// conversion pins the kind to Other, so the ErrorKind is useless for
+/// discrimination); only the INNER reqwest::Error knows, via `is_timeout()`.
+/// The anyhow chain is walked because `read_capped_line` wraps the io error
+/// in a context. Shape pinned by a probe test (`stream_round_timeout_…`);
+/// if a reqwest upgrade changes the shape, the probe goes red — this
+/// classification must never mistake a deadline rotation for a real error
+/// (or vice versa).
+fn is_stream_round_timeout(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .and_then(|io| io.get_ref())
+            .and_then(|inner| inner.downcast_ref::<reqwest::Error>())
+            .is_some_and(|re| re.is_timeout())
+    })
 }
 
 // ─── legacy HTTP+SSE ────────────────────────────────────────────────
@@ -1566,17 +1678,24 @@ struct SseTransport {
     pending: Pending,
     /// Signals the reader thread to stop at its next loop iteration.
     shutdown: Arc<AtomicBool>,
-    /// The reader thread's handle, kept so Drop can at least JOIN an already
-    /// finished reader (reclaims it deterministically) and observe — never
-    /// block on — a stuck one. Held for observability/lifecycle, not for
-    /// interruption: a blocked reqwest read cannot be interrupted without an
-    /// async runtime (see Drop).
+    /// The reader thread's handle, kept so Drop can reclaim it with a bounded
+    /// wait (join when it exits in time, silent detach otherwise). Held for
+    /// observability/lifecycle; the reads it blocks in cannot be interrupted,
+    /// but each one is round-bounded (STREAM_ROUND) — see Drop.
     reader: Option<std::thread::JoinHandle<()>>,
 }
 
 impl SseTransport {
     fn connect(url: &str, cfg: &McpServerConfig) -> Result<Self> {
-        // The GET is a long-lived stream: connect timeout only, no total timeout.
+        Self::connect_with_round(url, cfg, STREAM_ROUND)
+    }
+
+    /// `round` exists for tests (small rounds make rotations and bounded
+    /// teardown observable in milliseconds); production always passes
+    /// [`STREAM_ROUND`].
+    fn connect_with_round(url: &str, cfg: &McpServerConfig, round: Duration) -> Result<Self> {
+        // The GET is a long-lived stream: connect timeout only, no client
+        // total timeout — the round bound is applied per request below.
         let client = reqwest::blocking::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
@@ -1591,11 +1710,15 @@ impl SseTransport {
                     .build()
                     .expect("reqwest client build")
             });
-        let mut req = client.get(url).header("accept", "text/event-stream");
-        for (k, v) in &cfg.headers {
-            req = req.header(k, v);
-        }
-        // The GET is a long-lived stream; drive it on a reader thread.
+        // The GET is a long-lived stream; drive it on a reader thread. One
+        // ROUND per connection: every GET carries the round timeout, so a
+        // healthy (silent) stream rotates on its own at least once per
+        // [`STREAM_ROUND`] and a wedged read cannot outlive it (that bound is
+        // what makes teardown bounded). Delivery semantics are unchanged: the
+        // `endpoint` event is honored once per thread (reconnects ignore
+        // repeats — the POST target is already fixed), and every non-round end
+        // (stream end / real read error) keeps the existing fail-all-and-exit
+        // behavior.
         let (endpoint_tx, endpoint_rx) = mpsc::channel::<Option<reqwest::Url>>();
         let pending = pending_new();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -1603,56 +1726,90 @@ impl SseTransport {
             let pending = pending.clone();
             let shutdown = shutdown.clone();
             let url = url.to_string();
+            let headers = cfg.headers.clone();
             // Named for thread dumps: this thread can outlive the transport
-            // (see Drop) — a name is the difference between a diagnosable
-            // stray and an anonymous one.
+            // by at most ~one round now (see Drop) — a name is still the
+            // difference between a diagnosable stray and an anonymous one.
             let body = move || {
-                let Ok(resp) = req.send() else {
-                    pending_fail_all(&pending, "");
-                    return;
-                };
-                let mut reader = BufReader::new(resp);
                 let mut endpoint_sent = false;
-                while !shutdown.load(Ordering::Relaxed) {
-                    let (event, data) = match read_sse_event(&mut reader, MCP_EVENT_MAX) {
-                        Ok(Some(ev)) => ev,
-                        Ok(None) => break, // stream ended
-                        Err(e) => {
-                            // A line over the cap or a read error: the stream is
-                            // unusable. Fail every waiter so callers don't block
-                            // until CALL_TIMEOUT on a dead/abusive server. The
-                            // URL names WHICH server's stream died — several MCP
-                            // servers can be configured side by side.
-                            crate::diag::diag_warn!("[warn] MCP SSE read stopped for {url}: {e:#}");
-                            pending_fail_all(&pending, "");
-                            return;
+                'rounds: loop {
+                    if shutdown.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let mut req = client.get(&url).header("accept", "text/event-stream");
+                    for (k, v) in &headers {
+                        req = req.header(k, v);
+                    }
+                    let Ok(resp) = req.timeout(round).send() else {
+                        if endpoint_sent {
+                            // A reconnect round's connect failed (server down
+                            // at a rotation boundary): same treatment as the
+                            // standing stream — warn + backoff + retry, since
+                            // a routine rotation must not kill an otherwise
+                            // healthy session.
+                            crate::diag::diag_warn!(
+                                "[warn] MCP SSE reconnect failed for {url}; retrying"
+                            );
+                            std::thread::sleep(STREAM_BACKOFF);
+                            continue 'rounds;
                         }
+                        // First connect failed: the transport never came up —
+                        // fail every waiter (connect() surfaces it).
+                        pending_fail_all(&pending, "");
+                        return;
                     };
-                    match event.as_str() {
-                        "endpoint" if !endpoint_sent => {
-                            endpoint_sent = true;
-                            // Resolve against the SSE URL; refuse cross-origin
-                            // endpoints (SSRF guard on the authenticated POST).
-                            match resolve_endpoint(&url, data.trim()) {
-                                Ok(u) => {
-                                    let _ = endpoint_tx.send(Some(u));
+                    let mut reader = BufReader::new(resp);
+                    loop {
+                        if shutdown.load(Ordering::Relaxed) {
+                            break 'rounds;
+                        }
+                        let (event, data) = match read_sse_event(&mut reader, MCP_EVENT_MAX) {
+                            Ok(Some(ev)) => ev,
+                            Ok(None) => break 'rounds, // stream ended
+                            Err(e) => {
+                                // Round deadline on a healthy stream: rotate
+                                // at once, silently (see spawn_standalone_stream).
+                                if is_stream_round_timeout(&e) {
+                                    continue 'rounds;
                                 }
-                                Err(e) => {
-                                    crate::diag::diag_warn!(
-                                        "[warn] MCP SSE endpoint rejected: {e:#}"
-                                    );
-                                    let _ = endpoint_tx.send(None);
-                                    pending_fail_all(&pending, "");
-                                    return;
+                                // A line over the cap or a read error: the stream is
+                                // unusable. Fail every waiter so callers don't block
+                                // until CALL_TIMEOUT on a dead/abusive server. The
+                                // URL names WHICH server's stream died — several MCP
+                                // servers can be configured side by side.
+                                crate::diag::diag_warn!(
+                                    "[warn] MCP SSE read stopped for {url}: {e:#}"
+                                );
+                                pending_fail_all(&pending, "");
+                                return;
+                            }
+                        };
+                        match event.as_str() {
+                            "endpoint" if !endpoint_sent => {
+                                endpoint_sent = true;
+                                // Resolve against the SSE URL; refuse cross-origin
+                                // endpoints (SSRF guard on the authenticated POST).
+                                match resolve_endpoint(&url, data.trim()) {
+                                    Ok(u) => {
+                                        let _ = endpoint_tx.send(Some(u));
+                                    }
+                                    Err(e) => {
+                                        crate::diag::diag_warn!(
+                                            "[warn] MCP SSE endpoint rejected: {e:#}"
+                                        );
+                                        let _ = endpoint_tx.send(None);
+                                        pending_fail_all(&pending, "");
+                                        return;
+                                    }
                                 }
                             }
-                        }
-                        "message" => {
-                            if let Ok(msg) = serde_json::from_str::<Value>(&data) {
-                                pending_dispatch(&pending, msg);
+                            "message" => {
+                                if let Ok(msg) = serde_json::from_str::<Value>(&data) {
+                                    pending_dispatch(&pending, msg);
+                                }
                             }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
                 pending_fail_all(&pending, "");
@@ -1673,19 +1830,19 @@ impl SseTransport {
             .recv_timeout(CONNECT_TIMEOUT)
             .map_err(|e| {
                 // Timed out or the channel died before the endpoint arrived:
-                // tell the reader thread to stop. Its read() may still be
-                // blocked (reqwest::blocking can't be interrupted mid-read),
-                // but at least it won't keep dispatching into a dead table,
-                // and it will exit on the next event or stream close. If it
-                // IS stuck, say so — a connect-failure path that silently
-                // strands a thread + TCP connection is the one place the
-                // leak is not routine teardown (see Drop for why teardown
-                // itself stays silent).
+                // tell the reader thread to stop. Its read() cannot be
+                // interrupted mid-read, but every read is round-bounded
+                // (STREAM_ROUND) — the thread self-exits at the current
+                // round's deadline at the latest, so the residual thread +
+                // TCP connection live ~one round, not until process exit.
+                // Still worth a diagnostic: "never sent an endpoint" is a
+                // server misbehavior the host should see.
                 shutdown.store(true, Ordering::Relaxed);
                 if !reader.is_finished() {
                     crate::diag::diag_warn!(
-                        "[warn] MCP SSE: reader thread detached (server at {url} never \
-                         sent an 'endpoint' event; the stuck GET exits at process exit)"
+                        "[warn] MCP SSE: reader thread exiting late (server at {url} never \
+                         sent an 'endpoint' event; the round-bounded GET self-exits within \
+                         ~one round)"
                     );
                 }
                 anyhow!("MCP SSE: no 'endpoint' event from {url}: {e}")
@@ -1756,35 +1913,15 @@ impl Transport for SseTransport {
 
 impl Drop for SseTransport {
     fn drop(&mut self) {
-        // Ask the reader thread to stop. NOTE: reqwest::blocking responses
-        // block inside read() with no per-read timeout, so this only takes
-        // effect once the server sends another event or closes the stream —
-        // a fully stuck GET still relies on process exit to reclaim the
-        // thread and its TCP connection. Truly interruptible reads need an
-        // async runtime or direct hyper use, which this binary avoids; in
-        // batch mode prefer stdio MCP servers (which kill cleanly on drop).
-        self.shutdown.store(true, Ordering::Relaxed);
-        // Join only an ALREADY finished reader (never block on a live one —
-        // a healthy idle server keeps its stream open, and blocking here
-        // would hang teardown on exactly the servers we're giving up on).
-        // Joining the finished case reclaims it deterministically instead of
-        // leaving it to the runtime's unjoined-thread reclamation.
-        if let Some(handle) = self.reader.take() {
-            if handle.is_finished() {
-                let _ = handle.join();
-            } else {
-                // Same honest-detach note as HttpTransport: the reader blocked
-                // in a reqwest read cannot be interrupted, and a healthy idle
-                // server keeps the stream open — teardown must not hang, so
-                // the thread outlives us until process exit. Surface it.
-                drop(handle);
-                crate::diag::diag_warn!(
-                    "[mcp] legacy SSE reader detached on teardown: the server kept the stream \
-                     open, so the reader thread and its TCP connection survive until process \
-                     exit (prefer stdio MCP servers where clean teardown matters)"
-                );
-            }
-        }
+        // Bounded teardown (same contract as HttpTransport's): the reader's
+        // blocking read cannot be interrupted, but every read is round-bounded
+        // (STREAM_ROUND) — the thread wakes at its current round's deadline at
+        // the latest, sees the flag and exits. Drop joins within
+        // READER_JOIN_WAIT; the rare over-wait detaches silently, and the
+        // detached thread still self-reclaims (its TCP connection included)
+        // within ~one round + backoff instead of surviving until process
+        // exit.
+        shutdown_stream_reader(&self.shutdown, &mut self.reader);
     }
 }
 
@@ -2574,6 +2711,485 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // ── windows_cmd_tail × MSVC/cmd oracle 性质测试（任务 A）─────────────
+    //
+    // SUT 是 #[cfg(windows)] 的，本节把判据拆成两个**平台无关**的 oracle
+    // （MSVC argv 切分、cmd /C 剥引号）+ 一个**平台无关**的编码 oracle：
+    // Linux 上钉 oracle 本身、跑「文档编码 → 剥引号 → 切分」的整链镜像
+    // 往返；Windows 上另用真 SUT 跑同一往返。oracle 是测试内实现的判据，
+    // 不是产品代码。
+
+    /// Fuzz 迭代数：`TA_FUZZ_ITERS` 覆盖默认值（缺省 2_000；大迭代回归
+    /// 用 `TA_FUZZ_ITERS=50000 cargo test ...`）。
+    fn tail_fuzz_iters() -> usize {
+        std::env::var("TA_FUZZ_ITERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2_000)
+    }
+
+    /// 本节专用的随机源：固定种子 LCG 包一层，抽样取**高 32 位**再取模。
+    /// 共享 [`Lcg::below`] 直接取低位——mod 2^k 抽样的周期只有 2^k，变长
+    /// 重抽循环会与它锁步共振（fs_policy 路径汤 fuzz 实测 below(4) 序列
+    /// [3,2,1,0] 循环、每轮恰好耗 4 抽 = 整周期 → 每次尝试完全相同 →
+    /// 死循环）。高半字有全周期，可变消费模式不共振。
+    struct TailRng(u64);
+    impl TailRng {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0
+        }
+        fn hbelow(&mut self, n: usize) -> usize {
+            ((self.next_u64() >> 32) % n as u64) as usize
+        }
+        fn hpick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
+            &xs[self.hbelow(xs.len())]
+        }
+    }
+
+    /// MSVCRT argv 切分 oracle（CommandLineToArgvW 语义，Microsoft
+    /// 「Parsing C++ command-line arguments」规则）：
+    /// - 引号外空白（空格/制表）切分参数；
+    /// - `"` 开合引号段；引号段内相邻 `""` 折叠为字面量 `"`（保持引号态）；
+    /// - 反斜杠串后随 `"`：2n 个 → n 个字面量反斜杠 + 引号开关；2n+1 个 →
+    ///   n 个字面量反斜杠 + 字面量 `"`；后随其他字符：全部字面量。
+    ///
+    /// 简化（对本测试面无影响，显式声明）：不建模 argv[0]——真实
+    /// CreateProcess 里是被解析后的 exe 路径，往返断言的是「token 不被
+    /// 吞、不被重切」，不是 argv[0] 的字面值；输入不含 \r/\n（命令行语义
+    /// 之外）。
+    fn msvc_argv_split(line: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cur = String::new();
+        let mut started = false;
+        let mut in_quotes = false;
+        let cs: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        while i < cs.len() {
+            match cs[i] {
+                ' ' | '\t' => {
+                    if in_quotes {
+                        cur.push(cs[i]);
+                    } else if started {
+                        out.push(std::mem::take(&mut cur));
+                        started = false;
+                    }
+                    i += 1;
+                }
+                '"' => {
+                    started = true;
+                    if in_quotes && cs.get(i + 1) == Some(&'"') {
+                        cur.push('"');
+                        i += 2;
+                    } else {
+                        in_quotes = !in_quotes;
+                        i += 1;
+                    }
+                }
+                '\\' => {
+                    let mut n = 0;
+                    while cs.get(i + n) == Some(&'\\') {
+                        n += 1;
+                    }
+                    if cs.get(i + n) == Some(&'"') {
+                        for _ in 0..n / 2 {
+                            cur.push('\\');
+                        }
+                        started = true;
+                        if n % 2 == 1 {
+                            cur.push('"');
+                        } else {
+                            in_quotes = !in_quotes;
+                        }
+                        i += n + 1;
+                    } else {
+                        for _ in 0..n {
+                            cur.push('\\');
+                        }
+                        started = true;
+                        i += n;
+                    }
+                }
+                c => {
+                    cur.push(c);
+                    started = true;
+                    i += 1;
+                }
+            }
+        }
+        if started || !cur.is_empty() {
+            out.push(cur);
+        }
+        out
+    }
+
+    /// cmd /C 剥引号规则 oracle（`cmd /?` 与旧 KB 两支建模）：/C 尾首字符
+    /// 是 `"` 且**全行恰好两个引号**、其间无 cmd 特殊字符且有空白 → 保留
+    /// 原样；否则剥掉首字符与全行最后一个引号（其余字符——包括尾引号之后
+    /// 的内容——原样保留）。两引号保留支文档还要求「其间是可执行文件名」，
+    /// 那需要文件系统真值，SUT 输出不可达该支（SUT 的被包裹形态恒 ≥4 个
+    /// 引号：内层 cmd token 自带 ≥2 + 外层一对），这里保守按保留建模并
+    /// 显式声明简化。
+    fn cmd_c_strip_quotes(line: &str) -> String {
+        if !line.starts_with('"') {
+            return line.to_string();
+        }
+        let quotes: Vec<usize> = line
+            .char_indices()
+            .filter(|&(_, c)| c == '"')
+            .map(|(i, _)| i)
+            .collect();
+        if quotes.len() == 2 {
+            let between = &line[quotes[0] + 1..quotes[1]];
+            let has_special = between
+                .chars()
+                .any(|c| matches!(c, '&' | '|' | '<' | '>' | '^' | '(' | ')'));
+            let has_ws = between.chars().any(|c| c == ' ' || c == '\t');
+            if !has_special && has_ws {
+                return line.to_string();
+            }
+        }
+        let last = *quotes.last().expect("starts_with 已保证存在引号");
+        let mut out = String::with_capacity(line.len());
+        out.push_str(&line[1..last]);
+        out.push_str(&line[last + 1..]);
+        out
+    }
+
+    /// 编码 oracle：windows_cmd_tail 文档规则的复刻（触发集 = 空 / ASCII
+    /// 空白 / `"` / 非 ASCII / cmd 元字符 `& | < > ^ ( ) % !`——2026-10
+    /// 扩展，before/after 见该函数文档；内嵌 `"` 写 `\"` 且其前与收尾引号
+    /// 前的连续反斜杠翻倍）。与实现同构是刻意的——平台无关面要能在 Linux
+    /// 上验证往返数学；实现本身的钉子是既有 windows 单测 + e2e spawn 测试
+    /// + `windows_cmd_tail_roundtrips_random_vectors_through_both_oracles`。
+    fn doc_reference_msvc_encode(tok: &str) -> String {
+        let needs_quotes = tok.is_empty()
+            || tok.chars().any(|c| {
+                c.is_ascii_whitespace()
+                    || c == '"'
+                    || !c.is_ascii()
+                    || matches!(c, '&' | '|' | '<' | '>' | '^' | '(' | ')' | '%' | '!')
+            });
+        if !needs_quotes {
+            return tok.to_string();
+        }
+        let mut out = String::with_capacity(tok.len() + 2);
+        out.push('"');
+        let mut backslashes = 0usize;
+        for c in tok.chars() {
+            if c == '\\' {
+                backslashes += 1;
+                continue;
+            }
+            if c == '"' {
+                for _ in 0..backslashes * 2 {
+                    out.push('\\');
+                }
+                out.push_str("\\\"");
+            } else {
+                for _ in 0..backslashes {
+                    out.push('\\');
+                }
+                out.push(c);
+            }
+            backslashes = 0;
+        }
+        for _ in 0..backslashes * 2 {
+            out.push('\\');
+        }
+        out.push('"');
+        out
+    }
+
+    /// oracle 判例钉子：MSVC 切分按文档向量逐条核对（含空格切分、引号
+    /// 开合、`""` 折叠、反斜杠 2n/2n+1 规则、尾反斜杠吃引号、空参数、
+    /// CJK 透传）。
+    #[test]
+    fn msvc_argv_split_oracle_documented_vectors() {
+        for (line, want) in [
+            ("", &[] as &[&str]),
+            ("   ", &[]),
+            ("node server.js", &["node", "server.js"]),
+            ("a b   c", &["a", "b", "c"]),
+            (r#""my app" x"#, &["my app", "x"]),
+            (r#""a b"  "c""#, &["a b", "c"]),
+            (r#"a""b"#, &["ab"]),
+            (r#""a""b""#, &["a\"b"]),
+            (r#"a "" b"#, &["a", "", "b"]),
+            (r#"\""#, &["\""]),
+            (r#""C:\dir\""#, &[r#"C:\dir""#]),
+            (r#"a\"b c"#, &["a\"b", "c"]),
+            (r"npx 服务器.js", &["npx", "服务器.js"]),
+            (r#""""#, &[""]),
+        ] {
+            assert_eq!(
+                msvc_argv_split(line),
+                want.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                "MSVC 切分判据: {line:?}"
+            );
+        }
+    }
+
+    /// oracle 判例钉子：cmd /C 剥引号两支——首字符非 `"` 恒不动；≥4 引号
+    /// （SUT 被包裹形态）剥首字符 + 全行最后一个引号；恰 2 引号且其间干净
+    /// 有空白按保留支建模；恰 2 引号但含特殊字符走剥除支。
+    #[test]
+    fn cmd_c_strip_quotes_oracle_documented_vectors() {
+        assert_eq!(
+            cmd_c_strip_quotes(r#"node "a b" c"#),
+            r#"node "a b" c"#,
+            "首字符非引号：cmd 不剥"
+        );
+        // SUT 被包裹形态：外层一对 + 内层 ≥2，剥完剩下原拼好的尾段。
+        let inner = r#""C:\Program Files\x.exe" "my server.js""#;
+        assert_eq!(
+            cmd_c_strip_quotes(&format!("\"{inner}\"")),
+            inner,
+            "≥4 引号：剥外层首尾，内层完好"
+        );
+        assert_eq!(
+            cmd_c_strip_quotes(r#""C:\tools\my app.exe" x"#),
+            r#""C:\tools\my app.exe" x"#,
+            "恰 2 引号、其间有空白且无特殊字符：保留支（文档还要求其间是可执行文件名——文件系统真值，SUT 输出不可达该支，保守建模）"
+        );
+        assert_eq!(
+            cmd_c_strip_quotes(r#""C:\tools\app.exe" x"#),
+            "C:\\tools\\app.exe x",
+            "恰 2 引号但其间无空白：保留支五条件不齐，走剥除支"
+        );
+        assert_eq!(
+            cmd_c_strip_quotes(r#""a & b" c"#),
+            "a & b c",
+            "恰 2 引号但含特殊字符：剥除支"
+        );
+    }
+
+    /// 性质（fuzz，固定种子，平台无关）：编码 oracle 与切分 oracle 互逆——
+    /// 单 token：encode → split == [tok]；多 token：各 encode 后空格连接，
+    /// split == 原 token 序列。字符池不含 \r/\n（命令行语义外）；本测试
+    /// 无 cmd 层，\t 与 cmd 元字符（`& | < > ^ ( ) % !`——触发集 2026-10
+    /// 扩展后编码会包裹它们，切分按字面量还原）都可进池。
+    #[test]
+    fn doc_reference_msvc_encode_roundtrips_through_split_oracle_fuzz() {
+        const POOL: &[char] = &[
+            'a', 'Z', '9', '.', '_', '-', ' ', '\t', '"', '\\', '&', '|', '<', '>', '^', '(', ')',
+            '%', '!', '标', '図', 'ü',
+        ];
+        let mut rng = TailRng(0x5EED_0032);
+        for tok in [
+            "plain",
+            "with space",
+            "say \"hi\"",
+            "C:\\dir\\",
+            "C:\\dir with space\\",
+            "",
+            "服务器.js",
+            "\\",
+            "\"",
+            "a\\",
+            "\\\"b",
+            "a&b|c^d(e)f%g!h",
+        ] {
+            assert_eq!(
+                msvc_argv_split(&doc_reference_msvc_encode(tok)),
+                vec![tok.to_string()],
+                "单 token 往返: {tok:?}"
+            );
+        }
+        for toks in [
+            vec!["node".to_string(), "my project\\server.js".to_string()],
+            vec!["say \"hi\"".to_string(), "C:\\dir with space\\".to_string()],
+            vec![String::new(), "x".to_string()],
+            vec!["x".to_string(), String::new()],
+        ] {
+            let line = toks
+                .iter()
+                .map(|t| doc_reference_msvc_encode(t))
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(msvc_argv_split(&line), toks, "判例多 token 往返: {toks:?}");
+        }
+        for _ in 0..tail_fuzz_iters() {
+            let n = 1 + rng.hbelow(4);
+            let toks: Vec<String> = (0..n)
+                .map(|_| {
+                    let len = rng.hbelow(7);
+                    (0..len).map(|_| *rng.hpick(POOL)).collect()
+                })
+                .collect();
+            let line = toks
+                .iter()
+                .map(|t| doc_reference_msvc_encode(t))
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(msvc_argv_split(&line), toks, "多 token 往返: {toks:?}");
+        }
+    }
+
+    /// 性质（fuzz + 判例，平台无关）：**整链镜像**——文档编码 oracle +
+    /// 外层包装规则（尾段以 `"` 开头时整段再包一层，与 windows_cmd_tail
+    /// 文档一致）+ cmd 剥引号 oracle + MSVC 切分 oracle 的组合往返恒等于
+    /// 原 token 序列。本机（Linux）可跑可大迭代；真 SUT 的对应往返由
+    /// `windows_cmd_tail_roundtrips_random_vectors_through_both_oracles`
+    /// 在 Windows 上钉住。触发集 2026-10 扩展后 `& | < > ^ ( )` 被引号
+    /// 包裹、对 cmd 是字面量，可进池；`%`/`!` 仍排除（cmd 在引号内仍展开
+    /// `%VAR%`、`!` 随延迟扩展环境而变——链路 oracle 未建模展开语义，见
+    /// `windows_cmd_tail_quotes_cmd_metachars_for_the_child` 的定性注）；
+    /// \r/\n/\t 排除（剥引号/切分 oracle 未建模 cmd 对它们的自身怪癖）。
+    #[test]
+    fn documented_tail_chain_roundtrips_through_both_oracles_fuzz() {
+        const POOL: &[char] = &[
+            'a', 'Z', '9', '.', '_', '-', ' ', '"', '\\', '&', '|', '<', '>', '^', '(', ')', '标',
+            '図', 'ü',
+        ];
+        let mut rng = TailRng(0x5EED_0035);
+        for toks in [
+            vec![
+                "npx".to_string(),
+                "-y".to_string(),
+                "some-mcp-server".to_string(),
+            ],
+            vec![
+                "node".to_string(),
+                "arg with space".to_string(),
+                "--flag".to_string(),
+            ],
+            vec!["say \"hi\"".to_string(), "C:\\dir with space\\".to_string()],
+            vec!["服务器.js".to_string(), String::new(), "x".to_string()],
+            vec![
+                "C:\\Program Files\\nodejs\\node.exe".to_string(),
+                "my project\\server.js".to_string(),
+            ],
+            vec![
+                "node".to_string(),
+                "https://api.example.com/?a=1&b=2".to_string(),
+            ],
+            vec![String::new()],
+            vec!["x".to_string(), String::new()],
+        ] {
+            chain_roundtrip(&toks);
+        }
+        for _ in 0..tail_fuzz_iters() {
+            let n = 1 + rng.hbelow(4);
+            let toks: Vec<String> = (0..n)
+                .map(|_| {
+                    let len = rng.hbelow(7);
+                    (0..len).map(|_| *rng.hpick(POOL)).collect()
+                })
+                .collect();
+            chain_roundtrip(&toks);
+        }
+
+        /// 文档编码 + 外层包装 + 剥引号 + MSVC 切分的整链一例。
+        fn chain_roundtrip(toks: &[String]) {
+            let mut tail = toks
+                .iter()
+                .map(|t| doc_reference_msvc_encode(t))
+                .collect::<Vec<_>>()
+                .join(" ");
+            if tail.starts_with('"') {
+                tail = format!("\"{tail}\"");
+            }
+            assert_eq!(
+                msvc_argv_split(&cmd_c_strip_quotes(&tail)),
+                toks,
+                "整链往返: {toks:?} tail={tail:?}"
+            );
+        }
+    }
+
+    /// 性质（fuzz + 判例，#[cfg(windows)]）：真 SUT 的整链往返——
+    /// windows_cmd_tail 输出经剥引号 oracle、MSVC 切分 oracle 后必须还原
+    /// [cmd]+args。字符池同整链镜像（`& | < > ^ ( )` 触发集扩展后可进池；
+    /// `%`/`!`/` \r`/`\n`/`\t` 排除，理由见整链镜像文档）。
+    #[cfg(windows)]
+    #[test]
+    fn windows_cmd_tail_roundtrips_random_vectors_through_both_oracles() {
+        const POOL: &[char] = &[
+            'a', 'Z', '9', '.', '_', '-', ' ', '"', '\\', '&', '|', '<', '>', '^', '(', ')', '标',
+            '図', 'ü',
+        ];
+        let mut rng = TailRng(0x5EED_0033);
+        let mut cases: Vec<(String, Vec<String>)> = vec![
+            (
+                "npx".to_string(),
+                vec!["-y".to_string(), "some-mcp-server".to_string()],
+            ),
+            (
+                "node".to_string(),
+                vec!["arg with space".to_string(), "--flag".to_string()],
+            ),
+            (
+                "node".to_string(),
+                vec!["say \"hi\"".to_string(), "C:\\dir with space\\".to_string()],
+            ),
+            (
+                "npx".to_string(),
+                vec!["服务器.js".to_string(), String::new(), "x".to_string()],
+            ),
+            (
+                "C:\\Program Files\\nodejs\\node.exe".to_string(),
+                vec!["my project\\server.js".to_string()],
+            ),
+            (
+                "node".to_string(),
+                vec!["https://api.example.com/?a=1&b=2".to_string()],
+            ),
+        ];
+        let mut gen = |rng: &mut TailRng| {
+            let len = rng.hbelow(7);
+            (0..len).map(|_| *rng.hpick(POOL)).collect::<String>()
+        };
+        for _ in 0..tail_fuzz_iters() {
+            let n_args = rng.hbelow(4);
+            cases.push((gen(&mut rng), (0..n_args).map(|_| gen(&mut rng)).collect()));
+        }
+        for (cmd, args) in &cases {
+            let tail = windows_cmd_tail(cmd, args);
+            let stripped = cmd_c_strip_quotes(&tail);
+            let mut want = vec![cmd.clone()];
+            want.extend(args.iter().cloned());
+            assert_eq!(
+                msvc_argv_split(&stripped),
+                want,
+                "SUT 整链往返: cmd={cmd:?} args={args:?} tail={tail:?}"
+            );
+        }
+    }
+
+    /// 正式用例（2026-10 触发集扩展的验收，before/after 见
+    /// windows_cmd_tail 文档）：cmd 元字符 `& | < > ^ ( ) % !` 现在必须被
+    /// 包裹——此前它们是 ASCII 非空白、裸露在引号外，cmd /C 的解析层把
+    /// `&`/`|` 当命令分隔符、`<`/`>` 当重定向、`^` 当转义符、`( )` 当分组
+    /// 符，MCP args 含 URL query（`?a=1&b=2`）的活体形态在 cmd 层就被拆
+    /// 碎，子进程永远看不到完整参数；引号内这些字符对 cmd 一律字面量。
+    /// 定性：用户配置信任面的正确性修复，非安全边界。另注（文档限制级，
+    /// 不在本断言面）：`%VAR%` 展开连引号也挡不住（cmd 在引号内仍展开
+    /// 环境变量）、`!` 仅延迟扩展开启时特殊——对这两类加引号只是保守
+    /// 表意，不构成保证。
+    #[cfg(windows)]
+    #[test]
+    fn windows_cmd_tail_quotes_cmd_metachars_for_the_child() {
+        for arg in [
+            "https://api.example.com/?a=1&b=2",
+            "a|b",
+            "2>nul",
+            "a^b",
+            "(group)",
+            "100%",
+            "hi!",
+        ] {
+            let tail = windows_cmd_tail("node", &[arg.to_string()]);
+            assert!(
+                tail.contains(&format!("\"{arg}\"")),
+                "cmd 元字符参数必须整体加引号（引号外 cmd 会拆）：arg={arg:?} tail={tail:?}"
+            );
+        }
+    }
+
     // ─── Windows shutdown-reaper ──────────────────────────────────────
 
     /// Live pings whose command line references `ip` — the same fingerprint
@@ -3190,12 +3806,14 @@ mod tests {
         );
     }
 
-    /// A live reader cannot be joined (the server holds the GET open), so
-    /// Drop detaches it. That used to be silent — a long-lived host would
-    /// leak one thread + TCP connection per teardown with no trace. Pin the
-    /// diagnostic on the detach path and its absence on the finished path.
+    /// A reader that stays stuck LONGER than READER_JOIN_WAIT (simulated with
+    /// a foreign handle) gets detached after the bounded wait — silently: the
+    /// old "detached on teardown" warning is gone because the residual thread
+    /// now self-reclaims at its round deadline instead of leaking until
+    /// process exit. The wait itself must be honored (teardown must not hang,
+    /// and must not detach instantly either).
     #[test]
-    fn http_transport_warns_when_a_live_stream_reader_is_detached() {
+    fn http_transport_teardown_detaches_a_stuck_reader_silently_after_a_bounded_wait() {
         let (release_tx, release_rx) = mpsc::channel::<()>();
         let handle = std::thread::spawn(move || {
             let _ = release_rx.recv_timeout(std::time::Duration::from_secs(30));
@@ -3223,16 +3841,24 @@ mod tests {
                 sink.lock().unwrap().push(msg.to_string());
             }
         }));
+        let t0 = Instant::now();
         drop(t);
+        let elapsed = t0.elapsed();
         let captured = warnings.lock().unwrap().clone();
         crate::diag::clear_diag_sink();
         let _ = release_tx.send(()); // let the detached thread exit promptly
 
         assert!(
-            captured
-                .iter()
-                .any(|m| m.contains("HTTP standing-stream reader detached")),
-            "live reader detach must be announced, got {captured:?}"
+            !captured.iter().any(|m| m.contains("detached")),
+            "stuck-reader detach must be silent now (bounded self-reclaim), got {captured:?}"
+        );
+        assert!(
+            elapsed >= READER_JOIN_WAIT,
+            "the bounded wait must be honored before detaching, took {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "teardown must not hang on a stuck reader, took {elapsed:?}"
         );
     }
 
@@ -3278,6 +3904,611 @@ mod tests {
                 .any(|m| m.contains("standing-stream reader detached")),
             "finished reader must be joined silently, got {captured:?}"
         );
+    }
+
+    // ── 流轮转（STREAM_ROUND）与有界 teardown ────────────────────────────
+
+    /// Probe for `is_stream_round_timeout`: the deadline-vs-real-error
+    /// discrimination relies on reqwest's internal error shape (a
+    /// request-timeout read failure surfaces as
+    /// `io::Error::new(Other, reqwest::Error)` — into_io pins the ErrorKind
+    /// to Other, so only the INNER error knows, via `is_timeout()`). Verify
+    /// the shape against a real timeout before anything depends on it; a
+    /// reqwest upgrade that changes the shape turns THIS red first, instead
+    /// of rotations being misread as real read errors (or the reverse).
+    #[test]
+    fn stream_round_timeout_surfaces_as_a_detectable_reqwest_timeout() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let url = format!(
+            "http://127.0.0.1:{}/mcp",
+            listener.local_addr().unwrap().port()
+        );
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            let head = mock_read_request(&mut sock);
+            assert!(head.starts_with("get"), "{head}");
+            let resp = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                        cache-control: no-cache\r\nconnection: close\r\n\r\n";
+            sock.write_all(resp.as_bytes()).expect("write headers");
+            sock.flush().ok();
+            // Hold the connection open with no data: the client's read can
+            // only wake at its round deadline.
+            std::thread::sleep(Duration::from_secs(2));
+        });
+        // Same builder shape as the stream readers (connect-only client; the
+        // round bound rides on the request).
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("client");
+        let resp = client
+            .get(&url)
+            .header("accept", "text/event-stream")
+            .timeout(Duration::from_millis(300))
+            .send()
+            .expect("headers arrive");
+        let mut reader = BufReader::new(resp);
+        let t0 = Instant::now();
+        let err = read_sse_event(&mut reader, MCP_EVENT_MAX)
+            .expect_err("round deadline must fire on a silent stream");
+        assert!(
+            t0.elapsed() >= Duration::from_millis(250),
+            "timeout fired implausibly early: {:?}",
+            t0.elapsed()
+        );
+        assert!(
+            is_stream_round_timeout(&err),
+            "reqwest round-timeout must be recognizable through the error chain, got {err:#}"
+        );
+        // Negative: a plain io error (no reqwest inner) is never a rotation —
+        // not even with a timeout ErrorKind (reqwest's into_io never
+        // produces that shape, and the discrimination must not lean on it).
+        assert!(!is_stream_round_timeout(&anyhow::Error::from(
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "plain io timeout")
+        )));
+        server.join().expect("mock thread");
+    }
+
+    /// Mock that serves EVERY incoming connection (GET → SSE headers, then
+    /// silence — a client can only rotate away or exit via its round
+    /// deadline) and records `get`/`closed` entries: `closed` lands when the
+    /// client side of that connection goes away, so teardown tests can watch
+    /// the TCP connections close from the peer side. `with_endpoint`
+    /// prepends the legacy `endpoint` event (needed to construct a
+    /// SseTransport). Bounded like the sibling mocks: deadline-capped accept
+    /// loop, read timeouts, bounded request reads.
+    fn mock_held_sse_stream(with_endpoint: bool) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::Read;
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let url = format!(
+            "http://127.0.0.1:{}/mcp",
+            listener.local_addr().unwrap().port()
+        );
+        let log: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let log_main = log.clone();
+        std::thread::Builder::new()
+            .name("mcp-held-mock".into())
+            .spawn(move || {
+                listener.set_nonblocking(true).expect("nonblocking");
+                let deadline = Instant::now() + Duration::from_secs(15);
+                while Instant::now() < deadline {
+                    let mut sock = match listener.accept() {
+                        Ok((s, _)) => s,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(20));
+                            continue;
+                        }
+                        Err(_) => return,
+                    };
+                    sock.set_nonblocking(false).ok();
+                    sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                    let log_c = log_main.clone();
+                    std::thread::Builder::new()
+                        .name("mcp-held-mock-conn".into())
+                        .spawn(move || {
+                            let head = mock_read_request(&mut sock);
+                            if head.is_empty() {
+                                return;
+                            }
+                            log_c.lock().unwrap().push(head);
+                            let mut resp = String::from(
+                                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                                 cache-control: no-cache\r\nconnection: close\r\n\r\n",
+                            );
+                            if with_endpoint {
+                                resp.push_str("event: endpoint\ndata: /mcp\n\n");
+                            }
+                            sock.write_all(resp.as_bytes()).ok();
+                            sock.flush().ok();
+                            // Hold until the client side goes away (a
+                            // rotation or teardown) — that FIN/error is the
+                            // peer-observable close under test.
+                            let mut buf = [0u8; 1];
+                            let _ = sock.read(&mut buf);
+                            log_c.lock().unwrap().push("closed".into());
+                        })
+                        .expect("spawn conn thread");
+                }
+            })
+            .expect("spawn mock");
+        (url, log)
+    }
+
+    /// Poll the shared mock log until `pred` holds; asserts with the deadline
+    /// (the same bounded-wait shape the sibling mocks use inline).
+    fn wait_for_log(
+        log: &std::sync::Mutex<Vec<String>>,
+        pred: impl Fn(&[String]) -> bool,
+        what: &str,
+    ) {
+        let wait = Instant::now() + Duration::from_secs(5);
+        loop {
+            let entries = log.lock().unwrap().clone();
+            if pred(&entries) {
+                return;
+            }
+            assert!(
+                Instant::now() < wait,
+                "timed out waiting for {what}: {entries:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn count_gets(entries: &[String]) -> usize {
+        entries.iter().filter(|l| l.starts_with("get")).count()
+    }
+
+    #[test]
+    fn http_standing_stream_rotations_stay_silent() {
+        // 到期轮转是例行节奏，不是故障：健康流每轮重连一次，全程零 diag。
+        let (url, log) = mock_held_sse_stream(false);
+        let cfg = McpServerConfig {
+            name: "rot-silent".into(),
+            command: None,
+            args: vec![],
+            env: HashMap::new(),
+            url: Some(url.clone()),
+            transport: Some(McpTransport::Http),
+            headers: HashMap::new(),
+        };
+        let mut t = HttpTransport::new(&url, &cfg).expect("transport");
+        t.stream_round = Duration::from_millis(300);
+        let _guard = crate::diag::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let warnings = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&warnings);
+        crate::diag::install_diag_sink(Box::new(move |level, msg| {
+            if level == crate::diag::DiagLevel::Warn {
+                sink.lock().unwrap().push(msg.to_string());
+            }
+        }));
+        t.ensure_standalone_stream(true)
+            .expect("arm the standing stream");
+        wait_for_log(&log, |e| count_gets(e) >= 3, "≥2 deadline rotations");
+        drop(t); // teardown must stay silent too (join within ~one round)
+        let captured = warnings.lock().unwrap().clone();
+        crate::diag::clear_diag_sink();
+        assert!(
+            captured.is_empty(),
+            "deadline rotations must stay silent, got {captured:?}"
+        );
+    }
+
+    #[test]
+    fn http_transport_teardown_joins_a_round_bounded_reader_and_closes_the_tcp_connection() {
+        // 新 teardown 契约：置停后读者至多一轮内退出；Drop 在有界窗口内
+        // join（明显短于 READER_JOIN_WAIT 的 detach 路径）、静默，对端看到
+        // 每条连接最终关闭——包括 drop 时仍挂着的那条。
+        let (url, log) = mock_held_sse_stream(false);
+        let cfg = McpServerConfig {
+            name: "rot-teardown".into(),
+            command: None,
+            args: vec![],
+            env: HashMap::new(),
+            url: Some(url.clone()),
+            transport: Some(McpTransport::Http),
+            headers: HashMap::new(),
+        };
+        let mut t = HttpTransport::new(&url, &cfg).expect("transport");
+        t.stream_round = Duration::from_millis(300);
+        let _guard = crate::diag::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let warnings = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&warnings);
+        crate::diag::install_diag_sink(Box::new(move |level, msg| {
+            if level == crate::diag::DiagLevel::Warn {
+                sink.lock().unwrap().push(msg.to_string());
+            }
+        }));
+        t.ensure_standalone_stream(true)
+            .expect("arm the standing stream");
+        wait_for_log(&log, |e| count_gets(e) >= 2, "≥1 rotation");
+        // 落进新一轮的中段：drop 时读者正挂在一次有界读里。
+        std::thread::sleep(Duration::from_millis(120));
+        let t0 = Instant::now();
+        drop(t);
+        let elapsed = t0.elapsed();
+        let captured = warnings.lock().unwrap().clone();
+        crate::diag::clear_diag_sink();
+        assert!(
+            elapsed < Duration::from_millis(1900),
+            "teardown must join within the bounded wait (detaching takes ≥2s), took {elapsed:?}"
+        );
+        assert!(
+            !captured.iter().any(|m| m.contains("detached")),
+            "a joined reader must be silent, got {captured:?}"
+        );
+        // 对端观测：每条被接受的 GET 连接都被客户端关闭。
+        wait_for_log(
+            &log,
+            |e| count_gets(e) > 0 && e.iter().filter(|l| *l == "closed").count() >= count_gets(e),
+            "the peer to observe every connection closed",
+        );
+    }
+
+    /// Mock for the REAL-read-error case: the GET answers SSE headers with a
+    /// lying `content-length`, writes a few bytes, then closes — hyper fails
+    /// the body with an incomplete-message error (a genuine non-timeout
+    /// reqwest body error, exactly the shape a deadline must NOT be mistaken
+    /// for).
+    fn mock_short_body_stream() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let url = format!(
+            "http://127.0.0.1:{}/mcp",
+            listener.local_addr().unwrap().port()
+        );
+        let log: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let log_main = log.clone();
+        std::thread::Builder::new()
+            .name("mcp-shortbody-mock".into())
+            .spawn(move || {
+                listener.set_nonblocking(true).expect("nonblocking");
+                let deadline = Instant::now() + Duration::from_secs(15);
+                while Instant::now() < deadline {
+                    let mut sock = match listener.accept() {
+                        Ok((s, _)) => s,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(20));
+                            continue;
+                        }
+                        Err(_) => return,
+                    };
+                    sock.set_nonblocking(false).ok();
+                    sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                    let head = mock_read_request(&mut sock);
+                    if head.is_empty() {
+                        return;
+                    }
+                    log_main.lock().unwrap().push(head);
+                    let resp = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                                content-length: 100\r\nconnection: close\r\n\r\n0123456789";
+                    sock.write_all(resp.as_bytes()).ok();
+                    sock.flush().ok();
+                    drop(sock); // early FIN with 90 bytes still owed → real error
+                }
+            })
+            .expect("spawn mock");
+        (url, log)
+    }
+
+    #[test]
+    fn http_standing_stream_real_read_error_still_warns_and_reconnects() {
+        // 真读错照旧告警并重连——到期轮转的静默只属于 deadline 到期这一种
+        // 形状；两者绝不能混淆。
+        let (url, log) = mock_short_body_stream();
+        let cfg = McpServerConfig {
+            name: "rot-err".into(),
+            command: None,
+            args: vec![],
+            env: HashMap::new(),
+            url: Some(url.clone()),
+            transport: Some(McpTransport::Http),
+            headers: HashMap::new(),
+        };
+        let mut t = HttpTransport::new(&url, &cfg).expect("transport");
+        t.stream_round = Duration::from_millis(300);
+        let _guard = crate::diag::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let warnings = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&warnings);
+        crate::diag::install_diag_sink(Box::new(move |level, msg| {
+            if level == crate::diag::DiagLevel::Warn {
+                sink.lock().unwrap().push(msg.to_string());
+            }
+        }));
+        t.ensure_standalone_stream(true)
+            .expect("arm the standing stream");
+        wait_for_log(&log, |e| count_gets(e) >= 2, "a reconnect after the error");
+        let captured = warnings.lock().unwrap().clone();
+        crate::diag::clear_diag_sink();
+        assert!(
+            captured
+                .iter()
+                .any(|m| m.contains("read stopped") && m.contains("reconnecting")),
+            "a real read error must still warn, got {captured:?}"
+        );
+        drop(t);
+    }
+
+    /// Mock for the ROTATION-delivery case: POST → 202 (+ session id); EVERY
+    /// GET connection delivers response #1 immediately, then — once the
+    /// SECOND POST exists (shared log) — delivers response #2 on whichever
+    /// connection is live at that moment. If a rotation cuts the first
+    /// delivery, the next connection re-delivers and the shared pending table
+    /// hands it to the still-waiting caller. Bounded like the siblings.
+    fn mock_202_rotating_stream() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::Read;
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let url = format!(
+            "http://127.0.0.1:{}/mcp",
+            listener.local_addr().unwrap().port()
+        );
+        let log: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let log_main = log.clone();
+        std::thread::Builder::new()
+            .name("mcp-rot-mock".into())
+            .spawn(move || {
+                listener.set_nonblocking(true).expect("nonblocking");
+                let deadline = Instant::now() + Duration::from_secs(15);
+                while Instant::now() < deadline {
+                    let mut sock = match listener.accept() {
+                        Ok((s, _)) => s,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(20));
+                            continue;
+                        }
+                        Err(_) => return,
+                    };
+                    sock.set_nonblocking(false).ok();
+                    sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                    let log_c = log_main.clone();
+                    std::thread::Builder::new()
+                        .name("mcp-rot-mock-conn".into())
+                        .spawn(move || {
+                            let head = mock_read_request(&mut sock);
+                            if head.is_empty() {
+                                return;
+                            }
+                            let is_post = head.starts_with("post");
+                            log_c.lock().unwrap().push(head);
+                            if is_post {
+                                let resp = "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\n\
+                                            mcp-session-id: sess-rot\r\nconnection: close\r\n\r\n";
+                                let _ = sock.write_all(resp.as_bytes());
+                                let _ = sock.flush();
+                                return;
+                            }
+                            let resp = concat!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                                 cache-control: no-cache\r\nconnection: close\r\n\r\n",
+                                "event: message\n",
+                                "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"n\":1}}\n\n",
+                            );
+                            let _ = sock.write_all(resp.as_bytes());
+                            let _ = sock.flush();
+                            // Response #2 goes to whichever connection is
+                            // live when the second POST exists.
+                            let wait = Instant::now() + Duration::from_secs(5);
+                            let mut posts = 0usize;
+                            while Instant::now() < wait {
+                                posts = log_c
+                                    .lock()
+                                    .unwrap()
+                                    .iter()
+                                    .filter(|l| l.starts_with("post"))
+                                    .count();
+                                if posts >= 2 {
+                                    break;
+                                }
+                                std::thread::sleep(Duration::from_millis(20));
+                            }
+                            if posts >= 2 {
+                                let resp2 = "event: message\n\
+                                             data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"n\":2}}\n\n";
+                                let _ = sock.write_all(resp2.as_bytes());
+                                let _ = sock.flush();
+                            }
+                            // Hold until the client rotates away / tears down.
+                            let mut buf = [0u8; 1];
+                            let _ = sock.read(&mut buf);
+                        })
+                        .expect("spawn conn thread");
+                }
+            })
+            .expect("spawn mock");
+        (url, log)
+    }
+
+    #[test]
+    fn http_202_delivery_survives_standing_stream_rotations() {
+        // 到期轮转不得弄丢 202 投递：小轮时长下跨至少两次轮转，第二条响应
+        // 仍送达——落在轮转后仍活着的连接上；投递若被轮转切断，下一条连接
+        // 经共享 pending 表重投。
+        let (url, log) = mock_202_rotating_stream();
+        let cfg = McpServerConfig {
+            name: "rot-202".into(),
+            command: None,
+            args: vec![],
+            env: HashMap::new(),
+            url: Some(url.clone()),
+            transport: Some(McpTransport::Http),
+            headers: HashMap::new(),
+        };
+        let mut t = HttpTransport::new(&url, &cfg).expect("transport");
+        t.stream_round = Duration::from_millis(300);
+        let r1 = t
+            .request(1, "tools/list", json!({}), None)
+            .expect("first 202 response arrives via the standing stream");
+        assert_eq!(r1["n"], 1);
+        wait_for_log(&log, |e| count_gets(e) >= 3, "≥2 deadline rotations");
+        let r2 = t
+            .request(2, "tools/call", json!({}), None)
+            .expect("second 202 response still arrives despite rotations");
+        assert_eq!(r2["n"], 2);
+    }
+
+    #[test]
+    fn legacy_sse_teardown_joins_the_round_bounded_reader() {
+        // legacy SSE 同款契约：endpoint 握手后读者挂在 GET 读里；置停后至多
+        // 一轮退出——Drop 有界 join、静默，对端看到连接关闭。
+        let (url, log) = mock_held_sse_stream(true);
+        let cfg = McpServerConfig {
+            name: "legacy-teardown".into(),
+            command: None,
+            args: vec![],
+            env: HashMap::new(),
+            url: Some(url.clone()),
+            transport: Some(McpTransport::Sse),
+            headers: HashMap::new(),
+        };
+        let t = SseTransport::connect_with_round(&url, &cfg, Duration::from_millis(300))
+            .expect("connect with the endpoint event");
+        wait_for_log(&log, |e| count_gets(e) >= 2, "≥1 rotation");
+        let _guard = crate::diag::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let warnings = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&warnings);
+        crate::diag::install_diag_sink(Box::new(move |level, msg| {
+            if level == crate::diag::DiagLevel::Warn {
+                sink.lock().unwrap().push(msg.to_string());
+            }
+        }));
+        let t0 = Instant::now();
+        drop(t);
+        let elapsed = t0.elapsed();
+        let captured = warnings.lock().unwrap().clone();
+        crate::diag::clear_diag_sink();
+        assert!(
+            elapsed < Duration::from_millis(1900),
+            "legacy teardown must join within the bounded wait, took {elapsed:?}"
+        );
+        assert!(
+            !captured.iter().any(|m| m.contains("detached")),
+            "a joined legacy reader must be silent, got {captured:?}"
+        );
+        wait_for_log(
+            &log,
+            |e| count_gets(e) > 0 && e.iter().filter(|l| *l == "closed").count() >= count_gets(e),
+            "the peer to observe every legacy connection closed",
+        );
+    }
+
+    /// Mock for the legacy ROTATION-delivery case: POST → 202; every GET
+    /// connection sends the `endpoint` event, waits for the POST to exist
+    /// (shared log), then delivers response #1 — on whichever connection is
+    /// live at that moment (rotation-cut deliveries are re-delivered by the
+    /// next connection; the pending table dedups).
+    fn mock_legacy_rotating_stream() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::Read;
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let url = format!(
+            "http://127.0.0.1:{}/mcp",
+            listener.local_addr().unwrap().port()
+        );
+        let log: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let log_main = log.clone();
+        std::thread::Builder::new()
+            .name("mcp-legacy-rot-mock".into())
+            .spawn(move || {
+                listener.set_nonblocking(true).expect("nonblocking");
+                let deadline = Instant::now() + Duration::from_secs(15);
+                while Instant::now() < deadline {
+                    let mut sock = match listener.accept() {
+                        Ok((s, _)) => s,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(20));
+                            continue;
+                        }
+                        Err(_) => return,
+                    };
+                    sock.set_nonblocking(false).ok();
+                    sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                    let log_c = log_main.clone();
+                    std::thread::Builder::new()
+                        .name("mcp-legacy-rot-mock-conn".into())
+                        .spawn(move || {
+                            let head = mock_read_request(&mut sock);
+                            if head.is_empty() {
+                                return;
+                            }
+                            let is_post = head.starts_with("post");
+                            log_c.lock().unwrap().push(head);
+                            if is_post {
+                                let resp = "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\n\
+                                            connection: close\r\n\r\n";
+                                let _ = sock.write_all(resp.as_bytes());
+                                let _ = sock.flush();
+                                return;
+                            }
+                            let resp = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                                        cache-control: no-cache\r\nconnection: close\r\n\r\n\
+                                        event: endpoint\ndata: /mcp\n\n";
+                            let _ = sock.write_all(resp.as_bytes());
+                            let _ = sock.flush();
+                            let wait = Instant::now() + Duration::from_secs(5);
+                            let mut posts = 0usize;
+                            while Instant::now() < wait {
+                                posts = log_c
+                                    .lock()
+                                    .unwrap()
+                                    .iter()
+                                    .filter(|l| l.starts_with("post"))
+                                    .count();
+                                if posts >= 1 {
+                                    break;
+                                }
+                                std::thread::sleep(Duration::from_millis(20));
+                            }
+                            if posts >= 1 {
+                                let resp2 = "event: message\n\
+                                             data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":1}}\n\n";
+                                let _ = sock.write_all(resp2.as_bytes());
+                                let _ = sock.flush();
+                            }
+                            // Hold until the client rotates away / tears down.
+                            let mut buf = [0u8; 1];
+                            let _ = sock.read(&mut buf);
+                        })
+                        .expect("spawn conn thread");
+                }
+            })
+            .expect("spawn mock");
+        (url, log)
+    }
+
+    #[test]
+    fn legacy_sse_response_delivery_survives_stream_rotations() {
+        // legacy SSE 的轮转不得弄丢响应投递：轮转已稳定发生后发出的请求，
+        // 其响应落在当时活着的连接上照常送达。
+        let (url, log) = mock_legacy_rotating_stream();
+        let cfg = McpServerConfig {
+            name: "legacy-rot".into(),
+            command: None,
+            args: vec![],
+            env: HashMap::new(),
+            url: Some(url.clone()),
+            transport: Some(McpTransport::Sse),
+            headers: HashMap::new(),
+        };
+        let mut t = SseTransport::connect_with_round(&url, &cfg, Duration::from_millis(300))
+            .expect("connect with the endpoint event");
+        wait_for_log(&log, |e| count_gets(e) >= 2, "≥1 rotation");
+        let r = t
+            .request(1, "tools/list", json!({}), None)
+            .expect("response arrives despite rotations");
+        assert_eq!(r["ok"], 1);
     }
 
     // ── 解析器性质测试（固定种子 LCG，零依赖） ──────────────────────────────
