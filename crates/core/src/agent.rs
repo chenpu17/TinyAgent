@@ -2731,6 +2731,15 @@ impl Agent {
                             if !output.usage_in_shared_budget {
                                 self.share_budget(u.total());
                             }
+                            // Parallel-worker side channel: mirror the fold
+                            // into THIS thread's usage probe. A `task` child
+                            // running its own nested batch folds tool usage
+                            // here — normal outputs and panic-recovered ones
+                            // alike — so when the child's own thread later
+                            // panics, its probe carries the FULL ledger, not
+                            // just its direct chats (see `usage_probe`).
+                            // No-op on the top-level loop thread (no probe).
+                            crate::usage_probe::record(&u);
                             self.fold_usage(events, &u);
                         }
                         records.push(ToolCallRecord {

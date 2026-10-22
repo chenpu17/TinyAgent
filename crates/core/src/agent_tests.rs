@@ -2315,18 +2315,26 @@ impl Tool for PanicOnMarkTool {
     fn concurrency(&self) -> ToolConcurrency {
         ToolConcurrency::Parallel
     }
-    fn run(&self, input: &Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+    fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         let label = input["label"].as_str().unwrap_or("?");
         if label == "boom" {
-            // Model `bill_chat` having already shared this usage into the
-            // run-wide counter: the probe is the only channel that survives
-            // the unwind, and the join arm must recover it into the totals.
-            crate::usage_probe::record(&Usage {
+            // Model `bill_chat` having already billed this usage: share into
+            // the run-wide counter (real when the test installs one — the
+            // nested-panic tests below read it back) and record into the
+            // probe. The probe is the only channel that survives the unwind,
+            // and the join arm must recover it into the totals; the recovered
+            // output carries usage_in_shared_budget=true so the fold will not
+            // re-share.
+            let u = Usage {
                 input_tokens: 100,
                 output_tokens: 20,
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 0,
-            });
+            };
+            if let Some(g) = &ctx.budget {
+                g.share(u.total());
+            }
+            crate::usage_probe::record(&u);
             panic!("worker body blew up");
         }
         Ok(ToolOutput::text(format!("ok-{label}")))
@@ -2397,6 +2405,354 @@ fn parallel_worker_panic_becomes_an_error_slot_and_siblings_survive() {
         contents,
         vec!["ok-a", "parallel tool worker panicked", "ok-c"],
         "N:N pairing intact across a panicked worker"
+    );
+}
+
+// ── nested-parallel panic: the child's FULL ledger must reach its probe ──
+//
+// The `usage_probe` edge this fixture pins: a `task` child (worker thread C)
+// runs its OWN parallel batch; a nested worker panics; the recovered usage is
+// folded into C's ledger at the records.push point — and THEN C itself
+// panics. Without a fold-point `usage_probe::record`, C's probe only ever
+// held C's direct chats: the folded tool usage (normal outputs and recovered
+// ones alike) died with the thread, and the parent's recovered totals
+// diverged from the shared counter.
+
+/// A Parallel tool that reports a fixed `Usage` in a successful output with
+/// `usage_in_shared_budget: false` — the "host CallbackTool metering an
+/// upstream API" shape: the fold shares it into the counter and (the fix
+/// under test) mirrors it into the thread probe.
+struct BilledUsageTool {
+    usage: Usage,
+}
+impl Tool for BilledUsageTool {
+    fn def(&self) -> ToolDef {
+        ToolDef {
+            name: "billed".into(),
+            description: "test tool reporting fixed usage".into(),
+            schema: json!({"type": "object", "properties": {}}),
+        }
+    }
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Parallel
+    }
+    fn run(&self, _input: &Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+        Ok(ToolOutput {
+            content: "billed".into(),
+            image: None,
+            is_error: false,
+            usage: Some(self.usage),
+            usage_in_shared_budget: false,
+            meta: None,
+        })
+    }
+}
+
+/// A Sequential tool that panics on the AGENT'S OWN thread (inline pass) —
+/// the escape vehicle for the nested-panic scenario. A Parallel tool's panic
+/// can never escape an agent's `run`: that agent's own join arm contains it
+/// (the very mechanism under test), so blowing up the child's thread needs an
+/// inline call.
+struct PanicInlineTool;
+impl Tool for PanicInlineTool {
+    fn def(&self) -> ToolDef {
+        ToolDef {
+            name: "panic_inline".into(),
+            description: "test tool that panics inline".into(),
+            schema: json!({"type": "object", "properties": {}}),
+        }
+    }
+    fn run(&self, _input: &Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+        panic!("inline blow-up escapes the agent's own run");
+    }
+}
+
+/// A Parallel `task`-shaped tool that assembles a REAL child Agent (own
+/// MockProvider + toolset, fleet budget / cancel / sandbox shared through the
+/// parent's ctx) and drives it with `run_as_subagent` — the production
+/// SubAgent assembly minus the HTTP provider build. The outcome maps to a
+/// ToolOutput exactly like `tools::subagent::outcome_to_output` (private
+/// there): final text + usage billed to the parent with
+/// `usage_in_shared_budget: true`. The child's script is picked by the
+/// `label` input so one parent turn can fan out differently-behaving
+/// children.
+struct NestedTaskTool;
+impl Tool for NestedTaskTool {
+    fn def(&self) -> ToolDef {
+        ToolDef {
+            name: "task".into(),
+            description: "test nested sub-agent tool".into(),
+            schema: json!({"type": "object", "properties": {"label": {"type": "string"}}}),
+        }
+    }
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Parallel
+    }
+    fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        let label = input["label"].as_str().unwrap_or("?").to_string();
+        let (turns, tools) = nested_child_script(&label);
+        let mut child_cfg = cfg_with(5, 0, 0);
+        child_cfg.system_prompt = Some("nested test sub-agent".into());
+        let (prov, _) = MockProvider::new(turns);
+        let mut child = Agent::new(
+            &child_cfg,
+            Box::new(prov),
+            tools,
+            vec![user_text("go")],
+            // Mirror child_ctx: sandbox inherited, fleet budget + deadline
+            // Arc-shared, sub-agent identity tagged.
+            ToolCtx {
+                tool_absent_notes: ctx.tool_absent_notes.clone(),
+                workdir: ctx.workdir.clone(),
+                max_output_chars: ctx.max_output_chars,
+                restrict_to_workdir: ctx.restrict_to_workdir,
+                cancel: ctx.cancel.clone(),
+                shell_timeout_secs: ctx.shell_timeout_secs,
+                hooks: ctx.hooks.clone(),
+                subagent: Some(label.clone()),
+                budget: ctx.budget.clone(),
+                deadline: ctx.deadline,
+            },
+        );
+        if let Some(flag) = ctx.cancel.clone() {
+            child.set_cancel(flag);
+        }
+        match child.run_as_subagent(&mut |_| {}) {
+            Ok(o) => Ok(ToolOutput {
+                content: o.final_text.clone(),
+                image: None,
+                is_error: false,
+                usage: Some(Usage {
+                    input_tokens: o.input_tokens,
+                    output_tokens: o.output_tokens,
+                    cache_creation_input_tokens: o.cache_creation_input_tokens,
+                    cache_read_input_tokens: o.cache_read_input_tokens,
+                }),
+                usage_in_shared_budget: true,
+                meta: None,
+            }),
+            Err(re) => {
+                // Mirror run_subagent's honest-failure mapping: the partial
+                // cost rides the error output (the child billed its own
+                // chats into the inherited counter).
+                let mut out = ToolOutput::error(format!("nested {label} failed: {re:#}"));
+                if re.usage.total() > 0 {
+                    out.usage = Some(re.usage);
+                    out.usage_in_shared_budget = true;
+                }
+                Ok(out)
+            }
+        }
+    }
+}
+
+/// Script + toolset for one nested child, keyed by label. Panic variants:
+/// turn 1 = parallel batch [billed usage tool, PanicOnMarkTool] (that panic
+/// is recovered into a synthetic error output and folded at the child's
+/// records.push point), turn 2 = PanicOnMarkTool as a single call (same
+/// recovery, folded again), turn 3 = PanicInlineTool — the Sequential escape
+/// that panics on the child's OWN thread. Calm variants end after turn 2's
+/// final text — the no-panic twin for the no-double-count regression.
+fn nested_child_script(label: &str) -> (Vec<MockTurn>, Vec<Box<dyn Tool>>) {
+    let usage = |i: u64, o: u64| Usage {
+        input_tokens: i,
+        output_tokens: o,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+    };
+    let (u1, ut, u2, u3, panics) = match label {
+        "boom-a" => ((10, 2), (30, 7), (20, 3), Some((30, 4)), true),
+        "boom-b" => ((11, 3), (31, 8), (21, 4), Some((31, 5)), true),
+        "calm-a" => ((10, 2), (30, 7), (20, 3), None, false),
+        "calm-b" => ((11, 3), (31, 8), (21, 4), None, false),
+        _ => unreachable!("test-only labels"),
+    };
+    let mut tools: Vec<Box<dyn Tool>> = vec![
+        Box::new(BilledUsageTool {
+            usage: usage(ut.0, ut.1),
+        }),
+        Box::new(PanicOnMarkTool),
+    ];
+    let tool_turn = |blocks: Vec<Block>, u: Option<Usage>| {
+        MockTurn::Ok(ChatResponse {
+            blocks,
+            stop_reason: "tool_use".into(),
+            usage: u,
+        })
+    };
+    let mut turns = vec![tool_turn(
+        vec![
+            Block::ToolUse {
+                id: "c1".into(),
+                name: "billed".into(),
+                input: json!({}),
+            },
+            Block::ToolUse {
+                id: "c2".into(),
+                name: "task".into(),
+                input: json!({"label": "boom"}),
+            },
+        ],
+        Some(usage(u1.0, u1.1)),
+    )];
+    if panics {
+        // Single-call batch: the child's own join arm recovers the panic
+        // (usage_in_shared_budget=true) and folds it — the exact "nested
+        // recovery folded into the child's ledger" shape under test.
+        turns.push(tool_turn(
+            vec![Block::ToolUse {
+                id: "c3".into(),
+                name: "task".into(),
+                input: json!({"label": "boom"}),
+            }],
+            Some(usage(u2.0, u2.1)),
+        ));
+        turns.push(tool_turn(
+            vec![Block::ToolUse {
+                id: "c4".into(),
+                name: "panic_inline".into(),
+                input: json!({}),
+            }],
+            u3.map(|(i, o)| usage(i, o)),
+        ));
+        tools.push(Box::new(PanicInlineTool));
+    } else {
+        turns.push(mock::resp_text("all done", Some(usage(u2.0, u2.1))));
+    }
+    (turns, tools)
+}
+
+#[test]
+fn nested_parallel_panic_probe_carries_the_childs_full_ledger() {
+    // Two parallel `task` calls; both children run the nested-panic script
+    // and their threads blow up on the inline escape. The parent's join arm
+    // must recover each child's FULL ledger — before the fold-point record
+    // the probes held only the children's direct chats (boom-a (60,9) /
+    // boom-b (63,12)); the billed tool's fold and both recovered panics' folds
+    // died with the threads.
+    let mut cfg = cfg_with(5, 0, 0);
+    // max_total_tokens > 0 makes the top-level run install the REAL fleet
+    // counter (fresh per run, read back off agent.ctx below) — the
+    // counter-vs-totals equality half of the assertion.
+    cfg.limits.max_total_tokens = 1_000_000;
+    let (prov, _) = MockProvider::new(vec![
+        MockTurn::Ok(ChatResponse {
+            blocks: ["boom-a", "boom-b"]
+                .iter()
+                .enumerate()
+                .map(|(k, label)| Block::ToolUse {
+                    id: format!("t{k}"),
+                    name: "task".into(),
+                    input: json!({"label": label}),
+                })
+                .collect(),
+            stop_reason: "tool_use".into(),
+            usage: mock::mk_usage(1000, 100),
+        }),
+        mock::resp_text("done", mock::mk_usage(500, 50)),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(NestedTaskTool)],
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o.stop_reason, "end_turn");
+    assert_eq!(o.tool_calls.len(), 2, "both task calls recorded");
+    for rec in &o.tool_calls {
+        assert_eq!(rec.output, "parallel tool worker panicked");
+        assert!(rec.is_error);
+    }
+    // Per-child ledger reaching the parent's probe (LLM chats via bill_chat +
+    // the billed tool's fold + both recovered panics' folds):
+    //   boom-a: (10+30+100+20+100+30, 2+7+20+3+20+4) = (290, 56)
+    //   boom-b: (11+31+100+21+100+31, 3+8+20+4+20+5) = (294, 60)
+    // Parent totals = its own two chats + both recovered ledgers.
+    assert_eq!(
+        (o.input_tokens, o.output_tokens),
+        (1000 + 500 + 290 + 294, 100 + 50 + 56 + 60),
+        "recovered child usage must include the fold-point records"
+    );
+    // No divergence: every token entered the shared counter exactly once —
+    // child LLM chats via bill_chat, the billed tool's usage at the child's
+    // fold (usage_in_shared_budget=false), each panic's usage shared by the
+    // tool itself before recording; recovered outputs (true) are totals-only
+    // at every fold. The counter accumulates Usage::total() = in + out here
+    // (cache axes are 0 throughout).
+    let used = agent
+        .ctx
+        .budget
+        .as_ref()
+        .expect("fleet counter installed by the top-level run")
+        .used
+        .load(Ordering::Relaxed);
+    assert_eq!(
+        used,
+        2084 + 266,
+        "counter delta == totals delta (no divergence)"
+    );
+}
+
+#[test]
+fn nested_parallel_normal_child_completion_bills_exactly_once() {
+    // The no-panic twin: same nested shape, but each child rides out its
+    // contained worker panic and completes normally. The fold-point records
+    // then land in a probe that is DISCARDED on a successful join (the
+    // ToolOutput is the only authority) — exact totals + counter equality pin
+    // that the added recording never double-counts.
+    let mut cfg = cfg_with(5, 0, 0);
+    cfg.limits.max_total_tokens = 1_000_000;
+    let (prov, _) = MockProvider::new(vec![
+        MockTurn::Ok(ChatResponse {
+            blocks: ["calm-a", "calm-b"]
+                .iter()
+                .enumerate()
+                .map(|(k, label)| Block::ToolUse {
+                    id: format!("t{k}"),
+                    name: "task".into(),
+                    input: json!({"label": label}),
+                })
+                .collect(),
+            stop_reason: "tool_use".into(),
+            usage: mock::mk_usage(1000, 100),
+        }),
+        mock::resp_text("done", mock::mk_usage(500, 50)),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(NestedTaskTool)],
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o.stop_reason, "end_turn");
+    assert_eq!(o.tool_calls.len(), 2, "both task calls recorded");
+    for rec in &o.tool_calls {
+        assert_eq!(rec.output, "all done", "child summary rides through");
+        assert!(!rec.is_error);
+    }
+    // Per-child ledger: LLM chats + billed tool fold + recovered panic fold:
+    //   calm-a: (10+30+100+20, 2+7+20+3) = (160, 32)
+    //   calm-b: (11+31+100+21, 3+8+20+4) = (163, 35)
+    assert_eq!(
+        (o.input_tokens, o.output_tokens),
+        (1000 + 500 + 160 + 163, 100 + 50 + 32 + 35),
+        "normal completion bills the same totals with and without the probe"
+    );
+    let used = agent
+        .ctx
+        .budget
+        .as_ref()
+        .expect("fleet counter installed by the top-level run")
+        .used
+        .load(Ordering::Relaxed);
+    assert_eq!(
+        used,
+        1823 + 217,
+        "counter delta == totals delta (no divergence)"
     );
 }
 

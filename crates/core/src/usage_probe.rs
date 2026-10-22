@@ -23,13 +23,30 @@
 //! (they run on the same worker thread). `thread::scope` spawns a fresh OS
 //! thread per worker, so probes never leak between calls.
 //!
-//! Known edge (honest limit): a `task` child that runs its OWN parallel batch
-//! and then panics AFTER that nested batch joined successfully contributes
-//! only its direct chats to this probe — the nested children's usage already
-//! folded into the child's totals but was not re-recorded here. Re-recording
-//! folds would double-count the `llm` primitive (which records directly), and
-//! the two sources are indistinguishable at the fold point, so this rare
-//! nested-panic case may still under-report totals relative to the counter.
+//! Closed edge (was the honest limit): a `task` child that runs its OWN
+//! parallel batch and then panics AFTER that nested batch joined used to
+//! contribute only its direct chats to this probe — the nested children's
+//! usage had folded into the child's totals at the records.push point but was
+//! never re-recorded here, so the parent's recovered sum under-reported
+//! relative to the shared counter. The tool-billed fold point (`agent.rs`)
+//! now mirrors every fold into the probe, and a panicking child's probe
+//! carries its FULL ledger: direct chats, normal tool outputs, and
+//! panic-recovered ones alike (the recovered output keeps
+//! `usage_in_shared_budget: true`, so re-recording it adds totals only —
+//! never a second counter share).
+//!
+//! Why the fold-point mirror is not a double count: the fold runs on the
+//! AGENT'S loop thread, while every in-repo inner-chat tool (`task`, the
+//! sandbox `llm` primitive) is `Parallel` — its inner `bill_chat`s record
+//! into their own worker threads' probes, read once by their join arm and
+//! never seen by the fold. Remaining honest boundary: a SEQUENTIAL (inline)
+//! tool that itself drives a nested `Agent` on the agent's own thread and
+//! returns that usage in its `ToolOutput` would be counted twice on ONE
+//! probe (nested `bill_chat` + fold-point record), over-reporting the
+//! panic-recovered sum for that spend (normal totals stay correct — the
+//! `ToolOutput` is the authority there). No such tool exists in the tree
+//! today; a host `CallbackTool` composing nested agents inline inside a
+//! child-agent context would be the way to build one.
 
 use crate::provider::Usage;
 use std::cell::RefCell;
