@@ -85,13 +85,22 @@ ENTRIES = [
     ("src", "batch.rs", "批量任务 + --retries/--failed + 报告合并"),
     ("src", "harness.rs", "headless 模式 + result.json + NDJSON + exit code"),
     ("src", "harness_tests.rs", "harness 行为测试（重试梯子 / result.json / NDJSON；自内核 agent_tests.rs 随 harness 迁入）"),
-    ("src", "tui.rs", "TUI（feature tui）：内联流式渲染（对话进原生 scrollback）/ InputBuffer 多行输入 / 斜杠命令+补全 / markdown 渲染 / bracketed paste"),
+    ("src", "tui.rs", "TUI 模块根（feature tui）：mod 声明 + 对外出口（run / transcript_rows）"),
+    ("src", "tui/app.rs", "会话装配：run 入口 / worker 线程 / 事件与输入通道 / ui_loop 事件处理主体 / Ctrl-C 双击窗口"),
+    ("src", "tui/input.rs", "多行输入 InputBuffer 编辑器 / 输入历史回溯 / 输入框横向滚动"),
+    ("src", "tui/slash.rs", "斜杠命令：classify 文法 / 只读回复 / 补全弹窗状态机 / /context 报告"),
+    ("src", "tui/theme.rs", "主题：历史行与 chrome 配色单一来源 / 明暗旋钮 TINYAGENT_TUI_THEME / 数字格式化助手"),
+    ("src", "tui/markdown.rs", "markdown 与 ANSI 渲染：render_markdown / 转义解析 / fence 扫描（与流式切分共享）/ MdCache 单槽缓存"),
+    ("src", "tui/transcript.rs", "对话 Row 模型与全部构建/变更逻辑：历史渲染 / 流式增量与增量切分 / /export 转储 / resume 重建"),
+    ("src", "tui/render.rs", "终端绘制：scrollback 提交 commit_rows / live 区渲染 / 输入与状态条 chrome / 宽度与控制字符工具"),
+    ("src", "tui/tests.rs", "TUI 回归测试（TestBackend 抓 cell grid + 输入 / 补全 / 流式切分逻辑）"),
 ]
 
 DIR_COMMENTS = {
     "provider": "LLM 后端",
     "tools": "工具集：内置工具 + MCP 包装 + task 子 agent + run_code（feature code）",
     "tools/run_code": "run_code 子模块（同 code 门）：从原 11.9k 单文件按关注点拆分",
+    "tui": "TUI 子模块（同 tui 门）：从原 8.7k 行单文件按关注点拆分",
 }
 
 
