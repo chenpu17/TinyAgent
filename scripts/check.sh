@@ -7,8 +7,9 @@
 #   ./scripts/check.sh              # 跑默认全集（fmt clippy test e2e docs）
 #   ./scripts/check.sh fmt docs     # 只跑指定分组，可给多个
 #   ./scripts/check.sh e2e          # 只跑场景 e2e（内置 SSE mock，零密钥）
-#   ./scripts/check.sh all          # 等价默认（仍不含 bindings）
+#   ./scripts/check.sh all          # 等价默认（仍不含 bindings / bench）
 #   ./scripts/check.sh bindings     # 双绑定 clippy（默认不跑，见下）
+#   ./scripts/check.sh bench        # 性能基准（快跑一轮，默认不跑，见下）
 #
 # 有意不 set -e：全部检查跑完再汇总，避免第一条红灯掩盖后面独立的问题。
 # 也不并行：cargo 自身按锁串行，并行只会互相阻塞且打乱报错归属。
@@ -94,6 +95,19 @@ group_docs() {
         python3 scripts/check_eval_apparatus.py
 }
 
+group_bench() {
+    # 性能基准（crates/core/benches/loop_bench.rs，零依赖手搓 harness）。
+    # 默认不跑：数字只在本机可比、CI 不设性能门，且 --quick 一轮也要几十秒。
+    # 改了 agent loop / context_breakdown / confined_to 后手动跑一轮看趋势。
+    # 必须带 mock（loop 组用脚本化 Provider，不连网）；不加 --quick 则每组采样 ~1s。
+    # 顺手 lint 一遍：bench 的 agent_bench 模块门在 mock 后，四个 CI clippy 配置
+    # （都不带 mock）根本看不到它——不在这里补就永远没人 lint。
+    run_check "clippy: bench (mock)" \
+        cargo clippy -p tiny-agent-core --features mock --all-targets -- -D warnings
+    run_check "bench: loop_bench" \
+        cargo bench -p tiny-agent-core --features mock --bench loop_bench -- --quick
+}
+
 group_bindings() {
     # 默认不跑：需要 bindings/{python,node} 的依赖环境（maturin / napi），
     # 纯净 checkout 上跑不通。本地装好了再手动 `./scripts/check.sh bindings`。
@@ -108,14 +122,15 @@ group_bindings() {
 }
 
 usage() {
-    printf '用法: %s [fmt|clippy|test|e2e|docs|bindings|all]...（默认 all，不含 bindings）\n' "$0"
+    printf '用法: %s [fmt|clippy|test|e2e|docs|bench|bindings|all]...（默认 all，不含 bench/bindings）\n' "$0"
 }
 
 CHECKS=()
 for arg in "$@"; do
     case "$arg" in
-        fmt|clippy|test|e2e|docs|bindings) CHECKS+=("$arg") ;;
-        # all 刻意不含 bindings：纯净 checkout 跑不通，要跑显式点名。
+        fmt|clippy|test|e2e|docs|bench|bindings) CHECKS+=("$arg") ;;
+        # all 刻意不含 bench / bindings：前者没有 CI 门（数字只在本机可比），
+        # 后者纯净 checkout 跑不通。要跑显式点名。
         all) CHECKS=(fmt clippy test e2e docs) ;;
         -h|--help) usage; exit 0 ;;
         *) usage; exit 2 ;;

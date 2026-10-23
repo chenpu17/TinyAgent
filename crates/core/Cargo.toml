@@ -25,6 +25,13 @@ categories = ["development-tools"]
 name = "tiny_agent"
 path = "src/lib.rs"
 
+# Zero-dependency micro-benchmarks (hand-rolled on std::time::Instant;
+# `harness = false` runs `fn main` directly, no libtest). The agent-loop cases
+# need the `mock` feature; the tool cases run on any build.
+[[bench]]
+name = "loop_bench"
+harness = false
+
 [features]
 default = []
 # Expose the scripted `provider::mock` (otherwise cfg(test)-only) so binding

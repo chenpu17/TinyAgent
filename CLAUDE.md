@@ -164,6 +164,16 @@ cargo clippy -p tiny-agent-node
 
 ## 离线 / 视觉验证
 
+- **性能基准**：`./scripts/check.sh bench`（`crates/core/benches/loop_bench.rs`，零依赖手搓
+  `std::time::Instant` + `harness = false`，**不引 criterion**——单二进制/零依赖是项目定位）。五组：
+  agent loop 一轮（空历史 / 200 条历史，`Agent::new` 不计入）、`Agent::new` 本身（resume / 子 agent
+  的一次性成本）、`context_breakdown()` 两种历史规模、`confined_to` 三条路径。报中位数与 p95
+  （不看均值：一次调度抖动不该动头条）+ 一行 `BENCH name=… median_ns=…`。
+  **不在默认 `all` 集**：数字只在本机前后版本间可比，CI 不设性能门。改了 loop / context_breakdown /
+  confined_to 后手动跑一轮看趋势；`[profile.bench]` 在根 Cargo.toml 覆盖 release 的 `opt-level="z"+lto`，
+  别删（否则测的是发布体积权衡，不是代码本身）。**bench 的 agent 组门在 `mock` 后**，四个 CI clippy
+  配置都不带 mock、看不到它——所以 `bench` 组自己也跑一遍 `clippy --features mock`，否则这块永远没人 lint。
+
 - **场景 e2e**：`python3 scripts/e2e_scenarios.py`——内置 SSE 场景 mock（线程化、零密钥），走真实
   CLI/HTTP 栈守四个 loop 级行为：打转护栏（stuck_loop 硬停 / 同参不同果不误停 / nudge 只进历史不进
   事件流）、单轮 10 路并行 task fan-out（8/波 + N:N + 请求数精确核算）、SIGINT exit 130。CI 有

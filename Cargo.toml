@@ -69,6 +69,12 @@ libc = "0.2"
 [dev-dependencies]
 tiny_agent = { package = "tiny-agent-core", path = "crates/core", features = ["mock"] }
 
+# `cargo bench` 的 bench profile 继承 release（opt-level="z" + lto，为发布体积服务）。
+# 基准测试要的是可解释的绝对数字，不是体积，单独覆盖。
+[profile.bench]
+opt-level = 3
+lto = false
+
 [profile.release]
 opt-level = "z"
 lto = true

@@ -1024,7 +1024,8 @@ tool whitelist`。真正的"按轮临时预批准"需要每轮权限/激活层�
 
 `./scripts/check.sh` 一把跑完 CI 的 fmt / 四个 clippy / 测试 / 场景 e2e / 文档门禁（命令与
 `.github/workflows/ci.yml` 逐字一致，失败最后统一汇总）；也可只跑某组，如 `./scripts/check.sh fmt docs`。
-双绑定的 clippy 需要先装好 maturin / napi 环境，默认不跑，显式 `./scripts/check.sh bindings`。
+双绑定的 clippy 需要先装好 maturin / napi 环境，默认不跑，显式 `./scripts/check.sh bindings`；
+性能基准也不在默认集里，显式 `./scripts/check.sh bench`。
 
 ```sh
 cargo test --features tui,mock   # 单元测试（含 TUI 输入/渲染逻辑 + lib_api 集成测试）
@@ -1042,6 +1043,17 @@ cd $(mktemp -d) && MOCK_API_KEY=dummy tiny-agent --config <指向 mock 的配置
 `examples/mock_openai.py` / `mock_anthropic.py` 是零依赖 SSE mock server，用于离线验证整个
 agent loop（含 tool_use 配对、token 用量解析、流式取消）。注意 `[profile.release] panic = "abort"`，
 release 下 panic 不触发 `Drop`——调试 destructors（如 TUI 终端还原）用 debug 构建。
+
+性能基准在 `crates/core/benches/loop_bench.rs`，零依赖（手搓在 `std::time::Instant` 上，
+`harness = false`，不引 criterion）：一轮 agent loop 的开销（空历史 / 200 条历史，`Agent::new`
+不计入）、`Agent::new` 本身（resume / 子 agent 的一次性成本）、`context_breakdown()`（宿主每次刷新都拉）、
+`confined_to`（文件工具沙盒走查的成功/符号链接/拒绝三条路径）。输出中位数与 p95，外加一行机器可读的
+`BENCH name=… median_ns=… p95_ns=…`。基准只在本机前后版本间可比，CI 不设性能门：
+
+```sh
+./scripts/check.sh bench      # 等价于下面这行，--quick 每组采样 ~150ms
+cargo bench -p tiny-agent-core --features mock --bench loop_bench -- --quick
+```
 
 核心 agent loop 有进程内回归测试：`crates/core/src/provider/mock.rs` 是 cfg(test) 的脚本化 Provider，
 `crates/core/src/agent.rs` 的 `#[cfg(test)]` 模块覆盖 cancel 契约（run 永不清、预置即取消、受理点 `clear_cancel`）、tool_use/tool_result N:N 配对（含中途取消的
