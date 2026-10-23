@@ -24,6 +24,9 @@ pub struct OpenAi {
 }
 
 impl OpenAi {
+    /// `idle` is the maximum gap between SSE chunks before the stream is
+    /// treated as stalled (from `limits.stream_idle_secs`, clamped ≥1s by
+    /// `provider::build`). The client's own timeout stays the hard backstop.
     pub fn new(
         client: reqwest::blocking::Client,
         base_url: String,

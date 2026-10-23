@@ -81,6 +81,8 @@ pub struct SystemBreakdown {
 /// One origin bucket of tool-schema cost.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ToolCategory {
+    /// Sum of the per-tool estimates below (running-floor allocated, so the
+    /// four buckets sum to `ToolsBreakdown::tokens` exactly).
     pub tokens: u64,
     /// Per-tool entries in tool-list order (the same order
     /// `Agent::tool_names` reports, not sorted).
@@ -92,7 +94,9 @@ pub struct ToolCategory {
 /// sums over.
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolEntry {
+    /// The tool's name (agent-facing, post-sanitization for MCP tools).
     pub name: String,
+    /// This tool's share of the schema estimate.
     pub tokens: u64,
 }
 
@@ -100,9 +104,14 @@ pub struct ToolEntry {
 /// same total `Agent::tool_schema_chars` caches.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ToolsBreakdown {
+    /// `ToolOrigin::Builtin` tools (shell / files / image / todo / task /
+    /// run_code).
     pub builtin: ToolCategory,
+    /// `ToolOrigin::Mcp` tools.
     pub mcp: ToolCategory,
+    /// The `read_skill` / `list_skill` pair.
     pub skill: ToolCategory,
+    /// Host-injected or unrecognized tools (`ToolOrigin::Custom`'s default).
     pub custom: ToolCategory,
     /// The four buckets summed.
     pub tokens: u64,
@@ -111,7 +120,10 @@ pub struct ToolsBreakdown {
 /// Message history aggregated by block kind.
 #[derive(Debug, Clone, Serialize)]
 pub struct MessagesBreakdown {
+    /// Whole conversation history's estimate (the `by_kind` numbers sum to
+    /// this by the same running-floor allocation as the other sections).
     pub tokens: u64,
+    /// The same total split by block kind.
     pub by_kind: MessageKinds,
 }
 

@@ -60,13 +60,28 @@ fn default_tools() -> Vec<String> {
     ]
 }
 
+/// Run limits — the resource envelope of one run. Most fields are checked at
+/// turn boundaries (the running turn always finishes), and a batch task
+/// fragment may only TIGHTEN them (see the `Clamp` policy on each field);
+/// `shell_timeout_secs` is the lone exception.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Limits {
+    /// Maximum turns (chat requests) per run. The cap refuses to START a
+    /// turn, so the conversation always ends on a complete assistant message.
     #[serde(default = "default_max_turns")]
     pub max_turns: u32,
+    /// Whole-run wall clock in seconds from run start; `0` = no limit. A run
+    /// that exceeds it stops at the next turn boundary with `stop_reason:
+    /// "timeout"`; an in-flight request is additionally capped by the
+    /// remaining budget as its per-request timeout. Batch tightening only.
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
+    /// Per-tool-result character cap the tools apply to what they return
+    /// (`ctx.max_output_chars`; the core also applies it to hook-deny copy).
+    /// Excess is truncated with a marker; some tools treat it as a byte/page
+    /// budget rather than a hard text cut (read_file pages, mcp shaping). 0 is
+    /// not a useful value — every tool would return nothing.
     #[serde(default = "default_max_output")]
     pub max_output_chars: usize,
     /// Compress conversation history beyond this many chars (0 = never).
@@ -200,14 +215,21 @@ impl Clamp {
     }
 }
 
+/// The protocol family to speak. Deserialized as the lowercase config string
+/// (`"anthropic"` / `"openai"`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderKind {
+    /// Anthropic Messages API (native thinking blocks, prompt caching, PDF
+    /// document blocks).
     Anthropic,
+    /// OpenAI Chat Completions (also serves OpenAI-compatible gateways).
     Openai,
 }
 
 impl ProviderKind {
+    /// The vendor's public endpoint, used when `Config::base_url` is unset.
+    /// Worth overriding for gateways, proxies, and self-hosted endpoints.
     pub fn default_base_url(self) -> &'static str {
         match self {
             ProviderKind::Anthropic => "https://api.anthropic.com",
@@ -225,6 +247,8 @@ impl ProviderKind {
     }
 }
 
+/// Transport used to reach an MCP server over HTTP. Ignored for stdio
+/// (`command`) servers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum McpTransport {
@@ -247,20 +271,31 @@ pub enum McpTransport {
 // (`https://user:pass@host` basic-auth endpoints, folded in by the follow-up
 // P2 round via `redact_url_credentials`) — were the only places a raw
 // secret could ride a Debug print out of this module.
+/// One external MCP tool server. Exactly one of `command` (stdio) or `url`
+/// (HTTP/SSE) must be set — [`Self::validate`] enforces it; the struct's
+/// `Debug` masks credential values (see the impl below).
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpServerConfig {
+    /// Server name. Used to build the exposed tool names (`mcp_<server>_<tool>`)
+    /// and as the handle `Agent::remove_mcp_server` takes; names that collide
+    /// after sanitization fail the tool-name check at assembly.
     pub name: String,
     /// stdio transport: command to spawn.
     #[serde(default)]
     pub command: Option<String>,
+    /// stdio transport: arguments passed to `command`.
     #[serde(default)]
     pub args: Vec<String>,
     /// HTTP transports: server URL.
     #[serde(default)]
     pub url: Option<String>,
+    /// HTTP transports: force a transport instead of auto-detection.
+    /// stdio servers must leave this as well as `headers` unset.
     #[serde(default)]
     pub transport: Option<McpTransport>,
+    /// HTTP transports: extra request headers (e.g. `Authorization`). Values
+    /// are masked in `Debug` — treat them as credentials.
     #[serde(default)]
     pub headers: std::collections::HashMap<String, String>,
     /// stdio transport only: extra env vars passed to the spawned child, added
@@ -355,6 +390,11 @@ fn redact_url_credentials(url: &str) -> Cow<'_, str> {
 }
 
 impl McpServerConfig {
+    /// Reject structurally-unusable server entries at config time: exactly one
+    /// of `command` / `url`, and no HTTP-only fields on a stdio server. Called
+    /// by [`Config::load`] and by every overlay path that carries MCP servers,
+    /// so a bad entry is blamed on the config rather than surfacing as a
+    /// confusing transport error at first connect.
     pub fn validate(&self) -> Result<()> {
         match (&self.command, &self.url) {
             (Some(_), Some(_)) => {
@@ -440,6 +480,10 @@ pub struct CodeConfig {
     /// 两阶段打法都装不下（实测 agent 在摸底盘点阶段触顶、正事零执行）；
     /// 200 覆盖多数单阶段任务，更大的活由报错文案引导分批续跑。
     pub max_tool_calls: u32,
+    /// Guest linear-memory cap in MiB (enforced by the wasmtime store
+    /// limiter). A floor applies: the wasmtime module itself needs some
+    /// baseline, so a very low value is not honored exactly — raising it is
+    /// the only meaningful tuning direction.
     pub mem_mb: u32,
     /// Wall-clock cap; 0 = none (fuel/memory still bound the run). Enforcement
     /// (epoch + entry checks) lands in M3 — parsed from M1.
@@ -561,18 +605,38 @@ fn default_deny_paths() -> Vec<String> {
     .collect()
 }
 
+/// The parsed, validated configuration — one JSON file, the whole surface of
+/// a headless run or TUI conversation. Load it with [`Config::load`] (which
+/// also normalizes `workdir` and validates MCP entries), then hand it to
+/// [`crate::build_agent`].
+///
+/// Fields are grouped: connection (`provider` / `base_url` / `api_key_env` /
+/// `model` / `max_tokens`), behavior (`system_prompt` / `inject_environment` /
+/// `salvage_on_max_tokens` / `reasoning_effort`), the tool whitelist and its
+/// sandbox, and the [`Limits`] envelope. Unknown keys are rejected.
+///
+/// The API key itself is never stored here — only the NAME of the environment
+/// variable holding it (`api_key_env`), so a config file is safe to commit.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Which wire protocol to speak; also what result.json attributes the bill
+    /// to (even when a custom provider is injected).
     pub provider: ProviderKind,
     /// Optional; falls back to the provider's default endpoint.
     #[serde(default)]
     pub base_url: Option<String>,
     /// Name of the environment variable holding the API key.
     pub api_key_env: String,
+    /// Model name sent on every request. Batch tasks may override it.
     pub model: String,
+    /// Per-request output-token budget (`max_tokens`). Unlike a context-window
+    /// setting this bounds one reply, not the history.
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
+    /// Base system prompt. Assembly appends the level-1 skill intro to a COPY;
+    /// `Agent::try_new` additionally prepends the `# Environment` header
+    /// when `inject_environment` is on.
     #[serde(default)]
     pub system_prompt: Option<String>,
     /// Task to execute in headless mode (overridable via --task).
@@ -606,6 +670,9 @@ pub struct Config {
     /// Default on. Soft field (batch-overridable).
     #[serde(default = "default_salvage_on_max_tokens")]
     pub salvage_on_max_tokens: bool,
+    /// The run's resource envelope (turns, timeouts, compression thresholds,
+    /// token budget, shell timeout). A batch task fragment may only tighten
+    /// most of these — see [`Limits`].
     #[serde(default)]
     pub limits: Limits,
     /// External MCP tool servers (stdio transport).
@@ -761,6 +828,10 @@ fn validate_tool_whitelist(names: &[String]) -> Result<()> {
 }
 
 impl Config {
+    /// Read + parse + [`Self::validate_and_normalize`] a JSON config file. The
+    /// returned config has its `workdir` canonicalized (and rejected if it
+    /// does not exist or is not a directory) and its MCP server entries
+    /// validated, so a later failure is never "bad path discovered mid-run".
     pub fn load(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("cannot read config file: {}", path.display()))?;
@@ -790,6 +861,9 @@ impl Config {
         Ok(())
     }
 
+    /// The endpoint requests go to: `base_url` if set, else the provider's
+    /// default, with trailing slashes trimmed (providers join with `/path`,
+    /// and a doubled slash 404s on some gateways).
     pub fn base_url(&self) -> String {
         let base = self
             .base_url
@@ -801,6 +875,10 @@ impl Config {
         base.trim_end_matches('/').to_string()
     }
 
+    /// Read the API key from the environment variable named by
+    /// [`Self::api_key_env`]. The two failure modes (unset vs. set-but-not-UTF-8)
+    /// get distinct messages — they call for opposite fixes — and the secret
+    /// value is never echoed.
     pub fn api_key(&self) -> Result<String> {
         std::env::var(&self.api_key_env).map_err(|e| api_key_env_error(&self.api_key_env, e))
     }
@@ -994,25 +1072,47 @@ impl Config {
     }
 }
 
-/// All-optional config fragment used by batch task files.
+/// All-optional config fragment used by batch task files. Soft fields may be
+/// overlaid; hard fields (endpoints, credentials, workdir, tool whitelist,
+/// MCP servers) are rejected by [`Config::apply`] — see
+/// [`PartialConfig::forbidden_batch_override`] for the exact split.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PartialConfig {
+    /// HARD: switching the wire protocol mid-batch would invalidate every
+    /// message shape already in flight.
     pub provider: Option<ProviderKind>,
+    /// HARD: moving the endpoint would send the trusted API key elsewhere.
     pub base_url: Option<String>,
+    /// HARD: swapping the key variable is a credential-redirection vector.
     pub api_key_env: Option<String>,
+    /// Soft: batch tasks routinely pick a cheaper/different model.
     pub model: Option<String>,
+    /// Soft: a per-task output budget.
     pub max_tokens: Option<u32>,
+    /// Soft: the task's own system prompt.
     pub system_prompt: Option<String>,
+    /// Soft: the task message (what `--task` also overrides).
     pub task: Option<String>,
+    /// HARD: the workdir is the sandbox root.
     pub workdir: Option<PathBuf>,
+    /// HARD: the tool whitelist defines what the task may do at all.
     pub tools: Option<Vec<String>>,
+    /// HARD: turning confinement off per task would escape the sandbox.
     pub restrict_to_workdir: Option<bool>,
+    /// Soft, per-field: each [`Limits`] field has its own clamp policy
+    /// (tighten-only, except `shell_timeout_secs`). See [`PartialLimits`].
     pub limits: Option<PartialLimits>,
+    /// HARD: a task may not inject unvalidated MCP servers.
     pub mcp_servers: Option<Vec<McpServerConfig>>,
+    /// Soft.
     pub reasoning_effort: Option<String>,
+    /// Soft.
     pub inject_environment: Option<bool>,
+    /// Soft.
     pub salvage_on_max_tokens: Option<bool>,
+    /// Soft, per-field: see [`PartialCodeConfig`]. `code.enabled` is still
+    /// rejected — an untrusted fragment may not switch the sandbox.
     pub code: Option<PartialCodeConfig>,
 }
 
@@ -1088,18 +1188,35 @@ impl PartialConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PartialCodeConfig {
+    /// Rejected by [`Config::apply`] when present — an untrusted fragment may
+    /// not switch the sandbox on or off.
     pub enabled: Option<bool>,
+    /// Union — a fragment can only ADD denials.
     pub deny_paths: Option<Vec<String>>,
+    /// Entry-wise intersection with the base (an empty side is the universe,
+    /// so empty + empty stays "whole workdir writable").
     pub fs_write_dirs: Option<Vec<String>>,
+    /// Tighten only.
     pub max_tool_calls: Option<u32>,
+    /// Tighten only.
     pub mem_mb: Option<u32>,
+    /// Tighten only (`0` = no limit is the loosest, so a 0 is ignored).
     pub timeout_secs: Option<u64>,
+    /// Tighten only.
     pub fuel: Option<u64>,
+    /// Tighten only.
     pub max_result_chars: Option<usize>,
+    /// Tighten only — a fragment may disclose LESS, never more (the enum's
+    /// declaration order is the ordering).
     pub skill_injection: Option<SkillInjection>,
+    /// Tighten only (false < true).
     pub precheck: Option<bool>,
+    /// Tighten only — enabling a channel is the trusted base config's call.
     pub include: Option<bool>,
+    /// Tighten only.
     pub call_batch: Option<bool>,
+    /// `enabled` / `default_model` are rejected; `models` may only be
+    /// intersected down (see [`PartialLlmConfig`]).
     pub llm: Option<PartialLlmConfig>,
 }
 
@@ -1111,8 +1228,14 @@ pub struct PartialCodeConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PartialLlmConfig {
+    /// Rejected by [`Config::apply`] when present.
     pub enabled: Option<bool>,
+    /// Rejected by [`Config::apply`] when present — the default route is the
+    /// trusted base config's decision. An overlay that drops the default from
+    /// `models` is a bad_task (the narrowed tier couldn't serve it).
     pub default_model: Option<String>,
+    /// Intersected with the base list (declaration order preserved) — a
+    /// fragment can only narrow the tier.
     pub models: Option<Vec<String>>,
 }
 
@@ -1257,18 +1380,35 @@ impl CodeConfig {
     }
 }
 
+/// Batch-overlay shape for [`Limits`]: each field is merged under its own
+/// tighten/init/replace clamp policy (see the per-field notes and
+/// `PartialConfig::forbidden_batch_override` for the soft/hard split). `None`
+/// leaves the base value untouched; absent-from-JSON and explicit `null` both
+/// map to `None`.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PartialLimits {
+    /// `Tighten`: plain min.
     pub max_turns: Option<u32>,
+    /// `TightenOrInit`: a fragment's 0 is ignored; a 0 base adopts any finite
+    /// value.
     pub timeout_secs: Option<u64>,
+    /// `Tighten`: plain min.
     pub max_output_chars: Option<usize>,
+    /// `TightenOrInit`.
     pub compress_threshold_chars: Option<usize>,
+    /// `Tighten`.
     pub keep_recent_messages: Option<usize>,
+    /// `TightenOrInit`.
     pub max_context_tokens: Option<u64>,
+    /// `TightenOrInit` — the run-wide token budget.
     pub max_total_tokens: Option<u64>,
+    /// `Tighten`.
     pub stream_idle_secs: Option<u64>,
+    /// `Replace` — the ONLY limits field overridable in both directions (a
+    /// cost/latency knob, not a safety boundary).
     pub shell_timeout_secs: Option<u64>,
+    /// `TightenOrInit` — 0 (no separate ceiling) is the loosest value.
     pub subagent_max_turns: Option<u32>,
 }
 

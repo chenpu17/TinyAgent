@@ -135,8 +135,13 @@ fn read_capped_line<R: BufRead>(
 
 /// A tool as advertised by an MCP server.
 pub struct McpToolInfo {
+    /// The tool's WIRE name, exactly as the server sent it. It is kept
+    /// verbatim for `tools/call`; only the agent-facing display name goes
+    /// through sanitization.
     pub name: String,
+    /// Description sent by the server (shown to the model in the tool def).
     pub description: String,
+    /// The server's JSON Schema for this tool's input.
     pub input_schema: Value,
     /// `annotations.readOnlyHint` from the server (absent = false). A
     /// SERVER-declared scheduling hint feeding `Tool::batchable` — not a
@@ -166,6 +171,9 @@ trait Transport: Send {
     fn set_shutdown(&mut self, _shutdown: &Arc<AtomicBool>) {}
 }
 
+/// One connected MCP server: a JSON-RPC transport plus the initialize
+/// handshake state. Created and owned by [`McpTool`](crate::tools::mcp)
+/// instances; use [`McpClient::start`] rather than constructing one directly.
 pub struct McpClient {
     transport: Box<dyn Transport>,
     next_id: u64,

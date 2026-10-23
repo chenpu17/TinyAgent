@@ -12,10 +12,10 @@
     "crates/core/src/tools/run_code/lib_index.rs": "c201b666c297ac5659950d2f233b12184aa7aa83cbd11a67f709f983238a0f77",
     "crates/core/src/tools/run_code/batch.rs": "4e960d3ff1901e389cbaa34aa31144648559663c720e998ca26a889935b10e5d",
     "crates/core/src/tools/run_code/precheck.rs": "fa59312c184bafdc63d645ed7e1735055f5e05281d66cff688e186450945b728",
-    "crates/core/src/tools/run_code/tool.rs": "afa3bd6af10da7f60f70af974885314ae014e4ded09db2390b2079696a8e3cce",
+    "crates/core/src/tools/run_code/tool.rs": "765ef145c45ee14ac0bb96d932eaa970313487b32a0c5c02724b76d9713ba848",
     "crates/core/src/tools/run_code/test_util.rs": "4aa1cc87def60ae0b40eb646eb409cd0bd97a276f27b9e92217c52e1ded666dd",
     "crates/core/src/tools/run_code_skill.md": "04490a6b29633687feafaaa157317d673d61b7882ed0cf18a71fb326b5171942",
-    "crates/core/src/tools/skill.rs": "6285240569389e118587bb832a32f5e53c171d7211b16f6edc1bf28023a0f70a",
+    "crates/core/src/tools/skill.rs": "b3721534688ad5a2decc2d19e288aa803ff5d53208890f888727431719004a72",
     "docs/finetune_support_design.md": "7bfc8a388ad6b189ff778aadee4e9ef1be56097933688107b94f1241cbeb237d"
   },
   "prompt_bodies": {

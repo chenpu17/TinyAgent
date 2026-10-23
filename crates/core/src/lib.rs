@@ -22,18 +22,33 @@
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 
+#![warn(missing_docs)]
+
+/// The agent loop: history, tool dispatch, compression, billing, and the
+/// [`Agent`] itself. [`Agent::run`] is the single entry point; everything it
+/// returns ([`RunOutcome`] / [`RunError`]) carries honest cost even on failure.
 pub mod agent;
 pub mod compress;
+/// Static configuration ([`Config`]) plus the batch-overlay fragments
+/// (`PartialConfig` family). Deserialized with `deny_unknown_fields` — a typo
+/// is an error, not a silently ignored key.
 pub mod config;
 pub mod context_report;
 pub mod diag;
 pub mod fsutil;
 pub mod hooks;
 pub mod mcp;
+/// Provider wire protocols: [`Provider`] trait, the shared message/block model
+/// ([`Block`] / [`Message`] / [`Usage`]), and the Anthropic / OpenAI
+/// implementations. `provider::build` picks one from a [`Config`].
 pub mod provider;
 pub mod retry;
+/// Session-file persistence: save / load the conversation (plus the archive of
+/// messages folded out by compression) so `--resume` can continue a run.
 pub mod session;
 pub mod skills;
+/// The tool layer: the [`Tool`] trait, [`ToolCtx`], and the built-in
+/// implementations (further submodules are internal except `mcp` / `run_code`).
 pub mod tools;
 // windows, not not(unix): the module is windows-sys all the way down (Job
 // Objects), and windows-sys is a cfg(windows) dependency — a third platform

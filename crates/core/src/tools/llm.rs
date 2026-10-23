@@ -94,6 +94,10 @@ pub struct LlmTool {
 }
 
 impl LlmTool {
+    /// Built only by `RunCodeTool::registry` from the lineage's snapshot.
+    /// `provider_cell` is the clone-shared cell `Agent::set_code_tool`
+    /// late-fills with the outer agent's provider (LD-16); it may be empty
+    /// when a call arrives, which surfaces as an honest error, not a panic.
     pub fn new(cfg: LlmConfig, provider_cell: Arc<OnceLock<Arc<dyn Provider>>>) -> Self {
         Self {
             cfg,

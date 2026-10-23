@@ -37,6 +37,10 @@ pub struct ReadSkill {
 }
 
 impl ReadSkill {
+    /// Build the tool over a scanned index. Construction happens in assembly
+    /// only (the tool is not in the config whitelist); `index` is the same one
+    /// whose intro went into the system prompt, so the model and the tool
+    /// agree on the available names.
     pub fn new(index: SkillIndex) -> Self {
         Self {
             index,
@@ -226,6 +230,8 @@ pub struct ListSkill {
 }
 
 impl ListSkill {
+    /// Build the tool over the same index `ReadSkill` uses (assembly is the
+    /// only caller).
     pub fn new(index: SkillIndex) -> Self {
         Self { index }
     }

@@ -90,6 +90,12 @@ pub struct RunCodeTool {
 }
 
 impl RunCodeTool {
+    /// The single construction point (design §8.6, H3): `assemble` builds ONE
+    /// top-level instance per agent and hands a clone into the tool list when
+    /// `code.enabled`. `code_cfg` is the shared Arc the agent's
+    /// `set_code_config` / `set_code_enabled` mutate; `mcp_tools` and
+    /// `extra_tools` are the sets the guest registry may expose (each filtered
+    /// by its own opt-in marker).
     pub fn new(
         cfg: &Config,
         code_cfg: Arc<RwLock<CodeConfig>>,

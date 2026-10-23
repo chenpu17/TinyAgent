@@ -27,7 +27,10 @@ use std::sync::{Arc, RwLock};
 /// marks progress notes the CLI prints as-is (e.g. `mcp: server ready`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DiagLevel {
+    /// Progress note, printed as-is (e.g. `mcp: server ready`).
     Info,
+    /// Soft failure the host should surface (a skipped skill, a disabled
+    /// compression, …) — usually prefixed with a bracketed tag in the text.
     Warn,
 }
 

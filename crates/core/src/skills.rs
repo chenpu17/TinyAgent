@@ -33,6 +33,9 @@ use std::path::{Path, PathBuf};
 /// deliberately NOT `#[non_exhaustive]`, per the `AgentEvent` hygiene rule.
 #[derive(Clone, Debug)]
 pub enum SkillSource {
+    /// A directory on disk (`<dir>/<name>/` containing `SKILL.md`). Sidecar
+    /// files referenced by the body are readable through `read_skill`'s `file`
+    /// argument.
     Dir(PathBuf),
     /// Full `SKILL.md` text (frontmatter + body), compiled into the binary.
     Embedded(String),
@@ -54,10 +57,18 @@ impl Default for SkillSource {
 /// build one with `..Default::default()`.
 #[derive(Clone, Debug, Default)]
 pub struct SkillEntry {
+    /// The `name` frontmatter value; must equal the parent directory name for
+    /// disk skills (a mismatch is a scan warning, entry skipped).
     pub name: String,
+    /// The `description` frontmatter value — the ONLY prose preloaded into
+    /// the system prompt at level 1, so it is the model's sole clue that this
+    /// skill exists.
     pub description: String,
+    /// Where the body lives (disk dir or embedded text).
     pub source: SkillSource,
+    /// `license` frontmatter, accepted and stored but not surfaced anywhere.
     pub license: Option<String>,
+    /// `compatibility` frontmatter, accepted and stored but not surfaced.
     pub compatibility: Option<String>,
     /// `allowed-tools` frontmatter, split on whitespace. Experimental per the
     /// spec; TinyAgent only warns at assembly (no per-turn activation layer).
@@ -75,10 +86,14 @@ pub struct SkillIndex {
 }
 
 impl SkillIndex {
+    /// True when no skill was discovered — assembly then injects neither the
+    /// intro nor the `read_skill` / `list_skill` tools.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
+    /// All entries in sorted-by-name order (deterministic regardless of
+    /// filesystem enumeration order).
     pub fn entries(&self) -> &[SkillEntry] {
         &self.entries
     }

@@ -4,6 +4,7 @@ mod openai;
 // (used by the Python / TypeScript bindings and downstream dry-runs) exposes it
 // so an agent loop can be driven offline, with no API key or HTTP server.
 #[cfg(any(test, feature = "mock"))]
+#[allow(missing_docs)] // scripted test fixture, not a consumer-facing API
 pub mod mock;
 
 pub use anthropic::Anthropic;
@@ -17,6 +18,9 @@ pub use openai::OpenAi;
 /// (external re-review P2).
 #[derive(Debug)]
 pub struct ApiStatusError {
+    /// The HTTP status code, structured so the retry taxonomy can classify
+    /// without matching the display string. 408/425/429/5xx are transient;
+    /// other 4xx are deterministic.
     pub status: u16,
     message: String,
 }
@@ -58,10 +62,13 @@ use std::time::{Duration, Instant};
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Block {
+    /// Plain reply / prompt text.
     Text(String),
     /// base64-encoded image (media_type e.g. "image/png").
     Image {
+        /// MIME type, e.g. `"image/png"`.
         media_type: String,
+        /// Base64 payload (no data-URL prefix).
         data: String,
     },
     /// base64-encoded PDF document (`media_type: "application/pdf"`). Maps to
@@ -70,30 +77,51 @@ pub enum Block {
     /// OpenAI-compatible provider REJECTS requests containing this block with
     /// an explicit error rather than silently dropping the document.
     Document {
+        /// MIME type — `"application/pdf"` today.
         media_type: String,
+        /// Base64 payload (no data-URL prefix).
         data: String,
     },
+    /// The model asked to run a tool. `id` pairs this block with the matching
+    /// [`Block::ToolResult`]; N tool_use blocks must be answered by N
+    /// tool_results in the next user message (Anthropic is strict about the
+    /// pairing, and adjacent same-role messages are rejected).
     ToolUse {
+        /// Provider-minted (or synthetic) identifier, echoed by the result.
         id: String,
+        /// Tool name as written by the model.
         name: String,
+        /// Parsed arguments object.
         input: Value,
     },
+    /// A tool's answer to a [`Block::ToolUse`]. `content` is what the model
+    /// sees; error results are marked rather than dropped so the pairing stays
+    /// intact.
     ToolResult {
+        /// The `ToolUse.id` this answers.
         tool_use_id: String,
+        /// Result text shown to the model.
         content: String,
         /// Optional image payload attached to the result (e.g. load_image).
         image: Option<Box<Block>>,
+        /// Whether this result represents a failure.
         is_error: bool,
     },
 }
 
+/// Who authored a message. Only two roles exist here: tool results ride in
+/// `User` messages (that is the wire shape both providers speak), so a
+/// "tool" role never appears.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
+    /// User / host turn. Also carries tool_result blocks.
     User,
+    /// Model turn.
     Assistant,
 }
 
+/// One conversational message: a role plus its ordered content blocks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     /// Stable identity for host-side anchoring (a GUI's sidecar assets —
@@ -108,11 +136,19 @@ pub struct Message {
     /// pre-id session files stay valid and round-trip byte-identically.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    /// Author of the message.
     pub role: Role,
+    /// Ordered content blocks. A turn's text, images, tool calls, and tool
+    /// results all live in this one vector.
     pub content: Vec<Block>,
 }
 
 impl Message {
+    /// A user-role message with no id yet. The id is minted when the agent
+    /// ingests it ([`crate::agent::Agent::push_user`] or `Agent::try_new`);
+    /// until then, [`Message::id`] is `None`. Prefer
+    /// [`crate::agent::Agent::push_user`] over mutating history directly — it
+    /// also enforces the role-alternation rule.
     pub fn user(blocks: Vec<Block>) -> Self {
         Self {
             id: None,
@@ -121,6 +157,9 @@ impl Message {
         }
     }
 
+    /// An assistant-role message with no id yet (minted at ingest, like
+    /// [`Message::user`]). Handy for constructing a scripted history or for a
+    /// custom [`Provider`] building its response.
     pub fn assistant(blocks: Vec<Block>) -> Self {
         Self {
             id: None,
@@ -130,9 +169,16 @@ impl Message {
     }
 }
 
+/// One tool as advertised to the model: name, description, and the JSON
+/// Schema of its input. Serialized into every request, so its size is part of
+/// the context budget (see `context_breakdown`'s tool report).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ToolDef {
+    /// Agent-facing name. Must be `[A-Za-z0-9_-]{1,64}` and unique across the
+    /// whole list — validated at construction (see `tools::validate_tool_names`).
     pub name: String,
+    /// What the tool does, shown to the model. This text is context: it is
+    /// billed on every request and counted by `context_breakdown`.
     pub description: String,
     /// JSON Schema for the tool's input object.
     pub schema: Value,
@@ -145,6 +191,8 @@ pub struct ToolDef {
 /// consumer-side-only hygiene rule.
 #[non_exhaustive]
 pub enum ChatEvent {
+    /// A fragment of assistant text; concatenating a turn's deltas yields the
+    /// turn's [`Block::Text`].
     TextDelta(String),
     /// Reasoning/thinking increment from a reasoning model (OpenAI-style
     /// `reasoning_content`, Anthropic `thinking` blocks). Surfaced as an event
@@ -163,8 +211,11 @@ pub enum ChatEvent {
     /// display feed only: the authoritative assembled input arrives later in
     /// the `ToolUse` block / `ToolCall` agent event and never overlaps history.
     ToolInputDelta {
+        /// Tool_use id of the call this fragment belongs to.
         id: String,
+        /// Tool name of that call.
         name: String,
+        /// Raw JSON fragment.
         delta: String,
     },
 }
@@ -185,10 +236,13 @@ pub struct Usage {
     /// providers treat axes the server didn't return).
     #[serde(default)]
     pub input_tokens: u64,
+    /// Completion tokens. Defaults to 0 when unreported, like `input_tokens`.
     #[serde(default)]
     pub output_tokens: u64,
+    /// Prompt-cache writes (Anthropic only; billed at 1.25×). 0 = none.
     #[serde(default)]
     pub cache_creation_input_tokens: u64,
+    /// Prompt-cache reads (Anthropic and OpenAI; billed at ~0.1×). 0 = none.
     #[serde(default)]
     pub cache_read_input_tokens: u64,
 }
@@ -212,9 +266,12 @@ impl Usage {
 
 /// A completed assistant turn.
 pub struct ChatResponse {
+    /// The assembled assistant content: text blocks and any tool_use blocks
+    /// in stream order.
     pub blocks: Vec<Block>,
     /// "end_turn" | "tool_use" | "max_tokens" | provider-specific value.
     pub stop_reason: String,
+    /// Tokens this request cost; `None` when the provider reported none.
     pub usage: Option<Usage>,
 }
 
@@ -280,11 +337,21 @@ impl ChatResponse {
     }
 }
 
+/// One request handed to a [`Provider`]. Borrowed throughout — a provider
+/// serializes it and streams the reply; it never owns or mutates the agent's
+/// state.
 pub struct ChatRequest<'a> {
+    /// System prompt, already with the env header / skill intro assembled in.
     pub system: Option<&'a str>,
+    /// Full conversation history, oldest first. Must alternate roles (the
+    /// agent maintains that invariant); tool_result blocks ride in user
+    /// messages.
     pub messages: &'a [Message],
+    /// The tools the model may call, already filtered by the whitelist.
     pub tools: &'a [ToolDef],
+    /// Model name for this request.
     pub model: &'a str,
+    /// Output-token cap for this reply.
     pub max_tokens: u32,
     /// Per-request timeout that overrides the client default, used to keep
     /// a single chat inside the run's remaining budget (None = use the
@@ -315,12 +382,31 @@ pub struct ChatRequest<'a> {
     pub temperature: Option<f32>,
 }
 
+/// A chat backend. Implement this to plug in a custom provider — the
+/// Python/TypeScript bindings do exactly that (a host-language callable
+/// wrapped in this trait), and [`crate::build_agent_with_provider`] is the
+/// public injection point.
+///
+/// Contract notes for implementors:
+/// - `chat` must stream text as [`ChatEvent`]s AND return the fully assembled
+///   [`ChatResponse`]; the agent bills and stores the response, the events are
+///   display only.
+/// - `req.cancel` must be polled so a cancelled run does not wait out the
+///   whole generation (`ChatRequest::per_request_timeout` bounds it otherwise).
+/// - A returned error should carry [`ApiStatusError`] in its chain when the
+///   failure is an HTTP rejection — [`crate::agent::RunError::is_transient`]
+///   reads its status to decide whether a retry is worth it.
+/// - Returning an empty reply is legal but ends the run (the agent does not
+///   persist empty assistant turns).
 pub trait Provider: Send + Sync {
     /// Send one chat request, streaming text deltas to `on_event`.
     /// Returns the fully-assembled assistant message.
     fn chat(&self, req: &ChatRequest, on_event: &mut dyn FnMut(ChatEvent)) -> Result<ChatResponse>;
 }
 
+/// Build the provider a config names (Anthropic or OpenAI), sharing `client`
+/// for connection reuse. This is what [`crate::build_agent`] uses; call it
+/// directly only when building an [`crate::agent::Agent`] by hand.
 pub fn build(cfg: &Config, api_key: &str, client: reqwest::blocking::Client) -> Box<dyn Provider> {
     let base = cfg.base_url();
     // Clamp ≥1: 0 would be an instant always-firing idle timeout. The 30s

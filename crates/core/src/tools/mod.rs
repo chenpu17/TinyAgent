@@ -3,6 +3,9 @@ mod file;
 mod image;
 #[cfg(feature = "code")]
 pub mod llm;
+/// MCP (Model Context Protocol) client tooling: connect to stdio / HTTP
+/// servers, list their tools, and expose them as [`Tool`]s. Spawned by
+/// assembly for every `mcp_servers` entry.
 pub mod mcp;
 // The wasm-sandboxed JS tool. Gated: wasmtime adds ≈4.6 MiB to the release
 // binary, and enabling the tool is a per-deployment trust decision
@@ -39,7 +42,12 @@ use std::sync::Arc;
 /// shares cancel/hooks/budget with the original — nothing forks state.
 #[derive(Clone)]
 pub struct ToolCtx {
+    /// Sandbox root for the file tools and the run_code path checks — the
+    /// canonicalized `Config::workdir`.
     pub workdir: PathBuf,
+    /// Character budget a tool result may use before it is truncated (see
+    /// `Limits::max_output_chars`). Tools read this per call; they do NOT get
+    /// it from a stored copy.
     pub max_output_chars: usize,
     /// When true, file tools refuse paths that escape `workdir`.
     pub restrict_to_workdir: bool,
@@ -120,6 +128,10 @@ pub struct BudgetGate {
 }
 
 impl BudgetGate {
+    /// Create a gate holding `cap` billed tokens. Callers should only build
+    /// one when `cap > 0` (0 means "no limit" — the agent leaves
+    /// [`ToolCtx::budget`] `None` in that case); `tokens_left` would report 0
+    /// for a 0-cap gate and read as "exhausted".
     pub fn new(cap: u64) -> Self {
         Self {
             used: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -198,7 +210,9 @@ pub struct ReserveGuard {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use = "the settlement record is the LD-17 audit row; report it, don't discard it"]
 pub struct Settled {
+    /// Tokens reserved by the guard (the estimate).
     pub reserved: u64,
+    /// Tokens actually billed (what the caller passed to `settle`).
     pub actual: u64,
     /// `actual > reserved`: the estimate under-held. Not an error (the cap
     /// is a soft budget) but reported, so 超额 stays observable.
@@ -243,10 +257,19 @@ impl ReserveGuard {
     }
 }
 
+/// What one tool call produced: the text (and optional image) the model sees,
+/// an error marker, plus two side channels that do NOT reach the model —
+/// billable usage and structured audit metadata.
 #[derive(Debug, Clone)]
 pub struct ToolOutput {
+    /// Text shown to the model. Keep it within `ctx.max_output_chars`; the
+    /// core does not truncate this for you on every path.
     pub content: String,
+    /// Optional image attached to the result (lands in the tool_result block's
+    /// `image` field). Counted by context estimates as base64 len/100.
     pub image: Option<Block>,
+    /// Mark this as a failure. The result still enters history (as an
+    /// `is_error` tool_result) — never drop a result to signal failure.
     pub is_error: bool,
     /// Token usage a tool wants billed to the parent run. Leaf tools (shell,
     /// file, …) leave this None; the `task` sub-agent tool sets it to its
@@ -274,6 +297,7 @@ pub struct ToolOutput {
 }
 
 impl ToolOutput {
+    /// A successful text result (`image`/`usage`/`meta` unset).
     pub fn text(s: impl Into<String>) -> Self {
         Self {
             content: s.into(),
@@ -285,6 +309,8 @@ impl ToolOutput {
         }
     }
 
+    /// An error text result (`is_error: true`, same unset fields). The text is
+    /// what the model reads as the failure reason — make it actionable.
     pub fn error(s: impl Into<String>) -> Self {
         Self {
             content: s.into(),
@@ -399,8 +425,28 @@ pub(crate) fn validate_tool_names(tools: &[Box<dyn Tool>]) -> Result<()> {
     Ok(())
 }
 
+/// One callable tool. Implement this directly for full control (custom
+/// concurrency, streaming events, shutdown hooks), or wrap a closure in
+/// [`CallbackTool`] for the common case.
+///
+/// Only [`Tool::def`] and [`Tool::run`] are required; every other method is a
+/// capability marker with a safe default, so a minimal tool is two functions.
+/// `run` takes `&self` — the agent may invoke one tool concurrently when it
+/// opts into [`ToolConcurrency::Parallel`].
 pub trait Tool: Send + Sync {
+    /// The tool's advertised name / description / JSON schema. Called at
+    /// construction and whenever the tool list changes; the returned schema is
+    /// what the model sees, so keep it accurate.
     fn def(&self) -> ToolDef;
+
+    /// Execute one call. `input` is the model's parsed arguments (already
+    /// validated against `def().schema` only in the sense that the provider
+    /// may have enforced it — do your own checks). `ctx` carries the sandbox
+    /// root, output budget, cancel flag, hooks, and budget gate.
+    ///
+    /// Errors returned as `Err` become an `is_error` tool result whose text is
+    /// the error's Display; use [`ToolOutput::error`] instead when you want to
+    /// control the exact wording.
     fn run(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput>;
     /// Run with an event sink, for tools that stream progress into the parent
     /// run (the `task` sub-agent forwards its child's `AgentEvent`s, wrapped
@@ -575,6 +621,10 @@ pub struct CallbackTool {
 }
 
 impl CallbackTool {
+    /// Wrap `def` + a closure into a [`Tool`]. The closure runs on the agent's
+    /// tool thread(s) — for `Parallel`-capable cached state use interior
+    /// mutability with your own locking; this wrapper is always `Sequential`
+    /// (see the struct docs).
     pub fn new<F>(def: ToolDef, func: F) -> Self
     where
         F: Fn(&Value, &ToolCtx) -> Result<ToolOutput> + Send + Sync + 'static,

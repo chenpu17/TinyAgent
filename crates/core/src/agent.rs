@@ -33,8 +33,16 @@ const STREAM_BACKSTOP: Duration = Duration::from_secs(10 * 60);
 /// explicitly asking for one between runs ([`Agent::compact`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum CompressTrigger {
+    /// The per-turn preflight estimate crossed the configured threshold —
+    /// compaction happened BEFORE the request was sent (nothing was billed
+    /// for the oversized prompt).
     Preflight,
+    /// The provider rejected a request as too long for the context window and
+    /// the run force-compressed, then re-sent. Only used after the preflight
+    /// gate failed to prevent the rejection (bad estimator, or a prompt that
+    /// grew inside a single turn).
     Overflow,
+    /// The host asked explicitly via [`Agent::compact`] between runs.
     Manual,
 }
 
@@ -94,10 +102,19 @@ pub struct CompressOutcome {
 /// the compression's summary request really burned tokens).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CompressionRecord {
+    /// Which path triggered it — the lowercase wire label
+    /// ([`CompressTrigger::as_str`]), not the enum (see the struct docs).
     pub trigger: String,
+    /// Middle messages folded into the summary; `0` marks the degenerate pass,
+    /// which callers filter out before recording (so in practice `>= 1`).
     pub dropped: usize,
+    /// History length after the fold (live messages only — the archive does
+    /// not count).
     pub kept: usize,
+    /// Estimate taken just before the fold (see [`CompressOutcome`]).
     pub estimated_tokens_before: u64,
+    /// Estimate taken after the fold (always the whole-history heuristic —
+    /// the rewrite voids the anchor).
     pub estimated_tokens_after: u64,
     /// Provider-measured prompt tokens behind the `before` estimate; absent
     /// when no valid anchor existed (see [`CompressOutcome::
@@ -134,6 +151,9 @@ impl CompressionRecord {
 /// but the usage rides the anyhow chain for a binding to surface later.
 #[derive(Debug)]
 pub struct CompressError {
+    /// The underlying failure (provider error, folded-history calculation
+    /// error, …). `Display` delegates here, so `{e}` / `{e:#}` formatting
+    /// matches the pre-`burned` behavior.
     pub source: anyhow::Error,
     /// Tokens burned by the summary request(s) before the failure.
     pub burned: Option<Usage>,
@@ -166,7 +186,13 @@ impl std::error::Error for CompressError {
 #[derive(Debug, serde::Serialize)]
 #[non_exhaustive]
 pub enum AgentEvent {
+    /// A new turn began; the payload is the 1-based turn number (the same
+    /// number [`TurnTiming::turn`] reports). Emitted BEFORE preflight
+    /// compression, so the turn's timing includes it.
     TurnStart(u32),
+    /// A fragment of assistant reply text. Concatenating every `TextDelta` of
+    /// a turn reassembles that turn's [`Block::Text`]; the reply text itself
+    /// enters history once, at turn end.
     TextDelta(String),
     /// Reasoning/thinking increment from a reasoning model — serializes as
     /// `{"ThinkingDelta": "..."}` so a downstream UI (TinyWorker) renders a
@@ -188,17 +214,34 @@ pub enum AgentEvent {
     /// feed only: the authoritative assembled input arrives in the `ToolCall`
     /// event / `Block::ToolUse`; this never enters history.
     ToolInputDelta {
+        /// The call's tool_use id — stable across all fragments of one call,
+        /// so parallel same-name calls stay distinguishable.
         id: String,
+        /// The tool name (known by the time argument fragments arrive).
         name: String,
+        /// Raw JSON fragment; concatenating the pieces yields the call's input.
         delta: String,
     },
+    /// A tool call is about to run. `input` is the ASSEMBLED argument object
+    /// (from the model's parsed `Block::ToolUse`), not the raw fragment
+    /// stream. Emitted for every dispatched call, including ones the hooks
+    /// gate later denies.
     ToolCall {
+        /// Tool name as the model wrote it (before any hook rewrite).
         name: String,
+        /// Parsed arguments — the model's inputs, not a hook-modified copy.
         input: Value,
     },
+    /// A tool call finished. `content` is what the MODEL saw (possibly
+    /// truncated); the full text lives in [`ToolCallRecord::output`].
     ToolResult {
+        /// Tool name.
         name: String,
+        /// True when the tool reported a failure or the call was refused
+        /// (hook deny / cancel checkpoint). Error results still enter history
+        /// as `is_error` tool_result blocks.
         is_error: bool,
+        /// Result text shown to the model.
         content: String,
     },
     /// The agent updated its self-tracked task plan via the `todo` tool (full
@@ -207,6 +250,8 @@ pub enum AgentEvent {
     /// {"todos":[...]}}`. The final plan is also derived into `result.json`'s
     /// `plan` field at run end.
     TodoUpdate {
+        /// The full replacement plan (the `todo` tool has full-replacement
+        /// semantics — this is the whole list, not a delta).
         todos: Vec<TodoItem>,
     },
     /// Token usage reported by the provider for the latest chat request.
@@ -214,9 +259,13 @@ pub enum AgentEvent {
     /// (e.g. the stream wasn't cut off before the usage frame). The cache_*
     /// fields are 0 for providers/requests with no prompt caching.
     Usage {
+        /// Non-cached input tokens (the cache fields are separate axes).
         input_tokens: u64,
+        /// Completion tokens.
         output_tokens: u64,
+        /// Prompt-cache writes (Anthropic, billed at 1.25×); 0 when unused.
         cache_creation_input_tokens: u64,
+        /// Prompt-cache reads (billed at ~0.1×); 0 when unused.
         cache_read_input_tokens: u64,
     },
     /// History was compressed: how many middle messages were dropped,
@@ -225,10 +274,16 @@ pub enum AgentEvent {
     /// the field semantics — the event carries the same numbers the audit
     /// record keeps).
     Compressed {
+        /// Middle messages folded into the summary (`0` = degenerate pass —
+        /// see [`CompressOutcome::dropped`]).
         dropped: usize,
+        /// Live history length after the fold.
         kept: usize,
+        /// Which detection path fired.
         trigger: CompressTrigger,
+        /// Estimate just before the fold.
         estimated_tokens_before: u64,
+        /// Estimate just after the fold.
         estimated_tokens_after: u64,
         /// Provider-measured prompt tokens behind the `before` estimate;
         /// `null` when no valid usage anchor existed at fold time.
@@ -240,7 +295,9 @@ pub enum AgentEvent {
     /// size. tool_use/tool_result pairing is preserved; the model re-runs a
     /// tool if it needs pruned details back.
     Pruned {
+        /// Messages that lost content to placeholders.
         messages: usize,
+        /// Approximate characters reclaimed by the placeholders.
         chars_freed: usize,
     },
     /// The reply hit the output-token limit (`stop_reason: "max_tokens"`)
@@ -265,10 +322,20 @@ pub enum AgentEvent {
     /// and tell interleaved streams apart. The inner `event` is the child's own
     /// `AgentEvent` (TextDelta, ToolCall, …) — recurse to render it.
     SubAgent {
+        /// The child's name — the `name` argument of the `task` call that
+        /// spawned it (also the `ctx.subagent` hooks see).
         name: String,
+        /// The child's own event; recurse to render it.
         event: Box<AgentEvent>,
     },
+    /// The run ended normally. This is the LAST event of a successful run;
+    /// error paths emit no `Done` and surface through the `Result` instead.
     Done {
+        /// Why the loop stopped: the provider's own reason for the last turn
+        /// (`"end_turn"`, `"max_tokens"`, …), or one of the core-level labels
+        /// `"max_turns_reached"`, `"budget_exceeded"`, `"timeout"`,
+        /// `"cancelled"`, `"stuck_loop"`. Matches
+        /// [`RunOutcome::stop_reason`].
         stop_reason: String,
     },
 }
@@ -304,14 +371,26 @@ impl AgentEvent {
     }
 }
 
+/// One executed tool call, as recorded in the run's audit trail
+/// (`RunOutcome.tool_calls` / `RunError.tool_calls` → result.json's
+/// `tool_calls`). Unlike [`AgentEvent::ToolResult`] this carries the FULL
+/// result text and the hook-audit `meta`, and it is never touched by
+/// compression (compression rewrites `messages`, not the records), which is
+/// why the plan / cost audit survives a fold.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ToolCallRecord {
+    /// Tool name as dispatched.
     pub name: String,
+    /// The model's ORIGINAL arguments. A hooks `Modify` decision only swaps
+    /// the execution input — the audit trail (this field, and the `ToolCall`
+    /// event) deliberately keeps what the model actually wrote.
     pub input: Value,
     /// The tool's result text (what read_file returned, shell stdout, …) — kept
     /// so the structured result file is self-contained for verification, not
     /// just the model's summary of it.
     pub output: String,
+    /// True when the call failed or was refused (hook Deny / cancel
+    /// checkpoint). Refused calls still get a record, with `duration_ms` None.
     pub is_error: bool,
     /// Structured audit metadata the tool attached (not shown to the model).
     /// Only the `task` sub-agent sets this today (a compact child-run trace).
@@ -356,6 +435,8 @@ pub struct TurnTiming {
 /// even when the `todo` tool_results in history are folded into the summary.
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 pub struct TodoItem {
+    /// What the step is. Trimmed and required to be non-empty by the `todo`
+    /// tool; a malformed plan yields no `plan` field rather than a partial one.
     pub subject: String,
     /// `"pending"` | `"in_progress"` | `"completed"` — stored as a string (not
     /// an enum) so the field round-trips to JSON as-is and stays tolerant of
@@ -403,11 +484,25 @@ fn parse_todos(input: &Value) -> Option<Vec<TodoItem>> {
     Some(out)
 }
 
+/// What a successful [`Agent::run`] returns: the final reply plus the run's
+/// full audit trail (tool calls, compressions, per-turn timing) and honest
+/// token totals. Serializable as-is — this is what lands in `result.json`.
 #[derive(serde::Serialize)]
 pub struct RunOutcome {
+    /// The text of the last assistant turn (the reply the run ended on). Empty
+    /// when the model's final turn was all tool calls, or when it produced
+    /// nothing visible.
     pub final_text: String,
+    /// Turns started, 1-based. Equals `turn_timings.len()` on every outcome
+    /// (a failed run has no timings — see [`RunError::turns`]).
     pub turns: u32,
+    /// Why the loop stopped — the same vocabulary as [`AgentEvent::Done`]:
+    /// the provider's reason for the final turn (`"end_turn"`, `"max_tokens"`,
+    /// …), or a core-level label among `"max_turns_reached"`,
+    /// `"budget_exceeded"`, `"timeout"`, `"cancelled"`, `"stuck_loop"`.
     pub stop_reason: String,
+    /// Every tool call this run executed or refused, in execution order
+    /// (parallel batches in completion order).
     pub tool_calls: Vec<ToolCallRecord>,
     /// Audit trail of the compressions this run completed (see
     /// [`CompressionRecord`]). The degenerate empty-summary pass is not
@@ -425,9 +520,14 @@ pub struct RunOutcome {
     /// fields accumulate prompt-cache writes/reads so the reported cost stays
     /// honest when caching is on (Anthropic reports both; OpenAI reports reads).
     pub input_tokens: u64,
+    /// Completion tokens summed over every request.
     pub output_tokens: u64,
+    /// Prompt-cache writes summed over every request (0 without caching).
     pub cache_creation_input_tokens: u64,
+    /// Prompt-cache reads summed over every request (0 without caching).
     pub cache_read_input_tokens: u64,
+    /// Wall-clock time from run entry to return — includes the failed
+    /// attempt's work when a retry ladder folded costs in (`RunCost`).
     pub elapsed: Duration,
 }
 
@@ -442,6 +542,9 @@ pub struct RunOutcome {
 /// `Display`/`Debug` delegate to `source`, so existing `{e}` / `{e:#}`
 /// formatting at call sites is unchanged.
 pub struct RunError {
+    /// The underlying failure. `Display`/`Debug` delegate here, so existing
+    /// formatting is unchanged; the cost fields below are the extra payload a
+    /// retry loop needs.
     pub source: anyhow::Error,
     /// Tokens burned by chat requests in this run before it errored.
     pub usage: Usage,
@@ -543,7 +646,10 @@ impl serde::Serialize for RunError {
 /// fold it into the final outcome they report.
 #[derive(Default, Clone)]
 pub struct RunCost {
+    /// Tokens burned by the failed attempt(s).
     pub usage: Usage,
+    /// Tool calls the failed attempt(s) executed — their side effects already
+    /// happened, so they must appear in the final artifact too.
     pub tool_calls: Vec<ToolCallRecord>,
     /// Compressions completed by failed attempts (same honest audit as
     /// `tool_calls` — folded into the outcome / result.json).
@@ -551,6 +657,7 @@ pub struct RunCost {
     /// Turns accumulated across failed attempts (folded into the outcome so
     /// `result.json`'s `turns`/`elapsed_secs` stay consistent on success).
     pub turns: u32,
+    /// Wall-clock time spent in failed attempts.
     pub elapsed: Duration,
 }
 
@@ -722,6 +829,26 @@ struct UsageAnchor {
     scale: f64,
 }
 
+/// The agent: a provider, a tool set, a conversation history, and the limits
+/// that bound a run.
+///
+/// Construct one with [`Agent::try_new`] (or [`Agent::new`] for a panicking
+/// variant), or — the normal path — let [`crate::build_agent`] /
+/// [`crate::build_agent_with`] assemble it from a [`Config`]. Drive it with
+/// [`Agent::run`], feed later user messages with [`Agent::push_user`], and
+/// read state back through the accessors (`messages`, `usage`,
+/// `context_breakdown`, …).
+///
+/// Run-scoped vs. agent-scoped state matters for library users: [`Agent::run`]
+/// resets the usage counter and installs a fresh budget gate, so a second run
+/// on the same agent bills separately; history, tools, and hooks persist
+/// across runs.
+///
+/// The host hot-update setters (`set_model`, `set_hooks`, `set_code_config`,
+/// the MCP add/remove pair, …) apply to future turns of THIS agent. They do
+/// not propagate to sub-agents already constructed by earlier `task` calls,
+/// and some (`set_code_config`) are snapshot-time decisions — see each
+/// method's own docs.
 pub struct Agent {
     /// `Arc`, not `Box` (code_llm_design LD-16): the sandbox `llm` primitive
     /// must ride the VERY instance this agent chats through — `set_code_tool`
@@ -845,7 +972,10 @@ pub struct Agent {
 /// byte-identical (additive-key discipline).
 #[cfg(feature = "code")]
 pub struct CodeAudit {
+    /// The disclosure policy that was in force when the agent was ASSEMBLED
+    /// (a later `set_code_config` does not rewrite this — FD-7).
     pub skill_injection: crate::config::SkillInjection,
+    /// Whether the guest precheck was enabled at assembly time.
     pub precheck: bool,
     /// The llm gate's config snapshot (enabled=true by construction of the
     /// Some).
@@ -1432,6 +1562,10 @@ impl Agent {
         Ok(())
     }
 
+    /// Whether the cancel flag has been flipped. `run()` never clears it —
+    /// clearing is the host's job, and only when it is about to accept a NEW
+    /// task (see [`Agent::clear_cancel`]). Before deciding to retry or
+    /// continue, check this rather than assuming the flag is clean.
     pub fn cancelled(&self) -> bool {
         self.cancel
             .as_ref()
@@ -3057,6 +3191,10 @@ pub(crate) fn execute_tool_call(
     }
 }
 
+/// `s` cut to its first 200 CHARS (not bytes — a multi-byte character is
+/// never split) with a trailing `…` appended when anything was cut. For
+/// collapsed one-line tool rows in a UI; single pass, so it is cheap enough
+/// to call per row per frame. Shorter input comes back unchanged.
 pub fn preview(s: &str) -> String {
     const MAX: usize = 200;
     // Single pass: take MAX chars, then test whether anything remained. The
