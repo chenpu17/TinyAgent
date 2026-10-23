@@ -256,6 +256,14 @@
   与 `before_tool` 的 ctx 镜像对称——审计点靠 `ctx.subagent` 归因来源（顶层/task/沙箱），并行兄弟
   真并发下调用序关联不可靠，per-call ctx 是唯一可靠的来源标签。本期绑定不透出 hooks（backlog P3，
   两绑定 crate 头已明示该范围决策）。
+  **Slot 观测契约表**（`agent_tests.rs` 的 `slot_table_*` 六例）：`Slot` 只有 `Cancelled`/`Ran`
+  两态，但**进入路径有八条**（顺序 3 + 并行 4 + 批次整体跳过），每条对外的观测后果不同。六个用例用
+  同一张表钉住「状态 → 五类观测面」（records / `ToolResult` 事件 / `ToolCall` 事件 / `before_tool` /
+  `after_tool`），并派生两条不变量：**before↔after 严格配对**（`Ran` 两者都有、`Cancelled` 两者都无）
+  与 **ToolCall↔ToolResult 事件配平**（announce 过的必须闭合；从未 announce 的保持沉默）。此前这些断言
+  分散在六组测试里各写各的，任一条路径悄悄偏离没人拦。不变量用变异测试验证过——分别去掉 Cancelled
+  的 ToolResult 合成、去掉占位循环的 `after_tool`，对应用例立即转红。新增 Slot 赋值点或改占位/合成
+  逻辑时先对照这张表。
 - **任务计划（`todo` 工具，`tools/todo.rs`）+ 审计 `meta` 通道**：`todo` 是无状态工具（`&self`，与 shell 同），
   **全量替换语义**（每次发完整计划，TodoWrite 式）。两条关键设计：① **`plan` 从 tool-call 日志派生，不经压缩**——
   `agent::extract_plan` 取 `records`（`Vec<ToolCallRecord>`，独立于 `self.messages`）里最后一条非 error 的 `todo` 调用的

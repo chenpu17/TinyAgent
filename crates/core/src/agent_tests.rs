@@ -9132,3 +9132,404 @@ fn every_agent_event_has_a_stable_ndjson_type_tag() {
     // test-side mirror that also catches a "named but never yielded" arm.)
     assert_eq!(seen.len(), 15, "update the table when AgentEvent grows");
 }
+
+// ── Slot 状态 × 观测后果：跨路径统一契约表 ────────────────────────────────
+//
+// 并行批次里每个 tool_use 占一个 `Slot`（agent.rs 的私有枚举）。它只有两个
+// 状态（`Cancelled` / `Ran`），但**进入某个状态的路径**有八条，每条对外的
+// 可观测后果各不相同——而这些断言眼下分散在六组各自的测试里，各写各的。
+// 这里把「状态 → 五类观测面」补成一张表：槽位最终处于什么状态，就只允许产生
+// 表里规定的那几样东西。任何一条路径偏离这张表，下面的用例直接指出来。
+//
+// 五类观测面（消费者的全部可见面）：
+//   1. records         —— `RunOutcome::tool_calls`（进 result.json，宿主读它）
+//   2. ToolResult 事件 —— 只对 **已 announce（发过 ToolCall）** 的调用发
+//   3. ToolCall 事件   —— 只对真正走到 announce 点的调用发
+//   4. before_tool     —— 只在 decide（gate）时发；没走到 gate 就没有
+//   5. after_tool      —— 必须与 before_tool **严格配对**（审计底线）
+//
+// | 路径                                          | 槽位      | records | ToolResult | ToolCall | before | after    |
+// |-----------------------------------------------|-----------|---------|------------|----------|--------|----------|
+// | 顺序叶子：真的跑了                            | Ran       | 1 真果  | 1          | 1        | 1      | 1(true)  |
+// | 顺序叶子：hook Deny                           | Ran       | 1 错    | 1          | 1        | 1      | 1(false) |
+// | 顺序叶子：gate 后 cancel（未执行）            | Ran       | 1 错    | 1          | 1        | 1      | 1(false) |
+// | 并行：真的跑了                                | Ran       | 1 真果  | 1          | 1        | 1      | 1(true)  |
+// | 并行：hook Deny                               | Ran       | 1 错    | 1          | 1        | 1      | 1(false) |
+// | 并行：已过 gate 但没启动（占位）              | Ran       | 1 错    | 1          | 1        | 1      | 1(false) |
+// | 并行：从未过 gate（gate 循环被 cancel 打断）  | Cancelled | 0       | 1（announced）| 1     | 0      | 0        |
+// | 并行：批次整体跳过（连 announce 都没做）      | Cancelled | 0       | 0          | 0        | 0      | 0        |
+//
+// 两条不变量可直接从表里读出：
+//   A. `before_tool` 与 `after_tool` 严格配对——`Ran` 两者都有，`Cancelled`
+//      两者都没有（"过的 gate 不留未配对 before"）。
+//   B. ToolCall 事件 ⟺ ToolResult 事件——发过的必须闭合（"事件配平"）。
+
+/// 一个把 before/after 记进同一日志的钩子层，便于断言配对。
+struct PairingHooks {
+    log: std::sync::Mutex<Vec<String>>,
+    /// 非 None 时，before_tool 一律 Deny 并带上这条理由。
+    deny: Option<String>,
+    /// 非 None 时，before_tool 会把该 cancel 标志置位（模拟审批等待期取消）。
+    cancel_on_gate: Option<Arc<AtomicBool>>,
+}
+impl PairingHooks {
+    fn plain() -> Arc<Self> {
+        Arc::new(Self {
+            log: std::sync::Mutex::new(Vec::new()),
+            deny: None,
+            cancel_on_gate: None,
+        })
+    }
+    fn denying(reason: &str) -> Arc<Self> {
+        Arc::new(Self {
+            log: std::sync::Mutex::new(Vec::new()),
+            deny: Some(reason.to_string()),
+            cancel_on_gate: None,
+        })
+    }
+    fn cancelling(flag: Arc<AtomicBool>) -> Arc<Self> {
+        Arc::new(Self {
+            log: std::sync::Mutex::new(Vec::new()),
+            deny: None,
+            cancel_on_gate: Some(flag),
+        })
+    }
+    fn before_count(&self) -> usize {
+        self.log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.starts_with("before:"))
+            .count()
+    }
+    fn after(&self) -> Vec<String> {
+        self.log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.starts_with("after:"))
+            .cloned()
+            .collect()
+    }
+}
+impl Hooks for PairingHooks {
+    fn before_tool(&self, tool: &str, _input: &Value, _ctx: &ToolCtx) -> ToolDecision {
+        self.log.lock().unwrap().push(format!("before:{tool}"));
+        if let Some(f) = &self.cancel_on_gate {
+            f.store(true, Ordering::Relaxed);
+        }
+        match &self.deny {
+            Some(reason) => ToolDecision::Deny(reason.clone()),
+            None => ToolDecision::Allow,
+        }
+    }
+    fn after_tool(
+        &self,
+        tool: &str,
+        _input: &Value,
+        _output: &ToolOutput,
+        executed: bool,
+        _ctx: &ToolCtx,
+    ) {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("after:{tool}:{executed}"));
+    }
+}
+
+/// 跑一整套「turn1 发 tool_use → turn2 收尾」的剧本，收集五类观测面。
+fn observe_slots(
+    tools: Vec<Box<dyn Tool>>,
+    blocks: Vec<Block>,
+    hooks: Option<Arc<PairingHooks>>,
+    cancel_upfront: Option<Arc<AtomicBool>>,
+) -> (SlotObservation, Option<Arc<PairingHooks>>) {
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, _) = MockProvider::new(vec![
+        MockTurn::Ok(ChatResponse {
+            blocks,
+            stop_reason: "tool_use".into(),
+            usage: None,
+        }),
+        mock::resp_text("final", None),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        tools,
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    if let Some(h) = &hooks {
+        agent.set_hooks(h.clone());
+    }
+    if let Some(f) = cancel_upfront {
+        agent.set_cancel(f);
+    }
+    let mut events = Vec::new();
+    let o = agent.run(&mut |e| events.push(e)).unwrap();
+    let (tc, tr) = events.iter().fold((0usize, 0usize), |(c, r), e| match e {
+        AgentEvent::ToolCall { .. } => (c + 1, r),
+        AgentEvent::ToolResult { .. } => (c, r + 1),
+        _ => (c, r),
+    });
+    (
+        SlotObservation {
+            records: o.tool_calls.iter().map(|r| r.output.clone()).collect(),
+            executed_flags: o
+                .tool_calls
+                .iter()
+                .map(|r| r.duration_ms.is_some())
+                .collect(),
+            tool_call_events: tc,
+            tool_result_events: tr,
+            trailing: last_tool_result_turn(agent.messages()),
+            stop_reason: o.stop_reason,
+        },
+        hooks,
+    )
+}
+
+/// 历史里**最后一个带 tool_result 的 user 消息**的 result 文本，按块序。
+/// (run 收尾后末尾是 assistant 的 "final"，所以不能用只读末条消息的
+/// `trailing_tool_result_contents`。)
+fn last_tool_result_turn(messages: &[Message]) -> Vec<String> {
+    messages
+        .iter()
+        .rev()
+        .find_map(|m| {
+            let v: Vec<String> = m
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    Block::ToolResult { content, .. } => Some(content.clone()),
+                    _ => None,
+                })
+                .collect();
+            if v.is_empty() {
+                None
+            } else {
+                Some(v)
+            }
+        })
+        .unwrap_or_default()
+}
+
+/// 一次观测到的五类面 + 派生的配对/配平不变量。
+struct SlotObservation {
+    records: Vec<String>,
+    /// 每个 record 是否真的执行过（`duration_ms.is_some()`）。
+    executed_flags: Vec<bool>,
+    tool_call_events: usize,
+    tool_result_events: usize,
+    trailing: Vec<String>,
+    stop_reason: String,
+}
+
+impl SlotObservation {
+    /// 不变量 A：before/after 严格配对，且 `executed` 与"真有 duration"一致。
+    fn assert_hook_pairing(&self, hooks: Option<&Arc<PairingHooks>>) {
+        let Some(h) = hooks else {
+            return;
+        };
+        let befores = h.before_count();
+        let afters = h.after();
+        assert_eq!(
+            befores,
+            afters.len(),
+            "before_tool 与 after_tool 必须严格配对（过的 gate 不留未配对 before）: {afters:?}"
+        );
+        // after 的 executed 标志必须与 records 的 duration 存在性逐项一致：
+        // 说"执行了"就必须有耗时，说"没执行"就必须没有。
+        let after_flags: Vec<bool> = afters.iter().map(|s| s.ends_with(":true")).collect();
+        assert_eq!(
+            after_flags, self.executed_flags,
+            "after_tool(executed) 必须与 record 的 duration_ms 存在性一致"
+        );
+    }
+    /// 不变量 B：ToolCall 事件与 ToolResult 事件数量相等（发过的必须闭合）。
+    fn assert_event_balance(&self) {
+        assert_eq!(
+            self.tool_call_events, self.tool_result_events,
+            "ToolCall 与 ToolResult 事件必须配平（不能有未闭合的 ToolCall）"
+        );
+    }
+    /// N:N 配对：历史里的 tool_result 条数必须等于本轮 tool_use 条数。
+    fn assert_nn_pairing(&self, expected: usize) {
+        assert_eq!(
+            self.trailing.len(),
+            expected,
+            "每个 tool_use 都必须有且只有一个 tool_result（N:N）: {:?}",
+            self.trailing
+        );
+    }
+}
+
+#[test]
+fn slot_table_sequential_ok_runs_and_records() {
+    let (obs, hooks) = observe_slots(
+        vec![Box::new(EchoTool::new("echo"))],
+        vec![Block::ToolUse {
+            id: "a".into(),
+            name: "echo".into(),
+            input: json!({}),
+        }],
+        Some(PairingHooks::plain()),
+        None,
+    );
+    assert_eq!(obs.records, vec!["ok".to_string()]);
+    assert_eq!(obs.executed_flags, vec![true]);
+    assert_eq!((obs.tool_call_events, obs.tool_result_events), (1, 1));
+    obs.assert_hook_pairing(hooks.as_ref());
+    obs.assert_event_balance();
+    obs.assert_nn_pairing(1);
+    assert_eq!(obs.stop_reason, "end_turn");
+}
+
+#[test]
+fn slot_table_sequential_deny_records_error_but_no_duration() {
+    let (obs, hooks) = observe_slots(
+        vec![Box::new(EchoTool::new("danger"))],
+        vec![Block::ToolUse {
+            id: "a".into(),
+            name: "danger".into(),
+            input: json!({}),
+        }],
+        Some(PairingHooks::denying("not allowed")),
+        None,
+    );
+    assert_eq!(obs.records, vec!["not allowed".to_string()]);
+    assert_eq!(obs.executed_flags, vec![false], "被拒的调用不该报耗时");
+    obs.assert_hook_pairing(hooks.as_ref());
+    obs.assert_event_balance();
+    obs.assert_nn_pairing(1);
+}
+
+#[test]
+fn slot_table_parallel_ok_runs_all_and_records() {
+    let (obs, hooks) = observe_slots(
+        vec![Box::new(TaskTool)],
+        (0..3)
+            .map(|k| Block::ToolUse {
+                id: format!("t{k}"),
+                name: "task".into(),
+                input: json!({"label": k.to_string()}),
+            })
+            .collect(),
+        Some(PairingHooks::plain()),
+        None,
+    );
+    assert_eq!(
+        obs.records,
+        vec!["out-0".to_string(), "out-1".into(), "out-2".into()]
+    );
+    assert_eq!(obs.executed_flags, vec![true, true, true]);
+    obs.assert_hook_pairing(hooks.as_ref());
+    obs.assert_event_balance();
+    obs.assert_nn_pairing(3);
+}
+
+#[test]
+fn slot_table_parallel_deny_records_error_and_pairs_hooks() {
+    let (obs, hooks) = observe_slots(
+        vec![Box::new(TaskTool)],
+        vec![Block::ToolUse {
+            id: "t0".into(),
+            name: "task".into(),
+            input: json!({"label": "x"}),
+        }],
+        Some(PairingHooks::denying("blocked")),
+        None,
+    );
+    assert_eq!(obs.records, vec!["blocked".to_string()]);
+    assert_eq!(obs.executed_flags, vec![false]);
+    obs.assert_hook_pairing(hooks.as_ref());
+    obs.assert_event_balance();
+    obs.assert_nn_pairing(1);
+}
+
+#[test]
+fn slot_table_parallel_never_gated_stays_cancelled_without_hooks() {
+    // 两条并行调用；cancel 在第 1 条的审批中落下。第 1 条已过 gate（占位：
+    // records + after(false)），第 2 条从未走到 gate（Cancelled：无 record、
+    // 无 hooks），但两条都已 announce，因此都必须有 ToolResult（事件配平）。
+    let flag = Arc::new(AtomicBool::new(false));
+    let (obs, hooks) = observe_slots(
+        vec![Box::new(TaskTool)],
+        vec![
+            Block::ToolUse {
+                id: "t0".into(),
+                name: "task".into(),
+                input: json!({"label": "0"}),
+            },
+            Block::ToolUse {
+                id: "t1".into(),
+                name: "task".into(),
+                input: json!({"label": "1"}),
+            },
+        ],
+        Some(PairingHooks::cancelling(flag.clone())),
+        Some(flag),
+    );
+    assert_eq!(obs.stop_reason, "cancelled");
+    assert_eq!(
+        obs.records,
+        vec!["[cancelled by user]".to_string()],
+        "只有过了 gate 的那条留 record"
+    );
+    assert_eq!(obs.executed_flags, vec![false]);
+    obs.assert_hook_pairing(hooks.as_ref());
+    obs.assert_event_balance();
+    obs.assert_nn_pairing(2);
+    assert_eq!(
+        obs.trailing,
+        vec![
+            "[cancelled by user]".to_string(),
+            "[cancelled by user]".to_string()
+        ]
+    );
+}
+
+#[test]
+fn slot_table_batch_skipped_before_announce_stays_silent() {
+    // 顺序叶子先跑并触发 cancel；并行的调用连 announce 都没做（批次整体
+    // 跳过）。于是：并行那条没有任何事件、没有 record，只有 N:N 合成的
+    // tool_result；顺序那条正常记录。
+    let flag = Arc::new(AtomicBool::new(false));
+    let (obs, hooks) = observe_slots(
+        vec![
+            Box::new(EchoTool::cancel_on_run("trip", flag.clone())),
+            Box::new(TaskTool),
+        ],
+        vec![
+            Block::ToolUse {
+                id: "s0".into(),
+                name: "trip".into(),
+                input: json!({}),
+            },
+            Block::ToolUse {
+                id: "p0".into(),
+                name: "task".into(),
+                input: json!({"label": "p"}),
+            },
+        ],
+        Some(PairingHooks::plain()),
+        Some(flag),
+    );
+    assert_eq!(obs.stop_reason, "cancelled");
+    assert_eq!(obs.records, vec!["ok".to_string()], "只有顺序那条记录");
+    // 顺序那条 announce 过（1 对）；并行那条从未 announce → 事件只有 1 对。
+    assert_eq!(
+        (obs.tool_call_events, obs.tool_result_events),
+        (1, 1),
+        "从未 announce 的并行调用不该有事件"
+    );
+    obs.assert_event_balance();
+    obs.assert_nn_pairing(2);
+    obs.assert_hook_pairing(hooks.as_ref());
+    assert_eq!(
+        obs.trailing,
+        vec!["ok".to_string(), "[cancelled by user]".to_string()]
+    );
+}

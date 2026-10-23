@@ -172,6 +172,10 @@ cargo clippy -p tiny-agent-node
   用于无 API key 跑通整个 loop（tool_use 配对、usage 解析、取消）。改动 provider/agent 后用它回归。
 - **进程内回归**：`agent.rs` 的 loop 不变量用 `provider/mock.rs`（脚本化 Provider，不连网）单测覆盖
   （测试体在 `agent_tests.rs`），比 mock server 更快、断言更准。新增/改动 loop 行为优先在这里加用例。
+- **Slot 观测契约表**（`agent_tests.rs` 的 `slot_table_*`）：`Slot` 只有 `Cancelled`/`Ran` 两态，但进入
+  路径有八条。六个用例用同一张表钉住「状态 → 五类观测面」（records / ToolResult 事件 / ToolCall 事件 /
+  before_tool / after_tool），并派生出两条不变量：**before↔after 严格配对**、**ToolCall↔ToolResult 事件配平**。
+  改了并行批次的分支（新增 Slot 赋值点、改占位/合成逻辑）先看这张表再动。
 - **TUI 视觉验证**：用 ratatui `TestBackend` 抓 cell grid 做断言（见 `tui::tests`）；端到端交互用
   pty 脚本驱动（项目里惯用 `/tmp/ta-verify/` 放临时 mock + pty 脚本，跑完即删）。**不要只靠
   "看起来对"**——改了渲染/光标/markdown 要真抓屏或单测断言验证。pty 驱动两个坑：裸 pty 必须
