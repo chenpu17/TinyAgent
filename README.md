@@ -1293,7 +1293,7 @@ crates/core/src/  # 内核 crate（package tiny-agent-core，lib 名 tiny_agent�
 │   ├── openai.rs         ( 1814)  # OpenAI 兼容（include_usage；400 回退：max_tokens→max_completion_tokens / 丢 stream_options）
 │   ├── anthropic.rs      ( 1213)  # Anthropic 原生（message_start/message_delta usage）
 │   └── mock.rs           (  345)  # 测试用脚本化 Provider（cfg(any(test, feature="mock"))）
-├── agent.rs          ( 3965)  # 核心 loop + usage 累计 + cancel + 上下文压缩（前馈/溢出双触发 + 滚动分块摘要）+ 相邻消息归一 + 同 turn 多 task 并行
+├── agent.rs          ( 3984)  # 核心 loop + usage 累计 + cancel + 上下文压缩（前馈/溢出双触发 + 滚动分块摘要）+ 相邻消息归一 + 同 turn 多 task 并行
 ├── agent_tests.rs    ( 9134)  # 核心 loop 回归测试（provider::mock 脚本化，不连网）
 ├── usage_probe.rs    (   94)  # 并行 worker 的线程本地 usage 侧信道：panic unwind 后把已计费 usage 带回 join 点（防 result.json 与共享计数器分叉）
 ├── compress.rs       (  962)  # 压缩引擎（find_safe_cut / 分块摘要 / saturating usage 合并 + block 级计费原语）

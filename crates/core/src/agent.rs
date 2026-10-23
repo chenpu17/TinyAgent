@@ -2344,484 +2344,16 @@ impl Agent {
                 break; // end_turn / max_tokens without pending calls
             }
 
-            // Execute each tool call, collect results into one user message.
-            // Once cancelled (e.g. Ctrl-C during tool #1), stop running further
-            // tools — but STILL emit a result for every remaining tool_use: an
-            // assistant message carrying N tool_use blocks must be followed by
-            // N tool_results, or the next request is rejected. (A non-cancel-
-            // aware tool that was already in flight returns on its own; later
-            // tools in the batch are short-circuited here.)
-
-            // Collect tool_use blocks (in order) with stable ordinals — only
-            // these produce results; the turn's text already streamed above.
-            // Owned (not borrows into `resp`) so `.clone()` in the passes below
-            // yields String/Value, and so `tool_uses` can be borrowed by the
-            // scoped worker threads without entangling `resp`'s lifetime.
-            let tool_uses: Vec<(String, String, Value)> = resp
-                .blocks
-                .iter()
-                .filter_map(|b| match b {
-                    Block::ToolUse { id, name, input } => {
-                        Some((id.clone(), name.clone(), input.clone()))
-                    }
-                    _ => None,
-                })
-                .collect();
-
-            // Per-slot outcome. `Cancelled` keeps N:N pairing (a result block
-            // for every tool_use) without billing usage or recording a call —
-            // matching the pre-parallel behavior. `Ran` is a real ToolOutput
-            // (a Sequential tool run inline, or a Parallel one run in the
-            // batch below) plus the tool body's wall-clock duration — `None`
-            // when the call never actually executed (Deny / cancel checkpoint
-            // / approved-but-never-started placeholder). Boxed because
-            // `ToolOutput` carries an `Option<Value>` (audit `meta`) and
-            // crossed the `large_enum_variant` threshold — an alloc per tool
-            // call is negligible and keeps `Slot` (one per tool_use, in a
-            // Vec) small.
-            enum Slot {
-                Cancelled,
-                Ran(Box<ToolOutput>, Option<u64>),
-            }
-            let mut slots: Vec<Slot> = (0..tool_uses.len()).map(|_| Slot::Cancelled).collect();
-            // Hook-Modify replacements, per ordinal (None = ran with the
-            // original input). The stuck detector keys on the EFFECTIVE input
-            // (external re-review P2): an approval layer rewriting each call to
-            // a different page/target must not share one stuck key.
-            let mut effective_inputs: Vec<Option<Value>> =
-                (0..tool_uses.len()).map(|_| None).collect();
-            // Ordinals of Parallel-capable calls deferred to the parallel batch.
-            let mut parallel_slots: Vec<usize> = Vec::new();
-            let mut batch_cancelled = false;
-
-            // Inline leaf pass: run Sequential tools one at a time (avoids new
-            // races on shell/file), announce each LEAF call in block order, and
-            // short-circuit on cancel (later slots stay Cancelled). Routing is
-            // by CAPABILITY — a tool whose `concurrency()` reports Parallel is
-            // deferred to the batch below, whatever its name. Parallel calls
-            // are NOT announced here — their ToolCall is emitted in the batch
-            // block below, AFTER the cancel gate, so a call gated off by a
-            // later leaf tripping cancel never dangles a ToolCall without a
-            // matching ToolResult on the UI.
-            for (i, (_id, name, input)) in tool_uses.iter().enumerate() {
-                if batch_cancelled || self.cancelled() {
-                    batch_cancelled = true;
-                    continue; // leaves the default Slot::Cancelled
-                }
-                // Unknown names land here too (find_tool → None): run_tool
-                // synthesizes the "unknown tool" error result, exactly as
-                // before the capability split.
-                let parallel = match find_tool(&self.tool_defs, name) {
-                    Some(ti) => self.tools[ti].concurrency() == ToolConcurrency::Parallel,
-                    None => false,
-                };
-                if parallel {
-                    parallel_slots.push(i); // ToolCall announced + run in the batch below
-                } else {
-                    // One complete inline call: ToolCall event → gate → run →
-                    // after-notification (see execute_tool_call). The
-                    // ToolResult event is NOT emitted here — the assembly pass
-                    // below owns block order, N:N pairing, and the
-                    // cancelled-slot synthesis.
-                    let (output, duration_ms) = {
-                        let mut fwd = |ev: AgentEvent| events(ev);
-                        execute_tool_call(
-                            &self.tools,
-                            &self.tool_defs,
-                            &self.ctx,
-                            name,
-                            input,
-                            &mut fwd,
-                            &mut effective_inputs[i],
-                        )
-                    };
-                    slots[i] = Slot::Ran(Box::new(output), duration_ms);
-                }
-            }
-
-            // Parallel batch: every call whose tool reported
-            // ToolConcurrency::Parallel runs on its own scoped thread
-            // (borrowing the read-only tool list + ctx, both Sync), forwarding
-            // its events through an mpsc funnel the parent drains live — so
-            // concurrent sub-agents interleave on screen, tagged by name.
-            // Sequential tools stay inline (above); routing is by the
-            // capability marker, NOT by name, so a third-party tool opting
-            // into Parallel gets the same fan-out the built-in `task` does.
-            // Its implementor has signed up for reentrancy + cancel polling
-            // (see ToolConcurrency::Parallel). Cancel: gate before spawning (a
-            // cancel that hit during the inline pass, or one already set,
-            // marks the batch cancelled and skips it), re-checked PER CALL
-            // between the approval gates, once more before the first spawn,
-            // and again at the top of every wave — a cancel landing during an
-            // approval wait or between waves skips the rest (external
-            // re-review P2); in-flight workers self-terminate via the shared
-            // cancel flag they inherit, returning partial/cancelled results
-            // rather than synthesised ones. Hooks: after the announce, each
-            // call passes `before_tool` — serially, on this thread, before ANY
-            // worker spawns (approval decisions never race); denied calls
-            // never spawn. Announced calls that never run keep their
-            // Cancelled history slot but DO get a matching ToolResult event in
-            // the assembly pass (`announced_parallel`) so event consumers
-            // never see an unclosed ToolCall.
-            let mut announced_parallel = false;
-            if !parallel_slots.is_empty() && !batch_cancelled && !self.cancelled() {
-                // Announce the parallel calls in block order NOW that the batch
-                // is committed to run — emitting them in the inline pass (before
-                // the gate) would leave a ToolCall with no matching ToolResult
-                // if a later leaf tripped cancel and gated this batch off.
-                for &i in &parallel_slots {
-                    events(AgentEvent::ToolCall {
-                        name: tool_uses[i].1.clone(),
-                        input: tool_uses[i].2.clone(),
-                    });
-                }
-                announced_parallel = true;
-                // Hooks gate — SERIAL on this (parent) thread, before any
-                // worker spawns, in parallel-block order (see the Hooks doc,
-                // "Call order & concurrency"). Denied calls get their error
-                // slot + after-notification at decision time and spawn no
-                // worker; Allow/Modify land in `runnable` (Modify carrying the
-                // replacement — the audit trail keeps the original input from
-                // `tool_uses`).
-                let mut runnable: Vec<(usize, String, Value)> =
-                    Vec::with_capacity(parallel_slots.len());
-                for &i in &parallel_slots {
-                    // Cancel checkpoint, per call (external re-review P2): the
-                    // approval gates below can each wait unboundedly long, so
-                    // re-check between gates — a cancel that landed during an
-                    // earlier approval ends the gating here. Slots that were
-                    // never gated keep their Cancelled placeholder (N:N
-                    // synthesis below).
-                    if self.cancelled() {
-                        break;
-                    }
-                    let name = &tool_uses[i].1;
-                    let input = &tool_uses[i].2;
-                    match gate_tool_call(&self.ctx, name, input) {
-                        ToolDecision::Deny(reason) => {
-                            // Same output budget as any tool error (run_tool's
-                            // MCP path): a host's deny reason is model-visible
-                            // is_error text and can be arbitrarily long.
-                            let mut reason = reason;
-                            crate::tools::truncate(&mut reason, self.ctx.max_output_chars);
-                            let output = ToolOutput::error(reason);
-                            notify_tool_after(&self.ctx, name, input, &output, false);
-                            slots[i] = Slot::Ran(Box::new(output), None);
-                        }
-                        ToolDecision::Allow => {
-                            runnable.push((i, name.clone(), input.clone()));
-                        }
-                        ToolDecision::Modify(v) => {
-                            effective_inputs[i] = Some(v.clone());
-                            runnable.push((i, name.clone(), v));
-                        }
-                    }
-                }
-                // Second checkpoint before anything spawns: a cancel that
-                // landed during the LAST gate skips the whole batch. Approved
-                // but unstarted calls don't stay Cancelled — the placeholder
-                // loop after the waves converts them to the same recorded
-                // after_tool(executed=false) shape the worker pre-body
-                // checkpoint uses, so a passed gate never leaves an unmatched
-                // before_tool (external re-review P3). (Cancel = stop
-                // STARTING work; already-running workers self-terminate via
-                // the shared flag per the Parallel contract.) Control still
-                // falls through to the assembly pass below — the announced
-                // calls need their synthesized results.
-                let mut spawned = 0usize;
-                if !self.cancelled() && !runnable.is_empty() {
-                    // Waves cap concurrent workers (MAX_PARALLEL_TOOL_WORKERS):
-                    // the model can emit dozens of `task` calls in one turn and
-                    // one-thread-per-call would fan out unboundedly. Events funnel
-                    // through a BOUNDED channel per wave (sync_channel) — a flood
-                    // from a fast sub-agent blocks its emit instead of ballooning
-                    // memory when the parent's consumer is slow (backpressure).
-                    // Within a wave every worker still spawns before any joins, so
-                    // the drain loop below interleaves their events live. Cancel is
-                    // re-checked at each wave start AND inside the worker right
-                    // before the tool body runs — a cancel that landed during an
-                    // earlier wave must not start the next one (external
-                    // re-review P2).
-                    const MAX_PARALLEL_TOOL_WORKERS: usize = 8;
-                    for wave in runnable.chunks(MAX_PARALLEL_TOOL_WORKERS) {
-                        if self.cancelled() {
-                            break; // later waves get the placeholder loop below
-                        }
-                        let tools = &self.tools;
-                        let defs = &self.tool_defs;
-                        let ctx = &self.ctx;
-                        std::thread::scope(|s| {
-                            // The channel is created INSIDE the scope closure so
-                            // `rx` is a closure local: if the host event callback
-                            // panics under panic=unwind, the drain loop's unwind
-                            // drops `rx`, worker sends start failing, and scope's
-                            // join-all can complete — with `rx` borrowed from
-                            // outside, workers blocked on a full funnel while the
-                            // join waited on them: deadlock (external re-review
-                            // P2). The guard additionally trips the shared cancel
-                            // flag so in-flight workers wind down fast instead of
-                            // running a doomed wave to completion.
-                            struct CancelOnUnwind<'a> {
-                                flag: &'a Option<Arc<AtomicBool>>,
-                                armed: bool,
-                            }
-                            impl Drop for CancelOnUnwind<'_> {
-                                fn drop(&mut self) {
-                                    if self.armed && std::thread::panicking() {
-                                        if let Some(c) = self.flag {
-                                            c.store(true, Ordering::Relaxed);
-                                        }
-                                    }
-                                }
-                            }
-                            let (tx, rx) = std::sync::mpsc::sync_channel::<AgentEvent>(256);
-                            let mut unwind_guard = CancelOnUnwind {
-                                flag: &ctx.cancel,
-                                armed: true,
-                            };
-                            // Spawn every wave worker BEFORE joining any, so they
-                            // run concurrently. Each owns its input/name + a
-                            // sender clone, and only ever touches `tx` (never
-                            // `events`). A worker re-checks cancel before the
-                            // tool body: approved-but-unstarted calls return
-                            // None, which the join below turns into the same
-                            // cancelled-error shape the sequential gate
-                            // checkpoint uses.
-                            // Probe + join handle per worker; named to keep the
-                            // batch type readable (clippy::type_complexity). The
-                            // tuple also carries the tool body's wall-clock
-                            // duration (`None` when the body never ran).
-                            type Worker<'s> = (
-                                Arc<Mutex<Usage>>,
-                                std::thread::ScopedJoinHandle<
-                                    's,
-                                    (Option<ToolOutput>, Option<u64>),
-                                >,
-                            );
-                            let mut handles: Vec<Worker<'_>> = Vec::with_capacity(wave.len());
-                            for (_, name, input) in wave {
-                                let name = name.clone();
-                                let input = input.clone();
-                                let tx = tx.clone();
-                                // Per-worker usage side channel: if this worker
-                                // panics after billing a chat but before it can
-                                // return the ToolOutput that carries the usage,
-                                // the join arm below still recovers it. See
-                                // `usage_probe` for why this is thread-local.
-                                let probe = Arc::new(Mutex::new(Usage::default()));
-                                let worker_probe = Arc::clone(&probe);
-                                let h = s.spawn(move || {
-                                    crate::usage_probe::install(worker_probe);
-                                    let mut emit = |ev: AgentEvent| {
-                                        // Blocks when the funnel is full — the
-                                        // drain loop in this same scope is the
-                                        // only consumer, so it always unwinds.
-                                        let _ = tx.send(ev);
-                                    };
-                                    if ctx_cancelled(ctx) {
-                                        return (None, None);
-                                    }
-                                    let started = Instant::now();
-                                    let out = run_tool(tools, defs, &name, &input, ctx, &mut emit);
-                                    let ms = u64::try_from(started.elapsed().as_millis())
-                                        .unwrap_or(u64::MAX);
-                                    (Some(out), Some(ms))
-                                });
-                                handles.push((probe, h));
-                            }
-                            drop(tx); // workers hold the last clones; rx ends when they drop
-                                      // Forward child events to the parent sink as they arrive
-                                      // (interleaved across parallel sub-agents, told apart by name).
-                            while let Ok(ev) = rx.recv() {
-                                events(ev);
-                            }
-                            unwind_guard.armed = false; // drain finished cleanly
-                                                        // Join in spawn order (= parallel block order): notify
-                                                        // hooks with the ORIGINAL input (from tool_uses, never
-                                                        // the Modify replacement), then place each result at
-                                                        // its ordinal.
-                            for (pos, (probe, h)) in handles.into_iter().enumerate() {
-                                let (i, _, _) = wave[pos];
-                                let (output, duration_ms) = h.join().unwrap_or_else(|_| {
-                                    // A worker that panicked mid-run has
-                                    // already billed its chats into the SHARED
-                                    // fleet counter, and the `usage_probe`
-                                    // side channel carries those numbers out
-                                    // of the unwinding thread. Attach them to
-                                    // the synthesized error output so totals
-                                    // (RunOutcome / result.json) match the
-                                    // counter instead of silently dropping the
-                                    // spend. `usage_in_shared_budget: true`
-                                    // tells the fold the counter half is done.
-                                    let recovered = crate::usage_probe::read(&probe);
-                                    let mut out =
-                                        ToolOutput::error("parallel tool worker panicked");
-                                    if recovered.total() > 0 {
-                                        out.usage = Some(recovered);
-                                        out.usage_in_shared_budget = true;
-                                    }
-                                    // A panicked worker never got to stop its
-                                    // own timer cleanly — the duration is not
-                                    // observable, keep the record honest with
-                                    // `None`.
-                                    (Some(out), None)
-                                });
-                                match output {
-                                    Some(output) => {
-                                        notify_tool_after(
-                                            ctx,
-                                            &tool_uses[i].1,
-                                            &tool_uses[i].2,
-                                            &output,
-                                            true,
-                                        );
-                                        slots[i] = Slot::Ran(Box::new(output), duration_ms);
-                                    }
-                                    // Cancelled before the tool body ran: same
-                                    // shape as the sequential gate checkpoint —
-                                    // error slot, executed=false, and (the call
-                                    // was announced) a ToolResult event lands in
-                                    // the assembly pass.
-                                    None => {
-                                        let output = ToolOutput::error("[cancelled by user]");
-                                        notify_tool_after(
-                                            ctx,
-                                            &tool_uses[i].1,
-                                            &tool_uses[i].2,
-                                            &output,
-                                            false,
-                                        );
-                                        slots[i] = Slot::Ran(Box::new(output), None);
-                                    }
-                                }
-                            }
-                        });
-                        spawned += wave.len();
-                    }
-                }
-                // Approved-but-never-started calls (cancel at the pre-spawn
-                // checkpoint or between waves): their before_tool already
-                // fired — possibly after an approval wait — so they owe the
-                // audit trail the same recorded after_tool(executed=false)
-                // placeholder the worker pre-body checkpoint produces. Model-
-                // visible output is unchanged (the assembly pass was already
-                // synthesizing this exact ToolResult for announced slots);
-                // only records / hook pairing gain the entry. Never-gated
-                // calls (gate-loop break) keep their Cancelled slot: no
-                // before_tool fired, so there is nothing to pair.
-                for &(i, ref name, _) in &runnable[spawned..] {
-                    let output = ToolOutput::error("[cancelled by user]");
-                    notify_tool_after(&self.ctx, name, &tool_uses[i].2, &output, false);
-                    slots[i] = Slot::Ran(Box::new(output), None);
-                }
-            }
-
-            // Assemble results in block order: a result block for every tool_use
-            // (N:N), but records / ToolResult events / usage fold only for tools
-            // that actually ran. A `task` call's usage (the child's honest cost)
-            // is folded here exactly like a leaf tool's billed usage.
-            let mut results: Vec<Block> = Vec::with_capacity(tool_uses.len());
-            for (i, (id, name, input)) in tool_uses.iter().enumerate() {
-                match &slots[i] {
-                    Slot::Cancelled => {
-                        // A cancelled call that WAS announced (parallel batch
-                        // committed, then a gate/wave cancel kept it from
-                        // running) owes the event stream a ToolResult — the
-                        // consumer already saw its ToolCall and must not be
-                        // left with an open pair (external re-review P2).
-                        // Never-announced slots (inline-pass short-circuit,
-                        // batch gated off) stay silent on the event side.
-                        if announced_parallel {
-                            events(AgentEvent::ToolResult {
-                                name: name.clone(),
-                                is_error: true,
-                                content: "[cancelled by user]".into(),
-                            });
-                        }
-                        results.push(Block::ToolResult {
-                            tool_use_id: id.clone(),
-                            content: "[cancelled by user]".into(),
-                            image: None,
-                            is_error: true,
-                        })
-                    }
-                    Slot::Ran(output, duration_ms) => {
-                        // Tool-billed usage always folds into the run totals
-                        // (billing is honest regardless of source); the shared
-                        // counter gets it only when the producer did NOT
-                        // already share while running. `task` children set
-                        // usage_in_shared_budget (their own chats billed into
-                        // the inherited counter — re-adding here would halve
-                        // the fleet budget); any other tool reporting usage
-                        // (a host CallbackTool metering an upstream API) never
-                        // entered a counter, so the fold shares it now —
-                        // previously that spend billed the totals yet was
-                        // invisible to the max_total_tokens gate (external
-                        // review P2-3).
-                        if let Some(u) = output.usage {
-                            if !output.usage_in_shared_budget {
-                                self.share_budget(u.total());
-                            }
-                            // Parallel-worker side channel: mirror the fold
-                            // into THIS thread's usage probe. A `task` child
-                            // running its own nested batch folds tool usage
-                            // here — normal outputs and panic-recovered ones
-                            // alike — so when the child's own thread later
-                            // panics, its probe carries the FULL ledger, not
-                            // just its direct chats (see `usage_probe`).
-                            // No-op on the top-level loop thread (no probe).
-                            crate::usage_probe::record(&u);
-                            self.fold_usage(events, &u);
-                        }
-                        records.push(ToolCallRecord {
-                            name: name.clone(),
-                            input: input.clone(),
-                            output: output.content.clone(),
-                            is_error: output.is_error,
-                            meta: output.meta.clone(),
-                            duration_ms: *duration_ms,
-                        });
-                        events(AgentEvent::ToolResult {
-                            name: name.clone(),
-                            is_error: output.is_error,
-                            content: output.content.clone(),
-                        });
-                        // 打转计数：键 =（工具名, 规范化生效参数, 结果指纹）——
-                        // 同参不同果（轮询有进展）不同键、自动重置；nudge 只
-                        // 追加进历史块——ToolResult 事件与 records 保持原样输出
-                        let key = (
-                            name.clone(),
-                            canon_input(effective_inputs[i].as_ref().unwrap_or(input)),
-                            stuck_result_hash(output),
-                        );
-                        if stuck_key.as_ref() == Some(&key) {
-                            stuck_len += 1;
-                        } else {
-                            stuck_key = Some(key);
-                            stuck_len = 1;
-                        }
-                        let mut content = output.content.clone();
-                        if stuck_len == STUCK_NUDGE_AT {
-                            content.push_str(&stuck_nudge(stuck_len));
-                        }
-                        results.push(Block::ToolResult {
-                            tool_use_id: id.clone(),
-                            content,
-                            image: output.image.clone().map(Box::new),
-                            is_error: output.is_error,
-                        });
-                    }
-                }
-            }
-            // Anchor id minted before the push (minting scans `&self.messages`
-            // for collisions — impossible while the push borrows it).
-            let results_id = fresh_message_id(&self.messages, &mut self.next_msg_id);
-            let mut results_msg = Message::user(results);
-            results_msg.id = Some(results_id);
-            self.messages.push(results_msg);
-            if let Some(w) = self.save_session() {
-                events(AgentEvent::Warning(w));
-            }
+            // 工具执行与结果装配（顺序叶子 + 并行波次 + N:N 配对）——纯搬移
+            // 到 `execute_tool_calls`，轮体只负责调用与轮尾判定。
+            let blocks = resp.blocks;
+            self.execute_tool_calls(
+                events,
+                &blocks,
+                &mut records,
+                &mut stuck_key,
+                &mut stuck_len,
+            );
             // Turn-timing row: the turn body is complete (assistant message +
             // tool results in history). One push here covers all three exits
             // below — continue to the next turn, cancel break, stuck_loop
@@ -2862,6 +2394,493 @@ impl Agent {
             cache_read_input_tokens: self.usage.cache_read_input_tokens,
             elapsed: start.elapsed(),
         })
+    }
+
+    /// 执行本轮所有 tool_use 调用并装配成一条 user 消息（N:N 配对）。
+    ///
+    /// 从 `run_impl` 的轮体中原样抽出（纯搬移，零行为变更）：顺序叶子工具
+    /// 就地执行、`ToolConcurrency::Parallel` 的调用按波次 fan-out、结果按块序
+    /// 装配。`stuck_*` 是跨轮状态（打转护栏），由轮循环持有、这里以 &mut 传入。
+    fn execute_tool_calls(
+        &mut self,
+        events: &mut dyn FnMut(AgentEvent),
+        blocks: &[Block],
+        records: &mut Vec<ToolCallRecord>,
+        stuck_key: &mut Option<(String, String, u64)>,
+        stuck_len: &mut u32,
+    ) {
+        // Execute each tool call, collect results into one user message.
+        // Once cancelled (e.g. Ctrl-C during tool #1), stop running further
+        // tools — but STILL emit a result for every remaining tool_use: an
+        // assistant message carrying N tool_use blocks must be followed by
+        // N tool_results, or the next request is rejected. (A non-cancel-
+        // aware tool that was already in flight returns on its own; later
+        // tools in the batch are short-circuited here.)
+
+        // Collect tool_use blocks (in order) with stable ordinals — only
+        // these produce results; the turn's text already streamed above.
+        // Owned (not borrows into the response) so `.clone()` in the passes
+        // below yields String/Value, and so `tool_uses` can be borrowed by the
+        // scoped worker threads without entangling the response's lifetime.
+        let tool_uses: Vec<(String, String, Value)> = blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::ToolUse { id, name, input } => {
+                    Some((id.clone(), name.clone(), input.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+
+        // Per-slot outcome. `Cancelled` keeps N:N pairing (a result block
+        // for every tool_use) without billing usage or recording a call —
+        // matching the pre-parallel behavior. `Ran` is a real ToolOutput
+        // (a Sequential tool run inline, or a Parallel one run in the
+        // batch below) plus the tool body's wall-clock duration — `None`
+        // when the call never actually executed (Deny / cancel checkpoint
+        // / approved-but-never-started placeholder). Boxed because
+        // `ToolOutput` carries an `Option<Value>` (audit `meta`) and
+        // crossed the `large_enum_variant` threshold — an alloc per tool
+        // call is negligible and keeps `Slot` (one per tool_use, in a
+        // Vec) small.
+        enum Slot {
+            Cancelled,
+            Ran(Box<ToolOutput>, Option<u64>),
+        }
+        let mut slots: Vec<Slot> = (0..tool_uses.len()).map(|_| Slot::Cancelled).collect();
+        // Hook-Modify replacements, per ordinal (None = ran with the
+        // original input). The stuck detector keys on the EFFECTIVE input
+        // (external re-review P2): an approval layer rewriting each call to
+        // a different page/target must not share one stuck key.
+        let mut effective_inputs: Vec<Option<Value>> = (0..tool_uses.len()).map(|_| None).collect();
+        // Ordinals of Parallel-capable calls deferred to the parallel batch.
+        let mut parallel_slots: Vec<usize> = Vec::new();
+        let mut batch_cancelled = false;
+
+        // Inline leaf pass: run Sequential tools one at a time (avoids new
+        // races on shell/file), announce each LEAF call in block order, and
+        // short-circuit on cancel (later slots stay Cancelled). Routing is
+        // by CAPABILITY — a tool whose `concurrency()` reports Parallel is
+        // deferred to the batch below, whatever its name. Parallel calls
+        // are NOT announced here — their ToolCall is emitted in the batch
+        // block below, AFTER the cancel gate, so a call gated off by a
+        // later leaf tripping cancel never dangles a ToolCall without a
+        // matching ToolResult on the UI.
+        for (i, (_id, name, input)) in tool_uses.iter().enumerate() {
+            if batch_cancelled || self.cancelled() {
+                batch_cancelled = true;
+                continue; // leaves the default Slot::Cancelled
+            }
+            // Unknown names land here too (find_tool → None): run_tool
+            // synthesizes the "unknown tool" error result, exactly as
+            // before the capability split.
+            let parallel = match find_tool(&self.tool_defs, name) {
+                Some(ti) => self.tools[ti].concurrency() == ToolConcurrency::Parallel,
+                None => false,
+            };
+            if parallel {
+                parallel_slots.push(i); // ToolCall announced + run in the batch below
+            } else {
+                // One complete inline call: ToolCall event → gate → run →
+                // after-notification (see execute_tool_call). The
+                // ToolResult event is NOT emitted here — the assembly pass
+                // below owns block order, N:N pairing, and the
+                // cancelled-slot synthesis.
+                let (output, duration_ms) = {
+                    let mut fwd = |ev: AgentEvent| events(ev);
+                    execute_tool_call(
+                        &self.tools,
+                        &self.tool_defs,
+                        &self.ctx,
+                        name,
+                        input,
+                        &mut fwd,
+                        &mut effective_inputs[i],
+                    )
+                };
+                slots[i] = Slot::Ran(Box::new(output), duration_ms);
+            }
+        }
+
+        // Parallel batch: every call whose tool reported
+        // ToolConcurrency::Parallel runs on its own scoped thread
+        // (borrowing the read-only tool list + ctx, both Sync), forwarding
+        // its events through an mpsc funnel the parent drains live — so
+        // concurrent sub-agents interleave on screen, tagged by name.
+        // Sequential tools stay inline (above); routing is by the
+        // capability marker, NOT by name, so a third-party tool opting
+        // into Parallel gets the same fan-out the built-in `task` does.
+        // Its implementor has signed up for reentrancy + cancel polling
+        // (see ToolConcurrency::Parallel). Cancel: gate before spawning (a
+        // cancel that hit during the inline pass, or one already set,
+        // marks the batch cancelled and skips it), re-checked PER CALL
+        // between the approval gates, once more before the first spawn,
+        // and again at the top of every wave — a cancel landing during an
+        // approval wait or between waves skips the rest (external
+        // re-review P2); in-flight workers self-terminate via the shared
+        // cancel flag they inherit, returning partial/cancelled results
+        // rather than synthesised ones. Hooks: after the announce, each
+        // call passes `before_tool` — serially, on this thread, before ANY
+        // worker spawns (approval decisions never race); denied calls
+        // never spawn. Announced calls that never run keep their
+        // Cancelled history slot but DO get a matching ToolResult event in
+        // the assembly pass (`announced_parallel`) so event consumers
+        // never see an unclosed ToolCall.
+        let mut announced_parallel = false;
+        if !parallel_slots.is_empty() && !batch_cancelled && !self.cancelled() {
+            // Announce the parallel calls in block order NOW that the batch
+            // is committed to run — emitting them in the inline pass (before
+            // the gate) would leave a ToolCall with no matching ToolResult
+            // if a later leaf tripped cancel and gated this batch off.
+            for &i in &parallel_slots {
+                events(AgentEvent::ToolCall {
+                    name: tool_uses[i].1.clone(),
+                    input: tool_uses[i].2.clone(),
+                });
+            }
+            announced_parallel = true;
+            // Hooks gate — SERIAL on this (parent) thread, before any
+            // worker spawns, in parallel-block order (see the Hooks doc,
+            // "Call order & concurrency"). Denied calls get their error
+            // slot + after-notification at decision time and spawn no
+            // worker; Allow/Modify land in `runnable` (Modify carrying the
+            // replacement — the audit trail keeps the original input from
+            // `tool_uses`).
+            let mut runnable: Vec<(usize, String, Value)> =
+                Vec::with_capacity(parallel_slots.len());
+            for &i in &parallel_slots {
+                // Cancel checkpoint, per call (external re-review P2): the
+                // approval gates below can each wait unboundedly long, so
+                // re-check between gates — a cancel that landed during an
+                // earlier approval ends the gating here. Slots that were
+                // never gated keep their Cancelled placeholder (N:N
+                // synthesis below).
+                if self.cancelled() {
+                    break;
+                }
+                let name = &tool_uses[i].1;
+                let input = &tool_uses[i].2;
+                match gate_tool_call(&self.ctx, name, input) {
+                    ToolDecision::Deny(reason) => {
+                        // Same output budget as any tool error (run_tool's
+                        // MCP path): a host's deny reason is model-visible
+                        // is_error text and can be arbitrarily long.
+                        let mut reason = reason;
+                        crate::tools::truncate(&mut reason, self.ctx.max_output_chars);
+                        let output = ToolOutput::error(reason);
+                        notify_tool_after(&self.ctx, name, input, &output, false);
+                        slots[i] = Slot::Ran(Box::new(output), None);
+                    }
+                    ToolDecision::Allow => {
+                        runnable.push((i, name.clone(), input.clone()));
+                    }
+                    ToolDecision::Modify(v) => {
+                        effective_inputs[i] = Some(v.clone());
+                        runnable.push((i, name.clone(), v));
+                    }
+                }
+            }
+            // Second checkpoint before anything spawns: a cancel that
+            // landed during the LAST gate skips the whole batch. Approved
+            // but unstarted calls don't stay Cancelled — the placeholder
+            // loop after the waves converts them to the same recorded
+            // after_tool(executed=false) shape the worker pre-body
+            // checkpoint uses, so a passed gate never leaves an unmatched
+            // before_tool (external re-review P3). (Cancel = stop
+            // STARTING work; already-running workers self-terminate via
+            // the shared flag per the Parallel contract.) Control still
+            // falls through to the assembly pass below — the announced
+            // calls need their synthesized results.
+            let mut spawned = 0usize;
+            if !self.cancelled() && !runnable.is_empty() {
+                // Waves cap concurrent workers (MAX_PARALLEL_TOOL_WORKERS):
+                // the model can emit dozens of `task` calls in one turn and
+                // one-thread-per-call would fan out unboundedly. Events funnel
+                // through a BOUNDED channel per wave (sync_channel) — a flood
+                // from a fast sub-agent blocks its emit instead of ballooning
+                // memory when the parent's consumer is slow (backpressure).
+                // Within a wave every worker still spawns before any joins, so
+                // the drain loop below interleaves their events live. Cancel is
+                // re-checked at each wave start AND inside the worker right
+                // before the tool body runs — a cancel that landed during an
+                // earlier wave must not start the next one (external
+                // re-review P2).
+                const MAX_PARALLEL_TOOL_WORKERS: usize = 8;
+                for wave in runnable.chunks(MAX_PARALLEL_TOOL_WORKERS) {
+                    if self.cancelled() {
+                        break; // later waves get the placeholder loop below
+                    }
+                    let tools = &self.tools;
+                    let defs = &self.tool_defs;
+                    let ctx = &self.ctx;
+                    std::thread::scope(|s| {
+                        // The channel is created INSIDE the scope closure so
+                        // `rx` is a closure local: if the host event callback
+                        // panics under panic=unwind, the drain loop's unwind
+                        // drops `rx`, worker sends start failing, and scope's
+                        // join-all can complete — with `rx` borrowed from
+                        // outside, workers blocked on a full funnel while the
+                        // join waited on them: deadlock (external re-review
+                        // P2). The guard additionally trips the shared cancel
+                        // flag so in-flight workers wind down fast instead of
+                        // running a doomed wave to completion.
+                        struct CancelOnUnwind<'a> {
+                            flag: &'a Option<Arc<AtomicBool>>,
+                            armed: bool,
+                        }
+                        impl Drop for CancelOnUnwind<'_> {
+                            fn drop(&mut self) {
+                                if self.armed && std::thread::panicking() {
+                                    if let Some(c) = self.flag {
+                                        c.store(true, Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                        }
+                        let (tx, rx) = std::sync::mpsc::sync_channel::<AgentEvent>(256);
+                        let mut unwind_guard = CancelOnUnwind {
+                            flag: &ctx.cancel,
+                            armed: true,
+                        };
+                        // Spawn every wave worker BEFORE joining any, so they
+                        // run concurrently. Each owns its input/name + a
+                        // sender clone, and only ever touches `tx` (never
+                        // `events`). A worker re-checks cancel before the
+                        // tool body: approved-but-unstarted calls return
+                        // None, which the join below turns into the same
+                        // cancelled-error shape the sequential gate
+                        // checkpoint uses.
+                        // Probe + join handle per worker; named to keep the
+                        // batch type readable (clippy::type_complexity). The
+                        // tuple also carries the tool body's wall-clock
+                        // duration (`None` when the body never ran).
+                        type Worker<'s> = (
+                            Arc<Mutex<Usage>>,
+                            std::thread::ScopedJoinHandle<'s, (Option<ToolOutput>, Option<u64>)>,
+                        );
+                        let mut handles: Vec<Worker<'_>> = Vec::with_capacity(wave.len());
+                        for (_, name, input) in wave {
+                            let name = name.clone();
+                            let input = input.clone();
+                            let tx = tx.clone();
+                            // Per-worker usage side channel: if this worker
+                            // panics after billing a chat but before it can
+                            // return the ToolOutput that carries the usage,
+                            // the join arm below still recovers it. See
+                            // `usage_probe` for why this is thread-local.
+                            let probe = Arc::new(Mutex::new(Usage::default()));
+                            let worker_probe = Arc::clone(&probe);
+                            let h = s.spawn(move || {
+                                crate::usage_probe::install(worker_probe);
+                                let mut emit = |ev: AgentEvent| {
+                                    // Blocks when the funnel is full — the
+                                    // drain loop in this same scope is the
+                                    // only consumer, so it always unwinds.
+                                    let _ = tx.send(ev);
+                                };
+                                if ctx_cancelled(ctx) {
+                                    return (None, None);
+                                }
+                                let started = Instant::now();
+                                let out = run_tool(tools, defs, &name, &input, ctx, &mut emit);
+                                let ms = u64::try_from(started.elapsed().as_millis())
+                                    .unwrap_or(u64::MAX);
+                                (Some(out), Some(ms))
+                            });
+                            handles.push((probe, h));
+                        }
+                        drop(tx); // workers hold the last clones; rx ends when they drop
+                                  // Forward child events to the parent sink as they arrive
+                                  // (interleaved across parallel sub-agents, told apart by name).
+                        while let Ok(ev) = rx.recv() {
+                            events(ev);
+                        }
+                        unwind_guard.armed = false; // drain finished cleanly
+                                                    // Join in spawn order (= parallel block order): notify
+                                                    // hooks with the ORIGINAL input (from tool_uses, never
+                                                    // the Modify replacement), then place each result at
+                                                    // its ordinal.
+                        for (pos, (probe, h)) in handles.into_iter().enumerate() {
+                            let (i, _, _) = wave[pos];
+                            let (output, duration_ms) = h.join().unwrap_or_else(|_| {
+                                // A worker that panicked mid-run has
+                                // already billed its chats into the SHARED
+                                // fleet counter, and the `usage_probe`
+                                // side channel carries those numbers out
+                                // of the unwinding thread. Attach them to
+                                // the synthesized error output so totals
+                                // (RunOutcome / result.json) match the
+                                // counter instead of silently dropping the
+                                // spend. `usage_in_shared_budget: true`
+                                // tells the fold the counter half is done.
+                                let recovered = crate::usage_probe::read(&probe);
+                                let mut out = ToolOutput::error("parallel tool worker panicked");
+                                if recovered.total() > 0 {
+                                    out.usage = Some(recovered);
+                                    out.usage_in_shared_budget = true;
+                                }
+                                // A panicked worker never got to stop its
+                                // own timer cleanly — the duration is not
+                                // observable, keep the record honest with
+                                // `None`.
+                                (Some(out), None)
+                            });
+                            match output {
+                                Some(output) => {
+                                    notify_tool_after(
+                                        ctx,
+                                        &tool_uses[i].1,
+                                        &tool_uses[i].2,
+                                        &output,
+                                        true,
+                                    );
+                                    slots[i] = Slot::Ran(Box::new(output), duration_ms);
+                                }
+                                // Cancelled before the tool body ran: same
+                                // shape as the sequential gate checkpoint —
+                                // error slot, executed=false, and (the call
+                                // was announced) a ToolResult event lands in
+                                // the assembly pass.
+                                None => {
+                                    let output = ToolOutput::error("[cancelled by user]");
+                                    notify_tool_after(
+                                        ctx,
+                                        &tool_uses[i].1,
+                                        &tool_uses[i].2,
+                                        &output,
+                                        false,
+                                    );
+                                    slots[i] = Slot::Ran(Box::new(output), None);
+                                }
+                            }
+                        }
+                    });
+                    spawned += wave.len();
+                }
+            }
+            // Approved-but-never-started calls (cancel at the pre-spawn
+            // checkpoint or between waves): their before_tool already
+            // fired — possibly after an approval wait — so they owe the
+            // audit trail the same recorded after_tool(executed=false)
+            // placeholder the worker pre-body checkpoint produces. Model-
+            // visible output is unchanged (the assembly pass was already
+            // synthesizing this exact ToolResult for announced slots);
+            // only records / hook pairing gain the entry. Never-gated
+            // calls (gate-loop break) keep their Cancelled slot: no
+            // before_tool fired, so there is nothing to pair.
+            for &(i, ref name, _) in &runnable[spawned..] {
+                let output = ToolOutput::error("[cancelled by user]");
+                notify_tool_after(&self.ctx, name, &tool_uses[i].2, &output, false);
+                slots[i] = Slot::Ran(Box::new(output), None);
+            }
+        }
+
+        // Assemble results in block order: a result block for every tool_use
+        // (N:N), but records / ToolResult events / usage fold only for tools
+        // that actually ran. A `task` call's usage (the child's honest cost)
+        // is folded here exactly like a leaf tool's billed usage.
+        let mut results: Vec<Block> = Vec::with_capacity(tool_uses.len());
+        for (i, (id, name, input)) in tool_uses.iter().enumerate() {
+            match &slots[i] {
+                Slot::Cancelled => {
+                    // A cancelled call that WAS announced (parallel batch
+                    // committed, then a gate/wave cancel kept it from
+                    // running) owes the event stream a ToolResult — the
+                    // consumer already saw its ToolCall and must not be
+                    // left with an open pair (external re-review P2).
+                    // Never-announced slots (inline-pass short-circuit,
+                    // batch gated off) stay silent on the event side.
+                    if announced_parallel {
+                        events(AgentEvent::ToolResult {
+                            name: name.clone(),
+                            is_error: true,
+                            content: "[cancelled by user]".into(),
+                        });
+                    }
+                    results.push(Block::ToolResult {
+                        tool_use_id: id.clone(),
+                        content: "[cancelled by user]".into(),
+                        image: None,
+                        is_error: true,
+                    })
+                }
+                Slot::Ran(output, duration_ms) => {
+                    // Tool-billed usage always folds into the run totals
+                    // (billing is honest regardless of source); the shared
+                    // counter gets it only when the producer did NOT
+                    // already share while running. `task` children set
+                    // usage_in_shared_budget (their own chats billed into
+                    // the inherited counter — re-adding here would halve
+                    // the fleet budget); any other tool reporting usage
+                    // (a host CallbackTool metering an upstream API) never
+                    // entered a counter, so the fold shares it now —
+                    // previously that spend billed the totals yet was
+                    // invisible to the max_total_tokens gate (external
+                    // review P2-3).
+                    if let Some(u) = output.usage {
+                        if !output.usage_in_shared_budget {
+                            self.share_budget(u.total());
+                        }
+                        // Parallel-worker side channel: mirror the fold
+                        // into THIS thread's usage probe. A `task` child
+                        // running its own nested batch folds tool usage
+                        // here — normal outputs and panic-recovered ones
+                        // alike — so when the child's own thread later
+                        // panics, its probe carries the FULL ledger, not
+                        // just its direct chats (see `usage_probe`).
+                        // No-op on the top-level loop thread (no probe).
+                        crate::usage_probe::record(&u);
+                        self.fold_usage(events, &u);
+                    }
+                    records.push(ToolCallRecord {
+                        name: name.clone(),
+                        input: input.clone(),
+                        output: output.content.clone(),
+                        is_error: output.is_error,
+                        meta: output.meta.clone(),
+                        duration_ms: *duration_ms,
+                    });
+                    events(AgentEvent::ToolResult {
+                        name: name.clone(),
+                        is_error: output.is_error,
+                        content: output.content.clone(),
+                    });
+                    // 打转计数：键 =（工具名, 规范化生效参数, 结果指纹）——
+                    // 同参不同果（轮询有进展）不同键、自动重置；nudge 只
+                    // 追加进历史块——ToolResult 事件与 records 保持原样输出
+                    let key = (
+                        name.clone(),
+                        canon_input(effective_inputs[i].as_ref().unwrap_or(input)),
+                        stuck_result_hash(output),
+                    );
+                    if stuck_key.as_ref() == Some(&key) {
+                        *stuck_len = (*stuck_len).saturating_add(1);
+                    } else {
+                        *stuck_key = Some(key);
+                        *stuck_len = 1;
+                    }
+                    let mut content = output.content.clone();
+                    if *stuck_len == STUCK_NUDGE_AT {
+                        content.push_str(&stuck_nudge(*stuck_len));
+                    }
+                    results.push(Block::ToolResult {
+                        tool_use_id: id.clone(),
+                        content,
+                        image: output.image.clone().map(Box::new),
+                        is_error: output.is_error,
+                    });
+                }
+            }
+        }
+        // Anchor id minted before the push (minting scans `&self.messages`
+        // for collisions — impossible while the push borrows it).
+        let results_id = fresh_message_id(&self.messages, &mut self.next_msg_id);
+        let mut results_msg = Message::user(results);
+        results_msg.id = Some(results_id);
+        self.messages.push(results_msg);
+        if let Some(w) = self.save_session() {
+            events(AgentEvent::Warning(w));
+        }
     }
 }
 
