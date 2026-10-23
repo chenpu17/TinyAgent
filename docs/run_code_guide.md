@@ -24,7 +24,7 @@ export TINYAGENT_BIN="$PWD/target/release/tiny-agent"
 
 输出的 `features` 数组应包含 `code`。仅有运行时配置不能给未编入该特性的
 二进制增加沙箱能力。Python/Node 绑定也有独立的编译开关，见
-[绑定构建说明](../README.md#python--typescript-绑定)。
+[绑定构建说明](lib_api.md#python--typescript-绑定)。
 
 填入自己的模型连接后执行：
 
@@ -94,7 +94,7 @@ export TINYAGENT_API_KEY='your-api-key'
   `tools.list()` 核对准确名称，按实际 schema 传参；它返回 `[{name, description}]`。
 - **Rust 宿主自定义工具**：`CallbackTool` 默认不对 guest 开放，须逐工具调用
   `with_code_access()`；自定义 `Tool` 实现用 `available_to_code()` 声明。
-  通过 `build_agent_with` 装配，示例与接口见[库 API](../README.md#库-api程序化调用)。
+  通过 `build_agent_with` 装配，示例与接口见[库 API](lib_api.md)。
 - **工具和文件权限**：只开放任务需要的能力，配置工作目录、`deny_paths` 和
   `fs_write_dirs`。guest 没有直接网络或文件访问；授予的工具仍按它们自身的权限
   执行。尤其是 `shell`，不能把 guest 文件路径规则当作 shell 的隔离措施。

@@ -7,7 +7,7 @@
 
 使用入口：[快速上手与最佳实践](run_code_guide.md) ·
 [可运行演示](../examples/run-code-demo/README.md) ·
-[模型内置技能](../src/tools/run_code_skill.md)。
+[模型内置技能](../crates/core/src/tools/run_code_skill.md)。
 
 ## 1. 特性状态总表
 

@@ -57,7 +57,9 @@
   （`estimate_tokens`/`find_safe_cut`/`fold_summary`/`prune_tool_results`/`window_lines`/`chunk_lines`/
   `SUMMARY_*` 等）抽到 `compress.rs`（单向被 agent 依赖；`window_lines` 反向调 `crate::agent::preview`，
   不构成环）。`AgentEvent` 透传给 harness（headless 打印/NDJSON）或 TUI。上下文压缩的摘要请求自身
-  usage 也计入累计（诚实成本）。**分层漏斗（业界对齐）**：LLM 摘要前先走 `prune_tool_results`
+  usage 也计入累计（诚实成本）。
+
+  **分层漏斗（业界对齐）**：LLM 摘要前先走 `prune_tool_results`
   （保护窗外 >2000 字符旧 tool_result → 占位符，配对保留、todo 豁免、<20000 字符释放不重写）——
   preflight 超阈值先剪枝重估、溢出兜底先剪枝重试，常可免掉计费摘要调用；preflight 估算经
   `UsageAnchor` **锚定 provider 实测 prompt tokens**（input+缓存写+缓存读，前缀/system/工具表指纹
@@ -67,9 +69,11 @@
   4096 条 FIFO，格式向后兼容）。宿主入口 `compact()`/`compact_with(events, instructions)`（焦点指令
   拼进摘要 user prompt 尾部，不进 SUMMARY_SYSTEM），Python/Node 绑定同款 `compact(instructions?,
   on_event?)`。
+
   **`find_safe_cut` 空尾语义**：keep_recent=0 时 cut==n（空尾）是**合法**切点——真实 loop 每个请求点
   历史必 user 结尾，若钳到 n-1 扫边界必落空、该配置下压缩被静默禁用（A2 修复）；`fold_summary` 对空尾
   产出单条 user 头。守卫是 `saturating_add(2)`（usize::MAX 级 keep_recent 不 panic/回绕）。
+
   **`summary_call` 空正文重试（思考网关自愈，TinyWorker 反馈 #7）**：混合思考网关（deepseek/glm）把
   reasoning_content 计入 max_tokens，UPDATE 分支（带旧摘要）诱导的长推敲可整块烧光 1024 起步预算 →
   `finish=length` 映射成 stop_reason `"max_tokens"` 且**正文零字**——「截断仍连贯」的接受假设在零正文时
@@ -81,6 +85,7 @@
   summary_call 的 `reasoning_effort` 恒 `None` 且**不**改成低档值——Anthropic 上任何 Some(非 "none")
   effort 是**开启** adaptive thinking（与意图相反），OpenAI 兼容网关对 "low" 的解释是掷硬币；默认开思考
   的网关交给上面的空正文重试兜住。
+
   **`salvage_on_max_tokens`（max_tokens 截断一次性收尾自愈，bench 实证驱动）**：assistant 轮以
   stop_reason `max_tokens` 截断且**原始 blocks 无 tool_use** 时，push_user 一条英文 wrap-up nudge
   （`SALVAGE_NUDGE_PARTIAL`/`SALVAGE_NUDGE_EMPTY`——**刻意不写 "Final answer:"**，那是评测判卷契约，
@@ -92,9 +97,11 @@
   aborted 测试钉住）。事件 `AgentEvent::MaxTokensSalvage`（unit 变体：`--json` 吐
   `{"type":"salvage"}`、plain 走 stderr 一行、TUI wildcard 兜底）。Config 软字段默认 true
   （`PartialConfig` 软覆盖、不在 forbidden 表）；子 agent 经 cfg 快照自动继承、各 run 独立一次。
+
   **数值写端一律 saturating**：usage 累计 / RunCost / merge_usage / trace_meta / batch 汇总的 `+=`
   全部是 `saturating_add`（读端 `Usage::total()` 本就饱和）——新增累加点照做，谎报 u64::MAX 不 panic
   （debug）也不回绕躲预算闸门（release）。
+
   **打转护栏（stuck_loop）**：装配段对 `Slot::Ran` 的调用按（工具名, `canon_input` 规范化**生效**
   参数, 结果指纹=`stuck_result_hash`(is_error+content)）三连键计数连续重复：第 `STUCK_NUDGE_AT`=3
   次往该次 tool_result **历史块**追加纠偏提示（ToolResult 事件与 records 原样，UI/result.json 不
@@ -116,6 +123,7 @@
   计数跨轮持久、随 run 重置；`Cancelled` 槽不计数（未执行）。测试组 8 个：
   nudge→停 / 换参重置 / 键序不敏感 / 进展结果不误停 / Modify 生效参数 / 同轮换法解停 /
   取消优先 / 数值拼写归一。
+
   **溢出确定性**：溢出逃逸失败后的溢出错误经 `RunError::is_context_overflow()` 判定为确定性——单跑
   `run_with_retries` 与 batch（stop_reason `context_overflow`，run_one 只重试 `"error"`）都不再进退避。
 - **token 预算闸门（fleet 级）**（`limits.max_total_tokens`，0=不限）：`Agent::run` 入口安装 run 级
@@ -277,6 +285,7 @@
   不实现）。启动时（`lib.rs::assemble`）扫描全局 `~/.config/tinyagent/skills/`（`skills::default_global_skills_dir`
   镜像 `main.rs` 的手写 XDG 定位，无 dirs crate）+ 项目 `<workdir>/.tinyagent/skills/`，项目覆盖全局同名
   （`scan` 按 name 排序去重）。每个 skill 是子目录含 `SKILL.md`（YAML frontmatter + 正文）。
+
   **手写 6 字段 frontmatter 解析（无 YAML 依赖）**：必填 `name`/`description`；可选 `license`/`compatibility`（单行标量）、
   `allowed-tools`（空白拆成 `Vec`）、`metadata`（缩进 `key: value` 块 → `HashMap`，`in_metadata` 状态机）。多行 YAML 折叠
   不支持；`metadata` 是唯一支持块的字段。**`SkillEntry` 带全 6 字段**，但 level-1 简介只透出 name+description（license/
@@ -284,7 +293,9 @@
   **必须等于父目录名**（`valid_skill_name` + scan 内 `name == dir.file_name()` 校验）；`description` ≤1024；任一不过 →
   warning+skip。三级加载：①简介拼进 **system_prompt**（常驻——压缩只动 messages 不动 system，故简介安全；但计入
   `estimate_tokens`，必须短）②全文（SKILL.md 正文）经 `read_skill` 读进 **history**（tool_result，可被压缩回收，**不**常驻
-  system）③资源文件（`scripts/`/`references/`/`assets/` 等子目录）。**`read_skill` 放开子目录**：`file` 用 `safe_relative_path`
+  system）③资源文件（`scripts/`/`references/`/`assets/` 等子目录）。
+
+  **`read_skill` 放开子目录**：`file` 用 `safe_relative_path`
   （允许 `/`，禁 `..`/绝对/`\`/空/`.` 组件）+ `confined_to(dir, full, "skill directory")` 双层沙盒——后者复用 `tools/mod.rs`
   抽出的 `pub(crate) confined_to(root, full, label)`（`confine` 委托它，root 在内 canonicalize；
   **2026-10 起尾段逐组件解析走查**：最深已存在祖先 canonicalize 后，余下组件按源序推进——存在组件
@@ -293,6 +304,7 @@
   的祖先可落 root 外）。旧「尾段词法折叠」会把 `missing/../out_link`（已存在外向 symlink）折叠进
   返回值——Ok 且物理逃逸 + 再入漂移 Err，性质 fuzz（5 万次随机路径汤）抓到后重写。Ok 返回值永不背
   `..`/`.`、再入是不动点；内核解析真穿过外向 symlink 的拼写一律 Err，内向 symlink 尾段返回真身。
+
   **present-but-unresolvable 一律 fail-closed（审计 2026-10 追加）**：尾段组件 canonicalize 失败后经
   `symlink_metadata` 分诊——仅 ENOENT 真缺失走词法累积；悬空 symlink（目标不存在的链，写穿可在
   目标出现时落到 root 外——审计员实测 `std::fs::write` 真逃逸过）与 EACCES/ENOTDIR 等存在但不可
@@ -300,18 +312,25 @@
   （悬空且外指）与去掉 `exists()` 门的 lstat 直检性质同批落地——`exists()`=false 曾把悬空链整类
   拱出断言面。
   TOCTOU caveat 同 workdir 沙盒）。
+
   **`list_skill` 工具**列技能目录树（`walk_skill`，`file_type` 不跟随 symlink 防逃逸、深度封顶 4、跳隐藏），供模型 level-3 自主
-  发现资源。**内置（embedded）skill（v2 P2）**：`SkillEntry.source` 是 `SkillSource::{Dir, Embedded(String)}`
+  发现资源。
+
+  **内置（embedded）skill（v2 P2）**：`SkillEntry.source` 是 `SkillSource::{Dir, Embedded(String)}`
   枚举——`skills::embedded_entry(text)` 按同款 frontmatter 校验建条目；`read_skill` 对 Embedded 直接吐全文
   （读非 SKILL.md 的 file 报"无附属文件"）、`list_skill` 列单文件；`assemble` 在 `code.enabled` 时把
   run_code 的用法指南（`src/tools/run_code_skill.md`，`include_str!`）经 `insert_builtin` 注入——**磁盘同名
   skill 覆盖内置**（insert_builtin 撞名即 no-op、保持名字序），allowed-tools 白名单告警检查对 `run_code`
   在 enabled 时放行（它的 membership 由 code.enabled 驱动、不在 cfg.tools 白名单里）。
   `read_skill`/`list_skill` 都**不在 `cfg.tools` 白名单**（skill≠tool，刻意决策）——扫到技能时由 `assemble` 自动配套注入
-  （`tool_list.push(ReadSkill)` + `push(ListSkill)`，各 `index.clone()`）。**子 agent 不继承**：`subagent.rs:133` 硬编码
+  （`tool_list.push(ReadSkill)` + `push(ListSkill)`，各 `index.clone()`）。
+
+  **子 agent 不继承**：`subagent.rs:133` 硬编码
   system_prompt 覆盖为 `SUBAGENT_SYSTEM_PROMPT`，且子 agent 走白名单建工具集，故既无简介也无 `read_skill`/`list_skill`
   （决策，不改 subagent.rs）。坏 skill（缺 SKILL.md / 缺 frontmatter 字段 / name 不合规 / name≠目录 / description 超长）
-  跳过 + stderr `[skill]` 告警，**不 fatal**。**`allowed-tools` 仅告警不强制**（标准标 Experimental；TinyAgent 无 per-turn 激活层，
+  跳过 + stderr `[skill]` 告警，**不 fatal**。
+
+  **`allowed-tools` 仅告警不强制**（标准标 Experimental；TinyAgent 无 per-turn 激活层，
   真"临时预批准"不做）：`assemble` 遍历 `e.allowed_tools`，不在 `cfg.tools` ∪ {`read_skill`,`list_skill`} 的 → stderr 告警；
   字面量名匹配，不支持 glob/`Tool(spec)`。`assemble` 为注入简介 **clone cfg**（改 `cfg2.system_prompt`）并返回
   `(tool_list, ctx, cfg, CodeInstall, Option<Vec<Message>>)` 五元组（带 `#[allow(clippy::type_complexity)]`；
@@ -535,6 +554,7 @@
   `src/tui/`（模块根 `tui.rs` + app/transcript/markdown/slash/render/input/theme/tests）在
   `#[cfg(feature = "tui")]` 后——2026-10 由 8.7k 行单文件按关注点拆分（纯搬移零行为变更，
   148 个测试随迁；`crate::tui::run` 入口不变）。默认 headless 版不含它，保持体积。
+
   **内联/流式渲染**（非全屏 alternate-screen，与 Claude Code / Codex 同款）：
   `Terminal::with_options(Viewport::Inline(INLINE_HEIGHT=8))` 在主屏底部锚定一个固定高度 live 区
   （流式 zone + 输入框 + 状态行），每帧 `term.draw` 重绘；已定稿的对话块经 `term.insert_before`
@@ -544,6 +564,7 @@
   回合结束（stream 关闭）才整条提交。**`ratatui` 的 `scrolling-regions` feature 已在 Cargo.toml 启用**：
   默认回退路径每次 `insert_before` 都 `Terminal::clear()`（发一个 DSR 光标查询 `\x1b[6n`），开了
   scrolling-regions 走 CSR(DECSTBM) 滚动区路径、无此查询且渲染更平滑（CSR 现代终端普遍支持）。
+
   **TUI 定位（原"冻结只修 bug"政策已按产品决定放宽）**：交互体验对齐主流终端 AI 工具的基础项
   已落地一批（见下），红线仍是**架构与渲染模型**——不做全屏 / 鼠标托管 / 主题系统这类结构性扩张。
   已落地的扩展面速记：

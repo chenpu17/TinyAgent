@@ -11,20 +11,27 @@
     Python。`set_cancel(token)` **必须在 `run()` 之前**调（把共享 `Arc<AtomicBool>` 装进
     agent）。cancel 契约：`run()` 永不清标志——复用 agent 多轮的宿主在新任务受理点调
     `clear_cancel()`（绑定已透出），否则上一轮取消后每轮秒回 cancelled。
+
     **重入即死锁**（P1-2 教训）：回调里再调 agent 方法会 GIL↔Mutex 互等——run 期间的
     agent 方法调用经 `IN_RUN` thread-local 判定，报 "agent is running" 而非挂死；
     两个线程各自调方法也要靠 with_agent 的锁排队，别绕过它直拿 mutex。
   - **Node**（`bindings/node`）：`run()`/`compact()`/`chat()` 在**专属 `std::thread`** 上跑同步核心（**无
     tokio**），Promise 经 napi `JsDeferred`（`Send`，任意线程可 settle）结算，事件经 `ThreadsafeFunction`
-    回主线程。**绝不改回 napi `AsyncTask`/libuv 池**（外部评审教训）：agent 线程会阻塞等 JS 工具/provider
+    回主线程。
+
+    **绝不改回 napi `AsyncTask`/libuv 池**（外部评审教训）：agent 线程会阻塞等 JS 工具/provider
     round-trip，而被包装的 JS 回调把自己的异步活（`fs.promises`、timer、Promise continuation）也排进同一
     libuv 池——并发 run 数 ≥ 池线程数（默认 4）时全员互等死锁；专属线程与 `UV_THREADPOOL_SIZE` 解耦。
     线程用 8 MiB 栈（对齐原 libuv worker 默认）并经 `catch_unwind` 兜底——panic 也 settle Promise
     （release 是 `panic = "abort"`，仅 debug 有效）。自定义 JS 工具是 **TSFN round-trip**：agent 线程把 `{id,args}` 经 TSFN
     派给 JS、阻塞 `mpsc` 等结果；JS（`wrapper.js` 把 `run(args)` 包成 `(err,req)` 形状）调完用户函数后调
     导出的 `resolveTool(id, result)`，经全局 `PENDING_TOOLS: i64→Sender` 注册表唤醒 worker（120s
-    `recv_timeout` 兜底）。**JS 主线程在 `run()` 期间必须空闲**（调用方 `await`），否则 TSFN 回调排不进
-    主循环 → worker 永久阻塞 → 死锁。**同步方法（pushUser 等）在 run 期间返回 busy 错误**（`try_lock`
+    `recv_timeout` 兜底）。
+
+    **JS 主线程在 `run()` 期间必须空闲**（调用方 `await`），否则 TSFN 回调排不进
+    主循环 → worker 永久阻塞 → 死锁。
+
+    **同步方法（pushUser 等）在 run 期间返回 busy 错误**（`try_lock`
     而非阻塞等锁——等锁会冻结 JS 主循环，而 TSFN round-trip 靠它转动，等于自死锁）；**onEvent 回调抛
     异常不致命**（wrapper try/catch + 异步 catch 双保险，降级 stderr——TSFN 的 Fatal 策略会让 host 的
     一个日志 bug 杀掉整个进程）。`resolveTool` / `PENDING_TOOLS` / `build_extra_tools` 三者是一套，
@@ -70,6 +77,7 @@
 - **`panic = "abort"`（`[profile.release]`）**：release 下 panic **不触发 `Drop`**。TUI 的终端还原
   (`TerminalGuard`)、MCP 子进程清理（`StdioTransport::drop`）都依赖 Drop——调试这些行为用
   **debug 构建**。`std::process::exit` 也跳过 Drop，headless 模式退出前显式 `drop(agent)`。
+
   **MCP stdio 有 shutdown-aware teardown（cancel 与 shutdown 是两个独立标志）**：
   `Agent::set_shutdown` 把一个**独立于 cancel** 的 shutdown Arc 经 `Tool::set_shutdown`→
   `McpTool`→`McpClient`→`StdioTransport::set_shutdown` 传下去，后者 spawn 一个 `mcp-reaper` 线程
@@ -78,6 +86,7 @@
   `pending_fail_all`），worker 才能 drop agent、走正常 Drop 清理。否则 TUI 退出 3s join 超时 detach →
   agent 没 drop → MCP server 变孤儿。reaper 用 `alive` Arc + Drop 里 `join` 保证不在 child 被 reap 后误杀
   被 OS 复用的 pgid。
+
   **为什么是 shutdown 而不是 cancel**：`cancel` 是**可恢复的轮中断**（TUI Esc/Ctrl-C，下一轮复用同一个
   MCP server），杀 child 是不可逆的（无重启）——所以 reaper 只能监听 shutdown。shutdown 由前端**仅在会话
   结束**时置位：TUI 退出路径（`tui::run` 末尾）同时置 cancel + shutdown；headless Ctrl-C 总在进程退出前，
@@ -85,6 +94,7 @@
   Esc）只置 cancel、不置 shutdown**，MCP server 不被杀。`Agent::set_cancel` **不再**向 tools 传播（删掉了
   那个 for 循环）；改这条链路别把 reaper 接回 cancel，也别给 `set_cancel` 加回 tools 传播。子 agent 共享父的
   MCP client（Arc-clone），父的 `set_shutdown` 已在共享 client 上 arm 了 reaper，子 agent 不必再调。
+
   **轮内取消（2026-09 审核 #9）**：`McpTool::run` 把 `ctx.cancel` **随单次调用**传入传输层（不是 set_cancel
   传播），stdio/SSE 的响应等待按 ≤50ms 薄片轮询（`recv_cancelable`）——Ctrl-C 在卡死 server 上不再等满
   120s `CALL_TIMEOUT`；取消后 pending 槽由既有错误路径回收、迟到响应被 `pending_dispatch` 丢弃。HTTP 传输
@@ -100,19 +110,24 @@
   所有；`store(true)` 全库无自动复位，`agent::run()` **也不清**（旧入口 `store(false)` 已删——它会把
   宿主受理窗口内（懒构建可达数秒~15s）按下的停止当残留误清，用户停止被静默丢弃）。预置 true 的 run
   在循环首检即返回：`cancelled`、turns==0、零 provider 请求。清残留的主体责任在**受理新任务的一方**：
-  `Agent::clear_cancel()`（pub，绑定层 `clear_cancel`/`clearCancel` 已透出）。**破坏面**：嵌入方「set_cancel + 复用 agent 多轮」漏改的症状是每轮
+  `Agent::clear_cancel()`（pub，绑定层 `clear_cancel`/`clearCancel` 已透出）。
+
+  **破坏面**：嵌入方「set_cancel + 复用 agent 多轮」漏改的症状是每轮
   秒回 cancelled（确定可见、`turns==0` 可机判），不是静默。库内**真正调用** `clear_cancel` 的只有两处：TUI
   `run_once`（每条提交输入/初始 auto-run）与 `compact()` 入口；`harness::run_with_retries` / `batch`
   重试梯的 attempt 间判定是**终态出口**——cancel → `EXIT_CANCELLED`，不重试**也不清**（清了即复活
-  用户已否决的 run；batch agent 本就不装 cancel flag，行为零变化）。**gate→执行检查点**（2026-09
-  外审 P2）：`before_tool` 审批等待可以无限期，窗口内落下的 cancel 若不复查就出现"run 报
+  用户已否决的 run；batch agent 本就不装 cancel flag，行为零变化）。
+
+  **gate→执行检查点**（2026-09 外审 P2）：`before_tool` 审批等待可以无限期，窗口内落下的 cancel 若不复查就出现"run 报
   cancelled、被批准的工具照跑"——`agent::ctx_cancelled()` 在 gate 返回后、执行前复查，三处
   dispatch（`execute_tool_call` / 并行批 spawn 前 / run_code 内层）共用；顺序路径产出
   `[cancelled by user]` 错误槽 + `after_tool(executed=false)`，并行路径整批不启动（槽位 Cancelled
-  合成），run_code 内层复用 `CANCEL_HALTED_WHY` 墓碑。**波次间 + worker 预检**（第三轮 P2）：
-  并行批按 8/波，每波开波前复查 cancel、worker 进工具体前再查（返回 None → join 补
-  错误槽 + after(executed=false)）。**回调 panic 防死锁**：并行批的 `sync_channel` 必须在
-  `thread::scope` 闭包**内**创建——`rx` 借自闭包外时，drain 循环里宿主回调 panic 的 unwind
+  合成），run_code 内层复用 `CANCEL_HALTED_WHY` 墓碑。
+
+  **波次间 + worker 预检**（第三轮 P2）：并行批按 8/波，每波开波前复查 cancel、worker 进工具体前再查（返回 None → join 补
+  错误槽 + after(executed=false)）。
+
+  **回调 panic 防死锁**：并行批的 `sync_channel` 必须在 `thread::scope` 闭包**内**创建——`rx` 借自闭包外时，drain 循环里宿主回调 panic 的 unwind
   不销毁 `rx`，worker 堵死满漏斗、join-all 死锁；闭包内创建 + `CancelOnUnwind` 守卫翻 cancel
   收尾。测试组：`run_with_preset_cancel_returns…` /
   `run_does_not_clear…` / `clear_cancel_lets_the_next_run_proceed` /
