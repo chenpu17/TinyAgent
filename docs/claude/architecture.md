@@ -469,6 +469,12 @@
   总耗时看 `elapsed_secs`）；`tool_calls[].duration_ms` 只盖真实执行的工具体（排队/取消检查点不计，
   未启动占位 None）。NDJSON `Compressed` 事件带 `estimated_tokens_before/after` 与
   `measured_tokens_before`（锚点请求的 provider 实测，非校准估算——语义见字段文档）。
+  **构建归因**：`result.json` 与 batch `report.json` 顶层都写 `agent_version`（`CARGO_PKG_VERSION`，
+  与 `--version` 同源）——换构建的长系列 A/B 靠它区分前后两半；`schema_version` 契约（只加键 /
+  新键一律可选 / 破坏性才升版）写在 README「结果文件」，常量 `RESULT_SCHEMA_VERSION` 单处定义。
+  **NDJSON 类型是内核穷尽契约**：`AgentEvent::ndjson_type()` 对每个变体给标签（新增变体不补即编译
+  失败），harness 的 `_` 兜底只负责 `unmapped: true` 标记而不是发明 `unknown`——否则
+  `#[non_exhaustive]` 会让新事件静默变成无名流事件，而消费方（CI 管线 / 绑定回调）恰是按 `type` 分支的。
   **batch 终态落盘单出口**（`batch::write_terminal_result`，外部评审 P2-5）：不经 `run_one_attempt`
   正常完成的终态（退避中取消、bad_task/setup_error 早退、未启动即取消、worker panic）**也必须写
   `results/<name>.json`**——否则 report.json 说 cancelled 而 results 里留着上一次尝试（或上一轮运行）

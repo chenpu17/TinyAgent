@@ -5,6 +5,15 @@ use std::fmt;
 use std::io::{self, Write};
 use std::path::Path;
 
+/// `result.json`'s structural version. Bumped ONLY for a breaking change to
+/// the shape (removing or retyping an existing key); additive keys never bump
+/// it. The contract is documented in README「结果文件」: keys are only ever
+/// added, every added key is optional for consumers, and a consumer must
+/// treat an unknown key as skippable. Keeping the constant next to the writer
+/// (instead of a literal in the two branches) makes the promise greppable and
+/// lets tests assert both branches agree.
+const RESULT_SCHEMA_VERSION: u64 = 1;
+
 /// Attribution metadata stamped into `result.json` (and, in part, the batch
 /// report): which model / provider protocol produced the bill, and when the
 /// run started. `finished_at` is taken inside `write_result`, so this struct
@@ -492,9 +501,13 @@ fn event_json(ev: &AgentEvent) -> Value {
             json!({"type": "done", "stop_reason": stop_reason.clone()})
         }
         // AgentEvent is #[non_exhaustive] in the kernel: from this crate a
-        // wildcard is mandatory. An unknown event still gets a line so NDJSON
-        // consumers never miss the stream shape.
-        _ => json!({"type": "unknown"}),
+        // wildcard is mandatory. It must NOT collapse the event to a generic
+        // tag — the kernel's exhaustive `ndjson_type()` already forces a name
+        // for every variant, so carry that name through and flag the event as
+        // unmapped. A consumer then sees the real tag (and can log/tolerate
+        // the missing fields) instead of a stream full of `unknown`; the
+        // `unmapped` marker makes the gap visible rather than silent.
+        _ => json!({"type": ev.ndjson_type(), "unmapped": true}),
     }
 }
 
@@ -651,7 +664,8 @@ pub fn write_result(
                 })
                 .collect();
             let mut result = json!({
-                "schema_version": 1,
+                "schema_version": RESULT_SCHEMA_VERSION,
+                "agent_version": env!("CARGO_PKG_VERSION"),
                 "success": o.stop_reason == "end_turn",
                 "stop_reason": o.stop_reason.clone(),
                 "model": meta.model.clone(),
@@ -711,7 +725,8 @@ pub fn write_result(
                 })
                 .collect();
             let mut result = json!({
-                "schema_version": 1,
+                "schema_version": RESULT_SCHEMA_VERSION,
+                "agent_version": env!("CARGO_PKG_VERSION"),
                 "success": false,
                 "stop_reason": none_stop_reason,
                 "model": meta.model.clone(),
@@ -1214,22 +1229,25 @@ mod tests {
 
     #[test]
     fn write_result_stamps_attribution_on_success_and_failure() {
-        // The five attribution keys are NOT opt-in (unlike `plan`/`meta`): a
-        // bill you can't attribute to a model/provider/time isn't auditable.
-        // Both branches must carry them. (`line!()` keeps the temp dir unique
-        // against the OTHER tests sharing this prefix pattern.)
+        // The attribution keys are NOT opt-in (unlike `plan`/`meta`): a bill
+        // you can't attribute to a model/provider/time/BUILD isn't auditable.
+        // `agent_version` is the last link — two A/B runs of different
+        // binaries must be distinguishable from the bill alone. Both branches
+        // must carry them. (`line!()` keeps the temp dir unique against the
+        // OTHER tests sharing this prefix pattern.)
         let dir =
             std::env::temp_dir().join(format!("ta-attrib-{}-{}", line!(), std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let keys = |s: &str| {
             for k in [
-                "\"schema_version\": 1",
-                "\"model\": \"test-model\"",
-                "\"provider\": \"openai\"",
-                "\"started_at\": \"2026-08-15T07:41:02Z\"",
-                "\"finished_at\": \"",
+                format!("\"schema_version\": {RESULT_SCHEMA_VERSION}"),
+                format!("\"agent_version\": \"{}\"", env!("CARGO_PKG_VERSION")),
+                "\"model\": \"test-model\"".to_string(),
+                "\"provider\": \"openai\"".to_string(),
+                "\"started_at\": \"2026-08-15T07:41:02Z\"".to_string(),
+                "\"finished_at\": \"".to_string(),
             ] {
-                assert!(s.contains(k), "missing {k} in: {s}");
+                assert!(s.contains(&k), "missing {k} in: {s}");
             }
         };
 

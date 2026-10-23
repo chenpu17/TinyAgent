@@ -129,7 +129,7 @@ cargo clippy -p tiny-agent-node
 - **read_file 分页**：offset 跳行不花字节预算；json content 逐行保留原始行终止符；raw 默认窗口 3 字节对齐。
 - **env 注入 system prompt**：唯一收敛点在 `Agent::new`（子 agent 也过）；改 assemble 注入会漏子 agent。
 - **retry 诚实成本**：失败轮的 usage/tool_calls 经 `RunCost` 落进 result.json，不清零；压缩审计
-  `compressions` / 逐轮耗时 `turn_timings` / 工具耗时 `duration_ms` 同走这条账单面（失败轮压缩审计照落；turn_timings 失败路径不落行）；batch 不经 run_one_attempt 的终态一律走 `write_terminal_result` 单出口落盘（`early` 早退也继承 `acc`/`attempt_no`——重试轮 setup 失败不清零前轮真实成本）。
+  `compressions` / 逐轮耗时 `turn_timings` / 工具耗时 `duration_ms` 同走这条账单面（失败轮压缩审计照落；turn_timings 失败路径不落行）；batch 不经 run_one_attempt 的终态一律走 `write_terminal_result` 单出口落盘（`early` 早退也继承 `acc`/`attempt_no`——重试轮 setup 失败不清零前轮真实成本）。**构建归因**：两份账单顶层都带 `agent_version`，`schema_version` 契约=只加键（新增键一律可选、破坏性才升版，常量 `RESULT_SCHEMA_VERSION` 单源）；**NDJSON 类型=内核穷尽契约**（`AgentEvent::ndjson_type()`，新增变体不补即编译失败；harness `_` 臂只标 `unmapped: true`，别发明 `unknown`）。
 - **run_code 路径拦截**：符号链接走查按**原始拼写**逐组件进行（先折叠 `..` 会把 `link` 抹掉、`link/../x` 逃逸）；绝对拼写**从根锚定**走查（字面前缀非 workdir 的折叠拼写不再跳过）；不存在目标经**最深已存在祖先 canonicalize** 判定（不再纯词法回退）。cancel/deadline 入口拒绝都同时 latch `interrupt`+`halted`（可捕获异常被 guest 捕获重试时，停机检查拒纳）。
 - **headless Ctrl-C**：首次翻 cancel 优雅收尾（exit 130），二次硬退；批量模式 worker gate 同款。
 - **消息稳定 id**：ingest 点分配（非构造时）；`next_msg_id` 不随 `clear_messages` 重置。

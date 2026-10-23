@@ -273,6 +273,37 @@ pub enum AgentEvent {
     },
 }
 
+impl AgentEvent {
+    /// The NDJSON `type` tag for this event — the machine-readable vocabulary
+    /// of `--json` mode (harness's `event_json` with `--output`, and every
+    /// binding's per-event callback key off it). Exhaustive on purpose: a new
+    /// `AgentEvent` variant must be named HERE before the crate compiles, so
+    /// the event stream can never grow a silent gap (the harness maps this
+    /// crate's events through a `_`-armed match because the enum is
+    /// `#[non_exhaustive]` from its side, which is exactly how a new variant
+    /// would otherwise ship as `{"type":"unknown"}` without anyone noticing).
+    /// `SubAgent` keeps its own tag; the wrapper is not an event of its own.
+    pub fn ndjson_type(&self) -> &'static str {
+        match self {
+            AgentEvent::TurnStart(_) => "turn",
+            AgentEvent::TextDelta(_) => "text",
+            AgentEvent::ThinkingDelta(_) => "thinking",
+            AgentEvent::CodeLog(_) => "code_log",
+            AgentEvent::ToolInputDelta { .. } => "tool_input",
+            AgentEvent::ToolCall { .. } => "tool_call",
+            AgentEvent::ToolResult { .. } => "tool_result",
+            AgentEvent::TodoUpdate { .. } => "todo",
+            AgentEvent::Usage { .. } => "usage",
+            AgentEvent::Compressed { .. } => "compressed",
+            AgentEvent::Pruned { .. } => "pruned",
+            AgentEvent::MaxTokensSalvage => "salvage",
+            AgentEvent::Warning(_) => "warning",
+            AgentEvent::SubAgent { .. } => "subagent",
+            AgentEvent::Done { .. } => "done",
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ToolCallRecord {
     pub name: String,

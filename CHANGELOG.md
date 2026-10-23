@@ -27,6 +27,23 @@
 
 ### Changed
 
+- **`result.json` / `report.json` 补构建归因 `agent_version`**：两类账单此前有模型 / 协议 / 时间，
+  唯独答不出「这是哪一版二进制跑的」——A/B 长系列里换了构建就再也分不清前后两半。现在 `result.json`
+  顶层与 batch `report.json` 顶层都写 `agent_version`（= `--version` 的同一版本号），成功与失败
+  分支、单跑与批量一律携带。纯增量键，旧消费方按 key 取值不受影响；README「结果文件」同步补
+  `schema_version` 契约段（只加键不删键不改类型、新增键一律可选、破坏性变更才升版），常量提到
+  `RESULT_SCHEMA_VERSION` 单处定义，归因测试同时钉两分支。
+
+- **NDJSON 事件类型收敛为内核穷尽契约**：`AgentEvent::ndjson_type()` 在内核对**每个事件变体**
+  给出 `type` 标签（新增变体不补即编译失败），harness 的 `_` 兜底不再把未来事件压成
+  `{"type":"unknown"}`——改为输出真实标签 + `"unmapped": true`，管线看到的是可归因的缺口而不是
+  无名事件。README 的事件表补上此前漏掉的 `code_log` / `pruned` / `salvage`，并新增逐变体钉名
+  测试（15 个标签唯一、与枚举变体数对齐）。
+
+- **发布清单口径统一（README 5 处 → 6 处）**：`bindings/node/package-lock.json` 的
+  `optionalDependencies` 子包版本是第 6 个同步点（`npm ci` 不同步直接报错）——CLAUDE.md 上轮已改，
+  README 发布节仍写 5 处，两侧打架；本次对齐，并写明漏改的用户可见后果。
+
 - **TUI 拆分为模块目录 `src/tui/`**：8.7k 行单文件按关注点拆为 app（会话装配/ui_loop）/
   transcript（Row 模型与流式渲染）/ markdown / slash（斜杠命令+补全）/ render（scrollback 提交
   与 chrome）/ input（InputBuffer）/ theme 七个内容模块 + tests（148 个测试逐一对应零丢失）；
@@ -40,35 +57,6 @@
   该响应丢失、调用方坐满 120s CALL_TIMEOUT（最坏是丢到超时，不是延迟一轮）；② 健康流每 30s 主动
   轮转重连对服务器是新增的周期性 GET/日志负载（旧实现单连接挂到死）；③ 带活读者的 transport
   退出时多等 ≤2s。
-
-### Fixed
-
-- **诊断通道 `diag`（GUI 宿主可见的软失败警告）**：内核里 ~19 处裸 `eprintln!` 直写（技能扫描/装配警告、
-  MCP 握手与读线程降级、session 损坏保留提示、run_code 畸形 marker 回退与沙箱降级）对无控制台的
-  GUI 宿主与语言绑定完全不可见。统一收敛到 `crate::diag::diag_warn!`/`diag_info!`：默认（未装 sink）
-  逐字节回退 stderr（CLI 行为零变化）；宿主可 `tiny_agent::diag::install_diag_sink(Box<dyn Fn
-  (DiagLevel, &str)>)` 把警告作为数据接管（日志面板/文件/自家 facade）。进程级可替换 sink 而非
-  per-agent 管道——最吵的站点在装配期（尚无事件流）与后台线程（无 ToolCtx）。sink 集成断言挂在
-  strip_once 畸形 marker 测试上（TEST_LOCK 串行化）。
-
-- **子 agent turn 天花板可配置 `limits.subagent_max_turns`（跨核心 + 双绑定）**：`task` 子 agent 的
-  turn 预算天花板从硬编码 `SUBAGENT_MAX_TURNS=25` 提为 `Limits` 字段——外部宿主可自行放宽（GUI 类
-  应用跑千级轮次的场景）或设 `0` 不另设天花板（子 agent 完整继承父 `max_turns`）。语义不变量保持：
-  子预算恒 = `min(父 max_turns, 天花板)`（0 时 = 父预算），**永不高于父自身预算**——`task` 调用不能
-  比生成它的 run 活得更久；父 run 的 `timeout_secs` 与共享 cancel 仍是真正的墙钟护栏。默认 25 = 旧行为
-  （旧配置文件零改动兼容）。批量任务片段按 `Clamp::TightenOrInit` 归类：只允许收紧（片段 `0` 被忽略、
-  不拆基础天花板；基础 `0` 时采纳片段有限值）。核心实现见 916ee3b（`child_max_turns` 纯函数单测、
-  config anti-silence 哨兵与片段收紧五断言）；本条补充双绑定透传测试（py/node 各一：构造 + mock 跑通
-  证明 `deny_unknown_fields` 未拒新键）。
-
-- **run_code 使用文档三件套**：`docs/run_code_guide.md`（快速上手与最佳实践——配置合并、
-  工具接入、三项扩展示例、失败恢复；README run_code 专节与结项状态总表加使用入口）；
-  入门演示判分加固——每次独立 mktemp 工作区保留历史（不再 `rm -rf`）、请求模型前先验
-  二进制 features 含 `code`、配置由模板生成（`max_tokens` 2048→4096，
-  `TINYAGENT_DEMO_MAX_TOKENS` 可覆盖），判分为类型+值+键集+成功 run_code+end_turn
-  五重判据，不满足即非零退出。
-
-### Changed
 
 - **MCP Streamable HTTP 常开 standalone GET 流承载 202 响应**：202 由此前的「收到 202 才临时 GET
   建流」改为会话期常开一条 standalone GET 流（reader 线程轮转分发全部 JSON-RPC 消息、按 id 匹配），
@@ -137,6 +125,31 @@
   include 定位收紧为「宿主有明确复用需求才建库」，删除未经验证的价值比较表述。
 
 ### Fixed
+
+- **诊断通道 `diag`（GUI 宿主可见的软失败警告）**：内核里 ~19 处裸 `eprintln!` 直写（技能扫描/装配警告、
+  MCP 握手与读线程降级、session 损坏保留提示、run_code 畸形 marker 回退与沙箱降级）对无控制台的
+  GUI 宿主与语言绑定完全不可见。统一收敛到 `crate::diag::diag_warn!`/`diag_info!`：默认（未装 sink）
+  逐字节回退 stderr（CLI 行为零变化）；宿主可 `tiny_agent::diag::install_diag_sink(Box<dyn Fn
+  (DiagLevel, &str)>)` 把警告作为数据接管（日志面板/文件/自家 facade）。进程级可替换 sink 而非
+  per-agent 管道——最吵的站点在装配期（尚无事件流）与后台线程（无 ToolCtx）。sink 集成断言挂在
+  strip_once 畸形 marker 测试上（TEST_LOCK 串行化）。
+
+- **子 agent turn 天花板可配置 `limits.subagent_max_turns`（跨核心 + 双绑定）**：`task` 子 agent 的
+  turn 预算天花板从硬编码 `SUBAGENT_MAX_TURNS=25` 提为 `Limits` 字段——外部宿主可自行放宽（GUI 类
+  应用跑千级轮次的场景）或设 `0` 不另设天花板（子 agent 完整继承父 `max_turns`）。语义不变量保持：
+  子预算恒 = `min(父 max_turns, 天花板)`（0 时 = 父预算），**永不高于父自身预算**——`task` 调用不能
+  比生成它的 run 活得更久；父 run 的 `timeout_secs` 与共享 cancel 仍是真正的墙钟护栏。默认 25 = 旧行为
+  （旧配置文件零改动兼容）。批量任务片段按 `Clamp::TightenOrInit` 归类：只允许收紧（片段 `0` 被忽略、
+  不拆基础天花板；基础 `0` 时采纳片段有限值）。核心实现见 916ee3b（`child_max_turns` 纯函数单测、
+  config anti-silence 哨兵与片段收紧五断言）；本条补充双绑定透传测试（py/node 各一：构造 + mock 跑通
+  证明 `deny_unknown_fields` 未拒新键）。
+
+- **run_code 使用文档三件套**：`docs/run_code_guide.md`（快速上手与最佳实践——配置合并、
+  工具接入、三项扩展示例、失败恢复；README run_code 专节与结项状态总表加使用入口）；
+  入门演示判分加固——每次独立 mktemp 工作区保留历史（不再 `rm -rf`）、请求模型前先验
+  二进制 features 含 `code`、配置由模板生成（`max_tokens` 2048→4096，
+  `TINYAGENT_DEMO_MAX_TOKENS` 可覆盖），判分为类型+值+键集+成功 run_code+end_turn
+  五重判据，不满足即非零退出。
 
 - **confined_to 路径包含逃逸（性质测试 5 万次迭代抓到）**：拼写含「不存在组件 + `..` + 已存在
   symlink」时（如 `missing/../out_link`，out_link 指向 workdir 外），旧实现把已存在 symlink 当

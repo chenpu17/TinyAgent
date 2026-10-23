@@ -1582,8 +1582,11 @@ fn write_report(path: &Path, reports: &[TaskReport], provider: &str) -> Result<(
         "succeeded": succeeded,
         "failed": reports.len() - succeeded,
         // One provider per batch (forbidden_batch_override) — attribute the
-        // whole report once instead of per task.
+        // whole report once instead of per task. `agent_version` closes the
+        // same gap result.json closed: a multi-day A/B (or a rebuilt binary
+        // mid-series) must be distinguishable from the bill alone.
         "provider": provider,
+        "agent_version": env!("CARGO_PKG_VERSION"),
         "totals": {
             "input_tokens": ti,
             "output_tokens": to,
@@ -1744,6 +1747,7 @@ mod tests {
         assert_eq!(v["tasks"][1]["input_tokens"].as_u64().unwrap(), 200);
         // Attribution: top-level provider + per-task model/started_at.
         assert_eq!(v["provider"], "openai");
+        assert_eq!(v["agent_version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(v["tasks"][0]["model"], "test-model");
         assert!(v["tasks"][0]["started_at"].as_str().unwrap().ends_with('Z'));
 

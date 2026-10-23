@@ -9037,3 +9037,98 @@ fn env_attribution_splits_env_from_base() {
     assert_eq!(bd.system.base, bd.system.tokens);
     assert!(bd.system.tokens > 0);
 }
+
+/// The NDJSON vocabulary is a public contract (`--json` pipelines and both
+/// bindings key on the `type` tag), and the harness side cannot enforce it:
+/// it sees `AgentEvent` as `#[non_exhaustive]` and must keep a `_` arm. The
+/// kernel-side `ndjson_type()` is exhaustive, so a NEW variant won't compile
+/// until it is named there; this test pins the names themselves (a rename is
+/// just as breaking as a missing one) and covers every variant so a future
+/// variant that IS named but never exercised here gets caught by the count.
+#[test]
+fn every_agent_event_has_a_stable_ndjson_type_tag() {
+    let cases: Vec<(AgentEvent, &str)> = vec![
+        (AgentEvent::TurnStart(1), "turn"),
+        (AgentEvent::TextDelta(String::new()), "text"),
+        (AgentEvent::ThinkingDelta(String::new()), "thinking"),
+        (AgentEvent::CodeLog(String::new()), "code_log"),
+        (
+            AgentEvent::ToolInputDelta {
+                id: String::new(),
+                name: String::new(),
+                delta: String::new(),
+            },
+            "tool_input",
+        ),
+        (
+            AgentEvent::ToolCall {
+                name: String::new(),
+                input: Value::Null,
+            },
+            "tool_call",
+        ),
+        (
+            AgentEvent::ToolResult {
+                name: String::new(),
+                is_error: false,
+                content: String::new(),
+            },
+            "tool_result",
+        ),
+        (AgentEvent::TodoUpdate { todos: Vec::new() }, "todo"),
+        (
+            AgentEvent::Usage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            },
+            "usage",
+        ),
+        (
+            AgentEvent::Compressed {
+                dropped: 0,
+                kept: 0,
+                trigger: CompressTrigger::Preflight,
+                estimated_tokens_before: 0,
+                estimated_tokens_after: 0,
+                measured_tokens_before: None,
+            },
+            "compressed",
+        ),
+        (
+            AgentEvent::Pruned {
+                messages: 0,
+                chars_freed: 0,
+            },
+            "pruned",
+        ),
+        (AgentEvent::MaxTokensSalvage, "salvage"),
+        (AgentEvent::Warning(String::new()), "warning"),
+        (
+            AgentEvent::SubAgent {
+                name: String::new(),
+                event: Box::new(AgentEvent::Done {
+                    stop_reason: String::new(),
+                }),
+            },
+            "subagent",
+        ),
+        (
+            AgentEvent::Done {
+                stop_reason: String::new(),
+            },
+            "done",
+        ),
+    ];
+    let mut seen = std::collections::BTreeSet::new();
+    for (ev, want) in &cases {
+        assert_eq!(ev.ndjson_type(), *want, "wrong NDJSON tag for {ev:?}");
+        assert!(seen.insert(*want), "duplicate NDJSON tag {want}");
+    }
+    // Guards against a variant added to the enum but not to this table: the
+    // table must name as many distinct tags as the enum has variants. (The
+    // compile-time exhaustiveness lives in `ndjson_type` itself; this is the
+    // test-side mirror that also catches a "named but never yielded" arm.)
+    assert_eq!(seen.len(), 15, "update the table when AgentEvent grows");
+}

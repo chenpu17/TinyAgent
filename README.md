@@ -100,13 +100,13 @@ let mut agent = tiny_agent::build_agent(&cfg, Vec::new(), &client)?;
 agent.set_hooks(Arc::new(Policy));
 ```
 
-注意：钩子可能被多个 worker 线程并发调用（并行 `task` 的子 agent 各跑各的），实现要自带同步（`Mutex` / 原子量）；`--resume` 重建的 agent 需要重新 `set_hooks`。完整语义（调用次序、Modify 的审计分裂等）见 [`src/hooks.rs`](src/hooks.rs) 的 trait 文档。
+注意：钩子可能被多个 worker 线程并发调用（并行 `task` 的子 agent 各跑各的），实现要自带同步（`Mutex` / 原子量）；`--resume` 重建的 agent 需要重新 `set_hooks`。完整语义（调用次序、Modify 的审计分裂等）见 [`crates/core/src/hooks.rs`](crates/core/src/hooks.rs) 的 trait 文档。
 
 **工具能力标记**：自定义 `Tool` 还可用两个默认方法向 loop 声明能力——`concurrency()` 返回 `ToolConcurrency::Parallel` 即获得与内置 `task` 同款的同 turn 多调用并行执行（承诺可重入 + 轮询 `ctx.cancel`）；`available_to_subagent()` 返回 `false` 即退出子 agent 继承。路由按能力、不按名字，第三方工具与内置工具一视同仁。
 
 **常驻会话的热更新**（GUI 宿主场景）：CLI 的 config 在构建时定格，但宿主可以让一个 `Agent` 活整个会话、按需换挡——`set_model` / `set_reasoning_effort` / `set_max_tokens` / `set_max_context_tokens` 都是**纯字段替换**，下次请求生效，MCP 连接、工具装配、历史与 session 全不动（重建 Agent 要重跑 MCP 握手，实测可达秒级）。MCP server 集合也可热增删：`add_mcp_server(McpServerConfig)` / `remove_mcp_server(name)` / `tool_names()`（语义见[MCP 运行时热增删](#运行时热增删库-api)节）。`Agent::compact(&mut events)` 是压缩的**宿主主动入口**：轮次间调用即折叠历史（滚动摘要 + 安全切点 + 落盘 + `Compressed { trigger: "manual" }` 事件），返回 `dropped`/`kept`/摘要调用的 `usage`——这笔成本不进下一次 run 的账单（run 入口会重置总账），由宿主自行记账；`compact_with(&mut events, Some("focus on …"))` 可附带**焦点指令**引导摘要侧重。这些方法的 `&mut self` 签名即顺序契约：run 持有借用，「轮次间调用」由借用检查器强制。注意 `task` 子 agent 持构造期 config 快照，不跟随换挡。
 
-run 结束后从 [`RunOutcome`](src/agent.rs)（或 `Agent::usage()` / `messages()` / `model()` / `context_breakdown()` getter）读回诚实的 token 账单与历史。`AgentEvent` 派生了 `Serialize`，绑定层可直接序列化成宿主语言的 dict / object。`Message` 带**稳定 id**（`id: Option<String>`，agent 在消息进入历史时铸造、跨 save/load 不变、压缩折叠不重排存活者）——往消息上挂宿主侧资产（图片卡 / 文件链接）时锚 id 而不是下标，压缩/truncate 后锚点不漂移。
+run 结束后从 [`RunOutcome`](crates/core/src/agent.rs)（或 `Agent::usage()` / `messages()` / `model()` / `context_breakdown()` getter）读回诚实的 token 账单与历史。`AgentEvent` 派生了 `Serialize`，绑定层可直接序列化成宿主语言的 dict / object。`Message` 带**稳定 id**（`id: Option<String>`，agent 在消息进入历史时铸造、跨 save/load 不变、压缩折叠不重排存活者）——往消息上挂宿主侧资产（图片卡 / 文件链接）时锚 id 而不是下标，压缩/truncate 后锚点不漂移。
 
 **上下文构成查询**（`Agent::context_breakdown()`，拉取式只读、不发请求）：把**下一次请求的上下文**按来源拆出 token **估算**量——system prompt 三段（env 头 / 用户 system / skill 简介）、工具 schema 四类（builtin / mcp / skill / custom，类内逐工具列名与占用）、消息历史按类型聚合（用户文本 / 助手文本 / 工具调用参数 / 工具结果 / 图片 / PDF / `read_skill` 加载的 skill 正文），外加总量。所有数字都是**估算**（与压缩 preflight 同一套 ≈4 字符/token + PDF 页×3000 启发式），**不是 provider 实测**——记账权威永远是 `Usage` 事件 / `usage()`；估算与实测刻意不混流，所以这是查询方法而非事件。有存活的测量锚点（上一轮带 usage 的主 chat）时返回 `calibration: { measured_prompt_tokens, scale }`，全部分量已按锚点实测/估算比值均匀缩放（本身仍是启发式，修正中文低估一类系统性偏差）。压缩折叠 / MCP 热增删 / 前缀改写会使锚点失效，`calibration` 自动回到 `null`（纯启发式口径）。返回的 `ContextBreakdown` 派生了 `Serialize`，绑定层直接给宿主 dict / object（键 snake_case）；自家 TUI 的 `/context` 命令就是它的第一个消费端。
 
@@ -184,7 +184,7 @@ a = tiny_agent.Agent("chat.json", provider=echo_provider)  # 无 api_key
 `{workdir, subagent}`（顶层 `subagent=None`，`task` 子 agent / run_code 沙箱各自有名）。
 缺的方法即无操作；**`before_tool` 抛异常或返回非法值 = fail-closed 拒绝该调用**（理由进消息），
 观察类钩子的异常被吞掉。完整语义（并发、`--resume` 不带 hooks、威胁模型）见库 API 节与
-`src/hooks.rs` trait 文档。
+`crates/core/src/hooks.rs` trait 文档。
 
 **`run_code` 开关**（绑定默认不带 `code` feature，`maturin develop --features code` 编入）：`a.enable_code()`
 / `a.disable_code()` 运行期开关、`a.set_code_config({...})` 整包替换 code 配置（dict 形状同配置文件的
@@ -786,7 +786,7 @@ skill 扫描读取 64KiB 等）：不可信的 server / 目录最多拖慢，不
 TinyAgent 的定位是**可审计、可无人值守的 agent 执行单元**——一个跑完一定留下完整、诚实、机器可读账单的一次性进程。下面这些方向与该定位冲突，明确不做（把力气挡在护城河上）：
 
 - **不做 `--serve` / HTTP 服务模式**：长驻、多租户、鉴权是另一个产品，与"一次性执行单元"直接冲突。要集成的用户用 `--json`（NDJSON 流）+ exit code 包一层即可。
-- **不给 `shell` 自建沙箱 / 命令过滤**：半吊子命令过滤只制造虚假安全感，隔离的官方答案仍是**在容器或受限用户下运行**（见上文安全说明）。（`run_code` 不在此列也不破此例：它是 wasm **能力构造性**沙箱——不是给既有工具套过滤器，而是新建一个“没有授予就没有能力”的执行面，网络 / 文件系统在 guest 里根本不存在，见上文专节。库 API 的 Hooks 拦截层是给嵌入方接自己的审批/策略系统用的编译期扩展点，不是内置安全边界——威胁模型见 `src/hooks.rs`。）
+- **不给 `shell` 自建沙箱 / 命令过滤**：半吊子命令过滤只制造虚假安全感，隔离的官方答案仍是**在容器或受限用户下运行**（见上文安全说明）。（`run_code` 不在此列也不破此例：它是 wasm **能力构造性**沙箱——不是给既有工具套过滤器，而是新建一个“没有授予就没有能力”的执行面，网络 / 文件系统在 guest 里根本不存在，见上文专节。库 API 的 Hooks 拦截层是给嵌入方接自己的审批/策略系统用的编译期扩展点，不是内置安全边界——威胁模型见 `crates/core/src/hooks.rs`。）
 - **不做插件系统**：工具是编译期的内置 + MCP，不引入运行时加载。（Hooks 与工具能力标记同理：编译期 trait 扩展，不加载动态代码。）
 - **TUI 保持极简定位**：交互体验对齐主流终端 AI 工具（键位、浅色适配、结果查看等基础体验保证可用），但不做全屏 / 鼠标托管 / 主题系统这类结构性扩张——它是 dogfooding / 演示工具，对标全职迭代的 Claude Code / Codex，追平是负 ROI。
 
@@ -799,6 +799,7 @@ TinyAgent 的定位是**可审计、可无人值守的 agent 执行单元**—�
 ```json
 {
   "schema_version": 1,
+  "agent_version": "0.4.2",
   "success": true,
   "stop_reason": "end_turn",
   "model": "deepseek-chat",
@@ -833,11 +834,16 @@ TinyAgent 的定位是**可审计、可无人值守的 agent 执行单元**—�
 ```
 
 - `tool_calls[].output` 是工具返回的完整内容（`is_error` 标记是否为错误结果）
-- **归因字段（`schema_version` / `model` / `provider` / `started_at` / `finished_at`）每次都写**——
-  一份无法归因到模型 / 协议 / 时间的账单不可审计（`--model` 做 A/B 对照后两份结果必须能区分）。
-  与 `plan`/`meta` 的稀疏后插不同，这五个键是**纯增量**（新键，旧键不动），按 key 取值的消费方不受影响。
+- **归因字段（`schema_version` / `agent_version` / `model` / `provider` / `started_at` / `finished_at`）每次都写**——
+  一份无法归因到模型 / 协议 / 时间 / **构建**的账单不可审计（`--model` 做 A/B 对照后两份结果必须能区分；
+  换过二进制再跑的长系列评测同理，`agent_version` 是 `--version` 里的同一版本号）。
+  与 `plan`/`meta` 的稀疏后插不同，这组键是**纯增量**（新键，旧键不动），按 key 取值的消费方不受影响。
   `model`/`provider` 来自实际运行的配置（批量任务片段覆盖了 `model` 就记覆盖后的值）；`provider` 记
   配置声明的协议族（anthropic / openai），绑定层注入自定义 provider 回调时仍是配置声明值。
+- **`schema_version` 契约**：`1` 期间**只加键、不删键、不改既有键的类型**；新增键一律可选
+  （旧消费方忽略即可继续工作，稀疏键如 `plan`/`compressions`/`duration_ms` 缺省即不出现）；
+  只有"删除键 / 改变键类型"这类破坏性变更才升版本号。消费方应**按键取值**、遇到未知键跳过，
+  不要按位置或整体结构做严格校验。批量报告 `report.json` 同款（顶层另有 `agent_version`）。
 - `plan`（可选）：agent 通过 `todo` 工具记录的任务计划与每步状态（末次调用的全量列表）。**仅当 agent 用过 `todo` 才出现**，否则该键不存在——不用 `todo` 的结果文件与启用前逐字节相同。`tool_calls[]` 里 `task`（子 agent）条目另带一个可选 `meta` 字段（`turns`/`tools`/`tokens`/`stop_reason` 的紧凑 trace），同理仅在子 agent 调用时出现
 - `turn_timings`：每轮耗时（毫秒）与该轮工具调用数，逐轮对齐 `turns`；`duration_ms` 是该工具真实执行的耗时（排队与取消检查点不计入；因取消/打转未启动的占位记录不带该键）。`compressions`（可选）：上下文压缩审计——触发路径（`preflight`/`overflow`/`manual`）、折叠/保留消息数、压缩前后 token 估算（与 preflight 闸门同口径）及最近锚点请求的 provider 实测值（`measured_tokens_before`，无锚点时为 null）；**仅当发生过压缩才出现**。失败轮里已发生的压缩同样进审计（错误路径也是账单面）
 - `attempts` 是实际执行的 agent 运行次数（`>1` 表示发生了瞬态重试，见下文「单跑瞬态重试」）
@@ -868,11 +874,13 @@ Linux/macOS 经 SIGINT、Windows 经 `SetConsoleCtrlHandler`，行为一致。
 会被立即关闭**（防第二次 Ctrl-C 硬退时子进程成孤儿）——依赖 MCP 工具的在跑任务可能因此提前失败。
 TUI 模式下 `Ctrl-C` 是普通按键，按上面的按键表处理。
 
-`--json` 模式额外在每个事件吐一行 NDJSON（`type`: `turn` / `text` / `thinking` / `tool_input` /
-`tool_call` / `tool_result` / `usage` / `compressed` / `warning` / `subagent` / `todo` / `done`，
-重试时另吐 `retry`），可在结果文件落盘前实时跟进进度。`tool_input` 是工具参数的流式增量
+`--json` 模式额外在每个事件吐一行 NDJSON（`type`: `turn` / `text` / `thinking` / `code_log` /
+`tool_input` / `tool_call` / `tool_result` / `usage` / `compressed` / `pruned` / `salvage` / `warning` /
+`subagent` / `todo` / `done`，重试时另吐 `retry`），可在结果文件落盘前实时跟进进度。`tool_input` 是工具参数的流式增量
 （`{"type":"tool_input","id","name","delta"}`，键为 tool_use id）：模型边构造参数边透出，
 GUI 可渲染"正在构造调用…"（headless 终端不重复打印——完整 `tool_call` 行随后来）。
+这组 `type` 是**契约**：内核 `AgentEvent::ndjson_type()` 对每个事件变体穷尽赋值（新增变体不改它
+就编不过），`agent_tests` 里另有逐变体钉名测试——消费方按 `type` 分支即可，不会遇到无名的流事件。
 
 ## 内置工具
 
@@ -1240,16 +1248,18 @@ cd $(mktemp -d) && MOCK_API_KEY=dummy tiny-agent --config <指向 mock 的配置
 agent loop（含 tool_use 配对、token 用量解析、流式取消）。注意 `[profile.release] panic = "abort"`，
 release 下 panic 不触发 `Drop`——调试 destructors（如 TUI 终端还原）用 debug 构建。
 
-核心 agent loop 有进程内回归测试：`src/provider/mock.rs` 是 cfg(test) 的脚本化 Provider，
-`src/agent.rs` 的 `#[cfg(test)]` 模块覆盖 cancel 契约（run 永不清、预置即取消、受理点 `clear_cancel`）、tool_use/tool_result N:N 配对（含中途取消的
+核心 agent loop 有进程内回归测试：`crates/core/src/provider/mock.rs` 是 cfg(test) 的脚本化 Provider，
+`crates/core/src/agent.rs` 的 `#[cfg(test)]` 模块覆盖 cancel 契约（run 永不清、预置即取消、受理点 `clear_cancel`）、tool_use/tool_result N:N 配对（含中途取消的
 合成 `[cancelled by user]`）、上下文压缩、usage 累计等不变量。**改 `agent.rs` 核心路径请配套补 loop 测试。**
 
 ## 发布流程
 
-版本号同步在 **5 处**（改一处漏一处会造成绑定包与核心版本漂移）：根 `Cargo.toml`、
-`bindings/{python,node}/Cargo.toml`、`bindings/python/pyproject.toml`、`bindings/node/package.json`。
+版本号同步在 **6 处**（改一处漏一处会造成绑定包与核心版本漂移）：根 `Cargo.toml`、
+`bindings/{python,node}/Cargo.toml`、`bindings/python/pyproject.toml`、`bindings/node/package.json`，
+以及 `bindings/node/package-lock.json` 里 `optionalDependencies` 五个平台子包的版本
+（`npm install` 会自动刷新，`npm ci` 则因不同步直接报错——漏改它，用户跑 npm ci 就装不上）。
 
-1. 五处版本号同步 bump；
+1. 六处版本号同步 bump；
 2. `CHANGELOG.md` 补 `[新版本]` 段（从 `[Unreleased]` 挪入，附日期）；
 3. 提交后打 tag：`git tag vX.Y.Z`；
 4. `git push --tags` —— tag 推上 GitHub 后自动触发 release workflow
@@ -1283,8 +1293,8 @@ crates/core/src/  # 内核 crate（package tiny-agent-core，lib 名 tiny_agent�
 │   ├── openai.rs         ( 1814)  # OpenAI 兼容（include_usage；400 回退：max_tokens→max_completion_tokens / 丢 stream_options）
 │   ├── anthropic.rs      ( 1213)  # Anthropic 原生（message_start/message_delta usage）
 │   └── mock.rs           (  345)  # 测试用脚本化 Provider（cfg(any(test, feature="mock"))）
-├── agent.rs          ( 3934)  # 核心 loop + usage 累计 + cancel + 上下文压缩（前馈/溢出双触发 + 滚动分块摘要）+ 相邻消息归一 + 同 turn 多 task 并行
-├── agent_tests.rs    ( 8925)  # 核心 loop 回归测试（provider::mock 脚本化，不连网）
+├── agent.rs          ( 3965)  # 核心 loop + usage 累计 + cancel + 上下文压缩（前馈/溢出双触发 + 滚动分块摘要）+ 相邻消息归一 + 同 turn 多 task 并行
+├── agent_tests.rs    ( 9134)  # 核心 loop 回归测试（provider::mock 脚本化，不连网）
 ├── usage_probe.rs    (   94)  # 并行 worker 的线程本地 usage 侧信道：panic unwind 后把已计费 usage 带回 join 点（防 result.json 与共享计数器分叉）
 ├── compress.rs       (  962)  # 压缩引擎（find_safe_cut / 分块摘要 / saturating usage 合并 + block 级计费原语）
 ├── context_report.rs (  874)  # 上下文构成分解（ContextBreakdown 估算口径：system 三段 / 工具四类 / 消息分型 + 锚点校准）
@@ -1293,7 +1303,7 @@ crates/core/src/  # 内核 crate（package tiny-agent-core，lib 名 tiny_agent�
 ├── skills.rs         ( 1074)  # 三级技能加载（内置 / 用户目录 / 项目）
 ├── hooks.rs          (  181)  # hooks 闸门（Deny / Modify / 审计）
 ├── tools/  # 工具集：内置工具 + MCP 包装 + task 子 agent + run_code（feature code）
-│   ├── mod.rs            ( 1358)  # Tool trait + ToolCtx + CallbackTool/SharedTool + build 白名单组装
+│   ├── mod.rs            ( 1354)  # Tool trait + ToolCtx + CallbackTool/SharedTool + build 白名单组装
 │   ├── shell.rs          ( 1250)  # shell 工具（unix: sh -c；Windows: cmd /C + raw_arg 命令逐字传递，防 std 引用改写）
 │   ├── file.rs           ( 1524)  # read_file / write_file / edit_file / list_dir
 │   ├── image.rs          (   87)  # load_image 工具
@@ -1321,8 +1331,8 @@ crates/core/src/  # 内核 crate（package tiny-agent-core，lib 名 tiny_agent�
 src/  # CLI crate（package tiny-agent，bin tiny-agent）：进程壳 + headless 呈现 + 批量 + TUI
 ├── main.rs           ( 1021)  # CLI 入口 + 组装（build_agent）+ --session none
 ├── signal.rs         (  123)  # headless SIGINT → cancel（首次优雅 / 二次硬退 130）
-├── batch.rs          ( 3577)  # 批量任务 + --retries/--failed + 报告合并
-├── harness.rs        ( 2102)  # headless 模式 + result.json + NDJSON + exit code
+├── batch.rs          ( 3581)  # 批量任务 + --retries/--failed + 报告合并
+├── harness.rs        ( 2120)  # headless 模式 + result.json + NDJSON + exit code
 ├── harness_tests.rs  ( 1122)  # harness 行为测试（重试梯子 / result.json / NDJSON；自内核 agent_tests.rs 随 harness 迁入）
 ├── tui.rs            (   20)  # TUI 模块根（feature tui）：mod 声明 + 对外出口（run / transcript_rows）
 └── tui/  # TUI 子模块（同 tui 门）：从原 8.7k 行单文件按关注点拆分
