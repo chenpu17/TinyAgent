@@ -9,6 +9,9 @@
 
 ## 常用命令
 
+**本地一把过：`./scripts/check.sh`**（与 CI 同款门禁；`./scripts/check.sh fmt docs` 可只跑一组，
+命令改了要同步回 `.github/workflows/ci.yml` 与它两边）。
+
 ```sh
 cargo build --features tui                 # 默认只编 headless；TUI 要带 feature
 cargo test --features tui,mock             # 单测（含 TUI 输入/渲染逻辑 + lib_api 集成测试）

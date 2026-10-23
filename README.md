@@ -1231,6 +1231,10 @@ tool whitelist`。真正的"按轮临时预批准"需要每轮权限/激活层�
 
 ## 开发
 
+`./scripts/check.sh` 一把跑完 CI 的 fmt / 四个 clippy / 测试 / 场景 e2e / 文档门禁（命令与
+`.github/workflows/ci.yml` 逐字一致，失败最后统一汇总）；也可只跑某组，如 `./scripts/check.sh fmt docs`。
+双绑定的 clippy 需要先装好 maturin / napi 环境，默认不跑，显式 `./scripts/check.sh bindings`。
+
 ```sh
 cargo test --features tui,mock   # 单元测试（含 TUI 输入/渲染逻辑 + lib_api 集成测试）
 cargo clippy --features tui --all-targets   # lint（TUI 版）
