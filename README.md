@@ -1333,7 +1333,7 @@ src/  # CLI crate（package tiny-agent，bin tiny-agent）：进程壳 + headles
 ├── signal.rs         (  123)  # headless SIGINT → cancel（首次优雅 / 二次硬退 130）
 ├── batch.rs          ( 3581)  # 批量任务 + --retries/--failed + 报告合并
 ├── harness.rs        ( 2120)  # headless 模式 + result.json + NDJSON + exit code
-├── harness_tests.rs  ( 1122)  # harness 行为测试（重试梯子 / result.json / NDJSON；自内核 agent_tests.rs 随 harness 迁入）
+├── harness_tests.rs  ( 1127)  # harness 行为测试（重试梯子 / result.json / NDJSON；自内核 agent_tests.rs 随 harness 迁入）
 ├── tui.rs            (   20)  # TUI 模块根（feature tui）：mod 声明 + 对外出口（run / transcript_rows）
 └── tui/  # TUI 子模块（同 tui 门）：从原 8.7k 行单文件按关注点拆分
     ├── app.rs            ( 1625)  # 会话装配：run 入口 / worker 线程 / 事件与输入通道 / ui_loop 事件处理主体 / Ctrl-C 双击窗口

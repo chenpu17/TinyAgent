@@ -166,12 +166,16 @@ fn single_run_started_at_reflects_first_attempt_not_write_time() {
 }
 
 #[test]
-#[cfg(unix)]
 fn single_run_write_failure_keeps_exit_code() {
-    // C3: a failed result.json write must not swallow the run's exit code
-    // — the old `?` degraded any non-write failure to exit 1, lying to CI
-    // about what happened (e.g. a cancelled run stopped being 130). A
-    // read-only output dir forces the write failure.
+    // C3: result.json 写失败不能吞掉 run 自己的 exit code——旧代码的 `?`
+    // 会把任何非写失败退化成 exit 1，对 CI 谎报实际发生了什么（例如
+    // cancelled 的 130 被改成 1）。
+    //
+    // 失败注入：把输出的父路径弄成一个已存在的普通文件。atomic_write 先
+    // create_dir_all 父目录，那个名字已被一个非目录占用，于是必然报
+    // AlreadyExists(EEXIST) 而返回 Err，一个字节都不会落盘。这条失败由
+    // 文件系统结构决定，与运行用户身份无关——此前用 chmod 0o555 只读目录
+    // 注入，root 对只读目录照样能写，本机（root）下会被误判成"写成功了"。
     let cfg = cfg_with(5, 0, 0);
     let (prov, _) = MockProvider::new(vec![MockTurn::Err("503 one".into())]);
     let mut agent = Agent::new(
@@ -181,17 +185,18 @@ fn single_run_write_failure_keeps_exit_code() {
         vec![user_text("go")],
         test_ctx(),
     );
-    let dir = std::env::temp_dir().join(format!("ta-retry-ro-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-    let out = dir.join("r.json");
-    let r = crate::harness::run_with_retries(&mut agent, Some(&out), false, 0, |_| {});
-    // Restore FIRST so cleanup always runs, even if the assert fails.
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let code = r.expect("write failure must not turn into Err");
+    let dir = std::env::temp_dir().join(format!("ta-retry-wfail-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let blocker = dir.join("sub");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    let out = blocker.join("r.json");
+    let code = crate::harness::run_with_retries(&mut agent, Some(&out), false, 0, |_| {})
+        .expect("write failure must not turn into Err");
     assert_eq!(code, 1, "the run's own exit code is preserved");
     assert!(!out.exists(), "nothing was written");
+    // 父路径仍是那个普通文件，没被替换成目录。
+    assert!(blocker.is_file(), "blocker 文件不应被改动");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
