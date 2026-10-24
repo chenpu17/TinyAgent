@@ -1,6 +1,6 @@
 [package]
 name = "tiny-agent-py"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
 description = "Python bindings for TinyAgent (import tiny_agent)"
 license = "MIT"

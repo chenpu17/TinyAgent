@@ -5,6 +5,10 @@
 
 ## [Unreleased]
 
+（空）
+
+## [0.4.3] - 2026-10-24
+
 ### Added
 
 - **运行成本可观测性（压缩审计 + 逐轮/逐工具计时）**：`result.json` 新增三类字段（均稀疏插入）——
@@ -123,6 +127,15 @@
   `the sandbox stays alive`）；截断/异常终止不作为有效判别，级联示例移除未校准的
   `max_tokens: 8`（默认 1024）；落盘纪律改为「产物落盘并完成必要校验后收尾」；
   include 定位收紧为「宿主有明确复用需求才建库」，删除未经验证的价值比较表述。
+
+- **开源到 GitHub（主场 github.com/chenpu17/TinyAgent，gitee 转镜像）**：README 中英双语
+  （README.md 英文主版 + README.zh-CN.md，gen_structure 双写结构树、模块一句话职责英文化，
+  契约门禁标记与交叉核对逐字保真）+ 致谢（智谱免费 tokens / GLM-5.3-Flash 为主构建，兼用
+  Claude Code 与 DeepSeek）；四个 crate 与 pyproject/package.json 的 repository 元数据统一；
+  CI node-binding 改 `npm install`（平台子包未发布 npmjs，`npm ci` 干净 checkout 必红）；
+  audit job 弃用 rustsec/audit-check@v2（其判定与本地 `cargo audit` 退出码语义不一致——
+  本地绿 CI 红）改为直跑同一条命令，白名单 `.cargo/audit.toml` 单源；删除 6 个无引用的
+  老评测孤儿文档。
 
 ### Fixed
 
@@ -372,6 +385,14 @@
   - **依赖面**：libc 移入 unix target 依赖（两个 crate 的全部用点都是 `#[cfg(unix)]`，
     Windows 依赖图减重）；内核 Cargo.toml 补 keywords/categories（repository 待有公开
     仓库后补）。
+
+- **依赖安全升级（CI audit 首次真跑坐实）**：rustls 0.23.42→0.23.46（RUSTSEC-2026-0285
+  TLS 1.3 跨加密级握手）、quinn-proto 0.11.16→0.11.19（5 条：零长帧 panic / 重组内存绕限
+  等）、wasmtime 36.0.x→36.0.19（4 条）、webpki-roots→1.0.10——全部 semver 兼容 lockfile
+  补丁位零代码改动；pyo3 0.22.6 两条 advisory（RUSTSEC-2025-0020/2026-0177，修复需 0.24+
+  破坏性迁移）经 grep 坐实绑定未用受影响 API，按 audit job 设计流程以 `.cargo/audit.toml`
+  带理由白名单过渡。另修两处漏网 lint：mcp 测试多余 `mut`（自 9edb891 起 headless/code
+  配置必红）与 fs_policy `fuzz_iters` 补 `#[cfg(unix)]`（Windows code 配置死代码）。
 
 ## [0.4.2] - 2026-09-27
 

@@ -1,6 +1,6 @@
 {
   "name": "tiny-agent",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "Node.js / TypeScript bindings for TinyAgent",
   "license": "MIT",
   "repository": {

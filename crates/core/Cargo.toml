@@ -1,6 +1,6 @@
 [package]
 name = "tiny-agent-core"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
 # MSRV floor of the DEFAULT build, set by the dependency chain: the LOCKED
 # icu_* 2.2.0 family (reqwest → url → idna → idna_adapter) needs 1.86, above

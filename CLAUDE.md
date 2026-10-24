@@ -76,7 +76,7 @@ cargo clippy -p tiny-agent-node
   报 fatal。**所有** git 命令前置 `-c core.precomposeunicode=false`：
   `git -c core.precomposeunicode=false status` / `commit` / `log` ……
 - message 里有双引号会破坏 `-m "..."` 的 shell 引号——改用 `git commit -F <文件>` 写多行 message。
-- **发布（tag）**：版本号同步 6 处（根 `Cargo.toml`、`bindings/{python,node}/Cargo.toml`、
+- **发布（tag）**：版本号同步 7 处（根 `Cargo.toml`、`crates/core/Cargo.toml`、`bindings/{python,node}/Cargo.toml`、
   `pyproject.toml`、`package.json`、`bindings/node/package-lock.json` 的 optionalDependencies
   版本——`npm install` 会自动刷新；平台子包首发 npmjs 前 lock 里没有它们的条目，`npm ci` 在
   干净 checkout 上必报不同步，CI 因此用 `npm install`，首发后再评估改回）+ `CHANGELOG.md` 补段，

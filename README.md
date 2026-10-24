@@ -1388,15 +1388,15 @@ matching loop tests.**
 
 ## Release process
 
-Version numbers sync in **6 places** (miss one and the bindings drift from the core): root
-`Cargo.toml`, `bindings/{python,node}/Cargo.toml`, `bindings/python/pyproject.toml`,
-`bindings/node/package.json`, and the five platform subpackage versions under `optionalDependencies`
+Version numbers sync in **7 places** (miss one and the bindings drift from the core): root
+`Cargo.toml`, `crates/core/Cargo.toml`, `bindings/{python,node}/Cargo.toml`,
+`bindings/python/pyproject.toml`, `bindings/node/package.json`, and the five platform subpackage versions under `optionalDependencies`
 in `bindings/node/package-lock.json` (`npm install` refreshes it automatically; `npm ci` errors hard
 on desync — skip it and users can't install via npm ci; until the platform subpackages are first
 published to npmjs the lock carries no entries for them, which is why CI uses `npm install` — see the
 comment in `.github/workflows/ci.yml`).
 
-1. bump the version in all six places;
+1. bump the version in all seven places;
 2. add the `[new version]` section to `CHANGELOG.md` (moved from `[Unreleased]`, dated);
 3. commit, then tag: `git tag vX.Y.Z`;
 4. `git push --tags` — the tag landing on GitHub auto-triggers the release workflow

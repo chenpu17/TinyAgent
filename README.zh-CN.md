@@ -1067,12 +1067,12 @@ cargo bench -p tiny-agent-core --features mock --bench loop_bench -- --quick
 
 ## 发布流程
 
-版本号同步在 **6 处**（改一处漏一处会造成绑定包与核心版本漂移）：根 `Cargo.toml`、
-`bindings/{python,node}/Cargo.toml`、`bindings/python/pyproject.toml`、`bindings/node/package.json`，
+版本号同步在 **7 处**（改一处漏一处会造成绑定包与核心版本漂移）：根 `Cargo.toml`、
+`crates/core/Cargo.toml`、`bindings/{python,node}/Cargo.toml`、`bindings/python/pyproject.toml`、`bindings/node/package.json`，
 以及 `bindings/node/package-lock.json` 里 `optionalDependencies` 五个平台子包的版本
 （`npm install` 会自动刷新，`npm ci` 则因不同步直接报错——漏改它，用户跑 npm ci 就装不上；平台子包首发 npmjs 前 lock 里不会有它们的条目，CI 因此用 `npm install`，见 `.github/workflows/ci.yml` 注释）。
 
-1. 六处版本号同步 bump；
+1. 七处版本号同步 bump；
 2. `CHANGELOG.md` 补 `[新版本]` 段（从 `[Unreleased]` 挪入，附日期）；
 3. 提交后打 tag：`git tag vX.Y.Z`；
 4. `git push --tags` —— tag 推上 GitHub 后自动触发 release workflow

@@ -1,6 +1,6 @@
 [package]
 name = "tiny-agent"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
 # MSRV floor of the DEFAULT (headless) build: the heavy lifting stays in the
 # kernel crate (crates/core — its icu_* chain needs 1.86); this crate's own
