@@ -1125,7 +1125,7 @@ crates/core/src/  # 内核 crate（package tiny-agent-core，lib 名 tiny_agent�
 │       ├── contract.rs       (  747)  # 对客契约文本：保留名/CODE marker/字节上限、PRELUDE 三源、技能 md 装载、strip_once
 │       ├── sandbox.rs        (  799)  # wasmtime 沙箱：QuickJS 模块装载与缓存、epoch/fuel/MemLimiter、CallTrace、HostCtx、墙钟、guest 内存读上限
 │       ├── guest_api.rs      ( 3587)  # 宿主函数面：unpack/read/write、host_call_tool 分发、内层结果信封、llm marker 解析折叠、审计 meta
-│       ├── fs_policy.rs      ( 1938)  # fs/glob 策略：路径拦截与词法归一、写目录约束、symlink 检查、glob 匹配（** 折叠 + 段数上限）
+│       ├── fs_policy.rs      ( 1940)  # fs/glob 策略：路径拦截与词法归一、写目录约束、symlink 检查、glob 匹配（** 折叠 + 段数上限）
 │       ├── lib_index.rs      ( 2013)  # lib 家族：会话库索引/读写封顶、sha256、保留名、include 投递
 │       ├── batch.rs          ( 2288)  # callBatch：wave 调度、输出准入（总量封顶降级）、条目信封
 │       ├── precheck.rs       (  858)  # FR-2 预检：lexer + 关键词命中渲染

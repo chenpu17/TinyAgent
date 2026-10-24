@@ -1508,6 +1508,8 @@ mod tests {
 
     /// Fuzz 迭代数：`TA_FUZZ_ITERS` 覆盖默认值（缺省 2_000，离线小而确定；
     /// 大迭代回归用 `TA_FUZZ_ITERS=50000 cargo test ...`）。
+    /// 调用方全部在下方 #[cfg(unix)] 路径汤测试里（Windows 无 symlink 沙盘）。
+    #[cfg(unix)]
     fn fuzz_iters() -> usize {
         std::env::var("TA_FUZZ_ITERS")
             .ok()

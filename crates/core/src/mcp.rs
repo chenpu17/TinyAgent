@@ -3337,7 +3337,7 @@ mod tests {
                 vec!["https://api.example.com/?a=1&b=2".to_string()],
             ),
         ];
-        let mut gen = |rng: &mut TailRng| {
+        let gen = |rng: &mut TailRng| {
             let len = rng.hbelow(7);
             (0..len).map(|_| *rng.hpick(POOL)).collect::<String>()
         };
