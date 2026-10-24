@@ -57,6 +57,25 @@
     drop 时释放 libuv async handle 有时机问题（**工具/ provider 都有，预先存在**）——独立脚本 run 完不会
     自然退出；`node --test` 的 pending-promise 检查会因此误判文件 hang。force-exit 是 napi 绑定测试的
     标准做法，不掩盖功能 bug（测试仍验证正确性）。
+- **绑定 `push_user` / `pushUser` 的块形状有两种，别按一种写死**：`Block` 是外部标签 serde 枚举
+  （`{"text": "…"}` / `{"image": {"media_type", "data"}}`，`messages()` 读回的就是这个），而宿主的自然
+  写法是 Anthropic 风格的 `{"type": "image", …}`。绑定两种都收（serde 形归一化到 tagged 形后再走同一
+  解析器），否则「把历史块原样回推」会在第二个形状上炸。**一个块对象只解释一种形状**：serde 形同时带
+  多个形状键、或 tagged 形与另一种形状键并存，一律明确报错（取第一个会静默丢掉宿主的其余内容）；
+  `text` / `image` / `document` 的值类型不对也要给精确错误。`tool_use`/`tool_result` 两种形状都要给
+  「agent-loop internal」的精确拒绝，而非泛化的形状错误。
+- **napi 的 TSFN 构造函数对非函数是进程级 abort，不是可 catch 的异常**（`Assertion failed: (func)
+  != nullptr`，rc=134；`new Agent` / `Agent.create` / `setHooks` / `chat` 四入口全中）。所以 hooks
+  对象的 `beforeTool` / `afterTool` / `onChatRequest` 必须在**建 TSFN 之前**用 `JsUnknown::get_type`
+  验成 `Function`（`null`/`undefined` 视为缺省）；wrapper 侧同理（`typeof fn !== 'function'` 当场
+  TypeError，不能静默丢弃）。自定义工具的 `run`、provider 的 `chat` 同款——`wrapTools` 现在对
+  tools 非数组、`run`/`schema`/`name` 形状错误都同步 throw（旧行为：非数组静默禁用全部工具、
+  非函数 `run` 直接 abort、非对象 `schema` 原样发给 provider）。
+- **napi class 实例只能在 JS 线程 materialize**：`REGISTERED_CLASSES` 是 thread-local，worker 线程里
+  `into_instance` 拿不到类注册。`Agent.create` 因此把装配放 worker、只把**数据**交回，由
+  `env.create_deferred::<Agent, _>` 的 resolver（JS 线程）构造实例；wrapper 再
+  `Object.setPrototypeOf` 换回子类原型，onEvent 保护才不会丢。`JsDeferred` 的 `resolve` 是在 JS 线程
+  跑 resolver 的，别把它当成可以随便跨线程调用的回调。
 - **shell 正常退出后的管道孤儿回收**（`tools/shell.rs::collect_output`）：读管道线程的 EOF 要等
   **所有**写端关闭；命令留下的后台进程继承工具管道（`sleep 60 & echo x`，或 `cd d && server
   >/dev/null 2>&1 & curl …`——`&` 后台化整个 AND-list，为其 fork 的子 shell **自己**持有 fd1/2，

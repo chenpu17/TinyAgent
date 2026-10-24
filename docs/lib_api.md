@@ -88,7 +88,7 @@ agent.push_user(vec![doc, Block::Text("总结这份报告的要点".into())]);
 3. **host 侧逐页转图**——PDF 页渲染成 PNG 推 `Block::Image`，需视觉模型；成本与 Anthropic 原生处理同量级（~1.6k token/页）。
 4. **custom provider 对接端点自家文档 API**——注入自定义 Provider 后核心拒绝即不再适用（拒绝只发生在内置 `OpenAi` provider 上）。两个注入点：Rust 宿主用 `build_agent_with_provider`（复用 config 的工具 / MCP 装配、只换 provider——**provider 侧预处理的唯一公开入口**，见上文自定义 provider 段），Python / TS 绑定用 `provider=` 回调。两侧收到的 messages 都是整体序列化的（文档块以 `{"document":{"media_type":…,"data":…}}` 原样在场），宿主可自行对接端点自家的文档 API、或预转文本/图后再发。
 
-另：绑定层的 `pushUser` 目前只收文本——文档块推入面透出到 Python / TS（与 hooks 同批的 backlog）是前端做 PDF 附件的前置依赖，Rust 宿主现在就可用 `push_user`。
+绑定层同款：Python 的 `push_user(...)` / Node 的 `pushUser(...)` 既收 `str`（=一个文本块），也收内容块 dict 或它们的序列——块有两种等价形状：带 `type` 标签的 `{"type": "image", "media_type": …, "data": …}`，以及 `messages()` 实际读回的外部标签 serde 形状 `{"image": {"media_type": …, "data": …}}`，所以前端可把历史块原样回推（附件重发）。一个块对象只按一种形状解释：同时带多个形状键（`{"text": …, "image": …}`，或 `type` 与**另一种**形状键并存）会明确报错，不会静默丢掉其中一块。`text` / `image` / `document` 之外一律拒绝：`tool_use` / `tool_result` 的 id 必须与模型自己的输出配对，宿主注入即伪造配对。
 
 ### Python / TypeScript 绑定
 
@@ -149,6 +149,15 @@ a = tiny_agent.Agent("chat.json", provider=echo_provider)  # 无 api_key
 / `a.disable_code()` 运行期开关、`a.set_code_config({...})` 整包替换 code 配置（dict 形状同配置文件的
 `code` 节，未知键报错、缺省键重置为默认值）。未编入该 feature 时三个方法返回带重建提示的明确错误。
 
+**常驻会话的热更新**（同 Rust 侧「常驻会话的热更新」节）：`a.set_model(name)` /
+`a.set_reasoning_effort("high" | None)` / `a.set_max_tokens(n)`（整数 `0..=4294967295`，0 钳到 1）/
+`a.set_max_context_tokens(n)`（整数 `>= 0`，0 = 回退字符启发式）都是轮次间的纯字段替换，下次请求
+生效；负数/小数/越界值抛 `ValueError` / `TypeError`，不静默截断（与 Node 侧同一接受集合）。MCP
+集合可热增删：`a.add_mcp_server({"name": …, "command": …, "args": [...]})`（形状同配置文件的
+`mcp_servers` 条目，未知键报错）返回新增工具名；`a.remove_mcp_server(name)` 返回移除数，未知名字
+报错，撞名是可恢复错误（新 spawn 的子进程回滚，agent 原样不动）。`task` 子 agent 不跟随换挡。
+锁契约同其他同步方法：run 中跨线程调用阻塞等锁、回调内同线程重入报错。
+
 **Node.js / TypeScript（`import { chat, Agent }`，napi-rs）**
 
 ```sh
@@ -189,6 +198,22 @@ console.log((await a.run(ev => console.log(ev))).final_text);
 
 **上下文构成**：`a.contextBreakdown()` 同步返回下一请求上下文的估算 token 分解对象（形状见 `wrapper.d.ts` 的 `ContextBreakdown`；键 snake_case 与 Rust serde 一致）——宿主画上下文占比视图的数据源；语义见上文「上下文构成查询」，busy 契约与 `usage()` 同款（run 中调用立即报错，不冻结事件循环）。
 
+**常驻会话的热更新**：同 Python 的 camelCase 版本——`setModel` / `setReasoningEffort` /
+`setMaxTokens` / `setMaxContextTokens` / `addMcpServer` / `removeMcpServer`（`McpServerConfig`
+形状见 `wrapper.d.ts`），语义与 `task` 子 agent 不跟随的边界同 Rust 侧「常驻会话的热更新」节。
+所有同步方法在 run 进行中立即 busy 报错（阻塞锁会冻结 run 依赖的事件循环）。`setMaxTokens`
+只收 `0..=4294967295` 的整数（0 被内核钳到 1），`setMaxContextTokens` 只收 `>= 0` 的整数；
+小数、负数、越界值当场报错，不做截断/回绕（napi 的整数转换会把 `-5` 变成 42 亿）。`addMcpServer`
+同步 spawn + 握手，慢 server 会阻塞调用线程数秒；`removeMcpServer` 立即摘除工具，连接在最后
+持有者（包含在飞 `task` 快照）释放时回收。
+
+**异步构造 `Agent.create(configPath, opts)`**：与 `new Agent(...)` 等价，但 config 读取与工具装配
+（含每个 MCP server 的 spawn + 握手——慢 server 可达数秒）在专用 worker 线程完成，**JS 事件循环
+不被冻结**；返回 `Promise<Agent>`。`opts.tools` / `provider` / `hooks` 中的 JS 回调仍需在调用时
+同步建立 TSFN（形状错误当场 throw），config / 装配错误则 reject。resolve 出的是 wrapper 类实例
+（`instanceof Agent`、`run`/`compact` 的 onEvent 保护照旧）。配置里有 MCP server 时优先用它；
+`new Agent(...)` 的同步语义保持不变。
+
 **自定义 provider 回调**：传 `provider:` 一个函数（或 `{ chat }` 对象），整个替换内置 HTTP provider（不连网、不要 key）。收 `{system, messages, tools, model, max_tokens}`，返回 `string`（=纯文本）或 `{text, stop_reason?, usage?}`：
 
 ```javascript
@@ -206,8 +231,14 @@ await a.run();
 （返回 `null` 放行 / 拒绝字符串 / `{ modify: input }`，async 可用——决策经 TSFN round-trip）、
 `afterTool(payload)` / `onChatRequest(request)`（只读观察，payload 形状见 `wrapper.d.ts`）。
 `ctx` 是归因投影 `{ workdir, subagent }`（顶层 `subagent: null`）。缺的方法即无操作；
-**`beforeTool` 抛异常或返回非法值 = fail-closed 拒绝该调用**（理由进消息），观察类钩子的异常被
+某个方法存在但不是函数会当场 `TypeError`（native TSFN 对非函数会断言 abort，wrapper 与 native
+层都已在建 TSFN 前拦截）；**`beforeTool` 抛异常或返回非法值 = fail-closed 拒绝该调用**（理由进消息），观察类钩子的异常被
 吞掉（其 TSFN 是 Fatal 策略——不吞就是进程 abort）。语义同 Python 侧；`setHooks` 有 busy 契约。
+
+**宿主进程生命周期（Node）**：用过自定义 `tools` / `provider` / `hooks`（或事件回调）的进程，
+napi 的 TSFN 会让 libuv 句柄常驻，脚本自然结束后**不会自行退出**。这是既有行为，不是本次新增：
+宿主应在收尾时显式 `process.exit(0)`（或关闭自己的句柄）；仓库测试用 `node --test --test-force-exit`
+规避。纯 MCP / 内置 provider 的 agent 不受影响。
 
 **`runCode` 开关**（绑定默认不带 `code` feature，`npm run build -- --features code` 编入）：`a.enableCode()`
 / `a.disableCode()` 运行期开关、`a.setCodeConfig({...})` 整包替换 code 配置（对象形状同配置文件的

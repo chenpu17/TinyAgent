@@ -23,16 +23,22 @@
 //! here because this crate's own lib name — the npm import — is *also*
 //! `tiny-agent`).
 //!
-//! Known limitation (constructor): `new Agent(cfg, ...)` synchronously
-//! assembles tools — including spawning and handshaking every configured MCP
-//! server — on the JS main thread. `chat()` deliberately moved that work off
-//! the main thread; the constructor has not (yet). With slow MCP servers the
-//! event loop freezes for seconds at construction. Scope note in the same
-//! breath: the `setModel` family and MCP hot add/remove remain deliberately
-//! NOT exposed (minimal-surface v0.3 decision; Rust hosts get them via the
-//! core crate). The hooks interception layer IS exposed (`setHooks` /
-//! `hooks` option): `beforeTool` round-trips like a tool call (blocking
-//! decision), the observe-only hooks are fire-and-forget TSFNs.
+//! Constructor: `new Agent(cfg, ...)` synchronously assembles tools —
+//! including spawning and handshaking every configured MCP server — on the JS
+//! main thread, so a slow MCP server freezes the event loop for seconds.
+//! `Agent.create(cfg, ...)` is the non-blocking variant: same result, but the
+//! config load + assembly run on a dedicated worker thread (it settles a
+//! Promise). The class instance itself is still materialized in the deferred's
+//! resolver on the JS thread — napi's class registry is thread-local — which
+//! is also why the JS wrapper re-points its prototype. Scope note: the
+//! `setModel` family and MCP hot add/remove ARE exposed (`setModel` /
+//! `setReasoningEffort` / `setMaxTokens` / `setMaxContextTokens` /
+//! `addMcpServer` / `removeMcpServer`); like every sync method they follow the
+//! busy contract above and, by the kernel's scope decision, do NOT reach
+//! `task` sub-agents constructed before the swap. The hooks interception
+//! layer IS exposed (`setHooks` / `hooks` option): `beforeTool` round-trips
+//! like a tool call (blocking decision), the observe-only hooks are
+//! fire-and-forget TSFNs.
 
 // napi's `#[napi]` attribute macro can trip clippy's `useless_conversion` on
 // `Result` returns the same way pyo3's macros do. Scoped to this pure-binding
@@ -193,6 +199,147 @@ fn recv_interruptible<T>(
             // Disconnected without a send: no resolver is ever coming.
             Err(mpsc::RecvTimeoutError::Disconnected) => return Err(()),
         }
+    }
+}
+
+/// Convert a `pushUser` argument into core blocks. A string is one text block
+/// (the original shorthand); an object is one block; an array is one block per
+/// element, order preserved (a bare string inside the array is a text block).
+///
+/// Two object shapes are accepted: the Anthropic-style tagged form
+/// `{type: "text"|"image"|"document", …}` and the externally-tagged serde form
+/// `messages()` actually reports — `{text: "…"}`, `{image: {media_type, data}}`
+/// — so a transcript block round-trips through `pushUser(messages()[i].content[j])`.
+///
+/// Only the model-facing variants are accepted: `tool_use` / `tool_result` are
+/// agent-loop internals whose ids must pair with the model's own output, and a
+/// host injecting them would forge that pairing.
+fn push_user_blocks(v: &Value) -> Result<Vec<ta::Block>> {
+    /// One block object → core block.
+    fn one(v: &Value) -> Result<ta::Block> {
+        // Normalize the messages() serde form onto the tagged form so the
+        // parser below is the single source of shape truth.
+        let normalized;
+        let v = if v.get("type").is_some() {
+            v
+        } else {
+            normalized = serde_block_to_tagged(v)?;
+            &normalized
+        };
+        let tag = v
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| err("content block needs a string \"type\" field"))?;
+        reject_mixed_shape(v, tag)?;
+        let s = |key: &str| -> Result<String> {
+            v.get(key)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| err(format!("{tag} block needs a string \"{key}\" field")))
+        };
+        match tag {
+            "text" => Ok(ta::Block::Text(s("text")?)),
+            "image" => Ok(ta::Block::Image {
+                media_type: s("media_type")?,
+                data: s("data")?,
+            }),
+            "document" => Ok(ta::Block::Document {
+                media_type: s("media_type")?,
+                data: s("data")?,
+            }),
+            "tool_use" | "tool_result" => Err(internal_block_error(tag)),
+            other => Err(err(format!(
+                "unknown content block type {other:?} (expected \"text\", \"image\", or \"document\")"
+            ))),
+        }
+    }
+
+    match v {
+        Value::String(s) => Ok(vec![ta::Block::Text(s.clone())]),
+        Value::Object(_) => Ok(vec![one(v)?]),
+        Value::Array(items) => {
+            if items.is_empty() {
+                return Err(err(
+                    "pushUser needs at least one content block (got an empty array)",
+                ));
+            }
+            items
+                .iter()
+                .map(|item| match item {
+                    Value::String(s) => Ok(ta::Block::Text(s.clone())),
+                    _ => one(item),
+                })
+                .collect()
+        }
+        _ => Err(err(
+            "pushUser expects a string, a content-block object, or an array of those",
+        )),
+    }
+}
+
+/// The rejection for `tool_use` / `tool_result`, shared by both input shapes.
+fn internal_block_error(tag: &str) -> Error {
+    err(format!(
+        "content block type {tag:?} is agent-loop internal (its ids must pair with \
+         the model's own output) and cannot be pushed by the host"
+    ))
+}
+
+/// Reject a tagged block that ALSO carries a different externally-tagged shape
+/// key (`{type: "text", image: {...}}`): the tagged branch would silently drop
+/// the second block. The same-name pair is the normal tagged form
+/// (`{type: "text", text: "…"}`), so only keys other than `tag` count.
+fn reject_mixed_shape(v: &Value, tag: &str) -> Result<()> {
+    for key in ["text", "image", "document", "tool_use", "tool_result"] {
+        if key != tag && v.get(key).is_some() {
+            return Err(err(format!(
+                "content block has type {tag:?} but also carries the {key:?} shape key; \
+                 send exactly one block shape per object"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Normalize the serde shape `messages()` emits (externally tagged:
+/// `{text: "…"}`, `{image: {media_type, data}}`, …) onto the tagged form
+/// `one()` parses. `tool_use` / `tool_result` are recognized only so they get
+/// the precise rejection rather than a generic shape error. A block carrying
+/// MORE than one shape key is rejected — silently keeping the first would drop
+/// the rest of the host's content.
+fn serde_block_to_tagged(v: &Value) -> Result<Value> {
+    let obj = v
+        .as_object()
+        .ok_or_else(|| err("content block must be an object"))?;
+    let present: Vec<&str> = ["text", "image", "document", "tool_use", "tool_result"]
+        .into_iter()
+        .filter(|key| obj.contains_key(*key))
+        .collect();
+    if present.len() > 1 {
+        return Err(err(format!(
+            "content block mixes multiple message shapes ({}); send exactly one shape per object",
+            present.join(", ")
+        )));
+    }
+    match present.first().copied() {
+        Some("text") => match obj.get("text") {
+            Some(Value::String(s)) => Ok(serde_json::json!({ "type": "text", "text": s.clone() })),
+            _ => Err(err("text block needs a string \"text\" field")),
+        },
+        Some(tag @ ("image" | "document")) => {
+            let fields = obj
+                .get(tag)
+                .and_then(Value::as_object)
+                .ok_or_else(|| err(format!("{tag} block needs an object \"{tag}\" field")))?;
+            let mut m = fields.clone();
+            m.insert("type".into(), Value::String(tag.into()));
+            Ok(Value::Object(m))
+        }
+        Some(tag @ ("tool_use" | "tool_result")) => Err(internal_block_error(tag)),
+        _ => Err(err(
+            "content block needs a string \"type\" field (\"text\" / \"image\" / \
+             \"document\") or the messages() shape, e.g. {text: \"hello\"}",
+        )),
     }
 }
 
@@ -651,15 +798,37 @@ impl ta::Hooks for JsHooks {
     }
 }
 
+/// One optional hook method. `null` / `undefined` count as absent; anything
+/// else except a function is rejected before it can reach the TSFN
+/// constructor (see [`build_hooks`] for why that matters).
+fn hook_function(h: &Object, key: &str) -> Result<Option<JsFunction>> {
+    let Some(v) = h.get::<_, napi::JsUnknown>(key)? else {
+        return Ok(None);
+    };
+    match v.get_type()? {
+        napi::ValueType::Undefined | napi::ValueType::Null => Ok(None),
+        napi::ValueType::Function => Ok(Some(unsafe { v.cast::<JsFunction>() })),
+        other => Err(err(format!(
+            "hooks.{key} must be a function when present (got {other})"
+        ))),
+    }
+}
+
 /// Turn the user's duck-typed hooks object into a [`ta::Hooks`]. Methods are
 /// resolved HERE, on the JS thread, once — a present-but-not-a-function
 /// property errors at install time instead of failing silently mid-run.
 /// Returns None when no hooks object was passed (no layer installed).
+///
+/// The shape check is not cosmetic: handing a non-function to napi's TSFN
+/// constructor trips an internal assertion (`(func) != nullptr`) and ABORTS
+/// the whole process — uncatchable from JS. Checking `typeof` here, before any
+/// TSFN exists, turns that abort into an ordinary throwable error on every
+/// entry point (`new`, `Agent.create`, `setHooks`, `chat`).
 fn build_hooks(env: Env, hooks: Option<Object>) -> Result<Option<Arc<dyn ta::Hooks>>> {
     let Some(h) = hooks else { return Ok(None) };
-    let before: Option<JsFunction> = h.get("beforeTool")?;
-    let after: Option<JsFunction> = h.get("afterTool")?;
-    let on_chat: Option<JsFunction> = h.get("onChatRequest")?;
+    let before: Option<JsFunction> = hook_function(&h, "beforeTool")?;
+    let after: Option<JsFunction> = hook_function(&h, "afterTool")?;
+    let on_chat: Option<JsFunction> = hook_function(&h, "onChatRequest")?;
     // Env::create_threadsafe_function hardwires the CalleeHandled strategy;
     // the observe-only hooks need Fatal (fire-and-forget), so go through the
     // FromNapiValue conversion the #[napi] params themselves use, which takes
@@ -703,9 +872,17 @@ fn build_hooks(env: Env, hooks: Option<Object>) -> Result<Option<Arc<dyn ta::Hoo
 // work can never be scheduled: a total deadlock. Dedicated threads cost one
 // OS thread per in-flight run and scale independently of the pool size.
 
-/// The resolver shape every agent Promise settles with: materialize the
-/// pre-serialized outcome `Value` as a JS object on the JS thread.
-type AgentResolver = Box<dyn FnOnce(Env) -> Result<Outcome>>;
+/// The resolver shape napi runs on the JS thread to settle a deferred: turn
+/// the value the worker produced into a JS value (`Outcome` is pre-serialized
+/// to a `Value`; the async constructor materializes an `Agent` class instance).
+type Resolver<T> = Box<dyn FnOnce(Env) -> Result<T>>;
+
+/// Every agent Promise (`run` / `compact` / `chat`) settles with an [`Outcome`].
+type AgentResolver = Resolver<Outcome>;
+
+/// A deferred parked between the JS thread and a worker until exactly one side
+/// settles it (see [`spawn_agent_work`]).
+type DeferredSlot<T> = Arc<Mutex<Option<JsDeferred<T, Resolver<T>>>>>;
 
 /// Surface the structured cost a failed run burned, not just the Display
 /// message — the binding previously dropped usage / tool_calls / turns /
@@ -726,16 +903,23 @@ fn run_error_to_napi(e: &ta::RunError) -> Error {
 /// JS side is never left with an unsettled Promise. The 8 MiB stack matches
 /// the libuv worker default the AsyncTask shape used to run on, keeping
 /// headroom for deep JSON (de)serialization and provider call chains.
-fn spawn_agent_work<F>(deferred: JsDeferred<Outcome, AgentResolver>, work: F)
+///
+/// Generic over the settled value: `run` / `chat` / `compact` settle with an
+/// [`Outcome`] (a pre-serialized JSON `Value`), the async constructor
+/// (`Agent::create`) settles with an `Agent`. The RESOLVER runs on the JS
+/// thread (napi's TSFN), which is what makes the constructor case work at all:
+/// napi's class registry is thread-local, so a class instance can only be
+/// materialized where the class was registered.
+fn spawn_agent_work<Data, F>(deferred: JsDeferred<Data, Resolver<Data>>, work: F)
 where
-    F: FnOnce() -> Result<Value> + Send + 'static,
+    Data: ToNapiValue + Send + 'static,
+    F: FnOnce() -> Result<Data> + Send + 'static,
 {
     // Park the deferred behind a slot so it can be recovered and REJECTED if
     // thread creation itself fails — `Builder::spawn` drops the closure on
     // error, and a dropped JsDeferred settles nothing (no Drop impl), which
     // would strand the Promise forever.
-    let slot: Arc<Mutex<Option<JsDeferred<Outcome, AgentResolver>>>> =
-        Arc::new(Mutex::new(Some(deferred)));
+    let slot: DeferredSlot<Data> = Arc::new(Mutex::new(Some(deferred)));
     let worker_slot = slot.clone();
     let spawned = std::thread::Builder::new()
         .name("tiny-agent-run".into())
@@ -747,7 +931,7 @@ where
                 .take()
                 .expect("deferred settled exactly once");
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
-                Ok(Ok(v)) => deferred.resolve(Box::new(move |_env| Ok(Outcome(v)))),
+                Ok(Ok(v)) => deferred.resolve(Box::new(move |_env| Ok(v))),
                 Ok(Err(e)) => deferred.reject(e),
                 Err(_) => deferred.reject(err("agent worker thread panicked")),
             }
@@ -812,7 +996,9 @@ impl Default for CancelToken {
 /// shape. After the awaited run() resolves, the methods work again.
 fn agent_busy() -> Error {
     err("Agent.run() is active: sync methods (pushUser, setCancel, \
-        clearCancel, usage, contextBreakdown, messages, model, \
+        clearCancel, usage, contextBreakdown, messages, model, setHooks, \
+        setModel/setReasoningEffort/setMaxTokens/setMaxContextTokens, \
+        addMcpServer/removeMcpServer, \
         enableCode/disableCode/setCodeConfig) must \
         not be called until the awaited run() resolves — calling them while a run is \
         in flight would freeze the JS event loop the run depends on")
@@ -825,8 +1011,53 @@ pub struct Agent {
     inner: Arc<Mutex<ta::Agent>>,
 }
 
+/// Resolver shape for the async constructor (`Agent.create`): the finished
+/// `Agent` is materialized as a class instance IN the resolver, which napi runs
+/// on the JS thread — napi's class registry is thread-local, so the instance
+/// cannot be built on the worker that assembled it.
+type AgentBuildResolver = Resolver<Agent>;
+
+/// The config-load + agent-assembly half shared by `new Agent(...)`,
+/// `Agent.create(...)`, and `chat()`. Runs on whatever thread calls it — every
+/// JS-thread-bound step (TSFN creation for custom tools / provider / hooks)
+/// must already have happened, which is exactly what lets `create()` move this
+/// work onto a worker thread.
+fn assemble_agent(
+    config_path: &str,
+    api_key: Option<String>,
+    provider: Option<Box<dyn ta::Provider>>,
+    extra: Vec<Box<dyn ta::Tool>>,
+    hooks: Option<Arc<dyn ta::Hooks>>,
+) -> Result<ta::Agent> {
+    let cfg = ta::Config::load(Path::new(config_path)).map_err(err)?;
+    // A custom provider needs no API key for the main agent; only fall back
+    // to cfg.api_key() when using the built-in provider.
+    let api_key = match api_key {
+        Some(k) => k,
+        None => match &provider {
+            Some(_) => String::new(),
+            None => cfg.api_key().map_err(err)?,
+        },
+    };
+    let client = ta::provider::new_client(cfg.limits.timeout_secs);
+    let mut agent = match provider {
+        Some(p) => ta::build_agent_with_provider(&cfg, p, Vec::new(), &client, extra, &api_key),
+        None => ta::build_agent_with(&cfg, Vec::new(), &client, extra, &api_key),
+    }
+    .map_err(err)?;
+    if let Some(h) = hooks {
+        agent.set_hooks(h);
+    }
+    Ok(agent)
+}
+
 #[napi]
 impl Agent {
+    /// Synchronous constructor: config load + full assembly — including every
+    /// configured MCP server's spawn + handshake — run on the JS main thread.
+    /// With a slow MCP server that freezes the event loop for seconds. Prefer
+    /// `Agent.create(...)` whenever the config lists MCP servers: it does the
+    /// same work on a worker thread and resolves with the agent.
     #[napi(constructor)]
     pub fn new(
         env: Env,
@@ -836,34 +1067,46 @@ impl Agent {
         api_key: Option<String>,
         hooks: Option<Object>,
     ) -> Result<Self> {
-        let cfg = ta::Config::load(Path::new(&config_path)).map_err(err)?;
-        // A custom provider needs no API key for the main agent; only fall back
-        // to cfg.api_key() when using the built-in provider.
-        let api_key = match api_key {
-            Some(k) => k,
-            None => match &provider {
-                Some(_) => String::new(),
-                None => cfg.api_key().map_err(err)?,
-            },
-        };
-        let client = ta::provider::new_client(cfg.limits.timeout_secs);
         let extra = build_extra_tools(env, tools)?;
         // The TSFNs must be created on the JS thread (env); build_provider /
         // build_hooks do that, then the trait objects are Send and safe to
         // thread into the agent.
         let prov = build_provider(env, provider)?;
         let hooks_layer = build_hooks(env, hooks)?;
-        let mut agent = match prov {
-            Some(p) => ta::build_agent_with_provider(&cfg, p, Vec::new(), &client, extra, &api_key),
-            None => ta::build_agent_with(&cfg, Vec::new(), &client, extra, &api_key),
-        }
-        .map_err(err)?;
-        if let Some(h) = hooks_layer {
-            agent.set_hooks(h);
-        }
+        let agent = assemble_agent(&config_path, api_key, prov, extra, hooks_layer)?;
         Ok(Self {
             inner: Arc::new(Mutex::new(agent)),
         })
+    }
+
+    /// Async constructor — same result as `new Agent(...)`, but the
+    /// seconds-long part (config load + tool assembly, i.e. spawning and
+    /// handshaking every configured MCP server) runs on a dedicated worker
+    /// thread, so the JS event loop stays free while it happens. Only the
+    /// cheap JS-thread-bound steps (creating the custom-tool / provider /
+    /// hooks TSFNs from the passed objects) run synchronously; a malformed
+    /// `tools` entry still throws at call time, while config / assembly
+    /// errors reject the returned Promise.
+    #[napi]
+    pub fn create(
+        env: Env,
+        config_path: String,
+        tools: Option<Vec<Object>>,
+        provider: Option<Object>,
+        api_key: Option<String>,
+        hooks: Option<Object>,
+    ) -> Result<JsObject> {
+        let extra = build_extra_tools(env, tools)?;
+        let prov = build_provider(env, provider)?;
+        let hooks_layer = build_hooks(env, hooks)?;
+        let (deferred, promise) = env.create_deferred::<Agent, AgentBuildResolver>()?;
+        spawn_agent_work(deferred, move || {
+            let agent = assemble_agent(&config_path, api_key, prov, extra, hooks_layer)?;
+            Ok(Agent {
+                inner: Arc::new(Mutex::new(agent)),
+            })
+        });
+        Ok(promise)
     }
 
     /// Install the interception layer from a duck-typed hooks object with any
@@ -886,13 +1129,24 @@ impl Agent {
         Ok(())
     }
 
-    /// Append a user message (text) to the conversation, then (typically) call
+    /// Append a user message to the conversation, then (typically) call
     /// `.run()`. Errors with a busy error while `run()` is in flight (see
     /// [`agent_busy`]).
+    ///
+    /// `content` accepts a string (one text block — the original shorthand), a
+    /// single content-block object, or an array of those. Block objects come in
+    /// either the tagged form (`{type: 'text', text}` /
+    /// `{type: 'image'|'document', media_type, data: <base64>}` — note `type`,
+    /// not the wrapper's usual camelCase, because it is the wire format) or the
+    /// serde form `messages()` reports (`{text}` / `{image: {media_type, data}}`),
+    /// so a history block can be pushed straight back. `tool_use` /
+    /// `tool_result` are refused: their ids must pair with the model's own
+    /// output.
     #[napi]
-    pub fn push_user(&self, text: String) -> Result<()> {
+    pub fn push_user(&self, content: Value) -> Result<()> {
+        let blocks = push_user_blocks(&content)?;
         let mut a = self.inner.try_lock().map_err(|_| agent_busy())?;
-        a.push_user(vec![ta::Block::Text(text)]);
+        a.push_user(blocks);
         Ok(())
     }
 
@@ -948,7 +1202,7 @@ impl Agent {
                     }
                 })
                 .map_err(|e| run_error_to_napi(&e))?;
-            serde_json::to_value(&outcome).map_err(err)
+            serde_json::to_value(&outcome).map(Outcome).map_err(err)
         });
         Ok(promise)
     }
@@ -998,8 +1252,8 @@ impl Agent {
                     napi::Error::from_reason(payload.to_string())
                 })?;
             match outcome {
-                Some(o) => serde_json::to_value(o).map_err(err),
-                None => Ok(Value::Null),
+                Some(o) => serde_json::to_value(o).map(Outcome).map_err(err),
+                None => Ok(Outcome(Value::Null)),
             }
         });
         Ok(promise)
@@ -1040,6 +1294,113 @@ impl Agent {
     pub fn model(&self) -> Result<String> {
         let a = self.inner.try_lock().map_err(|_| agent_busy())?;
         Ok(a.model().to_string())
+    }
+
+    // ── hot-update surface (between runs) ───────────────────────────────────
+    //
+    // Pure field swaps in the kernel: the next request uses the new value, and
+    // MCP connections / tool assembly / history / the session file are all
+    // untouched (rebuilding the agent would re-run every MCP handshake —
+    // seconds on a slow server). Deliberate scope, shared with the kernel:
+    // `task` sub-agents capture their config at construction and do NOT follow
+    // these setters — swap before spawning if it must apply. Every method here
+    // follows the same busy contract as `pushUser` (try_lock + explanatory
+    // error while a run holds the agent).
+
+    /// Swap the model for subsequent requests (same provider/endpoint).
+    /// Validity is the caller's: an unknown model name fails at the next
+    /// request, honestly, like a config typo.
+    #[napi]
+    pub fn set_model(&self, model: String) -> Result<()> {
+        let mut a = self.inner.try_lock().map_err(|_| agent_busy())?;
+        a.set_model(&model);
+        Ok(())
+    }
+
+    /// Swap the reasoning-effort hint forwarded to the provider verbatim
+    /// (`null`/omitted = server default). No enum validation — vendor ladders
+    /// differ and shift across generations.
+    #[napi]
+    pub fn set_reasoning_effort(&self, effort: Option<String>) -> Result<()> {
+        let mut a = self.inner.try_lock().map_err(|_| agent_busy())?;
+        a.set_reasoning_effort(effort.as_deref());
+        Ok(())
+    }
+
+    /// Swap the per-request output budget. Accepts an integer in
+    /// `0..=u32::MAX`; 0 is clamped to 1 by the kernel (a persistent 0 would
+    /// make every following request an instant provider 400). The parameter
+    /// is `f64` so the check sees the ORIGINAL JS number: napi's integer
+    /// conversions truncate fractions and wrap out-of-range values (`-5`
+    /// became 4294967291), which silently armed a huge budget.
+    #[napi]
+    pub fn set_max_tokens(&self, max_tokens: f64) -> Result<()> {
+        if !max_tokens.is_finite()
+            || max_tokens.fract() != 0.0
+            || !(0.0..=f64::from(u32::MAX)).contains(&max_tokens)
+        {
+            return Err(err(
+                "setMaxTokens: maxTokens must be an integer in 0..=4294967295 \
+                 (0 is clamped to 1)",
+            ));
+        }
+        let mut a = self.inner.try_lock().map_err(|_| agent_busy())?;
+        a.set_max_tokens(max_tokens as u32);
+        Ok(())
+    }
+
+    /// Update the context-window ceiling used by the preflight compression
+    /// estimate (`0` = fall back to the char heuristic). Hosts learn the REAL
+    /// window from their model catalog at runtime; a wrong ceiling fires the
+    /// preflight far too early or never. Takes `f64` so fractional / negative /
+    /// absurd values are rejected instead of silently truncated or wrapped.
+    #[napi]
+    pub fn set_max_context_tokens(&self, tokens: f64) -> Result<()> {
+        if !tokens.is_finite() || tokens.fract() != 0.0 || tokens < 0.0 {
+            return Err(err("setMaxContextTokens: tokens must be an integer >= 0 \
+                 (0 = fall back to the char heuristic)"));
+        }
+        // 2^64 is the first f64 above u64::MAX; rejecting it avoids a
+        // saturating cast off by one.
+        if tokens >= 18_446_744_073_709_551_616.0 {
+            return Err(err(
+                "setMaxContextTokens: tokens must be <= 18446744073709551615",
+            ));
+        }
+        let mut a = self.inner.try_lock().map_err(|_| agent_busy())?;
+        a.set_max_context_tokens(tokens as u64);
+        Ok(())
+    }
+
+    /// Attach one MCP server at runtime (spawn + handshake, then the tools
+    /// join the next request). `cfg` is an object shaped like one entry of the
+    /// config file's `"mcp_servers"` list (`{name, command, args, env}` or
+    /// `{name, url, headers}`); unknown keys are an error. This is a
+    /// SYNCHRONOUS method: it returns the new tool display names, and the
+    /// handshake blocks the JS main thread for as long as the server takes —
+    /// prefer adding servers before user-facing work, or construct the agent
+    /// from a config that already lists them. A name collision is a
+    /// recoverable error with the agent left exactly as it was (no partial
+    /// add). NOT propagated to `task` sub-agents or the runCode sandbox
+    /// registry.
+    #[napi]
+    pub fn add_mcp_server(&self, cfg: Value) -> Result<Vec<String>> {
+        let parsed: ta::McpServerConfig =
+            serde_json::from_value(cfg).map_err(|e| err(format!("mcp server object: {e}")))?;
+        let mut a = self.inner.try_lock().map_err(|_| agent_busy())?;
+        a.add_mcp_server(parsed).map_err(err)
+    }
+
+    /// Detach an MCP server by its CONFIG name (the `name` field, not the
+    /// `mcp_<server>_<tool>` display names). Returns how many tools were
+    /// removed; an unknown name is an error, not a silent no-op. The stdio
+    /// child dies when its last holder drops (immediately if only this agent
+    /// held it).
+    #[napi]
+    pub fn remove_mcp_server(&self, name: String) -> Result<u32> {
+        let mut a = self.inner.try_lock().map_err(|_| agent_busy())?;
+        let removed = a.remove_mcp_server(&name).map_err(err)?;
+        u32::try_from(removed).map_err(|_| err("tool count overflowed u32"))
     }
 
     /// Enable the sandboxed `runCode` tool for the NEXT request (runtime
@@ -1134,23 +1495,7 @@ pub fn chat(
     let hooks_layer = build_hooks(env, hooks)?;
     let (deferred, promise) = env.create_deferred::<Outcome, AgentResolver>()?;
     spawn_agent_work(deferred, move || {
-        let cfg = ta::Config::load(Path::new(&config_path)).map_err(err)?;
-        let api_key = match api_key {
-            Some(k) => k,
-            None => match &prov {
-                Some(_) => String::new(),
-                None => cfg.api_key().map_err(err)?,
-            },
-        };
-        let client = ta::provider::new_client(cfg.limits.timeout_secs);
-        let mut agent = match prov {
-            Some(p) => ta::build_agent_with_provider(&cfg, p, Vec::new(), &client, extra, &api_key),
-            None => ta::build_agent_with(&cfg, Vec::new(), &client, extra, &api_key),
-        }
-        .map_err(err)?;
-        if let Some(h) = hooks_layer {
-            agent.set_hooks(h);
-        }
+        let mut agent = assemble_agent(&config_path, api_key, prov, extra, hooks_layer)?;
         agent.push_user(vec![ta::Block::Text(message)]);
 
         let outcome = agent
@@ -1163,7 +1508,7 @@ pub fn chat(
             })
             .map_err(|e| run_error_to_napi(&e))?;
 
-        serde_json::to_value(&outcome).map_err(err)
+        serde_json::to_value(&outcome).map(Outcome).map_err(err)
     });
     Ok(promise)
 }

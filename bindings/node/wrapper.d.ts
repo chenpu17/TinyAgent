@@ -93,6 +93,40 @@ export interface AgentOptions {
   apiKey?: string;
 }
 
+/** A model-facing content block a host may push, in either accepted shape:
+ *  the Anthropic-style tagged form (`{type: 'image', …}`) or the serde form
+ *  `messages()` reports (`{image: {…}}`) — so a transcript block round-trips
+ *  through `pushUser(messages()[i].content[j])`. `tool_use` / `tool_result`
+ *  are deliberately absent: they are agent-loop internals whose ids must pair
+ *  with the model's own output. */
+export type UserImage = { media_type: string; data: string };
+export type UserBlock =
+  | { type: 'text'; text: string }
+  | { type: 'image'; media_type: string; data: string }
+  | { type: 'document'; media_type: string; data: string }
+  | { text: string }
+  | { image: UserImage }
+  | { document: UserImage };
+
+/** One MCP server, shaped exactly like an entry in the config file's
+ *  `"mcp_servers"` array (unknown keys reject; exactly one of
+ *  `command` / `url` must be set). */
+export interface McpServerConfig {
+  name: string;
+  /** stdio transport: command to spawn. */
+  command?: string;
+  /** stdio transport: arguments passed to `command`. */
+  args?: string[];
+  /** HTTP transports: server URL. */
+  url?: string;
+  /** HTTP transports: force a transport instead of auto-detection. */
+  transport?: 'auto' | 'http' | 'sse';
+  /** HTTP transports: extra request headers (e.g. Authorization). */
+  headers?: Record<string, string>;
+  /** stdio transport: extra env vars for the spawned child. */
+  env?: Record<string, string>;
+}
+
 export interface ChatOptions {
   onEvent?: (event: AgentEvent) => void;
   tools?: Tool[];
@@ -243,8 +277,19 @@ export interface ContextBreakdown {
 
 export declare class Agent {
   constructor(configPath: string, opts?: AgentOptions);
-  /** Append a user message (text) to the conversation. */
-  pushUser(text: string): void;
+  /** Async constructor — same result as `new Agent(...)`, but config load and
+   *  tool assembly (spawning + handshaking every configured MCP server, the
+   *  seconds-long part with a slow server) run on a worker thread, so the JS
+   *  event loop keeps ticking. Malformed `opts.tools` / `opts.provider` /
+   *  `opts.hooks` throw SYNCHRONOUSLY at call time (the returned Promise is
+   *  not involved); config / assembly errors reject the Promise. Resolves to
+   *  an instance of this wrapper class (not the raw native one), so `run` /
+   *  `compact` keep their onEvent guard. */
+  static create(configPath: string, opts?: AgentOptions): Promise<Agent>;
+  /** Append a user message to the conversation. A string is one text block;
+   *  an object is one block; an array is one block per element (in order).
+   *  `tool_use` / `tool_result` blocks are rejected (agent-loop internals). */
+  pushUser(content: string | UserBlock | Array<string | UserBlock>): void;
   /** Arm a CancelToken; its flag interrupts the next turn boundary. */
   setCancel(token: CancelToken): void;
   /** Clear the cancel flag — the acceptance-point half of the cancel
@@ -272,6 +317,28 @@ export declare class Agent {
   messages(): unknown[];
   /** The model name this agent sends with each request. */
   model(): string;
+  /** Swap the model used from the next request on (between runs). Does NOT
+   *  propagate to `task` sub-agents constructed before the swap (kernel
+   *  scope decision: a sub-agent snapshots its config). */
+  setModel(model: string): void;
+  /** Set (or clear, with null) the reasoning effort passed through verbatim
+   *  for the next request. */
+  setReasoningEffort(effort: string | null): void;
+  /** Change the per-request max_tokens. Accepts an integer in
+   *  0..=4294967295; values below 1 are clamped to 1. Fractional, negative,
+   *  or out-of-range values throw (they are not silently truncated/wrapped). */
+  setMaxTokens(maxTokens: number): void;
+  /** Change the context budget used by compression; 0 falls back to the
+   *  char heuristic. Negative, fractional, or out-of-range values throw. */
+  setMaxContextTokens(tokens: number): void;
+  /** Spawn + handshake one MCP server and register its tools for the next
+   *  request; RETURNS the exposed tool names (synchronous — the handshake
+   *  blocks the JS thread). A name collision is a recoverable error (nothing
+   *  is registered). Throws while a run is in flight. */
+  addMcpServer(cfg: McpServerConfig): string[];
+  /** Tear down one MCP server by name; returns how many tools were removed.
+   *  Unknown names throw. Throws while a run is in flight. */
+  removeMcpServer(name: string): number;
   /** Enable the sandboxed runCode tool for the next request. Requires the
    *  module built with its `code` cargo feature (`npm run build -- --features
    *  code`); otherwise throws with a clear rebuild hint (synchronous method —

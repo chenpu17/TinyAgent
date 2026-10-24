@@ -148,7 +148,10 @@
   0 视为"无上限"被忽略。它和 `max_turns`/`timeout` 是 loop 的三个 turn 边界停止条件。
 - **宿主热更新面（run 外的 `&mut self` 方法，GUI 常驻场景）**：`set_model` / `set_reasoning_effort` /
   `set_max_tokens`（钳 ≥1）/ `set_max_context_tokens` 与 `compact()` 都是**纯字段操作/复用 compress 路径**，
-  `&mut self` 签名即顺序契约——run 持有借用，「轮次间调用」由借用检查器强制，无需运行期守卫。两条易错语义：
+  `&mut self` 签名即顺序契约——run 持有借用，「轮次间调用」由借用检查器强制，无需运行期守卫。两个绑定
+  均已透出该家族（Python 同步 / Node camelCase + try_lock busy 契约）；Node 的 `Agent.create` 把装配
+  （含 MCP spawn+握手）移到 worker 线程，但 napi class registry 是线程本地——实例只能在 JS 线程的
+  deferred resolver 里 materialize，wrapper 用 `Object.setPrototypeOf` 接回 onEvent 保护。两条易错语义：
   ① **`task` 子 agent 不跟随**（SubAgent 持构造期 cfg 快照，set_model 后 spawn 的子 agent 仍用旧模型）——文档
   化的边界，别为传播去改 SubAgent 读父字段；② **`compact()` 的成本口径**：摘要 usage 经 `CompressOutcome`
   返回宿主、**绝不进 `self.usage`**（run 入口重置总账，折进去会凭空消失）——与 run 内压缩走 `bill_chat` 进
@@ -254,8 +257,9 @@
   agent 需重挂（层活在实例上、不进 session 文件，`session_save_load_does_not_carry_hooks` 钉住）。
   **`after_tool` 带 `ctx: &ToolCtx`**（2026-09 外审，趁绑定未透出 hooks 的窗口期落的破坏性改动）：
   与 `before_tool` 的 ctx 镜像对称——审计点靠 `ctx.subagent` 归因来源（顶层/task/沙箱），并行兄弟
-  真并发下调用序关联不可靠，per-call ctx 是唯一可靠的来源标签。本期绑定不透出 hooks（backlog P3，
-  两绑定 crate 头已明示该范围决策）。
+  真并发下调用序关联不可靠，per-call ctx 是唯一可靠的来源标签。该破坏性改动落地时尚在绑定透出
+  hooks 之前（趁窗口期）；**两个绑定此后都已透出 hooks**（py `set_hooks` / node `setHooks`，Node
+  决策走 round-trip、观察类 TSFN 吞异常）。
   **Slot 观测契约表**（`agent_tests.rs` 的 `slot_table_*` 六例）：`Slot` 只有 `Cancelled`/`Ran`
   两态，但**进入路径有八条**（顺序 3 + 并行 4 + 批次整体跳过），每条对外的观测后果不同。六个用例用
   同一张表钉住「状态 → 五类观测面」（records / `ToolResult` 事件 / `ToolCall` 事件 / `before_tool` /

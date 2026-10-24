@@ -24,8 +24,11 @@
 //! Keep callbacks non-blocking; never join GIL-dependent threads from one.
 //!
 //! Scope note: the `set_model` / limits hot-update family and MCP hot
-//! add/remove are deliberately NOT exposed here (minimal-surface v0.3 decision
-//! — Rust hosts get them via the core crate). The hooks interception layer IS
+//! add/remove ARE exposed (`set_model` / `set_reasoning_effort` /
+//! `set_max_tokens` / `set_max_context_tokens` / `add_mcp_server` /
+//! `remove_mcp_server`); like every sync method they follow the busy contract
+//! above and, by the kernel's scope decision, do NOT reach `task` sub-agents
+//! constructed before the swap. The hooks interception layer IS
 //! exposed (`Agent.set_hooks` / `hooks=` kwarg): a Python object with any of
 //! `before_tool` / `after_tool` / `on_chat_request`; missing methods are
 //! no-ops, and the core `after_tool` signature already carries `&ToolCtx`.
@@ -42,7 +45,7 @@
 // file (pure pyo3 glue) so a genuine useless conversion elsewhere still trips.
 #![allow(clippy::useless_conversion)]
 
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pythonize::{depythonize, pythonize};
 use std::cell::Cell;
@@ -476,6 +479,190 @@ fn install_hooks(agent: &mut ta::Agent, hooks: Option<Py<PyAny>>, py: Python<'_>
     Ok(())
 }
 
+// ── user content blocks: str shorthand + the JSON block shapes ───────────────
+//
+// `push_user` used to take `text: &str` only, which kept host-side PDF / image
+// attachments out of reach: the Rust API accepts any `Vec<Block>`, but a Python
+// caller had no way to hand one over. The accepted dict shapes reuse the
+// vocabulary the transcript already speaks — the tagged `{"type": …}` form and
+// the externally-tagged serde form `messages()` reports — so a block that
+// round-trips through `messages()` can be pushed straight back. The bindings
+// add no block vocabulary of their own.
+//
+// A plain `str` stays the shorthand for one text block, so every existing call
+// site keeps working unchanged.
+
+/// Parse one user-supplied content block. Two dict shapes are accepted:
+///
+/// - the Anthropic-style tagged form `{"type": "text"|"image"|"document", …}`;
+/// - the externally-tagged serde form `messages()` actually reports —
+///   `{"text": "…"}`, `{"image": {"media_type", "data"}}`,
+///   `{"document": {…}}` — so a block read back from history can be pushed
+///   straight back (the round-trip hosts need for attachment re-send).
+///
+/// The second is normalized onto the first, so there is one parser below.
+///
+/// Only the model-facing variants are accepted: `tool_use` / `tool_result` are
+/// agent-loop internals whose ids must pair with the model's own output —
+/// a host injecting them would forge that pairing.
+fn block_from_py(bound: &Bound<'_, PyAny>) -> PyResult<ta::Block> {
+    let v: Value = depythonize(bound).map_err(|e| {
+        to_pyerr(format!(
+            "content block must be a dict shaped like {{\"type\": \"text\"|\"image\"|\"document\", …}} \
+             or like the messages() form ({{\"text\": …}} / {{\"image\": {{…}}}}): {e}"
+        ))
+    })?;
+    let v = match v.get("type") {
+        Some(_) => v,
+        None => serde_block_to_tagged(&v)?,
+    };
+    let tag = v
+        .get("type")
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| to_pyerr("content block dict needs a string \"type\" field"))?;
+    reject_mixed_shape(&v, tag)?;
+    match tag {
+        "text" => {
+            let text = v
+                .get("text")
+                .and_then(|t| t.as_str())
+                .ok_or_else(|| to_pyerr("text block needs a string \"text\" field"))?;
+            Ok(ta::Block::Text(text.to_string()))
+        }
+        "image" | "document" => {
+            // Both are `{media_type, data}`; the tag picks the variant. The
+            // base64 payload is passed through verbatim (no data-URL prefix
+            // stripping here — the loaders below are what produce it).
+            let media_type = v
+                .get("media_type")
+                .and_then(|m| m.as_str())
+                .ok_or_else(|| {
+                    to_pyerr(format!("{tag} block needs a string \"media_type\" field"))
+                })?;
+            let data = v
+                .get("data")
+                .and_then(|d| d.as_str())
+                .ok_or_else(|| to_pyerr(format!("{tag} block needs a string \"data\" field")))?;
+            Ok(if tag == "image" {
+                ta::Block::Image {
+                    media_type: media_type.to_string(),
+                    data: data.to_string(),
+                }
+            } else {
+                ta::Block::Document {
+                    media_type: media_type.to_string(),
+                    data: data.to_string(),
+                }
+            })
+        }
+        "tool_use" | "tool_result" => Err(internal_block_error(tag)),
+        other => Err(to_pyerr(format!(
+            "unknown content block type {other:?} (expected \"text\", \"image\", or \"document\")"
+        ))),
+    }
+}
+
+/// The rejection for `tool_use` / `tool_result`, shared by both input shapes.
+fn internal_block_error(tag: &str) -> PyErr {
+    to_pyerr(format!(
+        "content block type {tag:?} is agent-loop internal (its ids must pair with \
+         the model's own output) and cannot be pushed by the host"
+    ))
+}
+
+/// Reject a tagged block that ALSO carries a different externally-tagged shape
+/// key (`{"type": "text", "image": {…}}`): the tagged branch would silently
+/// drop the second block. The same-name pair is the normal tagged form
+/// (`{"type": "text", "text": "…"}`), so only keys other than `tag` count.
+fn reject_mixed_shape(v: &Value, tag: &str) -> PyResult<()> {
+    for key in ["text", "image", "document", "tool_use", "tool_result"] {
+        if key != tag && v.get(key).is_some() {
+            return Err(to_pyerr(format!(
+                "content block has type {tag:?} but also carries the {key:?} shape key; \
+                 send exactly one block shape per dict"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Normalize the serde shape `messages()` emits (externally tagged:
+/// `{"text": "…"}`, `{"image": {"media_type", "data"}}`, …) onto the tagged
+/// form `block_from_py` parses. `tool_use` / `tool_result` are recognized only
+/// so they get the precise rejection rather than a generic shape error. A block
+/// carrying MORE than one shape key is rejected — silently keeping the first
+/// would drop the rest of the host's content.
+fn serde_block_to_tagged(v: &Value) -> PyResult<Value> {
+    let obj = v
+        .as_object()
+        .ok_or_else(|| to_pyerr("content block must be a dict"))?;
+    let present: Vec<&str> = ["text", "image", "document", "tool_use", "tool_result"]
+        .into_iter()
+        .filter(|key| obj.contains_key(*key))
+        .collect();
+    if present.len() > 1 {
+        return Err(to_pyerr(format!(
+            "content block mixes multiple message shapes ({}); send exactly one shape per dict",
+            present.join(", ")
+        )));
+    }
+    match present.first().copied() {
+        Some("text") => match obj.get("text") {
+            Some(Value::String(s)) => Ok(serde_json::json!({ "type": "text", "text": s.clone() })),
+            _ => Err(to_pyerr("text block needs a string \"text\" field")),
+        },
+        Some(tag @ ("image" | "document")) => {
+            let fields = obj
+                .get(tag)
+                .and_then(Value::as_object)
+                .ok_or_else(|| to_pyerr(format!("{tag} block needs an object \"{tag}\" field")))?;
+            let mut m = fields.clone();
+            m.insert("type".into(), Value::String(tag.into()));
+            Ok(Value::Object(m))
+        }
+        Some(tag @ ("tool_use" | "tool_result")) => Err(internal_block_error(tag)),
+        _ => Err(to_pyerr(
+            "content block dict needs a string \"type\" field (\"text\" / \"image\" / \
+             \"document\") or the messages() shape, e.g. {\"text\": \"hello\"}",
+        )),
+    }
+}
+
+/// Convert the `push_user` argument into blocks:
+/// - `str` → one text block (the pre-existing shorthand, unchanged);
+/// - a single dict → one block;
+/// - a list / tuple of `str|dict` → one block each (order preserved).
+fn push_user_blocks(bound: &Bound<'_, PyAny>) -> PyResult<Vec<ta::Block>> {
+    if let Ok(s) = bound.extract::<String>() {
+        return Ok(vec![ta::Block::Text(s)]);
+    }
+    if bound.is_instance_of::<pyo3::types::PyDict>() {
+        return Ok(vec![block_from_py(bound)?]);
+    }
+    if let Ok(items) = bound.extract::<Vec<Bound<'_, PyAny>>>() {
+        if items.is_empty() {
+            return Err(to_pyerr(
+                "push_user needs at least one content block (got an empty sequence)",
+            ));
+        }
+        return items
+            .iter()
+            .map(|item| {
+                // Inside a sequence a bare `str` is one text block too, so
+                // ["caption", {"type": "image", …}] reads naturally.
+                if let Ok(s) = item.extract::<String>() {
+                    Ok(ta::Block::Text(s))
+                } else {
+                    block_from_py(item)
+                }
+            })
+            .collect();
+    }
+    Err(to_pyerr(
+        "push_user expects a str, a content-block dict, or a sequence of those",
+    ))
+}
+
 // ── Provider: a custom provider from a Python callable ──────────────────────
 
 /// The request shape handed to a Python custom provider: the conversation +
@@ -664,12 +851,24 @@ impl Agent {
         self.with_agent(py, |a| a.set_hooks(std::sync::Arc::new(h)))
     }
 
-    /// Append a user message (text) to the conversation, then `.run()`.
-    fn push_user(&self, text: &str, py: Python<'_>) -> PyResult<()> {
+    /// Append a user message to the conversation, then `.run()`.
+    ///
+    /// Accepts a `str` (one text block — the original shorthand), a single
+    /// content-block dict, or a sequence of those. Block dicts come in either
+    /// shape: the tagged one
+    /// `{"type": "text", "text": …}` /
+    /// `{"type": "image"|"document", "media_type": …, "data": <base64>}`, or
+    /// the externally-tagged form `messages()` actually reports
+    /// (`{"text": …}` / `{"image": {"media_type": …, "data": …}}`) — so a block
+    /// read back from the transcript can be pushed straight in.
+    /// `tool_use` / `tool_result` are refused: their ids must pair with the
+    /// model's own output.
+    fn push_user(&self, content: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<()> {
+        let blocks = push_user_blocks(content)?;
         // The returned session-save warning is dropped (same as before the
         // lock-model fix — the headless binary surfaces it, bindings don't).
         self.with_agent(py, |a| {
-            a.push_user(vec![ta::Block::Text(text.into())]);
+            a.push_user(blocks);
         })
     }
 
@@ -800,6 +999,92 @@ impl Agent {
     /// The model name this agent sends with each request.
     fn model(&self, py: Python<'_>) -> PyResult<String> {
         self.with_agent(py, |a| a.model().to_string())
+    }
+
+    // ── hot-update surface (between runs) ───────────────────────────────────
+    //
+    // Pure field swaps in the kernel: the next request uses the new value, and
+    // MCP connections / tool assembly / history / the session file are all
+    // untouched (rebuilding the agent would re-run every MCP handshake —
+    // seconds on a slow server). Deliberate scope, shared with the kernel:
+    // `"task"` sub-agents capture their config at construction and do NOT
+    // follow these setters — swap before spawning if it must apply.
+
+    /// Swap the model for subsequent requests (same provider/endpoint).
+    /// Validity is the caller's: an unknown model name fails at the next
+    /// request, honestly, like a config typo. Same busy contract as the other
+    /// sync methods.
+    fn set_model(&self, model: &str, py: Python<'_>) -> PyResult<()> {
+        self.with_agent(py, |a| a.set_model(model))
+    }
+
+    /// Swap the reasoning-effort hint forwarded to the provider verbatim
+    /// (`None` = server default). No enum validation — vendor ladders differ.
+    #[pyo3(signature = (effort=None))]
+    fn set_reasoning_effort(&self, effort: Option<String>, py: Python<'_>) -> PyResult<()> {
+        self.with_agent(py, |a| a.set_reasoning_effort(effort.as_deref()))
+    }
+
+    /// Swap the per-request output budget. Accepts an integer in
+    /// `0..=4294967295`; 0 is clamped to 1 by the kernel (a persistent 0 would
+    /// make every following request an instant provider 400). Negative and
+    /// out-of-range values raise ValueError (the same acceptance set as the
+    /// Node binding's `setMaxTokens`).
+    fn set_max_tokens(&self, max_tokens: i64, py: Python<'_>) -> PyResult<()> {
+        if !(0..=i64::from(u32::MAX)).contains(&max_tokens) {
+            return Err(PyValueError::new_err(
+                "set_max_tokens: max_tokens must be an integer in 0..=4294967295 \
+                 (0 is clamped to 1)",
+            ));
+        }
+        self.with_agent(py, |a| a.set_max_tokens(max_tokens as u32))
+    }
+
+    /// Update the context-window ceiling used by the preflight compression
+    /// estimate (`0` = fall back to the char heuristic). Hosts learn the REAL
+    /// window from their model catalog at runtime; a wrong ceiling fires the
+    /// preflight far too early or never. Negative values raise ValueError
+    /// (the same acceptance set as the Node binding's
+    /// `setMaxContextTokens`).
+    fn set_max_context_tokens(&self, tokens: i64, py: Python<'_>) -> PyResult<()> {
+        if tokens < 0 {
+            return Err(PyValueError::new_err(
+                "set_max_context_tokens: tokens must be an integer >= 0 \
+                 (0 = fall back to the char heuristic)",
+            ));
+        }
+        self.with_agent(py, |a| a.set_max_context_tokens(tokens as u64))
+    }
+
+    /// Attach one MCP server at runtime (spawn + handshake, then the tools
+    /// join the next request). `cfg` is a dict shaped like one entry of the
+    /// config file's `"mcp_servers"` list (`{"name": …, "command": …,
+    /// "args": […], "env": {…}}` or `{"name": …, "url": …, "headers": {…}}`);
+    /// unknown keys are an error. Returns the new tool display names.
+    ///
+    /// A name collision with any existing tool is a recoverable error and the
+    /// agent is left exactly as it was (no partial add). NOT propagated to
+    /// `task` sub-agents (they snapshot the tool set at construction) nor to
+    /// the run_code sandbox registry. Blocking: the handshake happens with the
+    /// GIL released, but this method itself waits for the server.
+    fn add_mcp_server(&self, cfg: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<Vec<String>> {
+        let parsed: ta::McpServerConfig = depythonize(cfg).map_err(|e| {
+            to_pyerr(format!(
+                "mcp server dict (shaped like one \"mcp_servers\" entry): {e}"
+            ))
+        })?;
+        self.with_agent(py, |a| a.add_mcp_server(parsed))
+            .and_then(|r| r.map_err(to_pyerr))
+    }
+
+    /// Detach an MCP server by its CONFIG name (the `name` field, not the
+    /// `mcp_<server>_<tool>` display names). Returns how many tools were
+    /// removed; an unknown name is an error, not a silent no-op. The stdio
+    /// child dies when its last holder drops (immediately if only this agent
+    /// held it).
+    fn remove_mcp_server(&self, name: &str, py: Python<'_>) -> PyResult<usize> {
+        self.with_agent(py, |a| a.remove_mcp_server(name))
+            .and_then(|r| r.map_err(to_pyerr))
     }
 
     /// Enable the sandboxed `run_code` tool for the NEXT request (runtime

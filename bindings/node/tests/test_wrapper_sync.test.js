@@ -99,3 +99,18 @@ test('wrapper.js wraps every method that takes onEvent (Fatal TSFN protection)',
     );
   }
 });
+
+test('wrapper.Agent.create overrides the native static (prototype fix-up)', () => {
+  // Native resolves a plain `native.Agent` (class instances can only be
+  // materialized on the JS thread), so the wrapper MUST override the static
+  // and re-point the prototype — otherwise `Agent.create()` returns an agent
+  // whose run()/compact() lost their onEvent guard. Statics live on the
+  // constructor, not the prototype, so the d.ts prototype scan above cannot
+  // see this method; this test is the guard.
+  assert.strictEqual(typeof native.Agent.create, 'function');
+  assert.notStrictEqual(
+    wrapper.Agent.create,
+    native.Agent.create,
+    'wrapper.Agent.create must override the native static',
+  );
+});
