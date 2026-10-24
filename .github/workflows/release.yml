@@ -149,9 +149,11 @@ jobs:
           working-directory: bindings/python
           command: build
           # --find-interpreter 会捡到容器里的 Python 3.14，而 pyo3 0.22 上限 3.13
-          # （本地 3.14 实测复现：configured interpreter newer than maximum supported）。
-          # 显式列出 3.8–3.13；升级 pyo3 后可放宽或换回 --find-interpreter。
-          args: --release --out dist -i 3.8 -i 3.9 -i 3.10 -i 3.11 -i 3.12 -i 3.13
+          # （本地 3.14 实测复现：configured interpreter newer than maximum supported）；
+          # 且 pypa 镜像已随 EOL 移除 cp38（-i 3.8 上轮真跑失败的原因）。显式钉
+          # 3.9–3.13（镜像现行集合，见 pypa/manylinux Dockerfile）；3.8 用户走
+          # sdist 自建；升级 pyo3 后可放宽或换回 --find-interpreter。
+          args: --release --out dist -i 3.9 -i 3.10 -i 3.11 -i 3.12 -i 3.13
           manylinux: manylinux2014
 
       # sdist 与解释器/ABI 无关，宿主直接打（内含 crates/core 路径依赖，
