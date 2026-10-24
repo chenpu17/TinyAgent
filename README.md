@@ -6,6 +6,8 @@ English · [简体中文](README.zh-CN.md)
 
 A minimal single-binary AI agent: one JSON config is all it takes to run. Two modes — headless task execution (harness scenarios) or a TUI chat. Targets: low-spec embedded Linux, macOS, Windows; a refined toolset, ~15k lines of core code (the agent loop lives in `agent.rs`; the optional TUI adds ~5k), structured to be read end-to-end quickly and customized freely.
 
+**First host: [TinySSH](https://github.com/chenpu17/TinySSH)** — a human–AI collaborative terminal (SSH client + first-class local terminal + embedded agent) that runs this kernel inside real sessions, behind approvals, audit, and explicit control hand-off.
+
 ## Features
 
 - **Single executable**, no runtime dependencies; a musl static build can be dropped onto a router / Raspberry Pi / CI runner and just run

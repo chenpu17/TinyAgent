@@ -6,6 +6,8 @@
 
 一个极简的单二进制 AI agent：一个 JSON 配置即可运行。两种模式 —— headless 执行任务（harness 场景）或 TUI 对话。目标：嵌入式低配 Linux、macOS、Windows，工具精炼、约 1.5 万行核心代码（核心 agent loop 集中在 `agent.rs`；可选 TUI 约 5 千行），结构清晰可快速通读并自行定制。
 
+**第一个完整宿主：[TinySSH](https://github.com/chenpu17/TinySSH)**——人机协同终端（SSH 客户端 + 一等公民本地终端 + 内置 Agent），本内核在真实会话中运行，经审批链、审计与显式控制权交托接入。
+
 ## 特性
 
 - **单一可执行文件**，无运行时依赖；musl 静态编译后可丢到路由器 / 树莓派 / CI runner 直接跑
