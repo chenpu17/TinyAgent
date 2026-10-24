@@ -3,6 +3,10 @@
   "version": "0.4.2",
   "description": "Node.js / TypeScript bindings for TinyAgent",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/chenpu17/TinyAgent.git"
+  },
   "main": "wrapper.js",
   "types": "wrapper.d.ts",
   "napi": {

@@ -4,6 +4,7 @@ version = "0.4.2"
 edition = "2021"
 description = "Node.js / TypeScript bindings for TinyAgent (import 'tiny-agent')"
 license = "MIT"
+repository = "https://github.com/chenpu17/TinyAgent"
 
 [lib]
 crate-type = ["cdylib"]

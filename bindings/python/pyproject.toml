@@ -9,6 +9,9 @@ description = "Python bindings for TinyAgent: a minimal, auditable AI agent"
 license = { text = "MIT" }
 requires-python = ">=3.8"
 
+[project.urls]
+Repository = "https://github.com/chenpu17/TinyAgent"
+
 [tool.maturin]
 # Flat module (tiny_agent.* ABI), not a package directory.
 module-name = "tiny_agent"

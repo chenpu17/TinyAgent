@@ -168,9 +168,15 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+      # npm install (not ci): the optionalDependencies platform subpackages
+      # (tiny-agent-<platform>) are built by the release workflow and not yet
+      # on the registry, so package-lock.json carries no entries for them —
+      # `npm ci` treats that as lock/package.json desync and fails on a clean
+      # checkout. `npm install` tolerates unresolvable optional deps and
+      # leaves the lock unchanged. Revisit after the first npm publish.
       - run: |
           cd bindings/node
-          npm ci
+          npm install
           npm run build:debug
           npm test
       - run: cargo clippy -p tiny-agent-node --all-targets -- -D warnings

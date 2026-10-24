@@ -11,8 +11,7 @@ edition = "2021"
 rust-version = "1.86"
 description = "TinyAgent kernel: the agent loop, tools, providers, and assembly that drive the tiny-agent CLI and the Python/TypeScript bindings"
 license = "MIT"
-# repository/documentation: left unset until the project has a public home —
-# add them at first publish.
+repository = "https://github.com/chenpu17/TinyAgent"
 keywords = ["agent", "llm", "mcp", "sandbox", "wasm"]
 categories = ["development-tools"]
 

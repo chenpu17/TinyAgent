@@ -12,6 +12,7 @@ edition = "2021"
 rust-version = "1.86"
 description = "A minimal single-binary AI agent: one JSON config, two modes (headless / TUI)"
 license = "MIT"
+repository = "https://github.com/chenpu17/TinyAgent"
 
 # Workspace split (kernel extraction): the ROOT package is the CLI/binary
 # half — process-level shell only (arg parsing, SIGINT, exit codes, headless

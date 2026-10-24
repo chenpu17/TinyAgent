@@ -1,7 +1,9 @@
 # TinyAgent — 项目备忘
 
 单二进制、同步（无 tokio）的极简 AI agent。一个 JSON 配置，两种模式：headless（harness / 评测）
-与 TUI 对话。详细用法见 `README.md`。
+与 TUI 对话。详细用法见 `README.md`（英文）与 `README.zh-CN.md`（中文）——两份内容平行，
+改了共享事实（配置默认值、键位、事件表等）要两边同步；代码结构树由 gen_structure 双写，勿手改。
+仓库主场 **github.com/chenpu17/TinyAgent**（origin），gitee 为镜像（remote 名 `gitee`）。
 
 **本文件只保留高频纪律与每主题一句话索引**；完整的设计决策与踩坑详录已归档到
 `docs/claude/architecture.md`（架构要点）与 `docs/claude/pitfalls.md`（容易踩的坑）——
@@ -31,8 +33,8 @@ cargo fmt --all                            # 格式化（CI 有 --check 门禁�
 `--check`，含双绑定 crate；存量 305 处漂移已在一个纯格式 commit 清零，该 commit 记在
 `.git-blame-ignore-revs`，`git blame` 配 ignoreRevsFile 后可跳过）。CI fmt job 还带两个
 文档同步门禁：`scripts/sync_run_code_contract.py --check`（含 README code 配置表与
-`CodeConfig::default` 的交叉核对）和 `scripts/gen_structure.py --check`（README 代码结构树
-行数从源文件实时生成）——动了对应内容记得 `--write` 再提交。
+`CodeConfig::default` 的交叉核对）和 `scripts/gen_structure.py --check`（README.md 与 README.zh-CN.md 两份代码结构树行数从源文件
+实时生成，ENTRIES 描述单一事实源、双写两份）——动了对应内容记得 `--write` 再提交。
 **测试命令必带 `--features mock` 才真正跑到 `tests/lib_api.rs`**：该文件整体门在
 `#![cfg(feature = "mock")]` 后（`provider::mock` 是 `cfg(any(test, feature = "mock"))`，
 而集成测试编译时 lib 不带 `cfg(test)`），不带 mock 的 `cargo test` 把它编成 **0 个测试
@@ -76,14 +78,16 @@ cargo clippy -p tiny-agent-node
 - message 里有双引号会破坏 `-m "..."` 的 shell 引号——改用 `git commit -F <文件>` 写多行 message。
 - **发布（tag）**：版本号同步 6 处（根 `Cargo.toml`、`bindings/{python,node}/Cargo.toml`、
   `pyproject.toml`、`package.json`、`bindings/node/package-lock.json` 的 optionalDependencies
-  版本——`npm install` 会自动刷新，`npm ci` 则因不同步直接报错）+ `CHANGELOG.md` 补段，然后 `git tag vX.Y.Z` 推双远端
-  （gitee origin + github）。tag 推 GitHub 触发 `release.yml`（musl 产物，tarball 附
-  README + LICENSE）。流程详见 README 发布节。许可证是 **MIT**（根 `LICENSE`，5 处元数据
-  已同步）——新增子模块/产物别忘带许可声明。
+  版本——`npm install` 会自动刷新；平台子包首发 npmjs 前 lock 里没有它们的条目，`npm ci` 在
+  干净 checkout 上必报不同步，CI 因此用 `npm install`，首发后再评估改回）+ `CHANGELOG.md` 补段，
+  然后 `git tag vX.Y.Z` 推双远端（github origin + gitee 镜像）。tag 推 GitHub 触发 `release.yml`
+  （musl 产物，tarball 附 README + LICENSE）。流程详见 README 发布节。许可证是 **MIT**
+  （根 `LICENSE`，各包 manifest 的 repository 字段统一指向 github.com/chenpu17/TinyAgent）——
+  新增子模块/产物别忘带许可声明。
 
 ## 高频纪律（几乎每次改动都适用）
 
-- **三个 clippy 配置 + `cargo fmt --all` 全跑**（见上「常用命令」），黄字即红灯。
+- **四个 clippy 配置 + `cargo fmt --all` 全跑**（见上「常用命令」），黄字即红灯。
 - **测试必带 `--features mock`**，否则 `tests/lib_api.rs` 编成 0 个测试照样全绿。
 - **改 `agent.rs` 核心路径必须配套 loop 测试**（`agent_tests.rs` + `provider/mock.rs` 脚本化 Provider，
   不连网）——别只靠 mock server 跑一遍就提交。

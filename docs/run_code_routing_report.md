@@ -91,7 +91,7 @@ python3 scripts/sync_run_code_contract.py --check
 | `tests/run_code_skill.rs` | 直接抽取文档代码块，在真实 QuickJS 中执行回归 |
 | `scripts/sync_run_code_contract.py` | 开发期契约同步与指纹检查 |
 | `docs/run_code_routing_manifest.json` | 源文件、描述、teaser、schema、prelude、提示词正文的 SHA256 |
-| `docs/run_code_design.md`、`docs/run_code_trigger.html` | 规格与触发说明同步 |
+| `docs/run_code_design.md` | 规格与触发说明同步 |
 | `README.md`、`CLAUDE.md`、`docs/claude/architecture.md` | 接入与维护说明 |
 
 编译与运行配置：
