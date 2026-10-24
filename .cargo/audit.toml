@@ -1,0 +1,10 @@
+# cargo-audit 忽略清单（CI audit job 读这里的 [advisories].ignore）。
+# 两条 pyo3 advisory 只影响 bindings/python（内核与 CLI 的依赖树不含 pyo3）：
+#   RUSTSEC-2025-0020 PyString::from_object 缓冲溢出风险——该 API 绑定未使用（grep 坐实）
+#   RUSTSEC-2026-0177 PyCFunction::new_closure 缺 Sync 约束——该 API 绑定未使用（grep 坐实）
+# 修复需 pyo3 0.22 → 0.24+/0.29 破坏性迁移，作为后续事项跟踪；升级完成后删除本文件。
+[advisories]
+ignore = [
+    "RUSTSEC-2025-0020",
+    "RUSTSEC-2026-0177",
+]
