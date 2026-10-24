@@ -248,10 +248,15 @@ jobs:
     # cargo-audit：RustSec 公告库扫描依赖树。依赖面小（reqwest + serde +
     # ratatui 级别），每次推送全量扫；出现 advisory 时红灯，由维护者决策
     # 升级或加 ignore。工具链锁定 stable，advisory 库每日随上游更新。
+    # 不用 rustsec/audit-check@v2：它以 `--file Cargo.lock --json` 调用并
+    # 用自带逻辑判定（warning 也计入上报、还要拿 checks:write 建 check
+    # run），与本地 `cargo audit` 的退出码语义不一致（本地绿、CI 红）。
+    # 直接跑同一条命令：本地绿 == CI 绿，ignore 清单由 .cargo/audit.toml
+    # 单源供给（见该文件的理由注释）。
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install --locked cargo-audit
+      - run: cargo audit
