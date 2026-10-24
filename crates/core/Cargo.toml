@@ -74,7 +74,7 @@ sha2 = { version = "0.10", optional = true }
 # have process groups, so all of this stays Windows-only.
 [target.'cfg(windows)'.dependencies]
 encoding_rs = "0.8"
-windows-sys = { version = "0.52", features = ["Win32_Globalization", "Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Globalization", "Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 # Unix-only process-group machinery (shell timeout kill, MCP child teardown);
 # every libc call site in this crate is #[cfg(unix)].
