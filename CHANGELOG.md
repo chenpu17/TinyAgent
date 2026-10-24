@@ -5,7 +5,15 @@
 
 ## [Unreleased]
 
-（空）
+### Fixed
+
+- **release.yml bindings-python sdist 步骤 EACCES（v0.4.3 Python wheel 缺失的根因）**：wheel 构建走
+  manylinux 容器，docker 以 root 身份把产物写回挂载的工作树——`bindings/python/dist/` 归 root，
+  宿主 runner 用户随后往同一 `dist/` 写 sdist 无写入权限而退出 1（jobs API 实锤：step6 wheel 成功、
+  step7 sdist 失败；本地 Windows 永远复现不了，因为权限模型不同）。修复：容器构建后、宿主 sdist 前
+  加 `sudo chown -R` 归还归属。同轮修正三个 `softprops/action-gh-release@v2` 步骤的输入名拼写
+  `generate_notes` → `generate_release_notes`（非法输入被静默忽略并告警，musl 步骤想要的自动
+  Release notes 自首次发布起就没生效过）。
 
 ## [0.4.3] - 2026-10-24
 

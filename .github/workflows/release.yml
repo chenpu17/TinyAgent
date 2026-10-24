@@ -46,9 +46,11 @@ jobs:
           tar -czf "dist/${DIR}.tar.gz" -C dist "${DIR}"
           (cd dist && shasum -a 256 "${DIR}.tar.gz" > "${DIR}.tar.gz.sha256")
 
+      # 输入名是 generate_release_notes（v0.4.3 前 CI 警告 Unexpected input
+      # 'generate_notes' 被静默忽略，自动 notes 一直没生效——改名才真开）。
       - uses: softprops/action-gh-release@v2
         with:
-          generate_notes: true
+          generate_release_notes: true
           files: |
             dist/*.tar.gz
             dist/*.sha256
@@ -156,6 +158,13 @@ jobs:
           args: --release --out dist -i 3.9 -i 3.10 -i 3.11 -i 3.12 -i 3.13
           manylinux: manylinux2014
 
+      # docker 容器以 root 身份往挂载的工作树写 wheel：dist/ 归 root，宿主
+      # runner 用户随后往同一 dist/ 写 sdist 会 EACCES——v0.4.3 三连失败的
+      # 根因（jobs API 实锤：step6 wheel 成功、step7 sdist exit 1）。构建后
+      # 先把归属还给 runner，再跑宿主侧步骤。
+      - name: Fix dist ownership (container writes as root)
+        run: sudo chown -R "$(id -u):$(id -g)" bindings/python/dist
+
       # sdist 与解释器/ABI 无关，宿主直接打（内含 crates/core 路径依赖，
       # 使用者在目标平台自行编译）。
       - uses: PyO3/maturin-action@v1
@@ -166,7 +175,7 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
-          generate_notes: false
+          generate_release_notes: false
           files: |
             bindings/python/dist/*
 
@@ -201,7 +210,7 @@ jobs:
       - uses: softprops/action-gh-release@v2
         if: env.NPM_TOKEN == ''
         with:
-          generate_notes: false
+          generate_release_notes: false
           files: |
             pkgs/**/*.tgz
         env:
