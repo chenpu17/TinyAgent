@@ -59,7 +59,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 # "no cache", never blocks the sandbox.
 wasmtime = { version = "36.0.14", optional = true, default-features = false, features = ["cranelift", "runtime", "std", "cache"] }
 # sha256 for run_code's audit meta (dual 128-bit-truncated input hashes).
-sha2 = { version = "0.10", optional = true }
+sha2 = { version = "0.11", optional = true }
 
 # Windows shell support: cmd.exe (and many legacy programs) emit text in the
 # system OEM code page (GBK/936 on Chinese Windows), not UTF-8 — the shell tool
