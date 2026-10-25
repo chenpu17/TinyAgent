@@ -9533,3 +9533,454 @@ fn slot_table_batch_skipped_before_announce_stays_silent() {
         vec!["ok".to_string(), "[cancelled by user]".to_string()]
     );
 }
+
+// ── R1: supervisor note injection (run-mid observer reminders) ─────────
+//
+// The TinyWorker observer contract: a host-side supervisor injects notes
+// mid-run through a cloned SupervisorHandle; the agent delivers each as a
+// SUPERVISOR_NOTE_MARKER-marked text block merged into the tail user turn
+// right before the next LLM call, or — when the run ends first — flushes
+// them into history at exit with a deferred NoteInjected event. FIFO,
+// at-most-once, never silently lost.
+
+/// Events of one run, filtered to the note deliveries: (text, deferred).
+fn note_texts(events: &[AgentEvent]) -> Vec<(String, bool)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::NoteInjected { text, deferred, .. } => Some((text.clone(), *deferred)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Notes delivered before the first LLM call land in that request, in FIFO
+/// order, as marker-prefixed blocks merged into the tail user turn; each
+/// delivery emits `NoteInjected { deferred: false }`; `Done` stays the last
+/// event. Also pins the wire shape of the new variant (externally tagged,
+/// bindings' serialization contract) and its ndjson tag.
+#[test]
+fn supervisor_notes_deliver_before_next_llm_call_in_order() {
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, state) = MockProvider::new(vec![mock::resp_text("done", None)]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("task")],
+        test_ctx(),
+    );
+    let sup = agent.supervisor_handle();
+    sup.inject_note("first reminder");
+    sup.inject_note("second reminder");
+    let mut events = Vec::new();
+    agent.run(&mut |e| events.push(e)).unwrap();
+    let cap = state.captured();
+    assert_eq!(cap.len(), 1);
+    assert_eq!(cap[0].user_texts.len(), 3, "task + two notes, one turn");
+    assert_eq!(cap[0].user_texts[0], "task");
+    assert!(cap[0].user_texts[1].starts_with(SUPERVISOR_NOTE_MARKER));
+    assert!(cap[0].user_texts[1].ends_with("first reminder"));
+    assert!(cap[0].user_texts[2].starts_with(SUPERVISOR_NOTE_MARKER));
+    assert!(cap[0].user_texts[2].ends_with("second reminder"));
+    assert_eq!(
+        note_texts(&events),
+        vec![
+            ("first reminder".to_string(), false),
+            ("second reminder".to_string(), false)
+        ]
+    );
+    let last_note = events
+        .iter()
+        .rposition(|e| matches!(e, AgentEvent::NoteInjected { .. }))
+        .unwrap();
+    let done = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Done { .. }))
+        .unwrap();
+    assert!(last_note < done, "Done must stay the last event");
+    // Serialization contract (bindings pass events through as serialized
+    // values): externally tagged, matching the enum's house style.
+    let v = serde_json::to_value(AgentEvent::NoteInjected {
+        kind: SUPERVISOR_NOTE_KIND.to_string(),
+        text: "t".into(),
+        deferred: true,
+    })
+    .unwrap();
+    assert_eq!(v["NoteInjected"]["kind"], "supervisor");
+    assert_eq!(v["NoteInjected"]["deferred"], true);
+    assert_eq!(
+        AgentEvent::NoteInjected {
+            kind: SUPERVISOR_NOTE_KIND.into(),
+            text: "t".into(),
+            deferred: false,
+        }
+        .ndjson_type(),
+        "note_injected"
+    );
+}
+
+/// A note injected while the run is live (the host reacts to its event
+/// stream) rides the queue to the NEXT turn top and reaches that turn's
+/// request — after the tool result that triggered it.
+#[test]
+fn supervisor_note_injected_mid_run_delivered_next_turn() {
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, state) = MockProvider::new(vec![
+        mock::resp_tool("t1", "echo", json!({}), None),
+        mock::resp_text("done", None),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(EchoTool::new("echo"))],
+        vec![user_text("task")],
+        test_ctx(),
+    );
+    let sup = agent.supervisor_handle();
+    let mut events = Vec::new();
+    agent
+        .run(&mut |e| {
+            // Host shape: observe a ToolCall, queue a reminder for the next
+            // request (TinyWorker's observer does this off-stream, from
+            // another thread — same handle, same contract).
+            if let AgentEvent::ToolCall { name, .. } = &e {
+                if name == "echo" {
+                    sup.inject_note("mid-run reminder");
+                }
+            }
+            events.push(e);
+        })
+        .unwrap();
+    let cap = state.captured();
+    assert_eq!(cap.len(), 2);
+    // Turn-2 request: task text, then the note (tool results are not Text
+    // blocks, so user_texts shows exactly these).
+    assert_eq!(
+        cap[1].user_texts,
+        vec![
+            "task".to_string(),
+            format!("{SUPERVISOR_NOTE_MARKER}\nmid-run reminder")
+        ]
+    );
+    // Delivery point is the next turn top: the note event fires after the
+    // ToolResult that provoked it.
+    let tool_result = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::ToolResult { .. }))
+        .unwrap();
+    let note = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::NoteInjected { .. }))
+        .unwrap();
+    assert!(tool_result < note);
+    assert_eq!(
+        note_texts(&events),
+        vec![("mid-run reminder".into(), false)]
+    );
+}
+
+/// The pure "run ended before any delivery point" shape: cancel pre-set →
+/// zero turns, zero requests, and the queued note is flushed into history
+/// at the unified exit (deferred event, model sees it next run) — never
+/// silently dropped. Done still fires (Ok path) and stays last.
+#[test]
+fn supervisor_note_flushed_deferred_when_run_ends_before_llm_call() {
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, state) = MockProvider::new(vec![mock::resp_text("never reached", None)]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("task")],
+        test_ctx(),
+    );
+    agent.set_cancel(Arc::new(AtomicBool::new(true)));
+    let sup = agent.supervisor_handle();
+    sup.inject_note("too late for this run");
+    let mut events = Vec::new();
+    let o = agent.run(&mut |e| events.push(e)).unwrap();
+    assert_eq!(o.stop_reason, "cancelled");
+    assert_eq!(state.calls(), 0, "no LLM call may happen");
+    assert_eq!(
+        note_texts(&events),
+        vec![("too late for this run".to_string(), true)]
+    );
+    let last = agent.messages().last().unwrap();
+    assert_eq!(last.role, Role::User);
+    let Block::Text(t) = &last.content[last.content.len() - 1] else {
+        panic!("expected a text block on the tail user turn");
+    };
+    assert!(t.starts_with(SUPERVISOR_NOTE_MARKER));
+    assert!(t.ends_with("too late for this run"));
+    let last_note = events
+        .iter()
+        .rposition(|e| matches!(e, AgentEvent::NoteInjected { .. }))
+        .unwrap();
+    let done = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Done { .. }))
+        .unwrap();
+    assert!(last_note < done, "flush precedes Done");
+}
+
+/// True cross-thread injection: the observer thread fires while the run
+/// loop holds `&mut self` (the tool gates until the injection landed). The
+/// notes must arrive FIFO before the next request, with no panic — the
+/// shared-handle pattern's whole point.
+#[test]
+fn supervisor_note_injection_from_another_thread_during_run() {
+    struct GateTool {
+        started: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+    }
+    impl Tool for GateTool {
+        fn def(&self) -> ToolDef {
+            ToolDef {
+                name: "gate".into(),
+                description: "test tool gating on a flag".into(),
+                schema: json!({"type": "object", "properties": {}}),
+            }
+        }
+        fn run(&self, _input: &Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+            self.started.store(true, Ordering::SeqCst);
+            while !self.release.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Ok(ToolOutput::text("released"))
+        }
+    }
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, state) = MockProvider::new(vec![
+        mock::resp_tool("t1", "gate", json!({}), None),
+        mock::resp_text("done", None),
+    ]);
+    let started = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(GateTool {
+            started: started.clone(),
+            release: release.clone(),
+        })],
+        vec![user_text("task")],
+        test_ctx(),
+    );
+    let sup = agent.supervisor_handle();
+    let injector = std::thread::spawn(move || {
+        while !started.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        sup.inject_note("cross a");
+        sup.inject_note("cross b");
+        release.store(true, Ordering::SeqCst);
+    });
+    let mut events = Vec::new();
+    agent.run(&mut |e| events.push(e)).unwrap();
+    injector.join().unwrap();
+    let cap = state.captured();
+    assert_eq!(cap.len(), 2);
+    assert_eq!(
+        cap[1].user_texts,
+        vec![
+            "task".to_string(),
+            format!("{SUPERVISOR_NOTE_MARKER}\ncross a"),
+            format!("{SUPERVISOR_NOTE_MARKER}\ncross b"),
+        ]
+    );
+    assert_eq!(
+        note_texts(&events),
+        vec![("cross a".into(), false), ("cross b".into(), false)]
+    );
+}
+
+/// Teardown insurance: drain_pending hands back still-undelivered notes
+/// FIFO and empties the queue; blank notes never enter it.
+#[test]
+fn supervisor_handle_drain_pending_and_blank_filtering() {
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, _state) = MockProvider::new(vec![]);
+    let agent = Agent::new(&cfg, Box::new(prov), vec![], vec![], test_ctx());
+    let sup = agent.supervisor_handle();
+    sup.inject_note("a");
+    sup.inject_note("   ");
+    sup.inject_note("b");
+    assert_eq!(sup.drain_pending(), vec!["a".to_string(), "b".to_string()]);
+    assert!(sup.drain_pending().is_empty(), "drain empties the queue");
+}
+
+/// The persistence contract: a delivered note block round-trips the session
+/// file byte-for-byte (it is a plain Text block — old readers and hosts see
+/// ordinary user text).
+#[test]
+fn supervisor_note_block_survives_session_round_trip() {
+    let dir = std::env::temp_dir().join(format!("ta-supnote-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("s.json");
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, _state) = MockProvider::new(vec![mock::resp_text("done", None)]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("task")],
+        test_ctx(),
+    );
+    agent.enable_session(path.clone());
+    let sup = agent.supervisor_handle();
+    sup.inject_note("persist me");
+    agent.run(&mut |_| {}).unwrap();
+    let (model, live) = crate::session::load(&path)
+        .unwrap()
+        .expect("session written");
+    assert_eq!(model, "m");
+    let all_text: String = live
+        .iter()
+        .flat_map(|m| {
+            m.content.iter().filter_map(|b| match b {
+                Block::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+        })
+        .collect();
+    assert!(all_text.contains(&format!("{SUPERVISOR_NOTE_MARKER}\npersist me")));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ── R1 × compression: stale-signal semantics ───────────────────────────
+//
+// A note is a time-sensitive control signal: verbatim cross-fold survival
+// is deliberately NOT wanted (the host confirmed — history bloat for text
+// that goes stale within a few turns). The summary prompt carries the gist
+// instead; the transcript still shows notes so the summarizer can fold
+// them in.
+
+#[test]
+fn fold_summary_excludes_supervisor_notes_from_verbatim_quotes() {
+    let bulk = "y".repeat(500);
+    let messages = vec![
+        user_text("task"),
+        user_text("keep this user intent"),
+        Message::assistant(vec![Block::Text(bulk)]),
+        Message::user(vec![
+            Block::Text("plain middle user text".into()),
+            Block::Text(format!("{}\nstale instruction", SUPERVISOR_NOTE_MARKER)),
+        ]),
+    ];
+    let folded = fold_summary(&messages, 4, "the summary");
+    let head = &folded[0];
+    let texts: Vec<&String> = head
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            Block::Text(t) => Some(t),
+            _ => None,
+        })
+        .collect();
+    // Ordinary middle user text rides the verbatim-quote mechanism…
+    assert!(texts
+        .iter()
+        .any(|t| t.starts_with(USER_QUOTE_MARKER) && t.contains("keep this user intent")));
+    assert!(texts
+        .iter()
+        .any(|t| t.starts_with(USER_QUOTE_MARKER) && t.contains("plain middle user text")));
+    // …supervisor notes deliberately do not.
+    assert!(
+        !texts.iter().any(|t| t.contains("stale instruction")),
+        "a supervisor note must not ride the verbatim-quote mechanism"
+    );
+}
+
+#[test]
+fn summary_prompt_carries_supervisor_note_guidance() {
+    for p in [
+        summary_prompt("BODY", None),
+        summary_prompt("BODY", Some("old brief")),
+    ] {
+        assert!(
+            p.contains(SUPERVISOR_NOTE_MARKER),
+            "guidance must name the exact marker (host replay matches bytewise)"
+        );
+        assert!(p.contains("Supervisor notes"));
+    }
+}
+
+#[test]
+fn window_lines_renders_middle_note_and_skips_head_note() {
+    let msgs = vec![
+        Message::user(vec![
+            Block::Text("task".into()),
+            Block::Text(format!("{}\nturn-1 note", SUPERVISOR_NOTE_MARKER)),
+        ]),
+        Message::user(vec![Block::Text(format!(
+            "{}\nmiddle note",
+            SUPERVISOR_NOTE_MARKER
+        ))]),
+    ];
+    let lines = window_lines(&msgs, 2).join("\n");
+    // Middle note reaches the summarizer transcript with its marker (the
+    // prompt guidance keys off it).
+    assert!(lines.contains("middle note"));
+    // Head note is preserved structurally in the head — re-feeding it as
+    // transcript would duplicate it (same rule as SUMMARY/TODO/USER_QUOTE).
+    assert!(!lines.contains("turn-1 note"));
+    assert!(lines.contains("task"));
+}
+
+/// End-to-end fold: a note sitting in the folded middle shows up in the
+/// summary request's transcript (marker + text + guidance) but is NOT
+/// preserved verbatim into the folded history — the ordinary middle user
+/// text next to it still is.
+#[test]
+fn compression_keeps_note_in_transcript_out_of_verbatim_head() {
+    let mut cfg = cfg_with(5, 0, 30);
+    cfg.limits.keep_recent_messages = 2;
+    let bulk = "y".repeat(2000);
+    let initial = vec![
+        user_text(&"x".repeat(40)),
+        user_text("intent to quote"),
+        Message::assistant(vec![Block::Text(bulk)]),
+        Message::user(vec![Block::Text(format!(
+            "{}\navoid double-checked locking",
+            SUPERVISOR_NOTE_MARKER
+        ))]),
+        Message::assistant(vec![Block::Text("a4".into())]),
+        user_text("u5"),
+    ];
+    let (prov, state) = MockProvider::new(vec![
+        mock::resp_text("SUMMARY", None),      // summarize_prefix call
+        mock::resp_text("final answer", None), // main call
+    ]);
+    let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+    let mut events = Vec::new();
+    agent.run(&mut |e| events.push(e)).unwrap();
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Compressed {
+                dropped: 3,
+                kept: 3,
+                ..
+            }
+        )),
+        "fold must happen (middle = intent + bulk + note)"
+    );
+    let cap = state.captured();
+    // Summary request: the transcript carries the note with its marker, and
+    // the guidance paragraph rides along.
+    let prompt = &cap[0].user_texts[0];
+    assert!(prompt.contains(SUPERVISOR_NOTE_MARKER));
+    assert!(prompt.contains("avoid double-checked locking"));
+    assert!(prompt.contains("Supervisor notes"));
+    // Folded main request: the note is gone verbatim; the neighbouring
+    // plain user text survived as a quote.
+    assert!(!cap[1]
+        .user_texts
+        .iter()
+        .any(|t| t.contains("avoid double-checked locking")));
+    assert!(cap[1]
+        .user_texts
+        .iter()
+        .any(|t| t.starts_with(USER_QUOTE_MARKER) && t.contains("intent to quote")));
+}

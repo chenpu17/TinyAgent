@@ -71,7 +71,8 @@ mod usage_probe;
 // ── Facade re-exports (the library's public face) ──────────────────────────
 pub use agent::{
     extract_plan, Agent, AgentEvent, CompressError, CompressOutcome, CompressTrigger,
-    CompressionRecord, RunCost, RunError, RunOutcome, TodoItem, ToolCallRecord, TurnTiming,
+    CompressionRecord, RunCost, RunError, RunOutcome, SupervisorHandle, TodoItem, ToolCallRecord,
+    TurnTiming, SUPERVISOR_NOTE_KIND,
 };
 pub use config::{CodeConfig, Config, Limits, McpServerConfig};
 pub use context_report::{

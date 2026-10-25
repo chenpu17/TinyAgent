@@ -40,6 +40,16 @@ pub(crate) const TODO_MARKER: &str =
 /// folds; subject to the shared [`USER_QUOTE_TOTAL_CHARS`] budget.
 pub(crate) const USER_QUOTE_MARKER: &str = "[用户消息原文保留 / User message preserved verbatim]";
 
+/// Marks a supervisor note the host injected mid-run (R1, see
+/// `Agent::supervisor_handle`): a time-sensitive control signal, carried as a
+/// plain text block so it survives `normalize_adjacent`, session round-trips,
+/// and old-binary reads like any user text. Deliberately NOT given the
+/// USER_QUOTE treatment (no verbatim cross-fold survival — a note goes stale
+/// within a few turns); the summary prompt carries its gist instead. Host
+/// replay recognizes notes by byte-exact prefix match — the string is a
+/// cross-team contract, change only with a version note.
+pub(crate) const SUPERVISOR_NOTE_MARKER: &str = "[监督者旁注 / Supervisor note]";
+
 /// Per-message cap for a preserved verbatim user text — big pastes (logs,
 /// code dumps) get truncated with the standard marker rather than crowding
 /// the head.
@@ -474,6 +484,13 @@ pub(crate) fn fold_summary(messages: &[Message], cut: usize, summary: &str) -> V
         }
         for b in &m.content {
             let Block::Text(t) = b else { continue };
+            // Supervisor notes are excluded on purpose (R1 contract): they are
+            // time-sensitive control signals, stale within a few turns — the
+            // summary prompt carries their gist instead of the head carrying
+            // them verbatim forever.
+            if t.starts_with(SUPERVISOR_NOTE_MARKER) {
+                continue;
+            }
             let t = t.trim();
             if t.is_empty() {
                 continue;
@@ -753,6 +770,10 @@ pub(crate) fn window_lines(messages: &[Message], cut: usize) -> Vec<String> {
                     if t.starts_with(SUMMARY_MARKER)
                         || t.starts_with(TODO_MARKER)
                         || t.starts_with(USER_QUOTE_MARKER)
+                        // A head note (turn-1 injection merges into the task
+                        // message) is already preserved verbatim in the head
+                        // — re-feeding it as transcript would duplicate it.
+                        || t.starts_with(SUPERVISOR_NOTE_MARKER)
                     {
                         continue;
                     }
@@ -803,7 +824,7 @@ pub(crate) fn summary_budget(size: usize) -> u32 {
 /// model to UPDATE a running brief from new material; otherwise to summarize
 /// fresh. The system prompt (SUMMARY_SYSTEM) is shared.
 pub(crate) fn summary_prompt(body: &str, old_summary: Option<&str>) -> String {
-    match old_summary {
+    let base = match old_summary {
         Some(old) if !old.trim().is_empty() => format!(
             "Below is the current running summary of the earlier conversation, followed by newer \
              conversation. Produce an UPDATED running summary that folds in the new material while \
@@ -811,7 +832,22 @@ pub(crate) fn summary_prompt(body: &str, old_summary: Option<&str>) -> String {
              ## Current running summary\n{old}\n\n## Newer conversation\n{body}"
         ),
         _ => format!("Summarize this conversation transcript:\n\n{body}"),
-    }
+    };
+    // Supervisor-note guidance rides every summary call (R1): notes are
+    // time-sensitive control signals from an external observer — the agent
+    // must not repeat a mistake the observer already flagged. Their gist
+    // belongs in the summary; verbatim preservation is deliberately NOT
+    // wanted (they go stale), so this is the only preservation channel.
+    // Appended here (not baked into SUMMARY_SYSTEM) so the marker stays
+    // single-sourced from the constant.
+    format!(
+        "{base}\n\n\
+         ## Supervisor notes\n\
+         User text starting with `{SUPERVISOR_NOTE_MARKER}` is a note injected by an external \
+         supervisor mid-run. Keep the gist of the RECENT ones in the summary — dropping one lets \
+         the agent repeat a mistake that was already flagged — but do not preserve them verbatim; \
+         they are time-sensitive and stale once acted on."
+    )
 }
 
 /// Append the host's focus instructions (manual `compact_with`) to a summary

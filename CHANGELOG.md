@@ -5,6 +5,23 @@
 
 ## [Unreleased]
 
+### Added
+
+- **监督者旁注注入（R1，TinyWorker 观察者运行中形态）**：`Agent::supervisor_handle()` 返回可
+  Clone 共享句柄（与 cancel 句柄同模式，队列自构造即存在、无注册时序），run 期间任意线程
+  `inject_note(text)` 注入。投递：**FIFO、至多一次、绝不无声丢失**——run 循环在每次 LLM 调用前
+  （`TurnStart` 后、preflight 压缩前，旁注计入 token 预检）排空队列，旁注作为带
+  `[监督者旁注 / Supervisor note]` 标记前缀的**文本块并入尾用户消息**（块级而非独立消息：
+  `normalize_adjacent` 会溶解相邻同角色消息，豁免合并则 wire 出 user-user 相邻；宿主回放按标记
+  前缀逐字节识别）。run 结束未及投递的在统一出口冲账进历史（`Done` 之前），事件
+  `NoteInjected { kind, text, deferred }`：`deferred=false` 本次请求可见，`deferred=true` 已入
+  历史、下次 run 模型可见。`SupervisorHandle::drain_pending()` 供会话销毁取回未投递旁注（堵
+  Agent 丢弃路径的静默蒸发）。压缩互适：摘要 prompt 附「近期旁注保留主旨」引导 + 标记随转录
+  可见；**刻意不进** USER_QUOTE 逐字保留机制（时效性控制信号，防历史膨胀），头内旁注跳过转录
+  去重。`task` 子代理独立实例无队列，天然不注入。harness `--json` 映射
+  `{"type":"note_injected",…}` + plain 模式 stderr 一行；TUI 系统卡渲染；bindings 事件序列化
+  透传零改动。文档：`docs/lib_api.md` 新增「监督者旁注注入」段（含消息形态的取舍理由）。
+
 ### Fixed
 
 - **release.yml bindings-python sdist 步骤 EACCES（v0.4.3 Python wheel 缺失的根因）**：wheel 构建走

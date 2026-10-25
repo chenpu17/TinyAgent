@@ -696,6 +696,20 @@ fn ui_loop(
                     AgentEvent::Warning(w) => {
                         rows.push(Row::sys_warn(format!("[warn] {w}")));
                     }
+                    AgentEvent::NoteInjected { text, deferred, .. } => {
+                        // Supervisor note (R1): a control signal injected by
+                        // an external observer — warn-level visibility so it
+                        // stands out; /export carries it like any row. The
+                        // deferred tag says it missed every delivery point
+                        // this run and rides history into the next one.
+                        if deferred {
+                            rows.push(Row::sys_warn(format!(
+                                "[supervisor note, deferred to next run] {text}"
+                            )));
+                        } else {
+                            rows.push(Row::sys_warn(format!("[supervisor note] {text}")));
+                        }
+                    }
                     AgentEvent::Usage {
                         input_tokens,
                         output_tokens,

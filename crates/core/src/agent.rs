@@ -6,6 +6,7 @@ use crate::provider::{Block, ChatEvent, ChatRequest, Message, Provider, Role, To
 use crate::tools::{BudgetGate, Tool, ToolConcurrency, ToolCtx, ToolOutput};
 use anyhow::Result;
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -317,6 +318,27 @@ pub enum AgentEvent {
     /// terminal with ratatui's raw-mode rendering and would corrupt the
     /// screen.
     Warning(String),
+    /// A supervisor note was delivered into the conversation (R1, see
+    /// [`Agent::supervisor_handle`]). The host injects a note mid-run from
+    /// another thread; the agent delivers it as a marked text block merged
+    /// into the tail user turn right before the next LLM call — the model
+    /// sees it on that request. `deferred == false` means exactly that:
+    /// delivered this run, visible to this request. `deferred == true` means
+    /// the run ended before any delivery point: the note was flushed into
+    /// history at run exit (after the last turn, before `Done`), and the
+    /// model will see it on the NEXT run's first request — late, never lost.
+    /// At-most-once either way; notes injected between runs ride the queue
+    /// to the next run's first delivery point.
+    NoteInjected {
+        /// Note kind — `"supervisor"` is the only kind today.
+        kind: String,
+        /// The note text exactly as injected (without the history marker
+        /// prefix the block carries).
+        text: String,
+        /// Whether delivery was deferred to the next run (the run ended
+        /// before a delivery point was reached).
+        deferred: bool,
+    },
     /// An event forwarded from a named sub-agent (the `task` tool). Carries the
     /// sub-agent's identity so a harness/UI can show concurrent sub-agent work
     /// and tell interleaved streams apart. The inner `event` is the child's own
@@ -365,10 +387,80 @@ impl AgentEvent {
             AgentEvent::Pruned { .. } => "pruned",
             AgentEvent::MaxTokensSalvage => "salvage",
             AgentEvent::Warning(_) => "warning",
+            AgentEvent::NoteInjected { .. } => "note_injected",
             AgentEvent::SubAgent { .. } => "subagent",
             AgentEvent::Done { .. } => "done",
         }
     }
+}
+
+/// The only note kind a host can inject today. Carried in
+/// [`AgentEvent::NoteInjected::kind`] so downstream pipelines can branch on
+/// it the day a second source of mid-run notes appears.
+pub const SUPERVISOR_NOTE_KIND: &str = "supervisor";
+
+/// Clone-able handle for injecting supervisor notes into a RUNNING agent
+/// (R1, the TinyWorker observer contract). Same shared-handle pattern as
+/// `set_cancel`'s `Arc<AtomicBool>` — but the queue exists unconditionally
+/// from construction, so the handle can be cloned any time (before, during,
+/// or between runs) and used from any thread: `inject_note` only touches
+/// the mutex inside the Arc, never the `Agent`, so no `&mut` aliasing
+/// arises even while `run` holds the agent.
+///
+/// Delivery semantics: FIFO, at-most-once, never silently dropped. A queued
+/// note is delivered either before the agent's next LLM call (merged into
+/// the tail user turn as a [`compress::SUPERVISOR_NOTE_MARKER`]-marked text
+/// block — model-visible on that request) or, if the run ends first,
+/// flushed into history at run exit with a `NoteInjected { deferred: true }`
+/// event; the model sees it on the next run's first request. Notes still
+/// queued when the host drops the agent vanish with it — call
+/// [`SupervisorHandle::drain_pending`] on session teardown to take them
+/// back instead.
+#[derive(Clone)]
+pub struct SupervisorHandle {
+    queue: Arc<Mutex<VecDeque<String>>>,
+}
+
+impl SupervisorHandle {
+    /// Queue a note for delivery before the agent's next LLM call. Order
+    /// preserved across calls; blank/whitespace-only notes are ignored
+    /// (they would become an empty history block). Non-blocking: the run
+    /// loop holds the same mutex only for the microseconds of a drain.
+    pub fn inject_note(&self, text: impl Into<String>) {
+        let text = text.into();
+        if text.trim().is_empty() {
+            return;
+        }
+        self.queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push_back(text);
+    }
+
+    /// Take back every still-undelivered note, leaving the queue empty.
+    /// Teardown insurance for the session-destroy path: a note left in the
+    /// queue of an agent about to be dropped would otherwise vanish
+    /// silently — the one loss shape the R1 contract forbids.
+    pub fn drain_pending(&self) -> Vec<String> {
+        self.queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain(..)
+            .collect()
+    }
+}
+
+/// The history shape of a delivered supervisor note: a plain user text block
+/// carrying the family-style marker prefix
+/// ([`compress::SUPERVISOR_NOTE_MARKER`]). Byte-exact prefix match on that
+/// marker is the replay contract shared with embedding hosts. A note is a
+/// BLOCK, never an independent message — `normalize_adjacent` dissolves an
+/// adjacent user message on the next request, and exempting notes from the
+/// merge would put user-user adjacency on the wire (Anthropic alternation);
+/// block-level identity is what the host's card rendering keys off anyway
+/// (tool results are blocks inside user messages too).
+fn supervisor_note_block(text: &str) -> Block {
+    Block::Text(format!("{}\n{text}", compress::SUPERVISOR_NOTE_MARKER))
 }
 
 /// One executed tool call, as recorded in the run's audit trail
@@ -891,6 +983,13 @@ pub struct Agent {
     /// agent can drop. Split from `cancel` so a recoverable turn-interrupt does
     /// not irreversibly kill the MCP server (no restart) the audit found.
     shutdown: Option<Arc<AtomicBool>>,
+    /// Supervisor-note inbox (R1). Unconditionally present — unlike
+    /// `cancel`'s opt-in install — so a [`SupervisorHandle`] can be cloned
+    /// before run with no registration-order hazard; empty and zero-cost
+    /// for hosts that never inject. Drained at each turn top (delivery) and
+    /// at run exit (deferred flush); see `SupervisorHandle` for the full
+    /// delivery contract.
+    notes: Arc<Mutex<VecDeque<String>>>,
     /// One compression failure disables further attempts for this run,
     /// so a persistent error doesn't retry (and warn) every single turn.
     compress_failed: bool,
@@ -1111,6 +1210,7 @@ impl Agent {
             session_path: None,
             cancel: None,
             shutdown: None,
+            notes: Arc::new(Mutex::new(VecDeque::new())),
             compress_failed: false,
             next_msg_id,
             usage: Usage::default(),
@@ -1822,7 +1922,72 @@ impl Agent {
         }
     }
 
+    /// Clone a handle for injecting supervisor notes into this agent's runs
+    /// (R1). Works any time — before a run, during one (from another
+    /// thread), or between runs; see [`SupervisorHandle`] for the delivery
+    /// contract. The handle stays valid for the agent's lifetime; notes
+    /// queued between runs are delivered at the next run's first turn.
+    pub fn supervisor_handle(&self) -> SupervisorHandle {
+        SupervisorHandle {
+            queue: Arc::clone(&self.notes),
+        }
+    }
+
+    /// Empty the supervisor-note inbox, FIFO. Shared by the turn-top
+    /// delivery point and the run-exit flush.
+    fn drain_notes(&self) -> Vec<String> {
+        self.notes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain(..)
+            .collect()
+    }
+
+    /// Deliver queued supervisor notes into history and tell the host.
+    /// `deferred == false` is the turn-top delivery path (the model sees the
+    /// notes on THIS turn's request); `deferred == true` is the run-exit
+    /// flush (the run ended before a delivery point — the notes enter
+    /// history for the NEXT run, and the host is told they were late, not
+    /// lost). `push_user` is the same ingestion path host content uses:
+    /// merges into a trailing user turn (keeping its id) or opens a new
+    /// one, mints ids, persists the session.
+    fn deliver_notes(&mut self, events: &mut dyn FnMut(AgentEvent), deferred: bool) {
+        for text in self.drain_notes() {
+            self.push_user(vec![supervisor_note_block(&text)]);
+            events(AgentEvent::NoteInjected {
+                kind: SUPERVISOR_NOTE_KIND.to_string(),
+                text,
+                deferred,
+            });
+        }
+    }
+
+    /// Unified exit funnel for the run loop: delivers still-queued supervisor
+    /// notes (R1) on EVERY exit path — the loop's clean breaks AND the Err
+    /// returns inside it — then emits `Done` on the success path.
+    ///
+    /// `Done` lives here rather than in the loop so a deferred flush always
+    /// arrives BEFORE the completion marker: a host that stops consuming its
+    /// card stream at `Done` must never miss a flush event (silent loss is
+    /// the one shape the R1 contract forbids). Moving the emission out of the
+    /// loop body preserves its exact historical semantics: only on Ok (error
+    /// paths emit no `Done`), last event of a successful run.
     fn run_impl(
+        &mut self,
+        events: &mut dyn FnMut(AgentEvent),
+        top_level: bool,
+    ) -> Result<RunOutcome, RunError> {
+        let result = self.run_loop(events, top_level);
+        self.deliver_notes(events, /* deferred = */ true);
+        if let Ok(outcome) = &result {
+            events(AgentEvent::Done {
+                stop_reason: outcome.stop_reason.clone(),
+            });
+        }
+        result
+    }
+
+    fn run_loop(
         &mut self,
         events: &mut dyn FnMut(AgentEvent),
         top_level: bool,
@@ -1958,6 +2123,15 @@ impl Agent {
             }
             turns += 1;
             events(AgentEvent::TurnStart(turns));
+            // R1 supervisor-note delivery point: drain the inbox here — after
+            // TurnStart (notes queued since the last turn, plus everything a
+            // host injected between runs, wait for exactly this spot), before
+            // preflight compression (so the notes' bytes are counted by the
+            // token precheck and the estimate anchor sees them as ordinary
+            // tail content). push_user merges each note as a marked text
+            // block into the tail user turn; see `supervisor_note_block` for
+            // why a block and not an independent message.
+            self.deliver_notes(events, /* deferred = */ false);
             // This turn's timing row bookkeeping: the timer starts here (so
             // preflight compression counts toward the turn) and the row is
             // pushed at the turn body's exit — every non-Err exit pushes one,
@@ -2512,9 +2686,6 @@ impl Agent {
             }
         }
 
-        events(AgentEvent::Done {
-            stop_reason: stop_reason.clone(),
-        });
         Ok(RunOutcome {
             final_text,
             turns,

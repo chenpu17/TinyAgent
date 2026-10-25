@@ -484,6 +484,16 @@ fn event_json(ev: &AgentEvent) -> Value {
         } => json!({"type": "pruned", "messages": *messages, "chars_freed": *chars_freed}),
         AgentEvent::MaxTokensSalvage => json!({"type": "salvage"}),
         AgentEvent::Warning(w) => json!({"type": "warning", "message": w.clone()}),
+        AgentEvent::NoteInjected {
+            kind,
+            text,
+            deferred,
+        } => json!({
+            "type": "note_injected",
+            "kind": kind.clone(),
+            "text": text.clone(),
+            "deferred": *deferred,
+        }),
         AgentEvent::TodoUpdate { todos } => {
             // Live plan-progress for `--json` pipelines. `todos` is the agent's
             // full current plan (full-replacement each `todo` call), serialized
@@ -934,6 +944,22 @@ impl<Out: Write, Err: Write> HumanRenderer<Out, Err> {
                     self.at_line_start = true;
                 }
                 let _ = writeln!(self.err, "[warn] {w}");
+                self.current_sub_name = None;
+            }
+            AgentEvent::NoteInjected { text, deferred, .. } => {
+                // A supervisor note is a control signal the human must see —
+                // stderr like warnings (stdout carries the transcript). The
+                // deferred tag says the note missed every delivery point this
+                // run and rides history into the next one.
+                if !self.at_line_start {
+                    let _ = writeln!(self.out);
+                    self.at_line_start = true;
+                }
+                if *deferred {
+                    let _ = writeln!(self.err, "[supervisor note, deferred to next run] {text}");
+                } else {
+                    let _ = writeln!(self.err, "[supervisor note] {text}");
+                }
                 self.current_sub_name = None;
             }
             AgentEvent::Usage {
@@ -1705,6 +1731,16 @@ mod tests {
         let v = event_json(&AgentEvent::Warning("careful".into()));
         assert_eq!(v["type"], "warning");
         assert_eq!(v["message"], "careful");
+        // NoteInjected → {"type":"note_injected","kind","text","deferred"}
+        let v = event_json(&AgentEvent::NoteInjected {
+            kind: "supervisor".into(),
+            text: "watch the deadline".into(),
+            deferred: false,
+        });
+        assert_eq!(v["type"], "note_injected");
+        assert_eq!(v["kind"], "supervisor");
+        assert_eq!(v["text"], "watch the deadline");
+        assert_eq!(v["deferred"], false);
         // TodoUpdate → {"type":"todo","todos":[{subject,status},...]} — the
         // full plan rides on every update (full-replacement semantics), so a
         // consumer can render the checklist from any single event.
