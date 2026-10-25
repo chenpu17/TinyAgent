@@ -329,7 +329,7 @@ impl ToolOutput {
 /// them by this marker: `Sequential` calls run one at a time in block order
 /// (the default — safe for file/shell tools whose side effects would race),
 /// while every `Parallel` call is deferred and fanned out on its own scoped
-/// thread (the parallel batch in `agent::run_impl`). Routing is by this
+/// thread (the parallel batch in `agent::run_loop`). Routing is by this
 /// marker, NOT by tool name — a third-party tool opting into `Parallel` gets
 /// the same fan-out the built-in `task` tool does.
 ///

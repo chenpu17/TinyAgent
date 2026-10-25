@@ -44,11 +44,14 @@ pub(crate) const USER_QUOTE_MARKER: &str = "[用户消息原文保留 / User mes
 /// `Agent::supervisor_handle`): a time-sensitive control signal, carried as a
 /// plain text block so it survives `normalize_adjacent`, session round-trips,
 /// and old-binary reads like any user text. Deliberately NOT given the
-/// USER_QUOTE treatment (no verbatim cross-fold survival — a note goes stale
-/// within a few turns); the summary prompt carries its gist instead. Host
-/// replay recognizes notes by byte-exact prefix match — the string is a
-/// cross-team contract, change only with a version note.
-pub(crate) const SUPERVISOR_NOTE_MARKER: &str = "[监督者旁注 / Supervisor note]";
+/// USER_QUOTE treatment: a MIDDLE note is absorbed through the summary (its
+/// gist rides the summary prompt, never verbatim preservation — it goes
+/// stale within a few turns), while a note that landed in the fold HEAD
+/// (turn-1 injection merges into the task message) rides `messages[0]`
+/// verbatim like the rest of the original task. Public: hosts replay notes
+/// from history by byte-exact prefix match — the string is a cross-team
+/// contract, change only with a version note.
+pub const SUPERVISOR_NOTE_MARKER: &str = "[监督者旁注 / Supervisor note]";
 
 /// Per-message cap for a preserved verbatim user text — big pastes (logs,
 /// code dumps) get truncated with the standard marker rather than crowding

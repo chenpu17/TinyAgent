@@ -9984,3 +9984,141 @@ fn compression_keeps_note_in_transcript_out_of_verbatim_head() {
         .iter()
         .any(|t| t.starts_with(USER_QUOTE_MARKER) && t.contains("intent to quote")));
 }
+
+// ── R1 复审补测（cbf3c4a 双 agent 复审发现的三个覆盖缺口）──────────────
+
+/// Err 路径的冲账：注入必须发生在最后一个投递点之后（Pruned 事件在轮体内、
+/// drain 之后发射，回调借此把 note 排进队列），主请求失败 run 以 Err 收场 —
+/// note 照样冲账进历史（deferred=true），且 Err 路径不发 Done。
+#[test]
+fn supervisor_note_flushed_deferred_when_run_fails_after_delivery_point() {
+    let mut cfg = cfg_with(5, 0, 200);
+    cfg.limits.keep_recent_messages = 2;
+    let mut initial = vec![user_text("task")];
+    initial.extend(big_tool_turn("t1", "shell", 30_000));
+    initial.push(user_text("u1"));
+    initial.push(Message::assistant(vec![Block::Text("a2".into())]));
+    initial.push(user_text("u2"));
+    let (prov, _state) = MockProvider::new(vec![MockTurn::Err("provider down".into())]);
+    let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+    let sup = agent.supervisor_handle();
+    let mut events = Vec::new();
+    let result = agent.run(&mut |e| {
+        if matches!(e, AgentEvent::Pruned { .. }) {
+            sup.inject_note("queued past the last drain");
+        }
+        events.push(e);
+    });
+    assert!(
+        result.is_err(),
+        "the scripted provider error must fail the run"
+    );
+    assert_eq!(
+        note_texts(&events),
+        vec![("queued past the last drain".to_string(), true)]
+    );
+    assert!(
+        !events.iter().any(|e| matches!(e, AgentEvent::Done { .. })),
+        "Err path emits no Done — the flush is the last note event"
+    );
+    let last = agent.messages().last().unwrap();
+    assert_eq!(last.role, Role::User);
+    let Block::Text(t) = &last.content[last.content.len() - 1] else {
+        panic!("expected the note block on the tail user turn");
+    };
+    assert!(t.ends_with("queued past the last drain"));
+}
+
+/// run 之间排队的 note（compact_with 没有投递点，也不该有）：折叠碰不到它
+/// （还不在历史里），原封不动等到下一 run 的首轮投递。
+#[test]
+fn supervisor_note_queued_between_runs_survives_compact_and_delivers_next_run() {
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, state) = MockProvider::new(vec![
+        mock::resp_text("r1", None),
+        mock::resp_text("r2", None),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("task")],
+        test_ctx(),
+    );
+    let sup = agent.supervisor_handle();
+    let mut events = Vec::new();
+    agent.run(&mut |e| events.push(e)).unwrap();
+    sup.inject_note("between runs");
+    // 折叠只动历史，队列里的 note 结构上不可见；无可折叠内容时连调用都不发。
+    let folded = agent.compact(&mut |_| {}).unwrap();
+    assert!(folded.is_none());
+    agent.run(&mut |e| events.push(e)).unwrap();
+    let cap = state.captured();
+    assert_eq!(cap.len(), 2, "compact consumed no provider call");
+    assert_eq!(
+        cap[1].user_texts,
+        vec![
+            "task".to_string(),
+            format!("{SUPERVISOR_NOTE_MARKER}\nbetween runs")
+        ]
+    );
+    assert_eq!(note_texts(&events), vec![("between runs".into(), false)]);
+}
+
+/// 冲账的另一个入库分支：干净 end_turn 的 run 留下 assistant 尾，延迟冲账
+/// 在其后开出**新的** user 消息（铸 id、交替不破）——这正是 ends_with_user()
+/// 翻真的形状（TUI 自续跑 / CLI resume 免 --task 自动开跑，已文档化的 R1 行为）。
+#[test]
+fn supervisor_note_flushed_onto_assistant_tail_opens_new_user_turn() {
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, _state) = MockProvider::new(vec![
+        mock::resp_tool("t1", "echo", json!({}), None),
+        mock::resp_text("all done", None),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(EchoTool::new("echo"))],
+        vec![user_text("task")],
+        test_ctx(),
+    );
+    let sup = agent.supervisor_handle();
+    let mut injected = false;
+    let mut events = Vec::new();
+    agent
+        .run(&mut |e| {
+            // 最后一轮回复期间注入（TextDelta 在本轮 drain 之后）：随后没有
+            // 再来的轮首——无 tool_use 的回复让循环收口。
+            if matches!(e, AgentEvent::TextDelta(_)) && !injected {
+                injected = true;
+                sup.inject_note("after the last drain");
+            }
+            events.push(e);
+        })
+        .unwrap();
+    assert_eq!(
+        note_texts(&events),
+        vec![("after the last drain".to_string(), true)]
+    );
+    let msgs = agent.messages();
+    let last = msgs.last().unwrap();
+    assert_eq!(
+        last.role,
+        Role::User,
+        "flush opens a new user turn after the assistant tail"
+    );
+    assert_eq!(last.content.len(), 1, "the new turn carries only the note");
+    let Block::Text(t) = &last.content[0] else {
+        panic!("expected a text block");
+    };
+    assert!(t.starts_with(SUPERVISOR_NOTE_MARKER));
+    assert!(t.ends_with("after the last drain"));
+    assert!(last.id.is_some(), "the new turn gets an anchor id");
+    assert!(
+        agent.ends_with_user(),
+        "documented flip: a deferred note leaves pending user content"
+    );
+    // 交替不破：下一个 push_user 并入 note 这轮而不是另开一条。
+    agent.push_user(vec![Block::Text("next task".into())]);
+    assert_eq!(agent.messages().last().unwrap().content.len(), 2);
+}

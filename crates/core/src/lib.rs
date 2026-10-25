@@ -74,6 +74,10 @@ pub use agent::{
     CompressionRecord, RunCost, RunError, RunOutcome, SupervisorHandle, TodoItem, ToolCallRecord,
     TurnTiming, SUPERVISOR_NOTE_KIND,
 };
+// The supervisor-note marker is part of the public R1 contract: hosts replay
+// notes from history by byte-exact prefix match, so they must be able to
+// reference the constant instead of hardcoding the CJK string.
+pub use compress::SUPERVISOR_NOTE_MARKER;
 pub use config::{CodeConfig, Config, Limits, McpServerConfig};
 pub use context_report::{
     Calibration, ContextBreakdown, MessageKinds, MessagesBreakdown, SystemBreakdown, ToolCategory,

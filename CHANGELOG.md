@@ -21,6 +21,12 @@
   去重。`task` 子代理独立实例无队列，天然不注入。harness `--json` 映射
   `{"type":"note_injected",…}` + plain 模式 stderr 一行；TUI 系统卡渲染；bindings 事件序列化
   透传零改动。文档：`docs/lib_api.md` 新增「监督者旁注注入」段（含消息形态的取舍理由）。
+  **双 agent 独立复审后修订**（无 P1）：`SUPERVISOR_NOTE_MARKER` 公开导出（`ta::SUPERVISOR_NOTE_MARKER`，
+  宿主回放引用常量而非硬编码 CJK 串）；`deliver_notes` 转发 `push_user` 的 session-save 警告
+  （出口冲账路径是唯一持久化信号，静默丢弃违背「绝不无声丢失」）；轮首投递移入 turn 计时；
+  三个补充验收测试（Err 路径冲账且不发 Done、run 间排队 note 存活折叠、assistant 尾冲账开新
+  user 轮）；文档补两个定版边界（延迟冲账令 `ends_with_user()` 翻真 → TUI/CLI resume 自动开跑
+  属投递机制；/clear 不清队列，note 照常投递）。
 
 ### Fixed
 

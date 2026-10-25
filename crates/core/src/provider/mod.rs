@@ -430,7 +430,7 @@ pub fn build(cfg: &Config, api_key: &str, client: reqwest::blocking::Client) -> 
 /// silently kill any streaming generation longer than a minute even though
 /// the user asked for no limit. The reader-thread leak backstop is handled
 /// separately, as a per-request timeout set on each streaming request in
-/// `agent::run_impl` (see `STREAM_BACKSTOP`) — reqwest's blocking client
+/// `agent::run_loop` (see `STREAM_BACKSTOP`) — reqwest's blocking client
 /// exposes no idle-read timeout, so a per-request total cap is the only
 /// available way to guarantee the `sse-reader` worker thread terminates on
 /// a half-open connection. See `CancellableSse`.

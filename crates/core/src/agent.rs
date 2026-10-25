@@ -324,11 +324,12 @@ pub enum AgentEvent {
     /// into the tail user turn right before the next LLM call — the model
     /// sees it on that request. `deferred == false` means exactly that:
     /// delivered this run, visible to this request. `deferred == true` means
-    /// the run ended before any delivery point: the note was flushed into
-    /// history at run exit (after the last turn, before `Done`), and the
-    /// model will see it on the NEXT run's first request — late, never lost.
-    /// At-most-once either way; notes injected between runs ride the queue
-    /// to the next run's first delivery point.
+    /// the run ended with the note still queued (no delivery point came
+    /// after it — the loop broke or errored before the next turn top): the
+    /// note was flushed into history at run exit (after the last turn,
+    /// before `Done`), and the model will see it on the NEXT run's first
+    /// request — late, never lost. At-most-once either way; notes injected
+    /// between runs ride the queue to the next run's first delivery point.
     NoteInjected {
         /// Note kind — `"supervisor"` is the only kind today.
         kind: String,
@@ -336,7 +337,7 @@ pub enum AgentEvent {
         /// prefix the block carries).
         text: String,
         /// Whether delivery was deferred to the next run (the run ended
-        /// before a delivery point was reached).
+        /// with the note still queued).
         deferred: bool,
     },
     /// An event forwarded from a named sub-agent (the `task` tool). Carries the
@@ -440,7 +441,9 @@ impl SupervisorHandle {
     /// Take back every still-undelivered note, leaving the queue empty.
     /// Teardown insurance for the session-destroy path: a note left in the
     /// queue of an agent about to be dropped would otherwise vanish
-    /// silently — the one loss shape the R1 contract forbids.
+    /// silently — the one loss shape the R1 contract forbids. NOT for
+    /// mid-run use: notes taken here are removed from the agent's delivery
+    /// pipeline entirely (the host owns delivering them some other way).
     pub fn drain_pending(&self) -> Vec<String> {
         self.queue
             .lock()
@@ -999,7 +1002,7 @@ pub struct Agent {
     /// the initial history (see `fresh_message_id`) so a resumed process
     /// can't re-issue an id the saved history already uses.
     next_msg_id: u64,
-    /// Running token totals for the current run (reset at run_impl entry).
+    /// Running token totals for the current run (reset at run_loop entry).
     /// Kept on self — not a local — so `run_error` can snapshot the partial
     /// cost into the returned `RunError` when a run fails mid-way, letting a
     /// retry loop bill the failed attempt's burned tokens (honest cost).
@@ -1722,7 +1725,7 @@ impl Agent {
     }
 
     /// Share one chat's spend into the run-wide counter (`ToolCtx::budget` —
-    /// see the gate in `run_impl`). The counter half of [`Self::bill_chat`],
+    /// see the gate in `run_loop`). The counter half of [`Self::bill_chat`],
     /// split out so the tool-billed fold can share WITHOUT double-adding a
     /// `task` child's already-shared spend.
     fn share_budget(&self, total: u64) {
@@ -1732,7 +1735,7 @@ impl Agent {
     }
 
     /// Bill one of THIS agent's own chat requests: share the spend into the
-    /// run-wide counter (`ToolCtx::budget` — see the gate in `run_impl`), then
+    /// run-wide counter (`ToolCtx::budget` — see the gate in `run_loop`), then
     /// fold into the local totals + emit. Used by the three direct-chat sites
     /// (main turn chat, preflight + forced-compression summaries). NOT
     /// wholesale for tool-billed usage: a `task` child already shared its own
@@ -1753,7 +1756,7 @@ impl Agent {
     /// Wrap a mid-run error with the partial cost burned so far (this run's
     /// accumulated `usage` + the `records` of tools already executed + the
     /// compressions already completed), so a retry loop can bill the failed
-    /// attempt honestly. Called at every error-return point in `run_impl`.
+    /// attempt honestly. Called at every error-return point in `run_loop`.
     fn run_error(
         &self,
         source: anyhow::Error,
@@ -1950,10 +1953,16 @@ impl Agent {
     /// history for the NEXT run, and the host is told they were late, not
     /// lost). `push_user` is the same ingestion path host content uses:
     /// merges into a trailing user turn (keeping its id) or opens a new
-    /// one, mints ids, persists the session.
+    /// one, mints ids, persists the session — and its session-save warning
+    /// is forwarded as `Warning` like every sibling call site, because on
+    /// the exit-flush path this is the ONLY persistence signal (nothing
+    /// re-saves afterwards; a silent failure here is the one shape where a
+    /// note stays memory-only without a diagnostic).
     fn deliver_notes(&mut self, events: &mut dyn FnMut(AgentEvent), deferred: bool) {
         for text in self.drain_notes() {
-            self.push_user(vec![supervisor_note_block(&text)]);
+            if let Some(w) = self.push_user(vec![supervisor_note_block(&text)]) {
+                events(AgentEvent::Warning(w));
+            }
             events(AgentEvent::NoteInjected {
                 kind: SUPERVISOR_NOTE_KIND.to_string(),
                 text,
@@ -2123,21 +2132,23 @@ impl Agent {
             }
             turns += 1;
             events(AgentEvent::TurnStart(turns));
-            // R1 supervisor-note delivery point: drain the inbox here — after
-            // TurnStart (notes queued since the last turn, plus everything a
-            // host injected between runs, wait for exactly this spot), before
-            // preflight compression (so the notes' bytes are counted by the
-            // token precheck and the estimate anchor sees them as ordinary
-            // tail content). push_user merges each note as a marked text
-            // block into the tail user turn; see `supervisor_note_block` for
-            // why a block and not an independent message.
-            self.deliver_notes(events, /* deferred = */ false);
             // This turn's timing row bookkeeping: the timer starts here (so
             // preflight compression counts toward the turn) and the row is
             // pushed at the turn body's exit — every non-Err exit pushes one,
             // so `turn_timings.len() == turns` on every Ok outcome.
             let turn_started = Instant::now();
             let turn_records_at_start = records.len();
+            // R1 supervisor-note delivery point: drain the inbox here — after
+            // TurnStart (notes queued since the last turn, plus everything a
+            // host injected between runs, wait for exactly this spot), before
+            // preflight compression (so the notes' bytes are counted by the
+            // token precheck and the estimate anchor sees them as ordinary
+            // tail content), and inside the turn timer (delivery may rewrite
+            // the session file — its cost belongs to duration_ms). push_user
+            // merges each note as a marked text block into the tail user
+            // turn; see `supervisor_note_block` for why a block and not an
+            // independent message.
+            self.deliver_notes(events, /* deferred = */ false);
             // Preflight compression: if the history is large enough that this
             // request would blow the window, summarize first. The summary
             // request is a real billed call; fold its usage into the run totals
@@ -2703,7 +2714,7 @@ impl Agent {
 
     /// 执行本轮所有 tool_use 调用并装配成一条 user 消息（N:N 配对）。
     ///
-    /// 从 `run_impl` 的轮体中原样抽出（纯搬移，零行为变更）：顺序叶子工具
+    /// 从 `run_loop` 的轮体中原样抽出（纯搬移，零行为变更）：顺序叶子工具
     /// 就地执行、`ToolConcurrency::Parallel` 的调用按波次 fan-out、结果按块序
     /// 装配。`stuck_*` 是跨轮状态（打转护栏），由轮循环持有、这里以 &mut 传入。
     fn execute_tool_calls(
