@@ -120,7 +120,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       # maturin develop 需要 virtualenv；conftest.py 从 __file__ 反解仓库根，
