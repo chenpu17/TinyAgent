@@ -113,7 +113,7 @@ jobs:
             node -e 'const fs=require("fs");const e=process.env;fs.writeFileSync(e.PKG_STAGE+"/package.json",JSON.stringify({name:e.PKG_NAME,version:e.PKG_VERSION,description:`TinyAgent native binding (${e.PKG_NAME})`,license:"MIT",main:e.PKG_NODE_FILE,files:[e.PKG_NODE_FILE]},null,2)+"\n")'
           (cd "$STAGE" && npm pack --silent)
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.pkg }}
           path: bindings/node/npm-stage/**/*.tgz
