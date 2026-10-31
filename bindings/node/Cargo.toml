@@ -23,7 +23,7 @@ code = ["ta_core/code"]
 # needs a distinct dep key.
 ta_core = { package = "tiny-agent-core", path = "../../crates/core", features = ["mock"] }
 napi = { version = "2", default-features = false, features = ["napi8", "serde-json"] }
-napi-derive = "2"
+napi-derive = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
