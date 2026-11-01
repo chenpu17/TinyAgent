@@ -35,6 +35,15 @@ pub(crate) enum JobDrop {
     /// long-lived child (an MCP server) whose teardown must reclaim the
     /// tree deterministically — no escape hatch, no survivors.
     Terminate,
+    /// Close unconditionally — never terminate, never probe. For a handle
+    /// that is PROVABLY never the last one open while members are alive
+    /// (the MCP shutdown-reaper's duplicate: `StdioTransport::drop` joins
+    /// the reaper thread before its own kill runs and before the original
+    /// handle's field drop, so the original is always open at dup-close and
+    /// KILL_ON_JOB_CLOSE cannot fire here). LeakIfAlive would leak this
+    /// handle on every reaper-armed transport teardown: at stand-down the
+    /// server is still running, so the probe always answers "alive".
+    PlainClose,
 }
 
 /// Owned Job Object handle wrapping one spawned child plus every
@@ -112,7 +121,7 @@ impl WinJob {
     }
 
     /// Duplicate the job handle into a second owned [`WinJob`] pointing at
-    /// the SAME job object, under [`JobDrop::LeakIfAlive`]. The duplicate
+    /// the SAME job object, under [`JobDrop::PlainClose`]. The duplicate
     /// exists so another thread (the MCP shutdown-reaper) can hold its own
     /// "killable handle": `TerminateJobObject` through ANY handle to the
     /// job flattens the same tree, so the reaper can kill the whole tree
@@ -120,10 +129,19 @@ impl WinJob {
     /// is mid-teardown. The ORIGINAL keeps the Terminate-on-drop policy and
     /// with it the role of deterministic reclaimer of record; the duplicate
     /// must never re-terminate (or close-kill) the tree on its own Drop —
-    /// LeakIfAlive closes only an already-EMPTY job (and leaks otherwise,
-    /// bounded by process exit), so dropping the copy is always a no-op
-    /// with respect to the tree. `None` (DuplicateHandle refused — e.g.
-    /// handle-count exhaustion) degrades to the caller's no-reaper path.
+    /// PlainClose closes unconditionally and never kills.
+    ///
+    /// SAFETY PRECONDITION for PlainClose: the original must still be open
+    /// whenever the duplicate closes, or the dup could become the LAST
+    /// handle and KILL_ON_JOB_CLOSE would fire. Every current call site
+    /// (the MCP reaper) satisfies it structurally: `StdioTransport::drop`
+    /// stores `alive=false` and JOINS the reaper thread before its own
+    /// kill and before the original handle's field drop, so the dup never
+    /// outlives the original. (LeakIfAlive here instead would leak one
+    /// handle per reaper-armed transport teardown — at stand-down the
+    /// server is still running, so the probe always answers "alive".)
+    /// `None` (DuplicateHandle refused — e.g. handle-count exhaustion)
+    /// degrades to the caller's no-reaper path.
     pub(crate) fn duplicate(&self) -> Option<Self> {
         let source = self.handle?;
         // Same-process duplicate (current → current process) with
@@ -149,7 +167,7 @@ impl WinJob {
         }
         Some(Self {
             handle: Some(dup),
-            drop_policy: JobDrop::LeakIfAlive,
+            drop_policy: JobDrop::PlainClose,
         })
     }
 
@@ -195,6 +213,9 @@ impl Drop for WinJob {
                     unsafe { CloseHandle(job) };
                 }
             }
+            JobDrop::PlainClose => unsafe {
+                CloseHandle(job);
+            },
         }
     }
 }
@@ -409,5 +430,52 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         std::fs::remove_file(&marker).ok();
+    }
+
+    /// duplicate 句柄的 Drop 不得杀树、也不得泄漏：MCP transport 拆解先
+    /// stand down 再 join reaper，dup Drop 时 server 仍在跑 —— LeakIfAlive
+    /// 在这条路径上探到活成员、按「空才关」必然泄漏句柄；PlainClose 不
+    /// 泄漏，但其安全前提是 dup 关闭时原句柄必然还开着（生产顺序：
+    /// StdioTransport::drop 先 join reaper、再杀树，原句柄的字段析构在
+    /// 最后），KILL_ON_JOB_CLOSE 只在最后一个句柄关闭时触发 —— 这里用
+    /// 「stand-down 时树活」与「dup 关闭后树仍活」两断言钉住。
+    #[test]
+    fn duplicate_close_does_not_kill_while_original_outlives_it() {
+        // 生产 MCP spawn 形态：cmd /C 包住真实命令（孙子进程）。
+        let mut child = {
+            use std::os::windows::process::CommandExt;
+            std::process::Command::new("cmd")
+                .args(["/C", "ping", "-n", "60", "127.0.0.250"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .creation_flags(0x0800_0000)
+                .spawn()
+                .expect("spawn cmd /C ping")
+        };
+        let job = WinJob::assign(&child, JobDrop::Terminate).expect("assign job");
+        let dup = job.duplicate().expect("duplicate job handle");
+        // 拆解 stand-down 时点树必须仍然活：这正是 LeakIfAlive 会泄漏的
+        // 场景（探到活成员 → 不关闭只泄漏），也是 PlainClose 安全前提里
+        // 「原句柄仍开」的一侧。
+        assert!(
+            dup.has_live_members(),
+            "at transport-Drop stand-down the server must still be alive"
+        );
+        // dup 的 Drop 不得触发 KILL_ON_JOB_CLOSE：原句柄还开着，dup 永不是
+        // 最后一个句柄 —— 树必须在 dup 关闭后存活。
+        drop(dup);
+        assert!(
+            job.has_live_members(),
+            "closing the duplicate must not kill the tree while the original handle is open"
+        );
+        // 收尾杀树；成员列表在 TerminateJobObject 后很快清空，这里只是
+        // 有界等待进程表稳定（非断言面），再收割直接子进程。
+        job.terminate();
+        let t0 = std::time::Instant::now();
+        while job.has_live_members() && t0.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = child.wait();
     }
 }

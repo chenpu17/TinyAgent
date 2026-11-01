@@ -281,9 +281,12 @@ impl Tool for Shell {
             out.push_str(&stderr);
         }
         let code = status.code().unwrap_or(-1);
-        out.push_str(&format!("\n[exit code: {code}]"));
         truncate(&mut out, ctx.max_output_chars);
         // Post-exit notes, appended AFTER truncate so they can't be cut away.
+        // The `[exit code: N]` note below belongs to this group and is the
+        // one that may never be cut: it is the single truth for is_error, and
+        // a big-output failing command truncated inside the zone would report
+        // the failure without its code.
         // The command itself ran to completion (real exit code above); these
         // are side notes about what its leftovers cost, so they never flip
         // is_error — the exit code stays the single truth for that.
@@ -305,6 +308,7 @@ impl Tool for Shell {
         if c.cancelled {
             out.push_str("\n[command cancelled by user]");
         }
+        out.push_str(&format!("\n[exit code: {code}]"));
 
         if code == 0 {
             Ok(ToolOutput::text(out))
@@ -512,11 +516,17 @@ fn decode_oem(bytes: &[u8]) -> Option<String> {
     oem_encoding_for(cp).map(|enc| enc.decode(bytes).0.into_owned())
 }
 
-/// Map a Windows code page number to an encoding_rs encoding. Only the OEM
-/// pages that carry multi-byte text need mapping: their output fails UTF-8
-/// decode above, while ASCII OEM pages (437/850) are valid UTF-8 and never
-/// reach here. Separated from `decode_oem` so the mapping is testable without
-/// the FFI call (and without depending on the host machine's locale).
+/// Map a Windows code page number to an encoding_rs encoding. The multi-byte
+/// CJK pages (936/932/949/950) and Thai 874 always fail a strict UTF-8 decode
+/// on non-ASCII output, so they need the mapping. The single-byte OEM pages
+/// (437/850/866, …) only need it when their output is NOT pure ASCII — a
+/// plain-ASCII page's output is valid UTF-8 and never reaches here, while a
+/// non-ASCII byte (Cyrillic under 866, box-drawing under 437) fails the decode
+/// and would otherwise become U+FFFD soup. 866 is the default cmd code page on
+/// Russian Windows; 437/850 stay unmapped (US/Western-EU defaults, their
+/// high-byte usage is legacy graphics more than text). Separated from
+/// `decode_oem` so the mapping is testable without the FFI call (and without
+/// depending on the host machine's locale).
 #[cfg(windows)]
 fn oem_encoding_for(cp: u32) -> Option<&'static encoding_rs::Encoding> {
     Some(match cp {
@@ -525,6 +535,7 @@ fn oem_encoding_for(cp: u32) -> Option<&'static encoding_rs::Encoding> {
         949 => encoding_rs::EUC_KR,
         950 => encoding_rs::BIG5,
         874 => encoding_rs::WINDOWS_874,
+        866 => encoding_rs::IBM866,
         _ => return None,
     })
 }
@@ -741,6 +752,26 @@ mod tests {
         }
     }
 
+    /// `[exit code: N]` 必须活过输出截断：它若留在 truncate 作用区内，
+    /// 大输出失败命令会让模型看到 is_error 却拿不到具体退出码。Windows 下
+    /// 用 cmd 输出 300 个 'x' 后 `exit /b 7`，帽 100 字符。
+    #[cfg(windows)]
+    #[test]
+    fn exit_code_survives_truncation() {
+        // 300 个 'x' + 换行 ≈ 302 字符，帽 100 —— 输出必然触 truncate。
+        let cmd = format!("echo {} & exit /b 7", "x".repeat(300));
+        let out = Shell
+            .run(&json!({"command": cmd}), &ctx(std::env::temp_dir(), 100))
+            .unwrap();
+        assert!(out.is_error, "exit 7 must be an error: {}", out.content);
+        assert!(
+            out.content.contains("[exit code: 7]"),
+            "exit code must survive the truncate: {}",
+            out.content
+        );
+        assert!(out.content.contains("[truncated"), "{}", out.content);
+    }
+
     #[cfg(windows)]
     #[test]
     fn oem_decode_turns_gbk_cmd_error_into_chinese() {
@@ -757,6 +788,22 @@ mod tests {
             s.contains("不是内部"),
             "GBK should decode to Chinese, got: {s:?}"
         );
+    }
+
+    /// 单字节 OEM 页 866（俄语 Windows 的 cmd 默认码页）：非 ASCII 输出
+    /// 过不了严格 UTF-8 解码、落到 oem_encoding_for —— 无映射时返回 None、
+    /// 全变 U+FFFD；映射后西里尔字节串正常解码。
+    #[cfg(windows)]
+    #[test]
+    fn oem_decode_maps_ibm866_cyrillic() {
+        let enc = oem_encoding_for(866).expect("CP866 maps to IBM866");
+        assert_eq!(enc.name(), "IBM866");
+        // "привет" (hello) in CP866: п=AF р=E0 и=A8 в=A2 е=A5 т=E2.
+        let cp866 = [0xAFu8, 0xE0, 0xA8, 0xA2, 0xA5, 0xE2];
+        let s = enc.decode(&cp866).0;
+        assert_eq!(s, "привет", "CP866 must decode Cyrillic, got: {s:?}");
+        // The UTF-8 encode round-trips so the model sees readable text.
+        assert!(std::str::from_utf8(s.as_bytes()).is_ok());
     }
 
     #[cfg(windows)]
