@@ -825,3 +825,131 @@ fn llm_primitive_rides_the_outer_provider_instance() {
     assert_eq!(outcome.input_tokens, 41);
     assert_eq!(outcome.output_tokens, 22);
 }
+
+/// An api_key carrying a control character (the classic accident: a trailing
+/// newline glued onto an env var) is rejected at assembly, before any request:
+/// reqwest defers header-value parsing to send(), so the failure would
+/// otherwise surface as a bare `builder error` on the FIRST request — no
+/// ApiStatusError in the chain, hence classified transient, pushing a
+/// deterministic configuration error through the whole backoff ladder. Both
+/// public assembly entries validate, so the bindings' custom-provider path is
+/// covered without a check of its own.
+#[test]
+fn api_key_with_control_character_is_rejected_at_assembly() {
+    let cfg: Config = serde_json::from_value(json!({
+        "provider": "openai",
+        "api_key_env": "NONE",
+        "model": "m",
+        "base_url": "http://127.0.0.1:1",
+        "tools": [],
+        "inject_environment": false
+    }))
+    .expect("config");
+    let client = tiny_agent::provider::new_client(60);
+    let err = match tiny_agent::build_agent_with(&cfg, Vec::new(), &client, vec![], "sk-test\n") {
+        Ok(_) => {
+            panic!("control characters are illegal in header values — must reject at assembly")
+        }
+        Err(e) => e,
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("control characters"),
+        "names the defect: {msg}"
+    );
+    // The secret must never ride the message.
+    assert!(!msg.contains("sk-test"), "error leaked the key: {msg}");
+
+    let (provider, _s) = MockProvider::new(vec![]);
+    let err = match tiny_agent::build_agent_with_provider(
+        &cfg,
+        Box::new(provider),
+        Vec::new(),
+        &client,
+        vec![],
+        "sk-test\n",
+    ) {
+        Ok(_) => panic!("the provider-injected entry must validate the key too"),
+        Err(e) => e,
+    };
+    assert!(
+        format!("{err:#}").contains("control characters"),
+        "names the defect: {err:#}"
+    );
+}
+
+/// A-1 eager + 折叠历史不重注：压缩折叠把合成对吸进摘要（live history 里已无
+/// `read_skill("run-code")` tool_use）。折叠头以摘要 marker 开头即视为已披露
+/// ——合成对恒落在被折叠走的前缀里——resume 不重复注入完整正文。
+#[cfg(feature = "code")]
+#[test]
+fn eager_injection_skips_a_folded_history() {
+    use tiny_agent::provider::new_client;
+    let dir = fr1_scratch("eager-compact");
+    let cfg: Config = serde_json::from_value(json!({
+        "provider": "openai",
+        "api_key_env": "NONE",
+        "model": "mock-model",
+        "tools": [],
+        "inject_environment": false,
+        "workdir": dir.to_str().unwrap(),
+        "limits": {"max_output_chars": 4000000, "keep_recent_messages": 0},
+        "code": {"enabled": true, "skill_injection": "eager"}
+    }))
+    .expect("fr1 compact config");
+    let client = new_client(0);
+    // Turn 1 ends the run; turn 2 is the compact() summary call.
+    let (provider, _s) = MockProvider::new(vec![
+        resp_text("did some work", mk_usage(10, 2)),
+        resp_text("folded summary of the earlier conversation", mk_usage(5, 1)),
+    ]);
+    let mut agent = tiny_agent::build_agent_with_provider(
+        &cfg,
+        Box::new(provider),
+        Vec::new(),
+        &client,
+        vec![],
+        "",
+    )
+    .expect("assemble eager");
+    agent.run(&mut |_| {}).expect("run one turn");
+    agent
+        .compact(&mut |_| {})
+        .expect("compact")
+        .expect("folded");
+    let resumed_history = agent.messages().to_vec();
+    // Precondition: the fold absorbed the synthetic pair — no read_skill
+    // tool_use survives in the live history (it rides the summary now).
+    let still_disclosed = resumed_history.iter().any(|m| {
+        m.role == tiny_agent::Role::Assistant
+            && m.content.iter().any(
+                |b| matches!(b, tiny_agent::Block::ToolUse { name, .. } if name == "read_skill"),
+            )
+    });
+    assert!(
+        !still_disclosed,
+        "precondition: the fold removed the synthetic pair, got: {resumed_history:?}"
+    );
+    // Resume an eager session over the folded history.
+    let (provider2, _s2) = MockProvider::new(vec![]);
+    let agent2 = tiny_agent::build_agent_with_provider(
+        &cfg,
+        Box::new(provider2),
+        resumed_history,
+        &client,
+        vec![],
+        "",
+    )
+    .expect("assemble eager over folded history");
+    let msgs = agent2.messages();
+    let re_injected = msgs[0].role == tiny_agent::Role::Assistant
+        && msgs[0]
+            .content
+            .iter()
+            .any(|b| matches!(b, tiny_agent::Block::ToolUse { name, .. } if name == "read_skill"));
+    assert!(
+        !re_injected,
+        "folded-then-resumed history got the full skill body re-injected \
+         (the summary already absorbed it), history: {msgs:?}"
+    );
+}

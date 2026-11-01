@@ -420,6 +420,26 @@ pub fn build(cfg: &Config, api_key: &str, client: reqwest::blocking::Client) -> 
     }
 }
 
+/// Reject an api_key carrying control characters. `HeaderValue::from_str`
+/// refuses them, but reqwest defers that check to `send()` — the first
+/// request would die as a bare `builder error` with no [`ApiStatusError`] in
+/// the chain, so `RunError::is_transient`'s fallback classifies a
+/// deterministic configuration error as retryable and burns the whole
+/// backoff ladder (the classic accident: a trailing newline glued onto the
+/// environment variable). Called at the `build_agent*` assembly entries, so
+/// every construction path — CLI, batch, TUI, and both language bindings —
+/// fails before any request. The key itself is never echoed.
+pub(crate) fn check_api_key(key: &str) -> anyhow::Result<()> {
+    if key.chars().any(char::is_control) {
+        anyhow::bail!(
+            "api_key contains control characters (a trailing newline from the \
+             environment variable?); re-export the variable without them \
+             (the key itself is never echoed)"
+        );
+    }
+    Ok(())
+}
+
 /// HTTP client with explicit timeouts. A stuck or trickling connection
 /// must never outlive the whole run budget — an agent that hangs forever
 /// would stall any CI/eval pipeline it runs in. Clones share one

@@ -131,6 +131,9 @@ pub fn build_agent_with(
     extra_tools: Vec<Box<dyn tools::Tool>>,
     api_key: &str,
 ) -> anyhow::Result<Agent> {
+    // Deterministic configuration errors fail at assembly, not as a
+    // transient-looking `builder error` on the first request.
+    provider::check_api_key(api_key)?;
     // The pre-assembly system-prompt length, for context_breakdown's base /
     // skill-intro attribution. Captured BEFORE `assemble` — its returned cfg
     // clone shadows this one and carries the appended skill intro.
@@ -174,6 +177,9 @@ pub fn build_agent_with_provider(
     extra_tools: Vec<Box<dyn tools::Tool>>,
     api_key: &str,
 ) -> anyhow::Result<Agent> {
+    // Same assembly-time key check as `build_agent_with` (the `task` child
+    // agents build their own provider from this key).
+    provider::check_api_key(api_key)?;
     // Same pre-assembly capture as `build_agent_with` (its cfg gets shadowed
     // by assemble's intro-augmented clone).
     let skill_base = cfg.system_prompt.as_ref().map(|s| s.len()).unwrap_or(0);
@@ -236,10 +242,16 @@ fn assemble(
     Option<Vec<Message>>,
 )> {
     use anyhow::Context;
-    let workdir = cfg
-        .workdir
-        .clone()
-        .unwrap_or(std::env::current_dir().context("cannot determine current directory")?);
+    // The configured branch was already canonicalized + verbatim-stripped by
+    // `validate_and_normalize`; only the cwd fallback needs `resolve_workdir`
+    // here (`std::env::current_dir()` can hand back the raw `\\?\` spelling
+    // on Windows, which must not reach the model-visible env header).
+    let workdir = match cfg.workdir.clone() {
+        Some(w) => w,
+        None => crate::config::resolve_workdir(
+            std::env::current_dir().context("cannot determine current directory")?,
+        )?,
+    };
 
     // Build MCP tools ONCE. The parent boxes them into its own tool list, and
     // tools::build hands SubAgent a clone of the same set — so a `task` call
@@ -495,7 +507,10 @@ fn assemble(
 /// Injection is skipped when the history already carries the disclosure:
 /// a resumed eager session contains the pair itself, and a history with a
 /// real `read_skill("run-code")` exchange already has the body — either way
-/// re-injecting duplicates it (the resume rule's actual intent).
+/// re-injecting duplicates it (the resume rule's actual intent). A folded
+/// history counts as disclosed too: the synthetic pair always lives in the
+/// prefix a compression fold absorbs, so the head's summary block is proof
+/// the body was already served.
 ///
 /// Boundary: the pair ends in a `user(tool_result)` message, and a leading
 /// user task message must MERGE into it (`append_user_turn`'s rule — two
@@ -519,7 +534,13 @@ fn prepend_eager_pair(eager: Option<Vec<Message>>, initial: Vec<Message>) -> Vec
                 )
             })
     });
-    if already_disclosed {
+    let folded = initial.first().is_some_and(|m| {
+        m.role == Role::User
+            && m.content.iter().any(
+                |b| matches!(b, Block::Text(t) if t.starts_with(crate::compress::SUMMARY_MARKER)),
+            )
+    });
+    if already_disclosed || folded {
         return initial;
     }
     let mut rest = initial;

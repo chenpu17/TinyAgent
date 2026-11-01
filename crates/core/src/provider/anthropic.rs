@@ -507,6 +507,11 @@ impl Anthropic {
                     ] {
                         if let Some(v) = ev["usage"][key].as_u64() {
                             *cur = (*cur).max(v);
+                            // Cache tokens are billed input: a delta carrying
+                            // ONLY a cache axis must still flip saw_usage, or
+                            // the billed tokens surface as usage: None (the
+                            // honest-cost hole the input arm above closed).
+                            saw_usage = saw_usage || v > 0;
                         }
                     }
                 }
@@ -585,6 +590,28 @@ mod tests {
     /// as 0 (honest-cost contract). max-fold keeps a real-API stream (which
     /// counts input at message_start and may repeat it in the delta) from
     /// double-counting.
+    /// The cache fold has the same duty as the input arm: a gateway that
+    /// reports ONLY a cache axis in message_delta (no message_start usage at
+    /// all) has billed those tokens — the response must still carry
+    /// `usage: Some`, never None.
+    #[test]
+    fn usage_cache_only_in_message_delta_is_counted() {
+        let raw = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"cache_read_input_tokens\":900}}\n\n",
+        );
+        let resp = parse(raw.as_bytes());
+        assert_eq!(resp.stop_reason, "end_turn");
+        let u = resp
+            .usage
+            .expect("cache-only delta usage must surface as Some, not None");
+        assert_eq!(u.cache_read_input_tokens, 900);
+        assert_eq!((u.input_tokens, u.output_tokens), (0, 0));
+    }
+
     #[test]
     fn usage_input_only_in_message_delta_is_counted() {
         let raw = concat!(

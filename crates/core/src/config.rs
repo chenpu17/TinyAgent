@@ -743,8 +743,10 @@ fn strip_verbatim(s: &str) -> Cow<'_, str> {
 }
 
 /// Canonicalize + validate a workdir (must exist and be a directory). Shared
-/// by `Config::load` and `Config::apply` (previously two hand-copied copies).
-fn resolve_workdir(dir: PathBuf) -> Result<PathBuf> {
+/// by `Config::load`, `Config::apply`, and assemble's no-workdir fallback —
+/// the fallback's `std::env::current_dir()` needs the same canonicalize +
+/// verbatim-strip treatment as a configured path.
+pub(crate) fn resolve_workdir(dir: PathBuf) -> Result<PathBuf> {
     let dir = dir
         .canonicalize()
         .with_context(|| format!("workdir does not exist: {}", dir.display()))?;
