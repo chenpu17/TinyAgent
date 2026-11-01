@@ -56,13 +56,20 @@ fn scan_totals(full: &std::path::Path) -> std::io::Result<Totals> {
         }
         let mut take = chunk.len();
         if scanned.saturating_add(take as u64) > TOTALS_SCAN_MAX {
-            take = (TOTALS_SCAN_MAX - scanned) as usize; // >0: scanned < MAX here
+            take = (TOTALS_SCAN_MAX - scanned) as usize; // positive unless scanned already hit MAX
             capped = true;
         }
         let c = &chunk[..take];
         nl += c.iter().filter(|&&b| b == b'\n').count() as u64;
         chars += c.iter().filter(|&&b| (b & 0xC0) != 0x80).count() as u64;
-        last = c.last().copied();
+        // An exactly-boundary hit (scanned == TOTALS_SCAN_MAX, take == 0)
+        // must not clear the last-byte record from the previous round: the
+        // empty slice's `last()` is None, and overwriting with it lost the
+        // unterminated boundary line from the count (capped totals read one
+        // line low).
+        if take > 0 {
+            last = c.last().copied();
+        }
         let len = take;
         r.consume(len);
         scanned += len as u64;
@@ -116,9 +123,14 @@ fn parse_offset(input: &Value) -> Result<usize> {
 /// [`parse_offset`]: on a 32-bit target `as usize` would truncate 2^32 to 0,
 /// and a limit of 0 makes the "line limit reached" cut fire on the very
 /// first line. (The raw-mode window is not affected — its limit is bounded
-/// by `min(cap)` before any conversion.)
+/// by `min(cap)` before any conversion.) An explicit 0 is a parameter
+/// error, not an empty page: a 0 limit cuts before the first line, so the
+/// JSON/raw lanes would answer `truncated: true` with `next_offset` equal
+/// to the request's own offset — a pager following next_offset (the
+/// documented loop in run_code_skill.md) would spin in place forever.
 fn parse_limit(input: &Value) -> Result<Option<usize>> {
     match input["limit"].as_u64() {
+        Some(0) => bail!("read_file: limit must be at least 1 (got 0)"),
         Some(n) => usize::try_from(n).map(Some).map_err(|_| {
             anyhow::anyhow!("read_file: limit {n} does not fit this platform's usize")
         }),
@@ -467,10 +479,13 @@ impl Tool for ReadFile {
 const MIB: u64 = 1024 * 1024;
 
 /// raw:true — a byte window as base64. offset/limit are BYTES here (a
-/// line-indexed offset cannot address byte-exact slices). The limit folds in
-/// half the caller's char budget so a display-scale caller can't pull a
-/// data-scale blob into the conversation, while the guest's 2M-char budget
-/// still gets the full RAW_READ_MAX_BYTES window.
+/// line-indexed offset cannot address byte-exact slices). The window cap
+/// folds in half the caller's char budget so a display-scale caller can't
+/// pull a data-scale blob into the conversation, and it binds even at guest
+/// scale: min(RAW_READ_MAX_BYTES 1.4M, 2M-char budget / 2) = 1M — the char
+/// budget, not the constant, sets the guest's window top. Only the DEFAULT
+/// window (`cap - cap % 3`) is 3-byte aligned; an explicit limit is honored
+/// as-is (min the cap) with no alignment guarantee.
 fn read_file_raw(
     path: &str,
     full: &std::path::Path,
@@ -480,7 +495,19 @@ fn read_file_raw(
 ) -> Result<ToolOutput> {
     use base64::Engine;
     use std::io::{Read, Seek, SeekFrom};
-    let offset = input["offset"].as_u64().unwrap_or(0);
+    // An ABSENT offset defaults to the file head. A PRESENT offset that is
+    // not a non-negative integer is a parameter error (same explicit style
+    // as parse_offset/parse_limit): `as_u64().unwrap_or(0)` would silently
+    // map a negative or malformed offset back to the head, and a pager whose
+    // offset math underflows would restart from byte 0 instead of surfacing
+    // the bug.
+    let offset = match input.get("offset") {
+        None | Some(Value::Null) => 0,
+        Some(v) => match v.as_u64() {
+            Some(off) => off,
+            None => bail!("read_file: offset must be a non-negative integer (got {v})"),
+        },
+    };
     let cap = RAW_READ_MAX_BYTES
         .min((ctx.max_output_chars as u64) / 2)
         .max(1);
@@ -493,6 +520,10 @@ fn read_file_raw(
     // content_b64. The FINAL window is the short remainder — nothing follows
     // it, so any length is fine there.
     let limit = match input["limit"].as_u64() {
+        // An explicit 0 is a parameter error (same ruling as the line-mode
+        // parse_limit): it would return bytes_read:0 with truncated:true and
+        // next_offset == offset — the raw pager would spin in place.
+        Some(0) => bail!("read_file: limit must be at least 1 (got 0)"),
         Some(l) => l.min(cap),
         None if cap >= 3 => cap - cap % 3,
         None => cap,
@@ -511,11 +542,16 @@ fn read_file_raw(
     }
     f.seek(SeekFrom::Start(offset))
         .with_context(|| format!("cannot read {}", full.display()))?;
-    let mut bytes = vec![0u8; limit];
-    let n = f
-        .read(&mut bytes)
+    // Fill to the FULL window: a single `read` may short-read (its return
+    // says nothing about the buffer being full), which would under-report
+    // bytes_read and push the pager to a spurious next round. `take` bounds
+    // the total at `limit`, so the memory upper bound is unchanged.
+    let mut bytes = Vec::with_capacity(limit);
+    (&mut f)
+        .take(limit as u64)
+        .read_to_end(&mut bytes)
         .with_context(|| format!("cannot read {}", full.display()))?;
-    bytes.truncate(n);
+    let n = bytes.len();
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     let end = offset + n as u64;
     let truncated = end < file_len;
@@ -1450,8 +1486,10 @@ mod tests {
         // base64(whole file) — which requires every non-final window to be a
         // multiple of 3 bytes. RAW_READ_MAX_BYTES (1.4M) and the guest-budget
         // window (1M) are both non-multiples, so the alignment is enforced in
-        // read_file_raw itself, not left to the caller (writeVerified's
-        // explicit CH=1399995 limit predates this and still works).
+        // read_file_raw itself: only the DEFAULT window is aligned down to a
+        // multiple of 3 — an explicit limit clamped to the cap carries no
+        // alignment guarantee, so a caller that needs lossless concatenation
+        // must page without naming a limit.
         let dir = std::env::temp_dir().join(format!("ta-rawjoin-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let mut bytes = Vec::new();
@@ -1487,6 +1525,116 @@ mod tests {
             base64::engine::general_purpose::STANDARD.encode(&bytes),
             "joined window b64 must equal whole-file b64"
         );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// totals 扫描可以恰好触界（TOTALS_SCAN_MAX = 8 MiB，BufReader 默认块
+    /// 8192 整除它）：scanned == MAX 的下一轮 take 被截成 0，空切片的
+    /// `last()` 是 None —— 无条件覆写会清掉上一轮的末字节记录，capped
+    /// 行数随之丢掉跨界的未完行。测试文件首个字节是 '\n'、帽内末字节是
+    /// 'a'：真实答案是 nl(1) + 1(未完行) = 2，记录丢失时报 1。
+    #[test]
+    fn scan_totals_capped_boundary_keeps_the_last_byte_record() {
+        let dir = std::env::temp_dir().join(format!("ta-totals-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        // TOTALS_SCAN_MAX + 100 bytes of 'a': the scan consumes MAX exactly
+        // (never setting `capped`), then enters one more round where take is
+        // clamped to 0.
+        let mut bytes = vec![b'a'; (TOTALS_SCAN_MAX as usize) + 100];
+        // A newline early so nl > 0 and the two undercount shapes are
+        // distinguishable; every other byte (including the boundary byte at
+        // the cap) stays a non-newline.
+        bytes[0] = b'\n';
+        fs::write(dir.join("big.bin"), &bytes).unwrap();
+        let t = scan_totals(&dir.join("big.bin")).unwrap();
+        assert!(t.capped, "file must trip the scan cap");
+        // True lower bound: 1 ('\n' ends line 1) + 1 (the unterminated tail
+        // starting inside the capped window and running past it). The last
+        // byte WITHIN the cap is 'a', so the intended answer is nl + 1 = 2.
+        assert_eq!(
+            t.lines, 2,
+            "capped totals must count the unterminated boundary line (last-byte record lost?)"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// limit:0 在两条车道都必须是参数错误：0 的窗口在第一行/第一字节之前
+    /// 就截断，两条车道会答 truncated:true 且 next_offset == 本次 offset
+    /// （json 车道空 content、raw 车道 bytes_read:0）—— 按 skill 文档
+    /// 「循环跟随 next_offset 直到 null」的官方分页器会原地打转。
+    /// limit:1 仍是合法下界。
+    #[test]
+    fn read_file_limit_zero_is_a_parameter_error_in_both_lanes() {
+        let dir = std::env::temp_dir().join(format!("ta-lim0-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("f.txt"), "row1\nrow2\nrow3\n").unwrap();
+        let err = ReadFile
+            .run(
+                &json!({"path": "f.txt", "offset": 2, "limit": 0, "format": "json"}),
+                &ctx_in(&dir),
+            )
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("at least 1"),
+            "json lane: {err:#}"
+        );
+        let err = ReadFile
+            .run(
+                &json!({"path": "f.txt", "raw": true, "offset": 4, "limit": 0}),
+                &ctx_in(&dir),
+            )
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("at least 1"),
+            "raw lane: {err:#}"
+        );
+        // limit:1 仍是合法下界。
+        let out = ReadFile
+            .run(
+                &json!({"path": "f.txt", "offset": 2, "limit": 1, "format": "json"}),
+                &ctx_in(&dir),
+            )
+            .unwrap();
+        let v: Value = serde_json::from_str(&out.content).unwrap();
+        assert_eq!(v["next_offset"], 3);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// raw 车道的 offset 是字节偏移：缺省 = 文件头（0），但**出现且不是
+    /// 非负整数**时是参数错误 —— `as_u64().unwrap_or(0)` 会把负数/畸形
+    /// offset 静默映射回文件头，偏移计算下溢的分页器会从 0 重读而不是
+    /// 暴露 bug（行车道 parse_offset/parse_limit 的显式报错同款）。
+    #[test]
+    fn read_file_raw_offset_must_be_a_non_negative_integer() {
+        let dir = std::env::temp_dir().join(format!("ta-raw-off-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("f.bin"), "0123456789").unwrap();
+        for bad in [-1i64, -99] {
+            let err = ReadFile
+                .run(
+                    &json!({"path": "f.bin", "raw": true, "offset": bad}),
+                    &ctx_in(&dir),
+                )
+                .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("non-negative"),
+                "offset {bad}: {err:#}"
+            );
+        }
+        let err = ReadFile
+            .run(
+                &json!({"path": "f.bin", "raw": true, "offset": "4"}),
+                &ctx_in(&dir),
+            )
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("non-negative"), "{err:#}");
+        // 缺省 offset 仍是文件头。
+        let out = ReadFile
+            .run(&json!({"path": "f.bin", "raw": true}), &ctx_in(&dir))
+            .unwrap();
+        let v: Value = serde_json::from_str(&out.content).unwrap();
+        assert_eq!(v["offset"], 0);
+        assert_eq!(v["bytes_read"], 10);
         fs::remove_dir_all(&dir).ok();
     }
 
