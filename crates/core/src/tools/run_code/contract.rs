@@ -155,9 +155,8 @@ function readLines(path) {
 function writeVerified(path, content) {
     tools.call("write_file", {path: path, content: content});
     var bytes = __ta_utf8(content), expect = __ta_b64(bytes), off = 0;
-    var CH = 1399995;
     for (;;) {
-        var r = tools.call("read_file", {path: path, raw: true, offset: off, limit: CH});
+        var r = tools.call("read_file", {path: path, raw: true, offset: off});
         if (!r || typeof r !== "object" || typeof r.content_b64 !== "string") throw new Error("writeVerified: unexpected read_file output");
         var seg = expect.substr((off / 3) * 4, r.content_b64.length);
         if (r.content_b64 !== seg) throw new Error("writeVerified: read-back mismatch in " + path + " at byte " + off + " — the file on disk differs from what was written");
@@ -488,6 +487,179 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// writeVerified at megabyte scale (1,020,000 bytes): the helper used to
+    /// request a fixed 1,399,995-byte read-back window, which the host
+    /// silently clamped to `min(RAW_READ_MAX, ctx.max_output_chars/2)` =
+    /// 1,000,000 — NOT a multiple of 3, so the window's base64 carried `==`
+    /// padding that the whole-file prefix never has and every first-window
+    /// compare failed with a FALSE "read-back mismatch" while the disk file
+    /// was byte-correct. The prelude now pages the default (3-byte-aligned)
+    /// window; any size must verify. Fuel is raised (default 5e9 does not
+    /// cover a megabyte-scale `__ta_b64` build plus two window compares —
+    /// this test exercises the window math at size, not fuel exhaustion).
+    #[test]
+    fn prelude_write_verified_roundtrips_exact_bytes_large() {
+        let dir = scratch();
+        let cc = CodeConfig {
+            fuel: 12_000_000_000,
+            ..CodeConfig::default()
+        };
+        let out = tool_with_tools(cc, r#"["read_file","write_file"]"#)
+            .run_with_emit(
+                &json!({"code": r#"
+                    var big = "x".repeat(1020000);
+                    try { return {ok: true, r: writeVerified("big.txt", big)}; }
+                    catch (e) { return {ok: false, err: String(e)}; }"#}),
+                &ctx(&dir),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(!out.is_error, "guest died: {}", out.content);
+        let v: Value = serde_json::from_str(&out.content).unwrap();
+        // The disk file is the ground truth: byte-correct regardless of the
+        // verdict the guest saw.
+        let on_disk = std::fs::read(dir.join("big.txt")).unwrap();
+        assert_eq!(on_disk.len(), 1_020_000, "disk file length");
+        assert!(on_disk.iter().all(|&b| b == b'x'), "disk file content");
+        // And the write must VERIFY — the old fixed-window spelling reported
+        // a false "read-back mismatch at byte 0" for exactly this size band.
+        assert_eq!(v["ok"], json!(true), "write must verify: {}", out.content);
+        assert!(
+            v["r"].as_str().unwrap_or_default().starts_with("verified "),
+            "expected the verified message, got: {}",
+            out.content
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Boundary at exactly 1,000,000 bytes — the old clamp's edge. One
+    /// clamped window covered the whole file there and its trailing `==`
+    /// happened to equal the whole-file base64's own, so this exact size
+    /// passed even with the old fixed-window spelling; with the default
+    /// window it pages 999,999 + 1. Either way it must verify — the boundary
+    /// must not become a regression surface when the windowing changes.
+    /// Fuel raised for the same reason as the large round-trip above.
+    #[test]
+    fn prelude_write_verified_boundary_exactly_1_000_000_bytes() {
+        let dir = scratch();
+        let cc = CodeConfig {
+            fuel: 12_000_000_000,
+            ..CodeConfig::default()
+        };
+        let out = tool_with_tools(cc, r#"["read_file","write_file"]"#)
+            .run_with_emit(
+                &json!({"code": r#"
+                    var big = "x".repeat(1000000);
+                    try { return writeVerified("big.txt", big); }
+                    catch (e) { return "ERR: " + String(e); }"#}),
+                &ctx(&dir),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(
+            !out.content.starts_with("ERR"),
+            "1,000,000 bytes must verify: {}",
+            out.content
+        );
+        assert_eq!(std::fs::read(dir.join("big.txt")).unwrap().len(), 1_000_000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Boundary one byte under the default window: 999,999 = 3 × 333,333 is
+    /// exactly one 3-aligned window, so the whole file is a single read with
+    /// no paging — and the base64 has no padding quirk to trip on. Must
+    /// verify. Fuel raised as above.
+    #[test]
+    fn prelude_write_verified_boundary_999_999_bytes_single_window() {
+        let dir = scratch();
+        let cc = CodeConfig {
+            fuel: 12_000_000_000,
+            ..CodeConfig::default()
+        };
+        let out = tool_with_tools(cc, r#"["read_file","write_file"]"#)
+            .run_with_emit(
+                &json!({"code": r#"
+                    var big = "x".repeat(999999);
+                    try { return writeVerified("big.txt", big); }
+                    catch (e) { return "ERR: " + String(e); }"#}),
+                &ctx(&dir),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(
+            !out.content.starts_with("ERR"),
+            "999,999 bytes must verify: {}",
+            out.content
+        );
+        assert_eq!(std::fs::read(dir.join("big.txt")).unwrap().len(), 999_999);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The false-mismatch band was reachable OUT OF THE BOX: 1,010,000 bytes
+    /// sits over the old clamp yet under the 1 MiB guest→host argument cap,
+    /// and the round trip completes on the DEFAULT fuel — an ordinary
+    /// writeVerified on a ~1 MB artifact hit the false "read-back mismatch"
+    /// with no config at all. No fuel raise here on purpose: default-fuel
+    /// reachability is part of the pinned contract. The disk file stays
+    /// byte-correct (asserted) and the write verifies.
+    #[test]
+    fn prelude_write_verified_roundtrips_at_default_fuel() {
+        let dir = scratch();
+        let out = tool_with_tools(CodeConfig::default(), r#"["read_file","write_file"]"#)
+            .run_with_emit(
+                &json!({"code": r#"
+                    var big = "x".repeat(1010000);
+                    try { return {ok: true, r: writeVerified("big.txt", big)}; }
+                    catch (e) { return {ok: false, err: String(e)}; }"#}),
+                &ctx(&dir),
+                &mut |_| {},
+            )
+            .unwrap();
+        let v: Value = serde_json::from_str(&out.content).unwrap();
+        let on_disk = std::fs::read(dir.join("big.txt")).unwrap();
+        assert_eq!(on_disk.len(), 1_010_000, "disk file is correct");
+        assert!(on_disk.iter().all(|&b| b == b'x'));
+        assert_eq!(
+            v["ok"],
+            json!(true),
+            "default-fuel band write must verify: {}",
+            out.content
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Past the 1 MiB guest→host argument cap the write cannot happen at
+    /// all: write_file refuses with the honest over-cap error and nothing
+    /// lands on disk. This bounds the megabyte story from above — beyond
+    /// ~1,048,544 bytes (ASCII) the failure mode is the argument-cap
+    /// refusal, not any read-back comparison, which is why the "over
+    /// 1,000,000 bytes" band is exactly the (1,000,000, ~1 MiB) interval.
+    #[test]
+    fn prelude_write_verified_over_guest_argument_cap_errors_honestly() {
+        let dir = scratch();
+        let cc = CodeConfig {
+            fuel: 12_000_000_000,
+            ..CodeConfig::default()
+        };
+        let out = tool_with_tools(cc, r#"["read_file","write_file"]"#)
+            .run_with_emit(
+                &json!({"code": r#"
+                    var big = "x".repeat(1100000);
+                    try { tools.call("write_file", {path: "big.txt", content: big}); return "wrote"; }
+                    catch (e) { return "refused:" + String(e); }"#}),
+                &ctx(&dir),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(
+            out.content.contains("refused:") && out.content.contains("over the 1 MiB"),
+            "expected the honest argument-cap error, got: {}",
+            out.content
+        );
+        assert!(!dir.join("big.txt").exists(), "write must not run");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A Hooks layer that truncates every write_file body to 3 bytes — the
     /// external-review P2-2 repro shape. writeVerified's read-back used to
     /// prefix-match the shortened file (read the whole file → not truncated →
@@ -579,7 +751,19 @@ mod tests {
         let llm_doc = std::fs::read_to_string(repo_docs.join("code_llm_design.md"))
             .expect("docs/code_llm_design.md via CARGO_MANIFEST_DIR")
             .replace("\r\n", "\n");
-        let cases: [(&str, String, &str); 3] = [
+        // A① (llm.rs) is the frozen block neither other gate reaches: llm.rs
+        // is not in the sync manifest's hashed paths, so this verbatim pin is
+        // its only freeze. The constant side comes through the reachable
+        // public constructor — the description text itself is never edited to
+        // satisfy this test (copy changes go through the design doc's
+        // revision log, then the constant, then this passes as-is).
+        let llm_entry_desc = crate::tools::llm::LlmTool::new(
+            crate::config::LlmConfig::default(),
+            Arc::new(OnceLock::new()),
+        )
+        .def()
+        .description;
+        let cases: [(&str, String, &str); 4] = [
             (
                 "A① 【库】段",
                 first_fenced_block_after(&lib_doc, "**① 描述（run_code 工具描述）的【库】段**"),
@@ -594,6 +778,11 @@ mod tests {
                 "A⑤ 【LLM 判别】overlay 段",
                 first_fenced_block_after(&llm_doc, "**⑤ run_code 描述的【LLM 判别】overlay 段**"),
                 LLM_DESC_SUFFIX,
+            ),
+            (
+                "A① llm 条目描述",
+                first_fenced_block_after(&llm_doc, "**① tools.list() 中 llm 条目的描述**"),
+                llm_entry_desc.as_str(),
             ),
         ];
         for (name, block, constant) in cases {

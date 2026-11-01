@@ -1960,6 +1960,7 @@ mod tests {
         assert_eq!(arr[1]["k"], json!("image"), "image entry envelope: {v}");
         let _ = std::fs::remove_dir_all(&dir);
     }
+    /// P2-7: a provider panic inside a batch WORKER does not propagate —
     /// the entry completes as the panic placeholder, and the placeholder
     /// now carries the llm audit row (model + re-derived estimate,
     /// actual:null) so meta.llm explains the reservation the guard's Drop

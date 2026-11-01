@@ -151,7 +151,7 @@ function judge(item) {
 ## read_file 的三种模式（tools.call 直调时按需选）
 1. **文本模式**（默认）：首行 `[文件名: 总行数 · 总字符 · complete|行区间 a-b]` 元数据，其后每行 `行号→tab` 前缀；带 limit 截断时末尾多一行 `... [line limit reached]`。需要解析内容时优先 readAll / readLines 或 json 模式，**不要手解析这个格式**
 2. **format:"json"**：返回 `{content, first_line, lines_total, chars_total, truncated, truncation, next_offset}`——content 无前缀。只有 limit 截断（行对齐）给非空 next_offset，循环传 `{offset: next_offset, limit, format:"json"}` 续读直到 null；chars/bytes 截断时 next_offset 为 null（窗口可能切在行中间，无法线对齐续读），此时改用 raw
-3. **raw:true**：按字节窗口返回 base64：`{content_b64, offset, bytes_read, bytes_total, truncated, next_offset}`——offset/limit 是**字节数**，默认窗口约 1.4 MB 且按 3 字节对齐；二进制 / 编码敏感内容的唯一保真通道
+3. **raw:true**：按字节窗口返回 base64：`{content_b64, offset, bytes_read, bytes_total, truncated, next_offset}`——offset/limit 是**字节数**，默认窗口按 3 字节对齐、随调用方字符预算变化（guest 端 999,999 字节 ≈ 1.0 MB）；二进制 / 编码敏感内容的唯一保真通道
 
 ## 字节保真复制（跨窗搬运二进制）
 **优先 `copy_bytes`**（经 tools.call，host 流式搬运、内容不经过 JS 字符串，二进制/非 UTF-8/大文件均逐字节一致）：

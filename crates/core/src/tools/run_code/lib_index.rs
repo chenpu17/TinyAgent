@@ -164,6 +164,13 @@ pub(super) fn parse_lib_index(
 /// text in, merged text out; the caller does the IO through the ordinary
 /// gated file tools. Output is byte-identical to the merge the prelude used
 /// to do in JS (the format-pinning tests hold it to that).
+///
+/// The merged output is ALWAYS LF-normalized: `str::lines()` strips each
+/// line's terminator and the join + appends use `\n`, so a CRLF-formatted
+/// INDEX.md is rewritten to LF in one shot by ANY saveLib — a one-time,
+/// idempotent normalization (machine lines are unaffected and prose line
+/// CONTENT is preserved byte-for-byte; only the terminators fold). The
+/// CRLF pin test holds this documented behavior.
 pub(super) fn lib_upsert_index(rel: &str, sha256: &str, text: &str) -> Result<String, String> {
     // The registration key must satisfy the same grammar a parsed line's
     // path does — plus no whitespace (machine lines are whitespace-tokenized;
@@ -1960,6 +1967,37 @@ mod tests {
             let merged3 = lib_upsert_index(&rel, &new_sha, &merged2).expect("re-upsert");
             assert_eq!(merged3, merged2);
         }
+    }
+
+    /// The merge is line-based (`str::lines()` drops each line's terminator,
+    /// the output joins with `\n`), so a CRLF-formatted INDEX.md comes back
+    /// fully LF on ANY saveLib — a one-time, idempotent normalization: the
+    /// guest hands the ORIGINAL CRLF text in via readAll and the merged
+    /// rewrite folds every terminator. Machine lines are unaffected and
+    /// prose line content is preserved byte-for-byte; this pin holds the
+    /// documented behavior, terminator rewrite included.
+    #[test]
+    fn upsert_index_output_is_lf_normalized_from_crlf_input() {
+        let sha = "a".repeat(64);
+        let text = "# index\r\n自由段落第一行\r\n第二行\r\n<!-- ta-lib: path=a.js sha256=0000000000000000000000000000000000000000000000000000000000000000 needs=- ver=1 st=ok -->\r\n尾行\r\n";
+        let merged = lib_upsert_index("b.js", &sha, text).expect("upsert crlf");
+        assert!(
+            !merged.contains('\r'),
+            "CRLF input must come back LF-normalized (one-time, documented): {merged}"
+        );
+        // Prose and machine lines keep their content across the rewrite.
+        for line in [
+            "# index",
+            "自由段落第一行",
+            "第二行",
+            "<!-- ta-lib: path=a.js sha256=0000000000000000000000000000000000000000000000000000000000000000 needs=- ver=1 st=ok -->",
+            "尾行",
+        ] {
+            assert!(merged.contains(line), "content preserved: {line:?} in {merged}");
+        }
+        // Idempotent: feeding the normalized output back changes nothing.
+        let again = lib_upsert_index("b.js", &sha, &merged).expect("upsert lf");
+        assert_eq!(merged, again, "LF output is a fixed point of the merge");
     }
 
     /// Property (fuzz, fixed seed): 随机劣化机器行（缺字段/重复字段/bad
