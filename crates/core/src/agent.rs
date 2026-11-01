@@ -311,7 +311,9 @@ pub enum AgentEvent {
     /// tagging); harness `--json` maps it to `{"type":"salvage"}`, plain
     /// headless writes one stderr line, and the TUI appends one warning
     /// system row ("[max_tokens hit — one wrap-up turn appended]"). All three
-    /// hosts surface it — none may drop the event silently. Informational —
+    /// hosts surface the top-level event; a sub-agent's salvage arrives
+    /// wrapped in `SubAgent` and is folded with the child's other internal
+    /// turn events. Informational —
     /// the wrap-up request itself is an ordinary main turn (hooks / billing /
     /// turn budget all apply to it like any other).
     MaxTokensSalvage,

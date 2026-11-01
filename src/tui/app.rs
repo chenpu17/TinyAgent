@@ -160,7 +160,7 @@ struct DoneSignal(
 
 impl Drop for DoneSignal {
     fn drop(&mut self) {
-        self.1.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.1.store(true, std::sync::atomic::Ordering::Release);
         let _ = self.0.send(());
     }
 }
@@ -556,7 +556,7 @@ fn ui_loop(
                     // is therefore detected by the flag DoneSignal set on
                     // drop, not by channel state.
                     if busy
-                        && worker_exited.load(std::sync::atomic::Ordering::Relaxed)
+                        && worker_exited.load(std::sync::atomic::Ordering::Acquire)
                         && reset_after_worker_exit(
                             &mut busy,
                             &mut run_start,
@@ -897,7 +897,7 @@ fn ui_loop(
                                 thinking_stream = None;
                                 rows.push(Row::sys_warn(format!("[{name}] [warn] {w}")));
                             }
-                            _ => {} // TurnStart/Usage/SubAgent: noisy or folded at the agent level
+                            _ => {} // the child's internal bookkeeping (TurnStart/Usage/Compressed/Pruned/MaxTokensSalvage/…): folded at the agent level
                         }
                     }
                     AgentEvent::MaxTokensSalvage => {

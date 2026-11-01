@@ -3507,8 +3507,16 @@ fn md_cache_bounded_single_slot_and_commit_bypass() {
     assert_eq!(c.len(), 1, "exactly the live streaming entry remains");
 }
 
+/// Serializes the tests that install the process-global diag sink: install is
+/// replace-semantics, so two of them interleaving would swap each other's sink
+/// mid-assertion.
+static DIAG_SINK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn diag_sink_forwards_kernel_diag_to_ui() {
+    let _sink = DIAG_SINK_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     // P2-2: while the TUI owns the terminal, kernel diagnostics must
     // arrive as UiMsg::Diag on the UI channel instead of eprintln'ing
     // from a background thread straight over the raw-mode viewport. The
@@ -3862,6 +3870,9 @@ fn kill_to_line_start_and_end_work_with_unicode() {
 /// `DoneSignal` sets, not via channel state.
 #[test]
 fn diag_bridge_sender_keeps_event_channel_connected_after_worker_exit() {
+    let _sink = DIAG_SINK_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     // When racing other tests that touch the global sink (install is
     // replace semantics), Disconnected can show up early because the sink
     // was swapped/cleared under us — retry on a fresh channel.
@@ -3879,14 +3890,22 @@ fn diag_bridge_sender_keeps_event_channel_connected_after_worker_exit() {
                 tiny_agent::diag::clear_diag_sink();
                 continue; // parallel interference: retry
             }
-            Ok(_) => panic!("unexpected UiMsg in a fresh channel"),
+            // Diag emitted by an unrelated parallel test reached us through
+            // the bridge: a live sender, so the channel is still connected.
+            Ok(_) => empty_observed = true,
         }
         // Clearing the bridge (the TerminalGuard::drop moment, which in
         // reality happens only after ui_loop returned) is what finally
         // disconnects the channel — the sink clone was the last sender.
         tiny_agent::diag::clear_diag_sink();
+        let after_clear = loop {
+            match out_rx.try_recv() {
+                Ok(_) => continue, // diag queued by a parallel test before the clear
+                Err(e) => break e,
+            }
+        };
         assert!(
-            matches!(out_rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)),
+            matches!(after_clear, mpsc::TryRecvError::Disconnected),
             "after clear_diag_sink the channel must finally disconnect"
         );
         break;
