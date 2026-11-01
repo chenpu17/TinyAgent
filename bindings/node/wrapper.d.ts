@@ -9,6 +9,38 @@ export interface Usage {
   cache_read_input_tokens: number;
 }
 
+/** Audit record of one completed compression during a run (`RunOutcome.compressions`,
+ *  only present when the run actually compressed). `trigger` is the lowercase
+ *  wire label ("preflight" / "overflow" / "manual"). */
+export interface CompressionRecord {
+  trigger: string;
+  /** Middle messages folded into the summary. */
+  dropped: number;
+  /** History length after the fold. */
+  kept: number;
+  /** chars/4 estimate taken just before the fold (same estimator the
+   *  preflight gate consults). */
+  estimated_tokens_before: number;
+  /** The same estimate taken after the fold (always the whole-history
+   *  heuristic — the rewrite voids the anchor). */
+  estimated_tokens_after: number;
+  /** Provider-MEASURED prompt tokens behind the `before` estimate; absent
+   *  when no valid usage anchor existed at fold time. */
+  measured_tokens_before?: number;
+}
+
+/** Per-turn wall-clock timing (`RunOutcome.turn_timings`; one row per started
+ *  turn, so `length === turns` on every outcome). */
+export interface TurnTiming {
+  /** 1-based turn number (matches the TurnStart event). */
+  turn: number;
+  /** Wall-clock milliseconds from turn start to the turn body's end
+   *  (preflight compression counts toward the turn). */
+  duration_ms: number;
+  /** Tool calls recorded during this turn. */
+  tool_calls: number;
+}
+
 export interface ToolCall {
   name: string;
   /** The model's parsed arguments for the call. */
@@ -19,6 +51,9 @@ export interface ToolCall {
   /** Audit side-channel the tool may attach (never model-visible content) —
    *  present only when the tool set one. */
   meta?: unknown;
+  /** Wall-clock milliseconds the tool BODY ran (hooks gate excluded);
+   *  absent when the call never executed (a deny or a cancel checkpoint). */
+  duration_ms?: number;
 }
 
 export interface RunOutcome {
@@ -26,6 +61,10 @@ export interface RunOutcome {
   turns: number;
   stop_reason: string;
   tool_calls: ToolCall[];
+  /** Compression audit trail; present only when the run compressed. */
+  compressions?: CompressionRecord[];
+  /** Per-turn wall-clock timing; one row per started turn. */
+  turn_timings?: TurnTiming[];
   input_tokens: number;
   output_tokens: number;
   cache_creation_input_tokens: number;
@@ -154,8 +193,11 @@ export type HookDecision =
   | { deny: string }
   | { modify: any };
 
-/** The finished-call view afterTool receives. `executed` is false only when
- *  beforeTool denied the call. */
+/** The finished-call view afterTool receives. `executed` is false for three
+ *  shapes (the core's hooks contract): beforeTool denied the call, the call
+ *  was skipped at the gate→execution cancel checkpoint (the cancel landed
+ *  while the gate was deliberating), or the approved call never started its
+ *  tool body (the parallel batch's recorded placeholder). */
 export interface HookAfterPayload {
   tool: string;
   /** The model's ORIGINAL input (never a modify replacement). */
@@ -205,11 +247,17 @@ export declare class CancelToken {
 
 /** Result of a manual compact(): dropped = messages folded into the summary,
  *  kept = history length after, usage = the summary request's token cost
- *  (null when the provider reported none). */
+ *  (null when the provider reported none), plus the token-estimate brackets
+ *  around the fold (the chars/4 yardstick the preflight gate consults);
+ *  measured_tokens_before is present only while a provider-measured anchor
+ *  was still valid at fold time. */
 export interface CompactOutcome {
   dropped: number;
   kept: number;
   usage: Usage | null;
+  estimated_tokens_before?: number;
+  estimated_tokens_after?: number;
+  measured_tokens_before?: number;
 }
 
 /** One tool's estimated schema cost (name + description + schema JSON,
@@ -290,7 +338,8 @@ export declare class Agent {
    *  an object is one block; an array is one block per element (in order).
    *  `tool_use` / `tool_result` blocks are rejected (agent-loop internals). */
   pushUser(content: string | UserBlock | Array<string | UserBlock>): void;
-  /** Arm a CancelToken; its flag interrupts the next turn boundary. */
+  /** Arm a CancelToken; its flag interrupts the next turn boundary. Throws
+   *  while a run is in flight (busy contract — flip `token.cancel()` instead). */
   setCancel(token: CancelToken): void;
   /** Clear the cancel flag — the acceptance-point half of the cancel
    *  contract: call when accepting a NEW task, never during a run (a stop

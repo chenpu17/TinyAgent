@@ -19,7 +19,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 
-const { chat, Agent } = require('..');
+const { chat, Agent, CancelToken } = require('..');
 const { ScriptedMock, toolCallSse, textSse, respondSse } = require('./mock');
 
 const MOCK_KEY = 'mock-key';
@@ -230,4 +230,107 @@ test('hooks object without methods is a no-op (allow all)', async (t) => {
   const out = await chat(cfgPath, 'go', { apiKey: MOCK_KEY, hooks: {} });
   assert.strictEqual(out.tool_calls[0].is_error, false);
   assert.ok(out.tool_calls[0].output.includes('passthrough'));
+});
+
+// ── gate waits: bounded timeout + cancel-aware wording + registry hygiene ────
+
+test('never-settling beforeTool denies with the bounded-wait message', async (t) => {
+  // A JS gate that never resolves must fail CLOSED within the run budget
+  // (never hang the worker on the 120s backstop), the call is refused with
+  // the reason the model sees, and the round-trip entry is reclaimed by the
+  // native failure arm (same discipline as the tool/provider round-trips —
+  // resolveHooksDecision is the only other remover and never fires here).
+  const mock = await ScriptedMock.start(shellRound('echo hi'));
+  t.after(() => mock.stop());
+  const workdir = fs.mkdtempSync(path.join(os.tmpdir(), 'ta-hooks-'));
+  t.after(() => fs.rmSync(workdir, { recursive: true, force: true }));
+  const cfgPath = path.join(workdir, 'config.json');
+  fs.writeFileSync(cfgPath, JSON.stringify({
+    provider: 'openai',
+    api_key_env: 'TA_NODE_UNUSED_KEY',
+    base_url: mock.url,
+    model: 'mock-model',
+    max_tokens: 1024,
+    tools: ['shell'],
+    workdir,
+    limits: { max_turns: 6, timeout_secs: 2, max_output_chars: 20000, stream_idle_secs: 30 },
+  }));
+  const a = new Agent(cfgPath, {
+    apiKey: MOCK_KEY,
+    hooks: { beforeTool: () => new Promise(() => {}) }, // never settles
+  });
+  a.pushUser('run it');
+  const started = Date.now();
+  const out = await a.run();
+  const rec = out.tool_calls[0];
+  assert.strictEqual(rec.is_error, true);
+  assert.ok(
+    /refused the call: JS callback did not resolve within \d+s/.test(rec.output),
+    `bounded-wait refusal expected: ${rec.output}`,
+  );
+  assert.ok(Date.now() - started < 60_000, 'the gate wait must be bounded by the run budget');
+});
+
+test('cancel flipping mid-gate reports "cancelled", not a timeout', async (t) => {
+  // The gate wait is polled in slices against the cancel flag: a cancel
+  // during the wait fails the gate with the CANCELLED wording — the same
+  // message split the tool round-trip uses — instead of the misleading
+  // "did not resolve within Ns".
+  const mock = await ScriptedMock.start(shellRound('echo hi'));
+  t.after(() => mock.stop());
+  const workdir = fs.mkdtempSync(path.join(os.tmpdir(), 'ta-hooks-'));
+  t.after(() => fs.rmSync(workdir, { recursive: true, force: true }));
+  const cfgPath = path.join(workdir, 'config.json');
+  fs.writeFileSync(cfgPath, JSON.stringify({
+    provider: 'openai',
+    api_key_env: 'TA_NODE_UNUSED_KEY',
+    base_url: mock.url,
+    model: 'mock-model',
+    max_tokens: 1024,
+    tools: ['shell'],
+    workdir,
+    limits: { max_turns: 6, timeout_secs: 8, max_output_chars: 20000, stream_idle_secs: 30 },
+  }));
+  const tok = new CancelToken();
+  const a = new Agent(cfgPath, {
+    apiKey: MOCK_KEY,
+    hooks: { beforeTool: () => new Promise(() => {}) }, // never settles
+  });
+  a.setCancel(tok);
+  a.pushUser('run it');
+  setTimeout(() => tok.cancel(), 300);
+  const out = await a.run();
+  assert.strictEqual(out.stop_reason, 'cancelled');
+  const rec = out.tool_calls[0];
+  assert.strictEqual(rec.is_error, true);
+  assert.ok(
+    /refused the call: cancelled/.test(rec.output),
+    `cancel wording expected: ${rec.output}`,
+  );
+  assert.ok(!/did not resolve within/.test(rec.output), 'no timeout wording on a cancel');
+});
+
+test('hooks decision with deny+modify fails closed (single-key contract)', async (t) => {
+  // One decision, one key: a decision carrying BOTH deny and modify is
+  // ill-formed and fails closed — the deny string is NOT trusted as the
+  // refusal reason. (The parser used to silently take whichever key its
+  // first match arm tested, diverging from the Python binding's rejection.)
+  const mock = await ScriptedMock.start(shellRound('echo original'));
+  t.after(() => mock.stop());
+  const hooks = {
+    beforeTool: async () => ({ deny: 'nope denied', modify: { command: 'echo evil' } }),
+  };
+  const { a, cleanup } = await withAgent(t, mock.url, hooks);
+  t.after(cleanup);
+
+  a.pushUser('run it');
+  const out = await a.run();
+
+  const rec = out.tool_calls[0];
+  assert.strictEqual(rec.is_error, true);
+  assert.ok(
+    !rec.output.includes('nope denied'),
+    `the deny arm must not win on a dual-key decision: ${rec.output}`,
+  );
+  assert.ok(rec.output.includes('refused the call'), rec.output);
 });

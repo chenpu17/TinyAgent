@@ -114,3 +114,31 @@ test('wrapper.Agent.create overrides the native static (prototype fix-up)', () =
     'wrapper.Agent.create must override the native static',
   );
 });
+
+test('wrapper.d.ts documents the cost-observability fields the runtime serializes', () => {
+  // The outcome shapes drift with the core's RunOutcome / ToolCallRecord /
+  // CompressOutcome (snake_case, mirrored verbatim). When the core gains a
+  // serialized field, this list fails until wrapper.d.ts documents it — the
+  // same discipline as the prototype scan above, for the DATA face. Each
+  // interface name must exist, and each field must appear as an OPTIONAL
+  // key (new keys are always `?:` — consumers compiled against the old
+  // shape must keep compiling).
+  const dts = fs.readFileSync(path.join(__dirname, '..', 'wrapper.d.ts'), 'utf8');
+  const keywords = [
+    'CompressionRecord',
+    'TurnTiming',
+    'compressions?',
+    'turn_timings?',
+    'duration_ms?',
+    'estimated_tokens_before?',
+    'estimated_tokens_after?',
+    'measured_tokens_before?',
+  ];
+  for (const kw of keywords) {
+    assert.ok(dts.includes(kw), `wrapper.d.ts must document ${kw}`);
+  }
+  // The two new interfaces carry the core's field names verbatim.
+  for (const iface of ['interface CompressionRecord', 'interface TurnTiming']) {
+    assert.ok(dts.includes(iface), `wrapper.d.ts must declare ${iface}`);
+  }
+});

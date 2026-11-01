@@ -125,9 +125,17 @@ function wrapProvider(provider) {
  *  throw in the callback escalates to napi_fatal_exception: an UNCATCHABLE
  *  process exit. Swallow instead (log to stderr), matching the Python
  *  binding's semantics (a buggy onEvent must not poison the run) and the
- *  tools/provider wrappers above. Covers sync throws and async rejections. */
+ *  tools/provider wrappers above. Covers sync throws and async rejections.
+ *
+ *  `null` / `undefined` mean "no callback"; anything else that is not a
+ *  function is a TypeError — the same present-but-wrong shape contract the
+ *  tools / provider / hooks wrappers enforce, instead of being silently
+ *  treated as "no callback". */
 function wrapOnEvent(onEvent) {
-  if (typeof onEvent !== 'function') return undefined;
+  if (onEvent == null) return undefined;
+  if (typeof onEvent !== 'function') {
+    throw new TypeError('onEvent must be a function when present');
+  }
   return function onNativeEvent(ev) {
     try {
       Promise.resolve(onEvent(ev)).catch((e) => {
@@ -137,6 +145,19 @@ function wrapOnEvent(onEvent) {
       console.error('[tiny-agent] onEvent callback threw (ignored):', e);
     }
   };
+}
+
+/** The three entry points (`new Agent` / `Agent.create` / `chat`) accept a
+ *  config FILE PATH only — an inline config object is Python-side-only for
+ *  now (documented in docs/lib_api.md). Rejecting here turns what would be a
+ *  confusing deep napi conversion error into a clear TypeError. */
+function requireConfigPath(configPath) {
+  if (typeof configPath !== 'string') {
+    throw new TypeError(
+      'configPath must be a config file path (inline config objects are Python-only for now)',
+    );
+  }
+  return configPath;
 }
 
 /** Wrap the user's duck-typed hooks object into the TSFN callback shapes the
@@ -226,8 +247,9 @@ function wrapHooks(hooks) {
 
 class Agent extends native.Agent {
   constructor(configPath, opts = {}) {
+    const cfgPath = requireConfigPath(configPath);
     super(
-      configPath,
+      cfgPath,
       wrapTools(opts.tools),
       wrapProvider(opts.provider),
       opts.apiKey,
@@ -250,8 +272,9 @@ class Agent extends native.Agent {
   // `this.prototype` (not `Agent.prototype`) keeps subclassing intact.
   static create(configPath, opts = {}) {
     const AgentClass = this;
+    const cfgPath = requireConfigPath(configPath);
     const pending = native.Agent.create(
-      configPath,
+      cfgPath,
       wrapTools(opts.tools),
       wrapProvider(opts.provider),
       opts.apiKey,
@@ -285,8 +308,9 @@ class Agent extends native.Agent {
 }
 
 async function chat(configPath, message, opts = {}) {
+  const cfgPath = requireConfigPath(configPath);
   return native.chat(
-    configPath,
+    cfgPath,
     message,
     wrapOnEvent(opts.onEvent),
     wrapTools(opts.tools),

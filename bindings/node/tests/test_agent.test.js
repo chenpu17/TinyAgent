@@ -43,6 +43,13 @@ function writeConfig(t, mockUrl, opts = {}) {
   return { cfgPath, workdir };
 }
 
+// Two-request script: a shell tool_call turn, then a final text turn (the
+// shape the cost-shape / envelope tests need).
+const shellRound = (command) => [
+  (_body, res) => respondSse(res, toolCallSse('c1', 'shell', { command })),
+  (_body, res) => respondSse(res, textSse('ok done')),
+];
+
 // ── 1. chat(): built-in write_file tool round-trip ──────────────────────────
 
 test('chat one-shot: built-in write_file tool round-trip + side effect', async (t) => {
@@ -349,6 +356,10 @@ test('compact(instructions?, onEvent?) folds the history between runs', async (t
   assert.strictEqual(outcome.dropped, 4);
   assert.strictEqual(outcome.kept, 2);
   assert.strictEqual(a.messages().length, 2);
+  // The estimate brackets around the fold (the chars/4 yardstick the
+  // preflight gate consults) ride the outcome alongside dropped/kept/usage.
+  assert.ok('estimated_tokens_before' in outcome);
+  assert.ok('estimated_tokens_after' in outcome);
   const compressed = events.filter((e) => e && 'Compressed' in e).map((e) => e.Compressed);
   assert.ok(compressed.length >= 1, 'Compressed event forwarded');
   assert.strictEqual(compressed[0].trigger, 'Manual');
@@ -862,4 +873,97 @@ test('contextBreakdown busy-errors while a run is in flight', async (t) => {
   assert.throws(() => a.contextBreakdown(), /Agent\.run\(\) is active/);
   await p;
   assert.ok(a.contextBreakdown().total_tokens > 0, 'works again after the run');
+});
+
+// ── 13. cost observability: outcome shape + failed-run envelope ──────────────
+
+test('run outcome exposes turn_timings and per-call duration_ms', async (t) => {
+  // The core's cost-observability fields serialize straight through the
+  // binding (snake_case, identical to the Python dicts): one timing row per
+  // started turn, wall-clock duration on every executed tool call.
+  const mock = await ScriptedMock.start(shellRound('echo hi'));
+  t.after(() => mock.stop());
+  const { cfgPath } = writeConfig(t, mock.url);
+  const a = new Agent(cfgPath, { apiKey: MOCK_KEY });
+  a.pushUser('run it');
+  const out = await a.run();
+  assert.strictEqual(out.turns >= 1, true);
+  assert.ok(Array.isArray(out.turn_timings), 'turn_timings serialized');
+  assert.strictEqual(out.turn_timings.length, out.turns);
+  for (const row of out.turn_timings) {
+    for (const k of ['turn', 'duration_ms', 'tool_calls']) {
+      assert.ok(k in row, `timing row missing ${k}`);
+    }
+  }
+  assert.strictEqual(typeof out.tool_calls[0].duration_ms, 'number');
+});
+
+test('failed run rejects with the honest-cost JSON envelope (6 keys)', async (t) => {
+  // A run that fails after executing a tool rejects with the structured
+  // envelope (error, usage, tool_calls, compressions, turns, elapsed) — the
+  // failed run's real cost, readable via JSON.parse(err.message). Locks the
+  // shape the older /boom/ message-match tests never pinned.
+  const mock = await ScriptedMock.start([
+    (_body, res) => respondSse(res, toolCallSse('c1', 'shell', { command: 'echo hi' })),
+    (_body, res) => { res.statusCode = 500; res.end('server exploded'); },
+  ]);
+  t.after(() => mock.stop());
+  const { cfgPath } = writeConfig(t, mock.url);
+  const a = new Agent(cfgPath, { apiKey: MOCK_KEY });
+  a.pushUser('run it');
+  await assert.rejects(
+    () => a.run(),
+    (e) => {
+      const env = JSON.parse(e.message);
+      for (const k of ['error', 'usage', 'tool_calls', 'compressions', 'turns', 'elapsed']) {
+        assert.ok(k in env, `envelope missing ${k}`);
+      }
+      assert.strictEqual(env.tool_calls.length, 1, 'the executed tool call is in the envelope');
+      assert.ok(/500/.test(env.error), `error names the failure: ${env.error}`);
+      return true;
+    },
+  );
+});
+
+// ── 14. entry-point shape guards (wrapper.js) ────────────────────────────────
+
+test('configPath must be a string in all three entry points', async (t) => {
+  // The Node entry points accept a config FILE PATH only; an inline config
+  // object is Python-side-only for now. The guard rejects with a clear
+  // TypeError at the door instead of a confusing deep napi conversion error
+  // (new/create throw synchronously; chat rejects — it is an async function).
+  const inline = {
+    provider: 'openai',
+    api_key_env: 'X',
+    base_url: 'http://unused',
+    model: 'm',
+    max_tokens: 1,
+    tools: [],
+    workdir: '.',
+  };
+  const expected = /configPath must be a config file path/;
+  assert.throws(() => new Agent(inline, { apiKey: MOCK_KEY }), expected);
+  assert.throws(() => Agent.create(inline, { apiKey: MOCK_KEY }), expected);
+  await assert.rejects(() => chat(inline, 'hi', { apiKey: MOCK_KEY }), expected);
+});
+
+test('non-function onEvent throws TypeError instead of running without events', async (t) => {
+  // null/undefined stay the documented "no callback" shorthand; any other
+  // non-function is the same present-but-wrong-shape contract the
+  // tools/provider/hooks wrappers enforce — never silently treated as "no
+  // callback". run/compact throw synchronously (the wrapper override), the
+  // async chat() rejects.
+  const mock = await ScriptedMock.start([(_b, res) => respondSse(res, textSse('done'))]);
+  t.after(() => mock.stop());
+  const { cfgPath } = writeConfig(t, mock.url, { tools: [] });
+  const a = new Agent(cfgPath, { apiKey: MOCK_KEY });
+  a.pushUser('hi');
+  const expected = /onEvent must be a function when present/;
+  assert.throws(() => a.run(42), expected);
+  assert.throws(() => a.run('oops'), expected);
+  assert.throws(() => a.compact(null, 42), expected);
+  await assert.rejects(() => chat(cfgPath, 'hi', { apiKey: MOCK_KEY, onEvent: 'oops' }), expected);
+  // null/undefined still mean "no callback" on every entry.
+  const out = await a.run();
+  assert.strictEqual(out.stop_reason, 'end_turn');
 });

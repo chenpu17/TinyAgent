@@ -647,13 +647,16 @@ pub fn resolve_hooks_decision(id: i64, result: Value) -> Result<()> {
 
 /// Parse a JS decision into a [`ta::ToolDecision`]: `null` → Allow, a string
 /// → Deny(message), `{deny: string}` / `{modify: input}` → the matching
-/// decision. Anything else fails closed.
+/// decision. A decision carrying BOTH `deny` and `modify` is ill-formed (one
+/// decision, one key — the Python binding rejects it the same way): it falls
+/// to the fail-closed arm rather than silently taking whichever key the match
+/// happens to test first. Anything else fails closed.
 fn decision_from_value(v: Value, tool: &str) -> ta::ToolDecision {
     match v {
         Value::Null => ta::ToolDecision::Allow,
         Value::String(s) => ta::ToolDecision::Deny(s),
         Value::Object(ref m) => match (m.get("deny"), m.get("modify")) {
-            (Some(Value::String(d)), _) => ta::ToolDecision::Deny(d.clone()),
+            (Some(Value::String(d)), None) => ta::ToolDecision::Deny(d.clone()),
             (None, Some(modv)) => ta::ToolDecision::Modify(modv.clone()),
             _ => ta::ToolDecision::Deny(format!(
                 "[hooks] beforeTool('{tool}') refused the call: object must be \
@@ -676,8 +679,11 @@ struct HookCtx<'a> {
 }
 
 /// The observe-only afterTool payload: original input, an output view
-/// ({content, is_error, meta}), whether it executed (false only for a Deny),
-/// and the ctx.
+/// ({content, is_error, meta}), whether it executed, and the ctx.
+/// `executed = false` covers three shapes (the core's hooks contract): a
+/// `before_tool` Deny, a call skipped at the gate→execution cancel checkpoint
+/// (the cancel landed while the gate was deliberating), and the parallel
+/// batch's placeholder for an approved call that never started its tool body.
 #[derive(serde::Serialize)]
 struct HookAfterCall<'a> {
     tool: &'a str,
@@ -746,11 +752,31 @@ impl ta::Hooks for JsHooks {
         let wait = callback_wait_ceiling(ctx.deadline);
         match recv_interruptible(&rx, wait, ctx.cancel.as_deref()) {
             Ok(v) => decision_from_value(v, tool),
-            Err(_) => ta::ToolDecision::Deny(format!(
-                "[hooks] beforeTool('{tool}') refused the call: JS callback did not \
-                 resolve within {}s",
-                wait.as_secs() + u64::from(wait.subsec_millis() > 0)
-            )),
+            Err(_) => {
+                // Reclaim the registry entry — the tool and custom-provider
+                // round-trips do the same in their failure arms, and
+                // resolveHooksDecision is the only other remover (it never
+                // fires for an abandoned call): a JS gate that never settles
+                // would otherwise strand one sender forever.
+                pending_hooks().lock().unwrap().remove(&id);
+                // Same message split as the tool closure: a cancel flip
+                // mid-gate is "cancelled", not a misleading timeout.
+                let why = if ctx
+                    .cancel
+                    .as_ref()
+                    .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+                {
+                    "cancelled".to_string()
+                } else {
+                    format!(
+                        "JS callback did not resolve within {}s",
+                        wait.as_secs() + u64::from(wait.subsec_millis() > 0)
+                    )
+                };
+                ta::ToolDecision::Deny(format!(
+                    "[hooks] beforeTool('{tool}') refused the call: {why}"
+                ))
+            }
         }
     }
 
@@ -1179,7 +1205,9 @@ impl Agent {
     /// Run one turn (until end_turn / max_turns / cancel / error). `onEvent` is
     /// called for each `AgentEvent` (text deltas, tool calls, usage, …) as a
     /// plain object. Resolves with the `RunOutcome` object
-    /// (final_text, turns, stop_reason, tool_calls, *_tokens, elapsed).
+    /// (final_text, turns, stop_reason, tool_calls — each with its
+    /// `duration_ms`, compressions (only when the run compressed),
+    /// turn_timings, *_tokens, elapsed).
     #[napi]
     pub fn run(
         &self,
@@ -1211,10 +1239,12 @@ impl Agent {
     /// summarize the middle via the LLM, fold it into the first message,
     /// rewrite the session file. `instructions` is an optional focus hint for
     /// the summarizer ("focus on the API changes"); `onEvent` receives the
-    /// `Compressed`/`Warning` events. Resolves with `{dropped, kept, usage}`
-    /// or `null` when nothing was compressible (history too short); rejects
-    /// on summary-request failure. The summary's cost is NOT part of the next
-    /// run's `usage()` — meter it from the returned `usage` yourself.
+    /// `Compressed`/`Warning` events. Resolves with `{dropped, kept, usage,
+    /// estimated_tokens_before, estimated_tokens_after, measured_tokens_before
+    /// (when a measured anchor was valid)}` or `null` when nothing was
+    /// compressible (history too short); rejects on summary-request failure.
+    /// The summary's cost is NOT part of the next run's `usage()` — meter it
+    /// from the returned `usage` yourself.
     #[napi]
     pub fn compact(
         &self,

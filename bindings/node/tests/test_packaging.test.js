@@ -80,6 +80,42 @@ function npm(args, opts) {
     : args, { ...opts, shell: win, encoding: 'utf8' });
 }
 
+test('optionalDependencies pins match the package version (manifest, not just lock)', () => {
+  // Release-sync guard: the MANIFEST's optionalDependencies are what npm
+  // ships in the published main package (the lockfile never enters the
+  // tarball), and with exact pins npm install reconciles the lock TOWARD the
+  // manifest — never the reverse. A version bump that edits the top-level
+  // version but leaves these five rows on the old release would make every
+  // user install the PREVIOUS release's platform binaries (old native API
+  // surface) while the repo still looks consistent (the lock was hand-synced).
+  const pkg = JSON.parse(fs.readFileSync(path.join(PKG_DIR, 'package.json'), 'utf8'));
+  const lock = JSON.parse(
+    fs.readFileSync(path.join(PKG_DIR, 'package-lock.json'), 'utf8'),
+  );
+  const pins = Object.entries(pkg.optionalDependencies ?? {});
+  assert.ok(
+    pins.length >= 5,
+    'the five platform subpackages must stay pinned in optionalDependencies',
+  );
+  for (const [name, version] of pins) {
+    assert.strictEqual(
+      version,
+      pkg.version,
+      `${name} must be pinned to the package version ${pkg.version} (got ${version})`,
+    );
+  }
+  // The lock mirrors the manifest for the same keys (an out-of-sync lock is
+  // the fingerprint of a hand-edited manifest).
+  const lockRoot = lock.packages && lock.packages[''];
+  assert.ok(lockRoot, 'package-lock.json has a root entry');
+  assert.deepStrictEqual(
+    lockRoot.optionalDependencies,
+    pkg.optionalDependencies,
+    'lock optionalDependencies must mirror the manifest',
+  );
+  assert.strictEqual(lock.version, pkg.version, 'lock top-level version matches');
+});
+
 test('main tarball whitelist: no *.node, loader + types shipped', { timeout: 60000 }, (t) => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ta-pack-wl-'));
   t.after(() => { try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* best-effort */ } });
