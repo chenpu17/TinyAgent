@@ -131,7 +131,9 @@ tiny-agent --config examples/chat.json --tui
 - 隔离 setup 失败（git 缺失 / 非 repo / 临时目录不可写）按 `setup_error` 报告（确定性，不重试）
 - git 模式孤儿 worktree：极端情况（进程被 SIGKILL）下 `git worktree prune` 在源仓库回收
 
-任务片段**只能覆盖** `task` / `system_prompt` / `model` / `max_tokens` / `limits`。安全相关字段
+任务片段**只能覆盖** `task` / `system_prompt` / `model` / `max_tokens` / `reasoning_effort` /
+`inject_environment` / `salvage_on_max_tokens` / `limits`（逐字段钳制）/ `code`（逐字段钳制；
+`code.enabled` 与 `code.llm.enabled` / `code.llm.default_model` 仍拒绝）。安全相关字段
 （`provider` / `base_url` / `api_key_env` / `workdir` / `tools` / `restrict_to_workdir` /
 `mcp_servers`）禁止覆盖——覆盖即标记 `bad_task` 失败，不执行。
 
@@ -145,11 +147,14 @@ tiny-agent --config examples/chat.json --tui
 | `error` | transient provider/网络错误（连接被拒、429、5xx、请求超时） | ✅ |
 | `request_error` | 确定性请求拒绝（401/403/404/400 等，重发同样被拒） | ❌ |
 | `context_overflow` | 上下文溢出且强制压缩未能救回（确定性） | ❌ |
+| `timeout` | run 级 `timeout_secs` 墙钟到点；run 在轮次边界收尾、transcript 完整（单跑 exit 124） | ❌ |
 | `bad_task` | 任务片段非法（禁用字段 / 缺 task / JSON 错） | ❌ |
 | `max_turns_reached` / `max_tokens` | 模型跑满上限 | ❌ |
 | `budget_exceeded` | 累计 token 触顶 `limits.max_total_tokens` | ❌ |
 | `stuck_loop` | 打转护栏：同参同果的相同调用连续 6 次（第 3 次先在下发的 tool_result 里附纠偏提示，给一次自愈机会；结果有进展或参数不同即重置） | ❌ |
 | `panic` | 任务在 worker 里 panic，被兜成失败条目（见下） | ❌ |
+| `cancelled` | 用户 Ctrl-C：未启动的任务标记 `cancelled` 不再执行；重试退避期间观测到取消同样以 `cancelled` 收尾（已烧成本照实入账） | ❌ |
+| `setup_error` | agent 构建失败（缺 `api_key_env` / MCP server 起不来 / 未知工具名）或任务 workdir 隔离 setup 失败（git 缺失 / 非 repo 根 / 临时目录不可写）；确定性——重试轮在此失败时保留前几轮的真实成本 | ❌ |
 | `end_turn` | 正常完成 | ❌（已成功） |
 
 **重试语义 = 整任务从头重放**：每次重试用全新 Agent 重跑完整任务，前一轮已发生的副作用
@@ -182,7 +187,8 @@ tiny-agent --config examples/harness.json --batch examples/tasks --failed --retr
 `request_error`（401/403/404/400 等确定性请求拒绝）直接以 exit 1 收场。请求失败发生在 run 截止
 （`limits.timeout_secs`）之后时按 `timeout`（exit 124）归属，不进重试梯。与 batch 相同，重试是**整任务
 重放**：前轮工具副作用不回滚（账单照实累计），副作用型任务需自行保证幂等。退出码与无重试时一致
-（成功 0、失败 1），`result.json` 的 `attempts` 字段记录实际运行次数（`>1` 即发生过重试）。`--json`
+（成功 0、失败 1），`result.json` 的 `attempts` 字段记录实际运行次数（`>1` 即发生过重试；批量任务
+终态先于 agent 构建时记 `0`）。`--json`
 模式每次重试前另吐一行
 `{"type":"retry","attempt":N,"max":M,"backoff_secs":B,"error":"..."}` 方便管道跟进。
 
@@ -417,7 +423,7 @@ tiny-agent --config examples/web-search.json --task "搜一下 Anthropic 最近�
   "workdir": "工具操作的工作目录，默认当前目录",
   "restrict_to_workdir": false,
   "inject_environment": true,
-  "tools": ["shell", "read_file", "write_file", "edit_file", "list_dir", "load_image"],
+  "tools": ["shell", "read_file", "write_file", "edit_file", "list_dir", "task", "todo"],
   "mcp_servers": [],
   "code": {"enabled": false},
   "reasoning_effort": "可选，思考程度字符串原样透传（none/low/medium/high/xhigh/max），不校验",
@@ -451,7 +457,7 @@ API key 从 `api_key_env` 指定的环境变量读取，不写进配置文件。
 
 `limits.stream_idle_secs`（默认 30）：流式响应两个 chunk 之间最长允许的静默秒数，超过即判定连接半开并中断。普通对话模型 chunk 间隔在亚秒级，30s 绰绰有余；**深度推理模型**（DeepSeek-R1、o 系列等）首 token 前可能静默数分钟，需要调大（如 180）才不会被误杀——`limits.timeout_secs` 仍是**模型请求层面**的软上限（约束每轮 chat 请求与轮次边界），不会因此无限挂起。
 
-`limits.timeout_secs`（默认 `0` = 不限）：整个 run 的墙钟**软上限**——约束每轮 chat 请求（单请求上限 = 剩余时间）与轮次边界（不再开新轮），`task` 子 agent 继承父的**剩余时间**（不会拿到完整第二份超时）。**不覆盖**的部分：工具执行各有独立上限（`shell_timeout_secs`、MCP 调用 120s），顶破上限那轮里已在跑的工具照常跑完（保 tool_use/tool_result 配对）；Python/Node 绑定的自定义 provider 回调是同步 host 调用，无法被强制中断（Node 侧等待上限已随剩余预算收紧，Python 侧靠 host 自律）。要硬墙钟请用外层 `timeout(1)` / 容器。
+`limits.timeout_secs`（默认 `600`；`0` = 不限）：整个 run 的墙钟**软上限**——约束每轮 chat 请求（单请求上限 = 剩余时间）与轮次边界（不再开新轮），`task` 子 agent 继承父的**剩余时间**（不会拿到完整第二份超时）。**不覆盖**的部分：工具执行各有独立上限（`shell_timeout_secs`、MCP 调用 120s），顶破上限那轮里已在跑的工具照常跑完（保 tool_use/tool_result 配对）；Python/Node 绑定的自定义 provider 回调是同步 host 调用，无法被强制中断（Node 侧等待上限已随剩余预算收紧，Python 侧靠 host 自律）。要硬墙钟请用外层 `timeout(1)` / 容器。
 
 `limits.shell_timeout_secs`（默认 120）：单条 `shell` 命令的墙钟上限，超时杀掉整个进程组并在结果里记 `[command timed out after Ns and was killed]`。评测任务里的构建 / 安装（`cargo build`、`npm install`、训练脚本）常常超过 120s——任务会被砍死写进账单成 error，看似模型不行实则 harness 不行；这类任务调大它（或设 `0` = 单命令不限时，交互取消与 run 级 `timeout_secs` 兜底仍生效）。注意它是**成本旋钮而非安全边界**：这也是 limits 里**唯一允许批量任务片段双向覆盖**的字段（放宽/收紧都行）——想烧时间的任务用一万条快命令同样能烧，真正的闸门是 `timeout_secs`（单向收紧）与 `max_total_tokens`。
 
@@ -643,8 +649,8 @@ TinyAgent 的定位是**可审计、可无人值守的 agent 执行单元**—�
   只有"删除键 / 改变键类型"这类破坏性变更才升版本号。消费方应**按键取值**、遇到未知键跳过，
   不要按位置或整体结构做严格校验。批量报告 `report.json` 同款（顶层另有 `agent_version`）。
 - `plan`（可选）：agent 通过 `todo` 工具记录的任务计划与每步状态（末次调用的全量列表）。**仅当 agent 用过 `todo` 才出现**，否则该键不存在——不用 `todo` 的结果文件与启用前逐字节相同。`tool_calls[]` 里 `task`（子 agent）条目另带一个可选 `meta` 字段（`turns`/`tools`/`tokens`/`stop_reason` 的紧凑 trace），同理仅在子 agent 调用时出现
-- `turn_timings`：每轮耗时（毫秒）与该轮工具调用数，逐轮对齐 `turns`；`duration_ms` 是该工具真实执行的耗时（排队与取消检查点不计入；因取消/打转未启动的占位记录不带该键）。`compressions`（可选）：上下文压缩审计——触发路径（`preflight`/`overflow`/`manual`）、折叠/保留消息数、压缩前后 token 估算（与 preflight 闸门同口径）及最近锚点请求的 provider 实测值（`measured_tokens_before`，无锚点时为 null）；**仅当发生过压缩才出现**。失败轮里已发生的压缩同样进审计（错误路径也是账单面）
-- `attempts` 是实际执行的 agent 运行次数（`>1` 表示发生了瞬态重试，见下文「单跑瞬态重试」）
+- `turn_timings`：每轮耗时（毫秒）与该轮工具调用数，**单个 attempt 内**与 `turns` 逐轮对齐；重试梯折叠后 `turns` 含失败 attempt 的轮次，`turn_timings` 只覆盖成功 attempt（行内轮编号按其所在 attempt 计）；`duration_ms` 是该工具真实执行的耗时（排队与取消检查点不计入；因取消/打转未启动的占位记录不带该键）。`compressions`（可选）：上下文压缩审计——触发路径（`preflight`/`overflow`/`manual`）、折叠/保留消息数、压缩前后 token 估算（与 preflight 闸门同口径）及最近锚点请求的 provider 实测值（`measured_tokens_before`，无锚点时为 null）；**仅当发生过压缩才出现**。失败轮里已发生的压缩同样进审计（错误路径也是账单面）
+- `attempts` 是实际执行的 agent 运行次数（`>1` 表示发生了瞬态重试，见下文「单跑瞬态重试」）。批量侧：终态先于 agent 构建时记 `0`（任务片段非法、隔离 setup 失败、从未启动即取消）；重试轮构建失败保留已进入的 attempt 计数
 - `input_tokens` / `output_tokens` 是本次运行累计的 token 用量；`cache_creation_input_tokens` /
   `cache_read_input_tokens` 是 prompt 缓存写/读累计（Anthropic 两者都报，OpenAI 只报读）。`input_tokens`
   只含未缓存部分，真实计费输入需加上缓存写 1.25× / 读 0.1×（见上文 Prompt caching）
@@ -674,7 +680,9 @@ TUI 模式下 `Ctrl-C` 是普通按键，按上面的按键表处理。
 
 `--json` 模式额外在每个事件吐一行 NDJSON（`type`: `turn` / `text` / `thinking` / `code_log` /
 `tool_input` / `tool_call` / `tool_result` / `usage` / `compressed` / `pruned` / `salvage` / `warning` /
-`subagent` / `todo` / `done`，重试时另吐 `retry`），可在结果文件落盘前实时跟进进度。`tool_input` 是工具参数的流式增量
+`note_injected` / `subagent` / `todo` / `done`，重试轮次之间另吐 `retry`，以及仅在 run_code 沙箱
+编译并启用时出现的流首 `code` 记录——`code` 是 harness 层记录、非 `AgentEvent` 变体），
+可在结果文件落盘前实时跟进进度。`tool_input` 是工具参数的流式增量
 （`{"type":"tool_input","id","name","delta"}`，键为 tool_use id）：模型边构造参数边透出，
 GUI 可渲染"正在构造调用…"（headless 终端不重复打印——完整 `tool_call` 行随后来）。
 这组 `type` 是**契约**：内核 `AgentEvent::ndjson_type()` 对每个事件变体穷尽赋值（新增变体不改它
@@ -1068,12 +1076,13 @@ cargo bench -p tiny-agent-core --features mock --bench loop_bench -- --quick
 
 ## 发布流程
 
-版本号同步在 **7 处**（改一处漏一处会造成绑定包与核心版本漂移）：根 `Cargo.toml`、
-`crates/core/Cargo.toml`、`bindings/{python,node}/Cargo.toml`、`bindings/python/pyproject.toml`、`bindings/node/package.json`，
-以及 `bindings/node/package-lock.json` 里 `optionalDependencies` 五个平台子包的版本
-（`npm install` 会自动刷新，`npm ci` 则因不同步直接报错——漏改它，用户跑 npm ci 就装不上；平台子包首发 npmjs 前 lock 里不会有它们的条目，CI 因此用 `npm install`，见 `.github/workflows/ci.yml` 注释）。
+版本号同步在 **6 处**（改一处漏一处会造成绑定包与核心版本漂移）：根 `Cargo.toml`、
+`crates/core/Cargo.toml`、`bindings/{python,node}/Cargo.toml`、`bindings/python/pyproject.toml`，
+以及 `bindings/node/package.json`——同一个文件里既有自身的 `version`，也有 `optionalDependencies`
+下五个平台子包的版本钉（主包 tarball 的依赖来自 manifest；`npm install` 会按 manifest 刷新 lock，
+反向不会）。
 
-1. 七处版本号同步 bump；
+1. 六处版本号同步 bump；
 2. `CHANGELOG.md` 补 `[新版本]` 段（从 `[Unreleased]` 挪入，附日期）；
 3. 提交后打 tag：`git tag vX.Y.Z`；
 4. `git push --tags` —— tag 推上 GitHub 后自动触发 release workflow

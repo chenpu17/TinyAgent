@@ -261,7 +261,9 @@
   hooks 之前（趁窗口期）；**两个绑定此后都已透出 hooks**（py `set_hooks` / node `setHooks`，Node
   决策走 round-trip、观察类 TSFN 吞异常）。
   **Slot 观测契约表**（`agent_tests.rs` 的 `slot_table_*` 六例）：`Slot` 只有 `Cancelled`/`Ran`
-  两态，但**进入路径有八条**（顺序 3 + 并行 4 + 批次整体跳过），每条对外的观测后果不同。六个用例用
+  两态，但**进入路径有九条**（顺序 3 + 并行 4 + 批次整体跳过 + 并行 worker panic——真的跑了但
+  worker unwind，合成 `Slot::Ran` 错误槽：records 一条错误、`duration_ms` 为空、
+  `after_tool(executed=true)`），每条对外的观测后果不同。六个用例用
   同一张表钉住「状态 → 五类观测面」（records / `ToolResult` 事件 / `ToolCall` 事件 / `before_tool` /
   `after_tool`），并派生两条不变量：**before↔after 严格配对**（`Ran` 两者都有、`Cancelled` 两者都无）
   与 **ToolCall↔ToolResult 事件配平**（announce 过的必须闭合；从未 announce 的保持沉默）。此前这些断言
@@ -540,13 +542,15 @@
   image/document/skill_content/other；**没有 thinking 桶**——思考是纯事件流永不进 history，恒 0 字段是
   撒谎式 API；skill_content 按 tool 名 == `read_skill` 归因，ToolResult 只有 tool_use_id，先扫 ToolUse 建
   id→name 映射（同 compress `todo_use_ids` 模式），eager 注入对与运行期真实调用一并归入）。**口径纪律**：
-  一切数字是启发式估算（`compress::estimate_tokens` 同一套 yardstick：chars/4 + 图片 len/100 + PDF 页
+  一切数字是启发式估算（`compress::estimate_tokens` 同一套 yardstick：units/4——ASCII 字符计 1、
+  CJK 计 9、其他非 ASCII 计 4——+ 图片 len/100 + PDF 页
   ×3000），**不是 provider 实测——记账权威永远是 Usage 事件/`usage()`；估算与实测刻意不混流**，所以走
   拉取式查询而非事件。**等和不变量**：未校准时
   `system.tokens+tools.tokens+messages.tokens == total_tokens == estimate_tokens(全量)` 严格成立，靠**单趟
   running-floor 分摊**（对全部 chars 段按固定顺序一遍：每段领 `floor(acc_after/4)-floor(acc_before/4)`；
   各段独立 /4 会因舍入差 1-2——`uncalibrated_total_equals_estimate_tokens` 测试是刻意钉子）；共享计费
-  原语 `compress::block_chars`/`block_pdf_tokens` 是 total_chars/estimate_tokens 与分解共用的单点
+  原语 `compress::block_chars`（chars 侧）/`block_units`（token 侧，文本走 CJK 感知的 `text_units`）/
+  `block_pdf_tokens` 是 total_chars/estimate_tokens 与分解共用的单点
   （新 Block 变体在此编译期强制决策，context_report 的分型 match 同样穷尽、`other` 是显式兜底目的地
   而非 wildcard）。**校准**：`UsageAnchor` 加 `scale: f64`（锚点写点顺手算
   `raw=estimate_tokens(同前缀)`，`scale=prompt/raw`，raw==0→1.0；**输入三轴全零的 usage 不写锚点**——

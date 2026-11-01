@@ -125,7 +125,9 @@ Under `--batch <dir>`, every `*.json` is a task fragment (all fields optional, o
 - Isolation setup failures (git missing / not a repo / temp dir unwritable) are reported as `setup_error` (deterministic, not retried)
 - git-mode orphan worktrees: in the extreme case (SIGKILL) `git worktree prune` reclaims them in the source repo
 
-Task fragments may **only override** `task` / `system_prompt` / `model` / `max_tokens` / `limits`. Security-relevant fields
+Task fragments may **only override** `task` / `system_prompt` / `model` / `max_tokens` / `reasoning_effort` /
+`inject_environment` / `salvage_on_max_tokens` / `limits` (clamped field by field) / `code` (clamped field by
+field; `code.enabled` and `code.llm.enabled` / `code.llm.default_model` are still refused). Security-relevant fields
 (`provider` / `base_url` / `api_key_env` / `workdir` / `tools` / `restrict_to_workdir` / `mcp_servers`) may not be
 overridden — any attempt marks the task `bad_task` and it is not executed.
 
@@ -140,11 +142,14 @@ cannot change them:
 | `error` | transient provider/network error (connection refused, 429, 5xx, request timeout) | ✅ |
 | `request_error` | deterministic request rejection (401/403/404/400 …; resending hits the same wall) | ❌ |
 | `context_overflow` | context overflow that forced compression could not rescue (deterministic) | ❌ |
+| `timeout` | the run-level `timeout_secs` wall clock expired; the run ends at a turn boundary with the transcript intact (exit 124 in single runs) | ❌ |
 | `bad_task` | invalid task fragment (forbidden field / missing task / JSON error) | ❌ |
 | `max_turns_reached` / `max_tokens` | a model limit was reached | ❌ |
 | `budget_exceeded` | cumulative tokens hit `limits.max_total_tokens` | ❌ |
 | `stuck_loop` | spinning guardrail: the same call with identical arguments and identical results 6 times in a row (the 3rd occurrence attaches a course-correction hint to the tool_result first, granting one self-healing chance; progress or changed args reset the counter) | ❌ |
 | `panic` | the task panicked in a worker and was caught into a failure entry (below) | ❌ |
+| `cancelled` | user Ctrl-C: tasks not yet started are marked `cancelled` without running; a cancel observed during retry backoff ends the task `cancelled` too (cost already burned stays in the bill) | ❌ |
+| `setup_error` | agent build failed (missing `api_key_env` / MCP server failed to start / unknown tool name) or per-task workdir isolation setup failed (git missing / not a repo root / temp dir unwritable); deterministic — a retry round that fails here keeps the earlier attempts' cost | ❌ |
 | `end_turn` | normal completion | ❌ (already succeeded) |
 
 **Retry semantics = the whole task replays from scratch**: every retry builds a fresh Agent and reruns the
@@ -182,7 +187,8 @@ rejections like 401/403/404/400) end with exit 1 immediately. A request failing 
 batch, a retry is a **full task replay**: prior tool side effects are not rolled back (the bill keeps honest
 count); side-effecting tasks must ensure their own idempotency. Exit codes are unchanged from the
 no-retry behavior (0 success / 1 failure), and `result.json`'s `attempts` field records how many runs
-actually happened (`>1` means a retry occurred). In `--json` mode each retry is preceded by a line
+actually happened (`>1` means a retry occurred; batch tasks whose terminal state is reached before any
+agent is built record `0`). In `--json` mode each retry is preceded by a line
 `{"type":"retry","attempt":N,"max":M,"backoff_secs":B,"error":"..."}` for pipe consumers.
 
 ```sh
@@ -473,7 +479,7 @@ tiny-agent --config examples/web-search.json --task "search for Anthropic's rece
   "workdir": "working directory for tool operations; defaults to the current directory",
   "restrict_to_workdir": false,
   "inject_environment": true,
-  "tools": ["shell", "read_file", "write_file", "edit_file", "list_dir", "load_image"],
+  "tools": ["shell", "read_file", "write_file", "edit_file", "list_dir", "task", "todo"],
   "mcp_servers": [],
   "code": {"enabled": false},
   "reasoning_effort": "optional; reasoning-effort string passed through verbatim (none/low/medium/high/xhigh/max), not validated",
@@ -522,7 +528,7 @@ silent for minutes before the first token and need this raised (e.g. 180) to avo
 `limits.timeout_secs` remains the **per-request-level** soft cap (bounding each turn's chat requests and
 the turn boundary), so nothing hangs forever because of it.
 
-`limits.timeout_secs` (default `0` = unlimited): the wall-clock **soft cap** for the whole run — it
+`limits.timeout_secs` (default `600`; `0` = unlimited): the wall-clock **soft cap** for the whole run — it
 bounds each turn's chat requests (per-request cap = remaining time) and the turn boundary (no new turn
 starts); a `task` sub-agent inherits the parent's **remaining** time (it never gets a full second
 helping of timeout). **Not** covered: tool executions have their own caps (`shell_timeout_secs`, 120s
@@ -839,7 +845,10 @@ temptations.
   result files that don't use it are byte-identical to pre-feature ones. A `task` (sub-agent) entry in
   `tool_calls[]` additionally carries an optional `meta` field (a compact trace of
   `turns`/`tools`/`tokens`/`stop_reason`), likewise present only when a sub-agent ran
-- `turn_timings`: per-turn duration (ms) and that turn's tool-call count, aligned with `turns`;
+- `turn_timings`: per-turn duration (ms) and that turn's tool-call count, aligned with `turns`
+  **within a single attempt**; once a retry ladder has folded, `turns` includes the failed attempts'
+  turns while `turn_timings` only covers the successful attempt (each row's turn number counts within
+  its own attempt);
   `duration_ms` is the tool's real execution time (queueing and cancel checkpoints excluded;
   placeholder records for calls never started due to cancel/stuck carry no key). `compressions`
   (optional): the context-compression audit — trigger path (`preflight`/`overflow`/`manual`),
@@ -848,7 +857,9 @@ temptations.
   **present only when a compression happened**. Compressions in a failed turn are audited too (error
   paths are also bill surfaces)
 - `attempts` is how many agent runs actually executed (`>1` means transient retries happened — see
-  "Single-run transient retries")
+  "Single-run transient retries"). Batch side: a terminal state reached before any agent is built
+  (bad task fragment, isolation setup failure, never-started cancel) records `0`; a retry round whose
+  rebuild fails keeps the attempt count already entered
 - `input_tokens` / `output_tokens` are the run's cumulative token usage;
   `cache_creation_input_tokens` / `cache_read_input_tokens` are the cumulative prompt-cache
   writes/reads (Anthropic reports both; OpenAI reports reads only). `input_tokens` excludes cached
@@ -884,7 +895,9 @@ the children) — an in-flight task depending on MCP tools may fail early becaus
 
 `--json` mode additionally emits one NDJSON line per event (`type`: `turn` / `text` / `thinking` /
 `code_log` / `tool_input` / `tool_call` / `tool_result` / `usage` / `compressed` / `pruned` / `salvage`
-/ `warning` / `subagent` / `todo` / `done`, plus `retry` on retries), letting pipes track progress
+/ `warning` / `note_injected` / `subagent` / `todo` / `done`, plus `retry` between retry attempts and a
+stream-head `code` record that appears only when the run_code sandbox is compiled in and enabled —
+`code` is a harness-level record, not an `AgentEvent` variant), letting pipes track progress
 before the result file lands. `tool_input` is the streaming increment of tool arguments
 (`{"type":"tool_input","id","name","delta"}`, keyed by tool_use id): the model emits while it is still
 constructing the call, and a GUI can render "constructing a call…". This set of `type`s is a
@@ -1391,15 +1404,14 @@ matching loop tests.**
 
 ## Release process
 
-Version numbers sync in **7 places** (miss one and the bindings drift from the core): root
+Version numbers sync in **6 places** (miss one and the bindings drift from the core): root
 `Cargo.toml`, `crates/core/Cargo.toml`, `bindings/{python,node}/Cargo.toml`,
-`bindings/python/pyproject.toml`, `bindings/node/package.json`, and the five platform subpackage versions under `optionalDependencies`
-in `bindings/node/package-lock.json` (`npm install` refreshes it automatically; `npm ci` errors hard
-on desync — skip it and users can't install via npm ci; until the platform subpackages are first
-published to npmjs the lock carries no entries for them, which is why CI uses `npm install` — see the
-comment in `.github/workflows/ci.yml`).
+`bindings/python/pyproject.toml`, and `bindings/node/package.json` — the last file carries both its own
+`version` and the five platform subpackage pins under `optionalDependencies` (the main package
+tarball's dependencies come from the manifest; `npm install` refreshes the lock from it — never the
+other way around).
 
-1. bump the version in all seven places;
+1. bump the version in all six places;
 2. add the `[new version]` section to `CHANGELOG.md` (moved from `[Unreleased]`, dated);
 3. commit, then tag: `git tag vX.Y.Z`;
 4. `git push --tags` — the tag landing on GitHub auto-triggers the release workflow

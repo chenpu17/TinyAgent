@@ -76,10 +76,9 @@ cargo clippy -p tiny-agent-node
   报 fatal。**所有** git 命令前置 `-c core.precomposeunicode=false`：
   `git -c core.precomposeunicode=false status` / `commit` / `log` ……
 - message 里有双引号会破坏 `-m "..."` 的 shell 引号——改用 `git commit -F <文件>` 写多行 message。
-- **发布（tag）**：版本号同步 7 处（根 `Cargo.toml`、`crates/core/Cargo.toml`、`bindings/{python,node}/Cargo.toml`、
-  `pyproject.toml`、`package.json`、`bindings/node/package-lock.json` 的 optionalDependencies
-  版本——`npm install` 会自动刷新；平台子包首发 npmjs 前 lock 里没有它们的条目，`npm ci` 在
-  干净 checkout 上必报不同步，CI 因此用 `npm install`，首发后再评估改回）+ `CHANGELOG.md` 补段，
+- **发布（tag）**：版本号同步 6 处（根 `Cargo.toml`、`crates/core/Cargo.toml`、`bindings/{python,node}/Cargo.toml`、
+  `pyproject.toml`、`package.json`——后者的 `optionalDependencies` 五行平台子包钉同一版本；
+  lock 由 `npm install` 按 manifest 刷新、反向不会）+ `CHANGELOG.md` 补段，
   然后 `git tag vX.Y.Z` 推双远端（github origin + gitee 镜像）。tag 推 GitHub 触发 `release.yml`
   （musl 产物，tarball 附 README + LICENSE）。流程详见 README 发布节。许可证是 **MIT**
   （根 `LICENSE`，各包 manifest 的 repository 字段统一指向 github.com/chenpu17/TinyAgent）——
@@ -164,6 +163,7 @@ cargo clippy -p tiny-agent-node
 - **`ToolConcurrency::Parallel` 是承诺**：可重入 + 轮询 cancel，核心不校验，谎报只在生产数据竞争。
 - **`#[non_exhaustive]` 只给消费侧枚举**；`Role`/`CompressTrigger`/生产侧枚举不加。
 - **思考展示**：headless 写 stderr 不进 stdout；TUI 独立 ✻ 区块不走 markdown。
+- **TUI 子 agent 气泡不切分**：live 区逐 delta 全量重解析是 O(气泡²)，触发条件是不守「简短总结」契约的子 agent（`TextDelta` 不受 `max_output_chars` 约束）。
 - **context_breakdown 等和靠单趟 running-floor**（各段独立 /4 会差 1-2 丢不变量）；无 thinking 桶（思考永不进 history）；锚点失效即校准回 None。
 
 ## 离线 / 视觉验证
@@ -187,7 +187,7 @@ cargo clippy -p tiny-agent-node
 - **进程内回归**：`agent.rs` 的 loop 不变量用 `provider/mock.rs`（脚本化 Provider，不连网）单测覆盖
   （测试体在 `agent_tests.rs`），比 mock server 更快、断言更准。新增/改动 loop 行为优先在这里加用例。
 - **Slot 观测契约表**（`agent_tests.rs` 的 `slot_table_*`）：`Slot` 只有 `Cancelled`/`Ran` 两态，但进入
-  路径有八条。六个用例用同一张表钉住「状态 → 五类观测面」（records / ToolResult 事件 / ToolCall 事件 /
+  路径有九条（含并行 worker panic：合成 `Ran` 错误槽、`duration_ms` 为空、`after_tool(executed=true)`）。六个用例用同一张表钉住「状态 → 五类观测面」（records / ToolResult 事件 / ToolCall 事件 /
   before_tool / after_tool），并派生出两条不变量：**before↔after 严格配对**、**ToolCall↔ToolResult 事件配平**。
   改了并行批次的分支（新增 Slot 赋值点、改占位/合成逻辑）先看这张表再动。
 - **TUI 视觉验证**：用 ratatui `TestBackend` 抓 cell grid 做断言（见 `tui::tests`）；端到端交互用

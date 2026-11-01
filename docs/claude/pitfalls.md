@@ -155,7 +155,10 @@
   `cancel_between_waves_never_starts_the_next_wave` /
   `parallel_event_sink_panic_unwinds_instead_of_deadlocking` +
   绑定两侧回归。
-- **批量任务片段只能覆盖** `task`/`system_prompt`/`model`/`max_tokens`/`limits`；安全字段
+- **批量任务片段只能覆盖** `task`/`system_prompt`/`model`/`max_tokens`/`reasoning_effort`/
+  `inject_environment`/`salvage_on_max_tokens`/`limits`（逐字段钳制）/`code`（逐字段钳制；
+  `code.enabled` 与 `code.llm.enabled`/`code.llm.default_model` 仍拒绝——不可信片段不得开关沙箱
+  或改 LLM 通道）；安全字段
   （`provider`/`base_url`/`api_key_env`/`workdir`/`tools`/`restrict_to_workdir`/`mcp_servers`）
   禁止覆盖（`config::forbidden_batch_override`），覆盖即 `bad_task` 失败、不执行。
   limits 内各字段的覆盖策略由 `config::Clamp` 三变体逐字段声明（`merge` 是唯一权威实现）：
@@ -271,6 +274,13 @@
   TUI 渲染为独立暗色斜体 `✻` 区块（`Row::Thinking`，不走 markdown/MdCache，与答复视觉分离；可折叠区块仍是 TinyWorker 的事）。
   子 agent 的思考经 `AgentEvent::SubAgent` 整体包装转发（`subagent.rs` 不逐变体 match），harness 的 SubAgent 内嵌
   match 单独把它写 stderr 带 `[name]` 前缀。
+- **TUI 子 agent 文本气泡不切分是既定决策，但它是平方级成本**：live 区对 SubAgent 气泡的每个
+  流式 `TextDelta` 都全量重解析整块 markdown（切分/增量渲染留后续）——单气泡渲染成本
+  O(气泡字节数²)。实测（bench profile，24KB 文本 / 300 个 delta）：子气泡路径 ≈371ms（≈单次
+  全量解析的 190 倍）vs 父路径 ≈1.25ms，外推 200KB 单气泡 ≈25s 纯 CPU。触发条件是**不守「简短总结」契约的
+  子 agent**——流式 `TextDelta` 不受 `max_output_chars` 约束、气泡可任意大，`task` 工具的
+  「只回简短总结」描述契约就是唯一的闸；给子 agent 塞长输出任务时记得这条成本曲线。
+  改 TUI live 区渲染前先读这条。
 - **改 `agent.rs` 核心路径必须配套 loop 测试**。测试外置在 `agent_tests.rs`（`agent.rs` 末尾
   `#[cfg(test)] #[path = "agent_tests.rs"] mod tests;` 引入，靠 `use super::*` 仍可达 agent 私有项；
   压缩纯函数的测试靠 `use crate::compress::*`）。用 `provider/mock.rs` 的脚本化 Provider 覆盖不变量：
