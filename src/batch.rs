@@ -147,12 +147,16 @@ fn prepare_isolation(
     match mode {
         IsolateMode::Copy => {
             let tmp = create_isolation_dir(&ISO_COUNTER, &std::env::temp_dir(), task_name)?;
-            copy_dir_filtered(&src, &tmp)?;
-            Ok(Some(IsolationGuard {
+            // Build the guard BEFORE the copy: a failed copy (unreadable
+            // entry, ...) must not leak the partial tree — Drop removes
+            // whatever got written, same contract as the git arm below.
+            let guard = IsolationGuard {
                 mode,
-                dir: tmp,
+                dir: tmp.clone(),
                 src_repo: None,
-            }))
+            };
+            copy_dir_filtered(&src, &tmp)?;
+            Ok(Some(guard))
         }
         IsolateMode::Git => {
             // The workdir must BE the repo root: `worktree add` checks out the
@@ -206,7 +210,10 @@ fn prepare_isolation(
             let mut last_err = String::new();
             let mut added = false;
             for attempt in 0..3u32 {
-                let out = no_window(&mut std::process::Command::new("git"))
+                // No `?` on the spawn: the sandbox dir already exists here, so
+                // a spawn failure must clean it up before propagating (same
+                // contract as the non-lock bail below).
+                let out = match no_window(&mut std::process::Command::new("git"))
                     // Pin the locale: the retry gate below matches the English
                     // "lock" substring in git's stderr, which a localized git
                     // would translate away (then a transient lock contention
@@ -221,7 +228,13 @@ fn prepare_isolation(
                         &tmp.display().to_string(),
                     ])
                     .output()
-                    .context("git worktree add failed to spawn")?;
+                {
+                    Ok(o) => o,
+                    Err(e) => {
+                        cleanup_failed_worktree_dir(&tmp);
+                        return Err(e).context("git worktree add failed to spawn");
+                    }
+                };
                 if out.status.success() {
                     added = true;
                     break;
@@ -375,6 +388,11 @@ fn copy_dir_filtered(src: &Path, dst: &Path) -> Result<()> {
 /// that ran until the disk filled. Skipped-on-repeat means the link's NAME
 /// is absent from the copy (no empty dir either): its target's content is
 /// already at the copy's corresponding location.
+///
+/// Non-regular files (FIFO / socket / device) are skipped with a warning,
+/// never `std::fs::copy`ed: copying opens the source for reading, and on
+/// unix that open blocks forever on a FIFO with no writer — isolation setup
+/// has no timeout, so one special file would hang the worker for good.
 fn copy_entry(
     from: &Path,
     to: &Path,
@@ -487,6 +505,22 @@ fn copy_entry(
                 )?;
             }
         } else {
+            // Same regular-file gate as the plain walk below, on the TARGET's
+            // type (resolved may itself be a link chain): std::fs::copy opens
+            // its source for reading, which on unix blocks forever on a FIFO —
+            // and isolation setup has no timeout, so one special file would
+            // hang the worker permanently.
+            let target_is_file = std::fs::metadata(&resolved)
+                .with_context(|| format!("cannot stat {}", resolved.display()))?
+                .is_file();
+            if !target_is_file {
+                harness::note(format_args!(
+                    "[warn] isolate copy: skipping symlink {} → {} (target is not a regular file)",
+                    from.display(),
+                    target.display()
+                ));
+                return Ok(());
+            }
             std::fs::copy(&resolved, to)?;
         }
     } else if ft.is_dir() {
@@ -503,8 +537,15 @@ fn copy_entry(
                 visited,
             )?;
         }
-    } else {
+    } else if ft.is_file() {
         std::fs::copy(from, to)?;
+    } else {
+        // FIFO / socket / device: not copied (see the dereference branch above
+        // for why a plain std::fs::copy here would hang on unix).
+        harness::note(format_args!(
+            "[warn] isolate copy: skipping {} (not a regular file)",
+            from.display()
+        ));
     }
     Ok(())
 }
@@ -542,6 +583,32 @@ struct TaskReport {
     model: String,
     #[serde(default)]
     started_at: String,
+}
+
+/// Task name of one scanned fragment file — the file stem; a path with no
+/// stem (the empty root, a drive letter) degrades to `"task"`.
+fn task_stem(f: &Path) -> String {
+    f.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "task".into())
+}
+
+/// Groups in `files` whose stems COLLIDE, e.g. `a.json` + `a.JSON` on a
+/// case-sensitive filesystem: the extension match is case-insensitive (so
+/// uppercase fragments are not silently skipped) and both files scan to task
+/// name "a". Colliding fragments all run under that one name and overwrite
+/// each other's `results/<name>.json` — the caller warns so the collision is
+/// at least visible.
+fn duplicate_task_stems(files: &[PathBuf]) -> Vec<(String, Vec<PathBuf>)> {
+    let mut groups: Vec<(String, Vec<PathBuf>)> = Vec::new();
+    for f in files {
+        let stem = task_stem(f);
+        match groups.iter_mut().find(|(n, _)| *n == stem) {
+            Some((_, group)) => group.push(f.clone()),
+            None => groups.push((stem, vec![f.clone()])),
+        }
+    }
+    groups.into_iter().filter(|(_, g)| g.len() > 1).collect()
 }
 
 /// Run every `*.json` task fragment in `dir` against the base config,
@@ -631,6 +698,18 @@ pub fn run(
     if files.is_empty() {
         bail!("no *.json task files in {}", dir.display());
     }
+    // Same-stem fragments (`a.json` + `a.JSON` — the scan deliberately keeps
+    // both) both run under task name "a" and share one results/<name>.json;
+    // only warn, the stem IS the task name by contract, renaming is the
+    // user's call. Unreachable where the filesystem itself is
+    // case-insensitive (the two spellings cannot coexist there).
+    for (stem, group) in duplicate_task_stems(&files) {
+        let spellings: Vec<String> = group.iter().map(|p| p.display().to_string()).collect();
+        harness::note(format_args!(
+            "[warn] duplicate task name {stem:?}: {} share one results file (results/{stem}.json)",
+            spellings.join(" + ")
+        ));
+    }
 
     // Parse all task fragments up front. A file that can't be read or
     // parsed is a per-task deterministic problem — the same class as a
@@ -642,10 +721,7 @@ pub fn run(
     let mut tasks: Vec<(String, PartialConfig)> = Vec::new();
     let mut bad_json: Vec<(String, String)> = Vec::new();
     for f in files {
-        let name = f
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "task".into());
+        let name = task_stem(&f);
         let raw = match std::fs::read_to_string(&f) {
             Ok(r) => r,
             Err(e) => {
@@ -689,7 +765,7 @@ pub fn run(
             tasks.len(),
             kept_successes
         ));
-        if tasks.is_empty() {
+        if tasks.is_empty() && bad_json.is_empty() {
             bail!(
                 "no previously-failed tasks matched files in {}",
                 dir.display()
@@ -1061,7 +1137,13 @@ fn run_one_attempt(
             name,
             stop,
             &msg,
-            attempt_no,
+            // `attempts` counts agent runs that actually executed. On attempt
+            // 1 nothing has run yet (this failure happened BEFORE build/apply),
+            // so write 0 — the same convention as the never-started / bad_json
+            // / isolated setup_error terminal records. From attempt 2 on, the
+            // earlier transient attempts really ran, so attempt_no is honest
+            // (retry_setup_failure_keeps_prior_attempt_cost pins 2).
+            if attempt_no > 1 { attempt_no } else { 0 },
             Some(&*acc),
             &harness::ResultMeta {
                 model: model.clone(),
@@ -1081,7 +1163,8 @@ fn run_one_attempt(
             "bad_task",
             format!(
                 "task file must not override '{field}' (only task/system_prompt/model/max_tokens/\
-                 limits/reasoning_effort/inject_environment/code are overridable in batch mode)"
+                 limits/reasoning_effort/inject_environment/salvage_on_max_tokens/code are \
+                 overridable in batch mode)"
             ),
         );
     }
@@ -1509,18 +1592,36 @@ fn merge_reports(prior: Vec<TaskReport>, fresh: &[TaskReport]) -> Vec<TaskReport
     // review P3). Each duplicate is still overlaid by a same-named fresh
     // entry; entries are position-independent after the final sort.
     let mut out = prior;
+    let mut consumed = vec![false; out.len()];
     for t in fresh {
-        // Overlay EVERY same-named prior entry (a duplicate prior should not
-        // keep a stale result beside its overlaid twin).
+        // Overlay the FIRST unconsumed same-named prior slot, so two fresh
+        // duplicates (case-sensitive FS: a.json + a.JSON) each keep their own
+        // result instead of the later one erasing the earlier.
         let mut matched = false;
-        for p in out.iter_mut() {
-            if p.name == t.name {
+        for (i, p) in out.iter_mut().enumerate() {
+            if p.name == t.name && !consumed[i] {
                 *p = t.clone();
+                consumed[i] = true;
                 matched = true;
+                break;
             }
         }
         if !matched {
             out.push(t.clone());
+            consumed.push(true);
+        }
+    }
+    // More same-named priors than fresh entries: overlay the leftover slots
+    // with the LAST fresh result of that name rather than keep a stale entry
+    // beside its overlaid twin (the invariant
+    // merge_reports_keeps_duplicate_named_prior_entries pins).
+    let last_fresh: std::collections::HashMap<&str, &TaskReport> =
+        fresh.iter().map(|t| (t.name.as_str(), t)).collect();
+    for (i, p) in out.iter_mut().enumerate() {
+        if !consumed[i] {
+            if let Some(t) = last_fresh.get(p.name.as_str()) {
+                *p = (*t).clone();
+            }
         }
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -3421,6 +3522,68 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn isolate_copy_skips_fifo_without_hanging() {
+        // A FIFO in the workdir must not reach std::fs::copy: copying opens
+        // its source for reading, and on unix that open blocks until a writer
+        // appears — isolation setup has no timeout, so one special file used
+        // to hang the worker forever. Both copy points are guarded: the plain
+        // walk (the FIFO itself) and the dereference branch (an absolute
+        // in-tree link to it). Regular files around it still copy.
+        let root = std::env::temp_dir().join(format!("ta-batch-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("plain.txt"), "x").unwrap();
+        let fifo = src.join("pipe");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).output();
+        match made {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => {
+                eprintln!(
+                    "skipping: mkfifo failed: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                );
+                std::fs::remove_dir_all(&root).ok();
+                return;
+            }
+            Err(e) => {
+                eprintln!("skipping: mkfifo not available: {e}");
+                std::fs::remove_dir_all(&root).ok();
+                return;
+            }
+        }
+        // Absolute in-tree link → the dereference branch.
+        std::os::unix::fs::symlink(&fifo, src.join("pipe-link")).unwrap();
+
+        let base: Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"K","model":"m","workdir":"SRC"}"#,
+        )
+        .unwrap();
+        let base = {
+            let mut b = base;
+            b.workdir = Some(src.clone());
+            b
+        };
+        let guard = prepare_isolation(IsolateMode::Copy, &base, "fifo")
+            .expect("copy with a FIFO must complete, not hang")
+            .expect("isolation guard");
+        let iso = guard.dir.clone();
+        assert!(
+            iso.join("plain.txt").exists(),
+            "regular files around the special entry still copy"
+        );
+        assert!(!iso.join("pipe").exists(), "the FIFO itself is skipped");
+        assert!(
+            !iso.join("pipe-link").exists(),
+            "a link to a FIFO is skipped, not dereference-copied"
+        );
+        drop(guard);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn isolate_git_rejects_non_repo_workdir_as_setup_error() {
         // git mode requires workdir to BE a repo root; anything else is a
         // deterministic setup_error (no retry — elapsed stays sub-second).
@@ -3577,5 +3740,255 @@ mod tests {
         // stop_reason == "error", so a panicked task stays failed in --failed
         // reruns of the same (fixed) code.
         assert_ne!(r.stop_reason, "error");
+    }
+
+    #[test]
+    fn merge_reports_preserves_every_duplicate_fresh_entry() {
+        // The overlay loop must not let two same-named FRESH entries collide:
+        // each fresh entry used to overwrite EVERY same-named prior slot, so
+        // when the fresh side itself carries duplicates (case-sensitive FS:
+        // a.json + a.JSON both scan with stem "a"; both fail under --failed
+        // and are re-run), the second fresh entry wiped the slots the first
+        // just filled — the first fresh result silently vanished from the
+        // merged report while the row count still looked right.
+        let mut a1 = tr("a", false);
+        a1.error = Some("attempt one: 503".into());
+        let mut a2 = tr("a", false);
+        a2.error = Some("attempt two: 503".into());
+        let prior = vec![tr("a", true), tr("a", true), tr("b", true)];
+        let fresh = vec![a1, a2];
+        let out = merge_reports(prior, &fresh);
+        assert_eq!(out.len(), 3, "no entry silently dropped");
+        let a_rows: Vec<&TaskReport> = out.iter().filter(|t| t.name == "a").collect();
+        assert_eq!(a_rows.len(), 2);
+        assert_eq!(
+            a_rows[0].error.as_deref(),
+            Some("attempt one: 503"),
+            "the first fresh duplicate must own one prior slot"
+        );
+        assert_eq!(
+            a_rows[1].error.as_deref(),
+            Some("attempt two: 503"),
+            "the second fresh duplicate must own the other prior slot"
+        );
+        assert!(out.iter().any(|t| t.name == "b" && t.success));
+    }
+
+    #[test]
+    fn duplicate_task_stems_flags_case_differing_fragments() {
+        // a.json + a.JSON both pass the extension-case-insensitive scan and
+        // both derive task name "a" — the pair that shares results/a.json and
+        // overwrites each other's per-task artifact on a case-sensitive
+        // filesystem. Pure name-level detection, so the test runs (and the
+        // collision it describes is real) even where the filesystem itself
+        // cannot hold both spellings at once.
+        let files = vec![
+            PathBuf::from("/tasks/a.json"),
+            PathBuf::from("/tasks/a.JSON"),
+            PathBuf::from("/tasks/other.json"),
+        ];
+        let dups = duplicate_task_stems(&files);
+        assert_eq!(dups.len(), 1, "exactly one colliding group");
+        assert_eq!(dups[0].0, "a");
+        assert_eq!(dups[0].1.len(), 2, "both spellings reported");
+        assert!(
+            duplicate_task_stems(&files[2..]).is_empty(),
+            "unique stems never warn"
+        );
+    }
+
+    #[test]
+    fn failed_rerun_of_only_bad_json_task_reaccounts_it() {
+        // The ONLY previously-failed task whose fragment is STILL bad JSON
+        // lands in `bad_json`, not `tasks` — after both retains `tasks` is
+        // empty and the bail used to fire with the wrong story ("no
+        // previously-failed tasks matched files"), even though the broken file
+        // is exactly what matched. With bad_json accounted, the bail must not
+        // fire; the task is re-marked bad_task and the merged report keeps
+        // failing on it (exit 1).
+        let dir = std::env::temp_dir().join(format!("ta-batch-fbad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("broken.json"), r#"{"task": not json}"#).unwrap();
+        // Prior report: broken failed (its failure is why we're re-running).
+        let report = dir.join("report.json");
+        std::fs::write(
+            &report,
+            r#"{"total":1,"succeeded":0,"failed":1,"tasks":[{"name":"broken","success":false,"stop_reason":"bad_task","turns":0,"elapsed_secs":0.0,"error":"invalid task file"}]}"#,
+        )
+        .unwrap();
+
+        let base: Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"MOCK_API_KEY","model":"m"}"#,
+        )
+        .unwrap();
+        let code = run(
+            &base,
+            &dir,
+            1,
+            &report,
+            0,
+            true, // --failed
+            IsolateMode::None,
+            Default::default(),
+        )
+        .expect("--failed rerun of a still-bad fragment must not bail");
+        assert_eq!(code, 1, "still broken → batch fails");
+        let tasks = read_prior_tasks(&report).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].name, "broken");
+        assert_eq!(tasks[0].stop_reason, "bad_task");
+        assert!(!tasks[0].success);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bad_task_first_attempt_writes_zero_attempts() {
+        // results/<name>.json's `attempts` counts agent runs that actually
+        // executed. A FIRST-attempt bad_task (forbidden override here) never
+        // built an agent — the never-started cancel path and the isolated
+        // setup_error path both write 0 (pinned by
+        // cancelled_run_marks_all_tasks_cancelled_exit_130) — `early()` used
+        // to write attempt_no=1 for the same "nothing ran" state. Post-fix
+        // contract: 0 when no agent run ever started, attempt_no once the
+        // ladder has retried (retry_setup_failure_keeps_prior_attempt_cost
+        // pins 2 there).
+        let dir = std::env::temp_dir().join(format!("ta-batt-att0-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // `provider` is a forbidden batch override → bad_task on attempt 1.
+        std::fs::write(dir.join("x.json"), r#"{"task":"x","provider":"anthropic"}"#).unwrap();
+
+        let base: Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"MOCK_API_KEY","model":"m"}"#,
+        )
+        .unwrap();
+        let report = dir.join("report.json");
+        let code = run(
+            &base,
+            &dir,
+            1,
+            &report,
+            0,
+            false,
+            IsolateMode::None,
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(code, 1);
+        let raw = std::fs::read_to_string(dir.join("results").join("x.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["stop_reason"].as_str().unwrap(), "bad_task");
+        assert_eq!(
+            v["attempts"].as_u64().unwrap(),
+            0,
+            "no agent run executed — attempts must be 0, got: {raw}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn batch_success_writes_per_task_result_file() {
+        // The Ok branch of run_one_attempt (success = error.is_none() &&
+        // stop_reason == "end_turn", attempt_no stamped) must land its
+        // results/<name>.json with the streamed summary — nothing used to
+        // read a SUCCESSFUL task's per-task result file at all.
+        let (url, _spans) = slow_ok_mock(Duration::from_millis(20));
+        let dir = std::env::temp_dir().join(format!("ta-batt-okres-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("t.json"), r#"{"task":"do it"}"#).unwrap();
+
+        std::env::set_var("TA_BATT_OKRES_KEY", "dummy");
+        let base: Config = serde_json::from_str(&format!(
+            r#"{{"provider":"openai","api_key_env":"TA_BATT_OKRES_KEY","model":"m","base_url":"{url}"}}"#,
+        ))
+        .unwrap();
+        let report = dir.join("report.json");
+        let code = run(
+            &base,
+            &dir,
+            1,
+            &report,
+            0,
+            false,
+            IsolateMode::None,
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+
+        let raw = std::fs::read_to_string(dir.join("results").join("t.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["success"], true, "{raw}");
+        assert_eq!(v["stop_reason"], "end_turn");
+        assert_eq!(v["attempts"], 1);
+        assert_eq!(v["model"], "m");
+        assert!(
+            v["summary"].as_str().is_some_and(|s| s.contains("done")),
+            "summary from the streamed reply: {raw}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn batch_result_write_failure_marks_task_failed() {
+        // Twin of the single-run
+        // successful_run_with_unwritable_result_path_exits_nonzero: a batch
+        // task whose results/<name>.json cannot be written must NOT be
+        // reported successful — report.json would claim success while the
+        // artifact CI reads is missing/stale.
+        let (url, _spans) = slow_ok_mock(Duration::from_millis(20));
+        let dir = std::env::temp_dir().join(format!("ta-batt-wfail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("t.json"), r#"{"task":"do it"}"#).unwrap();
+        // Block the per-task result path: an existing DIRECTORY where the
+        // result file would land — atomic_write's rename can never win.
+        std::fs::create_dir_all(dir.join("results").join("t.json")).unwrap();
+
+        std::env::set_var("TA_BATT_WFAIL_KEY", "dummy");
+        let base: Config = serde_json::from_str(&format!(
+            r#"{{"provider":"openai","api_key_env":"TA_BATT_WFAIL_KEY","model":"m","base_url":"{url}"}}"#,
+        ))
+        .unwrap();
+        let report = dir.join("report.json");
+        let code = run(
+            &base,
+            &dir,
+            1,
+            &report,
+            0,
+            false,
+            IsolateMode::None,
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(code, 1, "result write failure must degrade success");
+
+        let tasks = read_prior_tasks(&report).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert!(
+            !tasks[0].success,
+            "the run ended_turn but its record is lost"
+        );
+        assert_eq!(
+            tasks[0].stop_reason, "end_turn",
+            "the agent itself succeeded"
+        );
+        assert!(
+            tasks[0]
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("result file not written"),
+            "error must name the lost artifact: {:?}",
+            tasks[0].error
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
