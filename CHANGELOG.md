@@ -28,6 +28,16 @@
   user 轮）；文档补两个定版边界（延迟冲账令 `ends_with_user()` 翻真 → TUI/CLI resume 自动开跑
   属投递机制；/clear 不清队列，note 照常投递）。
 
+### Changed（破坏性）
+
+- **`AgentEvent::Usage` 新增 `tool_folded: bool`**：`false` = provider 请求自身的用量（上下文占用的
+  真值）；`true` = 工具账单折叠进 run 总额（`task` 子 agent 多轮累计、run_code 内层 `llm`、宿主回调
+  工具上报），在该工具的 `ToolCall` 之后、`ToolResult` 之前发出。累计总额两者都计，表示「最近一次
+  请求的上下文占用」只看 `false`——TUI 状态栏 ctx 段据此修正（此前 `task` 返回后显示子 agent 的多轮
+  累计，可超 100%，持续到父 agent 下一次请求完成）。harness `--json` 的 `usage` 记录只加
+  `tool_folded` 键；human 模式折叠行带 ` (tool-billed)` 后缀；两个绑定经 serde 透传自动带上新键。
+  **Rust 库消费方若对 `AgentEvent::Usage` 穷尽解构，需补该字段或 `..`**。
+
 ### Fixed
 
 - **release.yml bindings-python sdist 步骤 EACCES（v0.4.3 Python wheel 缺失的根因）**：wheel 构建走
@@ -37,6 +47,70 @@
   加 `sudo chown -R` 归还归属。同轮修正三个 `softprops/action-gh-release@v2` 步骤的输入名拼写
   `generate_notes` → `generate_release_notes`（非法输入被静默忽略并告警，musl 步骤想要的自动
   Release notes 自首次发布起就没生效过）。
+- **第九轮全面审核修复**（11 个分片审核 → 逐条独立复核（含动态复现）→ 分组修复 → 逐分支独立审查；
+  以下按模块归并，安全相关见下方 Security）：
+  - **MCP**：legacy SSE 每 30s 轮转后 POST 目标跟随新连接的 `endpoint` 事件（此前永远打向首条连接
+    的会话 URL——会话随连接回收的 server，如 python-sdk `SseServerTransport`，在 30s 后每次调用
+    404）；stdio 与 legacy SSE 两种传输的 reader 死亡（首连失败 / EOF / 真读错 / 超限行 / endpoint
+    被同源闸门拒）写入 dead latch，后续调用即时失败并给出原因（此前坐满 120s `CALL_TIMEOUT` 且文案
+    误导为 server died）；非 object 的 `inputSchema` 丢弃并告警（此前原样进 provider，使会话每个请求
+    400）；只回 `structuredContent` 的工具结果回落为文本（此前渲染为 `[empty tool result]`）。
+  - **run_code**：prelude `writeVerified` 改走默认 3 字节对齐窗口——此前 >1,000,000 字节的内容必然
+    报虚假的 `read-back mismatch`（磁盘文件其实正确：显式 limit 被钳到 1M、非 3 对齐）；skill 正文
+    raw 窗口尺寸陈述修正（guest 端约 1.0 MB，`docs/finetune_support_design.md` 修订记录 v0.7）；契约
+    同步脚本同时校验 README.zh-CN 的 CODE CONFIG SPEC 块、数值检查收紧为行形（此前巧合子串可假绿）、
+    生成附录加终止标记（防 `--write` 静默吞掉附录之后的内容）；epoch ticker 启动失败的诊断文案改准确
+    （cancel 与墙钟中断同时失效）；超帽 deny_paths 模式告警按 pattern 去重；code_llm 附录 A① 补逐字
+    钉子测试。
+  - **内核主循环**：监督者旁注投递在事件回调 panic 时把未投递尾部回填队列（此前 2..N 条既不在队列也
+    不在历史）；NDJSON 词汇钉住测试补 `NoteInjected` 并改为测试侧穷尽 match（此前硬编码计数对新变体
+    失明）；`RunOutcome.turns` / `turn_timings` 文档改准确（重试梯折叠后 turns 含失败 attempt 的轮次、
+    timings 只覆盖成功 attempt——刻意形状，已钉测试）；`after_tool` 的 `executed=false` 三种形态
+    文档对齐；Slot 契约表补并行 worker panic 第九形态。
+  - **内置工具**：read_file `limit: 0` 改为参数错误（此前 `truncated: true` 且 `next_offset` 原地回显，
+    分页器空转）；raw 车道循环读满整窗（此前单次 read 可短读——Windows 全套件下会触发 writeVerified
+    偶发假失败）、负数 offset 报错；totals 扫描恰好触界时少计 1 行；Windows 上 `confined_to` 对
+    「文件名下挂路径」同样 fail-closed（此前 ERROR_PATH_NOT_FOUND 被当成真缺失放行）；shell
+    `[exit code: N]` 不再被输出截断吃掉、补 CP866（俄语 cmd）解码；MCP reaper 复制的 job 句柄改为
+    直接关闭（此前每个 stdio MCP 会话拆解泄漏 1 个句柄）；`SharedTool` 补 `panic_audit_row` 委托。
+  - **provider / 配置 / 装配**：api_key 含控制字符（如环境变量尾部换行）在装配期即报错（此前首请求才
+    以 `builder error` 失败、被判 transient 白吃整个重试梯）；anthropic 仅带 cache 轴的
+    `message_delta` 也计入 usage（此前报 None）；未配置 workdir 时回退的 cwd 同样 canonicalize 并剥
+    `\\?\`（此前 verbatim 前缀进模型可见的 env 头）；eager skill 注入识别折叠后的历史，resume 不再
+    重复注入整份技能正文；子 agent 失败输出按 `max_output_chars` 截断。
+  - **CLI / batch**：默认 `--retries 0` 下 Ctrl-C 与失败轮竞态归为 exit 130 / `cancelled`（此前 exit 1 /
+    `error`）；`--failed` 合并保留每个同名 fresh 条目（此前后到者覆盖先到者）；`--failed` 唯一失败任务
+    仍是坏 JSON 时不再误报「无匹配」；从未构建出 agent 的终态 `attempts` 记 0；`--isolate copy` 跳过
+    FIFO 等非常规文件（此前 unix 上无限阻塞）、拷贝失败与 worktree spawn 失败不再泄漏沙箱目录；同
+    stem 任务文件扫描期告警；并行子 agent 的工具结果行不再与他人文本粘行；单跑 `--isolate NONE` 大小写
+    不敏感。
+  - **TUI**：worker 运行中退出（debug 构建 panic）可检测并复位（此前 diag 桥持有 sender，Disconnected
+    分支不可达，UI 永久卡在运行中）；ctx 段累加改 saturating；≥4 标记围栏软切后按真实长度重开（此前
+    内层 ``` 提前关闭、尾段泄漏为 markdown）；max_tokens salvage 显示一行提示；模型可控的工具名过
+    `strip_controls`；删除不可达的空态帮助页。
+  - **绑定**：Python 事件回调里的 `KeyboardInterrupt` 不再被吞——装了 cancel token 则置位、run 在
+    下一轮界停，run/compact 返回后重抛，异常带 `.outcome`（结果 dict 或成本信封 dict，错误路径成本不
+    丢）；hooks 方法在场但不可调用时安装期报错。Node：beforeTool 等待失败臂回收 `PENDING_HOOKS` 并
+    区分 cancelled / 超时文案；hooks 决策 deny+modify 双键 fail-closed；`onEvent` 非函数、`configPath`
+    非字符串当场 TypeError；`package.json` 平台子包钉版追平 0.4.3（此前仍钉 0.4.2，lock 会被
+    `npm install` 打回）；`wrapper.d.ts` 补成本可观测性字段。
+  - **文档 / CI**：README 双份修正 `limits.timeout_secs` 默认值（600，而非 0）、batch 片段可覆盖字段
+    清单、batch stop_reason 表补 `timeout` / `cancelled` / `setup_error`、配置示例默认工具表、NDJSON
+    type 清单补 `note_injected`；发布清单改指 `bindings/node/package.json` 的 optionalDependencies
+    （共 6 处）；`./scripts/check.sh e2e` 单跑先构建（此前用遗留二进制可假绿）；workflow 最小权限、
+    第三方 action 钉 commit SHA（`dtolnay/rust-toolchain@stable` 刻意豁免）、cargo-audit 钉 0.22.2、
+    release 并发组与 npm publish 幂等、`NPM_TOKEN` 提为 job 级 env。
+
+### Security
+
+- **run_code 路径拦截（fs_policy）三处收紧**：① 原始拼写超帽（>4096 字节或 >256 组件）读写两侧
+  一律 fail-closed——此前 `"a/../"×128 + "bak"` 类填充拼写让 symlink 走查因帽 bail 而跳过、判定却只看
+  解析后形态，`copy_bytes` 可经悬空外向 symlink 把字节写到 workdir 外（Windows 端到端实测），同类
+  填充拼写还能绕过 `deny_paths` 的读禁；② `fs_write_dirs` 多段条目在 Windows 上补分隔符折叠（此前恒不
+  匹配，目录内合法写入全被拒）；③ Windows 驱动器相对拼写（`C:foo`）在写臂直接拒绝（此前跳过 symlink
+  走查，判定随拼写翻转）。
+- **MCP 诊断与错误信息中的配置 URL 一律脱敏 userinfo 凭据**（六处字面量站点 + reqwest 错误
+  `without_url` + io 包装的错误链），与 `McpServerConfig` 的 Debug 脱敏政策一致。
 
 ## [0.4.3] - 2026-10-24
 
