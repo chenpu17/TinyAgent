@@ -669,6 +669,10 @@ impl Tool for CallbackTool {
 /// handle), so in practice it is a no-op — realistic injected tools
 /// (`CallbackTool`) have nothing to tear down, and a tool needing
 /// session-end teardown should not be injected as a shared handle.
+/// **Discipline: every new `&self` trait method must be added to the
+/// delegation here** — a missed one silently falls back to the trait default
+/// inside the guest registry, dropping whatever that method reports for the
+/// wrapped tool (e.g. its panic audit row).
 pub(crate) struct SharedTool {
     pub(crate) inner: Arc<Box<dyn Tool>>,
 }
@@ -705,6 +709,9 @@ impl Tool for SharedTool {
     }
     fn envelope_error_kind(&self, output: &ToolOutput) -> Option<&'static str> {
         self.inner.envelope_error_kind(output)
+    }
+    fn panic_audit_row(&self, input: &Value, ctx: &ToolCtx) -> Option<Value> {
+        self.inner.panic_audit_row(input, ctx)
     }
     fn origin(&self) -> ToolOrigin {
         self.inner.origin()
@@ -921,7 +928,31 @@ pub fn confined_to(root: &Path, full: &Path, label: &str) -> Result<PathBuf> {
                             // I/O would fail on exactly the same obstacle,
                             // so an early reject is honest, not lossy.
                             Err(c_err) => match cand.symlink_metadata() {
-                                Err(l) if l.kind() == std::io::ErrorKind::NotFound => cand,
+                                Err(l) if l.kind() == std::io::ErrorKind::NotFound => {
+                                    // A miss under a NON-directory is the
+                                    // ENOTDIR shape: unix reports it as
+                                    // NotADirectory (rejected below), but
+                                    // Windows collapses it to
+                                    // ERROR_PATH_NOT_FOUND → NotFound —
+                                    // indistinguishable from a plain miss.
+                                    // Probe the accumulated prefix once:
+                                    // present-but-not-a-directory fails
+                                    // closed exactly like unix (the
+                                    // caller's I/O would hit the same
+                                    // obstacle); a NotFound prefix or a
+                                    // real directory keeps the lexical
+                                    // lane.
+                                    match cur.symlink_metadata() {
+                                        Ok(md) if !md.is_dir() => {
+                                            bail!(
+                                                "cannot resolve path: {} ({})",
+                                                full.display(),
+                                                c_err
+                                            );
+                                        }
+                                        _ => cand,
+                                    }
+                                }
                                 stat => {
                                     let _ = stat;
                                     bail!("cannot resolve path: {} ({})", full.display(), c_err);
@@ -1375,6 +1406,80 @@ mod tests {
         assert!(ok.ends_with("new1/new2/f.txt"), "{ok:?}");
         assert!(!ok.exists(), "{ok:?}");
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 文件名下挂路径（"f.txt/x"）必须与 unix 同判 fail-closed：unix 的
+    /// canonicalize 报 NotADirectory、走既有拒绝臂；Windows 把它折叠成
+    /// ERROR_PATH_NOT_FOUND → NotFound —— 没有累积前缀的目录性探测就会被
+    /// 当成「真缺失」词法放行。
+    #[cfg(windows)]
+    #[test]
+    fn confined_to_rejects_path_under_file_on_windows_too() {
+        let base = std::env::temp_dir().join(format!("ta-conf-enotdir-{}", std::process::id()));
+        let root = base.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("f.txt"), "f").unwrap();
+        let err = confined_to(&root, &root.join("f.txt/x"), "working directory").unwrap_err();
+        assert!(
+            err.to_string().contains("cannot resolve path"),
+            "f.txt/x: {err}"
+        );
+        // Deeper tails under the file get the same ruling.
+        let err = confined_to(&root, &root.join("f.txt/x/y"), "working directory").unwrap_err();
+        assert!(
+            err.to_string().contains("cannot resolve path"),
+            "f.txt/x/y: {err}"
+        );
+        // 对照组：真缺失尾部仍然 Ok（词法车道不受影响）。
+        let ok = confined_to(&root, &root.join("missing/new.txt"), "working directory").unwrap();
+        assert!(ok.ends_with("missing/new.txt"), "{ok:?}");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 实现了 `panic_audit_row` 的测试工具：审计行不只是 guest-only 的
+    /// llm 原语才有 —— 宿主 extra_tool 同样可以实现它。
+    struct AuditingTool;
+
+    impl Tool for AuditingTool {
+        fn def(&self) -> ToolDef {
+            ToolDef {
+                name: "auditing".into(),
+                description: "test-only tool carrying a panic audit row".into(),
+                schema: serde_json::json!({"type": "object"}),
+            }
+        }
+        fn run(&self, _input: &Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+            Ok(ToolOutput::text(""))
+        }
+        fn panic_audit_row(&self, _input: &Value, _ctx: &ToolCtx) -> Option<Value> {
+            Some(serde_json::json!({"held_estimate": 42, "actual": null}))
+        }
+    }
+
+    /// SharedTool 必须把 `panic_audit_row` 转给内部工具：guest registry 里
+    /// 的工具都是 SharedTool 包装，batch 的 panic-join 占位符经包装层取
+    /// 审计行 —— 漏委托就静默落到 trait 默认 None。
+    #[test]
+    fn shared_tool_forwards_panic_audit_row() {
+        let shared = SharedTool {
+            inner: Arc::new(Box::new(AuditingTool) as Box<dyn Tool>),
+        };
+        let ctx = ToolCtx {
+            tool_absent_notes: Vec::new(),
+            workdir: std::env::temp_dir(),
+            max_output_chars: 1000,
+            restrict_to_workdir: false,
+            cancel: None,
+            shell_timeout_secs: 120,
+            hooks: None,
+            subagent: None,
+            budget: None,
+            deadline: None,
+        };
+        let row = shared
+            .panic_audit_row(&serde_json::json!({}), &ctx)
+            .expect("SharedTool must forward panic_audit_row to the inner tool");
+        assert_eq!(row["held_estimate"], 42);
     }
 
     #[test]
