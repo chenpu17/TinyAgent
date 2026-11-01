@@ -85,8 +85,13 @@ impl InputBuffer {
     /// Insert a (possibly multi-line) string at the cursor — used for bracketed
     /// paste. `\n` splits into a fresh line; the CR of a CRLF pair (Windows
     /// pastes) is dropped so it doesn't leave a stray CR in the input. A lone
-    /// `\r` is kept — swallowing every CR would corrupt content that uses it
-    /// deliberately (e.g. progress-redraw snippets).
+    /// `\r` is kept as ordinary content.
+    ///
+    /// In practice no `\r` reaches here today: the only caller (the Paste
+    /// handler) pre-strips control characters, and submission strips again
+    /// before the text enters rows, history, or the wire — a `\r` can never
+    /// reach the model. The CRLF handling stays as cheap insurance so this
+    /// helper remains correct for a caller that skips the pre-strip.
     ///
     /// Runs are inserted in BULK: the old per-char loop hit `put_char`, whose
     /// `String::insert` shifts the whole tail once PER CHARACTER — O(n²) on a

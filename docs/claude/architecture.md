@@ -95,7 +95,8 @@
   返回）；消耗 turn 预算、照常 bill_chat 计费与 on_chat_request hooks、`continue` 回循环头自然过
   cancel/max_turns/timeout/budget 四闸门（零特判）；**截断带 tool_use 不 salvage**（半调用已丢弃即停，
   aborted 测试钉住）。事件 `AgentEvent::MaxTokensSalvage`（unit 变体：`--json` 吐
-  `{"type":"salvage"}`、plain 走 stderr 一行、TUI wildcard 兜底）。Config 软字段默认 true
+  `{"type":"salvage"}`、plain 走 stderr 一行、TUI 渲染一行警示——三宿主各自呈现，不得静默丢弃）。
+  Config 软字段默认 true
   （`PartialConfig` 软覆盖、不在 forbidden 表）；子 agent 经 cfg 快照自动继承、各 run 独立一次。
 
   **数值写端一律 saturating**：usage 累计 / RunCost / merge_usage / trace_meta / batch 汇总的 `+=`

@@ -308,10 +308,12 @@ pub enum AgentEvent {
     /// (`Config::salvage_on_max_tokens`, default on) to salvage a usable
     /// conclusion — at most once per run, billed as an ordinary turn.
     /// Serializes as the string `"MaxTokensSalvage"` (unit variant, external
-    /// tagging); harness `--json` maps it to `{"type":"salvage"}` and plain
-    /// headless writes one stderr line. Informational — the wrap-up request
-    /// itself is an ordinary main turn (hooks / billing / turn budget all
-    /// apply to it like any other).
+    /// tagging); harness `--json` maps it to `{"type":"salvage"}`, plain
+    /// headless writes one stderr line, and the TUI appends one warning
+    /// system row ("[max_tokens hit — one wrap-up turn appended]"). All three
+    /// hosts surface it — none may drop the event silently. Informational —
+    /// the wrap-up request itself is an ordinary main turn (hooks / billing /
+    /// turn budget all apply to it like any other).
     MaxTokensSalvage,
     /// A non-fatal problem worth surfacing (session save failed, compression
     /// disabled after an error, …). Frontends decide how to show it — the

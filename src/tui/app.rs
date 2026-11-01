@@ -81,6 +81,16 @@ pub(super) fn is_normal_stop(reason: &str) -> bool {
     )
 }
 
+/// Display name for a tool call/result. Tool names are model-controlled
+/// (execute_tool_call emits whatever the model wrote), so control characters
+/// are stripped once here and every consumer — the row name, the activity
+/// segment, the `tool_running` key, `tool_elapsed_for`'s match — sees the
+/// same sanitized string. Sanitizing only one side would shift the name's
+/// display width and break the nearest-back call/result matching.
+pub(super) fn tool_display_name(name: &str) -> String {
+    strip_controls(name)
+}
+
 /// Expand a leading `~/` (and a bare `~`) to `$HOME`, for `/export ~/notes.md`.
 /// Only the current user's home — `~other` is left as-is (rare; not needed
 /// here). `_with` takes home explicitly so the logic is unit-testable without
@@ -651,6 +661,10 @@ fn ui_loop(
                         streaming = false;
                         thinking_stream = None;
                         thinking = false;
+                        // Sanitize once, before every consumer: the row, the
+                        // activity segment, and the tool tracker key all see
+                        // the same string (see tool_display_name).
+                        let name = tool_display_name(&name);
                         activity = format!("→ {name}");
                         tool_running.on_call(&name);
                         // Strip control chars once at entry so both the
@@ -673,6 +687,9 @@ fn ui_loop(
                     } => {
                         streaming = false;
                         thinking_stream = None;
+                        // Same sanitized key as the ToolCall arm above, so
+                        // the duration match and the tracker removal line up.
+                        let name = tool_display_name(&name);
                         tool_running.on_result(&name);
                         // Content stays RAW: ANSI colors survive into
                         // ansi_guided_lines at render (which strips non-SGR
@@ -800,10 +817,10 @@ fn ui_loop(
                         // need a stable id on AgentEvent::SubAgent (not just the
                         // model-supplied name); the contract is that `name`
                         // uniquely identifies a sub-agent within a turn.
-                        // Strip control chars from the model-supplied name
-                        // once, so every use (bubble prefix, row names,
-                        // activity segment) is terminal-safe.
-                        let name = strip_controls(&name);
+                        // Sanitize the model-supplied name once, so every use
+                        // (bubble prefix, row names, activity segment) is
+                        // terminal-safe.
+                        let name = tool_display_name(&name);
                         match &*event {
                             AgentEvent::TextDelta(t) => {
                                 thinking = false;
@@ -827,11 +844,13 @@ fn ui_loop(
                                 sub_streaming_name = None;
                                 thinking_stream = None;
                                 thinking = false;
+                                // Same sanitized display name as the row
+                                // below, so the placeholder and the committed
+                                // head agree (and their tracker keys match).
+                                let tn = tool_display_name(tn);
                                 activity = format!("[{name}] → {tn}");
                                 let input = strip_controls_json(input);
                                 let collapsed = compact(&input);
-                                // Same display name as the row below, so the
-                                // placeholder and the committed head agree.
                                 let row_name = format!("[{name}] {tn}");
                                 tool_running.on_call(&row_name);
                                 rows.push(Row::ToolCall {
@@ -850,8 +869,10 @@ fn ui_loop(
                                 sub_streaming_name = None;
                                 thinking_stream = None;
                                 // The row name mirrors the ToolCall arm's
-                                // format, so nearest-back matching finds it.
-                                // Content stays raw for the ANSI-aware render.
+                                // format (with the same sanitized tn), so
+                                // nearest-back matching finds it. Content
+                                // stays raw for the ANSI-aware render.
+                                let tn = tool_display_name(tn);
                                 let row_name = format!("[{name}] {tn}");
                                 tool_running.on_result(&row_name);
                                 let elapsed = tool_elapsed_for(&rows, &row_name);
@@ -876,9 +897,22 @@ fn ui_loop(
                                 thinking_stream = None;
                                 rows.push(Row::sys_warn(format!("[{name}] [warn] {w}")));
                             }
-                            _ => {} // TurnStart/Compressed/Usage/SubAgent: noisy or folded
+                            _ => {} // TurnStart/Usage/SubAgent: noisy or folded at the agent level
                         }
                     }
+                    AgentEvent::MaxTokensSalvage => {
+                        // The wrap-up turn after a max_tokens cutoff is billed
+                        // and hook-visible like any turn, but its trigger is
+                        // otherwise invisible here (harness writes stderr /
+                        // NDJSON `{"type":"salvage"}`) — warn level matches
+                        // the `[done: max_tokens]` notice above.
+                        rows.push(Row::sys_warn(
+                            "[max_tokens hit — one wrap-up turn appended]",
+                        ));
+                    }
+                    // ToolInputDelta is streaming plumbing: the ToolCall row
+                    // and the live tool placeholder own its presentation, and
+                    // a row per fragment would flood the transcript.
                     // non_exhaustive forward-compat: AgentEvent may grow new
                     // variants (0.x SemVer window); they render nothing here
                     // until given a dedicated arm. Compile-adaptation only —

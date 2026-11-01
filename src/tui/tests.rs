@@ -2517,8 +2517,10 @@ fn insert_str_handles_multiline_crlf_and_cjk() {
     b.insert_str("a\r\nb");
     assert_eq!(b.text(), "a\nb");
 
-    // A LONE \r is kept: only the CR of a CRLF pair is dropped — content
-    // that uses \r deliberately must survive the paste.
+    // A LONE \r survives here as ordinary content (only the CR of a CRLF
+    // pair collapses): line-break handling is this helper's whole contract —
+    // control-char sanitizing belongs to the paste entry point and to
+    // submission, so a \r never reaches the wire either way.
     let mut b = InputBuffer::new();
     b.insert_str("a\rb");
     assert_eq!(b.text(), "a\rb");
@@ -4077,4 +4079,19 @@ fn soft_cut_4_backtick_fence_tail_reopens_with_its_full_length() {
         10,
         "prefix code lines all barred: {prefix_texts:?}"
     );
+}
+
+/// Tool names are model-controlled (execute_tool_call emits whatever the
+/// model wrote), so the display name must be sanitized before it reaches row
+/// text, the activity segment, or the tool-tracker keys. Control chars are
+/// removed; a CSI's parameter bytes stay behind as inert text once the ESC
+/// byte is gone (the paint layer filters those too).
+#[test]
+fn tool_display_name_strips_model_control_chars() {
+    let clean = tool_display_name("sh\x1b[31mell\rx\u{0}");
+    assert_eq!(clean, "sh[31mellx");
+    assert!(!clean.chars().any(char::is_control));
+    // \n and \t are legitimate content here, like everywhere strip_controls
+    // applies.
+    assert_eq!(tool_display_name("a\nb\tc"), "a\nb\tc");
 }
