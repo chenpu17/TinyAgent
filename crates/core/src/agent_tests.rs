@@ -10122,3 +10122,141 @@ fn supervisor_note_flushed_onto_assistant_tail_opens_new_user_turn() {
     agent.push_user(vec![Block::Text("next task".into())]);
     assert_eq!(agent.messages().last().unwrap().content.len(), 2);
 }
+
+// ── 旁注投递的 panic 安全（"绝不无声丢失"的 unwind 形态）──────────────────
+//
+// 宿主事件回调 panic 时，投递不得让旁注既不在队列也不在历史：已投递的留在
+// 历史，未投递的尾部由 drop 守卫回填队列，`drain_pending()` 可收回。两条
+// 出口各钉一例：轮首投递点（deferred=false）与 run 收尾冲账（deferred=true）。
+
+/// An events callback that panics mid-delivery must not strand the
+/// undelivered tail outside queue AND history: the first note is already in
+/// history when its event fires, and every later note must stay recoverable
+/// via `drain_pending()` (FIFO) for the next run.
+#[test]
+fn note_delivery_panic_keeps_undelivered_notes_queued() {
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, _state) = MockProvider::new(vec![mock::resp_text("done", None)]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("task")],
+        test_ctx(),
+    );
+    let sup = agent.supervisor_handle();
+    sup.inject_note("first");
+    sup.inject_note("second");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        agent.run(&mut |e| {
+            if let AgentEvent::NoteInjected { text, .. } = &e {
+                if text == "first" {
+                    panic!("host event sink exploded on the first note");
+                }
+            }
+        })
+    }));
+    assert!(
+        result.is_err(),
+        "the panic must propagate through run (host killed its own run)"
+    );
+    // "first" made it into history before its event fired…
+    let history: Vec<String> = agent
+        .messages()
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .filter_map(|b| match b {
+            Block::Text(t) => Some(t.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        history
+            .iter()
+            .any(|t| t.starts_with(SUPERVISOR_NOTE_MARKER) && t.ends_with("first")),
+        "delivered note is in history: {history:?}"
+    );
+    // …and "second" rides the restored queue — never silently lost.
+    assert_eq!(
+        sup.drain_pending(),
+        vec!["second".to_string()],
+        "undelivered notes must stay in the queue when delivery panics"
+    );
+    assert!(
+        !history.iter().any(|t| t.ends_with("second")),
+        "the undelivered note must not be in history"
+    );
+}
+
+/// Twin of the turn-top case at the OTHER delivery exit: the run-exit flush
+/// (deferred) panics on its first event — the undelivered tail must come back
+/// the same way, still deliverable by a later run.
+#[test]
+fn note_flush_panic_at_run_exit_keeps_undelivered_notes_queued() {
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, state) = MockProvider::new(vec![mock::resp_text("done", None)]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("task")],
+        test_ctx(),
+    );
+    let sup = agent.supervisor_handle();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut injected = false;
+        agent.run(&mut |e| {
+            // Injected mid-run during the last reply (after the turn-top
+            // drain), so the only delivery chance left is the run-exit
+            // flush — and the host sink panics on the first deferred event.
+            if let AgentEvent::TextDelta(_) = &e {
+                if !injected {
+                    injected = true;
+                    sup.inject_note("first");
+                    sup.inject_note("second");
+                }
+            }
+            if let AgentEvent::NoteInjected { text, deferred, .. } = &e {
+                assert!(*deferred, "both notes take the deferred exit");
+                if text == "first" {
+                    panic!("host event sink exploded on the first flushed note");
+                }
+            }
+        })
+    }));
+    assert!(
+        result.is_err(),
+        "the panic must propagate through run (host killed its own run)"
+    );
+    assert_eq!(
+        state.calls(),
+        1,
+        "single-turn run: no delivery point after the turn-top drain"
+    );
+    // "first" was flushed into history before its event fired…
+    let history: Vec<String> = agent
+        .messages()
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .filter_map(|b| match b {
+            Block::Text(t) => Some(t.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        history
+            .iter()
+            .any(|t| t.starts_with(SUPERVISOR_NOTE_MARKER) && t.ends_with("first")),
+        "flushed note is in history: {history:?}"
+    );
+    // …and "second" is back in the queue for the next run's first turn.
+    assert_eq!(
+        sup.drain_pending(),
+        vec!["second".to_string()],
+        "the run-exit flush must restore undelivered notes on unwind too"
+    );
+    assert!(
+        !history.iter().any(|t| t.ends_with("second")),
+        "the undelivered note must not be in history"
+    );
+}

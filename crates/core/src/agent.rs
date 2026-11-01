@@ -1959,7 +1959,35 @@ impl Agent {
     /// re-saves afterwards; a silent failure here is the one shape where a
     /// note stays memory-only without a diagnostic).
     fn deliver_notes(&mut self, events: &mut dyn FnMut(AgentEvent), deferred: bool) {
-        for text in self.drain_notes() {
+        // The batch is drained ONCE and a drop guard carries the undelivered
+        // tail back to the FRONT of the queue when the events callback
+        // unwinds — a note must never sit outside the queue AND outside
+        // history (the one loss shape the delivery contract forbids). Notes
+        // injected mid-delivery (a host reacting to these very events) stay
+        // queued for the next delivery point: today's termination bound.
+        struct RestoreOnUnwind<'a> {
+            queue: Arc<Mutex<VecDeque<String>>>,
+            pending: &'a mut VecDeque<String>,
+        }
+        impl Drop for RestoreOnUnwind<'_> {
+            fn drop(&mut self) {
+                if self.pending.is_empty() {
+                    return;
+                }
+                let mut q = self.queue.lock().unwrap_or_else(|p| p.into_inner());
+                // Undelivered notes go back in front; notes injected while
+                // the callback ran queue behind them — FIFO preserved.
+                let mut restored = std::mem::take(self.pending);
+                restored.extend(q.drain(..));
+                *q = restored;
+            }
+        }
+        let mut batch: VecDeque<String> = self.drain_notes().into();
+        let guard = RestoreOnUnwind {
+            queue: Arc::clone(&self.notes),
+            pending: &mut batch,
+        };
+        while let Some(text) = guard.pending.pop_front() {
             if let Some(w) = self.push_user(vec![supervisor_note_block(&text)]) {
                 events(AgentEvent::Warning(w));
             }
