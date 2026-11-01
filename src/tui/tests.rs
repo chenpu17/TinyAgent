@@ -3860,3 +3860,316 @@ fn kill_to_line_start_and_end_work_with_unicode() {
     assert_eq!(b.text(), "中文");
     assert_eq!(b.col, 6);
 }
+
+// ── worker lifecycle: the diag bridge pins the event channel open ──────
+
+/// The event channel never reports Disconnected while the session lives:
+/// `run` installs the diag bridge (holding an `out_tx` clone) before the
+/// worker starts, and the bridge is only cleared at TerminalGuard teardown —
+/// after `ui_loop` has returned. Even when the worker's own sender dies with
+/// its thread (normal exit or panic unwind), `try_recv` keeps returning
+/// Empty, which is why a mid-run worker death is detected via the exit flag
+/// `DoneSignal` sets, not via channel state.
+#[test]
+fn diag_bridge_sender_keeps_event_channel_connected_after_worker_exit() {
+    // When racing other tests that touch the global sink (install is
+    // replace semantics), Disconnected can show up early because the sink
+    // was swapped/cleared under us — retry on a fresh channel.
+    let mut empty_observed = false;
+    for _ in 0..8 {
+        let (out_tx, out_rx) = mpsc::channel::<UiMsg>();
+        // Mirror run()'s assembly: install the bridge (holding a clone)
+        // BEFORE the worker starts.
+        install_diag_bridge(out_tx.clone());
+        // Simulate the worker closure exiting / unwinding: its sender dies.
+        drop(out_tx);
+        match out_rx.try_recv() {
+            Err(mpsc::TryRecvError::Empty) => empty_observed = true,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                tiny_agent::diag::clear_diag_sink();
+                continue; // parallel interference: retry
+            }
+            Ok(_) => panic!("unexpected UiMsg in a fresh channel"),
+        }
+        // Clearing the bridge (the TerminalGuard::drop moment, which in
+        // reality happens only after ui_loop returned) is what finally
+        // disconnects the channel — the sink clone was the last sender.
+        tiny_agent::diag::clear_diag_sink();
+        assert!(
+            matches!(out_rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)),
+            "after clear_diag_sink the channel must finally disconnect"
+        );
+        break;
+    }
+    tiny_agent::diag::clear_diag_sink(); // process-global sink: always clear
+    assert!(
+        empty_observed,
+        "worker sender dropped: try_recv must stay Empty while the diag bridge holds its clone"
+    );
+}
+
+/// reset_after_worker_exit on a mid-run death: the run state fully resets,
+/// the death is surfaced as a sys_error row, and the queue dies with the
+/// same "[dropped N queued message(s)]" notice the Esc path shows.
+#[test]
+fn reset_after_worker_exit_resets_run_state_and_drops_queue() {
+    let mut busy = true;
+    let mut run_start = Some(Instant::now());
+    let mut streaming = true;
+    let mut sub_streaming_name = Some("scout".to_string());
+    let mut thinking_stream = Some(String::new());
+    let mut thinking = true;
+    let mut activity = "writing".to_string();
+    let mut tool_running = ToolRunning::new();
+    tool_running.on_call("shell");
+    let mut queued: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    queued.push_back("late question".into());
+    let mut rows = vec![Row::User("go".into()), Row::Queued("late question".into())];
+    let mut cache = MdCache::new();
+
+    let changed = reset_after_worker_exit(
+        &mut busy,
+        &mut run_start,
+        &mut streaming,
+        &mut sub_streaming_name,
+        &mut thinking_stream,
+        &mut thinking,
+        &mut activity,
+        &mut tool_running,
+        &mut queued,
+        &mut rows,
+        &mut cache,
+    );
+    assert!(changed, "a mid-run death changes state");
+    assert!(!busy);
+    assert!(run_start.is_none());
+    assert!(!streaming);
+    assert!(sub_streaming_name.is_none());
+    assert!(thinking_stream.is_none());
+    assert!(!thinking);
+    assert!(activity.is_empty());
+    assert!(tool_running.calls.is_empty());
+    assert!(queued.is_empty());
+    assert!(
+        !rows.iter().any(|r| matches!(r, Row::Queued(_))),
+        "ghost rows dropped with the queue: {rows:?}"
+    );
+    let sys: Vec<String> = rows
+        .iter()
+        .filter_map(|r| match r {
+            Row::System { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        sys,
+        vec![
+            "[worker stopped unexpectedly — type /quit to exit]".to_string(),
+            "[dropped 1 queued message(s)]".to_string(),
+        ],
+        "death surfaced, then the queue notice: {sys:?}"
+    );
+}
+
+/// reset_after_worker_exit on a death the UI already idled past (or an
+/// empty teardown): nothing to reset, nothing queued — no rows, no repaint.
+#[test]
+fn reset_after_worker_exit_is_a_noop_when_idle_with_no_queue() {
+    let mut busy = false;
+    let mut run_start = None;
+    let mut streaming = false;
+    let mut sub_streaming_name = None;
+    let mut thinking_stream = None;
+    let mut thinking = false;
+    let mut activity = String::new();
+    let mut tool_running = ToolRunning::new();
+    let mut queued: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let mut rows = vec![Row::User("hi".into())];
+    let mut cache = MdCache::new();
+
+    let changed = reset_after_worker_exit(
+        &mut busy,
+        &mut run_start,
+        &mut streaming,
+        &mut sub_streaming_name,
+        &mut thinking_stream,
+        &mut thinking,
+        &mut activity,
+        &mut tool_running,
+        &mut queued,
+        &mut rows,
+        &mut cache,
+    );
+    assert!(!changed);
+    assert_eq!(rows.len(), 1, "an idle death pushes no rows: {rows:?}");
+}
+
+/// ctx_from_usage sums the four provider-reported u64s saturating: a
+/// hostile report must neither panic on the debug overflow check (the old
+/// plain `+` did) nor wrap into a small number in release.
+#[test]
+fn ctx_from_usage_saturates_hostile_usage() {
+    assert_eq!(ctx_from_usage(u64::MAX - 1, 1, 1, 1), u64::MAX);
+    assert_eq!(
+        ctx_from_usage(u64::MAX, u64::MAX, u64::MAX, u64::MAX),
+        u64::MAX
+    );
+    // Ordinary reports still sum exactly.
+    assert_eq!(ctx_from_usage(100, 20, 30, 10), 160);
+}
+
+/// TUI-04: soft_cut_offset 内部 fence 状态是 (char, usize)，返回时只带
+/// Option<char> 丢掉 opener 长度；split_streaming_row 于是固定用 3 个标记
+/// 字符重开尾段。≥4 标记的外层围栏被切在"内层 ``` 行之后"时，尾段的合成
+/// ``` 被内容里的内层 ``` 当成关闭，其余内容按 markdown 泄漏。
+#[test]
+fn soft_cut_4_backtick_fence_tail_reopens_with_3_and_inner_fence_closes_it() {
+    // 流式半截文本：4 反引号围栏未闭合，内含 ``` 行；无空行 → 无段落边界，
+    // 走 soft_cut（display-row 切）。每行 1 显示行（宽 200），总 13 行 > 阈值。
+    let mut text = String::from("````rust\n");
+    for i in 0..10 {
+        text.push_str(&format!("code-{i:02}\n"));
+    }
+    text.push_str("```\n"); // 内层 ``` 行（4 围栏里是内容，不会闭合外层）
+    text.push_str("code-tail"); // 最后一行；流式中尚未写出闭合 ````
+
+    let mut rows: Vec<Row> = vec![Row::Assistant(text)];
+    split_streaming_row(&mut rows, 200);
+    assert_eq!(rows.len(), 2, "expected prefix + tail split");
+    let (prefix_ok, tail_text, tight) = match (&rows[0], &rows[1]) {
+        (Row::Assistant(_), Row::AssistantCont { text: t, tight }) => (true, t.clone(), *tight),
+        _ => (false, String::new(), false),
+    };
+    assert!(prefix_ok, "rows must be Assistant + AssistantCont");
+    assert!(tight, "row-level cut is tight");
+    // 症状一：重开栏只有 3 个标记字符（丢掉了外层的长度 4）。
+    assert!(
+        tail_text.starts_with("```\n```"),
+        "tail must reopen with a 3-char marker (the bug): {tail_text:?}"
+    );
+    // 症状二：渲染尾段——内层 ``` 把合成开栏关闭，code-tail 泄漏为 markdown。
+    let leak_lines = render_markdown(&tail_text, 200);
+    let leak_texts: Vec<String> = leak_lines.iter().map(row_text).collect();
+    assert!(
+        !leak_texts.iter().any(|t| t.starts_with("▎ ")),
+        "tail rendered NOTHING as code — inner ``` closed the synthetic opener: {leak_texts:?}"
+    );
+    assert!(
+        leak_texts.iter().any(|t| t == "code-tail"),
+        "code-tail leaked as plain markdown: {leak_texts:?}"
+    );
+    // 对照：按 opener 实际长度（4）重开时，内层 ``` 是内容、code-tail 是代码。
+    let fixed = render_markdown("````\n```\ncode-tail", 200);
+    let fixed_texts: Vec<String> = fixed.iter().map(row_text).collect();
+    assert!(
+        fixed_texts.iter().any(|t| t == "▎ ```"),
+        "with a length-true reopen the inner ``` renders as code content: {fixed_texts:?}"
+    );
+    assert!(
+        fixed_texts.iter().any(|t| t == "▎ code-tail"),
+        "with a length-true reopen code-tail renders as code: {fixed_texts:?}"
+    );
+    // 前缀半截围栏（未闭合）照旧整块渲染为代码——不受本问题影响。
+    let mut cache = MdCache::new();
+    let prefix_lines = build_history_lines(
+        std::slice::from_ref(&rows[0]),
+        &mut cache,
+        200,
+        LiveRow::None,
+        false,
+        false,
+    );
+    let prefix_texts: Vec<String> = prefix_lines.iter().map(row_text).collect();
+    assert_eq!(
+        prefix_texts.iter().filter(|t| t.contains("▎ ")).count(),
+        10,
+        "prefix code lines all barred: {prefix_texts:?}"
+    );
+}
+
+/// TUI-08：SubAgent TextDelta 臂（app.rs 内层 match）只 append_sub_delta、
+/// 不调 split_streaming_row——气泡不切分（既定决策：task 返回短总结），但
+/// 后果是整条气泡全程留在 live 区，而 live 渲染路径（inflight 行 →
+/// build_history_lines → MdCache，key = 气泡全文）在**每个 delta** 都 miss
+/// → tui_markdown::from_str 全量重解析整条气泡 → O(气泡²) 总解析量。
+/// 本测试用同一条流对两条路径计时：子路径（现状）vs 父路径（有切分）。
+#[test]
+fn subagent_bubble_live_render_reparses_whole_bubble_per_delta() {
+    let para =
+        "analysis line with `code` and **bold** text, plus a list:\n\n- item one\n- item two\n\n";
+    let delta = &para[..80]; // ASCII，逐 delta 追加 ~80 字节
+    const N: usize = 300; // 300 × 80B ≈ 24KB 气泡（典型长总结的量级）
+
+    // 单次全量解析的基线（24KB，与最终气泡同量级）。
+    let mut full = String::from("[scout] ");
+    for _ in 0..N {
+        full.push_str(delta);
+    }
+    let one = {
+        let t = Instant::now();
+        render_markdown(&full, 80);
+        t.elapsed()
+    };
+
+    // 子 agent 路径（现状）：append_sub_delta + live 渲染，无切分。
+    let mut sub_rows: Vec<Row> = Vec::new();
+    let mut sub_name: Option<String> = None;
+    let mut cache = MdCache::new();
+    let t = Instant::now();
+    for _ in 0..N {
+        append_sub_delta(&mut sub_rows, &mut sub_name, "scout", delta);
+        if let Some(i) = inflight_row_index(&sub_rows, true) {
+            build_history_lines(
+                std::slice::from_ref(&sub_rows[i]),
+                &mut cache,
+                80,
+                LiveRow::Text,
+                false,
+                false,
+            );
+        }
+    }
+    let sub_total = t.elapsed();
+
+    // 父 agent 路径（对照）：append_delta + split_streaming_row 增量提交，
+    // live 区只剩 ~2 行尾巴，每次渲染解析的文本量有界。
+    let mut p_rows: Vec<Row> = Vec::new();
+    let mut streaming = false;
+    let mut p_cache = MdCache::new();
+    let t = Instant::now();
+    for _ in 0..N {
+        append_delta(&mut p_rows, &mut streaming, delta);
+        split_streaming_row(&mut p_rows, 80);
+        if let Some(i) = inflight_row_index(&p_rows, streaming) {
+            build_history_lines(
+                std::slice::from_ref(&p_rows[i]),
+                &mut p_cache,
+                80,
+                LiveRow::Text,
+                false,
+                false,
+            );
+        }
+    }
+    let parent_total = t.elapsed();
+
+    // 现状钉住：子气泡确实全程不切分（单一 Assistant 行）。
+    assert_eq!(sub_name.as_deref(), Some("scout"));
+    assert_eq!(sub_rows.len(), 1, "sub bubble must stay unsplit (today)");
+    assert!(matches!(sub_rows[0], Row::Assistant(_)));
+
+    println!(
+        "subagent bubble 24KB / 300 deltas: single 24KB parse {:?}; sub path total {:?} ({:.0}x single-parse); parent path total {:?} ({:.0}x)",
+        one,
+        sub_total,
+        sub_total.as_secs_f64() / one.as_secs_f64().max(1e-9),
+        parent_total,
+        parent_total.as_secs_f64() / one.as_secs_f64().max(1e-9),
+    );
+    // 子路径重解析总量 ≈ Σ(第 i 个 delta 时的气泡长) ≈ N/2 × 最终长，
+    // 理论上远超一次全量解析；给个宽松下界防退化（不钉上限，CI 不抖）。
+    assert!(
+        sub_total >= one,
+        "unsplit sub bubble re-parses the whole bubble per delta — must cost at least one full parse"
+    );
+}

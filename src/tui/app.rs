@@ -136,13 +136,21 @@ pub(super) enum Input {
     Context,
 }
 
-/// On drop, signals worker completion so the quit path can wait a bounded
-/// time for the worker to exit (and let a cancel-aware tool kill its child)
-/// instead of detaching it mid-tool and orphaning a spawned shell process.
-struct DoneSignal(mpsc::Sender<()>);
+/// On drop, latches the worker-exited flag and signals worker completion so
+/// the quit path can wait a bounded time for the worker to exit (and let a
+/// cancel-aware tool kill its child) instead of detaching it mid-tool and
+/// orphaning a spawned shell process. The flag is how the UI loop learns of
+/// a worker that died mid-run: the diag bridge (installed in `run` before
+/// the worker starts) holds a sender clone for the whole session, so the
+/// event channel itself never reports Disconnected.
+struct DoneSignal(
+    mpsc::Sender<()>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+);
 
 impl Drop for DoneSignal {
     fn drop(&mut self) {
+        self.1.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = self.0.send(());
     }
 }
@@ -202,6 +210,11 @@ pub fn run(
     let (done_tx, done_rx) = mpsc::channel::<()>();
     // Worker → UI: agent events.
     let (out_tx, out_rx) = mpsc::channel::<UiMsg>();
+    // Latched "worker thread has exited" flag, set by DoneSignal on ANY exit
+    // (normal loop end, early return, panic unwind). The event loop reads it
+    // because the diag bridge keeps the event channel connected for the whole
+    // session — a worker death mid-run is invisible to channel state.
+    let worker_exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Cancellation: Esc sets this; the agent checks it at each turn boundary.
     // This is the RECOVERABLE per-turn interrupt — the next turn reuses the same
     // MCP server child, so it must never tear it down.
@@ -256,10 +269,12 @@ pub fn run(
     // The worker thread owns the agent and drives run() per user input.
     let worker_cancel = cancel.clone();
     let worker_shutdown = shutdown.clone();
+    let worker_done_flag = worker_exited.clone();
     let worker = std::thread::spawn(move || {
         // Signal completion on ANY exit (normal loop end or early return) via
-        // Drop, so the quit path can join within a bounded wait.
-        let _done = DoneSignal(done_tx);
+        // Drop, so the quit path can join within a bounded wait and the UI
+        // loop can detect a mid-run death (see `worker_exited`).
+        let _done = DoneSignal(done_tx, worker_done_flag);
         let mut agent = agent;
         agent.set_cancel(worker_cancel);
         // Arm the MCP shutdown-reaper on the session-end flag (NOT cancel): a
@@ -326,6 +341,7 @@ pub fn run(
         cfg,
         &in_tx,
         &out_rx,
+        &worker_exited,
         &cancel,
         initial_task.as_deref(),
         auto_start,
@@ -390,6 +406,7 @@ fn ui_loop(
     cfg: &Config,
     in_tx: &mpsc::Sender<Option<Input>>,
     out_rx: &mpsc::Receiver<UiMsg>,
+    worker_exited: &std::sync::atomic::AtomicBool,
     cancel: &std::sync::atomic::AtomicBool,
     initial_task: Option<&str>,
     auto_start: bool,
@@ -520,37 +537,54 @@ fn ui_loop(
         loop {
             let msg = match out_rx.try_recv() {
                 Ok(m) => m,
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    // Worker thread is gone (e.g. panicked mid-run, or the
-                    // process is tearing down). Don't leave the UI stuck in
-                    // "running" waiting for a RunFinished that will never come
-                    // — surface it so the user can Esc out cleanly.
-                    if busy {
-                        busy = false;
-                        run_start = None;
-                        streaming = false;
-                        sub_streaming_name = None;
-                        thinking_stream = None;
-                        // TurnStart sets this true; without resetting it here a
-                        // worker that dies during the thinking phase (before any
-                        // TextDelta clears it) would leave a stale flag.
-                        thinking = false;
-                        tool_running.clear();
+                Err(mpsc::TryRecvError::Empty) => {
+                    // The diag bridge (installed in `run` for the whole
+                    // session) holds a sender clone, so the channel reports
+                    // Empty — never Disconnected — even after the worker's
+                    // own sender died with its thread. A worker gone mid-run
+                    // (a panic in a debug build; release aborts the process)
+                    // is therefore detected by the flag DoneSignal set on
+                    // drop, not by channel state.
+                    if busy
+                        && worker_exited.load(std::sync::atomic::Ordering::Relaxed)
+                        && reset_after_worker_exit(
+                            &mut busy,
+                            &mut run_start,
+                            &mut streaming,
+                            &mut sub_streaming_name,
+                            &mut thinking_stream,
+                            &mut thinking,
+                            &mut activity,
+                            &mut tool_running,
+                            &mut queued,
+                            &mut rows,
+                            &mut md_cache,
+                        )
+                    {
                         dirty = true;
-                        rows.push(Row::sys_error(
-                            "[worker stopped unexpectedly — type /quit to exit]",
-                        ));
                     }
-                    // Nothing queued can ever be delivered now: drop the
-                    // pending texts and their ghost rows. The MdCache slot is
-                    // content-keyed so removal can't alias it, but dropping a
-                    // slot that may reference a removed row is eager hygiene
-                    // (the watermark stays valid — only uncommitted ghosts
-                    // are ever removed).
-                    queued.clear();
-                    if drop_queued_ghosts(&mut rows) {
-                        md_cache.clear();
+                    break;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // Same reset as the worker-exited arm above. Defense in
+                    // depth: unreachable while the diag bridge holds its
+                    // sender clone, but kept so a future teardown that drops
+                    // the bridge mid-session still resets the UI instead of
+                    // hanging in "running".
+                    if reset_after_worker_exit(
+                        &mut busy,
+                        &mut run_start,
+                        &mut streaming,
+                        &mut sub_streaming_name,
+                        &mut thinking_stream,
+                        &mut thinking,
+                        &mut activity,
+                        &mut tool_running,
+                        &mut queued,
+                        &mut rows,
+                        &mut md_cache,
+                    ) {
+                        dirty = true;
                     }
                     break;
                 }
@@ -726,10 +760,12 @@ fn ui_loop(
                         // reports the whole prompt in input_tokens and leaves
                         // the buckets at 0). + output covers the response the
                         // next request will carry.
-                        ctx_tokens = input_tokens
-                            + cache_creation_input_tokens
-                            + cache_read_input_tokens
-                            + output_tokens;
+                        ctx_tokens = ctx_from_usage(
+                            input_tokens,
+                            cache_creation_input_tokens,
+                            cache_read_input_tokens,
+                            output_tokens,
+                        );
                     }
                     AgentEvent::TodoUpdate { todos } => {
                         // Update the live plan state — the status bar renders a
@@ -1636,4 +1672,79 @@ pub(super) fn apply_flush(
             *thinking = false;
         }
     }
+}
+
+/// Reset the run state after the worker thread died mid-run: drop the UI out
+/// of "running" (the RunFinished that would reset it is never coming),
+/// surface the death, and drop the queued messages — nothing can deliver
+/// them anymore. Shared by the event loop's worker-exited and channel-
+/// disconnected arms so the two paths cannot drift. Returns whether anything
+/// changed (the caller turns that into a repaint).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn reset_after_worker_exit(
+    busy: &mut bool,
+    run_start: &mut Option<Instant>,
+    streaming: &mut bool,
+    sub_streaming_name: &mut Option<String>,
+    thinking_stream: &mut Option<String>,
+    thinking: &mut bool,
+    activity: &mut String,
+    tool_running: &mut ToolRunning,
+    queued: &mut std::collections::VecDeque<String>,
+    rows: &mut Vec<Row>,
+    md_cache: &mut MdCache,
+) -> bool {
+    let mut changed = false;
+    if *busy {
+        *busy = false;
+        *run_start = None;
+        *streaming = false;
+        *sub_streaming_name = None;
+        *thinking_stream = None;
+        // TurnStart sets this true; without resetting it here a worker that
+        // dies during the thinking phase (before any TextDelta clears it)
+        // would leave a stale flag.
+        *thinking = false;
+        activity.clear();
+        tool_running.clear();
+        rows.push(Row::sys_error(
+            "[worker stopped unexpectedly — type /quit to exit]",
+        ));
+        changed = true;
+    }
+    // Nothing queued can ever be delivered now: same notice as the Esc path,
+    // then drop the pending texts and their ghost rows. The MdCache slot is
+    // content-keyed so removal can't alias it, but dropping a slot that may
+    // reference a removed row is eager hygiene (the watermark stays valid —
+    // only uncommitted ghosts are ever removed).
+    if !queued.is_empty() {
+        rows.push(Row::sys_warn(format!(
+            "[dropped {} queued message(s)]",
+            queued.len()
+        )));
+        changed = true;
+    }
+    queued.clear();
+    if drop_queued_ghosts(rows) {
+        md_cache.clear();
+        changed = true;
+    }
+    changed
+}
+
+/// Context occupancy implied by one Usage report: the full prompt (input
+/// plus both cache buckets) plus the response just appended to the history.
+/// Saturating like every other token accumulator: the four values are
+/// provider-reported u64s, so a hostile report must neither panic on the
+/// debug overflow check nor wrap into a small number in release.
+pub(super) fn ctx_from_usage(
+    input_tokens: u64,
+    cache_creation_input_tokens: u64,
+    cache_read_input_tokens: u64,
+    output_tokens: u64,
+) -> u64 {
+    input_tokens
+        .saturating_add(cache_creation_input_tokens)
+        .saturating_add(cache_read_input_tokens)
+        .saturating_add(output_tokens)
 }

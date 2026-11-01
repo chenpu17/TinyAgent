@@ -10402,3 +10402,56 @@ fn note_flush_panic_at_run_exit_keeps_undelivered_notes_queued() {
         "the undelivered note must not be in history"
     );
 }
+
+// ── 工具账单 Usage 事件的事件顺序契约 ──────────────────────────────
+
+#[test]
+fn tool_billed_usage_event_lands_between_subagent_stream_and_tool_result() {
+    // Slot::Ran 的工具账单折叠（Slot::Ran → fold_usage → events(Usage)）
+    // 以「顶层」AgentEvent::Usage 冒出，且位置固定：该工具的 SubAgent 事件
+    // 流之后、ToolResult 之前。顶层 Usage 的语义是「最近一次 API 请求后的
+    // 上下文占用」，消费方（如 TUI 状态栏 ctx 段）按此 SET——顺序即契约，
+    // 改动折叠/emit 位置前先核对全部消费方。真实 task 工具的 out.usage 是
+    // 子 agent 多轮累计（run_subagent_returns_final_text_and_bills_usage
+    // 钉住 2 轮聚合）；本测试用与真实 task 同形的 stand-in 钉住确切顺序。
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, _) = MockProvider::new(vec![
+        mock::resp_tool("t", "task", json!({"label": "a"}), None),
+        mock::resp_text("final", None),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(TaskTool)],
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    let mut events = Vec::new();
+    agent.run(&mut |e| events.push(e)).unwrap();
+
+    let sub_pos = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::SubAgent { .. }))
+        .expect("a forwarded SubAgent event");
+    let usage_pos = events
+        .iter()
+        .position(|e| {
+            matches!(
+                e,
+                AgentEvent::Usage {
+                    input_tokens: 100,
+                    output_tokens: 10,
+                    ..
+                }
+            )
+        })
+        .expect("the tool-billed top-level Usage event");
+    let tr_pos = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::ToolResult { name, .. } if name == "task"))
+        .expect("the task ToolResult event");
+    assert!(
+        sub_pos < usage_pos && usage_pos < tr_pos,
+        "expected SubAgent({sub_pos}) < Usage({usage_pos}) < ToolResult({tr_pos})"
+    );
+}
