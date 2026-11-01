@@ -421,11 +421,6 @@ pub(crate) fn is_context_overflow(e: &anyhow::Error) -> bool {
 /// keeps proper user → assistant alternation when the tail starts with an
 /// assistant message. Previous summary blocks are replaced, not stacked —
 /// the new summary already absorbed them via the transcript.
-/// Build the compressed history: original task (with the summary folded in
-/// as one extra text block) + the untouched tail. Folding into message[0]
-/// keeps proper user → assistant alternation when the tail starts with an
-/// assistant message. Previous summary blocks are replaced, not stacked —
-/// the new summary already absorbed them via the transcript.
 ///
 /// Post-fold fidelity (see the compaction research notes): alongside the
 /// summary the head carries (a) the todo checklist restored when the fold

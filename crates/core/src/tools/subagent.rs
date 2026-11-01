@@ -347,7 +347,13 @@ fn run_subagent(
     }) {
         Ok(o) => outcome_to_output(&o, name, max_output_chars),
         Err(re) => {
-            let mut out = ToolOutput::error(format!("subagent {name} failed: {re:#}"));
+            // Same output budget as every sibling model-visible error path
+            // (run_tool's Err arm, hooks-Deny, the llm tool's envelopes): the
+            // child's failure text — a provider error body is capped upstream
+            // at ERR_BODY_MAX = 16 KiB — must not bypass max_output_chars.
+            let mut msg = format!("subagent {name} failed: {re:#}");
+            tools::truncate(&mut msg, max_output_chars);
+            let mut out = ToolOutput::error(msg);
             // Honest cost even on failure: the turns the child completed before
             // erroring were real billed calls — dropping them would understate
             // the parent run's totals. The RunError carries exactly the partial
@@ -860,6 +866,29 @@ mod tests {
             meta["turns"].as_u64().unwrap_or(0) >= 1,
             "counted the turn that ran"
         );
+    }
+
+    /// The failure branch feeds a model-visible tool_result like every other
+    /// error path: the child's failure text (a provider error body is capped
+    /// upstream at ERR_BODY_MAX = 16 KiB) must ride the same
+    /// `max_output_chars` budget as run_tool's Err arm, hooks-Deny, the llm
+    /// tool's envelopes, and outcome_to_output.
+    #[test]
+    fn run_subagent_error_output_is_truncated_to_max_output_chars() {
+        let big = "E".repeat(50_000);
+        let mut agent = mock_agent(vec![
+            mock::resp_tool("t1", "noop", json!({}), mock::mk_usage(100, 5)),
+            mock::MockTurn::Err(big),
+        ]);
+        let out = run_subagent(&mut agent, "scout", &mut |_| {}, 1000);
+        assert!(out.is_error);
+        assert!(
+            out.content.len() <= 2000,
+            "error output must be capped to max_output_chars, got {} bytes",
+            out.content.len()
+        );
+        assert!(out.content.contains("truncated"), "cap must leave a marker");
+        assert!(out.content.starts_with("subagent scout failed: EEEE"));
     }
 
     #[test]

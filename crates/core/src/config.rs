@@ -71,10 +71,11 @@ pub struct Limits {
     /// turn, so the conversation always ends on a complete assistant message.
     #[serde(default = "default_max_turns")]
     pub max_turns: u32,
-    /// Whole-run wall clock in seconds from run start; `0` = no limit. A run
-    /// that exceeds it stops at the next turn boundary with `stop_reason:
-    /// "timeout"`; an in-flight request is additionally capped by the
-    /// remaining budget as its per-request timeout. Batch tightening only.
+    /// Whole-run wall clock in seconds from run start (default 600); `0` = no
+    /// limit. A run that exceeds it stops at the next turn boundary with
+    /// `stop_reason: "timeout"`; an in-flight request is additionally capped
+    /// by the remaining budget as its per-request timeout. Batch tightening
+    /// only.
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
     /// Per-tool-result character cap the tools apply to what they return
@@ -122,8 +123,8 @@ pub struct Limits {
     #[serde(default = "default_stream_idle")]
     pub stream_idle_secs: u64,
     /// Max wall-clock time for a single `shell` tool command before it is
-    /// killed and reported as an error. `0` (default is 120) = no per-command
-    /// limit — the run-level `timeout_secs` and interactive cancel still apply.
+    /// killed and reported as an error. `0` = no per-command limit (default
+    /// 120) — the run-level `timeout_secs` and interactive cancel still apply.
     /// Unlike the other limits fields this is a COST/latency knob, not a safety
     /// boundary: eval tasks routinely need builds/installs longer than 120s,
     /// and a task that wants to burn time can do it with ten thousand fast
@@ -183,7 +184,7 @@ enum Clamp {
     /// base adopts any finite task value (any finite value tightens);
     /// otherwise `min`.
     /// (timeout_secs / compress_threshold_chars / max_context_tokens /
-    /// max_total_tokens)
+    /// max_total_tokens / subagent_max_turns)
     TightenOrInit,
     /// Cost/latency knob, not a safety boundary: overridden in BOTH
     /// directions, no clamp. A task that wants to burn time can do it with
@@ -1122,7 +1123,8 @@ impl PartialConfig {
     /// First security-relevant field this fragment tries to set, if any.
     /// Batch task files are untrusted: they may only override soft fields
     /// (task / system_prompt / model / max_tokens / reasoning_effort /
-    /// inject_environment / limits). Everything else (endpoints, credentials,
+    /// inject_environment / salvage_on_max_tokens / limits / `code` under
+    /// its clamps). Everything else (endpoints, credentials,
     /// working directory, tool whitelist, sandbox, MCP servers) must come
     /// from the trusted base config and must not be weakened per task.
     ///
