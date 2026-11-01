@@ -260,11 +260,14 @@ pub enum AgentEvent {
     /// Token usage, in two flavors distinguished by `tool_folded`:
     ///
     /// * `tool_folded == false` — the provider's report for ONE direct chat
-    ///   request this agent itself made (the main turn, or a compression
-    ///   summary). This is the truth for "how much context does the history
-    ///   occupy right now". Best-effort: emitted only when the provider
-    ///   actually reported usage (e.g. the stream wasn't cut off before the
-    ///   usage frame).
+    ///   request this agent itself made inside a run (the main turn, or an
+    ///   in-run preflight/overflow compression summary — a host-invoked
+    ///   `compact()` emits no Usage event; its cost is returned in
+    ///   `CompressOutcome`). The best available measure of "how much context
+    ///   does the history occupy right now" (a summary that failed mid-stream
+    ///   reports only what it burned). Best-effort: emitted only when the
+    ///   provider actually reported usage (e.g. the stream wasn't cut off
+    ///   before the usage frame).
     /// * `tool_folded == true` — a TOOL call's bill folded into the run
     ///   totals (the `task` sub-agent's multi-turn aggregate, the `run_code`
     ///   inner llm, a host `CallbackTool` metering an upstream API). This is

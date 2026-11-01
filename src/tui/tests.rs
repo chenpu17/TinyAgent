@@ -3876,7 +3876,7 @@ fn diag_bridge_sender_keeps_event_channel_connected_after_worker_exit() {
     // When racing other tests that touch the global sink (install is
     // replace semantics), Disconnected can show up early because the sink
     // was swapped/cleared under us — retry on a fresh channel.
-    let mut empty_observed = false;
+    let mut connected_observed = false;
     for _ in 0..8 {
         let (out_tx, out_rx) = mpsc::channel::<UiMsg>();
         // Mirror run()'s assembly: install the bridge (holding a clone)
@@ -3885,14 +3885,14 @@ fn diag_bridge_sender_keeps_event_channel_connected_after_worker_exit() {
         // Simulate the worker closure exiting / unwinding: its sender dies.
         drop(out_tx);
         match out_rx.try_recv() {
-            Err(mpsc::TryRecvError::Empty) => empty_observed = true,
+            Err(mpsc::TryRecvError::Empty) => connected_observed = true,
             Err(mpsc::TryRecvError::Disconnected) => {
                 tiny_agent::diag::clear_diag_sink();
                 continue; // parallel interference: retry
             }
             // Diag emitted by an unrelated parallel test reached us through
             // the bridge: a live sender, so the channel is still connected.
-            Ok(_) => empty_observed = true,
+            Ok(_) => connected_observed = true,
         }
         // Clearing the bridge (the TerminalGuard::drop moment, which in
         // reality happens only after ui_loop returned) is what finally
@@ -3912,8 +3912,8 @@ fn diag_bridge_sender_keeps_event_channel_connected_after_worker_exit() {
     }
     tiny_agent::diag::clear_diag_sink(); // process-global sink: always clear
     assert!(
-        empty_observed,
-        "worker sender dropped: try_recv must stay Empty while the diag bridge holds its clone"
+        connected_observed,
+        "worker sender dropped: the channel must stay connected (Empty, or a routed diag) while the diag bridge holds its clone"
     );
 }
 

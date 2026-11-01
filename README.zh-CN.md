@@ -1130,7 +1130,7 @@ crates/core/src/  # kernel crate (package tiny-agent-core, lib name tiny_agent):
 │   ├── openai.rs         ( 1817)  # OpenAI-compatible (include_usage; 400 fallbacks: max_tokens→max_completion_tokens / drop stream_options)
 │   ├── anthropic.rs      ( 1246)  # Anthropic native (message_start/message_delta usage)
 │   └── mock.rs           (  345)  # scripted Provider for tests (cfg(any(test, feature="mock")))
-├── agent.rs          ( 4388)  # core loop + usage accounting + cancel + context compression (preflight/overflow dual trigger + rolling chunked summaries) + adjacent-message normalization + same-turn multi-task parallelism
+├── agent.rs          ( 4391)  # core loop + usage accounting + cancel + context compression (preflight/overflow dual trigger + rolling chunked summaries) + adjacent-message normalization + same-turn multi-task parallelism
 ├── agent_tests.rs    (10501)  # core-loop regression tests (scripted provider::mock, no network)
 ├── usage_probe.rs    (   94)  # thread-local usage side channel for parallel workers: recovers billed usage after a panic unwind at the join point (keeps result.json and the shared counter from diverging)
 ├── compress.rs       (  996)  # compression engine (find_safe_cut / chunked summaries / saturating usage merge + block-level billing primitives)
