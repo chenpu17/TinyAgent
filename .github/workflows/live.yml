@@ -10,13 +10,20 @@ on:
   workflow_dispatch:
   schedule:
     - cron: "23 4 * * 1"
+
+# 最低权限基线：只读代码。
+permissions:
+  contents: read
+
+# action 固定到 commit SHA（同 ci.yml 的口径）；dtolnay/rust-toolchain@stable
+# 豁免——该 ref 本就是刻意跟随 stable 分支的浮动 tag。
 jobs:
   mcp-wiring:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo test -p tiny-agent-core --features mock --lib hot_add_remove_mcp_server_live -- --ignored --nocapture
       - run: cargo test -p tiny-agent-core --features code,mock --lib guest_reaches_mcp_tools_live -- --ignored --nocapture

@@ -6,21 +6,37 @@ on:
   push:
     tags: ['v*']
 
+# workflow 级只读；写 Release 的三个 job（musl / bindings-python /
+# bindings-node-publish）各自带 job 级 contents: write，bindings-node
+# 矩阵只传 artifact、继承只读。
 permissions:
-  contents: write
+  contents: read
+
+# 同 tag 重复触发的串行化（cancel-in-progress: false——发版中途不许互相
+# 取消）。Release 创建竞态本身 action-gh-release v3 已自愈（422
+# already_exists 重试、draft 优先、重复 draft 清理）；run 内三个 job 对
+# 同一 Release 的并发写由 action 自身处理，无需在这里排队。
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+# action 固定到 commit SHA（`@<SHA> # vN`，Dependabot 周更）；唯一豁免
+# dtolnay/rust-toolchain@stable——该 ref 本就是刻意跟随 stable 分支的浮动 tag。
 
 jobs:
   musl:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: musl
 
@@ -48,7 +64,7 @@ jobs:
 
       # 输入名是 generate_release_notes（v0.4.3 前 CI 警告 Unexpected input
       # 'generate_notes' 被静默忽略，自动 notes 一直没生效——改名才真开）。
-      - uses: softprops/action-gh-release@v3
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           generate_release_notes: true
           files: |
@@ -72,17 +88,17 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: node-${{ matrix.target }}
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
 
@@ -113,7 +129,7 @@ jobs:
             node -e 'const fs=require("fs");const e=process.env;fs.writeFileSync(e.PKG_STAGE+"/package.json",JSON.stringify({name:e.PKG_NAME,version:e.PKG_VERSION,description:`TinyAgent native binding (${e.PKG_NAME})`,license:"MIT",main:e.PKG_NODE_FILE,files:[e.PKG_NODE_FILE]},null,2)+"\n")'
           (cd "$STAGE" && npm pack --silent)
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.pkg }}
           path: bindings/node/npm-stage/**/*.tgz
@@ -128,16 +144,18 @@ jobs:
   bindings-python:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: python
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
 
@@ -146,7 +164,7 @@ jobs:
       # auditwheel 拒绝；容器内构建 + 修复才能得到可移植的 manylinux_2_17。
       # 版本号单源 = pyproject.toml（5 处同步约定），maturin 自动写入
       # wheel/sdist 文件名，不从 tag 解析、不硬编码。
-      - uses: PyO3/maturin-action@v1
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
           working-directory: bindings/python
           command: build
@@ -167,13 +185,13 @@ jobs:
 
       # sdist 与解释器/ABI 无关，宿主直接打（内含 crates/core 路径依赖，
       # 使用者在目标平台自行编译）。
-      - uses: PyO3/maturin-action@v1
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
           working-directory: bindings/python
           command: sdist
           args: --out dist
 
-      - uses: softprops/action-gh-release@v3
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           generate_release_notes: false
           files: |
@@ -183,35 +201,47 @@ jobs:
     needs: bindings-node
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # 附 Release 的回退路径（未配 NPM_TOKEN 时活跃）也要写权限；publish 路径
+    # 同样需要（gh-release 不跑，但 job 权限是统一的）。
+    permissions:
+      contents: write
+    # NPM_TOKEN 放 job 级 env：job 级 env 允许映射 secrets，且在任何语义下
+    # 都对 step 的 `if:` 可见——两个 step 的条件写法因此保持不动。
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: pkgs
 
+      # 幂等发布：从 tgz 里读出 name@version，registry 已存在就 notice 跳过
+      # （同 tag 重跑 / concurrency 排队后的二次触发不再 403 翻车）。
       - name: Publish to npm (requires NPM_TOKEN secret)
         if: env.NPM_TOKEN != ''
         run: |
           find pkgs -name '*.tgz' | while read -r tgz; do
-            npm publish "$tgz" --access public
+            name=$(tar -xzOf "$tgz" package/package.json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const p=JSON.parse(s);console.log(p.name+"@"+p.version)})')
+            if npm view "$name" version >/dev/null 2>&1; then
+              echo "::notice::$name already on the registry, skipping"
+            else
+              npm publish "$tgz" --access public
+            fi
           done
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       # 未配 NPM_TOKEN：把子包 tarball 附到 GitHub Release（离线分发路径，
-      # npm install <tgz> 可用）；配了 token 的发布此步多余但无害。
-      - uses: softprops/action-gh-release@v3
+      # npm install <tgz> 可用）；配了 token 时子包走上一步发 npm，此步跳过。
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         if: env.NPM_TOKEN == ''
         with:
           generate_release_notes: false
           files: |
             pkgs/**/*.tgz
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
