@@ -13,6 +13,8 @@ Covers the full decision surface offline against ScriptedMock:
   - str shortcut + {"deny": …} / {"modify": …} dict forms
   - chat() one-shot entry point accepts hooks too
 """
+import types
+
 import pytest
 
 import tiny_agent
@@ -239,3 +241,49 @@ def test_set_hooks_rejects_broken_getattr(tmp_path):
     a = tiny_agent.Agent(cfg, api_key=MOCK_KEY)
     with pytest.raises(ValueError):
         a.set_hooks(Broken())
+
+
+def test_hooks_non_callable_method_rejected_at_install(tmp_path):
+    """A present-but-not-callable hook method is a TypeError at install time
+    (constructor / set_hooks) — the same contract the Node binding enforces
+    before building its callbacks — instead of failing closed per call
+    (decision hooks) or silently no-op'ing forever (observe hooks)."""
+    cfg = openai_config("http://127.0.0.1:1", tools=[], workdir=str(tmp_path))
+    with pytest.raises(TypeError, match="hooks.before_tool must be callable"):
+        tiny_agent.Agent(
+            cfg, api_key=MOCK_KEY, hooks=types.SimpleNamespace(before_tool=42)
+        )
+    a = tiny_agent.Agent(cfg, api_key=MOCK_KEY)
+    with pytest.raises(TypeError, match="hooks.after_tool must be callable"):
+        a.set_hooks(types.SimpleNamespace(after_tool=42))
+    with pytest.raises(TypeError, match="hooks.on_chat_request must be callable"):
+        a.set_hooks(types.SimpleNamespace(on_chat_request="nope"))
+
+
+def test_hooks_dual_key_decision_fails_closed(tmp_path):
+    """A decision carrying BOTH deny and modify is ill-formed (single-key
+    contract): fail-closed Deny, and the deny string is NOT trusted as the
+    refusal reason. Pins the Python-side behavior as the parity target for
+    the Node decision parser, which used to silently take the deny arm."""
+    mock = ScriptedMock(shell_round(command="echo original")).start()
+    try:
+        cfg = openai_config(mock.url, tools=["shell"], workdir=str(tmp_path))
+        a = tiny_agent.Agent(
+            cfg,
+            api_key=MOCK_KEY,
+            hooks=types.SimpleNamespace(
+                before_tool=lambda tool, input, ctx: {
+                    "deny": "nope denied",
+                    "modify": {"command": "echo evil"},
+                }
+            ),
+        )
+        a.push_user("run it")
+        out = a.run()
+    finally:
+        mock.stop()
+
+    rec = out["tool_calls"][0]
+    assert rec["is_error"] is True
+    assert "nope denied" not in rec["output"], "the deny arm must not win on a dual-key decision"
+    assert "single-key" in rec["output"] or "refused" in rec["output"], rec["output"]

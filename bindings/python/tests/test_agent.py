@@ -28,6 +28,20 @@ from conftest import (  # type: ignore[import-not-found]
 MOCK_KEY = "mock-key"  # the binding takes the key explicitly; never read from env
 
 
+def tool_then_text(tool="write_file", args=None):
+    """Two-request script: a tool_call turn, then a final text turn (shared
+    by the interrupt / cost-shape tests)."""
+    args = args or {"path": "out.txt", "content": "tool ran\n"}
+
+    def first(handler, body):
+        write_sse(handler, tool_call_sse("c1", tool, args))
+
+    def second(handler, body):
+        write_sse(handler, text_sse("ok done"))
+
+    return [first, second]
+
+
 # ── 1. one-shot chat against the real project mock asset ─────────────────────
 
 def test_chat_one_shot_against_project_mock(tmp_path):
@@ -239,6 +253,122 @@ def test_stale_cancel_persists_until_clear_cancel():
         mock.stop()
 
 
+# ── 4b. Ctrl-C inside on_event (the KeyboardInterrupt special case) ──────────
+#
+# The event callback runs with the GIL re-acquired on the run thread; a
+# KeyboardInterrupt raised there used to vanish with the discarded callback
+# result (the run sailed on, or the pending interrupt detonated at an
+# arbitrary host bytecode after run() returned). It is now special-cased:
+# with a cancel token armed the host flag is latched (run stops at the next
+# turn boundary), and the interrupt re-raises when run()/compact() returns.
+# Every other callback exception stays swallowed.
+
+
+def test_keyboard_interrupt_in_on_event_latches_cancel_and_reraises(tmp_path):
+    """With a cancel token armed, a KeyboardInterrupt from on_event latches
+    the token (the run stops at the next turn boundary — the follow-up text
+    request never happens) and re-raises when run() returns. The leftover
+    flag keeps the kernel's level-triggered contract: the next run returns
+    instantly cancelled until the host clears it at its acceptance point."""
+    mock = ScriptedMock(tool_then_text()).start()
+    try:
+        cfg = openai_config(mock.url, tools=["write_file"], workdir=str(tmp_path))
+        a = tiny_agent.Agent(cfg, api_key=MOCK_KEY)
+        tok = tiny_agent.CancelToken()
+        a.set_cancel(tok)
+        a.push_user("run it")
+
+        def on_event(ev):
+            raise KeyboardInterrupt  # the host's Ctrl-C, from its own callback
+
+        with pytest.raises(KeyboardInterrupt):
+            a.run(on_event=on_event)
+        assert tok.is_cancelled(), "the armed token must be latched by the interrupt"
+        assert len(mock.requests) == 1, (
+            "run must stop at the next boundary: the final text turn never requests"
+        )
+
+        # stop_reason is observable through the level-triggered contract: the
+        # leftover flag makes the next accepted run instantly cancelled.
+        a.push_user("next")
+        out = a.run()
+        assert out["stop_reason"] == "cancelled"
+        assert out["turns"] == 0
+
+        # Acceptance point: clear, then the agent is reusable end to end.
+        a.clear_cancel()
+        a.push_user("after clear")
+        out2 = a.run()
+        assert out2["stop_reason"] == "end_turn"
+        assert len(mock.requests) == 2
+    finally:
+        mock.stop()
+
+
+def test_keyboard_interrupt_without_token_reraises_after_run(tmp_path):
+    """Without a cancel token there is nothing to latch — the run runs to
+    completion (both scripted requests happen) and the KeyboardInterrupt
+    still surfaces when run() returns, instead of vanishing."""
+    mock = ScriptedMock(tool_then_text()).start()
+    try:
+        cfg = openai_config(mock.url, tools=["write_file"], workdir=str(tmp_path))
+        a = tiny_agent.Agent(cfg, api_key=MOCK_KEY)
+        a.push_user("run it")
+
+        def on_event(ev):
+            raise KeyboardInterrupt
+
+        with pytest.raises(KeyboardInterrupt):
+            a.run(on_event=on_event)
+        assert len(mock.requests) == 2, "no token armed: the run itself completes"
+    finally:
+        mock.stop()
+
+
+def test_keyboard_interrupt_in_compact_reraises(tmp_path):
+    """compact() shares the event-callback path with run(): a
+    KeyboardInterrupt from its on_event re-raises when compact() returns,
+    after the fold itself completed."""
+    def provider(request):
+        return {"text": "SUMMARY", "stop_reason": "end_turn"}
+
+    def on_event(ev):
+        raise KeyboardInterrupt
+
+    cfg = openai_config("http://unused", workdir=str(tmp_path))
+    cfg["limits"]["keep_recent_messages"] = 2
+    a = tiny_agent.Agent(cfg, provider=provider)
+    for msg in ("t1", "t2", "t3"):
+        a.push_user(msg)
+        a.run()
+
+    with pytest.raises(KeyboardInterrupt):
+        a.compact(on_event=on_event)
+    assert len(a.messages()) == 2, "the fold itself completed before the interrupt surfaced"
+
+
+def test_non_keyboardinterrupt_on_event_exception_still_swallowed(tmp_path):
+    """The swallow contract for ordinary callback bugs is unchanged: only
+    KeyboardInterrupt is control flow; a buggy on_event must not poison the
+    run."""
+    mock = ScriptedMock(tool_then_text()).start()
+    try:
+        cfg = openai_config(mock.url, tools=["write_file"], workdir=str(tmp_path))
+        a = tiny_agent.Agent(cfg, api_key=MOCK_KEY)
+        a.push_user("run it")
+        seen = {"events": 0}
+
+        def on_event(ev):
+            seen["events"] += 1
+            raise RuntimeError("buggy on_event")
+
+        out = a.run(on_event=on_event)
+        assert out["stop_reason"] == "end_turn"
+        assert seen["events"] >= 2, "the run continued past the callback error"
+    finally:
+        mock.stop()
+
+
 # ── 5. honest 4-axis token usage ──────────────────────────────────────────────
 
 def test_usage_four_axes_reported():
@@ -263,6 +393,58 @@ def test_usage_four_axes_reported():
         assert out["output_tokens"] == 9
         assert out["cache_read_input_tokens"] == 30
         assert out["cache_creation_input_tokens"] == 0  # OpenAI: no creation axis
+    finally:
+        mock.stop()
+
+
+# ── 5b. cost observability: outcome shape + failed-run envelope ──────────────
+
+def test_outcome_exposes_turn_timings_and_duration_ms(tmp_path):
+    """The cost-observability fields ride the outcome dict: per-turn timings
+    (one row per started turn, len == turns) and the per-call wall-clock
+    duration on every executed tool call."""
+    mock = ScriptedMock(tool_then_text()).start()
+    try:
+        cfg = openai_config(mock.url, tools=["write_file"], workdir=str(tmp_path))
+        a = tiny_agent.Agent(cfg, api_key=MOCK_KEY)
+        a.push_user("run it")
+        out = a.run()
+        assert out["turns"] >= 1
+        assert len(out["turn_timings"]) == out["turns"]
+        for row in out["turn_timings"]:
+            for k in ("turn", "duration_ms", "tool_calls"):
+                assert k in row, k
+        assert isinstance(out["tool_calls"][0]["duration_ms"], int)
+    finally:
+        mock.stop()
+
+
+def test_failed_run_raises_honest_cost_envelope(tmp_path):
+    """A run that fails after executing a tool raises RuntimeError with the
+    honest-cost JSON envelope: json.loads(e.args[0]) yields the 6-key shape
+    (error, usage, tool_calls, compressions, turns, elapsed) — the failed
+    run's real cost, not just a message. Locks the structural contract the
+    existing match="boom" tests never pinned."""
+    def boom(handler, _body):
+        body = b"server exploded"
+        handler.send_response(500)
+        handler.send_header("Content-Type", "text/plain")
+        handler.send_header("Content-Length", str(len(body)))
+        handler.end_headers()
+        handler.wfile.write(body)
+
+    mock = ScriptedMock(tool_then_text()[:1] + [boom]).start()
+    try:
+        cfg = openai_config(mock.url, tools=["write_file"], workdir=str(tmp_path))
+        a = tiny_agent.Agent(cfg, api_key=MOCK_KEY)
+        a.push_user("run it")
+        with pytest.raises(RuntimeError) as ei:
+            a.run()
+        env = json.loads(ei.value.args[0])
+        for k in ("error", "usage", "tool_calls", "compressions", "turns", "elapsed"):
+            assert k in env, f"envelope missing {k}"
+        assert len(env["tool_calls"]) == 1, "the executed tool call is in the envelope"
+        assert "500" in env["error"]
     finally:
         mock.stop()
 
@@ -505,6 +687,10 @@ def test_compact_between_runs_folds_reports_and_events(tmp_path):
     assert outcome is not None
     assert outcome["dropped"] == 4
     assert outcome["kept"] == 2
+    # The estimate brackets around the fold (the chars/4 yardstick the
+    # preflight gate consults) ride the outcome alongside dropped/kept/usage.
+    assert "estimated_tokens_before" in outcome
+    assert "estimated_tokens_after" in outcome
     # Folded head carries the summary; live history is head + trailing a3.
     assert len(a.messages()) == 2
     compressed = [e["Compressed"] for e in events

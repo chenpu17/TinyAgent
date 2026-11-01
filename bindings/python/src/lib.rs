@@ -45,7 +45,7 @@
 // file (pure pyo3 glue) so a genuine useless conversion elsewhere still trips.
 #![allow(clippy::useless_conversion)]
 
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pythonize::{depythonize, pythonize};
 use std::cell::Cell;
@@ -146,16 +146,57 @@ fn build_extra_tools(
     Ok(out)
 }
 
+/// Per-`run`/`compact` interrupt bookkeeping for the event-callback path.
+///
+/// A `KeyboardInterrupt` raised inside the host's `on_event` used to vanish
+/// (the callback result was discarded with `let _ =`): a Ctrl-C during the
+/// callback was silently swallowed and the run sailed on, or the pending
+/// interrupt detonated at an arbitrary host bytecode after the run returned.
+/// Now the event callback records the interrupt here so the blocking call can
+/// honor it:
+///
+/// - with a cancel token armed via `set_cancel`, the token's flag is LATCHED
+///   (the kernel contract's level-triggered flag, never cleared by the run) —
+///   the loop stops at the next turn boundary with `stop_reason: "cancelled"`;
+/// - the exception itself is stashed and re-raised when `run`/`compact`
+///   returns — with or without a token (without one the run runs to
+///   completion first).
+///
+/// Every OTHER callback exception stays swallowed: a buggy `on_event` must
+/// not poison the run — only the interrupt is control flow.
+struct InterruptState {
+    /// The host cancel token armed via `set_cancel`, snapshotted at `run` /
+    /// `compact` entry (the token is installed between runs; the mirror never
+    /// changes mid-run). `None` when no token was ever armed.
+    cancel: Option<Arc<AtomicBool>>,
+    /// The first `KeyboardInterrupt` from an event callback, re-raised when
+    /// the blocking call returns.
+    pending: Option<PyErr>,
+}
+
 /// Forward one event to the optional Python callback. Executed on the agent
 /// run thread while the GIL is released (the whole run sits inside
 /// `allow_threads`), so it re-acquires the GIL via `with_gil` just for the
-/// call. Errors in the callback are swallowed: a buggy on_event must not
-/// poison the agent run.
-fn emit_event(on_event: &Option<PyObject>, ev: ta::AgentEvent) {
+/// call. Errors in the callback are swallowed — EXCEPT `KeyboardInterrupt`,
+/// which latches `state`'s cancel flag (when a token is armed) and is stashed
+/// for re-raise when the run returns: a host's Ctrl-C inside its own callback
+/// must stop the run, not vanish into a dropped error.
+fn emit_event(on_event: &Option<PyObject>, state: &mut InterruptState, ev: ta::AgentEvent) {
     if let Some(cb) = on_event.as_ref() {
         Python::with_gil(|py| {
             if let Ok(py_ev) = pythonize(py, &ev) {
-                let _ = cb.call1(py, (py_ev,));
+                if let Err(e) = cb.call1(py, (py_ev,)) {
+                    if e.is_instance_of::<PyKeyboardInterrupt>(py) {
+                        if let Some(flag) = &state.cancel {
+                            flag.store(true, Ordering::Relaxed);
+                        }
+                        if state.pending.is_none() {
+                            state.pending = Some(e);
+                        }
+                    }
+                    // Anything else stays swallowed: a buggy on_event must
+                    // not poison the run.
+                }
             }
         });
     }
@@ -188,6 +229,26 @@ where
             }
         }
     }
+}
+
+/// Close out a `run` / `compact` call: a stashed `KeyboardInterrupt` from the
+/// event callbacks wins over the run's own result (including an unrelated
+/// failure's cost envelope) — the host's interrupt is the control flow that
+/// matters, and the run has fully unwound by this point either way. Without a
+/// pending interrupt the result maps as usual.
+fn finish_with_interrupt<T, E>(
+    mut interrupt: InterruptState,
+    result: Result<T, E>,
+    py: Python<'_>,
+) -> PyResult<PyObject>
+where
+    T: serde::Serialize,
+    E: serde::Serialize + std::fmt::Display,
+{
+    if let Some(ki) = interrupt.pending.take() {
+        return Err(ki);
+    }
+    outcome_to_py(result, py)
 }
 
 thread_local! {
@@ -313,10 +374,22 @@ struct HookChatRequest<'a> {
 
 /// Look up an optional duck-typed hook method. AttributeError (i.e. the host
 /// object doesn't define it) → None = core's default no-op; any other lookup
-/// error is a real problem and surfaces as a constructor error.
+/// error is a real problem and surfaces as a constructor error. A PRESENT
+/// method that is not callable is a TypeError at install time — the same
+/// contract the Node binding enforces before building its callback
+/// registrations: a `before_tool: 42` typo must not survive as a silent
+/// per-call fail-close (decision hooks) or a fully silent no-op (observe
+/// hooks).
 fn optional_method(obj: &Bound<'_, PyAny>, name: &str) -> PyResult<Option<PyObject>> {
     match obj.getattr(name) {
-        Ok(m) => Ok(Some(m.unbind())),
+        Ok(m) => {
+            if !m.is_callable() {
+                return Err(PyTypeError::new_err(format!(
+                    "hooks.{name} must be callable when present"
+                )));
+            }
+            Ok(Some(m.unbind()))
+        }
         Err(e) => {
             if e.is_instance_of::<pyo3::exceptions::PyAttributeError>(obj.py()) {
                 Ok(None)
@@ -744,6 +817,12 @@ impl ta::Provider for PyProvider {
 #[pyclass]
 pub struct Agent {
     inner: Mutex<ta::Agent>,
+    /// The cancel token armed via `set_cancel`, mirrored here so `run` /
+    /// `compact` can snapshot it (without contending `inner`) and latch the
+    /// host flag when a `KeyboardInterrupt` lands in an event callback (see
+    /// [`InterruptState`]). Leaf mutex: locked briefly on its own, never
+    /// held across another lock.
+    cancel_flag: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 impl Agent {
@@ -830,6 +909,7 @@ impl Agent {
         install_hooks(&mut agent, hooks, py)?;
         Ok(Self {
             inner: Mutex::new(agent),
+            cancel_flag: Mutex::new(None),
         })
     }
 
@@ -878,6 +958,10 @@ impl Agent {
     /// point you accept the next task (e.g. right before `push_user`/`run` of
     /// a new message) or every following run returns instantly cancelled.
     fn set_cancel(&self, token: &CancelToken, py: Python<'_>) -> PyResult<()> {
+        // Mirror the token for the event-callback interrupt path first (leaf
+        // lock, no ordering against `inner`); the run/compact entry then
+        // snapshots it without touching the agent lock.
+        *self.cancel_flag.lock().expect("cancel mirror poisoned") = Some(token.flag.clone());
         self.with_agent(py, |a| a.set_cancel(token.flag.clone()))
     }
 
@@ -891,12 +975,20 @@ impl Agent {
     /// Run one turn (until end_turn / max_turns / cancel / error). `on_event`
     /// is called for each `AgentEvent` (text deltas, tool calls, usage, …) with
     /// the event as a dict. Returns the `RunOutcome` as a dict
-    /// (final_text, turns, stop_reason, tool_calls, *_tokens, elapsed).
+    /// (final_text, turns, stop_reason, tool_calls, compressions (when any),
+    /// turn_timings, *_tokens, elapsed).
     ///
     /// The lock is acquired and the whole run happens with the GIL released;
     /// callbacks re-acquire it per call (`emit_event` / tool closures). A
     /// same-thread reentrant `run()` (from inside a callback) is a
     /// RuntimeError, not a self-deadlock.
+    ///
+    /// Ctrl-C semantics: a `KeyboardInterrupt` raised inside `on_event` stops
+    /// the run at the next turn boundary when a cancel token is armed via
+    /// `set_cancel` (the host flag is latched — `clear_cancel()` before the
+    /// next accepted task) and is re-raised when `run()` returns. Without a
+    /// token the run runs to completion and the interrupt still surfaces at
+    /// return. Any other callback exception stays swallowed.
     #[pyo3(signature = (on_event=None))]
     fn run(&self, on_event: Option<PyObject>, py: Python<'_>) -> PyResult<PyObject> {
         if IN_RUN.with(Cell::get) {
@@ -904,13 +996,21 @@ impl Agent {
                 "Agent.run() cannot be called reentrantly from an on_event/tool callback",
             ));
         }
+        let mut interrupt = InterruptState {
+            cancel: self
+                .cancel_flag
+                .lock()
+                .expect("cancel mirror poisoned")
+                .clone(),
+            pending: None,
+        };
         let result = py.allow_threads(|| {
             let mut agent = self.inner.lock().expect("agent mutex poisoned");
             IN_RUN.with(|c| c.set(true));
             let _flag = RunFlag; // RAII clear, panic-safe
-            agent.run(&mut |ev| emit_event(&on_event, ev))
+            agent.run(&mut |ev| emit_event(&on_event, &mut interrupt, ev))
         });
-        outcome_to_py(result, py)
+        finish_with_interrupt(interrupt, result, py)
     }
 
     /// Cumulative token usage of the current/latest run (4 axes).
@@ -942,10 +1042,17 @@ impl Agent {
     /// rewrite the session file. `instructions` is an optional focus hint for
     /// the summarizer ("focus on the API changes"); `on_event` receives the
     /// `Compressed`/`Warning` events. Returns the outcome dict
-    /// `{dropped, kept, usage}` or `None` when nothing was compressible
-    /// (history too short); raises on summary-request failure. Call between
-    /// runs (same reentrancy rules as `run`). The summary's cost is NOT part
+    /// `{dropped, kept, usage, estimated_tokens_before,
+    /// estimated_tokens_after, measured_tokens_before (when a measured
+    /// anchor was valid)}` or `None` when nothing was compressible (history
+    /// too short); raises on summary-request failure. Call between runs
+    /// (same reentrancy rules as `run`). The summary's cost is NOT part
     /// of the next run's `usage()` — meter it from the returned `usage`.
+    ///
+    /// Ctrl-C semantics match `run`: a `KeyboardInterrupt` from `on_event`
+    /// latches an armed cancel token (the fold stops at the next boundary)
+    /// and re-raises when `compact()` returns; other callback exceptions
+    /// stay swallowed.
     #[pyo3(signature = (instructions=None, on_event=None))]
     fn compact(
         &self,
@@ -958,34 +1065,48 @@ impl Agent {
                 "Agent.compact() cannot be called reentrantly from an on_event/tool callback",
             ));
         }
+        let mut interrupt = InterruptState {
+            cancel: self
+                .cancel_flag
+                .lock()
+                .expect("cancel mirror poisoned")
+                .clone(),
+            pending: None,
+        };
         let result = py.allow_threads(|| {
             let mut agent = self.inner.lock().expect("agent mutex poisoned");
             IN_RUN.with(|c| c.set(true));
             let _flag = RunFlag; // RAII clear, panic-safe
-            agent.compact_with(&mut |ev| emit_event(&on_event, ev), instructions)
+            agent.compact_with(
+                &mut |ev| emit_event(&on_event, &mut interrupt, ev),
+                instructions,
+            )
         });
-        match result {
-            Ok(Some(outcome)) => {
-                let bound = pythonize(py, &outcome)?;
-                Ok(bound.unbind())
-            }
-            Ok(None) => Ok(py.None()),
-            Err(e) => {
-                // Same honest-cost envelope as the run path (outcome_to_py):
-                // the summary cost a failed compact burned rides the error
-                // chain (CompressError::burned) instead of hitting the floor.
-                // JSON-string message — callers `json.loads(e.args[0])` and
-                // meter .burned exactly like a failed run's .usage. `burned`
-                // is null when the failure carried no usage (e.g. a host
-                // provider callback that simply raised).
-                let payload = serde_json::json!({
-                    "error": e.to_string(),
-                    "burned": e
-                        .downcast_ref::<ta::CompressError>()
-                        .and_then(|ce| ce.burned),
-                });
-                Err(PyRuntimeError::new_err(payload.to_string()))
-            }
+        match interrupt.pending.take() {
+            Some(ki) => Err(ki),
+            None => match result {
+                Ok(Some(outcome)) => {
+                    let bound = pythonize(py, &outcome)?;
+                    Ok(bound.unbind())
+                }
+                Ok(None) => Ok(py.None()),
+                Err(e) => {
+                    // Same honest-cost envelope as the run path (outcome_to_py):
+                    // the summary cost a failed compact burned rides the error
+                    // chain (CompressError::burned) instead of hitting the floor.
+                    // JSON-string message — callers `json.loads(e.args[0])` and
+                    // meter .burned exactly like a failed run's .usage. `burned`
+                    // is null when the failure carried no usage (e.g. a host
+                    // provider callback that simply raised).
+                    let payload = serde_json::json!({
+                        "error": e.to_string(),
+                        "burned": e
+                            .downcast_ref::<ta::CompressError>()
+                            .and_then(|ce| ce.burned),
+                    });
+                    Err(PyRuntimeError::new_err(payload.to_string()))
+                }
+            },
         }
     }
 
@@ -1171,9 +1292,16 @@ fn chat(
     install_hooks(&mut agent, hooks, py)?;
     agent.push_user(vec![ta::Block::Text(message.into())]);
     // Local agent (no shared mutex): the run itself still releases the GIL so
-    // other Python threads progress during the network-bound loop.
-    let result = py.allow_threads(|| agent.run(&mut |ev| emit_event(&on_event, ev)));
-    outcome_to_py(result, py)
+    // other Python threads progress during the network-bound loop. No cancel
+    // token surface on the one-shot entry, so the interrupt path only stashes
+    // (the KI re-raises when the run returns).
+    let mut interrupt = InterruptState {
+        cancel: None,
+        pending: None,
+    };
+    let result =
+        py.allow_threads(|| agent.run(&mut |ev| emit_event(&on_event, &mut interrupt, ev)));
+    finish_with_interrupt(interrupt, result, py)
 }
 
 // ── module ──────────────────────────────────────────────────────────────────
