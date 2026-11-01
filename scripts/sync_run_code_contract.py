@@ -15,8 +15,14 @@ import re
 
 ROOT = Path(__file__).resolve().parents[1]
 APPENDIX = "## 附录 A：LLM 可见契约"
+# The generated appendix ends at this marker; anything AFTER it is hand-added
+# content that a regeneration would drop — both modes refuse loudly instead.
+APPENDIX_END = "<!-- END GENERATED APPENDIX -->"
 MANIFEST = ROOT / "docs/run_code_routing_manifest.json"
-README_SPEC = ROOT / "README.md"
+README_SPECS = {
+    "en": ROOT / "README.md",
+    "zh": ROOT / "README.zh-CN.md",
+}
 SPEC_BEGIN_RE = re.compile(r"<!-- BEGIN CODE CONFIG SPEC[^>]*-->\n")
 SPEC_END = "<!-- END CODE CONFIG SPEC -->"
 
@@ -36,21 +42,22 @@ def sha_file_rel(path):
     return sha((ROOT / path).read_bytes().replace(b"\r\n", b"\n"))
 
 
-def readme_spec_section():
-    """The README's code-config block (JSON example + field table), kept
-    between BEGIN/END CODE CONFIG SPEC markers."""
-    text = README_SPEC.read_text(encoding="utf-8")
+def readme_spec_section(readme):
+    """A README's code-config block (JSON example + field table), kept
+    between BEGIN/END CODE CONFIG SPEC markers. Both the English and the
+    Chinese README carry one — each is cross-checked and hashed."""
+    text = readme.read_text(encoding="utf-8")
     m = SPEC_BEGIN_RE.search(text)
     if not m or SPEC_END not in text:
-        raise SystemExit("README.md is missing the CODE CONFIG SPEC markers.")
+        raise SystemExit(f"{readme.name} is missing the CODE CONFIG SPEC markers.")
     return text[m.end():text.index(SPEC_END)]
 
 
-def cross_check_readme_spec(section):
-    """Fail when README's spec block and config.rs's CodeConfig::default
+def cross_check_readme_spec(section, which):
+    """Fail when a README's spec block and config.rs's CodeConfig::default
     disagree on the numeric knobs — the drift direction the file-hash alone
     can't see (changing config.rs touches no hashed file). Runs in BOTH
-    --write and --check modes."""
+    --write and --check modes, for BOTH READMEs."""
     src = (ROOT / "crates/core/src/config.rs").read_text(encoding="utf-8")
     dm = re.search(r"impl Default for CodeConfig \{(.*?)\n\}", src, re.S)
     if not dm:
@@ -65,13 +72,30 @@ def cross_check_readme_spec(section):
 
     for name in ("max_tool_calls", "mem_mb", "timeout_secs", "fuel", "max_result_chars"):
         value = field(name)
-        # README may spell 5_000_000_000 as 5e9 in the prose column.
-        spellings = [str(value)] + (["5e9"] if value == 5_000_000_000 else [])
-        if not any(s in section for s in spellings):
+        # Line-exact like the boolean rows below, killing the bare-substring
+        # coincidences ("2" greenlit inside a "200" anywhere in the section):
+        # the key's own JSON line AND the key's own table row must each carry
+        # the exact default as the value cell (backticked or bare; fuel may
+        # be spelled 5e9 in the table cell — JSON needs the literal integer).
+        if not re.search(rf'^\s*"{name}": {value},?\s*$', section, re.M):
             raise SystemExit(
-                f"README code-config spec is stale: {name} default is {value} in "
-                f"config.rs but the README section carries none of {spellings}. "
-                "Update the README block (or revert config.rs), then re-run."
+                f"README[{which}] code-config spec is stale: {name} default is {value} in "
+                f"config.rs but the JSON example line does not carry exactly that "
+                "value. Update the README block (or revert config.rs), then re-run."
+            )
+        rows = [ln for ln in section.splitlines() if ln.lstrip().startswith(f"| `{name}`")]
+        if len(rows) != 1:
+            raise SystemExit(
+                f"README[{which}] code-config spec: expected exactly one table row for "
+                f"{name}, found {len(rows)} (extractor drift)."
+            )
+        cell = re.match(r"\|\s*`" + re.escape(name) + r"`\s*\|\s*`?([^`|]+?)`?\s*\|", rows[0].lstrip())
+        allowed = [str(value)] + (["5e9"] if value == 5_000_000_000 else [])
+        if not cell or cell.group(1).strip() not in allowed:
+            raise SystemExit(
+                f"README[{which}] code-config spec is stale: {name} default is {value} in "
+                f"config.rs but its table row's default cell does not equal one of "
+                f"{allowed}. Update the README block (or revert config.rs), then re-run."
             )
 
     # Boolean/nested knobs (external review round 3): a flipped default here
@@ -88,7 +112,7 @@ def cross_check_readme_spec(section):
         value = default_of(body, name)
         if f"`{name}` | `{value}`" not in section:
             raise SystemExit(
-                f"README code-config spec is stale: {name} default is {value} in "
+                f"README[{which}] code-config spec is stale: {name} default is {value} in "
                 "config.rs but the README table row does not carry that default. "
                 "Update the README block (or revert config.rs), then re-run."
             )
@@ -119,10 +143,22 @@ def cross_check_readme_spec(section):
     )
     if nested not in section:
         raise SystemExit(
-            "README code-config spec is stale: the `llm` row's nested default "
+            f"README[{which}] code-config spec is stale: the `llm` row's nested default "
             f"literal does not match config.rs ({nested}). Update the README "
             "block (or revert config.rs), then re-run."
         )
+
+
+def residue_after_appendix(text):
+    """Anything AFTER the generated appendix's END marker ('' when clean).
+
+    The generated block is defined to END at the marker; content added below
+    it would be silently dropped by --write (the appendix is regenerated as
+    the file tail), so both modes refuse loudly instead."""
+    i = text.find(APPENDIX_END)
+    if i < 0:
+        return ""
+    return text[i + len(APPENDIX_END):].strip()
 
 
 def main():
@@ -157,15 +193,28 @@ def main():
         raise SystemExit("Expected exactly one appendix A heading.")
     appendix = (
         APPENDIX + "（由源码生成）\n\n"
-        "<!-- Generated by scripts/sync_run_code_contract.py --write; do not edit below. -->\n\n"
+        "<!-- Generated by scripts/sync_run_code_contract.py --write; do not edit below; "
+        "the generated block ends at the END GENERATED APPENDIX marker. -->\n\n"
         "工具描述、技能正文、设计附录同源；修改后运行同步脚本。"
         "prelude 的封闭助手清单保持与描述及技能一致；脚本记录其哈希，不改运行时。\n\n"
         "**① 工具描述及 schema**（描述 ≤1200 字符，随请求常驻）：\n\n```json\n"
         + json.dumps(definition, ensure_ascii=False, indent=2) + "\n```\n\n"
         "**② 内置技能**（teaser ≤1024 字符；正文按需加载，磁盘同名技能可覆盖）：\n\n````markdown\n"
         + skill.rstrip() + "\n````\n"
+        + APPENDIX_END + "\n"
     )
     expected_doc = current.split(APPENDIX, 1)[0] + appendix
+
+    # The appendix is regenerated as the FILE TAIL: anything below its END
+    # marker is hand-added content a regeneration would silently drop —
+    # refuse in both modes (a doc with no marker yet is pre-migration and
+    # passes this probe; the first --write installs the marker).
+    residue = residue_after_appendix(current)
+    if residue:
+        raise SystemExit(
+            "content after the generated appendix would be dropped; move it "
+            f"above the appendix (first line: {residue.splitlines()[0]!r})"
+        )
 
     paths = [
         "examples/prompts/agentic.md", "examples/prompts/agentic-code.md",
@@ -199,12 +248,17 @@ def main():
     for p in paths[:2]:
         body = (ROOT / p).read_text(encoding="utf-8").split("\n---\n", 1)[1].strip()
         manifest["prompt_bodies"][p] = sha(body.encode("utf-8"))
-    # README's code-config block: cross-check defaults against config.rs and
-    # pin the section's hash (section-scoped so unrelated README edits — e.g.
-    # the generated structure tree — don't churn the manifest).
-    spec = readme_spec_section()
-    cross_check_readme_spec(spec)
-    manifest["readme_code_spec"] = {"sha256": sha(spec.encode("utf-8"))}
+    # Each README's code-config block: cross-check defaults against config.rs
+    # and pin the section's hash (section-scoped so unrelated README edits —
+    # e.g. the generated structure tree — don't churn the manifest). Both
+    # language editions carry the block; either may drift alone, so both are
+    # gated and pinned under per-language keys.
+    readme_code_spec = {}
+    for which, readme in README_SPECS.items():
+        spec = readme_spec_section(readme)
+        cross_check_readme_spec(spec, which)
+        readme_code_spec[which] = {"sha256": sha(spec.encode("utf-8"))}
+    manifest["readme_code_spec"] = readme_code_spec
     expected_manifest = json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
 
     if args.write:

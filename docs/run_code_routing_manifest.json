@@ -33,6 +33,11 @@
   "tool_schema_sha256": "5b3f1b33e6566f016571ca227808dea3a3f4adc117a79a8c4284bf457ea1e2c3",
   "prelude_source_sha256": "1db898a6aa06f534a52e70602c2c6d3ba32b732dc1d6a20cea7e114e97363307",
   "readme_code_spec": {
-    "sha256": "db860b6a83a1adf58011bd6b6410d634d1e931a3d43db0eb46958a618eb5dad9"
+    "en": {
+      "sha256": "db860b6a83a1adf58011bd6b6410d634d1e931a3d43db0eb46958a618eb5dad9"
+    },
+    "zh": {
+      "sha256": "7fc8df8739f7ad5491ac76b95b0cee88553c0ef00fc55b2012790382d85a8dc9"
+    }
   }
 }
