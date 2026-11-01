@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 本地 CI 一把过：把 .github/workflows/ci.yml 里 fmt / test / code 三个 job 的
+# 本地 CI 一把过：把 .github/workflows/ci.yml 里 fmt / test / code / e2e 四个 job 的
 # 命令原样搬到本地跑。命令与 ci.yml 必须逐字一致——本地绿灯才等于 CI 绿灯；
 # 改了 ci.yml 记得回来同步这里（参数、-D warnings、--features mock 都别漏）。
 #
@@ -71,13 +71,14 @@ group_test() {
         cargo test -p tiny-agent --features tui,mock
     run_check "test: code,mock" \
         cargo test -p tiny-agent-core -p tiny-agent --features code,mock
-    # ci.yml 的 code job 还把 code 版编成真实二进制再跑 e2e；这里同样先 build，
-    # 否则 e2e 用的是上次遗留的 target 产物，可能和当前源码对不上。
-    run_check "build: code" \
-        cargo build --features code
 }
 
 group_e2e() {
+    # 逐字对齐 ci.yml 的 e2e job 两步：先 build 出 code 版真实二进制再跑场景。
+    # e2e_scenarios.py 自己只在二进制不存在时才 build——这里显式 build 一次，
+    # 保证它测的是当前源码而不是上次遗留的 target 产物。
+    run_check "build: code" \
+        cargo build --features code
     # 内置 SSE 场景 mock（线程化、零密钥），走真实 CLI/HTTP 栈守四个 loop 级
     # 行为：打转护栏、并行 task fan-out、SIGINT exit 130、模型路由/批量并发。
     # 改了 loop / 取消 / 打转行为后必跑（CLAUDE.md「离线 / 视觉验证」）。
