@@ -281,15 +281,19 @@ def test_keyboard_interrupt_in_on_event_latches_cancel_and_reraises(tmp_path):
         def on_event(ev):
             raise KeyboardInterrupt  # the host's Ctrl-C, from its own callback
 
-        with pytest.raises(KeyboardInterrupt):
+        with pytest.raises(KeyboardInterrupt) as ei:
             a.run(on_event=on_event)
         assert tok.is_cancelled(), "the armed token must be latched by the interrupt"
         assert len(mock.requests) == 1, (
             "run must stop at the next boundary: the final text turn never requests"
         )
+        # The interrupted run's own result is NOT dropped: it rides the
+        # exception as .outcome (here the Ok outcome of the boundary stop).
+        assert ei.value.outcome["stop_reason"] == "cancelled"
+        assert ei.value.outcome["turns"] == 1
 
-        # stop_reason is observable through the level-triggered contract: the
-        # leftover flag makes the next accepted run instantly cancelled.
+        # stop_reason stays observable through the level-triggered contract:
+        # the leftover flag makes the next accepted run instantly cancelled.
         a.push_user("next")
         out = a.run()
         assert out["stop_reason"] == "cancelled"
@@ -308,7 +312,7 @@ def test_keyboard_interrupt_in_on_event_latches_cancel_and_reraises(tmp_path):
 def test_keyboard_interrupt_without_token_reraises_after_run(tmp_path):
     """Without a cancel token there is nothing to latch — the run runs to
     completion (both scripted requests happen) and the KeyboardInterrupt
-    still surfaces when run() returns, instead of vanishing."""
+    still surfaces when run() returns, carrying the full outcome dict."""
     mock = ScriptedMock(tool_then_text()).start()
     try:
         cfg = openai_config(mock.url, tools=["write_file"], workdir=str(tmp_path))
@@ -318,9 +322,53 @@ def test_keyboard_interrupt_without_token_reraises_after_run(tmp_path):
         def on_event(ev):
             raise KeyboardInterrupt
 
-        with pytest.raises(KeyboardInterrupt):
+        with pytest.raises(KeyboardInterrupt) as ei:
             a.run(on_event=on_event)
         assert len(mock.requests) == 2, "no token armed: the run itself completes"
+        assert ei.value.outcome["stop_reason"] == "end_turn"
+        assert ei.value.outcome["turns"] == 2
+    finally:
+        mock.stop()
+
+
+def test_keyboard_interrupt_with_failed_run_carries_cost_envelope(tmp_path):
+    """No token + the run fails mid-flight after a billed tool turn: the
+    KeyboardInterrupt re-raises at return AND the failed run's honest-cost
+    envelope rides as e.outcome (a dict — no json.loads needed). The tool
+    already ran and tokens were already burned, so error / usage /
+    tool_calls must stay readable; usage.input_tokens > 0 proves the first
+    turn's usage reached the envelope."""
+    usage = {"prompt_tokens": 40, "completion_tokens": 5, "total_tokens": 45}
+
+    def first(handler, body):
+        write_sse(handler, tool_call_sse(
+            "c1", "write_file", {"path": "out.txt", "content": "x\n"}, usage=usage))
+
+    def boom(handler, _body):
+        body = b"server exploded"
+        handler.send_response(500)
+        handler.send_header("Content-Type", "text/plain")
+        handler.send_header("Content-Length", str(len(body)))
+        handler.end_headers()
+        handler.wfile.write(body)
+
+    mock = ScriptedMock([first, boom]).start()
+    try:
+        cfg = openai_config(mock.url, tools=["write_file"], workdir=str(tmp_path))
+        a = tiny_agent.Agent(cfg, api_key=MOCK_KEY)
+        a.push_user("run it")
+
+        def on_event(ev):
+            raise KeyboardInterrupt
+
+        with pytest.raises(KeyboardInterrupt) as ei:
+            a.run(on_event=on_event)
+        env = ei.value.outcome
+        for k in ("error", "usage", "tool_calls", "compressions", "turns", "elapsed"):
+            assert k in env, f"envelope missing {k}"
+        assert env["usage"]["input_tokens"] > 0, "the billed first turn must be in the envelope"
+        assert len(env["tool_calls"]) == 1
+        assert "500" in env["error"]
     finally:
         mock.stop()
 
@@ -328,7 +376,9 @@ def test_keyboard_interrupt_without_token_reraises_after_run(tmp_path):
 def test_keyboard_interrupt_in_compact_reraises(tmp_path):
     """compact() shares the event-callback path with run(): a
     KeyboardInterrupt from its on_event re-raises when compact() returns,
-    after the fold itself completed."""
+    after the fold itself completed — and the fold's outcome dict rides as
+    e.outcome (a compact's summary cost never enters usage(), so this is
+    the host's only way to read it back after an interrupt)."""
     def provider(request):
         return {"text": "SUMMARY", "stop_reason": "end_turn"}
 
@@ -342,9 +392,11 @@ def test_keyboard_interrupt_in_compact_reraises(tmp_path):
         a.push_user(msg)
         a.run()
 
-    with pytest.raises(KeyboardInterrupt):
+    with pytest.raises(KeyboardInterrupt) as ei:
         a.compact(on_event=on_event)
     assert len(a.messages()) == 2, "the fold itself completed before the interrupt surfaced"
+    assert ei.value.outcome["dropped"] == 4
+    assert ei.value.outcome["kept"] == 2
 
 
 def test_non_keyboardinterrupt_on_event_exception_still_swallowed(tmp_path):

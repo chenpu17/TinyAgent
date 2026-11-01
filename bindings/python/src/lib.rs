@@ -23,6 +23,12 @@
 //! (the Node binding's TSFN path has a 120s backstop; Python has none).
 //! Keep callbacks non-blocking; never join GIL-dependent threads from one.
 //!
+//! Ctrl-C in a callback: a `KeyboardInterrupt` from an event callback is
+//! special-cased (every other callback error is swallowed) — it latches an
+//! armed cancel token, stops the call at the next boundary and re-raises
+//! when `run`/`compact` returns, carrying the call's own result (dict /
+//! cost envelope / None) as its `outcome` attribute.
+//!
 //! Scope note: the `set_model` / limits hot-update family and MCP hot
 //! add/remove ARE exposed (`set_model` / `set_reasoning_effort` /
 //! `set_max_tokens` / `set_max_context_tokens` / `add_mcp_server` /
@@ -231,11 +237,32 @@ where
     }
 }
 
-/// Close out a `run` / `compact` call: a stashed `KeyboardInterrupt` from the
-/// event callbacks wins over the run's own result (including an unrelated
-/// failure's cost envelope) — the host's interrupt is the control flow that
-/// matters, and the run has fully unwound by this point either way. Without a
-/// pending interrupt the result maps as usual.
+/// Attach `payload` to a re-raised `KeyboardInterrupt` as its `outcome`
+/// attribute (CPython convention: data travels with the exception, like
+/// `CalledProcessError.returncode`) and return it for re-raising. A host that
+/// catches the interrupt can then read back what the call actually did — the
+/// error paths are a billing surface ("错误路径也是账单面"): a dropped
+/// result would lose the only record of tokens already burned and tools
+/// already executed (a compact's burned summary cost never enters `usage()`
+/// at all, so the envelope is its only recovery surface). Payload shapes:
+/// the outcome dict or the 6-key cost envelope (`run`), the fold outcome
+/// dict or `None` (`compact`). ANY attachment failure (e.g. a broken
+/// instance dict) is swallowed — it must never mask the interrupt itself.
+fn raise_with_outcome(ki: PyErr, payload: Option<PyObject>, py: Python<'_>) -> PyErr {
+    let exc = ki.into_value(py).into_bound(py);
+    if let Some(p) = payload {
+        let _ = exc.setattr("outcome", p);
+    }
+    PyErr::from_value_bound(exc.into_any())
+}
+
+/// Close out `Agent::run`: a stashed `KeyboardInterrupt` from the event
+/// callbacks wins over the run's own result, but the result rides the
+/// exception as its `.outcome` attribute (see [`raise_with_outcome`]):
+/// `Ok` → the outcome dict, `Err` → the same honest-cost envelope
+/// `outcome_to_py` raises, as a dict (the host reads
+/// `e.outcome["usage"]` without a second `json.loads`). Without a pending
+/// interrupt the result maps as usual.
 fn finish_with_interrupt<T, E>(
     mut interrupt: InterruptState,
     result: Result<T, E>,
@@ -246,9 +273,34 @@ where
     E: serde::Serialize + std::fmt::Display,
 {
     if let Some(ki) = interrupt.pending.take() {
-        return Err(ki);
+        // Err: pythonize over the same serde serialization outcome_to_py
+        // stringifies into the RuntimeError message — so the attribute is
+        // that envelope as a dict. A serialization failure leaves the
+        // attribute unset rather than masking the interrupt.
+        let payload = match &result {
+            Ok(v) => pythonize(py, v).ok().map(|b| b.unbind()),
+            Err(e) => pythonize(py, e).ok().map(|b| b.unbind()),
+        };
+        return Err(raise_with_outcome(ki, payload, py));
     }
     outcome_to_py(result, py)
+}
+
+/// The compact failure payload: `{error, burned}` — the summary cost a
+/// failed compact burned rides the error chain (CompressError::burned)
+/// instead of hitting the floor. Callers either stringify it into the
+/// RuntimeError message (host does `json.loads(e.args[0])` and meters
+/// `.burned` exactly like a failed run's `.usage`) or attach the dict to a
+/// re-raised KeyboardInterrupt (see [`raise_with_outcome`]). `burned` is
+/// null when the failure carried no usage (e.g. a host provider callback
+/// that simply raised).
+fn compact_error_payload(e: &anyhow::Error) -> serde_json::Value {
+    serde_json::json!({
+        "error": e.to_string(),
+        "burned": e
+            .downcast_ref::<ta::CompressError>()
+            .and_then(|ce| ce.burned),
+    })
 }
 
 thread_local! {
@@ -988,7 +1040,9 @@ impl Agent {
     /// `set_cancel` (the host flag is latched — `clear_cancel()` before the
     /// next accepted task) and is re-raised when `run()` returns. Without a
     /// token the run runs to completion and the interrupt still surfaces at
-    /// return. Any other callback exception stays swallowed.
+    /// return. Any other callback exception stays swallowed. The re-raised
+    /// exception carries the run's result as its `outcome` attribute (the
+    /// outcome dict, or the honest-cost envelope dict when the run failed).
     #[pyo3(signature = (on_event=None))]
     fn run(&self, on_event: Option<PyObject>, py: Python<'_>) -> PyResult<PyObject> {
         if IN_RUN.with(Cell::get) {
@@ -1052,7 +1106,10 @@ impl Agent {
     /// Ctrl-C semantics match `run`: a `KeyboardInterrupt` from `on_event`
     /// latches an armed cancel token (the fold stops at the next boundary)
     /// and re-raises when `compact()` returns; other callback exceptions
-    /// stay swallowed.
+    /// stay swallowed. The re-raised exception carries the call's result as
+    /// its `outcome` attribute (the fold outcome dict, Python `None` when
+    /// nothing was compressible, or the `{error, burned}` envelope dict when
+    /// the summary request failed).
     #[pyo3(signature = (instructions=None, on_event=None))]
     fn compact(
         &self,
@@ -1083,7 +1140,21 @@ impl Agent {
             )
         });
         match interrupt.pending.take() {
-            Some(ki) => Err(ki),
+            Some(ki) => {
+                // The fold's own result rides the interrupt as `.outcome`
+                // (see [`raise_with_outcome`]): a failed summary's burned
+                // cost never enters `usage()`, so the envelope is the ONLY
+                // recovery surface for it. `Ok(None)` attaches Python None
+                // (nothing was compressible).
+                let payload = match &result {
+                    Ok(Some(outcome)) => pythonize(py, outcome).ok().map(|b| b.unbind()),
+                    Ok(None) => Some(py.None()),
+                    Err(e) => pythonize(py, &compact_error_payload(e))
+                        .ok()
+                        .map(|b| b.unbind()),
+                };
+                Err(raise_with_outcome(ki, payload, py))
+            }
             None => match result {
                 Ok(Some(outcome)) => {
                     let bound = pythonize(py, &outcome)?;
@@ -1091,19 +1162,9 @@ impl Agent {
                 }
                 Ok(None) => Ok(py.None()),
                 Err(e) => {
-                    // Same honest-cost envelope as the run path (outcome_to_py):
-                    // the summary cost a failed compact burned rides the error
-                    // chain (CompressError::burned) instead of hitting the floor.
-                    // JSON-string message — callers `json.loads(e.args[0])` and
-                    // meter .burned exactly like a failed run's .usage. `burned`
-                    // is null when the failure carried no usage (e.g. a host
-                    // provider callback that simply raised).
-                    let payload = serde_json::json!({
-                        "error": e.to_string(),
-                        "burned": e
-                            .downcast_ref::<ta::CompressError>()
-                            .and_then(|ce| ce.burned),
-                    });
+                    // Same honest-cost envelope as the run path
+                    // (outcome_to_py); see [`compact_error_payload`].
+                    let payload = compact_error_payload(&e);
                     Err(PyRuntimeError::new_err(payload.to_string()))
                 }
             },

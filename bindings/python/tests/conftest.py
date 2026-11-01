@@ -58,9 +58,11 @@ def sse_bytes(chunks: list, *, done: bool = True) -> bytes:
     return out
 
 
-def tool_call_sse(call_id: str, name: str, arguments: dict) -> bytes:
-    """A streaming tool_call: name first, then arguments, then finish=tool_calls."""
-    return sse_bytes([
+def tool_call_sse(call_id: str, name: str, arguments: dict, *, usage: dict | None = None) -> bytes:
+    """A streaming tool_call: name first, then arguments, then finish=tool_calls.
+    `usage` (optional) rides the finish chunk, OpenAI-compatible style — the
+    same pattern text_sse uses — so tool-call turns can bill honestly."""
+    chunks = [
         {"choices": [{"index": 0, "finish_reason": None, "delta": {
             "role": "assistant",
             "tool_calls": [{"index": 0, "id": call_id, "type": "function",
@@ -69,7 +71,10 @@ def tool_call_sse(call_id: str, name: str, arguments: dict) -> bytes:
             "tool_calls": [{"index": 0, "function": {
                 "arguments": json.dumps(arguments)}}]}}]},
         {"choices": [{"index": 0, "finish_reason": "tool_calls", "delta": {}}]},
-    ])
+    ]
+    if usage is not None:
+        chunks[-1]["usage"] = usage
+    return sse_bytes(chunks)
 
 
 def text_sse(content: str, *, usage: dict | None = None, finish: str = "stop") -> bytes:

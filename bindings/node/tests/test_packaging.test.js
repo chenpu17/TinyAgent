@@ -80,24 +80,36 @@ function npm(args, opts) {
     : args, { ...opts, shell: win, encoding: 'utf8' });
 }
 
+// The platform subpackages napi's generated loader (index.js) falls back to —
+// exactly the set release.yml's npm matrix builds and publishes.
+const PLATFORM_SUBPACKAGES = [
+  'tiny-agent-darwin-x64',
+  'tiny-agent-darwin-arm64',
+  'tiny-agent-linux-x64-gnu',
+  'tiny-agent-linux-x64-musl',
+  'tiny-agent-win32-x64-msvc',
+];
+
 test('optionalDependencies pins match the package version (manifest, not just lock)', () => {
   // Release-sync guard: the MANIFEST's optionalDependencies are what npm
   // ships in the published main package (the lockfile never enters the
   // tarball), and with exact pins npm install reconciles the lock TOWARD the
   // manifest — never the reverse. A version bump that edits the top-level
-  // version but leaves these five rows on the old release would make every
-  // user install the PREVIOUS release's platform binaries (old native API
+  // version but leaves these rows on the old release would make every user
+  // install the PREVIOUS release's platform binaries (old native API
   // surface) while the repo still looks consistent (the lock was hand-synced).
   const pkg = JSON.parse(fs.readFileSync(path.join(PKG_DIR, 'package.json'), 'utf8'));
   const lock = JSON.parse(
     fs.readFileSync(path.join(PKG_DIR, 'package-lock.json'), 'utf8'),
   );
-  const pins = Object.entries(pkg.optionalDependencies ?? {});
-  assert.ok(
-    pins.length >= 5,
-    'the five platform subpackages must stay pinned in optionalDependencies',
+  // The exact platform set — no missing entry (the loader falls back to a
+  // subpackage that is not declared), no stray entry (nothing to build it).
+  assert.deepStrictEqual(
+    Object.keys(pkg.optionalDependencies ?? {}).sort(),
+    [...PLATFORM_SUBPACKAGES].sort(),
+    'optionalDependencies must cover exactly the platform subpackage set',
   );
-  for (const [name, version] of pins) {
+  for (const [name, version] of Object.entries(pkg.optionalDependencies ?? {})) {
     assert.strictEqual(
       version,
       pkg.version,

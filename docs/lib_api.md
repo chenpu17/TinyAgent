@@ -127,7 +127,10 @@ print(a.run(on_event=lambda e: print(e))["final_text"])
 字节码时才转成 `KeyboardInterrupt`。绑定对**事件回调里**的 `KeyboardInterrupt` 特判（其余回调异常
 照旧吞掉）：装了 cancel token（`set_cancel`）时，回调内 KI 置位宿主 flag，run 在下一轮界停
 （`stop_reason: "cancelled"`），KI 在 `run()`/`compact()` 返回时重新抛出——flag 按取消契约不清除，
-下次受理任务前要 `clear_cancel()`；没装 token 时 run 照常跑完，KI 同样在返回时抛出。
+下次受理任务前要 `clear_cancel()`；没装 token 时 run 照常跑完，KI 同样在返回时抛出。重抛的
+`KeyboardInterrupt` 带 **`.outcome` 属性**（数据随异常走的惯例）：run 的 `Ok` 为结果 dict、`Err`
+为成本信封 dict（`e.outcome["usage"]` 可直读，无需再 `json.loads`）；compact 为折叠结果 dict、
+无可压缩时 `None`、摘要失败时含 `burned` 的信封 dict——宿主捕获中断后仍能读回真实成本。
 
 **上下文构成**：`a.context_breakdown()` 返回下一请求上下文的估算 token 分解 dict（`system` 三段 / `tools` 四类 / `messages.by_kind` 分型 / `total_tokens` / `calibration`，键 snake_case）——宿主画上下文占比视图的数据源；语义见上文「上下文构成查询」，与 `usage()` 同款 busy 契约（run 中跨线程调用阻塞等锁直至 run 结束、同线程回调重入报错——与 Node 侧的立即报错相反）。
 
