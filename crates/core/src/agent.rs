@@ -234,7 +234,9 @@ pub enum AgentEvent {
         input: Value,
     },
     /// A tool call finished. `content` is what the MODEL saw (possibly
-    /// truncated); the full text lives in [`ToolCallRecord::output`].
+    /// truncated; the stuck-loop nudge appended to the history block is NOT
+    /// included here — see `stuck_nudge`); the full text lives in
+    /// [`ToolCallRecord::output`].
     ToolResult {
         /// Tool name.
         name: String,
@@ -504,10 +506,14 @@ pub struct ToolCallRecord {
 }
 
 /// Per-turn wall-clock timing for a completed run (`RunOutcome.turn_timings`).
-/// One row per turn that STARTED — including wrap-up/salvage turns and a turn
-/// that died mid-request on an Ok-shaped stop (`timeout`) — so `len()` always
-/// equals `RunOutcome.turns`. FAILED runs (`RunError`) carry no per-turn
-/// detail; their total wall clock is still in `elapsed`/`elapsed_secs`.
+/// One row per turn that STARTED in the attempt behind the outcome —
+/// including wrap-up/salvage turns and a turn that died mid-request on an
+/// Ok-shaped stop (`timeout`) — so `len()` equals `RunOutcome.turns` within a
+/// single attempt. When a retry ladder folds failed attempts in
+/// ([`RunCost::fold_into`]), `turns` grows by the failed turns while these
+/// rows do not (FAILED runs (`RunError`) carry no per-turn detail; their
+/// total wall clock is still in `elapsed`/`elapsed_secs`), and each row's
+/// `turn` number counts within its own attempt.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TurnTiming {
     /// 1-based turn number (matches the `TurnStart` event).
@@ -588,8 +594,12 @@ pub struct RunOutcome {
     /// when the model's final turn was all tool calls, or when it produced
     /// nothing visible.
     pub final_text: String,
-    /// Turns started, 1-based. Equals `turn_timings.len()` on every outcome
-    /// (a failed run has no timings — see [`RunError::turns`]).
+    /// Turns started, 1-based, counting every attempt a retry ladder folded
+    /// in ([`RunCost::fold_into`]). Within a single attempt this equals
+    /// `turn_timings.len()`; after a fold it exceeds it — `turn_timings`
+    /// covers only the successful attempt (a failed run carries no per-turn
+    /// detail, see [`RunError::turns`]), and each row's `turn` number counts
+    /// within its own attempt.
     pub turns: u32,
     /// Why the loop stopped — the same vocabulary as [`AgentEvent::Done`]:
     /// the provider's reason for the final turn (`"end_turn"`, `"max_tokens"`,
@@ -606,8 +616,10 @@ pub struct RunOutcome {
     /// byte-identical to before the field existed.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub compressions: Vec<CompressionRecord>,
-    /// Per-turn wall-clock timing (see [`TurnTiming`]). One row per started
-    /// turn, so `len() == turns` on every outcome.
+    /// Per-turn wall-clock timing (see [`TurnTiming`]). One row per turn
+    /// started by the attempt behind this outcome — equal to `turns` within
+    /// a single attempt; a retry-ladder fold raises `turns` without adding
+    /// rows here (failed attempts carry no per-turn detail).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub turn_timings: Vec<TurnTiming>,
     /// Token usage summed across every chat request in this run (best-effort:
@@ -2084,8 +2096,9 @@ impl Agent {
         // failure (an audit entry is a bill; failure doesn't un-burn it).
         let mut compressions: Vec<CompressionRecord> = Vec::new();
         // Per-turn wall-clock timing — one TurnTiming row per STARTED turn,
-        // pushed at every non-Err exit of the turn body (so len() == turns
-        // on every Ok outcome). Err returns skip the detail deliberately.
+        // pushed at every non-Err exit of the turn body (so within this
+        // attempt len() == turns on an Ok outcome). Err returns skip the
+        // detail deliberately.
         let mut turn_timings: Vec<TurnTiming> = Vec::new();
         // 打转检测状态：上一个已决调用的（工具名, 规范化生效参数, 结果指纹）
         // 与其连续重复次数（见 STUCK_NUDGE_AT / STUCK_STOP_AT 的护栏说明）。
@@ -2163,7 +2176,11 @@ impl Agent {
             // This turn's timing row bookkeeping: the timer starts here (so
             // preflight compression counts toward the turn) and the row is
             // pushed at the turn body's exit — every non-Err exit pushes one,
-            // so `turn_timings.len() == turns` on every Ok outcome.
+            // so within this attempt `turn_timings.len() == turns`. A retry
+            // ladder folding failed attempts in raises `RunOutcome.turns`
+            // without rows for them (failure paths carry no per-turn detail)
+            // — the fold's intentional shape, pinned by
+            // `retry_ladder_fold_counts_failed_turns_without_their_timings`.
             let turn_started = Instant::now();
             let turn_records_at_start = records.len();
             // R1 supervisor-note delivery point: drain the inbox here — after
@@ -2704,7 +2721,8 @@ impl Agent {
             // Turn-timing row: the turn body is complete (assistant message +
             // tool results in history). One push here covers all three exits
             // below — continue to the next turn, cancel break, stuck_loop
-            // break — so `turn_timings.len() == turns` on every Ok outcome.
+            // break — so within this attempt `turn_timings.len() == turns`
+            // on the Ok outcome.
             turn_timings.push(TurnTiming {
                 turn: turns,
                 duration_ms: ms_since(turn_started),
@@ -3261,8 +3279,9 @@ pub(crate) fn ctx_cancelled(ctx: &ToolCtx) -> bool {
 
 /// Hooks after-notification for a finished tool call. `input` is always the
 /// ORIGINAL (never a `Modify` replacement); `executed` is false for a denied
-/// call and for one skipped by the gate→execution cancel checkpoint (both
-/// still get their error output reported).
+/// call, for one skipped by the gate→execution cancel checkpoint, and for an
+/// approved-but-never-started parallel placeholder (all still get their
+/// error output reported).
 pub(crate) fn notify_tool_after(
     ctx: &ToolCtx,
     name: &str,

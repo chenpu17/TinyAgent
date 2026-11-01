@@ -2377,6 +2377,10 @@ fn parallel_worker_panic_becomes_an_error_slot_and_siblings_survive() {
     assert!(!o.tool_calls[0].is_error);
     assert_eq!(o.tool_calls[1].output, "parallel tool worker panicked");
     assert!(o.tool_calls[1].is_error);
+    assert_eq!(
+        o.tool_calls[1].duration_ms, None,
+        "panicked worker never stopped its own timer — record stays honest with None"
+    );
     assert_eq!(o.tool_calls[2].output, "ok-c");
     assert_eq!(
         (o.input_tokens, o.output_tokens),
@@ -2405,6 +2409,45 @@ fn parallel_worker_panic_becomes_an_error_slot_and_siblings_survive() {
         contents,
         vec!["ok-a", "parallel tool worker panicked", "ok-c"],
         "N:N pairing intact across a panicked worker"
+    );
+}
+
+/// 契约表第九行的 hooks 面：带 hooks 跑一个最小 panic 批次。panic 的 join
+/// 臂合成错误槽后照发 `after_tool`——executed=true（"到了执行尝试"），但
+/// record 的 duration_ms 保持 None。这是 `assert_hook_pairing` 的
+/// executed↔耗时一致性断言唯一的豁免形态，故此处不走它、单独断言组合。
+#[test]
+fn parallel_worker_panic_reports_after_tool_true_without_duration() {
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, _) = MockProvider::new(vec![
+        MockTurn::Ok(ChatResponse {
+            blocks: vec![Block::ToolUse {
+                id: "t0".into(),
+                name: "task".into(),
+                input: json!({"label": "boom"}),
+            }],
+            stop_reason: "tool_use".into(),
+            usage: None,
+        }),
+        mock::resp_text("done", None),
+    ]);
+    let hooks = PairingHooks::plain();
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(PanicOnMarkTool)],
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    agent.set_hooks(hooks.clone());
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o.tool_calls.len(), 1);
+    assert_eq!(o.tool_calls[0].output, "parallel tool worker panicked");
+    assert_eq!(o.tool_calls[0].duration_ms, None);
+    assert_eq!(
+        hooks.after(),
+        vec!["after:task:true".to_string()],
+        "panic join 臂报 executed=true"
     );
 }
 
@@ -9043,10 +9086,35 @@ fn env_attribution_splits_env_from_base() {
 /// it sees `AgentEvent` as `#[non_exhaustive]` and must keep a `_` arm. The
 /// kernel-side `ndjson_type()` is exhaustive, so a NEW variant won't compile
 /// until it is named there; this test pins the names themselves (a rename is
-/// just as breaking as a missing one) and covers every variant so a future
-/// variant that IS named but never exercised here gets caught by the count.
+/// just as breaking as a missing one) and covers every variant. The test-side
+/// `census_type` below is the hard guard: it is exhaustive over
+/// `AgentEvent`, so a variant added to the enum without an arm here breaks
+/// the COMPILE of this file — whoever grows the enum lands in this file,
+/// where the pinned table sits; the count assertion is the belt to those
+/// suspenders (a variant named in `ndjson_type` but missing from the table
+/// cannot slip past a green count again).
 #[test]
 fn every_agent_event_has_a_stable_ndjson_type_tag() {
+    fn census_type(ev: &AgentEvent) -> &'static str {
+        match ev {
+            AgentEvent::TurnStart(_) => "turn",
+            AgentEvent::TextDelta(_) => "text",
+            AgentEvent::ThinkingDelta(_) => "thinking",
+            AgentEvent::CodeLog(_) => "code_log",
+            AgentEvent::ToolInputDelta { .. } => "tool_input",
+            AgentEvent::ToolCall { .. } => "tool_call",
+            AgentEvent::ToolResult { .. } => "tool_result",
+            AgentEvent::TodoUpdate { .. } => "todo",
+            AgentEvent::Usage { .. } => "usage",
+            AgentEvent::Compressed { .. } => "compressed",
+            AgentEvent::Pruned { .. } => "pruned",
+            AgentEvent::MaxTokensSalvage => "salvage",
+            AgentEvent::Warning(_) => "warning",
+            AgentEvent::NoteInjected { .. } => "note_injected",
+            AgentEvent::SubAgent { .. } => "subagent",
+            AgentEvent::Done { .. } => "done",
+        }
+    }
     let cases: Vec<(AgentEvent, &str)> = vec![
         (AgentEvent::TurnStart(1), "turn"),
         (AgentEvent::TextDelta(String::new()), "text"),
@@ -9106,6 +9174,14 @@ fn every_agent_event_has_a_stable_ndjson_type_tag() {
         (AgentEvent::MaxTokensSalvage, "salvage"),
         (AgentEvent::Warning(String::new()), "warning"),
         (
+            AgentEvent::NoteInjected {
+                kind: SUPERVISOR_NOTE_KIND.into(),
+                text: String::new(),
+                deferred: false,
+            },
+            "note_injected",
+        ),
+        (
             AgentEvent::SubAgent {
                 name: String::new(),
                 event: Box::new(AgentEvent::Done {
@@ -9123,20 +9199,25 @@ fn every_agent_event_has_a_stable_ndjson_type_tag() {
     ];
     let mut seen = std::collections::BTreeSet::new();
     for (ev, want) in &cases {
+        assert_eq!(
+            census_type(ev),
+            *want,
+            "census disagrees with the pinned table for {ev:?}"
+        );
         assert_eq!(ev.ndjson_type(), *want, "wrong NDJSON tag for {ev:?}");
         assert!(seen.insert(*want), "duplicate NDJSON tag {want}");
     }
-    // Guards against a variant added to the enum but not to this table: the
-    // table must name as many distinct tags as the enum has variants. (The
-    // compile-time exhaustiveness lives in `ndjson_type` itself; this is the
-    // test-side mirror that also catches a "named but never yielded" arm.)
-    assert_eq!(seen.len(), 15, "update the table when AgentEvent grows");
+    // Guards against a variant added to the enum but not to this table (the
+    // compile-time exhaustiveness lives in `ndjson_type` and `census_type`
+    // above; this is the runtime mirror that also catches a "named but never
+    // yielded" arm).
+    assert_eq!(seen.len(), 16, "update the table when AgentEvent grows");
 }
 
 // ── Slot 状态 × 观测后果：跨路径统一契约表 ────────────────────────────────
 //
 // 并行批次里每个 tool_use 占一个 `Slot`（agent.rs 的私有枚举）。它只有两个
-// 状态（`Cancelled` / `Ran`），但**进入某个状态的路径**有八条，每条对外的
+// 状态（`Cancelled` / `Ran`），但**进入某个状态的路径**有九条，每条对外的
 // 可观测后果各不相同——而这些断言眼下分散在六组各自的测试里，各写各的。
 // 这里把「状态 → 五类观测面」补成一张表：槽位最终处于什么状态，就只允许产生
 // 表里规定的那几样东西。任何一条路径偏离这张表，下面的用例直接指出来。
@@ -9154,6 +9235,7 @@ fn every_agent_event_has_a_stable_ndjson_type_tag() {
 // | 顺序叶子：hook Deny                           | Ran       | 1 错    | 1          | 1        | 1      | 1(false) |
 // | 顺序叶子：gate 后 cancel（未执行）            | Ran       | 1 错    | 1          | 1        | 1      | 1(false) |
 // | 并行：真的跑了                                | Ran       | 1 真果  | 1          | 1        | 1      | 1(true)  |
+// | 并行：真的跑了但 worker panic                 | Ran       | 1 错，duration_ms None | 1 | 1     | 1      | 1(true)  |
 // | 并行：hook Deny                               | Ran       | 1 错    | 1          | 1        | 1      | 1(false) |
 // | 并行：已过 gate 但没启动（占位）              | Ran       | 1 错    | 1          | 1        | 1      | 1(false) |
 // | 并行：从未过 gate（gate 循环被 cancel 打断）  | Cancelled | 0       | 1（announced）| 1     | 0      | 0        |
@@ -9163,6 +9245,9 @@ fn every_agent_event_has_a_stable_ndjson_type_tag() {
 //   A. `before_tool` 与 `after_tool` 严格配对——`Ran` 两者都有，`Cancelled`
 //      两者都没有（"过的 gate 不留未配对 before"）。
 //   B. ToolCall 事件 ⟺ ToolResult 事件——发过的必须闭合（"事件配平"）。
+// 附注：`after(executed)` 与「record 有无 duration_ms」的一致性对第九行
+// **不成立**——panic 的 join 臂报 executed=true 但 duration_ms None（panic
+// 的 worker 没能自己停表），见 `assert_hook_pairing` 的豁免说明。
 
 /// 一个把 before/after 记进同一日志的钩子层，便于断言配对。
 struct PairingHooks {
@@ -9341,7 +9426,11 @@ impl SlotObservation {
             "before_tool 与 after_tool 必须严格配对（过的 gate 不留未配对 before）: {afters:?}"
         );
         // after 的 executed 标志必须与 records 的 duration 存在性逐项一致：
-        // 说"执行了"就必须有耗时，说"没执行"就必须没有。
+        // 说"执行了"就必须有耗时，说"没执行"就必须没有。唯一豁免是并行
+        // worker panic 的 join 臂（契约表第九行）——executed=true 但
+        // duration_ms None；本套用例不含 panic 批次，panic 形态在
+        // `parallel_worker_panic_reports_after_tool_true_without_duration`
+        // 单独断言，所以这里仍可逐项比。
         let after_flags: Vec<bool> = afters.iter().map(|s| s.ends_with(":true")).collect();
         assert_eq!(
             after_flags, self.executed_flags,
@@ -10121,6 +10210,59 @@ fn supervisor_note_flushed_onto_assistant_tail_opens_new_user_turn() {
     // 交替不破：下一个 push_user 并入 note 这轮而不是另开一条。
     agent.push_user(vec![Block::Text("next task".into())]);
     assert_eq!(agent.messages().last().unwrap().content.len(), 2);
+}
+
+// ── 重试梯 × turn_timings：折叠后的形状钉子 ─────────────────────────────
+
+/// Retry-ladder shape pin: a success folded by `RunCost::fold_into` counts
+/// the failed attempts' turns in `RunOutcome.turns` while `turn_timings`
+/// covers only the successful attempt (RunError deliberately carries no
+/// per-turn detail — there is nothing to fold rows from). This is the
+/// documented shape, not a bug: attempt 1 finishes turn 1 (timing row
+/// pushed) then dies transiently on turn 2 (`RunError.turns == 2`); the
+/// ladder folds it into attempt 2's outcome — `turns == 3`,
+/// `turn_timings.len() == 1`, and the lone row says `turn: 1` (per-attempt
+/// TurnStart numbering). Single-attempt outcomes keep `len() == turns`.
+#[test]
+fn retry_ladder_fold_counts_failed_turns_without_their_timings() {
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, state) = MockProvider::new(vec![
+        // Attempt 1, turn 1: a real tool turn — timing row pushed, usage billed.
+        mock::resp_tool("t1", "echo", json!({}), mock::mk_usage(100, 10)),
+        // Attempt 1, turn 2: transient provider error → RunError (turns = 2,
+        // turn_timings: none — failure path carries no per-turn detail).
+        MockTurn::Err("503 transient".into()),
+        // Attempt 2, turn 1: clean success.
+        mock::resp_text("done", mock::mk_usage(50, 5)),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(EchoTool::new("echo"))],
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    // Mirror of harness::run_with_retries' ladder core (same fold primitive).
+    let mut acc = RunCost::default();
+    let mut o = match agent.run(&mut |_| {}) {
+        Ok(o) => o,
+        Err(re) => {
+            assert_eq!(re.turns, 2, "failed attempt ran two turns");
+            acc.add_failed(&re);
+            agent.run(&mut |_| {}).expect("attempt 2 succeeds")
+        }
+    };
+    assert_eq!(state.calls(), 3);
+    acc.fold_into(&mut o);
+    // The documented fold shape — turn counts merge, timing rows don't:
+    assert_eq!(o.turns, 3, "failed turns fold into turns");
+    assert_eq!(
+        o.turn_timings.len(),
+        1,
+        "timings cover only the successful attempt's single turn"
+    );
+    assert_eq!(o.turn_timings[0].turn, 1, "per-attempt TurnStart numbering");
+    assert_eq!((o.input_tokens, o.output_tokens), (150, 15));
 }
 
 // ── 旁注投递的 panic 安全（"绝不无声丢失"的 unwind 形态）──────────────────

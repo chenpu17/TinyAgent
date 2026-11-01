@@ -146,8 +146,10 @@ pub trait Hooks: Send + Sync {
 
     /// Observe a finished tool call: the ORIGINAL input the model sent (never
     /// a `Modify` replacement), the produced output, whether it executed
-    /// (`false` only when [`Hooks::before_tool`] denied it), and the
-    /// execution context — mirror of [`Hooks::before_tool`]'s `ctx`, so an
+    /// (`false` for a [`Hooks::before_tool`] Deny, for a call skipped at the
+    /// gate→execution cancel checkpoint, and for an
+    /// approved-but-never-started parallel placeholder — see *Edges* below),
+    /// and the execution context — mirror of [`Hooks::before_tool`]'s `ctx`, so an
     /// audit log can attribute the call to its source
     /// ([`ToolCtx::subagent`]: top-level, a `task` child, or the `run_code`
     /// sandbox). Attribution CANNOT be recovered from call order: parallel
