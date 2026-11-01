@@ -312,7 +312,10 @@ fn main() -> Result<()> {
     if !is_default_report(&cli.report) {
         bail!("--report only applies to --batch mode");
     }
-    if cli.isolate != "none" {
+    // Case-insensitive like batch::IsolateMode's FromStr: "--isolate NONE"
+    // parses fine for batch, so the single-run rejection must spell "none"
+    // the same way.
+    if !cli.isolate.eq_ignore_ascii_case("none") {
         bail!("--isolate only applies to --batch mode");
     }
 

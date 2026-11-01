@@ -298,7 +298,18 @@ pub(crate) fn run_with_retries(
                     attempt += 1;
                     continue;
                 }
-                break (EXIT_ERROR, None, Some(format!("{re:#}")));
+                // The cancel checks above both live inside `attempt <=
+                // retries`, so under the default --retries 0 this terminal
+                // exit is the ladder's only remaining cancel checkpoint — a
+                // stop that raced with the failing attempt must still report
+                // 130 / "cancelled", not 1 / "error" (the Ok arm already maps
+                // a cancelled run via stop_reason == "cancelled").
+                let terminal_code = if agent.cancelled() {
+                    EXIT_CANCELLED
+                } else {
+                    EXIT_ERROR
+                };
+                break (terminal_code, None, Some(format!("{re:#}")));
             }
         }
     };
@@ -1041,6 +1052,12 @@ impl<Out: Write, Err: Write> HumanRenderer<Out, Err> {
                         } else {
                             "[tool ✓]"
                         };
+                        // Twin of the parent ToolResult arm's guard: a sibling
+                        // worker's streamed text can leave stdout mid-line, and
+                        // this row must not stick to it.
+                        if !self.at_line_start {
+                            let _ = writeln!(self.out);
+                        }
                         let _ = writeln!(
                             self.out,
                             "[{name}] {tag} {tn}: {}",
@@ -2143,6 +2160,39 @@ mod tests {
         assert!(
             out_s.contains("[worker] x"),
             "second agent on its own tagged line: {out_s}"
+        );
+    }
+
+    #[test]
+    fn renderer_subagent_tool_result_breaks_line_after_other_subagent_text() {
+        // The SubAgent ToolResult arm prints its row with a bare writeln! —
+        // no leading newline and no at_line_start guard (unlike the parent
+        // ToolResult arm and both Warning arms). Sequence: sub-agent A streams
+        // text with no trailing newline (stdout left mid-line,
+        // at_line_start=false), then a DIFFERENT worker's tool result arrives
+        // → the row must not stick to A's last line
+        // ("[scout] Hel[worker] [tool ✓] shell: ...").
+        let mut r: HumanRenderer<Vec<u8>, Vec<u8>> = HumanRenderer::new(Vec::new(), Vec::new());
+        r.render(&AgentEvent::SubAgent {
+            name: "scout".into(),
+            event: Box::new(AgentEvent::TextDelta("Hel".into())),
+        });
+        r.render(&AgentEvent::SubAgent {
+            name: "worker".into(),
+            event: Box::new(AgentEvent::ToolResult {
+                name: "shell".into(),
+                is_error: false,
+                content: "ok".into(),
+            }),
+        });
+        let out_s = String::from_utf8_lossy(&r.out).into_owned();
+        assert!(
+            out_s.contains("Hel\n"),
+            "tool-result row must start on a fresh line, got: {out_s:?}"
+        );
+        assert!(
+            !out_s.contains("Hel[worker]"),
+            "sub-agent text must not stick to another worker's tool-result row, got: {out_s:?}"
         );
     }
 }

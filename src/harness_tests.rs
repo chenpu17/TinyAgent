@@ -515,6 +515,91 @@ fn single_run_cancel_during_failed_attempt_exits_130() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn single_run_cancel_during_failed_attempt_zero_retries_exits_130() {
+    // Twin of single_run_cancel_during_failed_attempt_exits_130 under the
+    // DEFAULT --retries 0. Both cancel checkpoints (between attempts, during
+    // backoff) live inside `if attempt <= retries`, so with retries=0 the
+    // ladder reaches the terminal Err exit without ever looking at the flag —
+    // a user-initiated stop racing the failed attempt was reported as
+    // exit 1 / stop_reason "error" (result.json + NDJSON done event) instead
+    // of 130 / "cancelled". Same CancelThenErrProvider construction, only the
+    // retries value differs.
+    let cfg = cfg_with(5, 0, 0);
+    let flag = Arc::new(AtomicBool::new(false));
+    let prov = CancelThenErrProvider { flag: flag.clone() };
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    agent.set_cancel(flag.clone());
+    let dir = std::env::temp_dir().join(format!("ta-retry-cancel3-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let out = dir.join("r.json");
+    let code = crate::harness::run_with_retries(&mut agent, Some(&out), false, 0, |_| {}).unwrap();
+    assert_eq!(
+        code, 130,
+        "stop during a failed attempt → exit 130 even at retries=0"
+    );
+    let s = std::fs::read_to_string(&out).unwrap();
+    assert!(
+        s.contains("\"stop_reason\": \"cancelled\""),
+        "a cancelled run must not be recorded as \"error\": {s}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn retry_success_result_folds_failed_turns_but_not_their_timings() {
+    // Deliberate shape of a retried run's result.json: the successful attempt
+    // folds the FAILED attempts' turn count and token cost into `turns` / the
+    // token totals (honest cost across the whole ladder), while
+    // `turn_timings` keeps only rows from attempts that produced them — a
+    // RunError carries no per-turn detail. The inequality
+    // turns != turn_timings.len() on this shape is the contract, not a bug.
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, state) = MockProvider::new(vec![
+        // Attempt 1, turn 1: a real tool turn — timing row pushed, usage billed.
+        mock::resp_tool("t1", "echo", json!({}), mock::mk_usage(100, 10)),
+        // Attempt 1, turn 2: transient provider error → RunError (turns = 2,
+        // no timing row — the failure path carries no per-turn detail).
+        MockTurn::Err("503 transient".into()),
+        // Attempt 2, turn 1: clean success.
+        mock::resp_text("done", mock::mk_usage(50, 5)),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(EchoTool::new("echo"))],
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    let dir = std::env::temp_dir().join(format!("ta-retry-folds-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let out = dir.join("r.json");
+    let code = crate::harness::run_with_retries(&mut agent, Some(&out), false, 1, |_| {}).unwrap();
+    assert_eq!(code, 0, "attempt 2 succeeds");
+    assert_eq!(state.calls(), 3, "failed attempt + retry = three requests");
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+    assert_eq!(
+        v["turns"], 3,
+        "the failed attempt's turns fold into `turns`"
+    );
+    let timings = v["turn_timings"].as_array().expect("turn_timings array");
+    assert_eq!(
+        timings.len(),
+        1,
+        "timings cover only the successful attempt's single turn"
+    );
+    assert_eq!(timings[0]["turn"], 1, "per-attempt TurnStart numbering");
+    assert_eq!(v["input_tokens"], 150, "every attempt's usage is billed");
+    assert_eq!(v["output_tokens"], 15);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ── end-to-end harness verification: realistic multi-turn, tool-using
 // tasks driven through harness::run_with_retries (the full agent loop +
 // real tool execution + event flow + result.json + exit code) — the kind
