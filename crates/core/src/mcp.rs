@@ -2063,9 +2063,15 @@ impl SseTransport {
                 // round's deadline at the latest, so the residual thread +
                 // TCP connection live ~one round, not until process exit.
                 // Still worth a diagnostic: "never sent an endpoint" is a
-                // server misbehavior the host should see.
+                // server misbehavior the host should see. A reader DEATH
+                // already latched its precise reason (the latch is written
+                // before the reader drops endpoint_tx), so it is read here
+                // first: it surfaces in the error below and retires the
+                // "exiting late" warning, which would be noise for a thread
+                // that already decided to exit.
                 shutdown.store(true, Ordering::Relaxed);
-                if !reader.is_finished() {
+                let reader_reason = dead.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                if reader_reason.is_none() && !reader.is_finished() {
                     crate::diag::diag_warn!(
                         "[warn] MCP SSE: reader thread exiting late (server at {} never \
                          sent an 'endpoint' event; the round-bounded GET self-exits within \
@@ -2073,10 +2079,20 @@ impl SseTransport {
                         redact_url_credentials(url)
                     );
                 }
-                anyhow!(
-                    "MCP SSE: no 'endpoint' event from {}: {e}",
-                    redact_url_credentials(url)
-                )
+                match reader_reason {
+                    // The reason was redacted at its source (strip_reqwest_url /
+                    // redacted_chain); the extra pass is a fail-safe for future
+                    // death paths and a no-op on redacted text.
+                    Some(reason) => anyhow!(
+                        "MCP SSE: no 'endpoint' event from {}: stream reader stopped ({})",
+                        redact_url_credentials(url),
+                        redact_url_credentials(&reason)
+                    ),
+                    None => anyhow!(
+                        "MCP SSE: no 'endpoint' event from {}: {e}",
+                        redact_url_credentials(url)
+                    ),
+                }
             })?
             .ok_or_else(|| anyhow!("MCP SSE endpoint rejected (origin mismatch)"))?;
         debug_assert!(
@@ -5714,7 +5730,9 @@ mod tests {
         // Mock server：call #1 → 倾倒一条 >16MiB 的行（杀掉客户端 stdout
         // reader）；进程保持存活、继续读 stdin。此时 stdout 已断，响应永远
         // 无法再送达——正是僵尸形态。
-        let script = std::env::temp_dir().join("ta_mcp_zombie_server.py");
+        // 脚本名带进程 id：同机并发跑两份 checkout 的同一测试时不互相覆盖。
+        let script =
+            std::env::temp_dir().join(format!("ta_mcp_zombie_server_{}.py", std::process::id()));
         std::fs::write(
             &script,
             r#"
@@ -5924,5 +5942,36 @@ for line in sys.stdin:
                 "call #{id} must carry the latch reason, got {msg}"
             );
         }
+    }
+
+    #[test]
+    fn sse_first_connect_failure_surfaces_the_latched_reader_reason() {
+        // 首连失败时 reader 在释放 endpoint 通道前已把精确原因写进 dead latch
+        // （"connect failed: …"）——connect() 返回的错误必须带上这个原因，而
+        // 不是泛化的 "channel disconnected"。拒绝性端口用「先 bind 占位再
+        // drop」取得，拒绝是确定性的（无服务的监听套接字关闭后不留 TIME_WAIT）。
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind placeholder");
+        let url = format!(
+            "http://127.0.0.1:{}/sse",
+            listener.local_addr().unwrap().port()
+        );
+        drop(listener);
+        let cfg = McpServerConfig {
+            name: "sse-refused".into(),
+            command: None,
+            args: vec![],
+            env: HashMap::new(),
+            url: Some(url.clone()),
+            transport: Some(McpTransport::Sse),
+            headers: HashMap::new(),
+        };
+        let Err(err) = SseTransport::connect(&url, &cfg) else {
+            panic!("connect against a refused port must fail");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("stream reader stopped (connect failed"),
+            "connect error must surface the reader's latched reason, got {msg}"
+        );
     }
 }

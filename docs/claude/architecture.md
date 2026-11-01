@@ -187,9 +187,9 @@
   server 在 GET 断开瞬间回收旧 endpoint），所以每条连接的 endpoint 事件都重新过同源闸门并
   刷新共享 `post_url`——冻结在第一条连接上的目标会在首次轮转后 404 掉每个调用。
   **reader 死亡即 latch 快败**（stdio stdout / legacy SSE 两种传输对称）：reader 的死亡退出
-  （EOF、真读错、超限行、endpoint 刷新被闸门拒）先写停止原因再 fail-all，之后的 request/notify
-  按原因立刻快败——否则服务器仍活时每次后续调用各坐满 CALL_TIMEOUT 变僵尸；轮转超时与重连
-  退避不是死亡，不 latch（这是传输死亡，不是 shutdown/cancel，reaper 契约不动）。
+  （首连失败、EOF、真读错、超限行、endpoint 刷新被闸门拒）先写停止原因再 fail-all，之后的
+  request/notify 按原因立刻快败——否则服务器仍活时每次后续调用各坐满 CALL_TIMEOUT 变僵尸；
+  轮转超时与重连退避不是死亡，不 latch（这是传输死亡，不是 shutdown/cancel，reaper 契约不动）。
   **run_code 的 guest registry 同样
   不感知**（与 ④ 同一条政策，外部评审曾当 P1 报过——实为既定快照语义）：registry 按构造期四件套在
   `Arc<OnceLock>` 里惰性建一次、跨克隆共享，热增的 server JS 看不到；热删的 server 仍可被已建 registry
