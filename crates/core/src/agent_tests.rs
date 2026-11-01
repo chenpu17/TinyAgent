@@ -968,21 +968,44 @@ fn tool_reported_usage_folds_into_run_totals_and_events() {
     // Cache only from turn 2 (5 write / 9 read); the tool billed none.
     assert_eq!(o.cache_creation_input_tokens, 5);
     assert_eq!(o.cache_read_input_tokens, 9);
-    // The tool's billed usage surfaced as its own Usage event (111/22).
-    let usage_events: Vec<(u64, u64)> = events
+    // The tool's billed usage surfaced as its own Usage event (111/22), and
+    // the two flavors are distinguishable: the tool's fold is tagged
+    // `tool_folded == true`, while each turn's own provider report is the
+    // request flavor `tool_folded == false` (turn 2 is the sole cache
+    // contributor, so its event carries the buckets). Consumers that read a
+    // Usage event as "the latest request's context occupancy" (the TUI
+    // status bar's ctx segment) branch on exactly this flag.
+    let usage_events: Vec<(u64, u64, u64, u64, bool)> = events
         .iter()
         .filter_map(|e| match e {
             AgentEvent::Usage {
                 input_tokens,
                 output_tokens,
-                ..
-            } => Some((*input_tokens, *output_tokens)),
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+                tool_folded,
+            } => Some((
+                *input_tokens,
+                *output_tokens,
+                *cache_creation_input_tokens,
+                *cache_read_input_tokens,
+                *tool_folded,
+            )),
             _ => None,
         })
         .collect();
-    assert!(
-        usage_events.contains(&(111, 22)),
-        "tool-reported usage must emit a Usage event; got {usage_events:?}"
+    // One event per flavor, in emission order: turn 1's request (50/7), the
+    // tool's fold (111/22), turn 2's request (0/0 + the run's only cache
+    // buckets) — the fold tagged true, both direct requests false.
+    assert_eq!(
+        usage_events,
+        vec![
+            (50, 7, 0, 0, false),
+            (111, 22, 0, 0, true),
+            (0, 0, 5, 9, false),
+        ],
+        "tool fold = tool_folded:true, direct provider requests = false; \
+         got {usage_events:?}"
     );
 }
 
@@ -4726,6 +4749,9 @@ fn all_zero_usage_object_emits_no_event_but_nonzero_still_does() {
         AgentEvent::Usage {
             input_tokens: 100,
             output_tokens: 10,
+            // The sole event here is turn 2's direct request — the request
+            // flavor, not a tool fold.
+            tool_folded: false,
             ..
         }
     ));
@@ -6800,6 +6826,8 @@ fn compress_without_provider_usage_emits_no_zero_event() {
         AgentEvent::Usage {
             input_tokens: 100,
             output_tokens: 10,
+            // The main call's own report — the request flavor.
+            tool_folded: false,
             ..
         }
     ));
@@ -9150,6 +9178,7 @@ fn every_agent_event_has_a_stable_ndjson_type_tag() {
                 output_tokens: 0,
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 0,
+                tool_folded: false,
             },
             "usage",
         ),
@@ -10409,11 +10438,14 @@ fn note_flush_panic_at_run_exit_keeps_undelivered_notes_queued() {
 fn tool_billed_usage_event_lands_between_subagent_stream_and_tool_result() {
     // Slot::Ran 的工具账单折叠（Slot::Ran → fold_usage → events(Usage)）
     // 以「顶层」AgentEvent::Usage 冒出，且位置固定：该工具的 SubAgent 事件
-    // 流之后、ToolResult 之前。顶层 Usage 的语义是「最近一次 API 请求后的
-    // 上下文占用」，消费方（如 TUI 状态栏 ctx 段）按此 SET——顺序即契约，
-    // 改动折叠/emit 位置前先核对全部消费方。真实 task 工具的 out.usage 是
-    // 子 agent 多轮累计（run_subagent_returns_final_text_and_bills_usage
-    // 钉住 2 轮聚合）；本测试用与真实 task 同形的 stand-in 钉住确切顺序。
+    // 流之后、ToolResult 之前。注意语义：这个顶层 Usage 是「工具账单折叠」
+    // 风味（tool_folded: true）——task 子 agent 的多轮累计在这里求和，不是
+    // 「最近一次 API 请求后的上下文占用」，消费方（如 TUI 状态栏 ctx 段）
+    // 不得按后者 SET（只认 tool_folded: false 的请求风味）；累计总额的
+    // 消费方则两种都要计。改动折叠/emit 位置或风味标记前先核对全部消费方。
+    // 真实 task 工具的 out.usage 是子 agent 多轮累计
+    // （run_subagent_returns_final_text_and_bills_usage 钉住 2 轮聚合）；
+    // 本测试用与真实 task 同形的 stand-in 钉住确切顺序与风味。
     let cfg = cfg_with(5, 0, 0);
     let (prov, _) = MockProvider::new(vec![
         mock::resp_tool("t", "task", json!({"label": "a"}), None),
@@ -10441,11 +10473,12 @@ fn tool_billed_usage_event_lands_between_subagent_stream_and_tool_result() {
                 AgentEvent::Usage {
                     input_tokens: 100,
                     output_tokens: 10,
+                    tool_folded: true,
                     ..
                 }
             )
         })
-        .expect("the tool-billed top-level Usage event");
+        .expect("the tool-billed top-level Usage event, tagged tool_folded:true");
     let tr_pos = events
         .iter()
         .position(|e| matches!(e, AgentEvent::ToolResult { name, .. } if name == "task"))
@@ -10453,5 +10486,16 @@ fn tool_billed_usage_event_lands_between_subagent_stream_and_tool_result() {
     assert!(
         sub_pos < usage_pos && usage_pos < tr_pos,
         "expected SubAgent({sub_pos}) < Usage({usage_pos}) < ToolResult({tr_pos})"
+    );
+    // The fold is the ONLY Usage event in this scenario (both provider turns
+    // report no usage), so the position finder above is unambiguous — and
+    // `tool_folded: true` in its pattern is itself the flavor pin.
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::Usage { .. }))
+            .count(),
+        1,
+        "exactly one (folded) Usage event expected"
     );
 }

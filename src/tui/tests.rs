@@ -4027,6 +4027,33 @@ fn ctx_from_usage_saturates_hostile_usage() {
     assert_eq!(ctx_from_usage(100, 20, 30, 10), 160);
 }
 
+/// ctx_after_usage is the TUI-03 contract in one function: a direct provider
+/// request (`tool_folded == false`) SETs the segment (per-request overwrite,
+/// not a sum), while a tool-folded report — a `task` child's multi-turn
+/// aggregate that can exceed the whole window — leaves the previous value
+/// untouched (its tokens still count into the totals elsewhere).
+#[test]
+fn ctx_after_usage_sets_on_request_reports_and_holds_on_tool_folds() {
+    // Request flavor: overwrite with the report's own numbers (100+20+30+10).
+    assert_eq!(ctx_after_usage(999_999, false, 100, 20, 30, 10), 160);
+    // Tool-folded flavor: hold whatever the last real request left.
+    assert_eq!(ctx_after_usage(54_700, true, 100, 20, 30, 10), 54_700);
+    // Holding survives a hostile (window-exceeding) fold: the segment never
+    // adopts it — ctx_after_usage ignores the four report values entirely.
+    assert_eq!(
+        ctx_after_usage(54_700, true, u64::MAX, u64::MAX, u64::MAX, u64::MAX),
+        54_700
+    );
+    // Composition: fold first, then the parent's next real request takes
+    // over again with its own measurement.
+    let after_fold = ctx_after_usage(160, true, 5_000_000, 0, 0, 900_000);
+    assert_eq!(after_fold, 160);
+    assert_eq!(
+        ctx_after_usage(after_fold, false, 30_000, 2_000, 8_000, 1_500),
+        41_500
+    );
+}
+
 /// A 4-backtick fence cut inside must reopen the tail with the fence's OWN
 /// length, not a fixed 3-marker synthetic: the block's own ``` CONTENT line
 /// closes a 3-marker opener, and everything after it leaks as markdown.

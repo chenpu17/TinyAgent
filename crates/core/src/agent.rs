@@ -257,10 +257,25 @@ pub enum AgentEvent {
         /// semantics — this is the whole list, not a delta).
         todos: Vec<TodoItem>,
     },
-    /// Token usage reported by the provider for the latest chat request.
-    /// Best-effort: emitted only when the provider actually reported usage
-    /// (e.g. the stream wasn't cut off before the usage frame). The cache_*
-    /// fields are 0 for providers/requests with no prompt caching.
+    /// Token usage, in two flavors distinguished by `tool_folded`:
+    ///
+    /// * `tool_folded == false` — the provider's report for ONE direct chat
+    ///   request this agent itself made (the main turn, or a compression
+    ///   summary). This is the truth for "how much context does the history
+    ///   occupy right now". Best-effort: emitted only when the provider
+    ///   actually reported usage (e.g. the stream wasn't cut off before the
+    ///   usage frame).
+    /// * `tool_folded == true` — a TOOL call's bill folded into the run
+    ///   totals (the `task` sub-agent's multi-turn aggregate, the `run_code`
+    ///   inner llm, a host `CallbackTool` metering an upstream API). This is
+    ///   NOT a measurement of the current history — a sub-agent's several
+    ///   turns sum up here and can exceed the whole window. Emitted at the
+    ///   fold site: after that tool's `ToolCall`, before its `ToolResult`.
+    ///
+    /// Consumers accumulating run totals count BOTH flavors; consumers
+    /// reading the event as "the latest request's context occupancy" (e.g. a
+    /// status-bar ctx meter) must look only at `tool_folded == false`. The
+    /// cache_* fields are 0 for providers/requests with no prompt caching.
     Usage {
         /// Non-cached input tokens (the cache fields are separate axes).
         input_tokens: u64,
@@ -270,6 +285,10 @@ pub enum AgentEvent {
         cache_creation_input_tokens: u64,
         /// Prompt-cache reads (billed at ~0.1×); 0 when unused.
         cache_read_input_tokens: u64,
+        /// `false` = one direct provider request's own usage (the context-
+        /// occupancy truth); `true` = a tool call's bill folded into the run
+        /// totals — see the variant docs for the full contract.
+        tool_folded: bool,
     },
     /// History was compressed: how many middle messages were dropped,
     /// how many remain, which path triggered it, and the estimated-vs-
@@ -1700,12 +1719,17 @@ impl Agent {
             .unwrap_or_else(|| Arc::new(AtomicBool::new(false)))
     }
 
-    /// Fold one request's usage into the run totals and emit the per-request
-    /// Usage event. Single site for the accumulate+emit pair — the four call
-    /// sites (preflight/forced compression, main chat, tool-billed usage) used
-    /// to each duplicate it, and the Some(Some) vs Some(None) semantics had to
-    /// be re-explained at every copy.
-    fn fold_usage(&mut self, events: &mut dyn FnMut(AgentEvent), u: &Usage) {
+    /// Fold one usage report into the run totals and emit the Usage event.
+    /// Single site for the accumulate+emit pair — the four call sites
+    /// (preflight/forced compression, main chat, tool-billed usage) used to
+    /// each duplicate it, and the Some(Some) vs Some(None) semantics had to
+    /// be re-explained at every copy. `tool_folded` tags the emitted event's
+    /// flavor (see [`AgentEvent::Usage`]): `false` for the direct-chat paths
+    /// (via [`Self::bill_chat`] — a request this agent itself made, so the
+    /// report IS the current history's context occupancy), `true` for the
+    /// tool-billed fold (a tool's output usage — a `task` child's multi-turn
+    /// sum or a host tool's own bill, never a measurement of this history).
+    fn fold_usage(&mut self, events: &mut dyn FnMut(AgentEvent), u: &Usage, tool_folded: bool) {
         // All-zero Usage = "the gateway sent a usage object but reported no
         // tokens on any axis" — functionally the same "nothing measurable
         // was billed" as the None the built-in providers send when the
@@ -1737,6 +1761,7 @@ impl Agent {
             output_tokens: u.output_tokens,
             cache_creation_input_tokens: u.cache_creation_input_tokens,
             cache_read_input_tokens: u.cache_read_input_tokens,
+            tool_folded,
         });
     }
 
@@ -1766,7 +1791,12 @@ impl Agent {
         // `usage_probe`). No-op outside a parallel worker.
         crate::usage_probe::record(u);
         self.share_budget(u.total());
-        self.fold_usage(events, u);
+        // bill_chat only ever bills THIS agent's own direct chat requests
+        // (main turn / compression summaries), so the emitted event is always
+        // the request-usage flavor — the context-occupancy truth consumers
+        // may SET a ctx meter from. The tool-billed fold passes the other
+        // flavor at its own call site below.
+        self.fold_usage(events, u, false);
     }
 
     /// Wrap a mid-run error with the partial cost burned so far (this run's
@@ -3196,7 +3226,10 @@ impl Agent {
                         // just its direct chats (see `usage_probe`).
                         // No-op on the top-level loop thread (no probe).
                         crate::usage_probe::record(&u);
-                        self.fold_usage(events, &u);
+                        // The tool-billed flavor: this event is the TOOL's
+                        // bill (e.g. a task child's multi-turn sum) — not a
+                        // measurement of this history's context occupancy.
+                        self.fold_usage(events, &u, true);
                     }
                     records.push(ToolCallRecord {
                         name: name.clone(),

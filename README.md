@@ -900,7 +900,13 @@ stream-head `code` record that appears only when the run_code sandbox is compile
 `code` is a harness-level record, not an `AgentEvent` variant), letting pipes track progress
 before the result file lands. `tool_input` is the streaming increment of tool arguments
 (`{"type":"tool_input","id","name","delta"}`, keyed by tool_use id): the model emits while it is still
-constructing the call, and a GUI can render "constructing a call…". This set of `type`s is a
+constructing the call, and a GUI can render "constructing a call…". The `usage` event carries a
+`tool_folded` flag with two flavors: `false` = the provider's own report for one direct request of
+this run (the truth for current context occupancy — what a ctx meter should set on); `true` = a tool
+call's bill folded into the run totals (a `task` sub-agent's multi-turn aggregate, the run_code inner
+llm, a host tool's own report — emitted between that tool's `tool_call` and `tool_result`, and NOT a
+measurement of the current history). Both flavors count toward the cumulative totals; branch on the
+flag when the two mean different things to you. This set of `type`s is a
 **contract**: the kernel's `AgentEvent::ndjson_type()` exhaustively assigns one per variant (a new
 variant without an entry fails to compile), and `agent_tests` pins the names variant-by-variant —
 consumers can branch on `type` and will never meet a nameless stream event.
@@ -941,7 +947,8 @@ the main context is never bloated by the sub-agent's intermediate steps.
   TUI prefixes sub-agent output with `[name]`. With several sub-agents in parallel, tell them apart by
   `name`.
 - **Honest cost accounting**: every sub-agent's token usage folds into the main run's totals and
-  `usage` events / `result.json` as usual (each of the parallel ones counted).
+  `usage` events / `result.json` as usual (each of the parallel ones counted). The folding `usage`
+  event is tagged `tool_folded: true` — see the NDJSON contract above.
 - **Audit trace (`meta`)**: each `task` entry in `result.json` carries a `meta` field — a compact
   record of the sub-agent's turns, tools used (counted by name), token subtotal, and stop_reason.
   **Not in the model-visible tool result** (the main context only receives the summary, staying lean);

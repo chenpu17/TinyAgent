@@ -685,6 +685,11 @@ TUI 模式下 `Ctrl-C` 是普通按键，按上面的按键表处理。
 可在结果文件落盘前实时跟进进度。`tool_input` 是工具参数的流式增量
 （`{"type":"tool_input","id","name","delta"}`，键为 tool_use id）：模型边构造参数边透出，
 GUI 可渲染"正在构造调用…"（headless 终端不重复打印——完整 `tool_call` 行随后来）。
+`usage` 事件带 `tool_folded` 标记，区分两种风味：`false` = 本次运行某次直接请求的 provider
+实测用量（当前上下文占用的真值——ctx 占用指示应只认它）；`true` = 某个工具调用的账单折进
+运行累计（`task` 子 agent 的多轮累计、run_code 内层 llm、宿主工具自行上报的用量——在该工具的
+`tool_call` 与 `tool_result` 之间发出，**不是**对当前历史上下文的测量）。两种风味都计入运行
+累计总额；两者对你含义不同时按该标记分支。
 这组 `type` 是**契约**：内核 `AgentEvent::ndjson_type()` 对每个事件变体穷尽赋值（新增变体不改它
 就编不过），`agent_tests` 里另有逐变体钉名测试——消费方按 `type` 分支即可，不会遇到无名的流事件。
 
@@ -709,7 +714,7 @@ GUI 可渲染"正在构造调用…"（headless 终端不重复打印——完�
 - **输入**：`{ "name": "身份标识", "description": "简短说明", "prompt": "完整自包含的指令" }`（`name` 与 `prompt` 必填，`description` 可选、信息性）。`name` 是这个子 agent 的身份，所有转发出来的事件都用它打标签。
 - **同 turn 多调用并行**：主 agent 在**一个** assistant turn 里发出多个 `task` 调用时，它们会**并行**跑（每个一个线程，按 8 个一波封顶，借线程池 scope），各自的事件经有界 mpsc 漏斗（背压）实时转发进主 run 的事件流——所以多个子 agent 协同工作时，输出是交错流式出现的。结果仍按原始块序拼回（N:N 配对不变）。叶子工具（`shell`/`read_file`/…）保持顺序执行，只有 `task` 并行，避免在文件/进程上引入新的竞态。
 - **事件可见**：子 agent 的流式过程（文本增量 / tool 调用 / tool 结果）**实时转发**进主 run 的事件流，每条都裹上 `name` 身份——headless 的 `--json` 输出形如 `{"type":"subagent","name":..,"event":<子事件>}`，TUI 里子 agent 的输出也带 `[name]` 前缀。并行多个子 agent 时，靠 `name` 区分交错的事件。
-- **成本诚实计入**：每个子 agent 的 token 用量折进主 run 的累计，并照常发 `usage` 事件 / 写进 `result.json`（并行的几个各自计入）。
+- **成本诚实计入**：每个子 agent 的 token 用量折进主 run 的累计，并照常发 `usage` 事件 / 写进 `result.json`（并行的几个各自计入）。折叠出的 `usage` 事件带 `tool_folded: true` 标记——见上文 NDJSON 契约。
 - **审计 trace（`meta`）**：`result.json` 里每个 `task` 条目另带一个 `meta` 字段——子 agent 的轮数、用过哪些工具（按名计数）、token 小计、stop_reason 的紧凑记录。**不进模型可见的 tool result**（主上下文只收摘要，保持清爽），仅供审计并行工作。失败子 agent 也带 `meta`（`stop_reason: "error"`），看得出"跑到哪一步倒了"。
 - **继承**：子 agent 复用主 agent 的 provider / model / 工作目录 / `restrict_to_workdir` / 取消标志（Ctrl-C 会连带中断在跑的子 agent）。工具白名单继承父配置。
 

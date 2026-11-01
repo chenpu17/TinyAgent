@@ -456,13 +456,22 @@ fn event_json(ev: &AgentEvent) -> Value {
             output_tokens,
             cache_creation_input_tokens,
             cache_read_input_tokens,
+            tool_folded,
         } => {
+            // Additive key: `tool_folded` distinguishes the two flavors —
+            // `false` = one direct provider request's own usage (the truth
+            // for current context occupancy), `true` = a tool call's bill
+            // folded into the run totals (a `task` child's multi-turn
+            // aggregate, the run_code inner llm, a host tool's own report).
+            // Totals consumers count both; "latest request ctx" consumers
+            // branch on the flag. See AgentEvent::Usage.
             json!({
                 "type": "usage",
                 "input_tokens": *input_tokens,
                 "output_tokens": *output_tokens,
                 "cache_creation_input_tokens": *cache_creation_input_tokens,
                 "cache_read_input_tokens": *cache_read_input_tokens,
+                "tool_folded": *tool_folded,
             })
         }
         AgentEvent::Compressed {
@@ -978,6 +987,7 @@ impl<Out: Write, Err: Write> HumanRenderer<Out, Err> {
                 output_tokens,
                 cache_creation_input_tokens,
                 cache_read_input_tokens,
+                tool_folded,
             } => {
                 let cache = if *cache_creation_input_tokens > 0 || *cache_read_input_tokens > 0 {
                     format!(
@@ -987,9 +997,13 @@ impl<Out: Write, Err: Write> HumanRenderer<Out, Err> {
                 } else {
                     String::new()
                 };
+                // Tag the tool-folded flavor so a human tailing the run can
+                // tell a tool's bill (a task child's multi-turn sum — NOT the
+                // current history's occupancy) from the turn's own request.
+                let folded = if *tool_folded { " (tool-billed)" } else { "" };
                 let _ = writeln!(
                     self.err,
-                    "[tokens: {input_tokens}↑ {output_tokens}↓{cache}]"
+                    "[tokens: {input_tokens}↑ {output_tokens}↓{cache}{folded}]"
                 );
             }
             AgentEvent::TodoUpdate { todos } => {
@@ -1680,18 +1694,36 @@ mod tests {
         assert_eq!(v["is_error"], false);
         assert_eq!(v["content"], "hello");
         // Usage → cache_* fields round-trip by exact name (a typo drops cache
-        // cost from any downstream token accounting).
+        // cost from any downstream token accounting); `tool_folded` rides
+        // along for both flavors (additive key, schema stays add-only).
         let v = event_json(&AgentEvent::Usage {
             input_tokens: 100,
             output_tokens: 5,
             cache_creation_input_tokens: 200,
             cache_read_input_tokens: 300,
+            tool_folded: false,
         });
         assert_eq!(v["type"], "usage");
         assert_eq!(v["input_tokens"], 100);
         assert_eq!(v["output_tokens"], 5);
         assert_eq!(v["cache_creation_input_tokens"], 200);
         assert_eq!(v["cache_read_input_tokens"], 300);
+        assert_eq!(
+            v["tool_folded"], false,
+            "a direct provider request reports the request flavor"
+        );
+        let v = event_json(&AgentEvent::Usage {
+            input_tokens: 111,
+            output_tokens: 22,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            tool_folded: true,
+        });
+        assert_eq!(v["type"], "usage");
+        assert_eq!(
+            v["tool_folded"], true,
+            "a tool-billed fold is tagged tool_folded:true"
+        );
         // Compressed → trigger stringifies for both variants.
         let v = event_json(&AgentEvent::ToolInputDelta {
             id: "c1".into(),
@@ -2059,6 +2091,16 @@ mod tests {
             output_tokens: 2,
             cache_creation_input_tokens: 5,
             cache_read_input_tokens: 8,
+            tool_folded: false,
+        });
+        // The tool-folded flavor carries a visible marker so a human can
+        // tell a tool's bill from the turn's own request.
+        r.render(&AgentEvent::Usage {
+            input_tokens: 111,
+            output_tokens: 22,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            tool_folded: true,
         });
         let err_s = String::from_utf8_lossy(&r.err).into_owned();
         assert!(err_s.contains("turn 1"));
@@ -2066,6 +2108,10 @@ mod tests {
         assert!(
             err_s.contains("[tokens: 10↑ 2↓ · cache 5write 8read]"),
             "cache suffix format: {err_s}"
+        );
+        assert!(
+            err_s.contains("[tokens: 111↑ 22↓ (tool-billed)]"),
+            "tool-folded marker: {err_s}"
         );
 
         // Transcript → stdout.

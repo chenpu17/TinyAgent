@@ -487,9 +487,10 @@ fn ui_loop(
     let mut cache_create: u64 = 0;
     let mut cache_read: u64 = 0;
     // Estimated context-window occupancy after the latest API call, SET (not
-    // summed) from each Usage event: prompt tokens (incl. cached parts) plus
-    // the response just appended to the history. Drives the status bar's
-    // `ctx` segment.
+    // summed) from each direct-request Usage event (tool-folded reports —
+    // a tool's bill, not a measurement — leave it alone; see ctx_after_usage):
+    // prompt tokens (incl. cached parts) plus the response just appended to
+    // the history. Drives the status bar's `ctx` segment.
     let mut ctx_tokens: u64 = 0;
     // The agent's current task plan, tracked via the `todo` tool. Shown live in
     // the status bar (a `plan done/total` segment) so progress is visible
@@ -766,18 +767,22 @@ fn ui_loop(
                         output_tokens,
                         cache_creation_input_tokens,
                         cache_read_input_tokens,
+                        tool_folded,
                     } => {
                         in_tokens = in_tokens.saturating_add(input_tokens);
                         out_tokens = out_tokens.saturating_add(output_tokens);
                         cache_create = cache_create.saturating_add(cache_creation_input_tokens);
                         cache_read = cache_read.saturating_add(cache_read_input_tokens);
-                        // Per-request values, not cumulative: overwrite. The
-                        // prompt side is input + both cache buckets (Anthropic
-                        // splits cached tokens out of input_tokens; OpenAI
-                        // reports the whole prompt in input_tokens and leaves
-                        // the buckets at 0). + output covers the response the
-                        // next request will carry.
-                        ctx_tokens = ctx_from_usage(
+                        // Only a DIRECT provider request re-measures the
+                        // context — see ctx_after_usage: a tool-folded report
+                        // (a `task` child's multi-turn sum, a run_code inner
+                        // llm, a host tool's bill) must not SET the ctx
+                        // segment (it would show a bogus, possibly >100%
+                        // number until the next real request). Totals above
+                        // still count it — honest cost, skipped only here.
+                        ctx_tokens = ctx_after_usage(
+                            ctx_tokens,
+                            tool_folded,
                             input_tokens,
                             cache_creation_input_tokens,
                             cache_read_input_tokens,
@@ -1781,4 +1786,31 @@ pub(super) fn ctx_from_usage(
         .saturating_add(cache_creation_input_tokens)
         .saturating_add(cache_read_input_tokens)
         .saturating_add(output_tokens)
+}
+
+/// The new ctx-segment value after one Usage event. Only a DIRECT provider
+/// request (`tool_folded == false`) measures the current history, so it SETs
+/// the segment via [`ctx_from_usage`]; a tool-folded report (a `task` child's
+/// multi-turn aggregate, the run_code inner llm, a host tool's own bill) is
+/// NOT a measurement of this history — a sub-agent's turns sum up here and
+/// can exceed the whole window — so it leaves the previous value alone (its
+/// tokens still count into the totals; only the ctx segment skips it).
+pub(super) fn ctx_after_usage(
+    current: u64,
+    tool_folded: bool,
+    input_tokens: u64,
+    cache_creation_input_tokens: u64,
+    cache_read_input_tokens: u64,
+    output_tokens: u64,
+) -> u64 {
+    if tool_folded {
+        current
+    } else {
+        ctx_from_usage(
+            input_tokens,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+            output_tokens,
+        )
+    }
 }
