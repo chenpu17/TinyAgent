@@ -63,7 +63,7 @@ agent.set_hooks(Arc::new(Policy));
 
 **工具能力标记**：自定义 `Tool` 还可用两个默认方法向 loop 声明能力——`concurrency()` 返回 `ToolConcurrency::Parallel` 即获得与内置 `task` 同款的同 turn 多调用并行执行（承诺可重入 + 轮询 `ctx.cancel`）；`available_to_subagent()` 返回 `false` 即退出子 agent 继承。路由按能力、不按名字，第三方工具与内置工具一视同仁。
 
-**常驻会话的热更新**（GUI 宿主场景）：CLI 的 config 在构建时定格，但宿主可以让一个 `Agent` 活整个会话、按需换挡——`set_model` / `set_reasoning_effort` / `set_max_tokens` / `set_max_context_tokens` 都是**纯字段替换**，下次请求生效，MCP 连接、工具装配、历史与 session 全不动（重建 Agent 要重跑 MCP 握手，实测可达秒级）。MCP server 集合也可热增删：`add_mcp_server(McpServerConfig)` / `remove_mcp_server(name)` / `tool_names()`（语义见[MCP 运行时热增删](../README.md#运行时热增删库-api)节）。`Agent::compact(&mut events)` 是压缩的**宿主主动入口**：轮次间调用即折叠历史（滚动摘要 + 安全切点 + 落盘 + `Compressed { trigger: "manual" }` 事件），返回 `dropped`/`kept`/摘要调用的 `usage`——这笔成本不进下一次 run 的账单（run 入口会重置总账），由宿主自行记账；`compact_with(&mut events, Some("focus on …"))` 可附带**焦点指令**引导摘要侧重。这些方法的 `&mut self` 签名即顺序契约：run 持有借用，「轮次间调用」由借用检查器强制。注意 `task` 子 agent 持构造期 config 快照，不跟随换挡。
+**常驻会话的热更新**（GUI 宿主场景）：CLI 的 config 在构建时定格，但宿主可以让一个 `Agent` 活整个会话、按需换挡——`set_model` / `set_reasoning_effort` / `set_max_tokens` / `set_max_context_tokens` 都是**纯字段替换**，下次请求生效，MCP 连接、工具装配、历史与 session 全不动（重建 Agent 要重跑 MCP 握手，实测可达秒级）。MCP server 集合也可热增删：`add_mcp_server(McpServerConfig)` / `remove_mcp_server(name)` / `tool_names()`（语义见[MCP 运行时热增删](../README.md#运行时热增删库-api)节）。`Agent::compact(&mut events)` 是压缩的**宿主主动入口**：轮次间调用即折叠历史（滚动摘要 + 安全切点 + 落盘 + `Compressed { trigger: "manual" }` 事件），返回 `dropped`/`kept`/摘要调用的 `usage`，外加折叠前后的 token 估算（`estimated_tokens_before`/`estimated_tokens_after`，与 preflight 同一套启发式；锚点仍有效时另带 provider 实测 `measured_tokens_before`）——这笔成本不进下一次 run 的账单（run 入口会重置总账），由宿主自行记账；`compact_with(&mut events, Some("focus on …"))` 可附带**焦点指令**引导摘要侧重。这些方法的 `&mut self` 签名即顺序契约：run 持有借用，「轮次间调用」由借用检查器强制。注意 `task` 子 agent 持构造期 config 快照，不跟随换挡。
 
 run 结束后从 [`RunOutcome`](../crates/core/src/agent.rs)（或 `Agent::usage()` / `messages()` / `model()` / `context_breakdown()` getter）读回诚实的 token 账单与历史。`AgentEvent` 派生了 `Serialize`，绑定层可直接序列化成宿主语言的 dict / object。`Message` 带**稳定 id**（`id: Option<String>`，agent 在消息进入历史时铸造、跨 save/load 不变、压缩折叠不重排存活者）——往消息上挂宿主侧资产（图片卡 / 文件链接）时锚 id 而不是下标，压缩/truncate 后锚点不漂移。
 
@@ -123,6 +123,12 @@ print(a.run(on_event=lambda e: print(e))["final_text"])
 
 `run()` 同步阻塞但**释放 GIL**（`py.allow_threads`），长网络等待期间其他 Python 线程可跑；事件回调用 `with_gil` 短暂重获。
 
+**Ctrl-C 语义（Python）**：run 全程释放 GIL，SIGINT 的 C 级处理只置标志、宿主线程下次执行 Python
+字节码时才转成 `KeyboardInterrupt`。绑定对**事件回调里**的 `KeyboardInterrupt` 特判（其余回调异常
+照旧吞掉）：装了 cancel token（`set_cancel`）时，回调内 KI 置位宿主 flag，run 在下一轮界停
+（`stop_reason: "cancelled"`），KI 在 `run()`/`compact()` 返回时重新抛出——flag 按取消契约不清除，
+下次受理任务前要 `clear_cancel()`；没装 token 时 run 照常跑完，KI 同样在返回时抛出。
+
 **上下文构成**：`a.context_breakdown()` 返回下一请求上下文的估算 token 分解 dict（`system` 三段 / `tools` 四类 / `messages.by_kind` 分型 / `total_tokens` / `calibration`，键 snake_case）——宿主画上下文占比视图的数据源；语义见上文「上下文构成查询」，与 `usage()` 同款 busy 契约（run 中跨线程调用阻塞等锁直至 run 结束、同线程回调重入报错——与 Node 侧的立即报错相反）。
 
 **自定义 provider 回调**：传 `provider=` 一个 Python callable，整个替换内置 HTTP provider（不连网、不要 key）。callable 收 `{system, messages, tools, model, max_tokens}`，返回 `str`（=纯文本）或 `{text, stop_reason?, usage?}`：
@@ -140,10 +146,13 @@ a = tiny_agent.Agent("chat.json", provider=echo_provider)  # 无 api_key
 **Hooks 拦截层**（Python 侧同款核心能力）：`a.set_hooks(obj)` 或构造时 `hooks=obj` /
 `chat(cfg, msg, hooks=obj)`——obj 按鸭子类型提供任意子集：`before_tool(tool, input, ctx)`
 返回 `None`（放行）/ 拒绝字符串（成为模型看到的错误结果）/ `{"modify": input}`（换输入执行，
-审计留原始输入）；`after_tool(tool, input, output, executed, ctx)` 事后审计（`executed=False`
-仅当 Deny）；`on_chat_request(request)` 只读观察主 turn 请求。`ctx` 是归因投影
+审计留原始输入）；`after_tool(tool, input, output, executed, ctx)` 事后审计
+（`executed=False` 共三种形态：`before_tool` 拒绝、gate→执行取消检查点跳过
+（审批等待期落下的 cancel）、并行批已过闸但未启动工具体的占位）；
+`on_chat_request(request)` 只读观察主 turn 请求。`ctx` 是归因投影
 `{workdir, subagent}`（顶层 `subagent=None`，`task` 子 agent / run_code 沙箱各自有名）。
-缺的方法即无操作；**`before_tool` 抛异常或返回非法值 = fail-closed 拒绝该调用**（理由进消息），
+缺的方法即无操作；方法存在但不可调用在安装时（构造 / `set_hooks`）当场 `TypeError`；
+**`before_tool` 抛异常或返回非法值 = fail-closed 拒绝该调用**（理由进消息），
 观察类钩子的异常被吞掉。完整语义（并发、`--resume` 不带 hooks、威胁模型）见上文与
 `crates/core/src/hooks.rs` trait 文档。
 
@@ -196,7 +205,7 @@ a.pushUser('波士顿天气？');
 console.log((await a.run(ev => console.log(ev))).final_text);
 ```
 
-`run()` 是 `Promise`——agent loop 在 libuv worker 线程跑（**无 tokio**），事件经 `ThreadsafeFunction` 回主线程；自定义 JS 工具经 TSFN round-trip（agent 线程触发 JS → JS 调 `resolveTool(id, result)` 唤醒 worker）。
+`run()` 是 `Promise`——agent loop 在 libuv worker 线程跑（**无 tokio**），事件经 `ThreadsafeFunction` 回主线程；自定义 JS 工具经 TSFN round-trip（agent 线程触发 JS → JS 调 `resolveTool(id, result)` 唤醒 worker）。**配置入口差异**：Node 三个入口（`new Agent` / `Agent.create` / `chat`）只收配置**文件路径**字符串（传其他类型当场 `TypeError`）；内联 dict/object 配置目前仅 Python 侧支持。
 
 **上下文构成**：`a.contextBreakdown()` 同步返回下一请求上下文的估算 token 分解对象（形状见 `wrapper.d.ts` 的 `ContextBreakdown`；键 snake_case 与 Rust serde 一致）——宿主画上下文占比视图的数据源；语义见上文「上下文构成查询」，busy 契约与 `usage()` 同款（run 中调用立即报错，不冻结事件循环）。
 
@@ -234,8 +243,10 @@ await a.run();
 `afterTool(payload)` / `onChatRequest(request)`（只读观察，payload 形状见 `wrapper.d.ts`）。
 `ctx` 是归因投影 `{ workdir, subagent }`（顶层 `subagent: null`）。缺的方法即无操作；
 某个方法存在但不是函数会当场 `TypeError`（native TSFN 对非函数会断言 abort，wrapper 与 native
-层都已在建 TSFN 前拦截）；**`beforeTool` 抛异常或返回非法值 = fail-closed 拒绝该调用**（理由进消息），观察类钩子的异常被
-吞掉（其 TSFN 是 Fatal 策略——不吞就是进程 abort）。语义同 Python 侧；`setHooks` 有 busy 契约。
+层都已在建 TSFN 前拦截）；**`beforeTool` 抛异常或返回非法值 = fail-closed 拒绝该调用**（理由进消息；
+`deny` 与 `modify` 并存的决策同样算非法、落入 fail-closed，不静默取其中一键），观察类钩子的异常被
+吞掉（其 TSFN 是 Fatal 策略——不吞就是进程 abort）。gate 决策等待与工具回调同款：上限取
+`min(剩余预算, 120s)`、分片轮询 cancel——等待期被取消时报 "cancelled" 而非误报超时。语义同 Python 侧；`setHooks` 有 busy 契约。
 
 **宿主进程生命周期（Node）**：用过自定义 `tools` / `provider` / `hooks`（或事件回调）的进程，
 napi 的 TSFN 会让 libuv 句柄常驻，脚本自然结束后**不会自行退出**。这是既有行为，不是本次新增：
