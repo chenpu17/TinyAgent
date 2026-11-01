@@ -46,11 +46,31 @@ pub(super) fn intercept_file_paths(
     // lexical form IS the resolved form, so the policy judgment below is
     // sound. (TOCTOU between check and write stays the documented best-effort
     // boundary, same as confined_to.)
-    if is_write && write_traverses_symlink(workdir_canon, path) {
-        return Some(format!(
-            "run_code: refusing to write through a symlink ('{path}') — \
-             write the real path instead"
-        ));
+    if is_write {
+        // Drive-relative spellings cannot be judged by the screens below (see
+        // [`is_drive_relative`]) — refused before any resolution happens.
+        if is_drive_relative(path) {
+            return Some(format!(
+                "run_code: refusing a drive-relative write path ('{path}') — \
+                 write a workdir-relative or fully absolute path instead"
+            ));
+        }
+        // 中-1 (whole-chain, per sec-review M-1): writes reject a symlink in
+        // ANY component under the workdir, not just the final one. A
+        // symlinked component makes the write's real destination unknowable
+        // from the spelling the model chose — `out -> /tmp/pwn` means `out/x`
+        // lands outside the workdir even though the lexical form says
+        // otherwise; a dangling `ln -s .env bak` lands the write on `.env`
+        // while the model chose "bak". With NO symlink component under the
+        // canonical workdir the lexical form IS the resolved form, so the
+        // policy judgment below is sound. (TOCTOU between check and write
+        // stays the documented best-effort boundary, same as confined_to.)
+        if write_traverses_symlink(workdir_canon, path) {
+            return Some(format!(
+                "run_code: refusing to write through a symlink ('{path}') — \
+                 write the real path instead"
+            ));
+        }
     }
 
     // Normalize to a workdir-relative path (中-2): independent of
@@ -105,6 +125,14 @@ pub(super) fn intercept_copy(
     let src = effective.get("src").and_then(Value::as_str)?;
     let dst = effective.get("dst").and_then(Value::as_str)?;
     // dst first — a refused write should fail before the read is even judged.
+    // Drive-relative spellings cannot be judged by the screens below (see
+    // [`is_drive_relative`]) — refused before any resolution happens.
+    if is_drive_relative(dst) {
+        return Some(format!(
+            "run_code: refusing a drive-relative write path ('{dst}') — \
+             write a workdir-relative or fully absolute path instead"
+        ));
+    }
     if write_traverses_symlink(workdir_canon, dst) {
         return Some(format!(
             "run_code: refusing to write through a symlink ('{dst}') — \
@@ -231,6 +259,18 @@ pub(super) fn absolutize(workdir: &Path, path: &str) -> PathBuf {
 /// `/outside/../<workdir>/link/../x` as INSIDE while the kernel wrote it
 /// outside (external re-review P1).
 pub(super) fn workdir_relative(workdir_canon: &Path, path: &str) -> Option<String> {
+    // Fail-closed caps on the RAW spelling, before any resolution: the two
+    // caps below judge the RESOLVED form, and `..` padding self-cancels —
+    // "a/../"×128 + "bak" (643 bytes, 257 components) resolves to rel = "bak"
+    // (both caps pass) while the symlink walk bails on the 257-component
+    // ORIGINAL, so the verdict flipped with the spelling alone (audit
+    // follow-up). Over-limit strings are payloads, not filenames (see the
+    // MAX_* docs): reads pass through and fail naturally at the tool, writes
+    // are denied.
+    let raw = Path::new(path);
+    if path.len() > MAX_REL_PATH_BYTES || raw.components().count() > MAX_REL_SEGMENTS {
+        return None;
+    }
     let full = absolutize(workdir_canon, path);
     let canon = match full.canonicalize() {
         Ok(c) => c,
@@ -333,9 +373,12 @@ pub(super) fn write_traverses_symlink(workdir_canon: &Path, path: &str) -> bool 
     // Payload paths (sec-review M-2): the walk below pays one symlink_metadata
     // per segment — µs-scale on unix, ~100µs+ on Windows filter drivers (60k
     // segments measured 12s there). Over-limit spellings are denied
-    // fail-closed by workdir_relative's length check right after regardless,
-    // so skipping the walk only saves the doomed syscalls, never flips a
-    // decision. Guard the ORIGINAL spelling: it is what drives the walk.
+    // fail-closed by workdir_relative's entry caps right after regardless —
+    // the caps guard the RAW spelling, the exact string this bail keys on, so
+    // skipping the walk only saves the doomed syscalls, never flips a
+    // decision (they used to judge only the RESOLVED form, which `..` padding
+    // could self-cancel; audit follow-up moved them to the raw entry). Guard
+    // the ORIGINAL spelling: it is what drives the walk.
     if path.len() > MAX_REL_PATH_BYTES {
         return false;
     }
@@ -459,14 +502,38 @@ pub(super) fn deny_match(patterns: &[String], rel: &str) -> bool {
 /// Containment against fs_write_dirs: `rel == dir` or `rel` nested under it.
 /// Entries are lexical dir paths (not globs), cleaned with the same lexical
 /// pass as guest paths — `./out`, `out/`, `out//x` all behave like their
-/// clean spellings (an entry that cleans to nothing matches nothing).
+/// clean spellings (an entry that cleans to nothing matches nothing). On
+/// Windows the entry's `\` separators fold to `/` (identical in kind to
+/// deny_match's pattern side) — lexical_normalize re-joins with
+/// MAIN_SEPARATOR, so an unfolded multi-segment entry was a dead rule
+/// against the `/`-separated rel.
 pub(super) fn under_write_dir(dirs: &[String], rel: &str) -> bool {
     let rel = fold_case(rel);
     dirs.iter().any(|d| {
-        let cleaned = lexical_normalize(Path::new(d));
-        let d = fold_case(&cleaned.to_string_lossy());
+        let cleaned = lexical_normalize(Path::new(d))
+            .to_string_lossy()
+            .into_owned();
+        #[cfg(windows)]
+        let cleaned = cleaned.replace('\\', "/");
+        let d = fold_case(&cleaned);
         !d.is_empty() && (rel == d || rel.starts_with(&format!("{d}/")))
     })
+}
+
+/// Windows drive-relative spelling (`C:foo` — a prefix with no root): the
+/// lexical screens cannot judge the shape. `absolutize`'s join truncates at
+/// the prefix (the spelling never lands under the workdir, so the symlink
+/// walk's screen bails), while `workdir_relative`'s canonicalize resolves it
+/// against the PER-DRIVE cwd — with that cwd on the workdir's drive, the
+/// same physical write flipped verdicts with the spelling alone (walk
+/// skipped, judged inside). The write arms refuse the shape outright; reads
+/// keep the documented 中-2 boundary (outside reads pass unseen). On unix
+/// `Component::Prefix` never matches, so "C:foo" stays an ordinary — and
+/// walkable — filename.
+fn is_drive_relative(path: &str) -> bool {
+    use std::path::Component;
+    let p = Path::new(path);
+    matches!(p.components().next(), Some(Component::Prefix(_))) && !p.is_absolute()
 }
 
 /// Pattern-side magnitude bound for [`glob_match`] (sec-review P2): the PATH
@@ -508,11 +575,26 @@ pub(super) fn glob_match(pat: &[&str], path: &[&str]) -> bool {
         flat.push(seg);
     }
     if flat.len() > MAX_GLOB_PATTERN_SEGMENTS {
-        crate::diag::diag_warn!(
-            "run_code: deny_paths pattern collapses to {} segments (cap \
-             {MAX_GLOB_PATTERN_SEGMENTS}) — treated as non-matching",
-            flat.len()
-        );
+        // One warn per pattern VALUE per process (audit follow-up): the cap
+        // is judged on every inner file call × every pattern, so one bad
+        // config entry in a long batch task repeated this warn per call —
+        // the per-process set keeps it a one-time signal, exactly like the
+        // code.llm freeze warning's per-value dedup.
+        use std::collections::HashSet;
+        use std::sync::{Mutex, OnceLock};
+        static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+        let warned = WARNED.get_or_init(Default::default);
+        let fresh = warned
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(flat.join("/"));
+        if fresh {
+            crate::diag::diag_warn!(
+                "run_code: deny_paths pattern collapses to {} segments (cap \
+                 {MAX_GLOB_PATTERN_SEGMENTS}) — treated as non-matching",
+                flat.len()
+            );
+        }
         return false;
     }
     glob_match_inner(&flat, path)
@@ -1936,5 +2018,310 @@ mod tests {
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(soup_outside(&root)).ok();
+    }
+
+    // ── 过限拼写 / 驱动器相对拼写 / 分隔符折叠回归（外审跟进） ────────────────
+
+    /// 平台 symlink helper：Windows 用 symlink_file（Administrator 通常持
+    /// 特权），unix 用 os::unix::fs::symlink。返回 false = 本机无特权，
+    /// 调用方跳过（运行期 bool 而非 `#[cfg]` + `return`——后者的函数体
+    /// 在另一平台变 unreachable，`-D warnings` 下 Windows clippy 会红，
+    /// 见 [`create_dangling_symlink`] 的文档）。
+    fn create_file_symlink(target: &Path, link: &Path) -> bool {
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(target, link).is_ok()
+        }
+        #[cfg(not(windows))]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+    }
+
+    /// Over-cap `..` padding used to flip the symlink verdict: the walk bails
+    /// on the 257-component ORIGINAL (`"a/../"×128 + "bak"`), while
+    /// workdir_relative's two caps judged only the RESOLVED form — the
+    /// deepest-existing-ancestor fallback landed on rel = "bak" and both caps
+    /// passed, so the bare spelling was refused as a symlink write while the
+    /// padded spelling of the SAME physical write sailed through (to a copy
+    /// that follows the dangling link outside; see the end-to-end twin). The
+    /// entry caps now judge the RAW spelling fail-closed: both answers agree.
+    #[test]
+    fn write_via_segment_cap_padding_still_refuses_symlink_traversal() {
+        let dir = scratch();
+        let outside = dir.parent().unwrap().join(format!(
+            "{}-pad-out",
+            dir.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let leak = outside.join("leak.txt");
+        if !create_file_symlink(&leak, &dir.join("bak")) {
+            eprintln!("symlink privilege unavailable on this host — skipping");
+            return;
+        }
+        let canon = dir.canonicalize().unwrap();
+        let padded: String = "a/../".repeat(128) + "bak";
+        assert_eq!(padded.len(), 643);
+        assert_eq!(Path::new(&padded).components().count(), 257);
+
+        // Control anchor: the bare spelling reaches the walk (中-1 refuses).
+        assert!(
+            write_traverses_symlink(&canon, "bak"),
+            "bare spelling must read as a symlink write (sandbox broken otherwise)"
+        );
+        // Informational: the walk still bails on the padded spelling (the
+        // caps bound the syscall fan-out), but that skip no longer flips a
+        // verdict — the entry caps refuse the raw spelling outright.
+        eprintln!(
+            "padded-spelling walk = {} (skip is expected; verdict is now fail-closed)",
+            write_traverses_symlink(&canon, &padded)
+        );
+        // Contract 1: workdir_relative answers None (fail-closed) for the
+        // over-cap RAW spelling, whatever it resolves to.
+        assert_eq!(
+            workdir_relative(&canon, &padded),
+            None,
+            "over-cap raw spelling must be fail-closed regardless of its \
+             resolved form (it resolves to plain \"bak\")"
+        );
+        // Contract 2: the policy entry refuses BOTH spellings — the verdict
+        // no longer depends on the padding.
+        let snap = CodeConfig::default();
+        let bare = intercept_copy(&json!({"src": "x.bin", "dst": "bak"}), &snap, &canon);
+        assert!(
+            bare.as_deref().unwrap_or_default().contains("symlink"),
+            "bare dst must be refused by the symlink rule: {bare:?}"
+        );
+        let padded_ans = intercept_copy(&json!({"src": "x.bin", "dst": &padded}), &snap, &canon);
+        let padded_msg = padded_ans.as_deref().unwrap_or_default().to_string();
+        assert!(
+            padded_ans.is_some(),
+            "padded dst must be refused too — same physical write as the bare \
+             spelling, which is refused"
+        );
+        assert!(
+            !padded_msg.contains("symlink"),
+            "the padded refusal comes from the entry caps, not the walk: {padded_msg}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    /// End-to-end twin of the padding test: the guest copies onto the padded
+    /// over-cap spelling while dst is a dangling file symlink pointing
+    /// OUTSIDE the workdir — `std::fs::copy` opens through the link, so a
+    /// policy pass would land the bytes outside. The refusal must fire
+    /// BEFORE any write: the guest sees `denied`, and the link target stays
+    /// nonexistent.
+    #[test]
+    fn copy_bytes_via_padded_over_cap_dst_cannot_reach_outside_symlink() {
+        let dir = scratch();
+        let outside = dir.parent().unwrap().join(format!(
+            "{}-pad-e2e",
+            dir.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(dir.join("src.bin"), "PAYLOAD").unwrap();
+        let leak = outside.join("leak.txt");
+        if !create_file_symlink(&leak, &dir.join("bak")) {
+            eprintln!("symlink privilege unavailable on this host — skipping");
+            return;
+        }
+        let padded: String = "a/../".repeat(128) + "bak";
+        let code = format!(
+            r#"
+            try {{ tools.call("copy_bytes", {{src: "src.bin", dst: {padded:?}}}); return "ran"; }}
+            catch (e) {{ return "refused:" + e.kind; }}"#
+        );
+        let out = tool_with(CodeConfig::default())
+            .run_with_emit(&json!({"code": code}), &ctx(&dir), &mut |_| {})
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        // The 中-1 / fail-closed refusal must precede the copy — the guest
+        // observes a denial, and nothing lands at the link target.
+        assert!(
+            out.content.contains("refused:denied"),
+            "the padded copy must be refused before any write: {}",
+            out.content
+        );
+        assert!(
+            !leak.exists(),
+            "bytes reached outside the workdir through the symlink ({})",
+            leak.display()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    /// fs_write_dirs entries are lexical dir paths: on Windows
+    /// lexical_normalize re-joins with MAIN_SEPARATOR, so a multi-segment
+    /// entry stayed `out\sub` against the `/`-separated rel side — every
+    /// multi-segment entry was a dead rule and ALL in-dir writes were
+    /// refused as "outside code.fs_write_dirs". The entry side now folds `\`
+    /// to `/` exactly like deny_match's pattern side. Single-segment entries
+    /// never had a separator to fold (control anchors below).
+    #[cfg(windows)]
+    #[test]
+    fn fs_write_dirs_multi_segment_entry_matches_on_windows() {
+        // Unit half: the documented contract (rel == dir, or nested under it).
+        assert!(
+            under_write_dir(&["out/sub".to_string()], "out/sub/x.txt"),
+            "multi-segment entry must match its own subtree"
+        );
+        assert!(
+            under_write_dir(&[r"out\sub".to_string()], "out/sub/x.txt"),
+            "backslashed multi-segment spelling folds to the same rule"
+        );
+        assert!(
+            !under_write_dir(&["out/sub".to_string()], "out/other.txt"),
+            "the entry must not swallow sibling subtrees"
+        );
+        // Control anchors: single-segment entries, and deny_match's pattern
+        // side (already folding — the two policy faces stay symmetric).
+        assert!(under_write_dir(&["out".to_string()], "out/x.txt"));
+        assert!(deny_match(&[r"lib\x.js".to_string()], "lib/x.js"));
+
+        // End-to-end half: fs_write_dirs = ["out/sub"], writing inside it
+        // must pass the policy layer.
+        let dir = scratch();
+        std::fs::create_dir_all(dir.join("out/sub")).unwrap();
+        let cc = CodeConfig {
+            fs_write_dirs: vec!["out/sub".into()],
+            ..CodeConfig::default()
+        };
+        let out = tool_with_tools(cc, r#"["read_file","write_file"]"#)
+            .run_with_emit(
+                &json!({"code": r#"
+                    try { tools.call("write_file", {path: "out/sub/x.txt", content: "ok"}); return "wrote"; }
+                    catch (e) { return "refused:" + e.message; }"#}),
+                &ctx(&dir),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(
+            out.content.contains("wrote"),
+            "an in-dir write must not be refused by a dead rule: {}",
+            out.content
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("out/sub/x.txt")).unwrap(),
+            "ok"
+        );
+    }
+
+    /// Windows drive-relative write spellings (`C:foo` — prefix without
+    /// root) are refused by BOTH write arms outright: the symlink walk's
+    /// lexical screen cannot see them (`join` truncates at the prefix), while
+    /// workdir_relative's canonicalize judges them against the per-drive cwd
+    /// — with that cwd on the workdir's drive, the same physical write
+    /// flipped verdicts with the spelling alone. The refusal is purely
+    /// lexical (no cwd, no filesystem state), so this test is parallel-safe;
+    /// absolute spellings and bare names keep their ordinary judgments
+    /// (anchors below). Unix never produces the shape (cfg(windows)).
+    #[cfg(windows)]
+    #[test]
+    fn drive_relative_write_spelling_refused_by_both_write_arms() {
+        let dir = scratch();
+        let canon = dir.canonicalize().unwrap();
+        let snap = CodeConfig::default();
+
+        // The shape, unit-level: prefix without root = drive-relative.
+        assert!(is_drive_relative("C:out.txt"));
+        assert!(is_drive_relative("C:"));
+        assert!(
+            !is_drive_relative(r"C:\out.txt"),
+            "prefix + root = absolute"
+        );
+        assert!(
+            !is_drive_relative("out.txt"),
+            "a bare name carries no prefix"
+        );
+
+        // write_file arm refuses; bare and absolute-inside spellings pass.
+        let refused =
+            intercept_file_paths("write_file", &json!({"path": "C:out.txt"}), &snap, &canon);
+        assert!(
+            refused
+                .as_deref()
+                .unwrap_or_default()
+                .contains("drive-relative"),
+            "drive-relative write_file path must be refused: {refused:?}"
+        );
+        assert_eq!(
+            intercept_file_paths("write_file", &json!({"path": "out.txt"}), &snap, &canon),
+            None,
+            "bare in-workdir spelling stays writable"
+        );
+        assert_eq!(
+            intercept_file_paths(
+                "write_file",
+                &json!({"path": canon.join("ok.txt").to_string_lossy()}),
+                &snap,
+                &canon
+            ),
+            None,
+            "absolute inside-workdir spelling stays writable"
+        );
+
+        // copy_bytes dst arm refuses; its bare twin passes.
+        let refused = intercept_copy(&json!({"src": "in.txt", "dst": "C:bak.bin"}), &snap, &canon);
+        assert!(
+            refused
+                .as_deref()
+                .unwrap_or_default()
+                .contains("drive-relative"),
+            "drive-relative copy dst must be refused: {refused:?}"
+        );
+        assert_eq!(
+            intercept_copy(&json!({"src": "in.txt", "dst": "bak.bin"}), &snap, &canon),
+            None,
+            "bare copy dst stays writable"
+        );
+    }
+
+    /// The over-cap "treated as non-matching" warn fires ONCE per pattern
+    /// value per process: deny_match runs per inner file call × per pattern,
+    /// so one bad config entry used to repeat the warn on every call of a
+    /// long batch task. The pattern below sits over the cap by a distinctive
+    /// margin AND is lexically unique in this suite, so the counted message
+    /// (which carries its own segment count) cannot come from another test's
+    /// over-cap pattern.
+    #[test]
+    fn glob_over_cap_pattern_warns_once_per_pattern_value() {
+        const EXTRA: usize = 3;
+        let over_cap = vec!["capskip-uniq"; MAX_GLOB_PATTERN_SEGMENTS + EXTRA].join("/");
+        let needle = format!(
+            "collapses to {} segments",
+            MAX_GLOB_PATTERN_SEGMENTS + EXTRA
+        );
+        let _g = crate::diag::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let got: std::sync::Arc<std::sync::Mutex<Vec<(crate::diag::DiagLevel, String)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let g = got.clone();
+        crate::diag::install_diag_sink(Box::new(move |lvl, msg| {
+            g.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((lvl, msg.to_owned()))
+        }));
+        for _ in 0..5 {
+            assert!(!deny_match(std::slice::from_ref(&over_cap), "x"));
+        }
+        crate::diag::clear_diag_sink();
+        let got = got.lock().unwrap_or_else(|e| e.into_inner());
+        let hits = got
+            .iter()
+            .filter(|(l, m)| *l == crate::diag::DiagLevel::Warn && m.contains(&needle))
+            .count();
+        assert_eq!(
+            hits, 1,
+            "the over-cap warn must be deduplicated per pattern value \
+             (5 calls → 1 warn): {got:?}"
+        );
     }
 }

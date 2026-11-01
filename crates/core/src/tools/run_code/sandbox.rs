@@ -112,7 +112,10 @@ pub(super) fn ensure_ticker() {
         // .expect here took down the whole process — the exact inconsistency
         // the graceful engine path exists to avoid (external re-review). Skip
         // arming with a stderr note instead: fuel/mem still bound the guest,
-        // only the epoch (wall-clock) interruption is lost.
+        // only the epoch-delivered interruptions are lost — and BOTH in-flight
+        // delivery vehicles ride the same ticker (cancel and the wall-clock
+        // deadline are both checked in the epoch callback), so both die with
+        // it.
         if std::thread::Builder::new()
             .name("code-epoch-ticker".into())
             .spawn(move || loop {
@@ -121,7 +124,11 @@ pub(super) fn ensure_ticker() {
             })
             .is_err()
         {
-            crate::diag::diag_warn!("run_code: epoch-ticker thread failed to spawn — wall-clock interruption disabled (fuel/mem limits still active)");
+            crate::diag::diag_warn!(
+                "run_code: epoch-ticker thread failed to spawn — cancel/\
+                 wall-clock epoch interruption disabled (fuel/mem limits \
+                 still active)"
+            );
         }
     });
 }
