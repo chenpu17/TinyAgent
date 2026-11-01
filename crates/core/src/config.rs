@@ -362,7 +362,7 @@ impl fmt::Debug for McpServerConfig {
 /// debuggability. A direct dependency plus that drift for ~15 lines of
 /// bounded scanning is the worse trade; every slice below lands on a
 /// separator the scan itself found, so the function cannot panic.
-fn redact_url_credentials(url: &str) -> Cow<'_, str> {
+pub(crate) fn redact_url_credentials(url: &str) -> Cow<'_, str> {
     // No `scheme://` → no authority to scan (relative refs, `localhost:8080`,
     // garbage): display verbatim — the untrusted-input fallback IS display.
     let Some(scheme_end) = url.find("://") else {
