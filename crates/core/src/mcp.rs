@@ -322,6 +322,19 @@ fn bound_tools(tools: Value, server: &str) -> Vec<McpToolInfo> {
             crate::tools::truncate(&mut description, MCP_TOOL_DESC_MAX);
         }
         let input_schema = t["inputSchema"].clone();
+        // A NON-object schema (a number, string or array) would ride verbatim
+        // into every provider request (anthropic `input_schema` / openai
+        // `parameters`) and 400 the WHOLE session — the exact fate the size
+        // guard below exists to prevent ("a garbage schema just moves the
+        // failure into every later request"). Same drop-with-warning policy as
+        // the empty name above. Null (missing field) survives: start_server
+        // swaps in the default empty-object schema for it.
+        if !input_schema.is_null() && !input_schema.is_object() {
+            crate::diag::diag_warn!(
+                "[warn] MCP '{server}': tool '{name}' inputSchema is not an object; ignoring the tool"
+            );
+            continue;
+        }
         if serde_json::to_string(&input_schema)
             .map(|s| s.len())
             .unwrap_or(usize::MAX)
@@ -1714,12 +1727,13 @@ fn standalone_stream_round(
     // read. Expiry surfaces as an io::Error wrapping a reqwest::Error —
     // classified by is_stream_round_timeout below, never by ErrorKind
     // (into_io pins that to Other).
-    let mut resp = match req.timeout(round).send() {
+    let mut resp = match req.timeout(round).send().map_err(strip_reqwest_url) {
         Ok(r) => r,
         Err(e) => {
             // Connect/network failure (server down, proxy reset): retry —
             // the standing stream is the delivery channel for future 202s,
-            // and the server coming back revives it.
+            // and the server coming back revives it. The error is
+            // URL-stripped (a configured URL may carry userinfo credentials).
             crate::diag::diag_warn!(
                 "[warn] MCP HTTP standalone stream connect failed ({e}); retrying"
             );
@@ -1759,8 +1773,12 @@ fn standalone_stream_round(
                 if is_stream_round_timeout(&e) {
                     return StandaloneRound::Expired;
                 }
+                // `e`'s chain can carry a reqwest error (an io error wrapping
+                // one) whose Display embeds the full request URL — render it
+                // through the redaction pass.
                 crate::diag::diag_warn!(
-                    "[warn] MCP HTTP standalone stream read stopped: {e:#}; reconnecting"
+                    "[warn] MCP HTTP standalone stream read stopped: {}; reconnecting",
+                    redacted_chain(&e)
                 );
                 return StandaloneRound::Ended;
             }
@@ -2274,8 +2292,8 @@ fn read_sse_event<R: BufRead>(
 /// server could otherwise redirect the authenticated POST (config headers) to
 /// an attacker or internal address.
 fn resolve_endpoint(sse_url: &str, endpoint: &str) -> Result<reqwest::Url> {
-    let base =
-        reqwest::Url::parse(sse_url).map_err(|e| anyhow!("invalid SSE URL {sse_url}: {e}"))?;
+    let base = reqwest::Url::parse(sse_url)
+        .map_err(|e| anyhow!("invalid SSE URL {}: {e}", redact_url_credentials(sse_url)))?;
     // WHATWG join covers all three endpoint shapes a legacy SSE server sends:
     // absolute (`http://…`), network-path (`//host/…`, borrows the base
     // scheme) and relative (`/path`, `?q`). Malformed input (control chars,
@@ -2287,8 +2305,9 @@ fn resolve_endpoint(sse_url: &str, endpoint: &str) -> Result<reqwest::Url> {
         Ok(abs)
     } else {
         bail!(
-            "MCP SSE endpoint '{endpoint}' is not on the same origin as '{sse_url}' \
-             (possible SSRF); refusing"
+            "MCP SSE endpoint '{endpoint}' is not on the same origin as '{}' \
+             (possible SSRF); refusing",
+            redact_url_credentials(sse_url)
         )
     }
 }
@@ -5178,7 +5197,7 @@ mod tests {
     }
 
     // ─── 传输回归钉子：GET-405 直答形态、legacy SSE 会话绑定轮转、
-    // reader 死亡 latch ───
+    // inputSchema 闸门、URL 凭据脱敏、reader 死亡 latch ───
 
     /// Like [`mock_read_request`] but also returns the request BODY (for mocks
     /// that route on the JSON-RPC method/id inside a POST body).
@@ -5587,6 +5606,81 @@ mod tests {
         assert!(
             served_by.is_some_and(|s| s >= 3),
             "must be served by a CURRENT (post-rotation) session, got {served_by:?}"
+        );
+    }
+
+    #[test]
+    fn bound_tools_drops_tools_with_non_object_schema() {
+        // 非 object 的 inputSchema（42 / "x" / []）会逐字发给 provider，使整个
+        // 会话每个请求 400——与「空名工具丢弃」同政策：diag_warn + 丢弃。
+        // 缺失（Null）必须保留（下游换默认 schema）。
+        let tools = json!({"tools": [
+            {"name": "good", "inputSchema": {"type": "object", "properties": {}}},
+            {"name": "num", "inputSchema": 42},
+            {"name": "str", "inputSchema": "x"},
+            {"name": "arr", "inputSchema": []},
+            {"name": "no_schema"}
+        ]});
+        let infos = bound_tools(tools, "srv");
+        let names: Vec<&str> = infos.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["good", "no_schema"],
+            "non-object schemas must be dropped like other garbage input, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn sse_diagnostics_do_not_leak_url_userinfo() {
+        // 配置 URL 带 userinfo 凭据时，任何诊断与返回错误都不得含凭据明文
+        // （与 McpServerConfig Debug 的脱敏政策一致）。本 mock 下发跨源
+        // endpoint，走通同源拒绝的最长诊断链路（diag + 返回错误）。
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://user:secret@127.0.0.1:{port}/sse");
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            let _ = mock_read_request(&mut sock);
+            let resp = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                        cache-control: no-cache\r\nconnection: close\r\n\r\n\
+                        event: endpoint\ndata: http://evil.example:99/messages\n\n";
+            sock.write_all(resp.as_bytes()).ok();
+            sock.flush().ok();
+            std::thread::sleep(Duration::from_millis(300));
+        });
+        let cfg = McpServerConfig {
+            name: "m05".into(),
+            command: None,
+            args: vec![],
+            env: HashMap::new(),
+            url: Some(url.clone()),
+            transport: Some(McpTransport::Sse),
+            headers: HashMap::new(),
+        };
+        let _guard = crate::diag::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let warnings = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&warnings);
+        crate::diag::install_diag_sink(Box::new(move |level, msg| {
+            if level == crate::diag::DiagLevel::Warn {
+                sink.lock().unwrap().push(msg.to_string());
+            }
+        }));
+        let Err(err) = SseTransport::connect(&url, &cfg) else {
+            panic!("cross-origin endpoint must be refused");
+        };
+        let captured = warnings.lock().unwrap().clone();
+        crate::diag::clear_diag_sink();
+        server.join().expect("mock thread");
+        assert!(
+            !captured.iter().any(|m| m.contains("user:secret")),
+            "diag must not leak userinfo, got {captured:?}"
+        );
+        assert!(
+            !format!("{err:#}").contains("user:secret"),
+            "returned error must not leak userinfo, got {err:#}"
         );
     }
 

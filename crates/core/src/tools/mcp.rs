@@ -129,6 +129,27 @@ fn shape_result(result: &Value, max_output_chars: usize, text_budget: usize) -> 
         }
         text.push_str(&note);
     }
+    // MCP 2025-06-18: a `tools/call` result may carry `structuredContent`; the
+    // spec only SHOULDs a TextContent mirror of it, so a structured-only server
+    // would otherwise render as "[empty tool result]". Surface the object
+    // serialized as one text segment (same accumulation budget; content takes
+    // precedence — no double mirror when both are present). Runs after the
+    // annotation notes, so budget overflow here can't join them — the final
+    // max_output_chars truncate bounds what the model sees either way.
+    if text.is_empty() && image.is_none() {
+        if let Some(sc) = result.get("structuredContent") {
+            if sc.is_object() {
+                if let Ok(seg) = serde_json::to_string(sc) {
+                    let room = text_budget;
+                    let mut take = room.min(seg.len());
+                    while !seg.is_char_boundary(take) {
+                        take -= 1;
+                    }
+                    text.push_str(&seg[..take]);
+                }
+            }
+        }
+    }
     if text.is_empty() && image.is_none() {
         text = "[empty tool result]".into();
     }
@@ -466,6 +487,32 @@ mod tests {
         let out = shape_result(&result, 4000, 2048);
         assert_eq!(out.content, "alpha\nbeta");
         assert!(!out.content.contains('['), "no annotation injected");
+    }
+
+    #[test]
+    fn shape_result_falls_back_to_structured_content() {
+        // MCP 2025-06-18 起 tools/call 结果可带 structuredContent；规范只
+        // SHOULD 要求 TextContent 镜像——不镜像的 server 下模型只会拿到
+        // "[empty tool result]"。约束：content 无 text/image 且
+        // structuredContent 为 object 时，把该对象序列化为一个 text 段
+        // （受同一 budget）；content 优先，不重复镜像。
+        let structured_only = json!({"structuredContent": {"answer": 42}});
+        let out = shape_result(&structured_only, 4000, 2048);
+        assert!(
+            out.content.contains("42"),
+            "structured-only result must surface to the model, got {:?}",
+            out.content
+        );
+        assert_ne!(out.content, "[empty tool result]");
+        let mirrored = json!({
+            "content": [{"type": "text", "text": "hello"}],
+            "structuredContent": {"answer": 42}
+        });
+        let out2 = shape_result(&mirrored, 4000, 2048);
+        assert_eq!(
+            out2.content, "hello",
+            "content takes precedence; no double mirror"
+        );
     }
 
     #[test]
