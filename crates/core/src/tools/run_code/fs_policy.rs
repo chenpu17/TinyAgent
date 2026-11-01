@@ -36,6 +36,16 @@ pub(super) fn intercept_file_paths(
     };
     let is_write = WRITE_TOOLS.contains(&name);
 
+    // Over-cap RAW spellings are payloads, not filenames — refused
+    // fail-closed on BOTH arms (reads included): workdir_relative answers
+    // None for the class ("policy can't see it"), and letting that pass a
+    // read let a PADDING spelling whose resolved form lands inside the
+    // workdir (`"a/../"×128 + ".env"`, 257 components, ≤4096 bytes) slip
+    // the deny_paths hit the bare spelling gets.
+    if is_over_cap_spelling(path) {
+        return Some(over_cap_refusal());
+    }
+
     // 中-1 (whole-chain, per sec-review M-1): writes reject a symlink in ANY
     // component under the workdir, not just the final one. A symlinked
     // component makes the write's real destination unknowable from the
@@ -113,10 +123,12 @@ pub(super) fn intercept_file_paths(
 /// The `copy_bytes` arm of [`intercept_file_paths`] (v2 review): a copy is a
 /// read of `src` AND a write of `dst`, so each side gets its own policy —
 /// `src` under READ rules (deny_paths only; outside-workdir reads stay the
-/// documented 中-2 boundary), `dst` under WRITE rules (symlink-traversal
-/// refusal, workdir confinement, deny_paths, fs_write_dirs — same order as
-/// the main arm). Missing/ill-typed fields pass through as `None` so the
-/// tool itself reports them, mirroring the main arm.
+/// documented 中-2 boundary; over-cap raw spellings are the payload
+/// exception — refused, see [`is_over_cap_spelling`]), `dst` under WRITE
+/// rules (symlink-traversal refusal, workdir confinement, deny_paths,
+/// fs_write_dirs — same order as the main arm). Missing/ill-typed fields
+/// pass through as `None` so the tool itself reports them, mirroring the
+/// main arm.
 pub(super) fn intercept_copy(
     effective: &Value,
     snap: &CodeConfig,
@@ -124,6 +136,13 @@ pub(super) fn intercept_copy(
 ) -> Option<String> {
     let src = effective.get("src").and_then(Value::as_str)?;
     let dst = effective.get("dst").and_then(Value::as_str)?;
+    // Over-cap RAW spellings are payloads, refused on BOTH sides fail-closed
+    // (see [`is_over_cap_spelling`] — a padded src whose resolved form lands
+    // inside must not slip deny_paths; dst used to fall into the
+    // outside-workdir refusal, same verdict, now the dedicated message).
+    if is_over_cap_spelling(dst) || is_over_cap_spelling(src) {
+        return Some(over_cap_refusal());
+    }
     // dst first — a refused write should fail before the read is even judged.
     // Drive-relative spellings cannot be judged by the screens below (see
     // [`is_drive_relative`]) — refused before any resolution happens.
@@ -249,9 +268,11 @@ pub(super) fn absolutize(workdir: &Path, path: &str) -> PathBuf {
 
 /// Normalize to the workdir-relative, `/`-separated form. Returns `None`
 /// when the path resolves outside the workdir (deny_paths "not applicable")
-/// or is too long/deep to be a real path (see [`MAX_REL_PATH_BYTES`] —
-/// reads then fall through to the tool and fail naturally, writes are
-/// denied). Canonicalize first (resolving symlinks that EXIST); on failure
+/// or is over-cap (see [`is_over_cap_spelling`] — the interception arms
+/// refuse that class with a dedicated message on BOTH arms BEFORE calling
+/// this, so for the arms a `None` from here means "resolves outside" only;
+/// the entry cap below stays as the backstop for any future caller).
+/// Canonicalize first (resolving symlinks that EXIST); on failure
 /// (target not there yet — the normal write case) resolve the deepest
 /// EXISTING ancestor of the ORIGINAL spelling and append the remainder
 /// ([`resolve_via_existing_ancestor`]) — kernel-truth, unlike the previous
@@ -264,26 +285,19 @@ pub(super) fn workdir_relative(workdir_canon: &Path, path: &str) -> Option<Strin
     // "a/../"×128 + "bak" (643 bytes, 257 components) resolves to rel = "bak"
     // (both caps pass) while the symlink walk bails on the 257-component
     // ORIGINAL, so the verdict flipped with the spelling alone (audit
-    // follow-up). Over-limit strings are payloads, not filenames (see the
-    // MAX_* docs): reads pass through and fail naturally at the tool, writes
-    // are denied.
-    let raw = Path::new(path);
-    if path.len() > MAX_REL_PATH_BYTES || raw.components().count() > MAX_REL_SEGMENTS {
+    // follow-up). Over-cap strings are payloads, not filenames (see the
+    // MAX_* docs): the arms refuse them on BOTH read and write faces — a
+    // padded spelling whose resolved form lands inside the workdir must not
+    // slip deny_paths on the read side either.
+    if is_over_cap_spelling(path) {
         return None;
     }
     let full = absolutize(workdir_canon, path);
     let canon = match full.canonicalize() {
         Ok(c) => c,
-        Err(_) => {
-            // Payload guard BEFORE the ancestor walk: over-long spellings end
-            // up denied (writes) / pass-through-then-ENOENT (reads) either
-            // way — bound the one-canonicalize-per-level walk first
-            // (sec-review M-2 shape).
-            if path.len() > MAX_REL_PATH_BYTES {
-                return None;
-            }
-            resolve_via_existing_ancestor(&full).unwrap_or_else(|| lexical_normalize(&full))
-        }
+        // The entry cap above already bounds the one-canonicalize-per-level
+        // walk (sec-review M-2 shape) — nothing further to check here.
+        Err(_) => resolve_via_existing_ancestor(&full).unwrap_or_else(|| lexical_normalize(&full)),
     };
     let rel = canon.strip_prefix(workdir_canon).ok()?;
     let rel = rel.to_string_lossy().replace('\\', "/");
@@ -291,6 +305,27 @@ pub(super) fn workdir_relative(workdir_canon: &Path, path: &str) -> Option<Strin
         return None;
     }
     Some(rel)
+}
+
+/// Over-cap RAW spelling (payload bound, sec-review M-2 + audit follow-up):
+/// past [`MAX_REL_PATH_BYTES`] bytes or [`MAX_REL_SEGMENTS`] components the
+/// string is not a filename but a payload. Judged on the ORIGINAL spelling —
+/// `..` padding self-cancels under resolution, so the resolved form can sit
+/// inside the workdir while the original trips the caps. The interception
+/// arms refuse the class fail-closed on BOTH read and write faces; this
+/// predicate is the single source the arms and [`workdir_relative`]'s entry
+/// cap share.
+pub(super) fn is_over_cap_spelling(path: &str) -> bool {
+    path.len() > MAX_REL_PATH_BYTES || Path::new(path).components().count() > MAX_REL_SEGMENTS
+}
+
+/// The shared refusal text for an over-cap raw spelling (one message for
+/// both arms — the payload class is not a per-arm policy question).
+fn over_cap_refusal() -> String {
+    format!(
+        "run_code: refusing an over-long path spelling \
+         (> {MAX_REL_PATH_BYTES} bytes or > {MAX_REL_SEGMENTS} components)"
+    )
 }
 
 /// Kernel-truth resolution for a path whose tail does not exist yet (the
@@ -530,6 +565,11 @@ pub(super) fn under_write_dir(dirs: &[String], rel: &str) -> bool {
 /// keep the documented 中-2 boundary (outside reads pass unseen). On unix
 /// `Component::Prefix` never matches, so "C:foo" stays an ordinary — and
 /// walkable — filename.
+///
+/// The VERBATIM drive-relative form (`\\?\C:foo`) never reaches this check:
+/// std parses it as an absolute verbatim prefix (no escape found — verified
+/// with a rustc probe), its canonicalize/open already fails at the kernel
+/// level, and the outside-workdir rule refuses it from there.
 fn is_drive_relative(path: &str) -> bool {
     use std::path::Component;
     let p = Path::new(path);
@@ -1356,7 +1396,9 @@ mod tests {
 
     /// Sec-review M-2: a ~500k-segment guest path is a payload, not a
     /// filename — it must cost neither host stack (recursive glob matcher)
-    /// nor time. Reads fall through and fail at the tool; writes are denied.
+    /// nor time. Both arms refuse it fail-closed (the interception layer
+    /// answers with the over-long-path policy error before any resolution;
+    /// earlier reads fell through to the tool's ENOENT instead).
     #[test]
     fn absurdly_deep_path_is_not_a_recursion_bomb() {
         let deep = format!("{}x", "a/".repeat(60_000));
@@ -2154,6 +2196,81 @@ mod tests {
         );
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&outside).ok();
+    }
+
+    /// Over-cap RAW spellings are refused fail-closed on the READ arm too
+    /// (audit follow-up): workdir_relative answers None for the class
+    /// ("policy can't see it"), and letting that pass a read let a PADDING
+    /// spelling whose resolved form lands INSIDE the workdir
+    /// (`"a/../"×128 + ".env"` — 644 bytes, 257 components, resolving to
+    /// plain ".env") slip the deny_paths hit the bare spelling gets, through
+    /// read_file AND copy_bytes' src. Both faces now get the dedicated
+    /// over-long-path refusal; normal-length reads/copies are untouched and
+    /// the bare-spelling deny rule stays alive (control anchors).
+    #[test]
+    fn over_cap_padded_read_spelling_refused_on_both_read_faces() {
+        let dir = scratch();
+        std::fs::write(dir.join(".env"), "SECRET=1\n").unwrap();
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::fs::create_dir_all(dir.join("out")).unwrap();
+        std::fs::write(dir.join("plain.txt"), "hello\n").unwrap();
+        let padded: String = "a/../".repeat(128) + ".env";
+        assert_eq!(padded.len(), 644, "under the byte cap — components trip it");
+        assert_eq!(Path::new(&padded).components().count(), 257);
+        let out = tool_with_tools(CodeConfig::default(), r#"["read_file"]"#)
+            .run_with_emit(
+                &json!({"code": format!(r#"
+                    const r = [];
+                    try {{
+                        const c = tools.call("read_file", {{path: {padded:?}}});
+                        r.push(c.indexOf("SECRET") >= 0 ? "padded-read:LEAKED" : "padded-read:ran");
+                    }}
+                    catch (e) {{
+                        r.push("padded-read:" + (String(e.message).indexOf("over-long") >= 0
+                            ? "refused-over-cap" : "other:" + String(e.message).slice(0, 40)));
+                    }}
+                    try {{ tools.call("copy_bytes", {{src: {padded:?}, dst: "out/x.bin"}}); r.push("padded-src:ran"); }}
+                    catch (e) {{
+                        r.push("padded-src:" + (String(e.message).indexOf("over-long") >= 0
+                            ? "refused-over-cap" : "other:" + String(e.message).slice(0, 40)));
+                    }}
+                    try {{ tools.call("read_file", {{path: ".env"}}); r.push("bare-env:ran"); }}
+                    catch (e) {{
+                        r.push("bare-env:" + (String(e.message).indexOf("deny_paths") >= 0 ? "denied" : "other"));
+                    }}
+                    tools.call("read_file", {{path: "plain.txt"}});
+                    r.push("plain:ran");
+                    tools.call("copy_bytes", {{src: "plain.txt", dst: "out/ok.bin"}});
+                    r.push("plain-copy:ran");
+                    return r;"#)}),
+                &ctx(&dir),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        for want in [
+            "padded-read:refused-over-cap",
+            "padded-src:refused-over-cap",
+            "bare-env:denied",
+            "plain:ran",
+            "plain-copy:ran",
+        ] {
+            assert!(
+                out.content.contains(want),
+                "expected {want} in the guest result: {}",
+                out.content
+            );
+        }
+        assert!(
+            !out.content.contains("SECRET"),
+            "the secret must not surface in any output: {}",
+            out.content
+        );
+        assert!(
+            !dir.join("out/x.bin").exists(),
+            "the refused copy must not land (its src is the secret)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// fs_write_dirs entries are lexical dir paths: on Windows

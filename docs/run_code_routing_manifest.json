@@ -8,7 +8,7 @@
     "crates/core/src/tools/run_code/contract.rs": "2372dd3b1b733982310de80eb4c48a1d94d460b4155d7476d529a53fcfcf4c6a",
     "crates/core/src/tools/run_code/sandbox.rs": "2a353537d8c44898ae19e322b9a7f3752faf9814048d1de4779f911b695ecc6a",
     "crates/core/src/tools/run_code/guest_api.rs": "f645daaf5cd444ea5e059ea2f625cacce6a4f52fbb28219395994234dfd782cb",
-    "crates/core/src/tools/run_code/fs_policy.rs": "9f9435093e8bdd02d299f7f72e284a6d495784af33b227c86f3aaa15f4d83628",
+    "crates/core/src/tools/run_code/fs_policy.rs": "84b47d96d8f21cd0ca13df143b03ee0b8e86dff415e854135b23a4163bdd0bae",
     "crates/core/src/tools/run_code/lib_index.rs": "1ec3b9c65a3dafce02bc73d2f7202aeef8352087305759db699c88f679919913",
     "crates/core/src/tools/run_code/batch.rs": "02b278e157f5cdbcdf2eec4bc9526fd9360040aa820dc1d6e0613d7bfae52587",
     "crates/core/src/tools/run_code/precheck.rs": "fa59312c184bafdc63d645ed7e1735055f5e05281d66cff688e186450945b728",
