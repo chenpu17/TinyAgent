@@ -137,11 +137,11 @@ pub(super) fn code_log_row(line: String) -> Row {
 /// cut mid-paragraph) folds into the previous block with a single `\n`, so
 /// concatenated chunks reassemble the original text; everything else starts
 /// after a blank line. A tight chunk cut inside a code fence begins with a
-/// synthetic opener — three of the fence's marker char, ``` or ~~~ (see
-/// `split_streaming_row`) — so it renders as code on its own; stripped here,
-/// the model never wrote that line. Corner case: a model-emitted bare fence
-/// opener landing exactly on a cut line loses that line in the dump
-/// (readability export, not an archive).
+/// synthetic opener — the fence's marker char at the opener's length, ``` or
+/// ~~~ alike (see `split_streaming_row`) — so it renders as code on its own;
+/// stripped here, the model never wrote that line. Corner case: a
+/// model-emitted bare fence opener landing exactly on a cut line loses that
+/// line in the dump (readability export, not an archive).
 pub(super) fn render_transcript(rows: &[Row]) -> String {
     let mut out = String::new();
     for row in rows {
@@ -155,10 +155,7 @@ pub(super) fn render_transcript(rows: &[Row]) -> String {
             Row::AssistantCont { text: t, .. } if t.is_empty() => continue,
             Row::AssistantCont { text: t, tight } => {
                 let body = if *tight {
-                    // Either marker shape (see split_streaming_row).
-                    t.strip_prefix("```\n")
-                        .or_else(|| t.strip_prefix("~~~\n"))
-                        .unwrap_or(t)
+                    strip_synthetic_opener(t)
                 } else {
                     t.as_str()
                 };
@@ -193,6 +190,26 @@ pub(super) fn render_transcript(rows: &[Row]) -> String {
     }
     out.push_str("\n\n");
     out
+}
+
+/// Strip the synthetic fence opener `split_streaming_row` prepends to a tail
+/// cut inside an open fence: a leading run of ≥3 identical marker chars
+/// (` or ~) followed by a newline. Matched by run length — not a fixed
+/// prefix — so any opener the splitter can write (3, 4, … markers) comes
+/// back out whole; a shorter leading run, or markers with no newline after
+/// them, is the model's own content and stays.
+fn strip_synthetic_opener(t: &str) -> &str {
+    let first = match t.chars().next() {
+        Some(c @ ('`' | '~')) => c,
+        _ => return t,
+    };
+    let run = t.chars().take_while(|&c| c == first).count();
+    let bytes = run * first.len_utf8();
+    if run >= 3 && t.as_bytes().get(bytes) == Some(&b'\n') {
+        &t[bytes + 1..]
+    } else {
+        t
+    }
 }
 
 /// Rebuild a resumed session's messages as display rows, so `--resume` opens
@@ -348,8 +365,8 @@ fn push_tool_head(lines: &mut Vec<Line<'static>>, head: Line<'static>, hang: usi
 /// Build styled history lines for the conversation. Used two ways: to render
 /// finalized rows into the terminal scrollback (via `commit_rows`), and to
 /// render the in-flight streaming row live in the viewport zone. Split out of
-/// the draw/commit paths so role hierarchy, colors, `│ ` guides, the streaming
-/// cursor, and the empty placeholder are unit-testable without a terminal.
+/// the draw/commit paths so role hierarchy, colors, `│ ` guides, and the
+/// streaming cursor are unit-testable without a terminal.
 ///
 /// Render one Assistant(-shaped) body: markdown via MdCache, indented under
 /// the role column. `head` swaps the first line's indent for the bold `● `
@@ -436,23 +453,6 @@ pub(super) fn build_history_lines(
     trailing_spacer: bool,
 ) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
-    if rows.is_empty() && !thinking {
-        // Empty conversation (post-/clear): the guide line plus a key
-        // cheat-sheet — cheapest onboarding real estate there is. The newline
-        // and cancel keys are the two highest-frequency confusions (a bare
-        // Enter sends, so multi-line needs a discoverable escape hatch; Esc
-        // only cancels mid-run), so they earn a line over everything else.
-        let style = Style::default().fg(dim_fg()).add_modifier(Modifier::ITALIC);
-        for l in [
-            "  no messages yet — type below; /help lists commands",
-            "  / completes commands · Enter sends",
-            "  Alt+Enter (or \\+Enter) newline · Esc cancels a run",
-            "  scroll / select / copy are native to your terminal",
-        ] {
-            lines.push(Line::from(Span::styled(l.to_string(), style)));
-        }
-        return lines;
-    }
     let marker = "    ";
     for (idx, row) in rows.iter().enumerate() {
         match row {
@@ -960,19 +960,22 @@ pub(super) const LIVE_TAIL_ROWS: usize = 2;
 /// Byte offset where a DISPLAY-row cut may split `text` so the tail keeps
 /// ~`keep_rows` wrapped rows: the cut always sits on a wrap boundary (a char
 /// that starts a fresh display row — the char after a `\n`, or the char that
-/// overflows the width). Returns (offset, fence) — `fence` is `Some(ch)` when
-/// the cut lands INSIDE an unclosed fence of marker char `ch`; the caller
-/// then re-opens the fence (with its OWN marker char) in the tail so both
-/// halves render as code. A cut landing exactly ON the fence's closing line
-/// slides past it (the closer joins the prefix, tail starts fence-free).
-/// None while the text is too short. Widths use unicode-width per char, the
-/// same tables the renderer wraps with — drift only raggeds the seam
-/// cosmetically, no text is lost or duplicated.
+/// overflows the width). Returns (offset, fence) — `fence` is
+/// `Some((ch, len))` when the cut lands INSIDE an unclosed fence of marker
+/// char `ch` whose opener was `len` markers long; the caller then re-opens
+/// the fence in the tail with the same marker at that length (min 3) so both
+/// halves render as code — a length-blind 3-marker reopen would let the
+/// block's own shorter marker lines close the synthetic opener. A cut
+/// landing exactly ON the fence's closing line slides past it (the closer
+/// joins the prefix, tail starts fence-free). None while the text is too
+/// short. Widths use unicode-width per char, the same tables the renderer
+/// wraps with — drift only raggeds the seam cosmetically, no text is lost or
+/// duplicated.
 pub(super) fn soft_cut_offset(
     text: &str,
     width: usize,
     keep_rows: usize,
-) -> Option<(usize, Option<char>)> {
+) -> Option<(usize, Option<(char, usize)>)> {
     let w = width.max(1);
     if keep_rows == 0 {
         return None;
@@ -1004,7 +1007,7 @@ pub(super) fn soft_cut_offset(
                     let nl = text[at..].find('\n')?;
                     return Some((at + nl + 1, None));
                 }
-                return Some((at, fence.map(|(ch, _)| ch)));
+                return Some((at, fence));
             }
             continue;
         }
@@ -1013,7 +1016,7 @@ pub(super) fn soft_cut_offset(
             rows += 1;
             col = 0;
             if rows == target {
-                return Some((i, fence.map(|(ch, _)| ch)));
+                return Some((i, fence));
             }
         }
         col += cw;
@@ -1041,8 +1044,10 @@ pub(super) fn soft_cut_offset(
 ///   box until it closes (the pre-row-cut behavior). The chunk is
 ///   `tight: true` (mid-paragraph: renders flush, transcript joins with
 ///   `\n`). Cutting inside an open code fence prepends a synthetic opener
-///   to the tail — three of the fence's OWN marker char, so a cut ``` block
-///   re-opens as ``` and a cut ~~~ block as ~~~: the unclosed prefix still
+///   to the tail — the fence's OWN marker char at the opener's length (min
+///   3), so a cut ``` block re-opens as ``` and a cut ```` block as ````:
+///   a shorter synthetic would let the block's own shorter marker lines
+///   close it and leak the rest as markdown. The unclosed prefix still
 ///   renders as a code block, and the tail renders as code on its own;
 ///   thinking rows skip this (plain prose render, a literal fence would
 ///   show).
@@ -1114,12 +1119,15 @@ pub(super) fn split_streaming_row(rows: &mut Vec<Row>, width: usize) {
             return;
         }
         // The cut landed inside an open fence (`fence_reopen` carries its
-        // marker char): re-open the tail with the fence's OWN marker — a
-        // cut ~~~ block re-opens as ~~~, not ```. Thinking rows skip this
+        // marker char and the opener's length): re-open the tail with the
+        // fence's OWN marker at that length (min 3 — the shortest fence the
+        // renderer accepts). Length-true matters: a 4-backtick block's own
+        // ``` content lines must not close the synthetic ``` opener. A cut
+        // ~~~ block re-opens as ~~~, not ```. Thinking rows skip this
         // (plain prose render, a literal fence would show).
         if !is_thinking {
-            if let Some(ch) = fence_reopen {
-                tail = format!("{ch}{ch}{ch}\n{tail}");
+            if let Some((ch, len)) = fence_reopen {
+                tail = format!("{}\n{tail}", ch.to_string().repeat(len.max(3)));
             }
         }
         (tail, tight)

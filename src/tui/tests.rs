@@ -200,25 +200,6 @@ fn history(rows: &[Row]) -> Vec<Line<'static>> {
 }
 
 #[test]
-fn history_empty_shows_dim_italic_placeholder() {
-    let lines = history(&[]);
-    assert_eq!(
-        lines.iter().map(row_text).collect::<Vec<_>>(),
-        vec![
-            "  no messages yet — type below; /help lists commands".to_string(),
-            "  / completes commands · Enter sends".to_string(),
-            "  Alt+Enter (or \\+Enter) newline · Esc cancels a run".to_string(),
-            "  scroll / select / copy are native to your terminal".to_string(),
-        ]
-    );
-    for l in &lines {
-        let st = l.spans[0].style;
-        assert_eq!(st.fg, Some(dim_fg()));
-        assert!(st.add_modifier.contains(Modifier::ITALIC));
-    }
-}
-
-#[test]
 fn theme_light_from_matches_light_case_insensitively() {
     // Only the exact value "light" (ASCII case-insensitive) opts in;
     // unset / "dark" / empty / typo all keep the dark default.
@@ -532,9 +513,8 @@ fn history_thinking_appends_a_transient_placeholder_tail() {
     // Not thinking: no tail, the trailing spacer stays last.
     let lines = history(&rows);
     assert_eq!(row_text(lines.last().unwrap()), "");
-    // Thinking on an EMPTY conversation (a run launched with a task,
-    // before its first row): the placeholder replaces the onboarding
-    // cheat-sheet instead of stacking under it.
+    // The placeholder is row-independent: with no rows at all it is the
+    // whole render.
     let mut cache = MdCache::new();
     let lines = build_history_lines(&[], &mut cache, TEST_W, LiveRow::None, true, true);
     assert_eq!(lines.len(), 1);
@@ -1690,9 +1670,14 @@ fn soft_cut_offset_keeps_tail_rows_and_tracks_fences() {
     // the last-but-one line.
     assert_eq!(soft_cut_offset("a\nb\nc", 80, 1), Some((4, None)));
     assert_eq!(soft_cut_offset("a\nb\nc\nd", 80, 2), Some((4, None)));
-    // Cut inside an open fence (opener before, closer after).
+    // Cut inside an open fence (opener before, closer after): the flag
+    // carries the marker char AND the opener's length (the tail reopens
+    // with a length-true synthetic).
     let fenced = "```\ncode1\ncode2\ncode3";
-    assert_eq!(soft_cut_offset(fenced, 80, 1), Some((16, Some('`'))));
+    assert_eq!(soft_cut_offset(fenced, 80, 1), Some((16, Some(('`', 3)))));
+    // Same for a longer opener: the reopen must not shrink it to ```.
+    let fenced4 = "````\ncode1\ncode2\ncode3";
+    assert_eq!(soft_cut_offset(fenced4, 80, 1), Some((17, Some(('`', 4)))));
     // Cut landing exactly ON the closing fence slides past it: the
     // closer joins the prefix, the tail starts fence-free.
     let closing = "```\nc1\nc2\n```\nz";
@@ -1709,17 +1694,20 @@ fn soft_cut_offset_keeps_tail_rows_and_tracks_fences() {
 
 #[test]
 fn soft_cut_offset_tracks_tilde_fences_and_mixed_markers() {
-    // Cut inside an open ~~~ fence: the fence flag carries the tilde so
-    // the reopen synthesizes ~~~ (not ```).
+    // Cut inside an open ~~~ fence: the fence flag carries the tilde (and
+    // its opener length) so the reopen synthesizes ~~~ (not ```).
     let tilde = "~~~\ncode1\ncode2\ncode3";
-    assert_eq!(soft_cut_offset(tilde, 80, 1), Some((16, Some('~'))));
+    assert_eq!(soft_cut_offset(tilde, 80, 1), Some((16, Some(('~', 3)))));
     // A ``` line inside the open ~~~ block is CONTENT, not a closer —
     // the cut (start of "code3") still reports the tilde fence open.
     let mixed = "~~~\ncode1\n```\ncode2\ncode3";
-    assert_eq!(soft_cut_offset(mixed, 80, 1), Some((20, Some('~'))));
+    assert_eq!(soft_cut_offset(mixed, 80, 1), Some((20, Some(('~', 3)))));
     // Mirror image: a ~~~ line inside a ``` block doesn't close it.
     let mixed_rev = "```\ncode1\n~~~\ncode2\ncode3";
-    assert_eq!(soft_cut_offset(mixed_rev, 80, 1), Some((20, Some('`'))));
+    assert_eq!(
+        soft_cut_offset(mixed_rev, 80, 1),
+        Some((20, Some(('`', 3))))
+    );
     // Cut landing exactly ON the ~~~ closer slides past it, fence-free
     // (and a cut after it closed is a plain cut).
     let closing = "~~~\nc1\nc2\n~~~\nz";
@@ -4018,20 +4006,21 @@ fn ctx_from_usage_saturates_hostile_usage() {
     assert_eq!(ctx_from_usage(100, 20, 30, 10), 160);
 }
 
-/// TUI-04: soft_cut_offset 内部 fence 状态是 (char, usize)，返回时只带
-/// Option<char> 丢掉 opener 长度；split_streaming_row 于是固定用 3 个标记
-/// 字符重开尾段。≥4 标记的外层围栏被切在"内层 ``` 行之后"时，尾段的合成
-/// ``` 被内容里的内层 ``` 当成关闭，其余内容按 markdown 泄漏。
+/// A 4-backtick fence cut inside must reopen the tail with the fence's OWN
+/// length, not a fixed 3-marker synthetic: the block's own ``` CONTENT line
+/// closes a 3-marker opener, and everything after it leaks as markdown.
 #[test]
-fn soft_cut_4_backtick_fence_tail_reopens_with_3_and_inner_fence_closes_it() {
-    // 流式半截文本：4 反引号围栏未闭合，内含 ``` 行；无空行 → 无段落边界，
-    // 走 soft_cut（display-row 切）。每行 1 显示行（宽 200），总 13 行 > 阈值。
+fn soft_cut_4_backtick_fence_tail_reopens_with_its_full_length() {
+    // Streaming half-text: an unclosed 4-backtick fence with a ``` line
+    // inside; no blank line means no paragraph boundary, so the cut is the
+    // display-row soft cut. One display row per line (width 200), 13 rows
+    // total — over the threshold.
     let mut text = String::from("````rust\n");
     for i in 0..10 {
         text.push_str(&format!("code-{i:02}\n"));
     }
-    text.push_str("```\n"); // 内层 ``` 行（4 围栏里是内容，不会闭合外层）
-    text.push_str("code-tail"); // 最后一行；流式中尚未写出闭合 ````
+    text.push_str("```\n"); // inner ``` line: CONTENT inside the 4 fence
+    text.push_str("code-tail"); // last line; the closing ```` not written yet
 
     let mut rows: Vec<Row> = vec![Row::Assistant(text)];
     split_streaming_row(&mut rows, 200);
@@ -4042,34 +4031,37 @@ fn soft_cut_4_backtick_fence_tail_reopens_with_3_and_inner_fence_closes_it() {
     };
     assert!(prefix_ok, "rows must be Assistant + AssistantCont");
     assert!(tight, "row-level cut is tight");
-    // 症状一：重开栏只有 3 个标记字符（丢掉了外层的长度 4）。
+    // The tail reopens with the opener's true length (4 markers), so the
+    // block's own ``` line cannot close the synthetic opener.
     assert!(
-        tail_text.starts_with("```\n```"),
-        "tail must reopen with a 3-char marker (the bug): {tail_text:?}"
+        tail_text.starts_with("````\n```"),
+        "tail must reopen with a length-true 4-marker fence: {tail_text:?}"
     );
-    // 症状二：渲染尾段——内层 ``` 把合成开栏关闭，code-tail 泄漏为 markdown。
-    let leak_lines = render_markdown(&tail_text, 200);
-    let leak_texts: Vec<String> = leak_lines.iter().map(row_text).collect();
+    // Rendering the tail: the inner ``` is code CONTENT and code-tail is
+    // code — nothing leaks as markdown.
+    let tail_lines = render_markdown(&tail_text, 200);
+    let tail_texts: Vec<String> = tail_lines.iter().map(row_text).collect();
     assert!(
-        !leak_texts.iter().any(|t| t.starts_with("▎ ")),
-        "tail rendered NOTHING as code — inner ``` closed the synthetic opener: {leak_texts:?}"
-    );
-    assert!(
-        leak_texts.iter().any(|t| t == "code-tail"),
-        "code-tail leaked as plain markdown: {leak_texts:?}"
-    );
-    // 对照：按 opener 实际长度（4）重开时，内层 ``` 是内容、code-tail 是代码。
-    let fixed = render_markdown("````\n```\ncode-tail", 200);
-    let fixed_texts: Vec<String> = fixed.iter().map(row_text).collect();
-    assert!(
-        fixed_texts.iter().any(|t| t == "▎ ```"),
-        "with a length-true reopen the inner ``` renders as code content: {fixed_texts:?}"
+        tail_texts.iter().any(|t| t == "▎ ```"),
+        "the inner ``` line must render as code content: {tail_texts:?}"
     );
     assert!(
-        fixed_texts.iter().any(|t| t == "▎ code-tail"),
-        "with a length-true reopen code-tail renders as code: {fixed_texts:?}"
+        tail_texts.iter().any(|t| t == "▎ code-tail"),
+        "code-tail must render as code: {tail_texts:?}"
     );
-    // 前缀半截围栏（未闭合）照旧整块渲染为代码——不受本问题影响。
+    // /export strips the synthetic opener back out (by its length) while
+    // keeping the model's own inner ``` line.
+    let dumped = render_transcript(&rows);
+    assert!(
+        !dumped.contains("\n````\n"),
+        "synthetic 4-marker opener leaked into the export: {dumped:?}"
+    );
+    assert!(
+        dumped.contains("```\ncode-tail"),
+        "the model's own inner ``` line must survive the export: {dumped:?}"
+    );
+    // The prefix's unclosed fence still renders as one code block, as
+    // before — unaffected by the tail-side fix.
     let mut cache = MdCache::new();
     let prefix_lines = build_history_lines(
         std::slice::from_ref(&rows[0]),
@@ -4084,92 +4076,5 @@ fn soft_cut_4_backtick_fence_tail_reopens_with_3_and_inner_fence_closes_it() {
         prefix_texts.iter().filter(|t| t.contains("▎ ")).count(),
         10,
         "prefix code lines all barred: {prefix_texts:?}"
-    );
-}
-
-/// TUI-08：SubAgent TextDelta 臂（app.rs 内层 match）只 append_sub_delta、
-/// 不调 split_streaming_row——气泡不切分（既定决策：task 返回短总结），但
-/// 后果是整条气泡全程留在 live 区，而 live 渲染路径（inflight 行 →
-/// build_history_lines → MdCache，key = 气泡全文）在**每个 delta** 都 miss
-/// → tui_markdown::from_str 全量重解析整条气泡 → O(气泡²) 总解析量。
-/// 本测试用同一条流对两条路径计时：子路径（现状）vs 父路径（有切分）。
-#[test]
-fn subagent_bubble_live_render_reparses_whole_bubble_per_delta() {
-    let para =
-        "analysis line with `code` and **bold** text, plus a list:\n\n- item one\n- item two\n\n";
-    let delta = &para[..80]; // ASCII，逐 delta 追加 ~80 字节
-    const N: usize = 300; // 300 × 80B ≈ 24KB 气泡（典型长总结的量级）
-
-    // 单次全量解析的基线（24KB，与最终气泡同量级）。
-    let mut full = String::from("[scout] ");
-    for _ in 0..N {
-        full.push_str(delta);
-    }
-    let one = {
-        let t = Instant::now();
-        render_markdown(&full, 80);
-        t.elapsed()
-    };
-
-    // 子 agent 路径（现状）：append_sub_delta + live 渲染，无切分。
-    let mut sub_rows: Vec<Row> = Vec::new();
-    let mut sub_name: Option<String> = None;
-    let mut cache = MdCache::new();
-    let t = Instant::now();
-    for _ in 0..N {
-        append_sub_delta(&mut sub_rows, &mut sub_name, "scout", delta);
-        if let Some(i) = inflight_row_index(&sub_rows, true) {
-            build_history_lines(
-                std::slice::from_ref(&sub_rows[i]),
-                &mut cache,
-                80,
-                LiveRow::Text,
-                false,
-                false,
-            );
-        }
-    }
-    let sub_total = t.elapsed();
-
-    // 父 agent 路径（对照）：append_delta + split_streaming_row 增量提交，
-    // live 区只剩 ~2 行尾巴，每次渲染解析的文本量有界。
-    let mut p_rows: Vec<Row> = Vec::new();
-    let mut streaming = false;
-    let mut p_cache = MdCache::new();
-    let t = Instant::now();
-    for _ in 0..N {
-        append_delta(&mut p_rows, &mut streaming, delta);
-        split_streaming_row(&mut p_rows, 80);
-        if let Some(i) = inflight_row_index(&p_rows, streaming) {
-            build_history_lines(
-                std::slice::from_ref(&p_rows[i]),
-                &mut p_cache,
-                80,
-                LiveRow::Text,
-                false,
-                false,
-            );
-        }
-    }
-    let parent_total = t.elapsed();
-
-    // 现状钉住：子气泡确实全程不切分（单一 Assistant 行）。
-    assert_eq!(sub_name.as_deref(), Some("scout"));
-    assert_eq!(sub_rows.len(), 1, "sub bubble must stay unsplit (today)");
-    assert!(matches!(sub_rows[0], Row::Assistant(_)));
-
-    println!(
-        "subagent bubble 24KB / 300 deltas: single 24KB parse {:?}; sub path total {:?} ({:.0}x single-parse); parent path total {:?} ({:.0}x)",
-        one,
-        sub_total,
-        sub_total.as_secs_f64() / one.as_secs_f64().max(1e-9),
-        parent_total,
-        parent_total.as_secs_f64() / one.as_secs_f64().max(1e-9),
-    );
-    // 子路径重解析总量 ≈ Σ(第 i 个 delta 时的气泡长) ≈ N/2 × 最终长，
-    // 理论上远超一次全量解析；给个宽松下界防退化（不钉上限，CI 不抖）。
-    assert!(
-        sub_total >= one,
-        "unsplit sub bubble re-parses the whole bubble per delta — must cost at least one full parse"
     );
 }
