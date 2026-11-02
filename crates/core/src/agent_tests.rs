@@ -11003,13 +11003,9 @@ fn session_rebuild_reproduces_the_model_visible_face_id_by_id() {
             .map(|m| (m.id.clone(), m.role))
             .collect()
     }
-    fn rebuild(
-        cfg: &Config,
-        path: &std::path::Path,
-    ) -> (
-        Vec<(Option<String>, crate::provider::Role)>,
-        Vec<Option<String>>,
-    ) {
+    type Face = Vec<(Option<String>, crate::provider::Role)>;
+    type ArchiveIds = Vec<Option<String>>;
+    fn rebuild(cfg: &Config, path: &std::path::Path) -> (Face, ArchiveIds) {
         let (model, live, archive) = crate::session::load_with_archive(path)
             .unwrap()
             .expect("session written");

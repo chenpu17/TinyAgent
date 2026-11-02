@@ -1164,6 +1164,8 @@ mod tests {
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
             elapsed: std::time::Duration::from_secs_f64(1.5),
+            config_fingerprint: String::new(),
+            gateway_fixes: Default::default(),
         };
         // Success path: tool output + token totals + summary all present.
         let path = dir.join("out.json");
@@ -1344,6 +1346,8 @@ mod tests {
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
             elapsed: std::time::Duration::from_secs_f64(0.1),
+            config_fingerprint: String::new(),
+            gateway_fixes: Default::default(),
         };
         let path = dir.join("ok.json");
         write_result(&path, Some(&o), None, 1, "error", None, &meta()).unwrap();
@@ -1416,6 +1420,8 @@ mod tests {
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
             elapsed: std::time::Duration::from_secs_f64(1.0),
+            config_fingerprint: String::new(),
+            gateway_fixes: Default::default(),
         };
         let path = dir.join("plan.json");
         write_result(&path, Some(&with_plan), None, 1, "error", None, &meta()).unwrap();
@@ -1445,6 +1451,8 @@ mod tests {
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
             elapsed: std::time::Duration::from_secs_f64(1.0),
+            config_fingerprint: String::new(),
+            gateway_fixes: Default::default(),
         };
         let np = dir.join("noplan.json");
         write_result(&np, Some(&without_plan), None, 1, "error", None, &meta()).unwrap();
@@ -1489,6 +1497,8 @@ mod tests {
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
             elapsed: std::time::Duration::from_secs_f64(1.0),
+            config_fingerprint: String::new(),
+            gateway_fixes: Default::default(),
         };
         let path = dir.join("ok.json");
         write_result(&path, Some(&o), None, 1, "error", None, &m).unwrap();
@@ -1553,6 +1563,8 @@ mod tests {
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
             elapsed: std::time::Duration::from_secs_f64(1.0),
+            config_fingerprint: String::new(),
+            gateway_fixes: Default::default(),
         };
         let path = dir.join("meta.json");
         write_result(&path, Some(&o), None, 1, "error", None, &meta()).unwrap();
@@ -1760,6 +1772,7 @@ mod tests {
         assert_eq!(v["delta"], "{\"comma");
         let v = event_json(&AgentEvent::Compressed {
             dropped: 3,
+            folded_ids: vec!["m1".into(), "m2".into(), "m3".into()],
             kept: 5,
             trigger: CompressTrigger::Preflight,
             estimated_tokens_before: 900,
@@ -1775,6 +1788,7 @@ mod tests {
         assert_eq!(v["measured_tokens_before"], 850);
         let v = event_json(&AgentEvent::Compressed {
             dropped: 1,
+            folded_ids: vec!["m1".into(), "m2".into(), "m3".into()],
             kept: 2,
             trigger: CompressTrigger::Overflow,
             estimated_tokens_before: 100,
@@ -1785,6 +1799,7 @@ mod tests {
         assert_eq!(v["measured_tokens_before"], serde_json::Value::Null);
         let v = event_json(&AgentEvent::Compressed {
             dropped: 1,
+            folded_ids: vec!["m1".into(), "m2".into(), "m3".into()],
             kept: 2,
             trigger: CompressTrigger::Manual,
             estimated_tokens_before: 100,
@@ -1946,6 +1961,8 @@ mod tests {
             output_tokens: 50,
             cache_creation_input_tokens: 800,
             cache_read_input_tokens: 200,
+            config_fingerprint: String::new(),
+            gateway_fixes: Default::default(),
             elapsed: std::time::Duration::from_secs(2),
         };
         let path = dir.join("cache.json");
@@ -1984,6 +2001,8 @@ mod tests {
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
             elapsed: std::time::Duration::from_secs_f64(1.0),
+            config_fingerprint: String::new(),
+            gateway_fixes: Default::default(),
         };
         let ppath = dir.join("plain.json");
         write_result(&ppath, Some(&plain), None, 1, "cancelled", None, &meta()).unwrap();
@@ -2025,6 +2044,8 @@ mod tests {
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
             elapsed: std::time::Duration::from_secs_f64(1.0),
+            config_fingerprint: String::new(),
+            gateway_fixes: Default::default(),
         };
         let upath = dir.join("partial.json");
         write_result(&upath, Some(&partial), None, 1, "cancelled", None, &meta()).unwrap();
@@ -2052,6 +2073,7 @@ mod tests {
             compressions: vec![CompressionRecord {
                 trigger: CompressTrigger::Preflight.as_str().into(),
                 dropped: 2,
+                folded_ids: vec!["m2".into(), "m3".into()],
                 kept: 1,
                 estimated_tokens_before: 900,
                 estimated_tokens_after: 300,
@@ -2074,6 +2096,8 @@ mod tests {
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
             elapsed: std::time::Duration::from_secs_f64(2.0),
+            config_fingerprint: String::new(),
+            gateway_fixes: Default::default(),
         };
         let apath = dir.join("audited.json");
         write_result(&apath, Some(&audited), None, 1, "error", None, &meta()).unwrap();
@@ -2156,6 +2180,7 @@ mod tests {
         });
         r.render(&AgentEvent::Compressed {
             dropped: 3,
+            folded_ids: vec!["m2".into(), "m3".into(), "m4".into()],
             kept: 5,
             trigger: CompressTrigger::Preflight,
             estimated_tokens_before: 900,
