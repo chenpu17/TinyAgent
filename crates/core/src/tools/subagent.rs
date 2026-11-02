@@ -500,6 +500,7 @@ mod tests {
             salvage_on_max_tokens: true,
             code: Default::default(),
             gateway_fixes_preset: None,
+            strip_think_tags: true,
         };
         let mut cfg = cfg;
         cfg.limits.max_total_tokens = max_total_tokens;
@@ -1087,6 +1088,7 @@ mod tests {
             salvage_on_max_tokens: true,
             code: Default::default(),
             gateway_fixes_preset: None,
+            strip_think_tags: true,
         }
     }
 }

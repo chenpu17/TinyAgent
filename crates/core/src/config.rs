@@ -710,6 +710,21 @@ pub struct Config {
     /// default) keeps today's learn-from-scratch behavior.
     #[serde(default)]
     pub gateway_fixes_preset: Option<crate::provider::GatewayFixes>,
+    /// Strip inline `<think>…</think>` blocks out of the openai-compat
+    /// content stream into `ThinkingDelta` events (宿主集成需求单 FR-2 缩减
+    /// 版：vLLM 系不开 reasoning-parser 时把推理内联在正文里；标签跨 chunk
+    /// 边界也能切干净，正文保证无标签残留）。Default on; set false for a
+    /// deployment whose models legitimately emit those literal tags. The
+    /// `reasoning_content`/`reasoning` delta fields are ALWAYS routed to
+    /// `ThinkingDelta` regardless of this knob (protocol variants, not a
+    /// content convention). Thinking never enters history or the reply — the
+    /// standing anthropic-side rule.
+    #[serde(default = "default_strip_think_tags")]
+    pub strip_think_tags: bool,
+}
+
+fn default_strip_think_tags() -> bool {
+    true
 }
 
 /// Strip the `\\?\` verbatim prefix Windows' `canonicalize()` produces:
@@ -906,6 +921,7 @@ impl Config {
             "tool_absent_notes": self.tool_absent_notes,
             "code": self.code,
             "gateway_fixes_preset": self.gateway_fixes_preset,
+            "strip_think_tags": self.strip_think_tags,
         });
         let digest = Sha256::digest(canonical.to_string().as_bytes());
         let mut out = String::with_capacity(16);

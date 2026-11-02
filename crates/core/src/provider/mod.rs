@@ -460,7 +460,8 @@ pub fn build(cfg: &Config, api_key: &str, client: reqwest::blocking::Client) -> 
         ProviderKind::Anthropic => Box::new(Anthropic::new(client, base, api_key, idle)),
         ProviderKind::Openai => Box::new(
             OpenAi::new(client, base, api_key, idle)
-                .with_preset(cfg.gateway_fixes_preset.unwrap_or_default()),
+                .with_preset(cfg.gateway_fixes_preset.unwrap_or_default())
+                .with_strip_think_tags(cfg.strip_think_tags),
         ),
     }
 }

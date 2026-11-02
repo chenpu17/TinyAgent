@@ -21,6 +21,9 @@ pub struct OpenAi {
     /// loop is single-threaded), but interior mutability from a shared ref is
     /// the correct shape for a `dyn Provider`.
     fixes: std::sync::Mutex<LearnedFixes>,
+    /// Strip inline `<think>…</think>` blocks from the content stream into
+    /// ThinkingDelta (FR-2, `Config::strip_think_tags`, default on).
+    strip_think_tags: bool,
 }
 
 impl OpenAi {
@@ -39,7 +42,16 @@ impl OpenAi {
             api_key: api_key.to_string(),
             idle,
             fixes: std::sync::Mutex::new(LearnedFixes::default()),
+            strip_think_tags: true,
         }
+    }
+
+    /// The FR-2 knob (`Config::strip_think_tags`): wired by
+    /// `provider::build`; the `new()` default is on, matching the config
+    /// default.
+    pub fn with_strip_think_tags(mut self, on: bool) -> Self {
+        self.strip_think_tags = on;
+        self
     }
 
     /// Preset gateway fixes learned in a PREVIOUS process (FR-3):
@@ -215,6 +227,110 @@ struct LearnedFixes {
     max_completion_tokens: bool,
     no_stream_options: bool,
     no_reasoning_effort: bool,
+}
+
+/// Streaming `<think>…</think>` separator for the openai-compat content
+/// channel (宿主集成需求单 FR-2 缩减版): vLLM-family deployments without a
+/// reasoning parser inline the reasoning trace in `delta.content` wrapped in
+/// literal think tags. This machine splits that stream into the TEXT channel
+/// and the THINKING channel — pieces land as `(is_text, chunk)`, the caller
+/// maps thinking onto the existing `ChatEvent::ThinkingDelta` (the standing
+/// rule: thinking never enters history or the reply text).
+///
+/// Tags are matched across arbitrary chunk boundaries (partial-tag prefixes
+/// are held back, at most one tag's worth of bytes). Once a complete
+/// `<think>` is seen the stream is committed to think-until-close: a stream
+/// that ends mid-block flushes the remainder as THINKING — fail-closed for
+/// text purity (no tag residue can ever reach `text`/history); unterminated
+/// partial tags held in Normal state flush as text at end-of-stream (they
+/// were never a tag). Byte-exact tags only: prose that legitimately quotes
+/// these tags must turn the knob off (`Config::strip_think_tags`). A close
+/// tag with no open one is ordinary text.
+#[derive(Default)]
+struct ThinkStripper {
+    state: ThinkState,
+    buf: String,
+}
+
+#[derive(Default, PartialEq)]
+enum ThinkState {
+    #[default]
+    Normal,
+    InThink,
+}
+
+const THINK_OPEN: &str = "<think>";
+const THINK_CLOSE: &str = "</think>";
+
+impl ThinkStripper {
+    fn feed(&mut self, chunk: &str) -> Vec<(bool, String)> {
+        self.buf.push_str(chunk);
+        self.drain()
+    }
+
+    /// Flush at end-of-stream: Normal-state leftovers were never a tag (text);
+    /// leftovers inside an unterminated `<think>` block stay thinking.
+    fn finish(&mut self) -> Vec<(bool, String)> {
+        if self.buf.is_empty() {
+            return Vec::new();
+        }
+        vec![(
+            self.state == ThinkState::Normal,
+            std::mem::take(&mut self.buf),
+        )]
+    }
+
+    fn drain(&mut self) -> Vec<(bool, String)> {
+        let mut out = Vec::new();
+        loop {
+            match self.state {
+                ThinkState::Normal => match self.buf.find('<') {
+                    Some(i) => {
+                        if i > 0 {
+                            out.push((true, self.buf.drain(..i).collect()));
+                        }
+                        // buf now starts with '<'.
+                        if self.buf.starts_with(THINK_OPEN) {
+                            self.buf.drain(..THINK_OPEN.len());
+                            self.state = ThinkState::InThink;
+                        } else if THINK_OPEN.starts_with(self.buf.as_str()) {
+                            break; // a possible tag prefix — wait for more bytes
+                        } else {
+                            out.push((true, self.buf.drain(..1).collect()));
+                        }
+                    }
+                    None => {
+                        if !self.buf.is_empty() {
+                            out.push((true, std::mem::take(&mut self.buf)));
+                        }
+                        break;
+                    }
+                },
+                ThinkState::InThink => match self.buf.find(THINK_CLOSE) {
+                    Some(i) => {
+                        if i > 0 {
+                            out.push((false, self.buf.drain(..i).collect()));
+                        }
+                        self.buf.drain(..THINK_CLOSE.len());
+                        self.state = ThinkState::Normal;
+                    }
+                    None => {
+                        // Hold back a suffix that could be a partial close tag.
+                        let hold = (1..THINK_CLOSE.len())
+                            .rev()
+                            .find(|k| self.buf.ends_with(&THINK_CLOSE[..*k]))
+                            .unwrap_or(0);
+                        let cut = self.buf.len() - hold;
+                        if cut > 0 {
+                            out.push((false, self.buf.drain(..cut).collect()));
+                        }
+                        break;
+                    }
+                },
+            }
+        }
+        out
+    }
 }
 
 impl LearnedFixes {
@@ -408,7 +524,7 @@ impl Provider for OpenAi {
         }
 
         let mut sse = CancellableSse::new(resp, req.cancel.clone(), self.idle)?;
-        Self::parse_loop(&mut sse, on_event)
+        Self::parse_loop(&mut sse, on_event, self.strip_think_tags)
     }
 
     fn gateway_fixes(&self) -> super::GatewayFixes {
@@ -521,7 +637,7 @@ impl OpenAi {
         on_event: &mut dyn FnMut(ChatEvent),
     ) -> Result<ChatResponse> {
         let mut sse = SseReader::new(reader);
-        Self::parse_loop(&mut sse, on_event)
+        Self::parse_loop(&mut sse, on_event, /* strip_think_tags */ true)
     }
 
     /// Streaming core shared by the sync test path (`SseReader`) and the live
@@ -532,6 +648,7 @@ impl OpenAi {
     fn parse_loop<S: SseSource>(
         src: &mut S,
         on_event: &mut dyn FnMut(ChatEvent),
+        strip_think_tags: bool,
     ) -> Result<ChatResponse> {
         let mut text = String::new();
         let mut calls: std::collections::BTreeMap<u64, PendingCall> = Default::default();
@@ -540,6 +657,26 @@ impl OpenAi {
         let mut got_finish = false;
         let mut abort: Option<&'static str> = None;
         let mut usage: Option<Usage> = None;
+        // FR-2: `<think>` splitter across the content channel. `None` = knob
+        // off, the raw passthrough shape (byte-identical to pre-FR-2).
+        let mut stripper = strip_think_tags.then(ThinkStripper::default);
+        // Every loop exit flushes the splitter's held-back bytes into their
+        // channels BEFORE the partial/total assembly — text-only bytes reach
+        // `text` (history), thinking bytes only fire ThinkingDelta events.
+        // Covers the clean ends AND the abort/error arms (honest-cost
+        // partials keep every received byte visible).
+        macro_rules! flush_think {
+            () => {
+                for (is_text, piece) in stripper.as_mut().map(|s| s.finish()).unwrap_or_default() {
+                    if is_text {
+                        text.push_str(&piece);
+                        on_event(ChatEvent::TextDelta(piece));
+                    } else {
+                        on_event(ChatEvent::ThinkingDelta(piece));
+                    }
+                }
+            };
+        }
 
         loop {
             let data = match src.next_payload() {
@@ -563,6 +700,7 @@ impl OpenAi {
                 // here dropped the usage (gateways that attach usage to the
                 // last choice chunk may have already sent it).
                 Err(StreamAbort::StreamError(msg)) => {
+                    flush_think!();
                     let mut blocks = Self::assemble_blocks(&text, &calls);
                     blocks.push(Block::Text(format!(
                         "[stream error] OpenAI stream read error: {msg}"
@@ -589,6 +727,7 @@ impl OpenAi {
             // that as no error (filter out null). Same honest-cost shape as
             // the read-failure arm above.
             if let Some(err) = ev.get("error").filter(|v| !v.is_null()) {
+                flush_think!();
                 let mut blocks = Self::assemble_blocks(&text, &calls);
                 blocks.push(Block::Text(format!(
                     "[stream error] OpenAI stream error: {}",
@@ -639,8 +778,26 @@ impl OpenAi {
             }
             let delta = &choice["delta"];
             if let Some(t) = delta["content"].as_str() {
-                text.push_str(t);
-                on_event(ChatEvent::TextDelta(t.to_string()));
+                // FR-2: inline `<think>` blocks split off the content channel
+                // (knob on) — text pieces keep the old path, thinking pieces
+                // fire ThinkingDelta only (never text/history). Knob off →
+                // the raw passthrough, byte-identical to pre-FR-2.
+                match stripper.as_mut() {
+                    Some(st) => {
+                        for (is_text, piece) in st.feed(t) {
+                            if is_text {
+                                text.push_str(&piece);
+                                on_event(ChatEvent::TextDelta(piece));
+                            } else {
+                                on_event(ChatEvent::ThinkingDelta(piece));
+                            }
+                        }
+                    }
+                    None => {
+                        text.push_str(t);
+                        on_event(ChatEvent::TextDelta(t.to_string()));
+                    }
+                }
             }
             // Reasoning models stream the thinking trace to the UI. Surface it as
             // a ThinkingDelta event ONLY — never into `text`/blocks: the reply is
@@ -710,6 +867,7 @@ impl OpenAi {
             }
         }
 
+        flush_think!();
         let blocks = Self::assemble_blocks(&text, &calls);
 
         // Normalize to Anthropic-style stop reasons. An explicit abort
@@ -1941,6 +2099,150 @@ mod tests {
                 no_reasoning_effort: false,
             },
             "exactly the learned bit exports"
+        );
+    }
+
+    // ── FR-2 缩减版：内联 <think> 剥离（ThinkStripper） ──────────────────
+
+    fn run_stripper(chunks: &[&str]) -> (String, String) {
+        let mut st = ThinkStripper::default();
+        let (mut text, mut think) = (String::new(), String::new());
+        for c in chunks {
+            for (is_text, piece) in st.feed(c) {
+                if is_text {
+                    text.push_str(&piece);
+                } else {
+                    think.push_str(&piece);
+                }
+            }
+        }
+        for (is_text, piece) in st.finish() {
+            if is_text {
+                text.push_str(&piece);
+            } else {
+                think.push_str(&piece);
+            }
+        }
+        (text, think)
+    }
+
+    #[test]
+    fn think_stripper_plain_content_passes_byte_identical() {
+        // 无标签正文：逐字节透传（含尖括号），thinking 通道恒空，finish 无残。
+        let (text, think) = run_stripper(&["hello < world", " & ", "ok"]);
+        assert_eq!(text, "hello < world & ok");
+        assert_eq!(think, "");
+    }
+
+    #[test]
+    fn think_stripper_splits_tags_across_chunk_boundaries() {
+        // 标签被任意切开也能认出；text 无 "<think"/"</think" 残留，字节不丢。
+        let chunks = ["<th", "ink>let me ", "check</thi", "nk>the answer is 4"];
+        let (text, think) = run_stripper(&chunks);
+        assert_eq!(text, "the answer is 4");
+        assert_eq!(think, "let me check");
+        assert!(!text.contains("think"), "no tag residue: {text}");
+    }
+
+    #[test]
+    fn think_stripper_handles_multiple_blocks_and_mixed_text() {
+        let (text, think) = run_stripper(&["pre<think>a</think>mid<think>b</think>post"]);
+        assert_eq!(text, "premidpost");
+        assert_eq!(think, "ab");
+    }
+
+    #[test]
+    fn think_stripper_unclosed_block_stays_thinking_at_eof() {
+        // 完整开标签后流断了：余量按 thinking 冲（正文纯净 fail-closed）。
+        let (text, think) = run_stripper(&["<think>partial thought"]);
+        assert_eq!(text, "");
+        assert_eq!(think, "partial thought");
+    }
+
+    #[test]
+    fn think_stripper_unterminated_partial_tag_is_text_at_eof() {
+        // 没成形的 "<thin" 从来不是标签：finish 按正文冲。
+        let (text, think) = run_stripper(&["answer <thin"]);
+        assert_eq!(text, "answer <thin");
+        assert_eq!(think, "");
+    }
+
+    #[test]
+    fn think_stripper_close_without_open_is_text() {
+        let (text, think) = run_stripper(&["a </think> b"]);
+        assert_eq!(text, "a </think> b");
+        assert_eq!(think, "");
+    }
+
+    #[test]
+    fn think_stripper_splits_evenly_at_every_offset() {
+        // 穷举切片点：任意 3 字节切片下输出与整段处理一致（跨边界不变式）。
+        let whole = "q<think>reason part</think>a</t";
+        for step in 1..=5 {
+            let chunks: Vec<&str> = whole
+                .as_bytes()
+                .chunks(step)
+                .map(|b| std::str::from_utf8(b).unwrap())
+                .collect();
+            let (text, think) = run_stripper(&chunks);
+            assert_eq!(text, "qa</t", "step={step}");
+            assert_eq!(think, "reason part", "step={step}");
+        }
+    }
+
+    #[test]
+    fn parse_stream_routes_inline_think_to_thinking_events() {
+        // SSE 集成（knob 默认开）：content 里的 <think> 块 → ThinkingDelta
+        // 事件拼出推理；blocks 的 Text 无标签残留（不入历史的内容面）。
+        // reasoning_content 形态照旧（协议字段，不受此开关管）。
+        let raw = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"<think>reason a\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"</think>the answer\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n",
+        );
+        let mut events = Vec::new();
+        let resp = OpenAi::parse_stream(raw.as_bytes(), &mut |e| events.push(e)).unwrap();
+        assert_eq!(resp.stop_reason, "end_turn");
+        assert!(
+            matches!(&resp.blocks[0], Block::Text(t) if t == "the answer"),
+            "text block has no tag residue: {:?}",
+            resp.blocks
+        );
+        let thinking: String = events
+            .iter()
+            .filter_map(|e| match e {
+                ChatEvent::ThinkingDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thinking, "reason a");
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                ChatEvent::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "the answer");
+    }
+
+    #[test]
+    fn parse_loop_with_knob_off_passes_tags_through() {
+        // 开关关（Config::strip_think_tags=false）：标签当普通正文透传，
+        // 与既有（FR-2 之前）行为字节一致。
+        let raw = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"<think>kept\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n",
+        );
+        let mut sse = SseReader::new(raw.as_bytes());
+        let mut events = Vec::new();
+        let resp = OpenAi::parse_loop(&mut sse, &mut |e| events.push(e), false).unwrap();
+        assert!(matches!(&resp.blocks[0], Block::Text(t) if t == "<think>kept"));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ChatEvent::ThinkingDelta(_))),
+            "knob off: no thinking channel traffic"
         );
     }
 }
