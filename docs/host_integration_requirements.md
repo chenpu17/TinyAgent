@@ -2,9 +2,9 @@
 
 | 项 | 值 |
 |---|---|
-| 状态 | v1.1（已获答复单 v1.0；本版按答复对齐口径并更正 FR-2 动机） |
+| 状态 | v1.2（宿主侧 FR-1/3/4 接入已落地；FR-5 基准数据回传见 §7） |
 | 日期 | 2026-11-02 |
-| 修订记录 | v1.1（2026-11-03）：按答复单 `host_integration_requirements_response.md` 对齐——FR-2 动机更正（`reasoning_content` 解析基线已在，系需求方 grep 输出截断误判；范围收敛为内联 `<think>` 剥离）；FR-1 事件口径（只发非默认决策）与定版语义指向答复单；FR-3 导出语义（含预置位的进程内累计）。v1.0：初稿 |
+| 修订记录 | v1.2（2026-11-03）：宿主侧按答复单 §5 接入清单落地 FR-1 观察者仲裁（`on_turn_stopping`）/ FR-3 档案往返 / FR-4 运行台账配对钉，FR-5 基准数据回传（§7，design 输入）。v1.1（2026-11-03）：按答复单 `host_integration_requirements_response.md` 对齐——FR-2 动机更正（`reasoning_content` 解析基线已在，系需求方 grep 输出截断误判；范围收敛为内联 `<think>` 剥离）；FR-1 事件口径（只发非默认决策）与定版语义指向答复单；FR-3 导出语义（含预置位的进程内累计）。v1.0：初稿 |
 | 需求方 | TinyWorker（宿主：tauri 桌面壳 + webui 服务器壳，path 依赖 `tiny-agent-core`） |
 | 需求来源 | ① DeepSeek Harness（dsh，2026-08-13 开源，MIT）架构调研对照；② TinyWorker 七轮审计的记录在案项（受核心签名约束而搁置者） |
 | 通道 | 「需求单 → 用户中转」（RSI 红线确立的 TinyAgent 改动通道），本单为该通道第一份 |
@@ -128,3 +128,33 @@ dsh 的核心论点（[NYU RITS 解读](https://rits.shanghai.nyu.edu/ai/deepsee
 4. 钩子内出错返回默认值、不 panic（unpaired tool_use 既有告诫）；
 5. 一切指纹/导出面不含凭据值（config 手写 Debug 的既有纪律延伸）；
 6. 每项 FR 落地前按仓库惯例过独立审核轮次。
+
+## 7. FR-5 基准数据回传（2026-11-03 实测，design 输入）
+
+### 7.1 宿主调用面盘点（tiny-worker 实码）
+
+| 调用点 | 锁内/外 | 频率 |
+|---|---|---|
+| `session_messages()`（history.rs：前端拉历史/搜索/导出的统一入口） | **sessions 锁内** `to_vec` | 每次前端读历史/搜索一遍全库 |
+| rebuild 族（切模型/分叉/截断→`old.messages().to_vec()`） | 锁外（agent 已 take） | 每次动作一次 |
+| 每次 run 起点 `pre_msgs` 归档对账快照 | 锁外（worker 线程） | 每 run 一次 |
+| `finish_turn` 的 `sidebar_snippet(agent.messages())` | sessions 锁内（借用读，无拷贝） | 每 run 一次 |
+
+### 7.2 `messages().to_vec()` 实测（release，Windows/18GB，热机，20 次取均值）
+
+| 会话形态 | 消息数 | 体量 | to_vec 均值 | 借用读基线 |
+|---|---|---|---|---|
+| 小（纯文本 1KB） | 200 | 200KB | **123 µs** | 1ns |
+| 中（纯文本 1KB） | 500 | 500KB | 329 µs | 1ns |
+| 大（纯文本 1KB） | 1 000 | 1MB | 806 µs | 1ns |
+| 大（纯文本 4KB） | 1 000 | 4MB | 1.88 ms | 1ns |
+| 任务型（4KB 文本 + 1/3×8KB 工具结果） | 1 000 | 5.3MB | 2.6 ms | 1ns |
+| 超大（同上） | 2 000 | 10.7MB | 5.4 ms | 1ns |
+
+吞吐 ~1.5–2 GB/s（分配 + memcpy 主导，线性于字节量；消息条数的每条分配开销可忽略）。
+
+### 7.3 结论（供 design 取舍）
+
+- 现实会话（≤1 000 条、≤5MB）单次锁内拷贝 **≤3ms**：今日可容忍，不是火烧眉毛的债；10MB 级会话在多窗口并发拉历史/搜索时锁持有 5ms+ 开始成为争用点。
+- 借用读恒为 **1ns 级**——方案 (a)（`read_messages(|&[Message]) -> T` 作用域回调）即可吃掉全部拷贝成本，且不动消息所有权结构（方案 (b)/(c) 的 Arc 化/游标语义复杂度对当前收益面偏高）。宿主侧最大消费点 `session_messages()` 天然是「回调内取所需」形态。
+- 建议 design 以 (a) 为主轴；(b)/(c) 仅在出现「回调内无法表达」的消费方时再议。
