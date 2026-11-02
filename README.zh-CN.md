@@ -1131,7 +1131,7 @@ crates/core/src/  # kernel crate (package tiny-agent-core, lib name tiny_agent):
 │   ├── anthropic.rs      ( 1246)  # Anthropic native (message_start/message_delta usage)
 │   └── mock.rs           (  345)  # scripted Provider for tests (cfg(any(test, feature="mock")))
 ├── agent.rs          ( 4544)  # core loop + usage accounting + cancel + context compression (preflight/overflow dual trigger + rolling chunked summaries) + adjacent-message normalization + same-turn multi-task parallelism
-├── agent_tests.rs    (11104)  # core-loop regression tests (scripted provider::mock, no network)
+├── agent_tests.rs    (11100)  # core-loop regression tests (scripted provider::mock, no network)
 ├── usage_probe.rs    (   94)  # thread-local usage side channel for parallel workers: recovers billed usage after a panic unwind at the join point (keeps result.json and the shared counter from diverging)
 ├── compress.rs       (  996)  # compression engine (find_safe_cut / chunked summaries / saturating usage merge + block-level billing primitives)
 ├── context_report.rs (  886)  # context composition breakdown (ContextBreakdown estimate: 3 system parts / 4 tool classes / message typing + anchor calibration)
@@ -1169,7 +1169,7 @@ src/  # CLI crate (package tiny-agent, bin tiny-agent): process shell + headless
 ├── main.rs           ( 1024)  # CLI entry + assembly (build_agent) + --session none
 ├── signal.rs         (  123)  # headless SIGINT → cancel (first press graceful / second hard-exit 130)
 ├── batch.rs          ( 3994)  # batch tasks + --retries/--failed + report merging
-├── harness.rs        ( 2276)  # headless mode + result.json + NDJSON + exit codes
+├── harness.rs        ( 2301)  # headless mode + result.json + NDJSON + exit codes
 ├── harness_tests.rs  ( 1212)  # harness behavior tests (retry ladder / result.json / NDJSON; moved here with harness from the kernel's agent_tests.rs)
 ├── tui.rs            (   20)  # TUI module root (feature tui): mod declarations + public exports (run / transcript_rows)
 └── tui/  # TUI submodules (same tui gate): split from the original 8.7k-line single file by concern
