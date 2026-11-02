@@ -266,10 +266,17 @@ def test_stale_cancel_persists_until_clear_cancel():
 
 def test_keyboard_interrupt_in_on_event_latches_cancel_and_reraises(tmp_path):
     """With a cancel token armed, a KeyboardInterrupt from on_event latches
-    the token (the run stops at the next turn boundary — the follow-up text
-    request never happens) and re-raises when run() returns. The leftover
-    flag keeps the kernel's level-triggered contract: the next run returns
-    instantly cancelled until the host clears it at its acceptance point."""
+    the token and re-raises when run() returns. Where the run stops depends on
+    when the interrupt lands (review fix — the providers now check the flag
+    before the first POST):
+    - raised on a mid-turn event (ToolCall, after the request went out): the
+      run stops at the next turn boundary — the follow-up text request never
+      happens, the Ok outcome rides the exception;
+    - raised on the turn-start event (before any request): the pre-POST
+      cancel checkpoint skips the request entirely — zero round-trips spent.
+    The leftover flag keeps the kernel's level-triggered contract: the next
+    run returns instantly cancelled until the host clears it at its
+    acceptance point."""
     mock = ScriptedMock(tool_then_text()).start()
     try:
         cfg = openai_config(mock.url, tools=["write_file"], workdir=str(tmp_path))
@@ -278,8 +285,10 @@ def test_keyboard_interrupt_in_on_event_latches_cancel_and_reraises(tmp_path):
         a.set_cancel(tok)
         a.push_user("run it")
 
+        # ── mid-turn interrupt: after turn 1's request, at its ToolCall ──
         def on_event(ev):
-            raise KeyboardInterrupt  # the host's Ctrl-C, from its own callback
+            if isinstance(ev, dict) and "ToolCall" in ev:
+                raise KeyboardInterrupt  # the host's Ctrl-C, from its own callback
 
         with pytest.raises(KeyboardInterrupt) as ei:
             a.run(on_event=on_event)
@@ -305,6 +314,35 @@ def test_keyboard_interrupt_in_on_event_latches_cancel_and_reraises(tmp_path):
         out2 = a.run()
         assert out2["stop_reason"] == "end_turn"
         assert len(mock.requests) == 2
+    finally:
+        mock.stop()
+
+
+def test_keyboard_interrupt_before_first_request_spends_no_round_trip(tmp_path):
+    """A KeyboardInterrupt on the turn-start event latches the cancel BEFORE
+    any request exists — the pre-POST cancel checkpoint (review fix) skips
+    the round-trip entirely: zero requests, zero tokens, the error-shaped
+    outcome (RunError serialization: `error` + cost fields, no stop_reason)
+    rides the exception."""
+    mock = ScriptedMock(tool_then_text()).start()
+    try:
+        cfg = openai_config(mock.url, tools=["write_file"], workdir=str(tmp_path))
+        a = tiny_agent.Agent(cfg, api_key=MOCK_KEY)
+        tok = tiny_agent.CancelToken()
+        a.set_cancel(tok)
+        a.push_user("run it")
+
+        def on_event(ev):
+            raise KeyboardInterrupt  # first event = turn start, pre-request
+
+        with pytest.raises(KeyboardInterrupt) as ei:
+            a.run(on_event=on_event)
+        assert tok.is_cancelled()
+        assert len(mock.requests) == 0, "pre-POST checkpoint must skip the request"
+        assert ei.value.outcome["error"] == (
+            "request cancelled before sending to the OpenAI-compatible API"
+        )
+        assert ei.value.outcome["usage"]["input_tokens"] == 0
     finally:
         mock.stop()
 

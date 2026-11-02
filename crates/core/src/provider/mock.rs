@@ -2,6 +2,13 @@
 //! injected errors) and records each request, so the agent loop's invariants
 //! can be asserted in-process — no HTTP server, no Python mock.
 //!
+//! Known coverage boundary (review IMP, documented): `MockTurn::Ok` streams
+//! text deltas but never emits `ThinkingDelta` and never passes through the
+//! SSE layer / `ThinkStripper` — so the agent loop's ThinkingDelta mapping is
+//! exercised end-to-end only by the binding/e2e suites (the FR-2 acceptance
+//! pins live at the parse level). Mock tests assert history/ledger invariants,
+//! which are channel-shape-agnostic.
+//!
 //! The provider is consumed by `Agent::new` (which takes `Box<dyn Provider>`),
 //! so the recorded state lives behind an `Arc` the test clones before boxing;
 //! after the run it reads `state.captured` / `state.calls()`.

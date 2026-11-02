@@ -350,8 +350,13 @@ fn main() -> Result<()> {
             resumed_archive = archive;
             resumed = true;
         } else {
+            // Neutral wording: `load_with_archive` returns Ok(None) for a
+            // missing file AND for a corrupt/future-version one (which already
+            // printed its own "session file corrupt … preserved at *.corrupt"
+            // line and starts fresh). The old "no session file found" second
+            // line contradicted that — external review P3.
             harness::note(format_args!(
-                "[warn] --resume given but no session file found; starting fresh"
+                "[warn] --resume given but no usable session history; starting fresh"
             ));
         }
     }

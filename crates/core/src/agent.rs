@@ -809,16 +809,23 @@ impl RunError {
     /// Context overflow is judged separately ([`Self::is_context_overflow`])
     /// — it has its own gate and label in both retry drivers.
     pub fn is_transient(&self) -> bool {
-        for cause in self.source.chain() {
-            if let Some(se) = cause.downcast_ref::<crate::provider::ApiStatusError>() {
-                return se.status == 408
-                    || se.status == 425
-                    || se.status == 429
-                    || se.status >= 500;
-            }
-        }
-        true
+        is_transient_error(&self.source)
     }
+}
+
+/// The transient/deterministic ladder, shared by the run-level retry gate
+/// (`RunError::is_transient`, whose payload is a `RunError`) and the summary
+/// request's one-retry guard (whose error is the provider's bare
+/// `anyhow::Error` — external review IMP: the summary retry used to resend
+/// even on deterministic 401/403/404/400, contradicting its own
+/// "transient-only" comment and `is_transient`'s taxonomy).
+pub(crate) fn is_transient_error(e: &anyhow::Error) -> bool {
+    for cause in e.chain() {
+        if let Some(se) = cause.downcast_ref::<crate::provider::ApiStatusError>() {
+            return se.status == 408 || se.status == 425 || se.status == 429 || se.status >= 500;
+        }
+    }
+    true
 }
 
 /// Serialize the structured cost fields (usage / tool_calls / turns / elapsed)
@@ -2729,6 +2736,14 @@ impl Agent {
                     });
                     continue;
                 }
+                // 本轮内落下的 cancel 必须报 "cancelled"/exit 130（M8 纪律，
+                // 与下方带块路径的 aborted override 同款）：零块 break 携带的
+                // provider stop_reason（end_turn / max_tokens / content_filter
+                // /stream_truncated）会把 post-chat 窗口（Usage 事件回调、
+                // anchor 更新）里落下的 cancel 谎报成错误的成功/失败码。
+                if self.cancelled() {
+                    stop_reason = "cancelled".into();
+                }
                 turn_timings.push(TurnTiming {
                     turn: turns,
                     duration_ms: ms_since(turn_started),
@@ -2905,6 +2920,16 @@ impl Agent {
                             }
                         }
                     }
+                }
+                // cancel 可在仲裁 hook 执行窗内落下（on_turn_stopping 是宿主
+                // 代码，可等待任意久）：Stop / capped 降级两条路径在此汇合出
+                // 口，全程不再有轮首护栏兜底——这是全 run 唯一 abort 检查后
+                // 不再看 flag 的出口。与带块路径的 aborted override 同款纪律：
+                // 本轮内落下的 cancel 压过 end_turn 与 arbitration_capped，
+                // 报 "cancelled"/exit 130。（Continue 分支在 match 内 continue，
+                // 由下一轮轮首护栏接管，已有钉子。）
+                if self.cancelled() {
+                    stop_reason = "cancelled".into();
                 }
                 turn_timings.push(TurnTiming {
                     turn: turns,
@@ -4202,10 +4227,20 @@ impl Agent {
             }
         };
 
-        let dropped = cut - 1;
         // The dropped middle's ORIGINALS move to the session archive (the
-        // head stays live in folded form, the tail verbatim).
-        let dropped_middle: Vec<Message> = self.messages[1..cut].to_vec();
+        // head stays live in folded form, the tail verbatim). Exception: an
+        // assistant-led head (fold_summary's fresh-user-head fallback) is
+        // REPLACED in live history, not re-derived — archive it too, or its
+        // original vanishes from both the live history and the session file
+        // (external review IMP: audit-chain gap; the summary gist is not the
+        // record).
+        let archive_from = if self.messages.first().is_some_and(|m| m.role != Role::User) {
+            0
+        } else {
+            1
+        };
+        let dropped = cut - archive_from;
+        let dropped_middle: Vec<Message> = self.messages[archive_from..cut].to_vec();
         // FR-6: snapshot the originals' ids BEFORE the move — these locate
         // the archive entries ("what did this summary replace") for the
         // event / audit record / host UI.
@@ -4433,15 +4468,19 @@ impl Agent {
             // loss for one blip. Deterministic failures don't retry: a
             // summary that itself overflows the window won't fit after 1s
             // either, and a cancel flag already set means the user asked to
-            // stop. Cancel mid-request doesn't arrive as an Err at all
-            // (it maps to a stop_reason, handled below), so no cancel-shape
-            // sniffing here.
+            // stop. The transient/deterministic ladder is `RunError`'s
+            // taxonomy applied to the bare provider error here (401/403/404/
+            // 400/422 get no backoff + full-prompt resend — external review
+            // IMP: the old guard only excluded overflow and cancel). Cancel
+            // mid-request doesn't arrive as an Err at all (it maps to a
+            // stop_reason, handled below), so no cancel-shape sniffing here.
             let mut request_attempt = 0u32;
             let resp = loop {
                 match self.provider.chat(&req, &mut |_| {}) {
                     Ok(r) => break r,
                     Err(e) => {
                         if request_attempt == 0
+                            && is_transient_error(&e)
                             && !compress::is_context_overflow(&e)
                             && !self.cancelled()
                         {

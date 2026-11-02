@@ -47,7 +47,7 @@
 
 ### 2.4 FR-4 有效配置指纹（P1）— 接受，已落地
 
-`Config::fingerprint()`：对 clamp/overlay 合并后的**生效**配置，按**固定字段序**规范化 JSON → SHA-256 截 64 bit（16 hex）。进哈希：内核版本 + 全部 harness 形状字段（provider/base_url/model/max_tokens/系统提示词/工具白名单[排序]/limits 全家/MCP 拓扑/推理档位/缺位注记/code 沙箱/`gateway_fixes_preset`/`strip_think_tags`）。排除：`task`/`workdir`（运行输入）。凭据纪律（约束⑤）：只进键名不进值——`api_key_env` 本是变量名；MCP headers/env 仅排序键名；mcp url 与 base_url 都过 userinfo 脱敏。语义有序列表（`mcp_servers`/`code.llm.models`/`tool_absent_notes`）按声明序进哈希——顺序本身是拓扑语义，序变即指纹变，属定版行为。验收①②③④各有钉子测试。出账面：`RunOutcome.config_fingerprint`（result.json 恒在键）+ `Agent::config_fingerprint()`。算法/截断长度/字段清单定版即兼容面，变更走 CHANGELOG——**在 [Unreleased] 窗口内指纹值无兼容承诺，定版于首个发布版**。
+`Config::fingerprint()`：对 clamp/overlay 合并后的**生效**配置，按**固定字段序**规范化 JSON → SHA-256 截 64 bit（16 hex）。进哈希：内核版本 + 全部 harness 形状字段（provider/base_url/model/max_tokens/系统提示词/工具白名单[排序]/limits 全家/MCP 拓扑/推理档位/缺位注记/code 沙箱/`gateway_fixes_preset`/`strip_think_tags`）。排除：`task`/`workdir`（运行输入）。凭据纪律（约束⑤）：只进键名不进值——`api_key_env` 本是变量名；MCP headers/env 仅排序键名；mcp url 与 base_url 都过 userinfo 脱敏。语义有序列表（`mcp_servers`/`code.llm.models`/`tool_absent_notes`）按声明序进哈希——顺序本身是拓扑语义，序变即指纹变，属定版行为。验收①②③④各有钉子测试。出账面：`RunOutcome.config_fingerprint` + `Agent::config_fingerprint()`；result.json 键在凡真正构建出 agent 的终态恒在——失败 run（重试梯耗尽 / request_error / 退避中取消）也在内（2026-11-03 评审 C-F1 修复前仅成功分支落键），只有空归属终态（bad_task / 未启动 / panic）缺席。算法/截断长度/字段清单定版即兼容面，变更走 CHANGELOG——**在 [Unreleased] 窗口内指纹值无兼容承诺，定版于首个发布版**。
 
 **时点语义（外审核定）**：指纹是 **Agent 构造时的快照**——常驻 Agent 的热更新换挡（`set_model` / `set_reasoning_effort` / `set_max_tokens` / `set_max_context_tokens` / `set_code_config` / `set_tool_absent_notes` / `add_mcp_server` / `remove_mcp_server`）改变实际生效形状，但**不移动**已出账的指纹。换挡后要做「模型 + harness」台账对比的宿主，请重建 Agent（或每 run 一建）取新指纹；CLI/批处理每 run 一建，天然无此歧义。
 
@@ -85,6 +85,6 @@ X-1「无证据不动」、X-3「不为没有消费方的 seam 扩面」照单�
 
 1. path 依赖对齐 `189c5a9`（或其后版本）；先核对 FR-2 打回部分的现状前提（§2.2）。
 2. RSI 观察者实现 `on_turn_stopping`：读 `TurnStopInfo { reply_text, turn, continuations_used, continuations_cap }` 做节奏控制；错误路径返回 `Stop` 不 panic（§6.4）。
-3. 运行台账接 `result.json.config_fingerprint`（恒在键）钉「模型 + harness 配对」。
+3. 运行台账接 `result.json.config_fingerprint`（agent 构建成功的终态恒在，失败 run 也在内）钉「模型 + harness 配对」。
 4. 模型档案接 `gateway_fixes` 往返（result.json sparse 键 → `Config.gateway_fixes_preset`）。
 5. FR-5 基准数据回传（§2.5），启动 design 立项。

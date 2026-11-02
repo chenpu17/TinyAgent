@@ -104,7 +104,7 @@ Under `--batch <dir>`, every `*.json` is a task fragment (all fields optional, o
 ```
 
 - Each task runs the full agent flow and writes `results/<task>.json` (same format as `--output`)
-- `--jobs N` controls concurrency (default 1); `--report` writes the summary: `{total, succeeded, failed, provider, totals, averages, tasks[]}` (`totals`/`averages` are sums and per-task means over the 4 token axes; each `tasks[]` entry carries `model` / `started_at` attribution — fragments may override `model`, which is how mixed-model batches stay distinguishable)
+- `--jobs N` controls concurrency (default 1); `--report` writes the summary: `{total, succeeded, failed, provider, totals, averages, tasks[]}` (`totals`/`averages` are sums and per-task means over the 4 token axes; each `tasks[]` entry carries `model` / `started_at` attribution — fragments may override `model`, which is how mixed-model batches stay distinguishable). `tasks[]` entries are summary rows only: `attempts` and the full `tool_calls`/`summary` detail live in the per-task `results/<name>.json` files, not in the report
 - ⚠ **The default semantics before `--isolate`**: with `--jobs > 1` all tasks **share one workdir** (the base config's; fragments cannot override it) — tasks that write the same files concurrently will clobber each other and pollute results. Two ways out:
   - `--jobs 1` (serial; or tasks that only read / pure reasoning are safe to parallelize)
   - `--isolate <mode>` gives each task a private workdir (below)
@@ -147,7 +147,8 @@ cannot change them:
 | `max_turns_reached` / `max_tokens` | a model limit was reached | ❌ |
 | `budget_exceeded` | cumulative tokens hit `limits.max_total_tokens` | ❌ |
 | `stuck_loop` | spinning guardrail: the same call with identical arguments and identical results 6 times in a row (the 3rd occurrence attaches a course-correction hint to the tool_result first, granting one self-healing chance; progress or changed args reset the counter) | ❌ |
-| `arbitration_capped` | turn-stopping arbitration (`Hooks::on_turn_stopping`) kept rejecting the model's `end_turn` past its per-run continuation cap (6, aligned with the stuck-loop discipline); the run then ends cleanly on the model's final turn — exit 0, the label lives in result.json for hosts that audit it (unreachable in `--batch`: batch installs no hooks; result.json `success` stays strict `end_turn`) | ❌ |
+| `arbitration_capped` | turn-stopping arbitration (`Hooks::on_turn_stopping`) kept rejecting the model's `end_turn` past its per-run continuation cap (6, aligned with the stuck-loop discipline); the run then ends cleanly on the model's final turn — exit 0, the label lives in result.json for hosts that audit it (unreachable from the CLI binary — neither single runs nor `--batch` install hooks; only library hosts can trigger it; result.json `success` stays strict `end_turn`) | ❌ |
+| `stream_truncated` / `stream_idle` | the streaming response was cut short by the gateway (no finish_reason) or went silent past `stream_idle_secs` — honest-cost partial result: whatever text/calls arrived is kept and billed, exit 1, not retried. (A mid-read stream DEATH is different: it surfaces as a transient `error` with the partial text kept, and IS retried) | ❌ |
 | `panic` | the task panicked in a worker and was caught into a failure entry (below) | ❌ |
 | `cancelled` | user Ctrl-C: tasks not yet started are marked `cancelled` without running; a cancel observed during retry backoff ends the task `cancelled` too (cost already burned stays in the bill) | ❌ |
 | `setup_error` | agent build failed (missing `api_key_env` / MCP server failed to start / unknown tool name) or per-task workdir isolation setup failed (git missing / not a repo root / temp dir unwritable); deterministic — a retry round that fails here keeps the earlier attempts' cost | ❌ |
@@ -201,7 +202,7 @@ tiny-agent --config examples/harness.json --task "run the tests" --retries 3 --o
 
 - `--session <path>` picks the session file (default `./.tinyagent-session.json`), atomically saved after every turn
 - `--session none` disables persistence — nothing read, nothing written; a one-shot headless run leaves no file in cwd (mutually exclusive with `--resume`)
-- `--resume` loads the history and continues; the config's `task` counts as consumed, append new instructions via `--task`
+- `--resume` loads the history and continues; the config's `task` counts as consumed, append new instructions via `--task`. A session saved under a different `model` than the current config resumes with the **new** model (a `[warn] session model '…' differs from config model '…'` line says so on stderr — model switch mid-session is allowed, not an error)
 - Completed turns survive crashes; applies to TUI mode as well
 - TUI `--resume` **transcribes the history into the native scrollback** (user/assistant messages, tool calls and results rebuilt as single-line views paired by id, `· ` system lines marked "resumed"); images are not transcribed; a session that stopped mid-tool_result resumes and auto-continues, with the last task text immediately visible
 
@@ -857,12 +858,16 @@ temptations.
   per-run delta — repeated runs of one agent export the same value; diff consecutive outcomes
   yourself if you need run-over-run increments. The fingerprint is a construction-time snapshot:
   a long-lived Agent's hot-swap setters (`set_model` et al) change the effective shape but not the
-  exported value — rebuild (or build per run) after swapping to compare ledgers.
+  exported value — rebuild (or build per run) after swapping to compare ledgers. `config_fingerprint`
+  is written on every result whose run got as far as building the agent — failed runs included
+  (retry ladder exhausted, `request_error`, cancel during backoff), so the pairing ledger covers
+  them too; only the attribution-empty terminals (`bad_task` / never-started / `panic`) omit it.
 - **The `schema_version` contract**: while it is `1`, **keys are only added, never removed, and
   existing keys never change type**; new keys are always optional (old consumers can ignore them and
   keep working; sparse keys like `plan`/`compressions`/`duration_ms` simply don't appear when empty);
   only breaking changes (deleting a key / changing its type) bump the version. Consume **by key** and
-  skip unknown keys; don't validate positionally or by whole-structure. The batch `report.json` is the
+  skip unknown keys; don't validate positionally or by whole-structure — the JSON examples below show
+  one real output's key order, which is illustrative, not a contract. The batch `report.json` is the
   same (plus top-level `agent_version`).
 - `plan` (optional): the task plan the agent recorded via `todo` and each item's status (the full list
   from the last call). **Present only if the agent used `todo`** — otherwise the key doesn't exist;
@@ -908,7 +913,7 @@ Process exit codes:
 | `124` | timeout (`timeout`, following the GNU `timeout` convention)|
 | `125` | budget exceeded (`budget_exceeded`, cumulative tokens hit `max_total_tokens`)|
 | `130` | user cancel (`cancelled`, 128 + SIGINT)|
-| `1` | anything else (`max_turns_reached` / `max_tokens` / provider errors, …)|
+| `1` | anything else (`max_turns_reached` / `max_tokens` / provider errors / `stream_truncated`-family partial streams, …)|
 
 In headless mode `Ctrl-C` is a **graceful cancel**: the first press interrupts between streaming chunks
 (≤200ms), writes a proper `result.json` (`stop_reason = cancelled`), then exits 130; a second `Ctrl-C`
@@ -1490,65 +1495,67 @@ one-line responsibility is maintained in that script's ENTRIES.
 <!-- BEGIN CODE STRUCTURE (generated by scripts/gen_structure.py) -->
 ```text
 crates/core/src/  # kernel crate (package tiny-agent-core, lib name tiny_agent): agent loop / tools / providers / config / assembly
-├── lib.rs            (  608)  # lib root: build_agent* / assemble (tool table, ToolCtx, code install, skill injection)
-├── fsutil.rs         (  463)  # atomic-write primitives (O_EXCL temp + fsync + dir fsync; shared by session/result/report)
-├── diag.rs           (  168)  # diagnostics channel: global sink installable by GUI hosts (falls back to stderr, byte-identical) — soft-failure warnings of skills/MCP/session/run_code go through it
-├── config.rs         ( 3177)  # config parsing + task-fragment merge + batch override whitelist
+├── lib.rs                (  608)  # lib root: build_agent* / assemble (tool table, ToolCtx, code install, skill injection)
+├── fsutil.rs             (  463)  # atomic-write primitives (O_EXCL temp + fsync + dir fsync; shared by session/result/report)
+├── diag.rs               (  168)  # diagnostics channel: global sink installable by GUI hosts (falls back to stderr, byte-identical) — soft-failure warnings of skills/MCP/session/run_code go through it
+├── config.rs             ( 3177)  # config parsing + task-fragment merge + batch override whitelist
 ├── provider/  # LLM backends
-│   ├── mod.rs            ( 1156)  # shared Message/Block, SSE reader, CancellableSse
-│   ├── openai.rs         ( 2310)  # OpenAI-compatible (include_usage; 400 fallbacks: max_tokens→max_completion_tokens / drop stream_options)
-│   ├── anthropic.rs      ( 1246)  # Anthropic native (message_start/message_delta usage)
-│   └── mock.rs           (  345)  # scripted Provider for tests (cfg(any(test, feature="mock")))
-├── agent.rs          ( 4572)  # core loop + usage accounting + cancel + context compression (preflight/overflow dual trigger + rolling chunked summaries) + adjacent-message normalization + same-turn multi-task parallelism
-├── agent_tests.rs    (11424)  # core-loop regression tests (scripted provider::mock, no network)
-├── usage_probe.rs    (   94)  # thread-local usage side channel for parallel workers: recovers billed usage after a panic unwind at the join point (keeps result.json and the shared counter from diverging)
-├── compress.rs       (  996)  # compression engine (find_safe_cut / chunked summaries / saturating usage merge + block-level billing primitives)
-├── context_report.rs (  886)  # context composition breakdown (ContextBreakdown estimate: 3 system parts / 4 tool classes / message typing + anchor calibration)
-├── retry.rs          (  158)  # exponential backoff shared by batch --retries and single-run transient retry (±25% jitter against lockstep)
-├── session.rs        (  522)  # session persistence (atomic writes + fold archive)
-├── skills.rs         ( 1089)  # three-tier skill loading (built-in / user dir / project)
-├── hooks.rs          (  296)  # hooks gate (Deny / Modify / audit)
+│   ├── mod.rs                ( 1165)  # shared Message/Block, SSE reader, CancellableSse
+│   ├── openai.rs             ( 2388)  # OpenAI-compatible (include_usage; 400 fallbacks: max_tokens→max_completion_tokens / drop stream_options)
+│   ├── openai_review_pins.rs (  982)  # openai review pins (loopback HTTP: status matrix/credential discipline/retry body; ThinkStripper differential + idle timeout)
+│   ├── sse_review_pins.rs    (  245)  # SSE parser review pins (chunk-boundary invariance across 17 stream shapes, sync vs worker path)
+│   ├── anthropic.rs          ( 1246)  # Anthropic native (message_start/message_delta usage)
+│   └── mock.rs               (  352)  # scripted Provider for tests (cfg(any(test, feature="mock")))
+├── agent.rs              ( 4611)  # core loop + usage accounting + cancel + context compression (preflight/overflow dual trigger + rolling chunked summaries) + adjacent-message normalization + same-turn multi-task parallelism
+├── agent_tests.rs        (11424)  # core-loop regression tests (scripted provider::mock, no network)
+├── usage_probe.rs        (   94)  # thread-local usage side channel for parallel workers: recovers billed usage after a panic unwind at the join point (keeps result.json and the shared counter from diverging)
+├── compress.rs           (  996)  # compression engine (find_safe_cut / chunked summaries / saturating usage merge + block-level billing primitives)
+├── context_report.rs     (  886)  # context composition breakdown (ContextBreakdown estimate: 3 system parts / 4 tool classes / message typing + anchor calibration)
+├── retry.rs              (  158)  # exponential backoff shared by batch --retries and single-run transient retry (±25% jitter against lockstep)
+├── session.rs            (  522)  # session persistence (atomic writes + fold archive)
+├── skills.rs             ( 1089)  # three-tier skill loading (built-in / user dir / project)
+├── hooks.rs              (  301)  # hooks gate (Deny / Modify / audit)
 ├── tools/  # toolset: built-in tools + MCP wrappers + task sub-agent + run_code (feature code)
-│   ├── mod.rs            ( 1509)  # Tool trait + ToolCtx + CallbackTool/SharedTool + whitelist assembly
-│   ├── shell.rs          ( 1297)  # shell tool (unix: sh -c; Windows: cmd /C + raw_arg verbatim command passing, defeating std quoting)
-│   ├── file.rs           ( 1672)  # read_file / write_file / edit_file / list_dir
-│   ├── image.rs          (   87)  # load_image tool
-│   ├── document.rs       (  100)  # PDF → Block::Document loading (lib API load_document_block)
-│   ├── skill.rs          (  981)  # read_skill / list_skill (outside the whitelist; injected by assembly)
-│   ├── mcp.rs            (  674)  # MCP tool wrapper (sanitize_name + wire_name dispatch)
-│   ├── subagent.rs       ( 1094)  # task sub-agent tool (own context + turn cap; non-recursive)
-│   ├── todo.rs           (  311)  # todo tool (task plan, full replacement; plan lands in result.json)
-│   ├── run_code.rs       (  103)  # run_code facade (feature code): mod declarations + symbol re-exports; implementation in run_code/ submodules
-│   ├── llm.rs            (  740)  # llm judgment primitive (feature code + code.llm gate): single-shot stateless inner model call — LD-17 reserve/settle, LD-18 label normalization, shared Provider cell
+│   ├── mod.rs                ( 1509)  # Tool trait + ToolCtx + CallbackTool/SharedTool + whitelist assembly
+│   ├── shell.rs              ( 1297)  # shell tool (unix: sh -c; Windows: cmd /C + raw_arg verbatim command passing, defeating std quoting)
+│   ├── file.rs               ( 1672)  # read_file / write_file / edit_file / list_dir
+│   ├── image.rs              (   87)  # load_image tool
+│   ├── document.rs           (  100)  # PDF → Block::Document loading (lib API load_document_block)
+│   ├── skill.rs              (  981)  # read_skill / list_skill (outside the whitelist; injected by assembly)
+│   ├── mcp.rs                (  674)  # MCP tool wrapper (sanitize_name + wire_name dispatch)
+│   ├── subagent.rs           ( 1101)  # task sub-agent tool (own context + turn cap; non-recursive)
+│   ├── todo.rs               (  311)  # todo tool (task plan, full replacement; plan lands in result.json)
+│   ├── run_code.rs           (  103)  # run_code facade (feature code): mod declarations + symbol re-exports; implementation in run_code/ submodules
+│   ├── llm.rs                (  740)  # llm judgment primitive (feature code + code.llm gate): single-shot stateless inner model call — LD-17 reserve/settle, LD-18 label normalization, shared Provider cell
 │   └── run_code/  # run_code submodules (same code gate): split from the original 11.9k single file by concern
-│       ├── contract.rs       (  936)  # guest-facing contract text: reserved names/CODE marker/byte caps, PRELUDE three sources, skill md loading, strip_once
-│       ├── sandbox.rs        (  806)  # wasmtime sandbox: QuickJS module load & cache, epoch/fuel/MemLimiter, CallTrace, HostCtx, wall clock, guest memory read caps
-│       ├── guest_api.rs      ( 3587)  # host function surface: unpack/read/write, host_call_tool dispatch, inner-result envelope, llm marker parse folding, audit meta
-│       ├── fs_policy.rs      ( 2444)  # fs/glob policy: path interception & lexical normalization, write-dir constraints, symlink checks, glob matching (** folding + segment caps)
-│       ├── lib_index.rs      ( 2051)  # lib family: session library index/read-write caps, sha256, reserved names, include delivery
-│       ├── batch.rs          ( 2289)  # callBatch: wave scheduling, output admission (total-cap degradation), entry envelopes
-│       ├── precheck.rs       (  858)  # FR-2 precheck: lexer + keyword-hit rendering
-│       ├── tool.rs           ( 1096)  # the tool itself: RunCodeTool state machine + Tool impl (hash-pinned description/schema)
-│       └── test_util.rs      (  123)  # shared test helpers (cfg(test): scratch/ctx/llm assembly)
-├── mcp.rs            ( 5977)  # MCP client (stdio / Streamable HTTP incl. 202→GET stream / legacy SSE)
-├── winjob.rs         (  481)  # Windows Job Object process-tree kill (shared by shell timeout/cancel + MCP child reaping; two drop strategies)
-└── m0_probes.rs      (  337)  # M0 mechanism probes (cfg(test), #[path]-declared in lib.rs): reserve/settle ledger, shared Provider cell, per-request model routing in-process prototype (A-L2b/2c/9 — reused directly by the M3 llm primitive)
+│       ├── contract.rs           (  936)  # guest-facing contract text: reserved names/CODE marker/byte caps, PRELUDE three sources, skill md loading, strip_once
+│       ├── sandbox.rs            (  806)  # wasmtime sandbox: QuickJS module load & cache, epoch/fuel/MemLimiter, CallTrace, HostCtx, wall clock, guest memory read caps
+│       ├── guest_api.rs          ( 3587)  # host function surface: unpack/read/write, host_call_tool dispatch, inner-result envelope, llm marker parse folding, audit meta
+│       ├── fs_policy.rs          ( 2444)  # fs/glob policy: path interception & lexical normalization, write-dir constraints, symlink checks, glob matching (** folding + segment caps)
+│       ├── lib_index.rs          ( 2051)  # lib family: session library index/read-write caps, sha256, reserved names, include delivery
+│       ├── batch.rs              ( 2289)  # callBatch: wave scheduling, output admission (total-cap degradation), entry envelopes
+│       ├── precheck.rs           (  858)  # FR-2 precheck: lexer + keyword-hit rendering
+│       ├── tool.rs               ( 1096)  # the tool itself: RunCodeTool state machine + Tool impl (hash-pinned description/schema)
+│       └── test_util.rs          (  123)  # shared test helpers (cfg(test): scratch/ctx/llm assembly)
+├── mcp.rs                ( 5977)  # MCP client (stdio / Streamable HTTP incl. 202→GET stream / legacy SSE)
+├── winjob.rs             (  481)  # Windows Job Object process-tree kill (shared by shell timeout/cancel + MCP child reaping; two drop strategies)
+└── m0_probes.rs          (  337)  # M0 mechanism probes (cfg(test), #[path]-declared in lib.rs): reserve/settle ledger, shared Provider cell, per-request model routing in-process prototype (A-L2b/2c/9 — reused directly by the M3 llm primitive)
 
 src/  # CLI crate (package tiny-agent, bin tiny-agent): process shell + headless rendering + batch + TUI
-├── main.rs           ( 1024)  # CLI entry + assembly (build_agent) + --session none
-├── signal.rs         (  123)  # headless SIGINT → cancel (first press graceful / second hard-exit 130)
-├── batch.rs          ( 3999)  # batch tasks + --retries/--failed + report merging
-├── harness.rs        ( 2385)  # headless mode + result.json + NDJSON + exit codes
-├── harness_tests.rs  ( 1212)  # harness behavior tests (retry ladder / result.json / NDJSON; moved here with harness from the kernel's agent_tests.rs)
-├── tui.rs            (   20)  # TUI module root (feature tui): mod declarations + public exports (run / transcript_rows)
+├── main.rs               ( 1029)  # CLI entry + assembly (build_agent) + --session none
+├── signal.rs             (  123)  # headless SIGINT → cancel (first press graceful / second hard-exit 130)
+├── batch.rs              ( 4013)  # batch tasks + --retries/--failed + report merging
+├── harness.rs            ( 2406)  # headless mode + result.json + NDJSON + exit codes
+├── harness_tests.rs      ( 1212)  # harness behavior tests (retry ladder / result.json / NDJSON; moved here with harness from the kernel's agent_tests.rs)
+├── tui.rs                (   20)  # TUI module root (feature tui): mod declarations + public exports (run / transcript_rows)
 └── tui/  # TUI submodules (same tui gate): split from the original 8.7k-line single file by concern
-    ├── app.rs            ( 1834)  # session assembly: run entry / worker thread / event & input channels / ui_loop event body / Ctrl-C double-press window
-    ├── input.rs          (  361)  # multi-line InputBuffer editor / input history recall / horizontal input scrolling
-    ├── slash.rs          (  543)  # slash commands: classify grammar / read-only replies / completion popup state machine / /context report
-    ├── theme.rs          (  147)  # theme: single source for history-row & chrome colors / light-dark switch TINYAGENT_TUI_THEME / number formatting helpers
-    ├── markdown.rs       (  632)  # markdown & ANSI rendering: render_markdown / escape parsing / fence scanning (shared with streaming splits) / MdCache single-slot cache
-    ├── transcript.rs     ( 1198)  # conversation Row model and all build/mutation logic: history rendering / streaming increments & incremental splits / /export dump / resume rebuild
-    ├── render.rs         (  490)  # terminal drawing: scrollback commit_rows / live-region render / input & status bar chrome / width & control-char utilities
-    └── tests.rs          ( 4143)  # TUI regression tests (TestBackend cell-grid assertions + input / completion / streaming-split logic)
+    ├── app.rs                ( 1834)  # session assembly: run entry / worker thread / event & input channels / ui_loop event body / Ctrl-C double-press window
+    ├── input.rs              (  361)  # multi-line InputBuffer editor / input history recall / horizontal input scrolling
+    ├── slash.rs              (  543)  # slash commands: classify grammar / read-only replies / completion popup state machine / /context report
+    ├── theme.rs              (  147)  # theme: single source for history-row & chrome colors / light-dark switch TINYAGENT_TUI_THEME / number formatting helpers
+    ├── markdown.rs           (  632)  # markdown & ANSI rendering: render_markdown / escape parsing / fence scanning (shared with streaming splits) / MdCache single-slot cache
+    ├── transcript.rs         ( 1198)  # conversation Row model and all build/mutation logic: history rendering / streaming increments & incremental splits / /export dump / resume rebuild
+    ├── render.rs             (  490)  # terminal drawing: scrollback commit_rows / live-region render / input & status bar chrome / width & control-char utilities
+    └── tests.rs              ( 4143)  # TUI regression tests (TestBackend cell-grid assertions + input / completion / streaming-split logic)
 ```
 <!-- END CODE STRUCTURE -->

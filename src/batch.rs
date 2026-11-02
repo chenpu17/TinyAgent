@@ -805,6 +805,7 @@ pub fn run(
                     provider: String::new(),
                     started_at: String::new(),
                     code: None,
+                    config_fingerprint: None,
                 },
             );
             TaskReport {
@@ -918,6 +919,7 @@ pub fn run(
                             provider: String::new(),
                             started_at: String::new(),
                             code: None,
+                            config_fingerprint: None,
                         },
                     );
                     TaskReport {
@@ -978,6 +980,7 @@ pub fn run(
                                     provider: String::new(),
                                     started_at: crate::harness::now_rfc3339(),
                                     code: None,
+                                    config_fingerprint: None,
                                 },
                             );
                             panic_report(&name, &payload)
@@ -1150,6 +1153,11 @@ fn run_one_attempt(
                 provider: base.provider.as_str().to_string(),
                 started_at: started_at.to_string(),
                 code: None,
+                // bad_task / setup_error never built an agent — no effective
+                // config ever RAN (same "not applicable" attribution as the
+                // base model above); earlier attempts' own result files (now
+                // overwritten) carried their fingerprints.
+                config_fingerprint: None,
             },
         );
         let mut r = bad(stop, msg, &acc.usage, acc.turns);
@@ -1209,6 +1217,10 @@ fn run_one_attempt(
         provider: agent.provider().to_string(),
         started_at: started_at.to_string(),
         code: harness::code_facts_of(&agent),
+        // FR-4 pairing key for the failure branch of write_result: the agent
+        // exists here, so even a run that dies before any outcome (503 ladder,
+        // request_error, cancel-during-backoff) still pins "model + harness".
+        config_fingerprint: Some(agent.config_fingerprint().to_string()),
     };
 
     let outcome = agent.run(&mut |_| {}); // quiet: no per-event printing
@@ -1438,6 +1450,7 @@ fn run_one(
                     provider: base.provider.as_str().to_string(),
                     started_at: started_at.clone(),
                     code: None,
+                    config_fingerprint: None,
                 },
             );
             return TaskReport {
@@ -1518,6 +1531,7 @@ fn run_one(
                     provider: base.provider.as_str().to_string(),
                     started_at: started_at.clone(),
                     code: None,
+                    config_fingerprint: None,
                 },
             );
             report = TaskReport {

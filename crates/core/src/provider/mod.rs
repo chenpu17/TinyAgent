@@ -649,6 +649,11 @@ impl<R: Read> SseReader<R> {
     /// clean EOF (which would make the caller assemble a truncated
     /// "successful" response). The `SseSource` impl maps this to
     /// `StreamAbort::StreamError`.
+    ///
+    /// Recorded spec deviation (review finding, accepted): line terminators
+    /// are LF (with one trailing CR trimmed — CRLF works); a CR-only stream
+    /// (spec-legal but produced by no real gateway) merges into ONE line.
+    /// Pinned by `sse_cr_only_line_endings_observed_behavior`.
     pub fn next_data(&mut self) -> std::io::Result<Option<String>> {
         self.next_data_with(SSE_EVENT_MAX, SSE_TOTAL_MAX)
     }
@@ -883,6 +888,10 @@ impl SseSource for CancellableSse {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "sse_review_pins.rs"]
+mod sse_review_pins;
 
 #[cfg(test)]
 mod tests {

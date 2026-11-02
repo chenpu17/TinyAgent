@@ -195,6 +195,13 @@ impl Tool for SubAgent {
         );
 
         let provider = provider::build(&child_cfg, &self.api_key, self.client.clone());
+        // Gateway-fix boundary (documented, deliberate): the child's provider
+        // starts from `gateway_fixes_preset` ONLY — it neither inherits what
+        // the parent provider learned in-process, nor folds its own 400
+        // lessons back into the parent (a fresh child per `task` call would
+        // re-pay a teaching 400 the parent already paid). The OR-merge is
+        // safe if a host ever needs it, but today no consumer asked for the
+        // cross-agent pooling — no seam without a consumer (§4 X-3).
         let initial = vec![Message::user(vec![Block::Text(prompt.to_string())])];
         let mut child = Agent::new(
             &child_cfg,

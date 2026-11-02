@@ -50,6 +50,8 @@ ENTRIES = [
     ("crates/core/src", "config.rs", "config parsing + task-fragment merge + batch override whitelist"),
     ("crates/core/src", "provider/mod.rs", "shared Message/Block, SSE reader, CancellableSse"),
     ("crates/core/src", "provider/openai.rs", "OpenAI-compatible (include_usage; 400 fallbacks: max_tokens→max_completion_tokens / drop stream_options)"),
+    ("crates/core/src", "provider/openai_review_pins.rs", "openai review pins (loopback HTTP: status matrix/credential discipline/retry body; ThinkStripper differential + idle timeout)"),
+    ("crates/core/src", "provider/sse_review_pins.rs", "SSE parser review pins (chunk-boundary invariance across 17 stream shapes, sync vs worker path)"),
     ("crates/core/src", "provider/anthropic.rs", "Anthropic native (message_start/message_delta usage)"),
     ("crates/core/src", "provider/mock.rs", "scripted Provider for tests (cfg(any(test, feature=\"mock\")))"),
     ("crates/core/src", "agent.rs", "core loop + usage accounting + cancel + context compression (preflight/overflow dual trigger + rolling chunked summaries) + adjacent-message normalization + same-turn multi-task parallelism"),

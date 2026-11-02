@@ -67,6 +67,11 @@
 
 ### Changed（破坏性）
 
+- **`ResultMeta` 新增 `config_fingerprint: Option<String>` 字段**（2026-11-03 评审 C-F1）：CLI crate
+  内部结构，绑定/库消费方不经此类型；随批 `ResultMeta { .. }` 字面构造（测试/工具）需补字段。
+- **折叠的 `folded_ids` / `dropped` 口径扩展**（2026-11-03 评审 A-F4 修复伴生）：assistant 开头的
+  历史（resumed 形态）折叠时头消息一并入档——该形态下 `Compressed` 事件的 `folded_ids` 与
+  `CompressOutcome.dropped` 比此前多 1（含被替换的头）；user 开头的历史（绝大多数）逐字节不变。
 - **`CompressOutcome` 失去 `Copy`**（FR-6 携带 `folded_ids: Vec<String>` 所致）：持有该类型按值
   拷贝的库消费方改用 `.clone()`。0.x minor 即破坏窗口。
 - **`RunOutcome` 新增 `config_fingerprint` / `gateway_fixes` 字段**（FR-3/FR-4 出账面）：Rust 库
@@ -78,6 +83,10 @@
   `TurnArbitration` 为枚举新增变体——enum 本身 `#[non_exhaustive]`，serde 透传零改动。
 - **`sha2` 依赖转必选**（FR-4 指纹哈希用）：此前 `code` feature 门控直连（wasmtime 传递已有），
   默认依赖树 +1 个既有 crate。
+- **绑定发布产物移除 `mock` feature**（2026-11-03 评审 D-F8）：python/node 绑定的常规依赖此前携带
+  core 的 `mock` feature，scripted 假 provider 编进发布 wheel/npm（`ProviderKind` 选不中它，无正确性
+  风险，但属契约背离 + 产物面扩大）；绑定源码/测试零引用，删除。core 对同款需求用
+  dev-dependencies 技巧，不受影响。
 - **`AgentEvent::Usage` 新增 `tool_folded: bool`**：`false` = provider 请求自身的用量（上下文占用的
   真值）；`true` = 工具账单折叠进 run 总额（`task` 子 agent 多轮累计、run_code 内层 `llm`、宿主回调
   工具上报），在该工具的 `ToolCall` 之后、`ToolResult` 之前发出。累计总额两者都计，表示「最近一次
@@ -88,6 +97,36 @@
 
 ### Fixed
 
+- **2026-11-03 外部对抗评审修复**（4 位独立评审 subagent 分片深审内核循环 / provider 流式 / CLI+文档对账 /
+  bindings+构建+CI，全部动态验证；钉子 34 根转正：`tests/kernel_review_pins.rs` 12 根、
+  `provider/sse_review_pins.rs` 5 根、`provider/openai_review_pins.rs` 17 根（含 wave-2 返工钉））：
+  - **cancel 纪律两处实现缺口**（M8「本轮内落下的 cancel 必须报 cancelled/exit 130」）：①零块收尾
+    出口（内容过滤 / thinking-only max_tokens 等）在 post-chat 窗口（Usage 事件回调、anchor 更新）落下
+    的 cancel 被吞，stop_reason 谎报 end_turn / max_tokens；②仲裁钩子（FR-1）执行窗内落下的 cancel
+    在 Stop / capped 降级汇合出口不再复查，被报成 end_turn（exit 0）/ arbitration_capped——两处各补
+    与带块路径同款的 override（cancel 压过 end_turn / max_tokens / arbitration_capped；Continue 路径
+    仍由轮首护栏接管）。`hooks.rs`「Loop-top guards always win」文档同步。
+  - **失败路径 result.json 缺 `config_fingerprint`**：`RunOutcome` 为 None 的终态（503 重试梯耗尽 /
+    request_error / 退避中取消）此前不落键，违背 FR-4「恒在键」契约——`ResultMeta` 增
+    `config_fingerprint: Option<String>`（`from_agent` 自动填），batch 同款；空归属终态（bad_task /
+    未启动 / panic）按归因空缺缺席（文档措辞同步收敛）。
+  - **OpenAI 兼容 provider 补首 POST 前 cancel 检查点**（与 Anthropic 对称）：已置位的 cancel 不再白付
+    一整轮连接 + 上传 round-trip。
+  - **200 + 非 SSE 体（网关 HTML 错误页）零诊断**：零 data 事件的截断路径现在在 transcript 里留诊断块（仅干净 EOF 收尾——cancel/idle/error 中止保持各自的诚实标签，wave-2 返工收窄）
+    （`[stream error] no SSE data events in response (content-type: …)`），stop_reason / exit 契约不变。
+  - **summary 重试只对 transient**：压缩摘要请求此前对 401/403/404/400 也吃一次退避 + 全量重传，与自身
+    注释矛盾——`RunError::is_transient` 的分类梯子抽为 `is_transient_error` 共享，确定性失败不再重试。
+  - **折叠审计链缺口**：assistant 头（resumed 形态）此前从活历史与 session archive 双双消失（活历史被
+    全新 user 头替换、归档只收 `[1..cut]`）——现在按头形态把 `[0..cut]` 整体入档，`folded_ids` / `dropped`
+    与归档内容一致。
+  - **CLI `--resume` 损坏会话双警告自相矛盾**：第二行改为中性「no usable session history」。
+  - **CI/发布管线**：发布三构建路径补锁校验（`cargo metadata --locked`）与 `--locked`（musl）；node /
+    python 发布构建设 `CARGO_PROFILE_RELEASE_PANIC=unwind`（workspace `panic="abort"` 使绑定的
+    catch_unwind → Promise reject / PanicException 在发布产物里全部失效——FFI 兜底恢复生效）；release
+    子包打包的 `ls | head -1` 掩错改为显式存在性断言；CI 测试 / clippy / e2e 门禁全部 `--locked`（与
+    msrv job 口径统一）；绑定成员补 rust-version 声明（python 1.86 并纳入 msrv job 验证；node 真实地板 1.88——锁内 napi-build 2.x 所要求，wave-2 复核实测——声明如实、CI 验证待 napi 3 迁移一并纳入）；dtolnay/
+    rust-toolchain 由浮动 ref 改钉 SHA + `toolchain: stable` 输入（工具链语义不变、action 代码由 SHA
+    锚定、Dependabot 可见）。
 - **release.yml bindings-python sdist 步骤 EACCES（v0.4.3 Python wheel 缺失的根因）**：wheel 构建走
   manylinux 容器，docker 以 root 身份把产物写回挂载的工作树——`bindings/python/dist/` 归 root，
   宿主 runner 用户随后往同一 `dist/` 写 sdist 无写入权限而退出 1（jobs API 实锤：step6 wheel 成功、

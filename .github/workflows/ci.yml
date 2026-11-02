@@ -10,9 +10,11 @@ permissions:
   contents: read
 
 # 第三方 action 全部固定到 commit SHA（`@<SHA> # vN`），由 Dependabot 周更
-# （.github/dependabot.yml 支持 SHA+注释形态）。唯一豁免
-# dtolnay/rust-toolchain@stable：该 ref 本就是刻意跟随 stable 分支的浮动
-# tag，无版本漂移面可言，钉死反而失去意义。
+# （.github/dependabot.yml 支持 SHA+注释形态）。dtolnay/rust-toolchain 此前
+# 是唯一豁免（@stable 浮动 tag「无版本漂移面」）——外审 IMP 指出该论证把
+# 「工具链刻意漂移」与「action 代码供应链漂移」混为一谈：@stable 的代码本体
+# 一样会被改。现在钉 SHA + `toolchain: stable` 输入，两头兼得：工具链语义
+# 不变（跟随 stable），action 代码由 SHA 钉住、Dependabot 可见可升。
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -27,8 +29,9 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
+          toolchain: stable
           components: rustfmt
       - run: cargo fmt --all --check
       # run_code 三处同源契约（工具描述 / skill 正文 / 附录 A 指纹）：微调
@@ -59,16 +62,20 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
+          toolchain: stable
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # 两个 clippy 都带 -D warnings：本地现状零警告，门禁就该硬。
-      - run: cargo clippy -p tiny-agent-core -p tiny-agent --all-targets -- -D warnings
-      - run: cargo clippy -p tiny-agent --features tui --all-targets -- -D warnings
-      - run: cargo test -p tiny-agent-core -p tiny-agent
-      - run: cargo test -p tiny-agent-core --features mock
-      - run: cargo test -p tiny-agent --features tui,mock
+      # --locked 与 msrv job 同口径（外审 D-F6）：门禁校验用户实际拿到的
+      # 锁文件组合，而不是解析器当天挑的版本——semver 兼容新版本发布后
+      # CI 绿灯与锁文件构建不再分叉。
+      - run: cargo clippy --locked -p tiny-agent-core -p tiny-agent --all-targets -- -D warnings
+      - run: cargo clippy --locked -p tiny-agent --features tui --all-targets -- -D warnings
+      - run: cargo test --locked -p tiny-agent-core -p tiny-agent
+      - run: cargo test --locked -p tiny-agent-core --features mock
+      - run: cargo test --locked -p tiny-agent --features tui,mock
 
   code:
     # `code` feature（run_code 沙箱）门禁：第三个 clippy 配置——run_code.rs
@@ -84,15 +91,16 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
+          toolchain: stable
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-      - run: cargo clippy -p tiny-agent-core -p tiny-agent --features code --all-targets -- -D warnings
+      - run: cargo clippy --locked -p tiny-agent-core -p tiny-agent --features code --all-targets -- -D warnings
       # 第四个 clippy 配置：tui×code 交叉面（TUI 的 CodeLog 渲染、/code 命令、
       # set_code_* 交互）在任一单 feature 配置里都不可见（外审：CI 盲区）。
-      - run: cargo clippy -p tiny-agent --features tui,code --all-targets -- -D warnings
-      - run: cargo test -p tiny-agent-core -p tiny-agent --features code,mock
+      - run: cargo clippy --locked -p tiny-agent --features tui,code --all-targets -- -D warnings
+      - run: cargo test --locked -p tiny-agent-core -p tiny-agent --features code,mock
 
   e2e:
     # 场景化端到端门（离线、零密钥）：内置 SSE 场景 mock + 真实 CLI/HTTP
@@ -105,9 +113,11 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
+        with:
+          toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-      - run: cargo build --features code
+      - run: cargo build --locked --features code
       - run: python3 scripts/e2e_scenarios.py
 
   python-binding:
@@ -125,8 +135,9 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
+          toolchain: stable
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
@@ -146,11 +157,11 @@ jobs:
           cd bindings/python
           maturin develop
           "$BIN/python" -m pytest tests/ -q
-      - run: cargo clippy -p tiny-agent-py --all-targets -- -D warnings
+      - run: cargo clippy --locked -p tiny-agent-py --all-targets -- -D warnings
       # The `code` forwarding feature (run_code switch methods) must stay
       # compiling; the behavioral tests for it run against a --features code
       # build locally — the compile gate is the cheap CI equivalent.
-      - run: cargo clippy -p tiny-agent-py --features code --all-targets -- -D warnings
+      - run: cargo clippy --locked -p tiny-agent-py --features code --all-targets -- -D warnings
       # ...and the BEHAVIORAL tests too (enable_code flips the tool table,
       # set_code_config rejects unknown keys): the clippy gate can't see a
       # feature that compiles but no-ops. Second wheel in the same venv;
@@ -170,8 +181,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
+          toolchain: stable
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -188,9 +200,9 @@ jobs:
           npm install
           npm run build:debug
           npm test
-      - run: cargo clippy -p tiny-agent-node --all-targets -- -D warnings
+      - run: cargo clippy --locked -p tiny-agent-node --all-targets -- -D warnings
       # `code` forwarding feature compile gate (same rationale as the python job).
-      - run: cargo clippy -p tiny-agent-node --features code --all-targets -- -D warnings
+      - run: cargo clippy --locked -p tiny-agent-node --features code --all-targets -- -D warnings
       # Behavioral round for the same feature (see python job): rebuild the
       # .node with --features code so the build-adaptive code tests run.
       - run: |
@@ -205,11 +217,13 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
+        with:
+          toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: rustup target add x86_64-unknown-linux-musl
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - run: cargo build --release --target x86_64-unknown-linux-musl
+      - run: cargo build --locked --release --target x86_64-unknown-linux-musl
       # 二进制级冒烟：--version --json 是为 CI 断言设计的机器可读面（README
       # 构建节）。此前 CI 只 build 从不 exec——「编得过但跑不起来」的静态产物
       # 正是每次 tag 发出去的东西（外审）。白构建 features 必须为空。
@@ -224,7 +238,7 @@ jobs:
       # code 变体冒烟：wasmtime+cranelift 纯 Rust 静态链接（quickjs.wasm 资产
       # 已嵌入、构建不碰 C 工具链，设计 D1）——"嵌入式低配 Linux + 沙箱"是
       # 核心交付组合，随每次 push 确认它仍编得出静态 ELF。
-      - run: cargo build --release --target x86_64-unknown-linux-musl --features code
+      - run: cargo build --locked --release --target x86_64-unknown-linux-musl --features code
       # code 变体的 features 必须恰为 ["code"]（无 tui——musl 产物定位无头）。
       - run: |
           BIN=./target/x86_64-unknown-linux-musl/release/tiny-agent
@@ -247,11 +261,20 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
           toolchain: 1.86.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo check --locked
+      # 绑定成员的 MSRV 验证（外审 D-F7，wave-2 复核定版）：python 在 1.86
+      # 全绿（pyo3 0.22 + maturin-build 地板更低），此处逐包验证（pyo3 需要
+      # 显式解释器）。node 的真实地板是 1.88（锁内 napi-build 2.x 要求），
+      # 高于本 job 的 1.86 工具链——暂移出，待 napi 3 迁移（第九轮延后项）
+      # 时一并纳入；其 rust-version="1.88" 已如实声明，cargo 对低于地板的
+      # 工具链会当场报错（本地 `cargo +1.86 check -p tiny-agent-node` 复现）。
+      - run: cargo check --locked -p tiny-agent-py
+        env:
+          PYO3_PYTHON: python3
 
   audit:
     # cargo-audit：RustSec 公告库扫描依赖树。依赖面小（reqwest + serde +
@@ -266,7 +289,9 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
+        with:
+          toolchain: stable
       # --locked 只锁依赖树、锁不住 cargo-audit 自身的版本——这里显式钉版；
       # Dependabot 不认 run 步骤（只看 uses: 引用），升版本靠手动改这一行。
       - run: cargo install --locked cargo-audit --version 0.22.2

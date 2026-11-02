@@ -270,13 +270,18 @@ pub trait Hooks: Send + Sync {
     ///   observed run, not of every nested one.
     /// - **Loop-top guards always win.** A cancel flagged during (or after)
     ///   a `Continue` lands at the next loop-top check — the continuation
-    ///   never sends a request past it, `stop_reason = "cancelled"`. The
-    ///   racy guards (`budget_exceeded`, timeout) are checked only there:
-    ///   an accepted decision does not pre-clear them, so a `continued ==
-    ///   true` event can be followed by a guard label instead of a request
-    ///   (the queued note then rides the deferred exit flush — late, never
-    ///   lost). The deterministic ones (continuation cap, `max_turns`) are
-    ///   pre-checked at the decision point — see *Cap & turn budget*.
+    ///   never sends a request past it, `stop_reason = "cancelled"`. A cancel
+    ///   flagged during the hook call itself is re-checked at the exit that
+    ///   follows (a `Stop` return or a capped degrade would otherwise report
+    ///   `end_turn` / `arbitration_capped` for a run the user already
+    ///   aborted): there too the cancel wins and the label is `cancelled`.
+    ///   The racy guards (`budget_exceeded`, timeout) are checked only at the
+    ///   loop top: an accepted decision does not pre-clear them, so a
+    ///   `continued == true` event can be followed by a guard label instead
+    ///   of a request (the queued note then rides the deferred exit flush —
+    ///   late, never lost). The deterministic ones (continuation cap,
+    ///   `max_turns`) are pre-checked at the decision point — see
+    ///   *Cap & turn budget*.
     /// - **Ordering vs compression.** Arbitration happens after the final
     ///   turn's messages are persisted (the turn's message face is
     ///   settled); the injected note is delivered at the next turn top,

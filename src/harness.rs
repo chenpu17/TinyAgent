@@ -27,6 +27,15 @@ pub struct ResultMeta {
     /// skill_injection/precheck decision. `Some` only when the sandbox was
     /// enabled at assembly — absent key = byte-identical default output.
     pub code: Option<CodeFacts>,
+    /// FR-4 pairing key for the failure branch of `write_result` (external
+    /// review P2): a run whose agent was built but never produced an outcome
+    /// (503 ladder exhausted, request_error, cancel-during-backoff) must
+    /// still carry the fingerprint — the ledger's "model + harness pairing"
+    /// audit needs it on failed runs as much as on successful ones. `None`
+    /// only for the attribution-empty terminals (bad_task / never-started /
+    /// panic) where no effective config ever ran. The success branch ignores
+    /// this and uses the outcome's own value.
+    pub config_fingerprint: Option<String>,
 }
 
 /// The run_code facts worth auditing for a bench rerun (NFR-3).
@@ -75,6 +84,7 @@ impl ResultMeta {
             provider: agent.provider().to_string(),
             started_at: now_rfc3339(),
             code: code_facts_of(agent),
+            config_fingerprint: Some(agent.config_fingerprint().to_string()),
         }
     }
 }
@@ -820,6 +830,15 @@ pub fn write_result(
             if !acc.compressions.is_empty() {
                 result["compressions"] = json!(acc.compressions);
             }
+            // FR-4 pairing key on the failure branch too (external review P2):
+            // the meta carries the fingerprint whenever an agent was actually
+            // built, so a 503-ladder / request_error / cancel-during-backoff
+            // terminal still pins "model + harness" for the ledger. Absent
+            // only for the attribution-empty terminals (bad_task /
+            // never-started / panic) where no effective config ever ran.
+            if let Some(fp) = &meta.config_fingerprint {
+                result["config_fingerprint"] = json!(fp);
+            }
             result
         }
     };
@@ -1142,6 +1161,7 @@ mod tests {
             provider: "openai".into(),
             started_at: "2026-08-15T07:41:02Z".into(),
             code: None,
+            config_fingerprint: None,
         }
     }
 
@@ -1494,6 +1514,7 @@ mod tests {
                 precheck: true,
                 llm: None,
             }),
+            config_fingerprint: None,
         };
         let o = RunOutcome {
             final_text: "done".into(),

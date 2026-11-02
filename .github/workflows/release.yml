@@ -20,8 +20,9 @@ concurrency:
   group: release-${{ github.ref_name }}
   cancel-in-progress: false
 
-# action 固定到 commit SHA（`@<SHA> # vN`，Dependabot 周更）；唯一豁免
-# dtolnay/rust-toolchain@stable——该 ref 本就是刻意跟随 stable 分支的浮动 tag。
+# action 固定到 commit SHA（`@<SHA> # vN`，Dependabot 周更），含
+# dtolnay/rust-toolchain（钉 SHA + toolchain: stable 输入，工具链语义不变、
+# action 代码由 SHA 锚定——与 ci.yml 同批处理）。
 
 jobs:
   musl:
@@ -32,8 +33,9 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
+          toolchain: stable
           targets: x86_64-unknown-linux-musl
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
@@ -43,12 +45,18 @@ jobs:
       - name: Install musl-tools
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
+      # 发布纪律（外审 D-F4）：发布产物必须按审计过的锁文件组合构建——锁欠
+      # 更新的提交在这里红灯，而不是静默重解析出与审计不同的依赖树。三个
+      # 构建 job（musl / node / python）同款。
+      - name: Verify Cargo.lock is up to date
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
       # 产物带 code feature（run_code 沙箱编译入内、运行期 enabled 默认关，
       # 用户 config "code":{"enabled":true} 才暴露给模型）——产品拍板 2026-09：
       # A/B 指标已验证（PRD §10 两批），+4.6 MiB 换开箱可用；默认关维持
       # "被注入模型默认不获得循环+代码执行能力"的红线（设计 D15）。
       - name: Build static binary
-        run: cargo build --release --target x86_64-unknown-linux-musl --features code
+        run: cargo build --release --target x86_64-unknown-linux-musl --features code --locked
 
       # 扩展点：后续版本可加 aarch64-musl / macOS / Windows 产物，
       # 每平台一个 job、同样的打包命名约定。
@@ -90,8 +98,9 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
@@ -106,8 +115,17 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
+      - name: Verify Cargo.lock is up to date
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
+      # FFI 兜底覆盖（外审 D-F5）：workspace [profile.release] panic="abort"
+      # 会让 napi 的 catch_unwind → Promise reject 在发布产物里全部失效
+      # （核心 panic 直接杀死宿主进程）——env 覆盖回 unwind，CLI 二进制
+      # 的 musl job 保持 abort 不变（那是刻意的体积/语义取舍）。
       - name: Build native binding
         working-directory: bindings/node
+        env:
+          CARGO_PROFILE_RELEASE_PANIC: unwind
         run: npm install && npm run build -- --target ${{ matrix.target }}
 
       # 子包 = package.json（name/version 与主包一致）+ 平台 .node + LICENSE。
@@ -122,7 +140,14 @@ jobs:
           VERSION=$(node -p "require('./package.json').version")
           STAGE="npm-stage/${PKG_NAME}"
           mkdir -p "$STAGE"
-          NODE_FILE=$(ls tiny-agent.*.node | head -1)
+          NODE_FILE=$(ls tiny-agent.*.node 2>/dev/null | head -1)
+          # 显式存在性断言（外审 D-F3）：GitHub 默认 bash -e 无 pipefail，
+          # `.node` 缺失时 ls 的失败被 head 的 0 掩盖，错误会延迟到 cp 才以
+          # 误导性的形态浮出——这里当面失败并说明根因。
+          if [ -z "$NODE_FILE" ]; then
+            echo "ERROR: no tiny-agent.*.node produced by the napi build" >&2
+            exit 1
+          fi
           cp "$NODE_FILE" "$STAGE/"
           cp ../../LICENSE "$STAGE/"
           PKG_STAGE="$STAGE" PKG_VERSION="$VERSION" PKG_NODE_FILE="$NODE_FILE" \
@@ -149,7 +174,9 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
+        with:
+          toolchain: stable
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
@@ -164,7 +191,15 @@ jobs:
       # auditwheel 拒绝；容器内构建 + 修复才能得到可移植的 manylinux_2_17。
       # 版本号单源 = pyproject.toml（5 处同步约定），maturin 自动写入
       # wheel/sdist 文件名，不从 tag 解析、不硬编码。
+      # wheel 面的 FFI 兜底与 node 侧同款（外审 D-F5）：env 覆盖 workspace
+      # panic="abort"（PyO3 的 PanicException 只在 unwind 下存在），发布
+      # wheel 的核心 panic 转为 Python 异常而非进程死亡。
+      - name: Verify Cargo.lock is up to date
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
       - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        env:
+          CARGO_PROFILE_RELEASE_PANIC: unwind
         with:
           working-directory: bindings/python
           command: build

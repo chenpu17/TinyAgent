@@ -379,6 +379,18 @@ fn reject_documents(messages: &[Message]) -> Result<()> {
 
 impl Provider for OpenAi {
     fn chat(&self, req: &ChatRequest, on_event: &mut dyn FnMut(ChatEvent)) -> Result<ChatResponse> {
+        // Cancel checkpoint before the first POST — the anthropic side has
+        // had one all along (external review P3, symmetry): the agent's
+        // loop-head check runs before the turn starts, but a cancel landing
+        // during the previous turn's tool phase would otherwise buy one full
+        // request round-trip (connect + upload + TTFB) before
+        // CancellableSse's in-stream check notices. Same guard shape and
+        // message style as the anthropic twin and the 400-resend checkpoint
+        // below; the run-level retry ladder treats the resulting Err + set
+        // flag as EXIT_CANCELLED.
+        if req.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            anyhow::bail!("request cancelled before sending to the OpenAI-compatible API");
+        }
         // Fail fast (before any body building or HTTP) if the history carries a
         // PDF document block: the chat-completions protocol has no document
         // content block, so the only honest options are an explicit error or
@@ -523,8 +535,22 @@ impl Provider for OpenAi {
             }
         }
 
+        // Captured BEFORE the body is consumed (the headers die with the
+        // response once CancellableSse owns it) — the zero-data truncation
+        // diagnosis below names the content-type so a gateway HTML error
+        // page is identifiable from the transcript alone.
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
         let mut sse = CancellableSse::new(resp, req.cancel.clone(), self.idle)?;
-        Self::parse_loop(&mut sse, on_event, self.strip_think_tags)
+        Self::parse_loop(
+            &mut sse,
+            on_event,
+            self.strip_think_tags,
+            content_type.as_deref(),
+        )
     }
 
     fn gateway_fixes(&self) -> super::GatewayFixes {
@@ -637,24 +663,31 @@ impl OpenAi {
         on_event: &mut dyn FnMut(ChatEvent),
     ) -> Result<ChatResponse> {
         let mut sse = SseReader::new(reader);
-        Self::parse_loop(&mut sse, on_event, /* strip_think_tags */ true)
+        Self::parse_loop(&mut sse, on_event, /* strip_think_tags */ true, None)
     }
 
     /// Streaming core shared by the sync test path (`SseReader`) and the live
     /// path (`CancellableSse`). A cancel/idle abort surfaces as a stop_reason
     /// carrying whatever partial text/calls arrived — mirroring stream_truncated,
     /// so the agent ends the run cleanly instead of hanging on a half-open
-    /// connection.
+    /// connection. `content_type` rides along for the zero-data truncation
+    /// diagnosis below (external review P3: a 200 whose body is a gateway
+    /// HTML error page used to end the run as a silent empty `stream_truncated`).
     fn parse_loop<S: SseSource>(
         src: &mut S,
         on_event: &mut dyn FnMut(ChatEvent),
         strip_think_tags: bool,
+        content_type: Option<&str>,
     ) -> Result<ChatResponse> {
         let mut text = String::new();
         let mut calls: std::collections::BTreeMap<u64, PendingCall> = Default::default();
         let mut cur_idx: u64 = 0;
         let mut finish_reason = String::from("stop");
         let mut got_finish = false;
+        // Any `data:` payload dispatched at all — the zero-data marker for
+        // the truncation diagnosis (a real truncation mid-stream has
+        // payloads; a non-SSE body has none).
+        let mut saw_payload = false;
         let mut abort: Option<&'static str> = None;
         let mut usage: Option<Usage> = None;
         // FR-2: `<think>` splitter across the content channel. `None` = knob
@@ -680,7 +713,10 @@ impl OpenAi {
 
         loop {
             let data = match src.next_payload() {
-                Ok(Some(d)) => d,
+                Ok(Some(d)) => {
+                    saw_payload = true;
+                    d
+                }
                 Ok(None) => break, // end of stream
                 Err(StreamAbort::Cancelled) => {
                     abort = Some("cancelled");
@@ -868,7 +904,27 @@ impl OpenAi {
         }
 
         flush_think!();
-        let blocks = Self::assemble_blocks(&text, &calls);
+        let mut blocks = Self::assemble_blocks(&text, &calls);
+
+        // Zero-data truncation diagnosis: a 200 whose body was never SSE (a
+        // gateway error page) lands here with zero payloads, empty blocks and
+        // no finish_reason — the bare `stream_truncated` label said THAT it
+        // failed, never WHY. Mirror the stream_error arm's marker-block
+        // style: point at the root cause (content-type is the giveaway),
+        // honest-cost style, without changing the stop_reason/exit contract.
+        // Clean-EOF exits ONLY (wave-2 rework): an abort (cancel/idle/error)
+        // with zero payloads has its own honest label — stamping
+        // "non-streaming body?" over a cancel (e.g. the flag landing in the
+        // TTFB window) would put a false accusation into history, final_text
+        // and the session.
+        if abort.is_none() && !got_finish && !saw_payload {
+            let mut diag = "[stream error] no SSE data events in response".to_string();
+            if let Some(ct) = content_type {
+                diag.push_str(&format!(" (content-type: {ct})"));
+            }
+            diag.push_str(" — gateway returned a non-streaming body?");
+            blocks.push(Block::Text(diag));
+        }
 
         // Normalize to Anthropic-style stop reasons. An explicit abort
         // (cancel/idle) wins; otherwise a missing finish_reason means the
@@ -920,6 +976,10 @@ impl OpenAi {
         blocks
     }
 }
+
+#[cfg(test)]
+#[path = "openai_review_pins.rs"]
+mod review_pins;
 
 #[cfg(test)]
 mod tests {
@@ -1555,10 +1615,21 @@ mod tests {
     /// request gets a minimal success SSE. Records each received body in
     /// arrival order so the test can assert exactly which field names were sent.
     fn max_tokens_400_mock() -> (String, Arc<Mutex<Vec<Value>>>) {
+        let (url, bodies, _cancel) = max_tokens_400_mock_with_cancel_flip();
+        (url, bodies)
+    }
+
+    /// `max_tokens_400_mock` + a server-side cancel flip: the shared flag is
+    /// armed AFTER the first request lands, so the pre-POST checkpoint (an
+    /// already-set flag fails fast with zero round-trips) doesn't intercept —
+    /// this reaches the 400-fix loop's own checkpoint instead.
+    fn max_tokens_400_mock_with_cancel_flip() -> (String, Arc<Mutex<Vec<Value>>>, Arc<AtomicBool>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
         let bodies: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
         let bodies_c = bodies.clone();
+        let cancel: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        let cancel_c = cancel.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let mut stream = match stream {
@@ -1569,6 +1640,10 @@ mod tests {
                 if let Ok(v) = serde_json::from_str::<Value>(&body) {
                     bodies_c.lock().unwrap().push(v);
                 }
+                // Arm the cancel once the first request has fully landed: the
+                // 400 response is coming back to a client that now carries a
+                // set flag — the resend checkpoint must see it.
+                cancel_c.store(true, std::sync::atomic::Ordering::SeqCst);
                 // A 400 iff the body still carries the OLD field name. (The
                 // renamed key `max_completion_tokens` does NOT contain the
                 // quoted substring `"max_tokens"` — see the test below.)
@@ -1599,7 +1674,7 @@ mod tests {
                 let _ = stream.flush();
             }
         });
-        (url, bodies)
+        (url, bodies, cancel)
     }
 
     #[test]
@@ -1778,11 +1853,14 @@ mod tests {
     /// The cancel checkpoint before the 400 resend: a cancel that arrived
     /// while the 400 round-trip was in flight aborts instead of starting
     /// another HTTP request (the run-level ladder treats the Err + flag as
-    /// EXIT_CANCELLED). Cancel is set before chat() so the first post still
-    /// runs (posts don't poll the flag) — deterministic, no race.
+    /// EXIT_CANCELLED). The flag is flipped SERVER-SIDE after the first
+    /// request lands — the pre-POST checkpoint (review pin
+    /// `openai_cancel_before_first_post_sends_nothing`) intercepts an
+    /// already-set flag before the first request, so arming it before chat()
+    /// would no longer reach the resend path.
     #[test]
     fn fix_resend_aborts_when_cancelled_during_the_400() {
-        let (url, bodies) = max_tokens_400_mock();
+        let (url, bodies, cancel) = max_tokens_400_mock_with_cancel_flip();
         let client = reqwest::blocking::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(5))
             .redirect(reqwest::redirect::Policy::none())
@@ -1797,7 +1875,7 @@ mod tests {
             model: "m",
             max_tokens: 100,
             per_request_timeout: Some(std::time::Duration::from_secs(10)),
-            cancel: Arc::new(AtomicBool::new(true)),
+            cancel,
             cache: true,
             reasoning_effort: None,
             temperature: None,
@@ -2236,7 +2314,7 @@ mod tests {
         );
         let mut sse = SseReader::new(raw.as_bytes());
         let mut events = Vec::new();
-        let resp = OpenAi::parse_loop(&mut sse, &mut |e| events.push(e), false).unwrap();
+        let resp = OpenAi::parse_loop(&mut sse, &mut |e| events.push(e), false, None).unwrap();
         assert!(matches!(&resp.blocks[0], Block::Text(t) if t == "<think>kept"));
         assert!(
             !events
