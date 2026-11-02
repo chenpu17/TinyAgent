@@ -11098,3 +11098,64 @@ fn session_rebuild_reproduces_the_model_visible_face_id_by_id() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn turn_arbitration_degrades_when_no_turn_budget_left() {
+    // 外审 FR-1 P1（worktree 探针实锤）：仲裁发生在当轮收尾点，若被仲裁的
+    // 恰是最后一个预算轮（turns 已到 max_turns），无脑兑现 Continue 会让
+    // 下一轮首护栏以 max_turns_reached 收尾——把无钩子时 end_turn（exit 0）
+    // 的成功收尾翻成护栏失败（exit 1），且事件 continued:true 的承诺落空。
+    // 决策点必须做确定性预检：轮预算耗尽按 capped 同款降级（continued=
+    // false、note 不入队不入史、stop_reason=arbitration_capped、干净收尾）。
+    let mut cfg = cfg_with(1, 0, 0);
+    cfg.limits.max_turns = 1;
+    let (prov, state) = MockProvider::new(vec![mock::resp_text("claimed done", None)]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("task")],
+        test_ctx(),
+    );
+    agent.set_hooks(Arc::new(AlwaysContinueArbitration {
+        note: "keep going".into(),
+    }));
+    let mut events = Vec::new();
+    let o = agent.run(&mut |e| events.push(e)).unwrap();
+
+    assert_eq!(o.stop_reason, "arbitration_capped");
+    assert_eq!(o.turns, 1, "no extra turn was started");
+    assert_eq!(state.captured().len(), 1, "exactly the one request");
+    let dec: Vec<(u32, bool)> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TurnArbitration {
+                turn, continued, ..
+            } => Some((*turn, *continued)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(dec, vec![(1, false)], "refused up front");
+    // note 不入队不入史：无任何 NoteInjected（连 deferred 冲账都没有——
+    // 队列从头就是空的）。
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::NoteInjected { .. })));
+    let cap = state.captured();
+    assert!(
+        !cap[0]
+            .user_texts
+            .iter()
+            .any(|t| t.starts_with(SUPERVISOR_NOTE_MARKER)),
+        "the refused note must never reach the model"
+    );
+    // Done 仍在（成功路径收尾），stop_reason 可辨。
+    let done = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Done { .. }))
+        .expect("Done emitted");
+    match &events[done] {
+        AgentEvent::Done { stop_reason } => assert_eq!(stop_reason, "arbitration_capped"),
+        _ => unreachable!(),
+    }
+}

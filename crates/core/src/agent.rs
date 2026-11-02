@@ -401,19 +401,25 @@ pub enum AgentEvent {
     /// [`Hooks::on_turn_stopping`]. Emitted ONLY for non-default hook
     /// decisions: a run whose hook returns `Stop` (or never overrides the
     /// method) produces no such event, keeping the default wire shape
-    /// byte-identical. `continued == true` means one more turn follows and
-    /// the note rides the supervisor-note pipeline (a `NoteInjected` event
-    /// with `deferred == false` lands at the next delivery point, before
-    /// that turn's request). `continued == false` means the per-run
-    /// continuation cap was hit: the run ends with
-    /// `stop_reason = "arbitration_capped"` and the note is NOT delivered —
-    /// it survives only here, so the host audit keeps what the hook asked
-    /// for while history stays clean of it.
+    /// byte-identical. `continued == true` means the decision was ACCEPTED
+    /// and the loop attempts one more turn (the note rides the
+    /// supervisor-note pipeline; a `NoteInjected` event with
+    /// `deferred == false` lands at the next delivery point, before that
+    /// turn's request) — a loop-top guard can still end the run first
+    /// (cancel, `max_turns_reached`, `budget_exceeded`, timeout; the queued
+    /// note then rides the deferred exit flush). `continued == false` means
+    /// the continuation was refused up front — the per-run continuation cap
+    /// was hit, OR `turns` had already reached `max_turns` (the next turn
+    /// could never start): the run ends with
+    /// `stop_reason = "arbitration_capped"` on the model's final turn and
+    /// the note is NOT delivered — it survives only here, so the host audit
+    /// keeps what the hook asked for while history stays clean of it.
     TurnArbitration {
         /// 1-based number of the turn whose end was arbitrated.
         turn: u32,
-        /// `true` = continuing with one more turn; `false` = capped, run
-        /// ends (see variant docs).
+        /// `true` = one more turn attempts to start (loop-top guards may
+        /// still win); `false` = refused up front, run ends
+        /// `arbitration_capped` (see variant docs).
         continued: bool,
         /// The note exactly as the hook returned it (without the history
         /// marker prefix the delivered block carries).
@@ -2846,7 +2852,17 @@ impl Agent {
                         match h.on_turn_stopping(&info) {
                             crate::hooks::TurnStopDecision::Stop => {}
                             crate::hooks::TurnStopDecision::Continue { note } => {
-                                if arbitrations_used >= TURN_ARBITRATION_CAP {
+                                // 确定性守卫预检（外审 FR-1 P1）：续跑帽耗尽，
+                                // 或 turns 已到 max_turns（下一轮根本无法启动
+                                // ——轮首护栏必以 max_turns_reached 收尾，把
+                                // 无钩子时 exit 0 的成功收尾翻成护栏失败），
+                                // 都按 capped 同款降级：run 干净收尾在模型的
+                                // 最后一轮上，note 不入队不入史，只留在事件
+                                // 里。budget/deadline 是竞态类守卫，不预检
+                                // ——轮首护栏永远赢（见 TurnArbitration 文档）。
+                                if arbitrations_used >= TURN_ARBITRATION_CAP
+                                    || turns >= self.limits.max_turns
+                                {
                                     stop_reason = "arbitration_capped".into();
                                     events(AgentEvent::TurnArbitration {
                                         turn: turns,

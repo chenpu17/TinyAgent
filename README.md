@@ -1485,15 +1485,15 @@ crates/core/src/  # kernel crate (package tiny-agent-core, lib name tiny_agent):
 │   ├── openai.rs         ( 2248)  # OpenAI-compatible (include_usage; 400 fallbacks: max_tokens→max_completion_tokens / drop stream_options)
 │   ├── anthropic.rs      ( 1246)  # Anthropic native (message_start/message_delta usage)
 │   └── mock.rs           (  345)  # scripted Provider for tests (cfg(any(test, feature="mock")))
-├── agent.rs          ( 4544)  # core loop + usage accounting + cancel + context compression (preflight/overflow dual trigger + rolling chunked summaries) + adjacent-message normalization + same-turn multi-task parallelism
-├── agent_tests.rs    (11100)  # core-loop regression tests (scripted provider::mock, no network)
+├── agent.rs          ( 4560)  # core loop + usage accounting + cancel + context compression (preflight/overflow dual trigger + rolling chunked summaries) + adjacent-message normalization + same-turn multi-task parallelism
+├── agent_tests.rs    (11161)  # core-loop regression tests (scripted provider::mock, no network)
 ├── usage_probe.rs    (   94)  # thread-local usage side channel for parallel workers: recovers billed usage after a panic unwind at the join point (keeps result.json and the shared counter from diverging)
 ├── compress.rs       (  996)  # compression engine (find_safe_cut / chunked summaries / saturating usage merge + block-level billing primitives)
 ├── context_report.rs (  886)  # context composition breakdown (ContextBreakdown estimate: 3 system parts / 4 tool classes / message typing + anchor calibration)
 ├── retry.rs          (  158)  # exponential backoff shared by batch --retries and single-run transient retry (±25% jitter against lockstep)
 ├── session.rs        (  522)  # session persistence (atomic writes + fold archive)
 ├── skills.rs         ( 1089)  # three-tier skill loading (built-in / user dir / project)
-├── hooks.rs          (  281)  # hooks gate (Deny / Modify / audit)
+├── hooks.rs          (  294)  # hooks gate (Deny / Modify / audit)
 ├── tools/  # toolset: built-in tools + MCP wrappers + task sub-agent + run_code (feature code)
 │   ├── mod.rs            ( 1509)  # Tool trait + ToolCtx + CallbackTool/SharedTool + whitelist assembly
 │   ├── shell.rs          ( 1297)  # shell tool (unix: sh -c; Windows: cmd /C + raw_arg verbatim command passing, defeating std quoting)
@@ -1523,8 +1523,8 @@ crates/core/src/  # kernel crate (package tiny-agent-core, lib name tiny_agent):
 src/  # CLI crate (package tiny-agent, bin tiny-agent): process shell + headless rendering + batch + TUI
 ├── main.rs           ( 1024)  # CLI entry + assembly (build_agent) + --session none
 ├── signal.rs         (  123)  # headless SIGINT → cancel (first press graceful / second hard-exit 130)
-├── batch.rs          ( 3994)  # batch tasks + --retries/--failed + report merging
-├── harness.rs        ( 2301)  # headless mode + result.json + NDJSON + exit codes
+├── batch.rs          ( 3999)  # batch tasks + --retries/--failed + report merging
+├── harness.rs        ( 2320)  # headless mode + result.json + NDJSON + exit codes
 ├── harness_tests.rs  ( 1212)  # harness behavior tests (retry ladder / result.json / NDJSON; moved here with harness from the kernel's agent_tests.rs)
 ├── tui.rs            (   20)  # TUI module root (feature tui): mod declarations + public exports (run / transcript_rows)
 └── tui/  # TUI submodules (same tui gate): split from the original 8.7k-line single file by concern

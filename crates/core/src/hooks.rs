@@ -82,7 +82,10 @@ pub enum TurnStopDecision {
 pub struct TurnStopInfo<'a> {
     /// The text blocks of the turn that is ending the run, joined with
     /// newlines — the completion claim being judged. Empty when the final
-    /// turn carried no visible text (e.g. a thinking-only reply).
+    /// turn carried no visible text (e.g. a thinking-only reply). A final
+    /// turn with ZERO blocks (a content filter swallowing the reply) ends
+    /// the run without consulting this hook at all — there is no claim to
+    /// judge.
     pub reply_text: &'a str,
     /// 1-based number of the turn about to end the run.
     pub turn: u32,
@@ -249,19 +252,29 @@ pub trait Hooks: Send + Sync {
     ///   delivery point. If the run dies before the next request (e.g. a
     ///   cancel landing in the window), the queued note is flushed at run
     ///   exit as `deferred == true` — late, never lost (the R1 contract).
-    /// - **Cap.** At most [`TurnStopInfo::continuations_cap`] `Continue`
-    ///   decisions per run; past it the decision is downgraded to `Stop`,
-    ///   `stop_reason` becomes `"arbitration_capped"` (a core-level label),
-    ///   and the note survives only in the `TurnArbitration` event — the
-    ///   run ends cleanly, history untouched by the discarded note.
+    /// - **Cap & turn budget.** At most [`TurnStopInfo::continuations_cap`]
+    ///   `Continue` decisions per run; past it — or when `turns` has
+    ///   already reached `max_turns` (a decision accepted there could never
+    ///   start its extra turn; the loop-top guard would end the run
+    ///   `max_turns_reached`, flipping what a no-hook run reports as a
+    ///   clean `end_turn` success) — the decision is downgraded up front,
+    ///   `stop_reason` becomes `"arbitration_capped"` (a core-level
+    ///   label), and the note survives only in the `TurnArbitration` event
+    ///   — the run ends cleanly, history untouched by the discarded note.
     /// - **Scope.** Top-level runs only: a `task` sub-agent inherits this
     ///   layer for gating/observation, but its run never arbitrates — a
     ///   child's completion is the `task` call's concern, and the
     ///   serial/no-delegation turn-stopping shape is a property of the
     ///   observed run, not of every nested one.
-    /// - **Cancel still wins.** A cancel flagged during (or after) a
-    ///   `Continue` lands at the next loop-top check — the continuation
-    ///   never sends a request past it, `stop_reason = "cancelled"`.
+    /// - **Loop-top guards always win.** A cancel flagged during (or after)
+    ///   a `Continue` lands at the next loop-top check — the continuation
+    ///   never sends a request past it, `stop_reason = "cancelled"`. The
+    ///   racy guards (`budget_exceeded`, timeout) are checked only there:
+    ///   an accepted decision does not pre-clear them, so a `continued ==
+    ///   true` event can be followed by a guard label instead of a request
+    ///   (the queued note then rides the deferred exit flush — late, never
+    ///   lost). The deterministic ones (continuation cap, `max_turns`) are
+    ///   pre-checked at the decision point — see *Cap & turn budget*.
     /// - **Ordering vs compression.** Arbitration happens after the final
     ///   turn's messages are persisted (the turn's message face is
     ///   settled); the injected note is delivered at the next turn top,

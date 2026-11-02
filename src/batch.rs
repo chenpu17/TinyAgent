@@ -1237,6 +1237,11 @@ fn run_one_attempt(
                 ));
                 error = Some(format!("result file not written: {e:#}"));
             }
+            // 批处理成功口径严格于 CLI 退出码（FR-1 外审 P2 记录在案）：
+            // CLI 把 arbitration_capped 算 exit 0（模型产出了完整收尾轮），
+            // 批处理只认 end_turn —— 口径差异是刻意的：batch 进程内从不
+            // set_hooks，该 stop_reason 在 batch 里不可达；哪天批处理获得
+            // 钩子面，先定这里的口径再放开。
             let success = error.is_none() && o.stop_reason == "end_turn";
             TaskReport {
                 name: name.into(),

@@ -1678,6 +1678,25 @@ mod tests {
         assert_eq!(exit_code_for("max_tokens"), 1);
         // stuck_loop 走默认臂（确定性失败，不重试、exit 1）
         assert_eq!(exit_code_for("stuck_loop"), 1);
+        // 仲裁续跑帽/轮预算降级：模型产出了完整收尾轮，run 按成功算（精确
+        // 标签在 result.json.stop_reason，脚本自行区分）
+        assert_eq!(exit_code_for("arbitration_capped"), 0);
+    }
+
+    #[test]
+    fn event_json_maps_turn_arbitration_shape() {
+        // FR-1 NDJSON 形状钉子：{"type":"turn_arbitration","turn",
+        // "continued","note"} —— continued=false 时该事件是 note 的唯一
+        // 载体（note 不入队不入史），字段必须齐全。
+        let v = event_json(&AgentEvent::TurnArbitration {
+            turn: 3,
+            continued: false,
+            note: "check the tests".into(),
+        });
+        assert_eq!(v["type"], "turn_arbitration");
+        assert_eq!(v["turn"], 3);
+        assert_eq!(v["continued"], false);
+        assert_eq!(v["note"], "check the tests");
     }
 
     #[test]
