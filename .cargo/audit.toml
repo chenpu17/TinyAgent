@@ -1,10 +1,29 @@
 # cargo-audit 忽略清单（CI audit job 读这里的 [advisories].ignore）。
+#
 # 两条 pyo3 advisory 只影响 bindings/python（内核与 CLI 的依赖树不含 pyo3）：
 #   RUSTSEC-2025-0020 PyString::from_object 缓冲溢出风险——该 API 绑定未使用（grep 坐实）
 #   RUSTSEC-2026-0177 PyCFunction::new_closure 缺 Sync 约束——该 API 绑定未使用（grep 坐实）
-# 修复需 pyo3 0.22 → 0.24+/0.29 破坏性迁移，作为后续事项跟踪；升级完成后删除本文件。
+# 修复需 pyo3 0.22 → 0.24+/0.29 破坏性迁移，作为后续事项跟踪；升级完成后删除这两条。
+#
+# 四条 zstd 家族 advisory 只经 `code` feature 的 wasmtime `cache`（quickjs.wasm 磁盘编译缓存）
+# 进入依赖树：wasmtime-internal-cache 整个 36.x 线都钉 `zstd ^0.13`（default-features = false、
+# 不开任何 feature），修复版在 zstd 0.14 / zstd-safe 8，只能随 wasmtime 升级到改用 zstd 0.14 的
+# 大版本一起解决（届时删除这四条）。逐条可达性：
+#   RUSTSEC-2026-0391 复用上下文时被放弃的流泄漏进下一流——wasmtime-cache 只调一次性的
+#                     zstd::encode_all / decode_all，每次新建上下文，从不复用
+#   RUSTSEC-2026-0398 Seekable::decompress 设 Vec 长度越界——不用 seekable 格式 API
+#   RUSTSEC-2026-0403 legacy 帧流式解压失败暴露未初始化内存——legacy 是 zstd 的默认 feature，
+#                     wasmtime-cache 以 default-features = false 引用，legacy 帧支持未编入
+#   RUSTSEC-2026-0410 WebAssembly 分配器垫片在分配失败时破坏内存——仅 zstd-sys 编到 wasm 目标时
+#                     存在；本项目原生构建
+# 另：缓存目录内存放的是编译好的原生机器码，能篡改它的人本就能注入代码——该目录本身就在
+# 信任边界内，解压输入不是攻击面。
 [advisories]
 ignore = [
     "RUSTSEC-2025-0020",
     "RUSTSEC-2026-0177",
+    "RUSTSEC-2026-0391",
+    "RUSTSEC-2026-0398",
+    "RUSTSEC-2026-0403",
+    "RUSTSEC-2026-0410",
 ]

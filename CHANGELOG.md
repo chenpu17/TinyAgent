@@ -111,6 +111,14 @@
   走查，判定随拼写翻转）。
 - **MCP 诊断与错误信息中的配置 URL 一律脱敏 userinfo 凭据**（六处字面量站点 + reqwest 错误
   `without_url` + io 包装的错误链），与 `McpServerConfig` 的 Debug 脱敏政策一致。
+- **依赖 advisory 处置（CI audit job 自 10 月中旬新 RustSec 公告起转红）**：兼容升级
+  `wasmtime` 36.0.19 → 36.0.20（RUSTSEC-2026-0424，component model 资源转移的内存记账——本项目未启用
+  component model，仍随补丁版升级）与 `pulldown-cmark` 0.13.4 → 0.13.6（RUSTSEC-2026-0414，
+  `ENABLE_WIKILINKS` 指数膨胀，经 TUI 的 tui-markdown 引入）；两者 MSRV 均不高于 1.86。zstd 家族四条
+  （RUSTSEC-2026-0391/0398/0403/0410）只经 `code` feature 的 wasmtime 编译缓存进入依赖树，
+  wasmtime-internal-cache 整个 36.x 线钉 `zstd ^0.13`、修复版在 0.14，逐条可达性分析后写入
+  `.cargo/audit.toml` 白名单（一次性 encode/decode、不用 seekable、未编入 legacy 帧、非 wasm 目标），
+  随 wasmtime 大版本升级移除。
 
 ## [0.4.3] - 2026-10-24
 

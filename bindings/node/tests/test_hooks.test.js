@@ -294,11 +294,19 @@ test('cancel flipping mid-gate reports "cancelled", not a timeout', async (t) =>
   const tok = new CancelToken();
   const a = new Agent(cfgPath, {
     apiKey: MOCK_KEY,
-    hooks: { beforeTool: () => new Promise(() => {}) }, // never settles
+    hooks: {
+      // Flip cancel from inside the gate callback: the native side is parked
+      // in the bounded wait by the time JS runs the hook, so the flip lands
+      // mid-gate regardless of how long the first request took (a wall-clock
+      // timer could fire before the gate and cancel the request instead).
+      beforeTool: () => {
+        tok.cancel();
+        return new Promise(() => {}); // never settles
+      },
+    },
   });
   a.setCancel(tok);
   a.pushUser('run it');
-  setTimeout(() => tok.cancel(), 300);
   const out = await a.run();
   assert.strictEqual(out.stop_reason, 'cancelled');
   const rec = out.tool_calls[0];
