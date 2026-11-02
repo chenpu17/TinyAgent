@@ -41,10 +41,10 @@ mock = []
 # default — it adds ≈4.6 MiB to the release binary (M2-measured on the musl
 # static build; design §10) and is a per-deployment trust decision
 # (docs/run_code_design.md §15, milestone M1).
-# sha2: audit-input hashing in run_code's meta trace, truncated to 128 bits
-# (design §8.4) — already in the tree transitively via wasmtime, so this is
-# a feature-gated direct edge over an existing dep, not a new dependency.
-code = ["dep:wasmtime", "dep:sha2"]
+# sha2: audit-input hashing in run_code's meta trace (truncated to 128 bits,
+# design §8.4) and the effective-config fingerprint (FR-4, always-on) — both
+# already-in-tree deps, direct edges only.
+code = ["dep:wasmtime"]
 
 [dependencies]
 anyhow = "1"
@@ -58,8 +58,10 @@ serde_json = { version = "1", features = ["preserve_order"] }
 # process no longer re-pays the lazy compile; any cache failure degrades to
 # "no cache", never blocks the sandbox.
 wasmtime = { version = "36.0.14", optional = true, default-features = false, features = ["cranelift", "runtime", "std", "cache"] }
-# sha256 for run_code's audit meta (dual 128-bit-truncated input hashes).
-sha2 = { version = "0.10", optional = true }
+# sha256 for run_code's audit meta (dual 128-bit-truncated input hashes) and
+# the effective-config fingerprint (FR-4) — wasmtime already pulls it into
+# any code-feature build, so the default tree grows by one in-tree crate.
+sha2 = "0.10"
 
 # Windows shell support: cmd.exe (and many legacy programs) emit text in the
 # system OEM code page (GBK/936 on Chinese Windows), not UTF-8 — the shell tool

@@ -687,6 +687,12 @@ pub struct RunOutcome {
     /// Wall-clock time from run entry to return — includes the failed
     /// attempt's work when a retry ladder folded costs in (`RunCost`).
     pub elapsed: Duration,
+    /// The stable fingerprint of the effective config this run was built on
+    /// (FR-4, see [`Agent::config_fingerprint`] / [`Config::fingerprint`]).
+    /// Newer key: result.json consumers that pin "model + harness" pairings
+    /// in run ledgers read this instead of re-deriving config identity from
+    /// scattered fields.
+    pub config_fingerprint: String,
 }
 
 /// A run that failed after burning tokens / running tools. Carries the partial
@@ -1030,6 +1036,10 @@ pub struct Agent {
     /// bill to. Kept as a plain string (via `ProviderKind::as_str`) so it
     /// serializes/reports without carrying the enum around.
     provider_label: String,
+    /// 有效配置指纹（FR-4）：构造时对 clamp/overlay 合并后的 config 算一次
+    /// （[`Config::fingerprint`]），此后随 [`RunOutcome`] 出账、经访问器
+    /// 可查。台账/评测用它把「模型 + harness 配对」钉进运行记录。
+    config_fingerprint: String,
     tools: Vec<Box<dyn Tool>>,
     tool_defs: Vec<ToolDef>,
     messages: Vec<Message>,
@@ -1271,6 +1281,7 @@ impl Agent {
         Ok(Self {
             provider,
             provider_label: cfg.provider.as_str().to_string(),
+            config_fingerprint: cfg.fingerprint(),
             tools,
             tool_defs,
             messages,
@@ -1356,6 +1367,17 @@ impl Agent {
     /// declared kind; see the field doc for why.
     pub fn provider(&self) -> &str {
         &self.provider_label
+    }
+
+    /// The stable fingerprint of the EFFECTIVE config this agent was built
+    /// from (FR-4, [`Config::fingerprint`] for the canonical form and the
+    /// exclusion/credential discipline). Same config → same fingerprint;
+    /// any harness-shaping change (model / limits / tools / MCP topology /
+    /// code sandbox / …) changes it. Identical to
+    /// [`RunOutcome::config_fingerprint`] — one is computed, the other
+    /// carries it out of the run.
+    pub fn config_fingerprint(&self) -> &str {
+        &self.config_fingerprint
     }
 
     /// The limits (max_turns / timeout / token budget / …) in effect.
@@ -2808,10 +2830,8 @@ impl Agent {
                                 } else {
                                     arbitrations_used += 1;
                                     {
-                                        let mut q = self
-                                            .notes
-                                            .lock()
-                                            .unwrap_or_else(|p| p.into_inner());
+                                        let mut q =
+                                            self.notes.lock().unwrap_or_else(|p| p.into_inner());
                                         q.push_back(note.clone());
                                     }
                                     events(AgentEvent::TurnArbitration {
@@ -2890,6 +2910,7 @@ impl Agent {
             cache_creation_input_tokens: self.usage.cache_creation_input_tokens,
             cache_read_input_tokens: self.usage.cache_read_input_tokens,
             elapsed: start.elapsed(),
+            config_fingerprint: self.config_fingerprint.clone(),
         })
     }
 

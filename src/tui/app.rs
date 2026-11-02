@@ -915,7 +915,9 @@ fn ui_loop(
                             "[max_tokens hit — one wrap-up turn appended]",
                         ));
                     }
-                    AgentEvent::TurnArbitration { continued, note, .. } => {
+                    AgentEvent::TurnArbitration {
+                        continued, note, ..
+                    } => {
                         // 轮末仲裁（FR-1）：仅在宿主 hook 给出非默认决策时
                         // 出现。continued 的投递可见性由随后的 NoteInjected
                         // 行承担，这里标决策点本身；capped 的 note 不会投递

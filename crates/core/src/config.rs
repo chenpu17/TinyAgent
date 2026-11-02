@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -64,7 +64,7 @@ fn default_tools() -> Vec<String> {
 /// turn boundaries (the running turn always finishes), and a batch task
 /// fragment may only TIGHTEN them (see the `Clamp` policy on each field);
 /// `shell_timeout_secs` is the lone exception.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Limits {
     /// Maximum turns (chat requests) per run. The cap refuses to START a
@@ -250,7 +250,7 @@ impl ProviderKind {
 
 /// Transport used to reach an MCP server over HTTP. Ignored for stdio
 /// (`command`) servers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum McpTransport {
     /// Try Streamable HTTP first, fall back to legacy HTTP+SSE.
@@ -427,7 +427,7 @@ impl McpServerConfig {
 /// ordering — `Off < OnDemand < Eager` — so batch fragments merge with
 /// `Clamp::Tighten` (min): an untrusted fragment can only disclose LESS.
 /// `Default = OnDemand` keeps every unconfigured user byte-identical.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillInjection {
     /// Built-in skill is not injected into the index; read_skill("run-code")
@@ -460,7 +460,7 @@ impl SkillInjection {
 /// exists behind `--features code`. The deny/fs lists and the call limit are
 /// enforced by the M2 interception layer; the wall clock is the remaining M3
 /// item.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CodeConfig {
     /// Off by default (design D15): enabling `run_code` is an explicit trust
@@ -569,7 +569,7 @@ impl Default for CodeConfig {
 /// - `models` order is preserved as the declaration order; dedup happens at
 ///   parse normalization so the batch-overrides intersection logic and the
 ///   tool's allowlist never see duplicates.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LlmConfig {
     /// Off by default (D15 class): exposing inner model calls to guest code
@@ -831,6 +831,81 @@ fn validate_tool_whitelist(names: &[String]) -> Result<()> {
 }
 
 impl Config {
+    /// 有效配置的稳定指纹（宿主集成需求单 FR-4）——「分数是模型 + harness
+    /// 配对」要钉住的那一半：调用方传进来的是 clamp/overlay 合并后的
+    /// Config（[`Self::apply`] 之后），指纹即这份实际生效形状的摘要。
+    /// `Agent::try_new` 在构造时算一次存进 agent（[`crate::Agent::
+    /// config_fingerprint`]），随 `RunOutcome` 出账。
+    ///
+    /// 规范化序列化：手工拼装**固定字段序**的 JSON（serde_json 带
+    /// preserve_order，对象序即插入序），SHA-256 截 64 bit 输出 16 hex。
+    /// 算法 / 截断长度 / 字段清单三者定版后视为兼容面——任何变更必须走
+    /// CHANGELOG（指纹变了，历史台账的可比性就断了）。
+    ///
+    /// 进哈希：内核版本（harness 配对的另一半）+ 全部 harness 形状字段
+    /// （provider/base_url/model/max_tokens/系统提示词/工具白名单/限制
+    /// 全家/MCP 拓扑/推理档位/缺位工具注记/代码沙箱配置）。
+    /// 不进哈希（运行输入，非 harness 形状，且跨机器不可移植）：`task`
+    /// （请求本身）与 `workdir`（运行环境）。
+    /// 凭据纪律（约束 ⑤，config 手写 Debug 纪律的延伸）：**只进键名不进
+    /// 值**——`api_key_env` 本是环境变量名；MCP `headers`/`env` 只进排序
+    /// 后的键名列表；`url` 先过 [`redact_url_credentials`] 再进。`tools`
+    /// 排序后进（白名单语义无序），新增 harness 字段时必须同步加进这里
+    /// （漏加 = 该字段变动不换指纹 = 台账静默失真）。
+    pub fn fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut tools = self.tools.clone();
+        tools.sort();
+        let mcp: Vec<serde_json::Value> = self
+            .mcp_servers
+            .iter()
+            .map(|s| {
+                let mut header_keys: Vec<&String> = s.headers.keys().collect();
+                header_keys.sort();
+                let mut env_keys: Vec<&String> = s.env.keys().collect();
+                env_keys.sort();
+                serde_json::json!({
+                    "name": s.name,
+                    "command": s.command,
+                    "args": s.args,
+                    "url": s
+                        .url
+                        .as_deref()
+                        .map(|u| redact_url_credentials(u).into_owned()),
+                    "transport": s.transport,
+                    "header_keys": header_keys,
+                    "env_keys": env_keys,
+                })
+            })
+            .collect();
+        let canonical = serde_json::json!({
+            "schema": 1,
+            "core": env!("CARGO_PKG_VERSION"),
+            "provider": self.provider.as_str(),
+            "base_url": self.base_url,
+            "api_key_env": self.api_key_env,
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "system_prompt": self.system_prompt,
+            "tools": tools,
+            "restrict_to_workdir": self.restrict_to_workdir,
+            "inject_environment": self.inject_environment,
+            "salvage_on_max_tokens": self.salvage_on_max_tokens,
+            "limits": self.limits,
+            "mcp_servers": mcp,
+            "reasoning_effort": self.reasoning_effort,
+            "tool_absent_notes": self.tool_absent_notes,
+            "code": self.code,
+        });
+        let digest = Sha256::digest(canonical.to_string().as_bytes());
+        let mut out = String::with_capacity(16);
+        for b in &digest[..8] {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{b:02x}");
+        }
+        out
+    }
+
     /// Read + parse + [`Self::validate_and_normalize`] a JSON config file. The
     /// returned config has its `workdir` canonicalized (and rejected if it
     /// does not exist or is not a directory) and its MCP server entries
@@ -2706,5 +2781,92 @@ mod tests {
             let err = cfg.apply_trusted(p).unwrap_err().to_string();
             assert!(err.contains(must), "tool-name rule fired ({must}): {err}");
         }
+    }
+
+    // ── 有效配置指纹（宿主集成需求单 FR-4）：Config::fingerprint ────────────
+
+    #[test]
+    fn fingerprint_stable_sensitive_and_credential_blind() {
+        fn base() -> Config {
+            serde_json::from_str::<Config>(
+            r#"{"provider":"openai","api_key_env":"KEY_ENV","model":"m",
+                "tools":["shell","read_file"],
+                "mcp_servers":[{"name":"srv","command":"mcp","headers":{"Authorization":"Bearer secret-a"},"env":{"TOKEN":"v-a"}}]}"#,
+        )
+        .unwrap()
+        }
+        // ① 同配置同指纹（16 hex = 64 bit 截断）。
+        let fp = base().fingerprint();
+        assert_eq!(fp.len(), 16);
+        assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(fp, base().fingerprint());
+        // ② 任一 harness 阈值变动 → 指纹变。
+        let mut c = base();
+        c.limits.compress_threshold_chars = 123456;
+        assert_ne!(c.fingerprint(), fp);
+        let mut c = base();
+        c.max_tokens = 777;
+        assert_ne!(c.fingerprint(), fp);
+        let mut c = base();
+        c.reasoning_effort = Some("high".into());
+        assert_ne!(c.fingerprint(), fp);
+        // ③ 工具白名单无序：同集合不同顺序 → 同指纹。
+        let mut c = base();
+        c.tools = vec!["read_file".into(), "shell".into()];
+        assert_eq!(c.fingerprint(), fp);
+        // ④ 凭据值不进哈希：headers/env 的 VALUE 换掉 → 同指纹。
+        let mut c = base();
+        c.mcp_servers[0].headers = [("Authorization".to_string(), "Bearer secret-b".to_string())]
+            .into_iter()
+            .collect();
+        c.mcp_servers[0].env = [("TOKEN".to_string(), "v-b".to_string())]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            c.fingerprint(),
+            fp,
+            "credential VALUES must not move the hash"
+        );
+        // ⑤ 键名进哈希：改键名 → 指纹变。
+        let mut c = base();
+        c.mcp_servers[0].env = [("TOKEN2".to_string(), "v-a".to_string())]
+            .into_iter()
+            .collect();
+        assert_ne!(c.fingerprint(), fp);
+        // ⑥ api_key_env 名进哈希（它决定读哪个环境变量——harness 形状）。
+        let mut c = base();
+        c.api_key_env = "OTHER_ENV".into();
+        assert_ne!(c.fingerprint(), fp);
+        // ⑦ task / workdir 是运行输入：不进哈希。
+        let mut c = base();
+        c.task = Some("different task".into());
+        assert_eq!(
+            c.fingerprint(),
+            fp,
+            "task is the request, not harness shape"
+        );
+        // ⑧ url 凭据先脱敏再进：userinfo 密码换掉 → 同指纹（host 变 → 变）。
+        let mut c = base();
+        c.mcp_servers[0].command = None;
+        c.mcp_servers[0].url = Some("http://alice:pw-a@h.example/mcp".into());
+        c.mcp_servers[0].transport = Some(McpTransport::Auto);
+        let mut d = base();
+        d.mcp_servers[0].command = None;
+        d.mcp_servers[0].url = Some("http://alice:pw-b@h.example/mcp".into());
+        d.mcp_servers[0].transport = Some(McpTransport::Auto);
+        assert_eq!(
+            c.fingerprint(),
+            d.fingerprint(),
+            "url userinfo value is a credential"
+        );
+        let mut e = base();
+        e.mcp_servers[0].command = None;
+        e.mcp_servers[0].url = Some("http://alice:pw-a@other.example/mcp".into());
+        e.mcp_servers[0].transport = Some(McpTransport::Auto);
+        assert_ne!(
+            e.fingerprint(),
+            c.fingerprint(),
+            "url host IS harness shape"
+        );
     }
 }

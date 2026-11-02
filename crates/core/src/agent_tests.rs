@@ -10509,7 +10509,6 @@ fn tool_billed_usage_event_lands_between_subagent_stream_and_tool_result() {
     );
 }
 
-
 // ── 轮末仲裁（宿主集成需求单 FR-1）：Hooks::on_turn_stopping ─────────────
 
 /// 继续前 N 次、之后默认 Stop 的仲裁钩子（数轮续跑用的最小桩）。
@@ -10522,7 +10521,10 @@ impl Hooks for ContinueNArbitration {
         let left = self.remaining.load(Ordering::Relaxed);
         if left == 0 {
             // 第二次进入（每轮 end_turn 各一次）：计数纪律必须如实可见。
-            assert_eq!(info.continuations_used, 1, "one continuation already honored");
+            assert_eq!(
+                info.continuations_used, 1,
+                "one continuation already honored"
+            );
             assert_eq!(info.continuations_cap, 6, "cap aligned with STUCK_STOP_AT");
             TurnStopDecision::Stop
         } else {
@@ -10579,7 +10581,10 @@ fn turn_arbitration_continue_extends_run_and_delivers_note_next_turn() {
     assert_eq!(cap.len(), 2, "one request per turn");
     // 第二轮请求的尾用户文本：标记块 + note 原文（监督者旁注同款前缀）。
     let tail = cap[1].user_texts.last().expect("tail user text");
-    assert!(tail.starts_with(SUPERVISOR_NOTE_MARKER), "marked block: {tail}");
+    assert!(
+        tail.starts_with(SUPERVISOR_NOTE_MARKER),
+        "marked block: {tail}"
+    );
     assert!(tail.ends_with("check the tests first"), "note text: {tail}");
 
     // 事件次序与回执。
@@ -10589,7 +10594,9 @@ fn turn_arbitration_continue_extends_run_and_delivers_note_next_turn() {
         .expect("TurnArbitration emitted");
     match &events[arb_pos] {
         AgentEvent::TurnArbitration {
-            turn, continued, note,
+            turn,
+            continued,
+            note,
         } => {
             assert_eq!(*turn, 1);
             assert!(*continued);
@@ -10600,9 +10607,20 @@ fn turn_arbitration_continue_extends_run_and_delivers_note_next_turn() {
     let note_pos = arb_pos
         + events[arb_pos..]
             .iter()
-            .position(|e| matches!(e, AgentEvent::NoteInjected { deferred: false, .. }))
+            .position(|e| {
+                matches!(
+                    e,
+                    AgentEvent::NoteInjected {
+                        deferred: false,
+                        ..
+                    }
+                )
+            })
             .expect("note delivered this run");
-    assert!(arb_pos < note_pos, "decision event precedes the delivery receipt");
+    assert!(
+        arb_pos < note_pos,
+        "decision event precedes the delivery receipt"
+    );
     let done_pos = events
         .iter()
         .position(|e| matches!(e, AgentEvent::Done { .. }))
@@ -10661,7 +10679,10 @@ fn turn_arbitration_cap_degrades_to_arbitration_capped_stop() {
     let o = agent.run(&mut |e| events.push(e)).unwrap();
 
     assert_eq!(o.stop_reason, "arbitration_capped");
-    assert_eq!(o.turns, 7, "six continuations, then the capped seventh turn");
+    assert_eq!(
+        o.turns, 7,
+        "six continuations, then the capped seventh turn"
+    );
     let dec: Vec<(u32, bool)> = events
         .iter()
         .filter_map(|e| match e {
@@ -10687,7 +10708,15 @@ fn turn_arbitration_cap_degrades_to_arbitration_capped_stop() {
     // 交付回执恰六条（第 2..7 轮轮首各一条），无第七条。
     let delivered = events
         .iter()
-        .filter(|e| matches!(e, AgentEvent::NoteInjected { deferred: false, .. }))
+        .filter(|e| {
+            matches!(
+                e,
+                AgentEvent::NoteInjected {
+                    deferred: false,
+                    ..
+                }
+            )
+        })
         .count();
     assert_eq!(delivered, 6);
     // 被丢弃的 note 只在事件里：最后请求里恰六个标记块，不是七个。
@@ -10737,9 +10766,13 @@ fn turn_arbitration_cancel_mid_continuation_reports_cancelled() {
 
     assert_eq!(o.stop_reason, "cancelled");
     assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::TurnArbitration { continued: true, .. })),
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::TurnArbitration {
+                continued: true,
+                ..
+            }
+        )),
         "the decision event still fires (it happened)"
     );
     assert!(
@@ -10749,9 +10782,13 @@ fn turn_arbitration_cancel_mid_continuation_reports_cancelled() {
         "queued note flushed at run exit as deferred"
     );
     assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::NoteInjected { deferred: false, .. })),
+        !events.iter().any(|e| matches!(
+            e,
+            AgentEvent::NoteInjected {
+                deferred: false,
+                ..
+            }
+        )),
         "no in-run delivery point was reached"
     );
     let done_pos = events
@@ -10806,7 +10843,11 @@ fn turn_arbitration_never_fires_on_subagent_runs() {
     let mut events = Vec::new();
     let o = agent.run_impl(&mut |e| events.push(e), false).unwrap();
     assert_eq!(o.stop_reason, "end_turn");
-    assert_eq!(state.captured().len(), 1, "one request, no forced extra turn");
+    assert_eq!(
+        state.captured().len(),
+        1,
+        "one request, no forced extra turn"
+    );
     assert!(!events
         .iter()
         .any(|e| matches!(e, AgentEvent::TurnArbitration { .. })));
@@ -10816,4 +10857,27 @@ fn turn_arbitration_never_fires_on_subagent_runs() {
             .any(|e| matches!(e, AgentEvent::NoteInjected { .. })),
         "no note ever queued on the child path"
     );
+}
+
+#[test]
+fn run_outcome_carries_the_effective_config_fingerprint() {
+    // FR-4：RunOutcome.config_fingerprint 与 Agent::config_fingerprint()
+    // 同源同值，且等于从同一份（生效）config 重算的指纹——台账用任一入口
+    // 读到的都是同一个「模型 + harness 配对」钉子。
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, _) = MockProvider::new(vec![mock::resp_text("ok", None)]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("task")],
+        test_ctx(),
+    );
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o.config_fingerprint, agent.config_fingerprint());
+    assert_eq!(o.config_fingerprint, cfg.fingerprint());
+    assert_eq!(o.config_fingerprint.len(), 16);
+    // 换一份配置（预算阈值不同）→ 指纹不同。
+    let cfg2 = cfg_with(6, 0, 0);
+    assert_ne!(cfg2.fingerprint(), cfg.fingerprint());
 }
