@@ -424,6 +424,10 @@ pub trait Provider: Send + Sync {
 /// public boundary so the wire shape (result.json / config JSON) can't drift
 /// from the bits a preset consumes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+// deny 与外层 Config / Limits / CodeConfig 同姿势（外审 FR-3 P2）：预置位
+// 打错字（如 max_completion_token 少个 s）当场报错，而不是静默解析成
+// false 让教学 400 无声回归。前向兼容窗口同 0.x minor。
+#[serde(deny_unknown_fields)]
 pub struct GatewayFixes {
     /// Rename `max_tokens` → `max_completion_tokens` on every request
     /// (reasoning models on gateways that only accept the new name).

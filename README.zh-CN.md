@@ -1124,13 +1124,13 @@ crates/core/src/  # kernel crate (package tiny-agent-core, lib name tiny_agent):
 ├── lib.rs            (  608)  # lib root: build_agent* / assemble (tool table, ToolCtx, code install, skill injection)
 ├── fsutil.rs         (  463)  # atomic-write primitives (O_EXCL temp + fsync + dir fsync; shared by session/result/report)
 ├── diag.rs           (  168)  # diagnostics channel: global sink installable by GUI hosts (falls back to stderr, byte-identical) — soft-failure warnings of skills/MCP/session/run_code go through it
-├── config.rs         ( 2936)  # config parsing + task-fragment merge + batch override whitelist
+├── config.rs         ( 3018)  # config parsing + task-fragment merge + batch override whitelist
 ├── provider/  # LLM backends
-│   ├── mod.rs            ( 1129)  # shared Message/Block, SSE reader, CancellableSse
-│   ├── openai.rs         ( 2248)  # OpenAI-compatible (include_usage; 400 fallbacks: max_tokens→max_completion_tokens / drop stream_options)
+│   ├── mod.rs            ( 1133)  # shared Message/Block, SSE reader, CancellableSse
+│   ├── openai.rs         ( 2291)  # OpenAI-compatible (include_usage; 400 fallbacks: max_tokens→max_completion_tokens / drop stream_options)
 │   ├── anthropic.rs      ( 1246)  # Anthropic native (message_start/message_delta usage)
 │   └── mock.rs           (  345)  # scripted Provider for tests (cfg(any(test, feature="mock")))
-├── agent.rs          ( 4560)  # core loop + usage accounting + cancel + context compression (preflight/overflow dual trigger + rolling chunked summaries) + adjacent-message normalization + same-turn multi-task parallelism
+├── agent.rs          ( 4567)  # core loop + usage accounting + cancel + context compression (preflight/overflow dual trigger + rolling chunked summaries) + adjacent-message normalization + same-turn multi-task parallelism
 ├── agent_tests.rs    (11161)  # core-loop regression tests (scripted provider::mock, no network)
 ├── usage_probe.rs    (   94)  # thread-local usage side channel for parallel workers: recovers billed usage after a panic unwind at the join point (keeps result.json and the shared counter from diverging)
 ├── compress.rs       (  996)  # compression engine (find_safe_cut / chunked summaries / saturating usage merge + block-level billing primitives)
@@ -1169,7 +1169,7 @@ src/  # CLI crate (package tiny-agent, bin tiny-agent): process shell + headless
 ├── main.rs           ( 1024)  # CLI entry + assembly (build_agent) + --session none
 ├── signal.rs         (  123)  # headless SIGINT → cancel (first press graceful / second hard-exit 130)
 ├── batch.rs          ( 3999)  # batch tasks + --retries/--failed + report merging
-├── harness.rs        ( 2320)  # headless mode + result.json + NDJSON + exit codes
+├── harness.rs        ( 2380)  # headless mode + result.json + NDJSON + exit codes
 ├── harness_tests.rs  ( 1212)  # harness behavior tests (retry ladder / result.json / NDJSON; moved here with harness from the kernel's agent_tests.rs)
 ├── tui.rs            (   20)  # TUI module root (feature tui): mod declarations + public exports (run / transcript_rows)
 └── tui/  # TUI submodules (same tui gate): split from the original 8.7k-line single file by concern

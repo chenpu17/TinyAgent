@@ -722,7 +722,11 @@ pub struct RunOutcome {
     /// has been learned — pre-FR-3 result.json stays byte-identical. A host
     /// persists this into the next process's `Config::gateway_fixes_preset`
     /// to skip the teaching 400; the export carries boolean bits only, never
-    /// credentials.
+    /// credentials. PRESET BITS ARE INCLUDED: this is the provider's running
+    /// cumulative set (OR of the process preset + everything learned since),
+    /// NOT a per-run delta — repeated runs of one Agent export the same
+    /// value; a host wanting run-over-run increments must diff consecutive
+    /// outcomes itself (OR-idempotence makes the preset round-trip stable).
     #[serde(skip_serializing_if = "crate::provider::GatewayFixes::is_default")]
     pub gateway_fixes: crate::provider::GatewayFixes,
 }
@@ -4201,6 +4205,9 @@ impl Agent {
         // the archive entries ("what did this summary replace") for the
         // event / audit record / host UI.
         let folded_ids: Vec<String> = dropped_middle.iter().filter_map(|m| m.id.clone()).collect();
+        // 「exactly those dropped messages」承诺的代码级钉子（外审 FR-6
+        // P2）：全部入史路径都铸 id，短了 = 未来新 append 点漏铸 id。
+        debug_assert_eq!(folded_ids.len(), dropped);
         self.archive_messages(dropped_middle);
         self.messages = compress::fold_summary(&self.messages, cut, &summary);
         let estimated_tokens_after =

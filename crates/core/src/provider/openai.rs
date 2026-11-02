@@ -2245,4 +2245,47 @@ mod tests {
             "knob off: no thinking channel traffic"
         );
     }
+
+    #[test]
+    fn parse_stream_mixed_reasoning_field_and_inline_think_do_not_cross() {
+        // FR-2 验收③（外审 P2-6 补钉）：同一流里 reasoning_content 协议字段
+        // 与内联 <think> 内容约定两形态混跑——各自进 ThinkingDelta、互不串
+        // 线，正文无标签残留。
+        let raw = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"proto-think \"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"<think>inline-think </think>\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"still proto\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"the answer\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n",
+        );
+        let mut events = Vec::new();
+        let resp = OpenAi::parse_stream(raw.as_bytes(), &mut |e| events.push(e)).unwrap();
+        assert_eq!(resp.stop_reason, "end_turn");
+        assert!(
+            matches!(&resp.blocks[0], Block::Text(t) if t == "the answer"),
+            "text block clean: {:?}",
+            resp.blocks
+        );
+        let thinking: String = events
+            .iter()
+            .filter_map(|e| match e {
+                ChatEvent::ThinkingDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        // 协议字段原样、内联标签剥离——两条通道的量都到齐、无标签残留。
+        assert_eq!(thinking, "proto-think inline-think still proto");
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                ChatEvent::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "the answer");
+        assert!(
+            !text.contains("think"),
+            "no tag residue in the reply channel"
+        );
+    }
 }

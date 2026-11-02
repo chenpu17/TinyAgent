@@ -873,8 +873,11 @@ impl Config {
     /// （请求本身）与 `workdir`（运行环境）。
     /// 凭据纪律（约束 ⑤，config 手写 Debug 纪律的延伸）：**只进键名不进
     /// 值**——`api_key_env` 本是环境变量名；MCP `headers`/`env` 只进排序
-    /// 后的键名列表；`url` 先过 [`redact_url_credentials`] 再进。`tools`
-    /// 排序后进（白名单语义无序），新增 harness 字段时必须同步加进这里
+    /// 后的键名列表；mcp `url` 与 `base_url` 都先过
+    /// [`redact_url_credentials`] 再进（外审 FR-4 P2：userinfo 端点的凭据
+    /// 值不得喂进哈希）。`tools` 排序后进（白名单语义无序），语义有序的
+    /// 列表（`mcp_servers`/`code.llm.models`/`tool_absent_notes`）按声明
+    /// 序进——顺序本身是拓扑语义。新增 harness 字段时必须同步加进这里
     /// （漏加 = 该字段变动不换指纹 = 台账静默失真）。
     pub fn fingerprint(&self) -> String {
         use sha2::{Digest, Sha256};
@@ -906,7 +909,13 @@ impl Config {
             "schema": 1,
             "core": env!("CARGO_PKG_VERSION"),
             "provider": self.provider.as_str(),
-            "base_url": self.base_url,
+            // 与 mcp url 同款脱敏（外审 FR-4 P2）：把凭据放 userinfo 的
+            // 网关端点（https://user:pass@gw/v1）不得把值喂进哈希——无
+            // userinfo 时恒等，正常配置指纹零变化。
+            "base_url": self
+                .base_url
+                .as_deref()
+                .map(|u| redact_url_credentials(u).into_owned()),
             "api_key_env": self.api_key_env,
             "model": self.model,
             "max_tokens": self.max_tokens,
@@ -2932,5 +2941,78 @@ mod tests {
             ..Default::default()
         });
         assert_ne!(preset.fingerprint(), base.fingerprint());
+    }
+
+    // ── 外审 FR-2/3/4/6 P2 返工测试 ──────────────────────────────────────────
+
+    #[test]
+    fn fingerprint_base_url_userinfo_is_redacted() {
+        // 外审 P2-2：把凭据放 userinfo 的网关端点（https://user:pass@gw/v1）
+        // 不得把值喂进哈希——换钥即换指纹违背验收③的精神。host 不变时同指纹。
+        let mk = |url: &str| -> Config {
+            serde_json::from_str::<Config>(&format!(
+                r#"{{"provider":"openai","api_key_env":"K","model":"m","base_url":"{url}"}}"#
+            ))
+            .unwrap()
+        };
+        let a = mk("http://alice:pw-a@gw.example/v1");
+        let b = mk("http://alice:pw-b@gw.example/v1");
+        assert_eq!(
+            a.fingerprint(),
+            b.fingerprint(),
+            "userinfo value is a credential"
+        );
+        let c = mk("http://alice:pw-a@other.example/v1");
+        assert_ne!(
+            a.fingerprint(),
+            c.fingerprint(),
+            "gateway host IS harness shape"
+        );
+        // 无 userinfo：恒等路径，正常配置不受影响。
+        let plain_a = mk("https://gw.example/v1");
+        let plain_b = mk("https://gw.example/v1");
+        assert_eq!(plain_a.fingerprint(), plain_b.fingerprint());
+    }
+
+    #[test]
+    fn fingerprint_equal_results_from_any_overlay_order_match() {
+        // 验收④的直接钉子：overlay 应用顺序不同、合并结果相同 → 同指纹。
+        // PartialConfig 按 apply 的字段合并（last-writer-wins / tighten-only），
+        // 字段不相交时两序结果相等。
+        let base: Config =
+            serde_json::from_str(r#"{"provider":"openai","api_key_env":"K","model":"m"}"#).unwrap();
+        let pa: PartialConfig = serde_json::from_str(r#"{"model":"model-a"}"#).unwrap();
+        let pb: PartialConfig = serde_json::from_str(r#"{"max_tokens":4096}"#).unwrap();
+        let mut ab = base.clone();
+        ab.apply(pa.clone()).unwrap();
+        ab.apply(pb.clone()).unwrap();
+        let mut ba = base.clone();
+        ba.apply(pb.clone()).unwrap();
+        ba.apply(pa.clone()).unwrap();
+        assert_eq!(ab.model, ba.model);
+        assert_eq!(ab.max_tokens, ba.max_tokens);
+        assert_eq!(
+            ab.fingerprint(),
+            ba.fingerprint(),
+            "same merged result, same fingerprint"
+        );
+    }
+
+    #[test]
+    fn gateway_fixes_rejects_unknown_preset_keys() {
+        // 外审 P2-4：预置位打错字（少个 s）必须当场报错，而不是静默解析成
+        // false 让教学 400 无声回归。
+        let err = serde_json::from_str::<crate::provider::GatewayFixes>(
+            r#"{"max_completion_token":true}"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field"),
+            "typo must fail loudly: {err}"
+        );
+        // 正确键照常解析。
+        let ok: crate::provider::GatewayFixes =
+            serde_json::from_str(r#"{"no_stream_options":true}"#).unwrap();
+        assert!(ok.no_stream_options);
     }
 }

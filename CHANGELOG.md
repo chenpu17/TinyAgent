@@ -42,8 +42,9 @@
   稳定指纹——固定字段序规范化 JSON → SHA-256 截 64 bit（16 hex）；进哈希：内核版本 + 全部
   harness 形状字段（provider/base_url/model/max_tokens/系统提示词/工具白名单/限制全家/MCP 拓扑/
   推理档位/缺位注记/code 沙箱/网关修复预置/`strip_think_tags`），排除 `task`/`workdir`（运行
-  输入），**凭据纪律只进键名不进值**（MCP headers/env 仅排序键名、url 过 userinfo 脱敏、白名单
-  排序无序化）。`Agent::config_fingerprint()` 访问器 + `RunOutcome.config_fingerprint`
+  输入），**凭据纪律只进键名不进值**（MCP headers/env 仅排序键名、mcp url 与 base_url 过 userinfo
+  脱敏、白名单排序无序化）。语义有序的列表（`mcp_servers`/`code.llm.models`/`tool_absent_notes`）
+  **按声明序进哈希**——顺序本身影响 MCP 拓扑命名与注记查找语义，序变即指纹变，属定版行为。`Agent::config_fingerprint()` 访问器 + `RunOutcome.config_fingerprint`
   （result.json 加键）——运行台账/评测把「模型 + harness 配对」钉进记录。算法/截断/字段清单定版
   即兼容面，变更须走 CHANGELOG。
 - **网关修复可导出/可预置（FR-3，P2）**：`Provider` trait 新增带默认实现的 `gateway_fixes()`

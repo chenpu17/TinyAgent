@@ -737,6 +737,16 @@ pub fn write_result(
                 "tool_calls": tool_calls,
                 "error": error_val,
             });
+            // FR-4: the effective-config fingerprint is an ALWAYS-present
+            // ledger key (pin "model + harness" per run).
+            result["config_fingerprint"] = json!(o.config_fingerprint.clone());
+            // FR-3: gateway fixes export — sparse like plan/compressions: a
+            // run that learned nothing omits the key (pre-FR-3 result.json
+            // stays byte-identical); feed a non-empty export back via the
+            // config's gateway_fixes_preset in the next process.
+            if !o.gateway_fixes.is_default() {
+                result["gateway_fixes"] = json!(o.gateway_fixes);
+            }
             // `plan` only when the agent actually used `todo`; omitted otherwise
             // so a result.json with no plan is byte-identical to pre-feature.
             if let Some(plan) = extract_plan(&o.tool_calls) {
@@ -1993,6 +2003,56 @@ mod tests {
         assert_eq!(parsed["cache_creation_input_tokens"], 800);
         assert_eq!(parsed["cache_read_input_tokens"], 200);
         assert_eq!(parsed["attempts"], 3);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_result_carries_fingerprint_and_sparse_gateway_fixes() {
+        // FR-3/FR-4 外审 P1 实锤返工：result.json 必须真的落 config_fingerprint
+        // （恒在，台账钉「模型 + harness 配对」）与 gateway_fixes（仅学到修复
+        // 时在——sparse 约定，无修复的产出与既有字节一致）。此前文档声称两键
+        // 在而 write_result 手工键清单漏了它们，实现与文档各说各话。
+        let dir = std::env::temp_dir().join(format!("ta-res-fp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mk = |fp: &str, fixes: tiny_agent::GatewayFixes| RunOutcome {
+            final_text: "done".into(),
+            turns: 1,
+            stop_reason: "end_turn".into(),
+            tool_calls: vec![],
+            compressions: vec![],
+            turn_timings: vec![],
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            config_fingerprint: fp.into(),
+            gateway_fixes: fixes,
+            elapsed: std::time::Duration::from_secs(1),
+        };
+        // ① 无修复：config_fingerprint 恒在，gateway_fixes 键缺席。
+        let plain = mk("3f9a1c2e4b5d6071", Default::default());
+        let p1 = dir.join("plain.json");
+        write_result(&p1, Some(&plain), None, 1, "end_turn", None, &meta()).unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&p1).unwrap()).unwrap();
+        assert_eq!(v["config_fingerprint"], "3f9a1c2e4b5d6071");
+        assert!(
+            v.get("gateway_fixes").is_none(),
+            "no-fix export must stay sparse: {}",
+            v
+        );
+        // ② 学到修复：两键都在，位如实。
+        let learned = mk(
+            "aaaaaaaaaaaaaaaa",
+            tiny_agent::GatewayFixes {
+                max_completion_tokens: true,
+                ..Default::default()
+            },
+        );
+        let p2 = dir.join("learned.json");
+        write_result(&p2, Some(&learned), None, 1, "end_turn", None, &meta()).unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&p2).unwrap()).unwrap();
+        assert_eq!(v["config_fingerprint"], "aaaaaaaaaaaaaaaa");
+        assert_eq!(v["gateway_fixes"]["max_completion_tokens"], true);
         std::fs::remove_dir_all(&dir).ok();
     }
 
