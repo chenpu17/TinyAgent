@@ -879,6 +879,15 @@ impl Config {
     /// 列表（`mcp_servers`/`code.llm.models`/`tool_absent_notes`）按声明
     /// 序进——顺序本身是拓扑语义。新增 harness 字段时必须同步加进这里
     /// （漏加 = 该字段变动不换指纹 = 台账静默失真）。
+    ///
+    /// 时点语义（外审 P2 定版）：指纹是**构造时快照**——`Agent::new` 时对
+    /// 定格的 [`Config`] 算一次，此后出账恒复制该值。常驻 `Agent` 的热更新
+    /// （`set_model` / `set_reasoning_effort` / `set_max_tokens` /
+    /// `set_max_context_tokens` / `set_code_config` / `set_tool_absent_notes`
+    /// / `add_mcp_server` / `remove_mcp_server`）改变实际生效形状，但**不
+    /// 移动**已出账的指纹——换挡后要做「模型 + harness」台账对比的宿主，
+    /// 请重建 Agent（或每 run 一建）取新指纹；CLI/批处理每 run 一建，天然
+    /// 无此歧义。
     pub fn fingerprint(&self) -> String {
         use sha2::{Digest, Sha256};
         let mut tools = self.tools.clone();

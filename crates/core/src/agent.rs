@@ -715,7 +715,10 @@ pub struct RunOutcome {
     /// (FR-4, see [`Agent::config_fingerprint`] / [`Config::fingerprint`]).
     /// Newer key: result.json consumers that pin "model + harness" pairings
     /// in run ledgers read this instead of re-deriving config identity from
-    /// scattered fields.
+    /// scattered fields. Construction-time snapshot: a long-lived `Agent`'s
+    /// hot-swap setters (`set_model` et al) change the effective shape but
+    /// not this value — rebuild (or build per run) after swapping to get a
+    /// fresh pairing key.
     pub config_fingerprint: String,
     /// Cumulative gateway-body fixes the provider has learned (FR-3, see
     /// [`Provider::gateway_fixes`]). Skipped in the serialization when no fix
@@ -2691,7 +2694,9 @@ impl Agent {
             if !turn_text.is_empty() {
                 // clone 而非 move：轮末仲裁（FR-1）在收尾点还要读本轮文本
                 // 判「完成声称」——final_text 承接的是「最近一个非空轮」，
-                // thinking-only 收尾轮时两者不同，语义必须取本轮。
+                // 收尾轮有块但可见文本为空（如 image-only）时两者不同，
+                // 语义必须取本轮。thinking-only 收尾是零块路径，在前面的
+                // 零块 break 就退出、到不了仲裁点。
                 final_text = turn_text.clone();
             }
             // An empty assistant turn (e.g. a content-filtered response that

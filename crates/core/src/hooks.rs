@@ -82,10 +82,12 @@ pub enum TurnStopDecision {
 pub struct TurnStopInfo<'a> {
     /// The text blocks of the turn that is ending the run, joined with
     /// newlines — the completion claim being judged. Empty when the final
-    /// turn carried no visible text (e.g. a thinking-only reply). A final
-    /// turn with ZERO blocks (a content filter swallowing the reply) ends
-    /// the run without consulting this hook at all — there is no claim to
-    /// judge.
+    /// turn carried no visible text but did carry other blocks (e.g. an
+    /// image-only reply). A final turn with ZERO blocks ends the run
+    /// without consulting this hook at all — there is no claim to judge;
+    /// note a thinking-only reply is that zero-block shape, not this one
+    /// (thinking never solidifies into a block, so such a turn exits via
+    /// the zero-block path and never reaches arbitration).
     pub reply_text: &'a str,
     /// 1-based number of the turn about to end the run.
     pub turn: u32,

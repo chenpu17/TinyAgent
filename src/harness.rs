@@ -1809,6 +1809,11 @@ mod tests {
             measured_tokens_before: Some(850),
         });
         assert_eq!(v["type"], "compressed");
+        assert_eq!(
+            v["folded_ids"],
+            serde_json::json!(["m1", "m2", "m3"]),
+            "folded_ids ride the NDJSON event"
+        );
         assert_eq!(v["dropped"], 3);
         assert_eq!(v["kept"], 5);
         assert_eq!(v["trigger"], "preflight");
