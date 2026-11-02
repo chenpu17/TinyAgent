@@ -242,9 +242,14 @@
   闸门」条）；`timeout_secs` 经 `clamp_child_timeout` 收紧为父的**剩余时间**（`ToolCtx::deadline`，
   只紧不松、地板 1s——0 会意外松成"不限"），不再克隆完整第二份超时。粒度仍是轮次边界：同轮已并行
   启动的兄弟互不见对方本轮后续花费，严格控成本仍留余量或去掉 `task`（README limits 节同款表述）。
-- **Hooks 拦截层（`hooks.rs`，P1，第三方扩展面）**：`trait Hooks: Send + Sync` 三默认方法
+- **Hooks 拦截层（`hooks.rs`，P1，第三方扩展面）**：`trait Hooks: Send + Sync` 四默认方法
   （`before_tool` → `ToolDecision::{Allow, Deny(String), Modify(Value)}`；`after_tool` 事后审计；
-  `on_chat_request` 只读观察主 turn 请求），`Agent::set_hooks` 后置安装（仿 `set_cancel` 模式）。
+  `on_chat_request` 只读观察主 turn 请求；`on_turn_stopping` 轮末仲裁——FR-1：仅 top_level、仅
+  `end_turn`、仅即将发 `Done` 前调用，`Continue{note}` 复用 R1 旁注管线（入队 → 下轮轮首
+  `deliver_notes` 投递），续跑帽 `TURN_ARBITRATION_CAP = STUCK_STOP_AT`（6），超限降级
+  `stop_reason="arbitration_capped"`、note 只留在 `TurnArbitration` 事件里；**默认 `Stop` 零漂移**
+  ——非默认决策才发事件，既有钉子表不漂移；子 agent run（`top_level=false`）从不仲裁），
+  `Agent::set_hooks` 后置安装（仿 `set_cancel` 模式）。
   装配（`lib.rs::assemble`）留 `ToolCtx::hooks = None`——二进制与绑定**零行为变化**，只有库用户
   显式安装才生效。**子 agent 经 `child_ctx()` Arc-clone 继承同一层**（顶层拒绝 = 子 agent 内也拒绝，
   无绕过）；`ToolCtx::subagent` 以名字标注子 agent 身份供钩子区分。**关键语义**：Deny 产出

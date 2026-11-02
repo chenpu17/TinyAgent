@@ -147,6 +147,7 @@ cannot change them:
 | `max_turns_reached` / `max_tokens` | a model limit was reached | ❌ |
 | `budget_exceeded` | cumulative tokens hit `limits.max_total_tokens` | ❌ |
 | `stuck_loop` | spinning guardrail: the same call with identical arguments and identical results 6 times in a row (the 3rd occurrence attaches a course-correction hint to the tool_result first, granting one self-healing chance; progress or changed args reset the counter) | ❌ |
+| `arbitration_capped` | turn-stopping arbitration (`Hooks::on_turn_stopping`) kept rejecting the model's `end_turn` past its per-run continuation cap (6, aligned with the stuck-loop discipline); the run then ends cleanly on the model's final turn — exit 0, the label lives in result.json for hosts that audit it | ❌ |
 | `panic` | the task panicked in a worker and was caught into a failure entry (below) | ❌ |
 | `cancelled` | user Ctrl-C: tasks not yet started are marked `cancelled` without running; a cancel observed during retry backoff ends the task `cancelled` too (cost already burned stays in the bill) | ❌ |
 | `setup_error` | agent build failed (missing `api_key_env` / MCP server failed to start / unknown tool name) or per-task workdir isolation setup failed (git missing / not a repo root / temp dir unwritable); deterministic — a retry round that fails here keeps the earlier attempts' cost | ❌ |
@@ -813,8 +814,10 @@ temptations.
     { "turn": 2, "duration_ms": 950, "tool_calls": 0 }
   ],
   "compressions": [
-    { "trigger": "preflight", "dropped": 8, "kept": 6, "estimated_tokens_before": 152000, "estimated_tokens_after": 41000, "measured_tokens_before": 148220 }
+    { "trigger": "preflight", "dropped": 8, "folded_ids": ["m3","m4","m5","m6","m7","m8","m9","m10"], "kept": 6, "estimated_tokens_before": 152000, "estimated_tokens_after": 41000, "measured_tokens_before": 148220 }
   ],
+  "config_fingerprint": "3f9a1c2e4b5d6071",
+  "gateway_fixes": { "max_completion_tokens": true, "no_stream_options": false, "no_reasoning_effort": false },
   "plan": [
     { "subject": "run the tests", "status": "completed" },
     { "subject": "fix failing cases", "status": "in_progress" },
@@ -833,7 +836,14 @@ temptations.
   untouched); consumers that read by key are unaffected. `model`/`provider` come from the actually-run
   config (a batch fragment's `model` override is recorded post-override); `provider` records the
   configured protocol family (anthropic / openai) — still the declared value when a binding injects a
-  custom provider callback.
+  custom provider callback. Two newer additive keys serve run ledgers directly (FR-3/FR-4 of the
+  host-integration requirements): `config_fingerprint` — a stable 16-hex fingerprint of the EFFECTIVE
+  (clamp/overlay-merged) config, computed over harness-shaping fields + kernel version, excluding
+  `task`/`workdir` (per-run inputs) and credential VALUES (MCP header/env key names only, URLs
+  userinfo-redacted); same config → same fingerprint, any model/limits/tools/MCP/sandbox change →
+  different. `gateway_fixes` — the openai-compat gateway body fixes learned so far (three boolean
+  bits, credential-free), present only when at least one has been learned; feed it back via the
+  config's `gateway_fixes_preset` in the next process to skip the teaching 400.
 - **The `schema_version` contract**: while it is `1`, **keys are only added, never removed, and
   existing keys never change type**; new keys are always optional (old consumers can ignore them and
   keep working; sparse keys like `plan`/`compressions`/`duration_ms` simply don't appear when empty);
@@ -854,6 +864,9 @@ temptations.
   (optional): the context-compression audit — trigger path (`preflight`/`overflow`/`manual`),
   dropped/kept message counts, before/after token estimates (same basis as the preflight gate) and the
   most recent anchor's provider-measured value (`measured_tokens_before`, null without an anchor);
+  each entry also carries `folded_ids` — the message ids of exactly the folded middle (the originals
+  live in the session archive; id-stable across save/load), so an export can reconstruct "what did
+  this summary replace" without counting positions;
   **present only when a compression happened**. Compressions in a failed turn are audited too (error
   paths are also bill surfaces)
 - `attempts` is how many agent runs actually executed (`>1` means transient retries happened — see
@@ -895,7 +908,7 @@ the children) — an in-flight task depending on MCP tools may fail early becaus
 
 `--json` mode additionally emits one NDJSON line per event (`type`: `turn` / `text` / `thinking` /
 `code_log` / `tool_input` / `tool_call` / `tool_result` / `usage` / `compressed` / `pruned` / `salvage`
-/ `warning` / `note_injected` / `subagent` / `todo` / `done`, plus `retry` between retry attempts and a
+/ `warning` / `note_injected` / `turn_arbitration` / `subagent` / `todo` / `done`, plus `retry` between retry attempts and a
 stream-head `code` record that appears only when the run_code sandbox is compiled in and enabled —
 `code` is a harness-level record, not an `AgentEvent` variant), letting pipes track progress
 before the result file lands. `tool_input` is the streaming increment of tool arguments
@@ -906,7 +919,14 @@ this run (the truth for current context occupancy — what a ctx meter should se
 call's bill folded into the run totals (a `task` sub-agent's multi-turn aggregate, the run_code inner
 llm, a host tool's own report — emitted between that tool's `tool_call` and `tool_result`, and NOT a
 measurement of the current history). Both flavors count toward the cumulative totals; branch on the
-flag when the two mean different things to you. This set of `type`s is a
+flag when the two mean different things to you. `turn_arbitration` appears only when a host's
+turn-stopping hook rejected the model's completion (FR-1): `{"type":"turn_arbitration","turn","continued","note"}`
+— `continued:true` means one more turn follows (the note rides the supervisor-note pipeline, a
+`note_injected` event lands at the delivery point); `continued:false` means the continuation cap was
+hit and the run ends `arbitration_capped` with the undelivered note surviving only in this event. The
+`compressed` event now carries `folded_ids` (FR-6): the message ids of exactly the folded middle —
+the originals live in the session archive, so a UI/export can key "what did this summary replace"
+by id instead of counting positions. This set of `type`s is a
 **contract**: the kernel's `AgentEvent::ndjson_type()` exhaustively assigns one per variant (a new
 variant without an entry fails to compile), and `agent_tests` pins the names variant-by-variant —
 consumers can branch on `type` and will never meet a nameless stream event.
@@ -1456,24 +1476,24 @@ one-line responsibility is maintained in that script's ENTRIES.
 <!-- BEGIN CODE STRUCTURE (generated by scripts/gen_structure.py) -->
 ```text
 crates/core/src/  # kernel crate (package tiny-agent-core, lib name tiny_agent): agent loop / tools / providers / config / assembly
-├── lib.rs            (  607)  # lib root: build_agent* / assemble (tool table, ToolCtx, code install, skill injection)
+├── lib.rs            (  608)  # lib root: build_agent* / assemble (tool table, ToolCtx, code install, skill injection)
 ├── fsutil.rs         (  463)  # atomic-write primitives (O_EXCL temp + fsync + dir fsync; shared by session/result/report)
 ├── diag.rs           (  168)  # diagnostics channel: global sink installable by GUI hosts (falls back to stderr, byte-identical) — soft-failure warnings of skills/MCP/session/run_code go through it
-├── config.rs         ( 2710)  # config parsing + task-fragment merge + batch override whitelist
+├── config.rs         ( 2936)  # config parsing + task-fragment merge + batch override whitelist
 ├── provider/  # LLM backends
-│   ├── mod.rs            ( 1083)  # shared Message/Block, SSE reader, CancellableSse
-│   ├── openai.rs         ( 1817)  # OpenAI-compatible (include_usage; 400 fallbacks: max_tokens→max_completion_tokens / drop stream_options)
+│   ├── mod.rs            ( 1129)  # shared Message/Block, SSE reader, CancellableSse
+│   ├── openai.rs         ( 2248)  # OpenAI-compatible (include_usage; 400 fallbacks: max_tokens→max_completion_tokens / drop stream_options)
 │   ├── anthropic.rs      ( 1246)  # Anthropic native (message_start/message_delta usage)
 │   └── mock.rs           (  345)  # scripted Provider for tests (cfg(any(test, feature="mock")))
-├── agent.rs          ( 4391)  # core loop + usage accounting + cancel + context compression (preflight/overflow dual trigger + rolling chunked summaries) + adjacent-message normalization + same-turn multi-task parallelism
-├── agent_tests.rs    (10501)  # core-loop regression tests (scripted provider::mock, no network)
+├── agent.rs          ( 4544)  # core loop + usage accounting + cancel + context compression (preflight/overflow dual trigger + rolling chunked summaries) + adjacent-message normalization + same-turn multi-task parallelism
+├── agent_tests.rs    (11104)  # core-loop regression tests (scripted provider::mock, no network)
 ├── usage_probe.rs    (   94)  # thread-local usage side channel for parallel workers: recovers billed usage after a panic unwind at the join point (keeps result.json and the shared counter from diverging)
 ├── compress.rs       (  996)  # compression engine (find_safe_cut / chunked summaries / saturating usage merge + block-level billing primitives)
 ├── context_report.rs (  886)  # context composition breakdown (ContextBreakdown estimate: 3 system parts / 4 tool classes / message typing + anchor calibration)
 ├── retry.rs          (  158)  # exponential backoff shared by batch --retries and single-run transient retry (±25% jitter against lockstep)
 ├── session.rs        (  522)  # session persistence (atomic writes + fold archive)
 ├── skills.rs         ( 1089)  # three-tier skill loading (built-in / user dir / project)
-├── hooks.rs          (  183)  # hooks gate (Deny / Modify / audit)
+├── hooks.rs          (  281)  # hooks gate (Deny / Modify / audit)
 ├── tools/  # toolset: built-in tools + MCP wrappers + task sub-agent + run_code (feature code)
 │   ├── mod.rs            ( 1509)  # Tool trait + ToolCtx + CallbackTool/SharedTool + whitelist assembly
 │   ├── shell.rs          ( 1297)  # shell tool (unix: sh -c; Windows: cmd /C + raw_arg verbatim command passing, defeating std quoting)
@@ -1482,7 +1502,7 @@ crates/core/src/  # kernel crate (package tiny-agent-core, lib name tiny_agent):
 │   ├── document.rs       (  100)  # PDF → Block::Document loading (lib API load_document_block)
 │   ├── skill.rs          (  981)  # read_skill / list_skill (outside the whitelist; injected by assembly)
 │   ├── mcp.rs            (  674)  # MCP tool wrapper (sanitize_name + wire_name dispatch)
-│   ├── subagent.rs       ( 1082)  # task sub-agent tool (own context + turn cap; non-recursive)
+│   ├── subagent.rs       ( 1094)  # task sub-agent tool (own context + turn cap; non-recursive)
 │   ├── todo.rs           (  311)  # todo tool (task plan, full replacement; plan lands in result.json)
 │   ├── run_code.rs       (  103)  # run_code facade (feature code): mod declarations + symbol re-exports; implementation in run_code/ submodules
 │   ├── llm.rs            (  740)  # llm judgment primitive (feature code + code.llm gate): single-shot stateless inner model call — LD-17 reserve/settle, LD-18 label normalization, shared Provider cell
@@ -1504,11 +1524,11 @@ src/  # CLI crate (package tiny-agent, bin tiny-agent): process shell + headless
 ├── main.rs           ( 1024)  # CLI entry + assembly (build_agent) + --session none
 ├── signal.rs         (  123)  # headless SIGINT → cancel (first press graceful / second hard-exit 130)
 ├── batch.rs          ( 3994)  # batch tasks + --retries/--failed + report merging
-├── harness.rs        ( 2252)  # headless mode + result.json + NDJSON + exit codes
+├── harness.rs        ( 2276)  # headless mode + result.json + NDJSON + exit codes
 ├── harness_tests.rs  ( 1212)  # harness behavior tests (retry ladder / result.json / NDJSON; moved here with harness from the kernel's agent_tests.rs)
 ├── tui.rs            (   20)  # TUI module root (feature tui): mod declarations + public exports (run / transcript_rows)
 └── tui/  # TUI submodules (same tui gate): split from the original 8.7k-line single file by concern
-    ├── app.rs            ( 1816)  # session assembly: run entry / worker thread / event & input channels / ui_loop event body / Ctrl-C double-press window
+    ├── app.rs            ( 1834)  # session assembly: run entry / worker thread / event & input channels / ui_loop event body / Ctrl-C double-press window
     ├── input.rs          (  361)  # multi-line InputBuffer editor / input history recall / horizontal input scrolling
     ├── slash.rs          (  543)  # slash commands: classify grammar / read-only replies / completion popup state machine / /context report
     ├── theme.rs          (  147)  # theme: single source for history-row & chrome colors / light-dark switch TINYAGENT_TUI_THEME / number formatting helpers

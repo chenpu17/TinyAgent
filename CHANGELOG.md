@@ -27,9 +27,52 @@
   三个补充验收测试（Err 路径冲账且不发 Done、run 间排队 note 存活折叠、assistant 尾冲账开新
   user 轮）；文档补两个定版边界（延迟冲账令 `ends_with_user()` 翻真 → TUI/CLI resume 自动开跑
   属投递机制；/clear 不清队列，note 照常投递）。
+- **轮末仲裁钩子 `Hooks::on_turn_stopping`（宿主集成需求单 FR-1，P0，TinyWorker RSI 判停闭环）**：
+  top-level run 因模型自身 `end_turn` 即将收尾的当下（发 `Done` 前）被调用，返回 `Stop`（默认）或
+  `Continue { note }`——不发 `Done`，note 复用监督者旁注管线入队，下一轮轮首以标记块并入尾用户
+  消息（模型当轮可见，`NoteInjected{deferred:false}` 回执照发）。仅此一档仲裁：`max_tokens`（含
+  salvage）/ `stuck_loop` / cancel / 预算 / 轮帽 / Err 全是强制终止，从不咨询；子 agent run
+  （`top_level=false`）从不仲裁；续跑窗口内 cancel 照常生效（`stop_reason="cancelled"`，已入队
+  note 走出口 deferred 冲账）。单 run 续跑上限 `TURN_ARBITRATION_CAP = STUCK_STOP_AT`（6），超限
+  降级为 `stop_reason = "arbitration_capped"`（新核心标签；harness 退出码按成功算，标签在
+  result.json 供审计），被丢弃的 note 只保留在事件里。**默认 Stop = 零漂移**：仅非默认决策发
+  `TurnArbitration` 事件（NDJSON `turn_arbitration`，钉子表 16→17），默认路径的事件流/历史/
+  stop_reason 与无钩子 run 逐字节一致。harness 显式映射 + TUI 决策行；bindings serde 透传零改动。
+- **有效配置指纹（FR-4，P1）**：`Config::fingerprint()` 对 clamp/overlay 合并后的**生效**配置计算
+  稳定指纹——固定字段序规范化 JSON → SHA-256 截 64 bit（16 hex）；进哈希：内核版本 + 全部
+  harness 形状字段（provider/base_url/model/max_tokens/系统提示词/工具白名单/限制全家/MCP 拓扑/
+  推理档位/缺位注记/code 沙箱/网关修复预置/`strip_think_tags`），排除 `task`/`workdir`（运行
+  输入），**凭据纪律只进键名不进值**（MCP headers/env 仅排序键名、url 过 userinfo 脱敏、白名单
+  排序无序化）。`Agent::config_fingerprint()` 访问器 + `RunOutcome.config_fingerprint`
+  （result.json 加键）——运行台账/评测把「模型 + harness 配对」钉进记录。算法/截断/字段清单定版
+  即兼容面，变更须走 CHANGELOG。
+- **网关修复可导出/可预置（FR-3，P2）**：`Provider` trait 新增带默认实现的 `gateway_fixes()`
+  （非学习型 provider 零改动）；openai 私有 `LearnedFixes` 投影为公共 `GatewayFixes`（三布尔位，
+  serde，凭据无关）经 `RunOutcome.gateway_fixes` 出账（skip_serializing_if 保无修复时 result.json
+  字节不变）。`Config.gateway_fixes_preset`（可选）经 `OpenAi::with_preset` 预置——本进程**首个
+  请求**即带修复形状，教学 400 往返整个消失；导出/预置往返等价；预置位进指纹。
+- **压缩审计补 `folded_ids`（FR-6，P2）**：`CompressOutcome` / `Compressed` 事件 /
+  `CompressionRecord` 三面补被折叠中段消息的 id（即 session 归档原文的 id，跨 save/load 不变），
+  宿主 UI/导出按 id 定位「这段被摘要了什么」，不再数数对位；NDJSON `compressed` 事件加键
+  （additive）。新增**重建一致性钉子**：session 文件 + 归档重建的消息面 == 实际发给模型的消息面，
+  未折叠/折叠/退化折叠三类会话逐 id 对账全绿（dsh「model-visible means logged」纪律的固化）。
+- **内联 `<think>` 剥离（FR-2 缩减版，P1）**：vLLM 系不开 reasoning-parser 时内联在 openai 正文流
+  里的 `<think>…</think>` 块由流式状态机（`ThinkStripper`）跨任意 chunk 边界切成 text/thinking
+  两通道，thinking 映射到既有 `ThinkingDelta`（**永不入历史/正文**）；完整开标签后流断按 thinking
+  冲（正文纯净 fail-closed）、未成形的部分标签按正文冲、关标签无开标签是普通正文。`Config::
+  strip_think_tags`（默认 true；指纹纳入）；关 = 逐字节透传（FR-2 之前行为）。`reasoning_content`/
+  `reasoning` 协议字段路径不受开关影响（此前已支持，需求单该半前提已过时）。
 
 ### Changed（破坏性）
 
+- **`CompressOutcome` 失去 `Copy`**（FR-6 携带 `folded_ids: Vec<String>` 所致）：持有该类型按值
+  拷贝的库消费方改用 `.clone()`。0.x minor 即破坏窗口。
+- **`RunOutcome` 新增 `config_fingerprint` / `gateway_fixes` 字段**（FR-3/FR-4 出账面）：Rust 库
+  消费方若字面构造 `RunOutcome`（罕见——它由 run 返回）需补字段；读取方按键消费不受影响
+  （`gateway_fixes` 无修复时不出现）。result.json 由此加 `config_fingerprint` 键（恒在）与
+  `gateway_fixes` 键（学到的修复非空才在）——additive，schema_version 仍为 1。
+- **`sha2` 依赖转必选**（FR-4 指纹哈希用）：此前 `code` feature 门控直连（wasmtime 传递已有），
+  默认依赖树 +1 个既有 crate。
 - **`AgentEvent::Usage` 新增 `tool_folded: bool`**：`false` = provider 请求自身的用量（上下文占用的
   真值）；`true` = 工具账单折叠进 run 总额（`task` 子 agent 多轮累计、run_code 内层 `llm`、宿主回调
   工具上报），在该工具的 `ToolCall` 之后、`ToolResult` 之前发出。累计总额两者都计，表示「最近一次
