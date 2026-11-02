@@ -915,6 +915,22 @@ fn ui_loop(
                             "[max_tokens hit — one wrap-up turn appended]",
                         ));
                     }
+                    AgentEvent::TurnArbitration { continued, note, .. } => {
+                        // 轮末仲裁（FR-1）：仅在宿主 hook 给出非默认决策时
+                        // 出现。continued 的投递可见性由随后的 NoteInjected
+                        // 行承担，这里标决策点本身；capped 的 note 不会投递
+                        // （只活在事件里），所以把它带上——否则这段意图在
+                        // 会话里就无迹可寻了。warn 级与 NoteInjected 对齐。
+                        if continued {
+                            rows.push(Row::sys_warn(
+                                "[arbitration: completion rejected — one more turn]",
+                            ));
+                        } else {
+                            rows.push(Row::sys_warn(format!(
+                                "[arbitration capped — note not delivered] {note}"
+                            )));
+                        }
+                    }
                     // ToolInputDelta is streaming plumbing: the ToolCall row
                     // and the live tool placeholder own its presentation, and
                     // a row per fragment would flood the transcript.

@@ -1,6 +1,6 @@
 use super::*;
 use crate::compress::*;
-use crate::hooks::{Hooks, ToolDecision};
+use crate::hooks::{Hooks, ToolDecision, TurnStopDecision, TurnStopInfo};
 use crate::provider::mock::{self, MockProvider, MockTurn};
 use crate::provider::{ChatRequest, ChatResponse};
 use crate::tools::ToolOutput;
@@ -9139,6 +9139,7 @@ fn every_agent_event_has_a_stable_ndjson_type_tag() {
             AgentEvent::MaxTokensSalvage => "salvage",
             AgentEvent::Warning(_) => "warning",
             AgentEvent::NoteInjected { .. } => "note_injected",
+            AgentEvent::TurnArbitration { .. } => "turn_arbitration",
             AgentEvent::SubAgent { .. } => "subagent",
             AgentEvent::Done { .. } => "done",
         }
@@ -9220,6 +9221,14 @@ fn every_agent_event_has_a_stable_ndjson_type_tag() {
             "subagent",
         ),
         (
+            AgentEvent::TurnArbitration {
+                turn: 1,
+                continued: true,
+                note: String::new(),
+            },
+            "turn_arbitration",
+        ),
+        (
             AgentEvent::Done {
                 stop_reason: String::new(),
             },
@@ -9240,7 +9249,7 @@ fn every_agent_event_has_a_stable_ndjson_type_tag() {
     // compile-time exhaustiveness lives in `ndjson_type` and `census_type`
     // above; this is the runtime mirror that also catches a "named but never
     // yielded" arm).
-    assert_eq!(seen.len(), 16, "update the table when AgentEvent grows");
+    assert_eq!(seen.len(), 17, "update the table when AgentEvent grows");
 }
 
 // ── Slot 状态 × 观测后果：跨路径统一契约表 ────────────────────────────────
@@ -10497,5 +10506,314 @@ fn tool_billed_usage_event_lands_between_subagent_stream_and_tool_result() {
             .count(),
         1,
         "exactly one (folded) Usage event expected"
+    );
+}
+
+
+// ── 轮末仲裁（宿主集成需求单 FR-1）：Hooks::on_turn_stopping ─────────────
+
+/// 继续前 N 次、之后默认 Stop 的仲裁钩子（数轮续跑用的最小桩）。
+struct ContinueNArbitration {
+    remaining: std::sync::atomic::AtomicU32,
+    note: String,
+}
+impl Hooks for ContinueNArbitration {
+    fn on_turn_stopping(&self, info: &TurnStopInfo) -> TurnStopDecision {
+        let left = self.remaining.load(Ordering::Relaxed);
+        if left == 0 {
+            // 第二次进入（每轮 end_turn 各一次）：计数纪律必须如实可见。
+            assert_eq!(info.continuations_used, 1, "one continuation already honored");
+            assert_eq!(info.continuations_cap, 6, "cap aligned with STUCK_STOP_AT");
+            TurnStopDecision::Stop
+        } else {
+            self.remaining.store(left - 1, Ordering::Relaxed);
+            assert_eq!(info.turn, 1, "the first arbitration sees the first turn");
+            TurnStopDecision::Continue {
+                note: self.note.clone(),
+            }
+        }
+    }
+}
+
+/// 永远 Continue 的仲裁钩子（打上限用）。
+struct AlwaysContinueArbitration {
+    note: String,
+}
+impl Hooks for AlwaysContinueArbitration {
+    fn on_turn_stopping(&self, _info: &TurnStopInfo) -> TurnStopDecision {
+        TurnStopDecision::Continue {
+            note: self.note.clone(),
+        }
+    }
+}
+
+#[test]
+fn turn_arbitration_continue_extends_run_and_delivers_note_next_turn() {
+    // Continue 的完整链路：不发 Done、note 入旁注队列 → 下轮轮首以标记块
+    // 并入尾用户消息（模型当轮可见）→ NoteInjected{deferred:false} 回执 →
+    // 第二轮 end_turn 钩子回 Stop → 正常 end_turn 收尾。事件次序：
+    // TurnArbitration 在 NoteInjected 之前，Done 永远最后。
+    let cfg = cfg_with(8, 0, 0);
+    let (prov, state) = MockProvider::new(vec![
+        mock::resp_text("claimed done", None),
+        mock::resp_text("actually finished", None),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("task")],
+        test_ctx(),
+    );
+    agent.set_hooks(Arc::new(ContinueNArbitration {
+        remaining: std::sync::atomic::AtomicU32::new(1),
+        note: "check the tests first".into(),
+    }));
+    let mut events = Vec::new();
+    let o = agent.run(&mut |e| events.push(e)).unwrap();
+
+    assert_eq!(o.stop_reason, "end_turn");
+    assert_eq!(o.final_text, "actually finished");
+    assert_eq!(o.turns, 2);
+    let cap = state.captured();
+    assert_eq!(cap.len(), 2, "one request per turn");
+    // 第二轮请求的尾用户文本：标记块 + note 原文（监督者旁注同款前缀）。
+    let tail = cap[1].user_texts.last().expect("tail user text");
+    assert!(tail.starts_with(SUPERVISOR_NOTE_MARKER), "marked block: {tail}");
+    assert!(tail.ends_with("check the tests first"), "note text: {tail}");
+
+    // 事件次序与回执。
+    let arb_pos = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::TurnArbitration { .. }))
+        .expect("TurnArbitration emitted");
+    match &events[arb_pos] {
+        AgentEvent::TurnArbitration {
+            turn, continued, note,
+        } => {
+            assert_eq!(*turn, 1);
+            assert!(*continued);
+            assert_eq!(note, "check the tests first");
+        }
+        _ => unreachable!(),
+    }
+    let note_pos = arb_pos
+        + events[arb_pos..]
+            .iter()
+            .position(|e| matches!(e, AgentEvent::NoteInjected { deferred: false, .. }))
+            .expect("note delivered this run");
+    assert!(arb_pos < note_pos, "decision event precedes the delivery receipt");
+    let done_pos = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Done { .. }))
+        .unwrap();
+    assert!(note_pos < done_pos, "Done stays last");
+    assert_eq!(
+        events[done_pos..]
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::Done { .. }))
+            .count(),
+        1,
+        "exactly one Done despite the extra turn"
+    );
+
+    // 序列化契约（bindings 以 serde 值透传事件）：外部 tagging + 独立 NDJSON 标签。
+    let v = serde_json::to_value(AgentEvent::TurnArbitration {
+        turn: 3,
+        continued: false,
+        note: "n".into(),
+    })
+    .unwrap();
+    assert_eq!(v["TurnArbitration"]["turn"], 3);
+    assert_eq!(v["TurnArbitration"]["continued"], false);
+    assert_eq!(v["TurnArbitration"]["note"], "n");
+    assert_eq!(
+        AgentEvent::TurnArbitration {
+            turn: 1,
+            continued: true,
+            note: String::new(),
+        }
+        .ndjson_type(),
+        "turn_arbitration"
+    );
+}
+
+#[test]
+fn turn_arbitration_cap_degrades_to_arbitration_capped_stop() {
+    // 六次 Continue 兑现后，第七次仲裁请求被降级：stop_reason =
+    // "arbitration_capped"，note 不入队不入史（只活在事件里），run 干净收尾。
+    let cfg = cfg_with(20, 0, 0);
+    let turns: Vec<MockTurn> = (0..8)
+        .map(|i| mock::resp_text(&format!("t{i}"), None))
+        .collect();
+    let (prov, state) = MockProvider::new(turns);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("task")],
+        test_ctx(),
+    );
+    agent.set_hooks(Arc::new(AlwaysContinueArbitration {
+        note: "keep going".into(),
+    }));
+    let mut events = Vec::new();
+    let o = agent.run(&mut |e| events.push(e)).unwrap();
+
+    assert_eq!(o.stop_reason, "arbitration_capped");
+    assert_eq!(o.turns, 7, "six continuations, then the capped seventh turn");
+    let dec: Vec<(u32, bool)> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TurnArbitration {
+                turn, continued, ..
+            } => Some((*turn, *continued)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        dec,
+        vec![
+            (1, true),
+            (2, true),
+            (3, true),
+            (4, true),
+            (5, true),
+            (6, true),
+            (7, false)
+        ],
+        "six honored decisions then the cap"
+    );
+    // 交付回执恰六条（第 2..7 轮轮首各一条），无第七条。
+    let delivered = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::NoteInjected { deferred: false, .. }))
+        .count();
+    assert_eq!(delivered, 6);
+    // 被丢弃的 note 只在事件里：最后请求里恰六个标记块，不是七个。
+    let cap = state.captured();
+    let marked: usize = cap[6]
+        .user_texts
+        .iter()
+        .filter(|t| t.starts_with(SUPERVISOR_NOTE_MARKER))
+        .count();
+    assert_eq!(marked, 6, "six notes reached the final request, not seven");
+    // 队列已空——出口漏斗不再有 deferred 冲账。
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::NoteInjected { deferred: true, .. })));
+}
+
+#[test]
+fn turn_arbitration_cancel_mid_continuation_reports_cancelled() {
+    // Continue 落地后、下一请求发出前落下的 cancel 照常生效：钩子返回
+    // Continue 的同时翻 cancel 旗，下一个轮首检查即停——stop_reason =
+    // "cancelled"；已入队的 note 走出口漏斗 deferred 冲账（晚到、不丢）。
+    let cfg = cfg_with(8, 0, 0);
+    let (prov, _) = MockProvider::new(vec![mock::resp_text("done?", None)]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("task")],
+        test_ctx(),
+    );
+    let flag = Arc::new(AtomicBool::new(false));
+    agent.set_cancel(flag.clone());
+    struct ContinueAndCancel {
+        cancel: Arc<AtomicBool>,
+    }
+    impl Hooks for ContinueAndCancel {
+        fn on_turn_stopping(&self, _info: &TurnStopInfo) -> TurnStopDecision {
+            self.cancel.store(true, Ordering::Relaxed);
+            TurnStopDecision::Continue {
+                note: "one more".into(),
+            }
+        }
+    }
+    agent.set_hooks(Arc::new(ContinueAndCancel { cancel: flag }));
+    let mut events = Vec::new();
+    let o = agent.run(&mut |e| events.push(e)).unwrap();
+
+    assert_eq!(o.stop_reason, "cancelled");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnArbitration { continued: true, .. })),
+        "the decision event still fires (it happened)"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::NoteInjected { deferred: true, .. })),
+        "queued note flushed at run exit as deferred"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::NoteInjected { deferred: false, .. })),
+        "no in-run delivery point was reached"
+    );
+    let done_pos = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Done { .. }))
+        .unwrap();
+    match &events[done_pos] {
+        AgentEvent::Done { stop_reason } => assert_eq!(stop_reason, "cancelled"),
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn turn_arbitration_default_stop_is_zero_drift() {
+    // 钩子在但永远回 Stop（默认实现）：事件流里不得出现 TurnArbitration，
+    // 事件形状与无钩子 run 完全一致——默认路径零漂移是 FR-1 的验收 ①。
+    let cfg = cfg_with(8, 0, 0);
+    let (prov, state) = MockProvider::new(vec![mock::resp_text("done", None)]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("task")],
+        test_ctx(),
+    );
+    agent.set_hooks(Arc::new(CaptureHooks::new()));
+    let mut events = Vec::new();
+    let o = agent.run(&mut |e| events.push(e)).unwrap();
+    assert_eq!(o.stop_reason, "end_turn");
+    assert_eq!(state.captured().len(), 1);
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::TurnArbitration { .. })));
+}
+
+#[test]
+fn turn_arbitration_never_fires_on_subagent_runs() {
+    // 仲裁只属于 top_level run（task 子 agent 继承钩子层仅用于门禁/观察，
+    // run_as_subagent 走 top_level=false——子 run 的收尾是 task 调用的事）。
+    let cfg = cfg_with(8, 0, 0);
+    let (prov, state) = MockProvider::new(vec![mock::resp_text("child done", None)]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("child task")],
+        test_ctx(),
+    );
+    agent.set_hooks(Arc::new(AlwaysContinueArbitration {
+        note: "not for children".into(),
+    }));
+    let mut events = Vec::new();
+    let o = agent.run_impl(&mut |e| events.push(e), false).unwrap();
+    assert_eq!(o.stop_reason, "end_turn");
+    assert_eq!(state.captured().len(), 1, "one request, no forced extra turn");
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::TurnArbitration { .. })));
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::NoteInjected { .. })),
+        "no note ever queued on the child path"
     );
 }

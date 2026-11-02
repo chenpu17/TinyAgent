@@ -379,13 +379,35 @@ pub enum AgentEvent {
         /// The child's own event; recurse to render it.
         event: Box<AgentEvent>,
     },
+    /// A turn-stopping arbitration extended (or capped) the run — see
+    /// [`Hooks::on_turn_stopping`]. Emitted ONLY for non-default hook
+    /// decisions: a run whose hook returns `Stop` (or never overrides the
+    /// method) produces no such event, keeping the default wire shape
+    /// byte-identical. `continued == true` means one more turn follows and
+    /// the note rides the supervisor-note pipeline (a `NoteInjected` event
+    /// with `deferred == false` lands at the next delivery point, before
+    /// that turn's request). `continued == false` means the per-run
+    /// continuation cap was hit: the run ends with
+    /// `stop_reason = "arbitration_capped"` and the note is NOT delivered —
+    /// it survives only here, so the host audit keeps what the hook asked
+    /// for while history stays clean of it.
+    TurnArbitration {
+        /// 1-based number of the turn whose end was arbitrated.
+        turn: u32,
+        /// `true` = continuing with one more turn; `false` = capped, run
+        /// ends (see variant docs).
+        continued: bool,
+        /// The note exactly as the hook returned it (without the history
+        /// marker prefix the delivered block carries).
+        note: String,
+    },
     /// The run ended normally. This is the LAST event of a successful run;
     /// error paths emit no `Done` and surface through the `Result` instead.
     Done {
         /// Why the loop stopped: the provider's own reason for the last turn
         /// (`"end_turn"`, `"max_tokens"`, …), or one of the core-level labels
         /// `"max_turns_reached"`, `"budget_exceeded"`, `"timeout"`,
-        /// `"cancelled"`, `"stuck_loop"`. Matches
+        /// `"cancelled"`, `"stuck_loop"`, `"arbitration_capped"`. Matches
         /// [`RunOutcome::stop_reason`].
         stop_reason: String,
     },
@@ -417,6 +439,7 @@ impl AgentEvent {
             AgentEvent::MaxTokensSalvage => "salvage",
             AgentEvent::Warning(_) => "warning",
             AgentEvent::NoteInjected { .. } => "note_injected",
+            AgentEvent::TurnArbitration { .. } => "turn_arbitration",
             AgentEvent::SubAgent { .. } => "subagent",
             AgentEvent::Done { .. } => "done",
         }
@@ -630,7 +653,9 @@ pub struct RunOutcome {
     /// Why the loop stopped — the same vocabulary as [`AgentEvent::Done`]:
     /// the provider's reason for the final turn (`"end_turn"`, `"max_tokens"`,
     /// …), or a core-level label among `"max_turns_reached"`,
-    /// `"budget_exceeded"`, `"timeout"`, `"cancelled"`, `"stuck_loop"`.
+    /// `"budget_exceeded"`, `"timeout"`, `"cancelled"`, `"stuck_loop"`,
+    /// `"arbitration_capped"` (a turn-stopping hook kept extending the run
+    /// past its continuation cap — see [`Hooks::on_turn_stopping`]).
     pub stop_reason: String,
     /// Every tool call this run executed or refused, in execution order
     /// (parallel batches in completion order).
@@ -878,6 +903,14 @@ const SALVAGE_NUDGE_EMPTY: &str = "Your previous reply produced no visible \
 /// 烧钱的主力（Codex CLI 无打转保护出现过 9 小时压缩死循环）。
 const STUCK_NUDGE_AT: u32 = 3;
 const STUCK_STOP_AT: u32 = 6;
+
+/// 单次 run 内轮末仲裁（[`Hooks::on_turn_stopping`]，宿主集成需求单 FR-1）
+/// `Continue` 决策的上限。对齐 [`STUCK_STOP_AT`] 的计数纪律：仲裁本质也是
+/// 「模型想停、宿主按住不让停」的强制续跑，同一量级的帽防的是同一类失控
+/// （观察者误判 → 无限续跑烧钱）。超限的决策降级为 `Stop`，
+/// `stop_reason = "arbitration_capped"`，note 只保留在 `TurnArbitration`
+/// 事件里，不再入队。
+const TURN_ARBITRATION_CAP: u32 = STUCK_STOP_AT;
 
 /// 纠偏提示（对模型的一次性警告，随第 N 次重复的 tool_result 下发）。
 fn stuck_nudge(n: u32) -> String {
@@ -2126,6 +2159,9 @@ impl Agent {
         // wrap-up turn per run (a salvage turn that ALSO truncates is
         // returned as-is, never salvaged twice).
         let mut salvage_used = false;
+        // 轮末仲裁（FR-1）已兑现的 Continue 计数——上限
+        // [`TURN_ARBITRATION_CAP`]，只在 top_level 的 end_turn 收尾点消耗。
+        let mut arbitrations_used = 0u32;
         let mut final_text = String::new();
         let mut records: Vec<ToolCallRecord> = Vec::new();
         // Compression audit trail — the CompressionRecord twin of `records`:
@@ -2595,7 +2631,10 @@ impl Agent {
                 }
             }
             if !turn_text.is_empty() {
-                final_text = turn_text;
+                // clone 而非 move：轮末仲裁（FR-1）在收尾点还要读本轮文本
+                // 判「完成声称」——final_text 承接的是「最近一个非空轮」，
+                // thinking-only 收尾轮时两者不同，语义必须取本轮。
+                final_text = turn_text.clone();
             }
             // An empty assistant turn (e.g. a content-filtered response that
             // yields zero blocks) must NOT be persisted: an empty assistant
@@ -2737,6 +2776,65 @@ impl Agent {
             }
 
             if !has_tool_use {
+                // 轮末仲裁（宿主集成需求单 FR-1）：仅在 top_level、仅
+                // end_turn、仅在即将收尾的当下。Stop（默认）走原有路径零
+                // 漂移；Continue 复用 R1 旁注管线——note 入队，下轮轮首
+                // `deliver_notes` 以标记块并入尾用户消息（模型当轮可见，
+                // NoteInjected{deferred:false} 回执随投递点发出）；超限降
+                // 级为 `stop_reason = "arbitration_capped"`，note 只留在
+                // TurnArbitration 事件里（收尾语义，不入队不入史）。每次
+                // 非默认决策发一条 TurnArbitration 供宿主审计；默认路径不
+                // 发事件，既有钉子表不漂移。max_tokens 收尾不走这里（上
+                // 面 aborted 分支已接手），stuck_loop / cancel / 预算 / 轮
+                // 帽是强制终止，从不仲裁。
+                if top_level && stop_reason == "end_turn" {
+                    if let Some(h) = &self.ctx.hooks {
+                        let info = crate::hooks::TurnStopInfo {
+                            reply_text: &turn_text,
+                            turn: turns,
+                            continuations_used: arbitrations_used,
+                            continuations_cap: TURN_ARBITRATION_CAP,
+                        };
+                        match h.on_turn_stopping(&info) {
+                            crate::hooks::TurnStopDecision::Stop => {}
+                            crate::hooks::TurnStopDecision::Continue { note } => {
+                                if arbitrations_used >= TURN_ARBITRATION_CAP {
+                                    stop_reason = "arbitration_capped".into();
+                                    events(AgentEvent::TurnArbitration {
+                                        turn: turns,
+                                        continued: false,
+                                        note,
+                                    });
+                                } else {
+                                    arbitrations_used += 1;
+                                    {
+                                        let mut q = self
+                                            .notes
+                                            .lock()
+                                            .unwrap_or_else(|p| p.into_inner());
+                                        q.push_back(note.clone());
+                                    }
+                                    events(AgentEvent::TurnArbitration {
+                                        turn: turns,
+                                        continued: true,
+                                        note,
+                                    });
+                                    // 本轮已真实发生（assistant 消息已入
+                                    // 史）——与所有非 Err 出口一致补一行
+                                    // 轮计时，保持 len() == turns 不变式。
+                                    turn_timings.push(TurnTiming {
+                                        turn: turns,
+                                        duration_ms: ms_since(turn_started),
+                                        tool_calls: records
+                                            .len()
+                                            .saturating_sub(turn_records_at_start),
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
                 turn_timings.push(TurnTiming {
                     turn: turns,
                     duration_ms: ms_since(turn_started),

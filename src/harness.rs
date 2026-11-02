@@ -411,6 +411,11 @@ const EXIT_CANCELLED: i32 = 130;
 fn exit_code_for(stop_reason: &str) -> i32 {
     match stop_reason {
         "end_turn" => 0,
+        // 轮末仲裁的续跑帽（FR-1）：模型确实产出了完整收尾轮，run 本身
+        // 是正常结束——精确语义在 result.json 的 stop_reason 里，脚本要
+        // 区分自行读它；进程退出码按成功算（与 max_turns_reached /
+        // stuck_loop 那类「循环被护栏打断」的 EXIT_ERROR 不同）。
+        "arbitration_capped" => 0,
         "timeout" => EXIT_TIMEOUT,
         "budget_exceeded" => EXIT_BUDGET,
         "cancelled" => EXIT_CANCELLED,
@@ -519,6 +524,21 @@ fn event_json(ev: &AgentEvent) -> Value {
             // full current plan (full-replacement each `todo` call), serialized
             // as-is so a consumer can render its own checklist.
             json!({"type": "todo", "todos": todos})
+        }
+        AgentEvent::TurnArbitration {
+            turn,
+            continued,
+            note,
+        } => {
+            // Turn-stopping arbitration (FR-1): emitted only for non-default
+            // hook decisions. `continued == false` also means the note was
+            // NOT delivered (cap hit) — this event is its only carrier.
+            json!({
+                "type": "turn_arbitration",
+                "turn": *turn,
+                "continued": *continued,
+                "note": note.clone(),
+            })
         }
         AgentEvent::SubAgent { name, event } => {
             json!({

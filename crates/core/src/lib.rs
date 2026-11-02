@@ -83,7 +83,7 @@ pub use context_report::{
     Calibration, ContextBreakdown, MessageKinds, MessagesBreakdown, SystemBreakdown, ToolCategory,
     ToolEntry, ToolsBreakdown,
 };
-pub use hooks::{Hooks, ToolDecision};
+pub use hooks::{Hooks, ToolDecision, TurnStopDecision, TurnStopInfo};
 pub use provider::{
     Block, ChatRequest, ChatResponse, Message, Provider, Role, SimpleChatResponse, ToolDef, Usage,
 };

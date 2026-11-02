@@ -51,6 +51,51 @@ pub enum ToolDecision {
     Modify(Value),
 }
 
+/// What a [`Hooks::on_turn_stopping`] arbitration decides for a run the
+/// model is about to end with its own `end_turn`.
+///
+/// Producer-side enum (third parties CONSTRUCT it, the core consumes) —
+/// deliberately **not** `#[non_exhaustive]` (same hygiene rule as
+/// [`ToolDecision`]): constructors must not be forced into wildcard arms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnStopDecision {
+    /// Let the run end exactly as it would have without the hook (the
+    /// default — an implementation that never overrides
+    /// `on_turn_stopping` leaves every run byte-identical).
+    Stop,
+    /// Reject this completion and force one more turn. `note` is queued
+    /// through the supervisor-note delivery pipeline (the same marked block,
+    /// FIFO, at-most-once, panic-safe machinery as
+    /// [`crate::Agent::supervisor_handle`]) and reaches the model before the
+    /// next request. Continuations are capped per run — see
+    /// [`TurnStopInfo::continuations_cap`]; past the cap the decision
+    /// degrades to `Stop` with `stop_reason = "arbitration_capped"`.
+    Continue {
+        /// Text merged into the tail user turn as a marked block for the
+        /// model (why the completion was rejected / what to do next).
+        note: String,
+    },
+}
+
+/// The context one turn-stopping arbitration sees. Core-constructed,
+/// hook-read — an implementation never constructs it.
+pub struct TurnStopInfo<'a> {
+    /// The text blocks of the turn that is ending the run, joined with
+    /// newlines — the completion claim being judged. Empty when the final
+    /// turn carried no visible text (e.g. a thinking-only reply).
+    pub reply_text: &'a str,
+    /// 1-based number of the turn about to end the run.
+    pub turn: u32,
+    /// How many `Continue` decisions this run has already honored (the
+    /// decision currently being made is number `continuations_used + 1`).
+    pub continuations_used: u32,
+    /// The per-run cap on `Continue` decisions — a `Continue` past it is
+    /// downgraded to `Stop` and the run ends with
+    /// `stop_reason = "arbitration_capped"`. Aligned with the stuck-loop
+    /// counter discipline (same value as the private `STUCK_STOP_AT`, 6).
+    pub continuations_cap: u32,
+}
+
 /// Third-party interception points into the agent loop. All methods default
 /// to no-ops, so an implementation overrides only what it needs. The layer is
 /// installed per agent via [`crate::Agent::set_hooks`]; `task` sub-agents
@@ -179,5 +224,58 @@ pub trait Hooks: Send + Sync {
     /// is already committed by the time the observer returns).
     fn on_chat_request(&self, req: &ChatRequest) {
         let _ = req;
+    }
+
+    /// Turn-end arbitration (the host RSI contract): called each time the
+    /// TOP-LEVEL run is about to end because the model's last turn finished
+    /// with its own `end_turn` — the one stop a host may veto in the
+    /// moment, turning "the model claims done" into "one more turn with
+    /// this note". Every other exit is a forced termination and never
+    /// consults this hook: `max_tokens` (incl. the salvage path),
+    /// `stuck_loop`, cancel, `budget_exceeded`, `max_turns_reached`,
+    /// timeouts, and every `Err` return.
+    ///
+    /// Semantics, read before implementing:
+    /// - **Default `Stop` = zero drift.** A run whose hook returns `Stop`
+    ///   (or never overrides this method) is byte-identical to a run
+    ///   without the hook — same history, same events, same stop_reason.
+    ///   The [`crate::AgentEvent::TurnArbitration`] audit event is emitted
+    ///   only for non-default decisions (a `Continue` honored, or one
+    ///   downgraded at the cap), so pipelines that don't opt in see nothing.
+    /// - **`Continue` reuses the supervisor-note pipeline** (R1): the note
+    ///   is queued and delivered as a marked block into the tail user turn
+    ///   right before the NEXT request — the model sees it there; a
+    ///   `NoteInjected` event with `deferred == false` follows at that
+    ///   delivery point. If the run dies before the next request (e.g. a
+    ///   cancel landing in the window), the queued note is flushed at run
+    ///   exit as `deferred == true` — late, never lost (the R1 contract).
+    /// - **Cap.** At most [`TurnStopInfo::continuations_cap`] `Continue`
+    ///   decisions per run; past it the decision is downgraded to `Stop`,
+    ///   `stop_reason` becomes `"arbitration_capped"` (a core-level label),
+    ///   and the note survives only in the `TurnArbitration` event — the
+    ///   run ends cleanly, history untouched by the discarded note.
+    /// - **Scope.** Top-level runs only: a `task` sub-agent inherits this
+    ///   layer for gating/observation, but its run never arbitrates — a
+    ///   child's completion is the `task` call's concern, and the
+    ///   serial/no-delegation turn-stopping shape is a property of the
+    ///   observed run, not of every nested one.
+    /// - **Cancel still wins.** A cancel flagged during (or after) a
+    ///   `Continue` lands at the next loop-top check — the continuation
+    ///   never sends a request past it, `stop_reason = "cancelled"`.
+    /// - **Ordering vs compression.** Arbitration happens after the final
+    ///   turn's messages are persisted (the turn's message face is
+    ///   settled); the injected note is delivered at the next turn top,
+    ///   before that turn's preflight compression — so the note's bytes
+    ///   are counted by the token precheck like any tail content.
+    /// - **Errors fail safe.** On any internal error return `Stop`, not a
+    ///   panic: a panicking hook is not caught anywhere (same discipline as
+    ///   the other hooks — see *Edges*) and would unwind `Agent::run`
+    ///   instead of ending the run cleanly.
+    /// - An agent rebuilt from `--resume` does NOT carry hooks over (see
+    ///   *Edges*), so a resumed run arbitrates only after the host re-runs
+    ///   `set_hooks`.
+    fn on_turn_stopping(&self, info: &TurnStopInfo) -> TurnStopDecision {
+        let _ = info;
+        TurnStopDecision::Stop
     }
 }
