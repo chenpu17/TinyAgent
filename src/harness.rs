@@ -481,6 +481,7 @@ fn event_json(ev: &AgentEvent) -> Value {
         }
         AgentEvent::Compressed {
             dropped,
+            folded_ids,
             kept,
             trigger,
             estimated_tokens_before,
@@ -492,10 +493,13 @@ fn event_json(ev: &AgentEvent) -> Value {
             let how = trigger.as_str();
             // Additive fields: existing consumers of dropped/kept are
             // unaffected. `measured_tokens_before` is null when the run had
-            // no valid usage anchor at fold time.
+            // no valid usage anchor at fold time. `folded_ids` (FR-6) keys
+            // "what did this summary replace" to the archived originals by
+            // id — additive key, position-counting consumers unaffected.
             json!({
                 "type": "compressed",
                 "dropped": *dropped,
+                "folded_ids": folded_ids.clone(),
                 "kept": *kept,
                 "trigger": how,
                 "estimated_tokens_before": estimated_tokens_before,

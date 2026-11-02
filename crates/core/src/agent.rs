@@ -65,13 +65,19 @@ impl CompressTrigger {
 /// What a compression pass reports to its caller. Public shape for the
 /// host-initiated [`Agent::compact`]; the run loop consumes the same struct
 /// internally (billing + the `CompressionRecord` audit entry).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct CompressOutcome {
     /// Middle messages folded into the summary (`cut - 1`). `0` together with
     /// `usage: Some(_)` marks the degenerate pass: the summary call ran (and
     /// billed) but its text was empty/unusable, so nothing was folded and
     /// compression is disabled for the rest of the run (a `Warning` said why).
     pub dropped: usize,
+    /// The message ids of exactly those `dropped` middle messages — the
+    /// originals that moved to the session archive (FR-6). A host UI/export
+    /// can key "what did this summary replace" by id instead of counting
+    /// positions; empty when `dropped == 0`. Copy was dropped from this
+    /// struct to carry them — 0.x breaking-window change, see CHANGELOG.
+    pub folded_ids: Vec<String>,
     /// History length after the fold (`messages().len()` at the event).
     pub kept: usize,
     /// Usage billed by the summary call(s); `None` = provider reported none.
@@ -109,6 +115,12 @@ pub struct CompressionRecord {
     /// Middle messages folded into the summary; `0` marks the degenerate pass,
     /// which callers filter out before recording (so in practice `>= 1`).
     pub dropped: usize,
+    /// The message ids of exactly those `dropped` middle messages — the
+    /// originals that moved to the session archive (FR-6). A host UI/export
+    /// keys "what did this summary replace" by id, byte-stable across
+    /// save/load (folding never renumbers survivors, and the archive keeps
+    /// the originals' ids verbatim).
+    pub folded_ids: Vec<String>,
     /// History length after the fold (live messages only — the archive does
     /// not count).
     pub kept: usize,
@@ -132,6 +144,7 @@ impl CompressionRecord {
         CompressionRecord {
             trigger: trigger.as_str().to_string(),
             dropped: o.dropped,
+            folded_ids: o.folded_ids.clone(),
             kept: o.kept,
             estimated_tokens_before: o.estimated_tokens_before,
             estimated_tokens_after: o.estimated_tokens_after,
@@ -302,6 +315,11 @@ pub enum AgentEvent {
         /// Middle messages folded into the summary (`0` = degenerate pass —
         /// see [`CompressOutcome::dropped`]).
         dropped: usize,
+        /// The message ids of exactly those `dropped` middle messages — the
+        /// originals now in the session archive (FR-6). Key a host UI's
+        /// "what did this summary replace" by id instead of counting
+        /// positions; empty when `dropped == 0`.
+        folded_ids: Vec<String>,
         /// Live history length after the fold.
         kept: usize,
         /// Which detection path fired.
@@ -4144,6 +4162,7 @@ impl Agent {
                 // emits no event and is recorded by no caller (dropped == 0).
                 return Ok(Some(CompressOutcome {
                     dropped: 0,
+                    folded_ids: Vec::new(),
                     kept: self.messages.len(),
                     estimated_tokens_before,
                     estimated_tokens_after: estimated_tokens_before,
@@ -4162,6 +4181,10 @@ impl Agent {
         // The dropped middle's ORIGINALS move to the session archive (the
         // head stays live in folded form, the tail verbatim).
         let dropped_middle: Vec<Message> = self.messages[1..cut].to_vec();
+        // FR-6: snapshot the originals' ids BEFORE the move — these locate
+        // the archive entries ("what did this summary replace") for the
+        // event / audit record / host UI.
+        let folded_ids: Vec<String> = dropped_middle.iter().filter_map(|m| m.id.clone()).collect();
         self.archive_messages(dropped_middle);
         self.messages = compress::fold_summary(&self.messages, cut, &summary);
         let estimated_tokens_after =
@@ -4179,6 +4202,7 @@ impl Agent {
         }
         events(AgentEvent::Compressed {
             dropped,
+            folded_ids: folded_ids.clone(),
             kept: self.messages.len(),
             trigger,
             estimated_tokens_before,
@@ -4192,6 +4216,7 @@ impl Agent {
         // it here would silently vanish at the next run entry).
         Ok(Some(CompressOutcome {
             dropped,
+            folded_ids,
             kept: self.messages.len(),
             estimated_tokens_before,
             estimated_tokens_after,

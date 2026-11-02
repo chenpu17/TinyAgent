@@ -4953,6 +4953,7 @@ fn compress_records_anchor_backed_measured_tokens() {
         .filter_map(|e| match e {
             AgentEvent::Compressed {
                 dropped,
+                folded_ids: _,
                 kept,
                 trigger,
                 estimated_tokens_before,
@@ -5086,6 +5087,7 @@ fn compress_reports_none_measured_after_anchor_voiding_prune() {
             estimated_tokens_before,
             estimated_tokens_after,
             measured_tokens_before,
+            ..
         } = e
         {
             assert!(matches!(trigger, CompressTrigger::Preflight));
@@ -9186,6 +9188,7 @@ fn every_agent_event_has_a_stable_ndjson_type_tag() {
         (
             AgentEvent::Compressed {
                 dropped: 0,
+                folded_ids: Vec::new(),
                 kept: 0,
                 trigger: CompressTrigger::Preflight,
                 estimated_tokens_before: 0,
@@ -10929,4 +10932,173 @@ fn mock_provider_exports_no_gateway_fixes() {
     );
     let o = agent.run(&mut |_| {}).unwrap();
     assert_eq!(o.gateway_fixes, crate::provider::GatewayFixes::default());
+}
+
+// ── FR-6：折叠 id 范围 + 会话重建一致性钉子 ──────────────────────────────
+
+#[test]
+fn folded_ids_identify_the_archived_originals() {
+    // CompressOutcome / Compressed / CompressionRecord 三面的 folded_ids
+    // 同源同值：恰为被折叠中段消息的 id，且这些 id 能在 session 归档里
+    // 找到原文（「这段被摘要了什么」按 id 定位，不靠数数对位）。
+    let mut cfg = cfg_with(5, 0, 0);
+    cfg.limits.keep_recent_messages = 2;
+    let initial = vec![
+        user_text("task"),
+        Message::assistant(vec![Block::Text("a1".into())]),
+        user_text("u1"),
+        Message::assistant(vec![Block::Text("a2".into())]),
+        user_text("u2"),
+    ];
+    let (prov, _state) = MockProvider::new(vec![mock::resp_text("SUMMARY", None)]);
+    let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+    let mut events = Vec::new();
+    let o = agent
+        .compact(&mut |e| events.push(e))
+        .unwrap()
+        .expect("folds");
+    assert_eq!(o.dropped, 2);
+    // 入库顺序铸 id：task→m1, a1→m2, u1→m3, a2→m4, u2→m5；中段 [1..cut]
+    // = a1,u1 → ["m2","m3"]。
+    assert_eq!(o.folded_ids, vec!["m2".to_string(), "m3".to_string()]);
+    let ev = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::Compressed { folded_ids, .. } => Some(folded_ids.clone()),
+            _ => None,
+        })
+        .expect("Compressed event");
+    assert_eq!(ev, o.folded_ids, "event carries the same ids");
+    let rec = agent
+        .session_archive
+        .iter()
+        .filter_map(|m| m.id.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        rec.iter().all(|id| o.folded_ids.contains(id)),
+        "archive holds exactly the folded originals: {rec:?} vs {:?}",
+        o.folded_ids
+    );
+    // 存活的 m1（折叠头）与 m4/m5（尾段）不在 folded_ids 里。
+    let live_ids: Vec<String> = agent
+        .messages()
+        .iter()
+        .filter_map(|m| m.id.clone())
+        .collect();
+    assert!(live_ids.contains(&"m1".to_string()));
+    assert!(live_ids.contains(&"m4".to_string()));
+    assert!(live_ids.contains(&"m5".to_string()));
+}
+
+/// 重建一致性钉子（FR-6，dsh「model-visible means logged」纪律的固化）：
+/// 从 session 文件 + 归档重建的消息面，必须与实际发给模型的消息面逐 id
+/// 相等。三类会话各钉一遍：未折叠（纯 run）、折叠（manual compact）、
+/// 退化折叠（dropped=0，历史不变）。
+#[test]
+fn session_rebuild_reproduces_the_model_visible_face_id_by_id() {
+    fn snapshot(agent: &Agent) -> Vec<(Option<String>, crate::provider::Role)> {
+        agent
+            .messages()
+            .iter()
+            .map(|m| (m.id.clone(), m.role))
+            .collect()
+    }
+    fn rebuild(
+        cfg: &Config,
+        path: &std::path::Path,
+    ) -> (
+        Vec<(Option<String>, crate::provider::Role)>,
+        Vec<Option<String>>,
+    ) {
+        let (model, live, archive) = crate::session::load_with_archive(path)
+            .unwrap()
+            .expect("session written");
+        let _ = model;
+        let (prov, _s) = MockProvider::new(vec![]);
+        let mut resumed = Agent::new(cfg, Box::new(prov), vec![], live, test_ctx());
+        resumed.set_session_archive(archive.clone());
+        (
+            snapshot(&resumed),
+            resumed
+                .session_archive
+                .iter()
+                .map(|m| m.id.clone())
+                .collect(),
+        )
+    }
+    fn dir_for(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("ta-rebuild-pin-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+    let initial = || {
+        vec![
+            user_text("task"),
+            Message::assistant(vec![Block::Text("a1".into())]),
+            user_text("u1"),
+            Message::assistant(vec![Block::Text("a2".into())]),
+            user_text("u2"),
+        ]
+    };
+    let mut cfg = cfg_with(5, 0, 0);
+    cfg.limits.keep_recent_messages = 2;
+
+    // ① 未折叠：纯 run，历史 = 初始 + 助手收尾轮。
+    let dir = dir_for("plain");
+    let path = dir.join("s.json");
+    let (prov, _) = MockProvider::new(vec![mock::resp_text("final", None)]);
+    let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial(), test_ctx());
+    agent.enable_session(path.clone());
+    agent.run(&mut |_| {}).unwrap();
+    let face = snapshot(&agent);
+    let (rebuilt, rebuilt_archive) = rebuild(&cfg, &path);
+    assert_eq!(rebuilt, face, "plain run: rebuild == live face, id by id");
+    assert!(rebuilt_archive
+        .iter()
+        .all(|id| id.is_none() || face.iter().any(|(fid, _)| fid == id)));
+    std::fs::remove_dir_all(&dir).ok();
+
+    // ② 折叠：manual compact，中段进归档，面 = 折叠头 + 尾段。
+    let dir = dir_for("folded");
+    let path = dir.join("s.json");
+    let (prov, _) = MockProvider::new(vec![mock::resp_text("SUMMARY", None)]);
+    let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial(), test_ctx());
+    agent.enable_session(path.clone());
+    let o = agent.compact(&mut |_| {}).unwrap().expect("folds");
+    assert_eq!(o.dropped, 2);
+    let face = snapshot(&agent);
+    let (rebuilt, rebuilt_archive) = rebuild(&cfg, &path);
+    assert_eq!(rebuilt, face, "folded run: rebuild == live face, id by id");
+    let archive_ids: Vec<Option<String>> =
+        agent.session_archive.iter().map(|m| m.id.clone()).collect();
+    assert_eq!(rebuilt_archive, archive_ids, "archive ids survive verbatim");
+    std::fs::remove_dir_all(&dir).ok();
+
+    // ③ 退化折叠：空摘要 → dropped=0，历史不变（压不下去也必须对得上）。
+    let dir = dir_for("degenerate");
+    let path = dir.join("s.json");
+    let (prov, _) = MockProvider::new(vec![MockTurn::Ok(ChatResponse {
+        blocks: vec![],
+        stop_reason: "end_turn".into(),
+        usage: mock::mk_usage(10, 5),
+    })]);
+    let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial(), test_ctx());
+    agent.enable_session(path.clone());
+    let o = agent
+        .compact(&mut |_| {})
+        .unwrap()
+        .expect("degenerate pass");
+    assert_eq!(o.dropped, 0);
+    assert!(o.folded_ids.is_empty(), "nothing folded, no ids");
+    // 退化路径不落盘（历史未变，save 在 fold 之后）——推一条用户消息
+    // 走既有 save_session 纪律，落出的文件必须与改后历史面逐 id 一致。
+    let warn = agent.push_user(vec![Block::Text("next".into())]);
+    assert!(warn.is_none(), "session save failed: {warn:?}");
+    let face = snapshot(&agent);
+    let (rebuilt, _archive) = rebuild(&cfg, &path);
+    assert_eq!(
+        rebuilt, face,
+        "degenerate fold: rebuild == live face, id by id"
+    );
+    std::fs::remove_dir_all(&dir).ok();
 }
