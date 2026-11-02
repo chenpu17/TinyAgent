@@ -2288,4 +2288,23 @@ mod tests {
             "no tag residue in the reply channel"
         );
     }
+
+    #[test]
+    fn knob_setter_copies_the_config_value_verbatim() {
+        // 外审返工补钉：`with_strip_think_tags` 是 FR-2 的唯一生产布线点
+        // （provider::build）的末端——取反/接反会让默认行为整体翻转而单元
+        // 测试全绿（它们直接给 parse_loop 传参，绕过 setter）。preset 面
+        // 的 build 布线由 provider::tests::build_wires_the_config_knobs 钉。
+        let o = OpenAi::new(
+            reqwest::blocking::Client::new(),
+            "http://127.0.0.1:9/v1".into(),
+            "k",
+            std::time::Duration::from_secs(30),
+        );
+        assert!(o.strip_think_tags, "default is on");
+        let o = o.with_strip_think_tags(false);
+        assert!(!o.strip_think_tags);
+        let o = o.with_strip_think_tags(true);
+        assert!(o.strip_think_tags);
+    }
 }

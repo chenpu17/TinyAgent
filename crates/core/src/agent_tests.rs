@@ -11159,3 +11159,266 @@ fn turn_arbitration_degrades_when_no_turn_budget_left() {
         _ => unreachable!(),
     }
 }
+
+// ── 外审返工补钉（FR-1 时序/契约面，收编自独立审核探针）─────────────────
+
+#[test]
+fn note_enters_history_before_preflight_compression() {
+    // 验收⑤的直测：Continue 的 note 在下一轮轮首、先于 preflight 压缩入史
+    // ——压缩 summary 请求（第 2 次 chat 调用）的转写里已含标记块（note
+    // 字节计入 token 预检）；事件次序 NoteInjected < Compressed。没有这根
+    // 钉子，deliver_notes 与 compress 的顺序重排不会红。
+    let mut cfg = cfg_with(8, 0, 0);
+    cfg.limits.compress_threshold_chars = 1;
+    cfg.limits.keep_recent_messages = 0; // 3 条历史也允许切（cut=n=3）
+    let (prov, state) = MockProvider::new(vec![
+        mock::resp_text("t0 body that is long enough to matter", None),
+        // 第二个 chat 调用 = preflight 压缩的 summary 请求。
+        mock::resp_text("fold summary", None),
+        mock::resp_text("t1 final", None),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("task")],
+        test_ctx(),
+    );
+    agent.set_hooks(Arc::new(ContinueNArbitration {
+        remaining: std::sync::atomic::AtomicU32::new(1),
+        note: "check the tests first".into(),
+    }));
+    let mut events = Vec::new();
+    let o = agent.run(&mut |e| events.push(e)).unwrap();
+    assert_eq!(o.stop_reason, "end_turn");
+    let cap = state.captured();
+    assert!(
+        cap.len() >= 3,
+        "turn request + compression summary + next turn request"
+    );
+    assert!(
+        cap[0].cache,
+        "first chat call is the turn-1 request (cache:true)"
+    );
+    assert!(
+        !cap[1].cache,
+        "second chat call is the compression summary (cache:false)"
+    );
+    assert!(
+        cap[1]
+            .user_texts
+            .iter()
+            .any(|t| t.contains(SUPERVISOR_NOTE_MARKER) && t.contains("check the tests first")),
+        "the arbitrated note is already in history when the compression summary is built"
+    );
+    let note_pos = events
+        .iter()
+        .position(|e| {
+            matches!(
+                e,
+                AgentEvent::NoteInjected {
+                    deferred: false,
+                    ..
+                }
+            )
+        })
+        .expect("note delivered");
+    let comp_pos = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Compressed { .. }))
+        .expect("preflight compression fired");
+    assert!(
+        note_pos < comp_pos,
+        "note enters history BEFORE compression"
+    );
+}
+
+#[test]
+fn budget_guard_inside_continuation_window_flushes_note_deferred() {
+    // 竞态类守卫（预算）在续跑窗口内落下：决策已兑现（continued:true）、
+    // 下一轮轮首 budget_exceeded 截断、note 走出口漏斗 deferred 冲账入史
+    // （宁晚不丢、不重复投递）。
+    let mut cfg = cfg_with(8, 0, 0);
+    cfg.limits.max_total_tokens = 1000;
+    let (prov, _state) = MockProvider::new(vec![mock::resp_text(
+        "claimed done",
+        mock::mk_usage(1500, 10),
+    )]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("task")],
+        test_ctx(),
+    );
+    agent.set_hooks(Arc::new(AlwaysContinueArbitration {
+        note: "one more".into(),
+    }));
+    let mut events = Vec::new();
+    let o = agent.run(&mut |e| events.push(e)).unwrap();
+    assert_eq!(o.stop_reason, "budget_exceeded");
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::TurnArbitration {
+            continued: true,
+            ..
+        }
+    )));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::NoteInjected { deferred: true, .. })),
+        "queued note flushed at run exit as deferred"
+    );
+    assert!(!events.iter().any(|e| matches!(
+        e,
+        AgentEvent::NoteInjected {
+            deferred: false,
+            ..
+        }
+    )));
+    // 冲账真实入史：尾用户消息带标记块 + note 原文。
+    let tail = agent.messages().last().unwrap();
+    assert_eq!(tail.role, Role::User);
+    assert!(tail.content.iter().any(|b| matches!(b, Block::Text(t)
+        if t.starts_with(SUPERVISOR_NOTE_MARKER) && t.ends_with("one more"))));
+}
+
+#[test]
+fn panic_in_arbitration_hook_unwinds_run_per_contract() {
+    // 契约如实性：panic 钩子不被核心吞掉——按 trait *Edges* 文档原样穿过
+    // Agent::run 向上展开（fail-safe 靠实现者返回 Stop / 不 panic，核心无
+    // 防护）。panic 点在 assistant 消息入史之后：本轮已持久化，无半途撕裂。
+    let (prov, _s) = MockProvider::new(vec![mock::resp_text("claimed done", None)]);
+    let mut agent = Agent::new(
+        &cfg_with(8, 0, 0),
+        Box::new(prov),
+        vec![],
+        vec![user_text("task")],
+        test_ctx(),
+    );
+    agent.set_hooks(Arc::new(PanickingArbitration));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| agent.run(&mut |_| {})));
+    assert!(
+        result.is_err(),
+        "panicking hook must unwind, not be swallowed"
+    );
+    assert!(agent.messages().iter().any(|m| m.role == Role::Assistant
+        && m.content
+            .iter()
+            .any(|b| matches!(b, Block::Text(t) if t == "claimed done"))));
+}
+
+struct PanickingArbitration;
+impl Hooks for PanickingArbitration {
+    fn on_turn_stopping(&self, _info: &TurnStopInfo) -> TurnStopDecision {
+        panic!("hook exploded");
+    }
+}
+
+#[test]
+fn turn_stop_info_reports_the_ending_turn_and_cap_alignment() {
+    // TurnStopInfo 四字段语义：reply_text 是「正在收尾这一轮」的文本（不
+    // 是全程 final_text；有块无可见文本的收尾轮为空串）；continuations_used
+    // 是已兑现数（不含本次）；cap 恒 6 = STUCK_STOP_AT；final_text 始终是
+    // 最后一个非空轮，仲裁全程不改写它。
+    let blank = MockTurn::Ok(ChatResponse {
+        blocks: vec![Block::Text(String::new())],
+        stop_reason: "end_turn".into(),
+        usage: None,
+    });
+    let (prov, state) = MockProvider::new(vec![
+        mock::resp_text("first answer", None),
+        blank,
+        mock::resp_text("third", None),
+    ]);
+    let hook = Arc::new(RecordingArbitration::default());
+    let mut agent = Agent::new(
+        &cfg_with(8, 0, 0),
+        Box::new(prov),
+        vec![],
+        vec![user_text("task")],
+        test_ctx(),
+    );
+    agent.set_hooks(hook.clone());
+    let mut events = Vec::new();
+    let o = agent.run(&mut |e| events.push(e)).unwrap();
+    let seen = hook.seen.lock().unwrap().clone();
+    assert_eq!(
+        seen,
+        vec![
+            ("first answer".to_string(), 1, 0, 6),
+            (String::new(), 2, 1, 6),
+            ("third".to_string(), 3, 2, 6),
+        ],
+        "reply_text = ending turn's text; used = previously honored; cap = 6"
+    );
+    assert_eq!(
+        o.final_text, "third",
+        "arbitration must not rewrite final_text"
+    );
+    assert_eq!(o.stop_reason, "end_turn");
+    assert_eq!(o.turns, 3);
+    // 两条 note 都在第 3 轮请求前入史。
+    let cap = state.captured();
+    assert_eq!(cap.len(), 3);
+    let marked = cap[2]
+        .user_texts
+        .iter()
+        .filter(|t| t.starts_with(SUPERVISOR_NOTE_MARKER))
+        .count();
+    assert_eq!(marked, 2, "both notes delivered before turn 3");
+}
+
+/// 记录每次仲裁所见、前两次 Continue、之后 Stop（配合三条 mock 响应）。
+#[derive(Default)]
+struct RecordingArbitration {
+    calls: std::sync::atomic::AtomicU32,
+    seen: std::sync::Mutex<Vec<(String, u32, u32, u32)>>,
+}
+impl Hooks for RecordingArbitration {
+    fn on_turn_stopping(&self, info: &TurnStopInfo) -> TurnStopDecision {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        self.seen.lock().unwrap().push((
+            info.reply_text.to_string(),
+            info.turn,
+            info.continuations_used,
+            info.continuations_cap,
+        ));
+        if n < 2 {
+            TurnStopDecision::Continue {
+                note: format!("go{n}"),
+            }
+        } else {
+            TurnStopDecision::Stop
+        }
+    }
+}
+
+#[test]
+fn zero_block_final_turn_never_consults_arbitration() {
+    // 零块收尾轮（内容过滤吞回复 / thinking-only）：没有可判的完成声称
+    // ——钩子绝不触发、无 TurnArbitration 事件、正常 end_turn 收尾。
+    let (prov, _s) = MockProvider::new(vec![MockTurn::Ok(ChatResponse {
+        blocks: vec![],
+        stop_reason: "end_turn".into(),
+        usage: None,
+    })]);
+    let mut agent = Agent::new(
+        &cfg_with(8, 0, 0),
+        Box::new(prov),
+        vec![],
+        vec![user_text("task")],
+        test_ctx(),
+    );
+    agent.set_hooks(Arc::new(AlwaysContinueArbitration {
+        note: "should not fire".into(),
+    }));
+    let mut events = Vec::new();
+    let o = agent.run(&mut |e| events.push(e)).unwrap();
+    assert_eq!(o.stop_reason, "end_turn");
+    assert_eq!(o.turns, 1);
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::TurnArbitration { .. })));
+}

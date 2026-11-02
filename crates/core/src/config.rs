@@ -3024,4 +3024,154 @@ mod tests {
             serde_json::from_str(r#"{"no_stream_options":true}"#).unwrap();
         assert!(ok.no_stream_options);
     }
+
+    #[test]
+    fn fingerprint_field_completeness_sweep() {
+        // 外审返工补钉（FR-4）：逐字段扫描——每个 harness 形状字段变异后
+        // 指纹必须移动，task/workdir 必须不动。堵「新增字段忘了进指纹」
+        // 这类静默台账失真：新增 Config/Limits/CodeConfig 字段时本测试会
+        // 编译期提醒（字段删改）+ 运行期兜底（新字段若漏进指纹，需在此
+        // 补一行变异并同步 fingerprint() 本体）。
+        let mk = || -> Config {
+            serde_json::from_str::<Config>(r#"{"provider":"openai","api_key_env":"K","model":"m"}"#)
+                .unwrap()
+        };
+        let base = mk().fingerprint();
+
+        // ── 顶层 harness 形状字段 ──
+        let mut c = mk();
+        c.base_url = Some("http://gw.example/v1".into());
+        assert_ne!(c.fingerprint(), base, "base_url must move fp");
+        let mut c = mk();
+        c.api_key_env = "OTHER".into();
+        assert_ne!(c.fingerprint(), base, "api_key_env must move fp");
+        let mut c = mk();
+        c.model = "other".into();
+        assert_ne!(c.fingerprint(), base, "model must move fp");
+        let mut c = mk();
+        c.max_tokens = 99;
+        assert_ne!(c.fingerprint(), base, "max_tokens must move fp");
+        let mut c = mk();
+        c.system_prompt = Some("be brief".into());
+        assert_ne!(c.fingerprint(), base, "system_prompt must move fp");
+        let mut c = mk();
+        c.tools = vec!["read_file".into()];
+        assert_ne!(c.fingerprint(), base, "tools must move fp");
+        let mut c = mk();
+        c.restrict_to_workdir = true;
+        assert_ne!(c.fingerprint(), base, "restrict_to_workdir must move fp");
+        let mut c = mk();
+        c.inject_environment = false;
+        assert_ne!(c.fingerprint(), base, "inject_environment must move fp");
+        let mut c = mk();
+        c.salvage_on_max_tokens = false;
+        assert_ne!(c.fingerprint(), base, "salvage_on_max_tokens must move fp");
+        let mut c = mk();
+        c.mcp_servers.push(
+            serde_json::from_str::<McpServerConfig>(r#"{"name":"s","command":"x"}"#).unwrap(),
+        );
+        assert_ne!(c.fingerprint(), base, "mcp_servers must move fp");
+        let mut c = mk();
+        c.reasoning_effort = Some("high".into());
+        assert_ne!(c.fingerprint(), base, "reasoning_effort must move fp");
+        let mut c = mk();
+        c.tool_absent_notes = vec![("nope".into(), "gone".into())];
+        assert_ne!(c.fingerprint(), base, "tool_absent_notes must move fp");
+        let mut c = mk();
+        c.gateway_fixes_preset = Some(crate::provider::GatewayFixes {
+            no_reasoning_effort: true,
+            ..Default::default()
+        });
+        assert_ne!(c.fingerprint(), base, "gateway_fixes_preset must move fp");
+        let mut c = mk();
+        c.strip_think_tags = false;
+        assert_ne!(c.fingerprint(), base, "strip_think_tags must move fp");
+        // provider / code.skill_injection 经解析面变异（枚举不在根部）。
+        let c: Config =
+            serde_json::from_str(r#"{"provider":"anthropic","api_key_env":"K","model":"m"}"#)
+                .unwrap();
+        assert_ne!(c.fingerprint(), base, "provider must move fp");
+        let c: Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"K","model":"m",
+                "code":{"skill_injection":"off"}}"#,
+        )
+        .unwrap();
+        assert_ne!(c.fingerprint(), base, "code.skill_injection must move fp");
+
+        // ── 运行输入，必须不动 ──
+        let mut c = mk();
+        c.task = Some("other task".into());
+        assert_eq!(c.fingerprint(), base, "task must NOT move fp");
+        let mut c = mk();
+        c.workdir = Some(std::path::PathBuf::from("."));
+        assert_eq!(c.fingerprint(), base, "workdir must NOT move fp");
+
+        // ── Limits 全部 10 个字段 ──
+        macro_rules! lim {
+            ($field:ident, $val:expr) => {{
+                let mut c = mk();
+                c.limits.$field = $val;
+                assert_ne!(
+                    c.fingerprint(),
+                    base,
+                    concat!("limits.", stringify!($field), " must move fp")
+                );
+            }};
+        }
+        lim!(max_turns, 3);
+        lim!(timeout_secs, 99);
+        lim!(max_output_chars, 99);
+        lim!(compress_threshold_chars, 123456);
+        lim!(keep_recent_messages, 4);
+        lim!(max_context_tokens, 1000);
+        lim!(max_total_tokens, 1000);
+        lim!(stream_idle_secs, 77);
+        lim!(shell_timeout_secs, 99);
+        lim!(subagent_max_turns, 7);
+
+        // ── CodeConfig 全部字段 ──
+        macro_rules! code {
+            ($field:ident, $val:expr) => {{
+                let mut c = mk();
+                c.code.$field = $val;
+                assert_ne!(
+                    c.fingerprint(),
+                    base,
+                    concat!("code.", stringify!($field), " must move fp")
+                );
+            }};
+        }
+        code!(enabled, true);
+        code!(deny_paths, vec!["x".into()]);
+        code!(fs_write_dirs, vec!["y".into()]);
+        code!(max_tool_calls, 3);
+        code!(mem_mb, 1);
+        code!(timeout_secs, 5);
+        code!(fuel, 1);
+        code!(max_result_chars, 1);
+        code!(precheck, true);
+        code!(include, true);
+        code!(call_batch, true);
+        let mut c = mk();
+        c.code.llm.enabled = true;
+        c.code.llm.default_model = Some("inner".into());
+        c.code.llm.models = vec!["inner".into()];
+        assert_ne!(c.fingerprint(), base, "code.llm must move fp");
+
+        // ── 声明序语义钉子 ──
+        let mk_pair = |a_first: bool| -> Config {
+            let a: McpServerConfig =
+                serde_json::from_str(r#"{"name":"a","command":"xa"}"#).unwrap();
+            let b: McpServerConfig =
+                serde_json::from_str(r#"{"name":"b","command":"xb"}"#).unwrap();
+            let mut c = mk();
+            c.mcp_servers = if a_first { vec![a, b] } else { vec![b, a] };
+            c
+        };
+        assert_ne!(
+            mk_pair(true).fingerprint(),
+            mk_pair(false).fingerprint(),
+            "mcp_servers declared order IS harness topology (documented)"
+        );
+    }
 }

@@ -25,7 +25,7 @@
 需求单全部验收通过，另有四个**定版语义**需要贵侧实现时知晓：
 
 1. **事件只发非默认决策**（对「每次仲裁无论结果发一条事件」的通道读法）：Rust trait 无法区分「未覆盖的默认 Stop」与「显式 Stop」，且验收①要求默认路径零漂移——故 `TurnArbitration` 事件仅在 `Continue` 被兑现或被降级时发出；显式 `Stop` 与无钩子 run 逐字节一致（事件流/历史/stop_reason 均不变）。trait 文档已如实写明，建议需求单后续修订时对齐。
-2. **确定性守卫在决策点预检**：续跑帽（6，`TurnStopInfo::continuations_cap`）耗尽、或 `turns` 已到 `max_turns`（下一轮根本无法启动）时，`Continue` 当场降级——`stop_reason = "arbitration_capped"`（新核心标签，**exit 0**，标签在 result.json 供审计）、`continued: false`、note 不入队不入史、只保留在事件里。独立审查实测证实了必须预检：无预检时该场景会被轮首护栏翻成 `max_turns_reached`（exit 1），把无钩子时的成功收尾翻转成失败。
+2. **确定性守卫在决策点预检**：续跑帽（6，`TurnStopInfo::continuations_cap`）耗尽、或 `turns` 已到 `max_turns`（下一轮根本无法启动）时，`Continue` 当场降级——`stop_reason = "arbitration_capped"`（新核心标签，**exit 0**，标签在 result.json 供审计；result.json 的 `success` 键保持严格 `end_turn` 口径——同一 run exit 0 而 `success:false`，宿主汇总台账以标签为准）、`continued: false`、note 不入队不入史、只保留在事件里。独立审查实测证实了必须预检：无预检时该场景会被轮首护栏翻成 `max_turns_reached`（exit 1），把无钩子时的成功收尾翻转成失败。
 3. **竞态类守卫永远赢**：cancel / `budget_exceeded` / timeout 只在轮首检查，`continued: true` 表示「决策被接受，下一轮尝试启动」而非保证发出请求；已入队的 note 在这些出口走 R1 的 deferred 冲账（晚到、不丢）。
 4. **不仲裁的面**：子 agent run（`task` 子代理，`top_level=false`）从不仲裁；`max_tokens`（含 salvage）/`stuck_loop`/预算/轮帽/Err 全是强制终止；零块收尾轮（内容过滤吞掉回复）也不仲裁——没有可判的完成声称。
 
@@ -49,6 +49,8 @@
 
 `Config::fingerprint()`：对 clamp/overlay 合并后的**生效**配置，按**固定字段序**规范化 JSON → SHA-256 截 64 bit（16 hex）。进哈希：内核版本 + 全部 harness 形状字段（provider/base_url/model/max_tokens/系统提示词/工具白名单[排序]/limits 全家/MCP 拓扑/推理档位/缺位注记/code 沙箱/`gateway_fixes_preset`/`strip_think_tags`）。排除：`task`/`workdir`（运行输入）。凭据纪律（约束⑤）：只进键名不进值——`api_key_env` 本是变量名；MCP headers/env 仅排序键名；mcp url 与 base_url 都过 userinfo 脱敏。语义有序列表（`mcp_servers`/`code.llm.models`/`tool_absent_notes`）按声明序进哈希——顺序本身是拓扑语义，序变即指纹变，属定版行为。验收①②③④各有钉子测试。出账面：`RunOutcome.config_fingerprint`（result.json 恒在键）+ `Agent::config_fingerprint()`。算法/截断长度/字段清单定版即兼容面，变更走 CHANGELOG——**在 [Unreleased] 窗口内指纹值无兼容承诺，定版于首个发布版**。
 
+**时点语义（外审核定）**：指纹是 **Agent 构造时的快照**——常驻 Agent 的热更新换挡（`set_model` / `set_reasoning_effort` / `set_max_tokens` / `set_max_context_tokens` / `set_code_config` / `set_tool_absent_notes` / `add_mcp_server` / `remove_mcp_server`）改变实际生效形状，但**不移动**已出账的指纹。换挡后要做「模型 + harness」台账对比的宿主，请重建 Agent（或每 run 一建）取新指纹；CLI/批处理每 run 一建，天然无此歧义。
+
 ### 2.5 FR-5 消息免深拷贝（P1）— 接受问题，方案另议（本批不落地）
 
 锁内 `to_vec()` 全量深拷贝是真痛点，接受立项。但三个候选的取舍需要 design 数据支撑：
@@ -71,11 +73,13 @@ X-1「无证据不动」、X-3「不为没有消费方的 seam 扩面」照单�
 4. `stop_reason` 新核心标签 `arbitration_capped`（CLI exit 0；批处理 success 口径仍只认 `end_turn`——batch 无钩子面暂不可达，分歧已注释留白）。
 5. `sha2` 由 code-feature 门控转必选依赖（默认树 +1 个既有 crate）。
 6. `Config` 新增两个可选字段：`gateway_fixes_preset` / `strip_think_tags`（serde default，旧配置文件解析不变）。
+7. `AgentEvent::Compressed` 变体新增 `folded_ids` 字段（FR-6 携带）——Rust 侧对该变体做穷尽解构（不带 `..`）的消费方需补字段；serde/NDJSON 面为 additive 键，schema_version 契约不变。
 
 ## 4. 审查与验证记录
 
 - 双独立审查（隔离 worktree，动态复现）：FR-1 一轮（APPROVE + 1×P1 已修）、FR-2/3/4/6 一轮（REQUEST-CHANGES，2×P1 + 6×P2 全部处置）。P1 中最实质的两条：①轮预算边界翻转（见 §2.1 第 2 点，worktree 探针实锤后修复）；②result.json 写键面与文档声明不符（`write_result` 手工键清单漏键，FR-3/4 对 CLI 宿主的闭环断路——已补键并加落键测试）。
-- 门禁（分支顶点）：`check.sh all` 14/14（fmt/clippy×4/测试×4/build:code/e2e/文档门禁×3）、bench 组 2/2、bindings 组 clippy×4；core 608（mock）/ 792（code,mock）、CLI 110 测试全绿。每项 FR 均按 §6.6 过独立审核轮次。
+- **推送前终审**（本批完成后的第二批双独立审核 + e2e，全部动态验证）：两位审核员分片深审（FR-1 仲裁+宿主面 / FR-2/3/4/6+全文档对账）均 **APPROVE、无 P1**；计 2×P2 + 8×P3，全部处置——指纹定版「构造时快照」语义（§2.4）、zh README 补齐 EN 全部新增段落、`Compressed` 变体字段补破坏性记账（§3 第 7 条）、`reply_text` 文档例与零块路径对齐、config 参考补两键、exit 表与 batch 表注记，并收编 8 根回归钉子（指纹字段完备性扫描 / build 布线 / 压缩时序两条 / TurnStopInfo 语义 / panic 契约 / 零块不仲裁 / NDJSON folded_ids）。e2e（真实二进制 + 真实 HTTP/SSE 栈）27/27：think 剥离开/关、预置修复首请求生效、指纹稳定/区分、result.json 两键、无钩子零漂移、压缩 folded_ids + 折叠会话 resume。
+- 门禁（分支顶点）：`check.sh all` 14/14（fmt/clippy×4/测试×4/build:code/e2e/文档门禁×3）、bench 组 2/2、bindings 组 clippy×4；core 616（mock）/ 800（code,mock）、CLI 110 测试全绿。每项 FR 均按 §6.6 过独立审核轮次。
 
 ## 5. 宿主侧接入清单（建议顺序）
 

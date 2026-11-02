@@ -147,7 +147,7 @@ cannot change them:
 | `max_turns_reached` / `max_tokens` | a model limit was reached | ❌ |
 | `budget_exceeded` | cumulative tokens hit `limits.max_total_tokens` | ❌ |
 | `stuck_loop` | spinning guardrail: the same call with identical arguments and identical results 6 times in a row (the 3rd occurrence attaches a course-correction hint to the tool_result first, granting one self-healing chance; progress or changed args reset the counter) | ❌ |
-| `arbitration_capped` | turn-stopping arbitration (`Hooks::on_turn_stopping`) kept rejecting the model's `end_turn` past its per-run continuation cap (6, aligned with the stuck-loop discipline); the run then ends cleanly on the model's final turn — exit 0, the label lives in result.json for hosts that audit it | ❌ |
+| `arbitration_capped` | turn-stopping arbitration (`Hooks::on_turn_stopping`) kept rejecting the model's `end_turn` past its per-run continuation cap (6, aligned with the stuck-loop discipline); the run then ends cleanly on the model's final turn — exit 0, the label lives in result.json for hosts that audit it (unreachable in `--batch`: batch installs no hooks; result.json `success` stays strict `end_turn`) | ❌ |
 | `panic` | the task panicked in a worker and was caught into a failure entry (below) | ❌ |
 | `cancelled` | user Ctrl-C: tasks not yet started are marked `cancelled` without running; a cancel observed during retry backoff ends the task `cancelled` too (cost already burned stays in the bill) | ❌ |
 | `setup_error` | agent build failed (missing `api_key_env` / MCP server failed to start / unknown tool name) or per-task workdir isolation setup failed (git missing / not a repo root / temp dir unwritable); deterministic — a retry round that fails here keeps the earlier attempts' cost | ❌ |
@@ -484,6 +484,8 @@ tiny-agent --config examples/web-search.json --task "search for Anthropic's rece
   "mcp_servers": [],
   "code": {"enabled": false},
   "reasoning_effort": "optional; reasoning-effort string passed through verbatim (none/low/medium/high/xhigh/max), not validated",
+  "strip_think_tags": true,
+  "gateway_fixes_preset": null,
   "limits": {
     "max_turns": 30,
     "timeout_secs": 600,
@@ -501,6 +503,13 @@ tiny-agent --config examples/web-search.json --task "search for Anthropic's rece
 
 The API key is read from the environment variable named by `api_key_env` — it never goes into the config
 file.
+
+Two newer keys (host-integration batch): `strip_think_tags` (default `true`) strips inline
+`<think>…</think>` blocks out of openai reply streams into `thinking` events (the reply text is
+guaranteed tag-free); set `false` for byte-exact passthrough. `gateway_fixes_preset` (optional
+object) pre-seeds the openai gateway body fixes (`max_completion_tokens` / `no_stream_options` /
+`no_reasoning_effort`, all default `false`) so the FIRST request already carries the learned shape
+and the teaching-400 round-trip disappears — feed a previously exported `gateway_fixes` back here.
 
 `inject_environment` (default `true`): when the agent is constructed, a block of runtime environment
 facts is prepended to the **very front** of the system prompt:
@@ -846,7 +855,9 @@ temptations.
   config's `gateway_fixes_preset` in the next process to skip the teaching 400. This is the
   provider's running cumulative set (process preset + everything learned since, OR-ed), NOT a
   per-run delta — repeated runs of one agent export the same value; diff consecutive outcomes
-  yourself if you need run-over-run increments.
+  yourself if you need run-over-run increments. The fingerprint is a construction-time snapshot:
+  a long-lived Agent's hot-swap setters (`set_model` et al) change the effective shape but not the
+  exported value — rebuild (or build per run) after swapping to compare ledgers.
 - **The `schema_version` contract**: while it is `1`, **keys are only added, never removed, and
   existing keys never change type**; new keys are always optional (old consumers can ignore them and
   keep working; sparse keys like `plan`/`compressions`/`duration_ms` simply don't appear when empty);
@@ -893,7 +904,7 @@ Process exit codes:
 
 | code | meaning |
 |---|---|
-| `0` | normal completion (`stop_reason == "end_turn"`)|
+| `0` | normal completion — `stop_reason == "end_turn"`, or `arbitration_capped` (hooks-driven continuation cap; exit 0 by design, while result.json `success` stays strict `end_turn`)|
 | `124` | timeout (`timeout`, following the GNU `timeout` convention)|
 | `125` | budget exceeded (`budget_exceeded`, cumulative tokens hit `max_total_tokens`)|
 | `130` | user cancel (`cancelled`, 128 + SIGINT)|
@@ -1482,21 +1493,21 @@ crates/core/src/  # kernel crate (package tiny-agent-core, lib name tiny_agent):
 ├── lib.rs            (  608)  # lib root: build_agent* / assemble (tool table, ToolCtx, code install, skill injection)
 ├── fsutil.rs         (  463)  # atomic-write primitives (O_EXCL temp + fsync + dir fsync; shared by session/result/report)
 ├── diag.rs           (  168)  # diagnostics channel: global sink installable by GUI hosts (falls back to stderr, byte-identical) — soft-failure warnings of skills/MCP/session/run_code go through it
-├── config.rs         ( 3018)  # config parsing + task-fragment merge + batch override whitelist
+├── config.rs         ( 3177)  # config parsing + task-fragment merge + batch override whitelist
 ├── provider/  # LLM backends
-│   ├── mod.rs            ( 1133)  # shared Message/Block, SSE reader, CancellableSse
-│   ├── openai.rs         ( 2291)  # OpenAI-compatible (include_usage; 400 fallbacks: max_tokens→max_completion_tokens / drop stream_options)
+│   ├── mod.rs            ( 1156)  # shared Message/Block, SSE reader, CancellableSse
+│   ├── openai.rs         ( 2310)  # OpenAI-compatible (include_usage; 400 fallbacks: max_tokens→max_completion_tokens / drop stream_options)
 │   ├── anthropic.rs      ( 1246)  # Anthropic native (message_start/message_delta usage)
 │   └── mock.rs           (  345)  # scripted Provider for tests (cfg(any(test, feature="mock")))
-├── agent.rs          ( 4567)  # core loop + usage accounting + cancel + context compression (preflight/overflow dual trigger + rolling chunked summaries) + adjacent-message normalization + same-turn multi-task parallelism
-├── agent_tests.rs    (11161)  # core-loop regression tests (scripted provider::mock, no network)
+├── agent.rs          ( 4572)  # core loop + usage accounting + cancel + context compression (preflight/overflow dual trigger + rolling chunked summaries) + adjacent-message normalization + same-turn multi-task parallelism
+├── agent_tests.rs    (11424)  # core-loop regression tests (scripted provider::mock, no network)
 ├── usage_probe.rs    (   94)  # thread-local usage side channel for parallel workers: recovers billed usage after a panic unwind at the join point (keeps result.json and the shared counter from diverging)
 ├── compress.rs       (  996)  # compression engine (find_safe_cut / chunked summaries / saturating usage merge + block-level billing primitives)
 ├── context_report.rs (  886)  # context composition breakdown (ContextBreakdown estimate: 3 system parts / 4 tool classes / message typing + anchor calibration)
 ├── retry.rs          (  158)  # exponential backoff shared by batch --retries and single-run transient retry (±25% jitter against lockstep)
 ├── session.rs        (  522)  # session persistence (atomic writes + fold archive)
 ├── skills.rs         ( 1089)  # three-tier skill loading (built-in / user dir / project)
-├── hooks.rs          (  294)  # hooks gate (Deny / Modify / audit)
+├── hooks.rs          (  296)  # hooks gate (Deny / Modify / audit)
 ├── tools/  # toolset: built-in tools + MCP wrappers + task sub-agent + run_code (feature code)
 │   ├── mod.rs            ( 1509)  # Tool trait + ToolCtx + CallbackTool/SharedTool + whitelist assembly
 │   ├── shell.rs          ( 1297)  # shell tool (unix: sh -c; Windows: cmd /C + raw_arg verbatim command passing, defeating std quoting)
@@ -1527,7 +1538,7 @@ src/  # CLI crate (package tiny-agent, bin tiny-agent): process shell + headless
 ├── main.rs           ( 1024)  # CLI entry + assembly (build_agent) + --session none
 ├── signal.rs         (  123)  # headless SIGINT → cancel (first press graceful / second hard-exit 130)
 ├── batch.rs          ( 3999)  # batch tasks + --retries/--failed + report merging
-├── harness.rs        ( 2380)  # headless mode + result.json + NDJSON + exit codes
+├── harness.rs        ( 2385)  # headless mode + result.json + NDJSON + exit codes
 ├── harness_tests.rs  ( 1212)  # harness behavior tests (retry ladder / result.json / NDJSON; moved here with harness from the kernel's agent_tests.rs)
 ├── tui.rs            (   20)  # TUI module root (feature tui): mod declarations + public exports (run / transcript_rows)
 └── tui/  # TUI submodules (same tui gate): split from the original 8.7k-line single file by concern

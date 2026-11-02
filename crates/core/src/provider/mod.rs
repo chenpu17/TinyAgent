@@ -926,6 +926,29 @@ mod tests {
     }
 
     #[test]
+    fn build_wires_the_config_knobs_into_the_provider() {
+        // 外审返工补钉（FR-3）：`build()` 是 `gateway_fixes_preset` 进
+        // provider 的唯一生产布线点——接反/漏接会让预置静默失效而门禁全绿
+        // （openai 单元测试都绕过 build 直连 with_*）。strip_think_tags 的
+        // 布线由 e2e 场景（真实二进制开/关两跑）覆盖；这里钉可廉价观测的
+        // preset 面。
+        let cfg: Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"K","model":"m",
+                "gateway_fixes_preset":{"no_stream_options":true}}"#,
+        )
+        .unwrap();
+        let p = build(&cfg, "k", reqwest::blocking::Client::new());
+        let gf = p.gateway_fixes();
+        assert!(gf.no_stream_options, "preset must reach the provider");
+        assert!(!gf.max_completion_tokens);
+        // 未预置：默认零值，教学 400 学习路径不受影响。
+        let cfg: Config =
+            serde_json::from_str(r#"{"provider":"openai","api_key_env":"K","model":"m"}"#).unwrap();
+        let p = build(&cfg, "k", reqwest::blocking::Client::new());
+        assert!(p.gateway_fixes().is_default());
+    }
+
+    #[test]
     fn sse_reader_strips_at_most_one_leading_space() {
         // Spec: exactly one optional space after the colon is the separator;
         // the payload owns any further indentation (a tab is payload, not

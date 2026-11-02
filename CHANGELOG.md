@@ -46,7 +46,8 @@
   脱敏、白名单排序无序化）。语义有序的列表（`mcp_servers`/`code.llm.models`/`tool_absent_notes`）
   **按声明序进哈希**——顺序本身影响 MCP 拓扑命名与注记查找语义，序变即指纹变，属定版行为。`Agent::config_fingerprint()` 访问器 + `RunOutcome.config_fingerprint`
   （result.json 加键）——运行台账/评测把「模型 + harness 配对」钉进记录。算法/截断/字段清单定版
-  即兼容面，变更须走 CHANGELOG。
+  即兼容面，变更须走 CHANGELOG。指纹为**构造时快照**（外审 P2 定版）：常驻 Agent 的热更新换挡
+  （`set_model` 等）改变生效形状但不移动已出账指纹，换挡后台账对比需重建 Agent 或每 run 一建。
 - **网关修复可导出/可预置（FR-3，P2）**：`Provider` trait 新增带默认实现的 `gateway_fixes()`
   （非学习型 provider 零改动）；openai 私有 `LearnedFixes` 投影为公共 `GatewayFixes`（三布尔位，
   serde，凭据无关）经 `RunOutcome.gateway_fixes` 出账（skip_serializing_if 保无修复时 result.json
@@ -72,6 +73,9 @@
   消费方若字面构造 `RunOutcome`（罕见——它由 run 返回）需补字段；读取方按键消费不受影响
   （`gateway_fixes` 无修复时不出现）。result.json 由此加 `config_fingerprint` 键（恒在）与
   `gateway_fixes` 键（学到的修复非空才在）——additive，schema_version 仍为 1。
+- **`AgentEvent::Compressed` 变体新增 `folded_ids` 字段**（FR-6）：Rust 库消费方若对该变体穷尽
+  解构（不带 `..`）需补字段；serde/NDJSON 面为 additive 键，schema_version 契约不变。同批
+  `TurnArbitration` 为枚举新增变体——enum 本身 `#[non_exhaustive]`，serde 透传零改动。
 - **`sha2` 依赖转必选**（FR-4 指纹哈希用）：此前 `code` feature 门控直连（wasmtime 传递已有），
   默认依赖树 +1 个既有 crate。
 - **`AgentEvent::Usage` 新增 `tool_folded: bool`**：`false` = provider 请求自身的用量（上下文占用的

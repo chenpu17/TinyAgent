@@ -152,6 +152,7 @@ tiny-agent --config examples/chat.json --tui
 | `max_turns_reached` / `max_tokens` | 模型跑满上限 | ❌ |
 | `budget_exceeded` | 累计 token 触顶 `limits.max_total_tokens` | ❌ |
 | `stuck_loop` | 打转护栏：同参同果的相同调用连续 6 次（第 3 次先在下发的 tool_result 里附纠偏提示，给一次自愈机会；结果有进展或参数不同即重置） | ❌ |
+| `arbitration_capped` | 轮末仲裁（`Hooks::on_turn_stopping`）在单 run 续跑帽（6，与打转护栏同款纪律）内持续否决模型的 `end_turn`；run 在模型最后一轮干净收尾——exit 0、标签留在 result.json 供审计。`--batch` 不可达（batch 不装钩子）；result.json 的 `success` 键仍严格只认 `end_turn` | ❌ |
 | `panic` | 任务在 worker 里 panic，被兜成失败条目（见下） | ❌ |
 | `cancelled` | 用户 Ctrl-C：未启动的任务标记 `cancelled` 不再执行；重试退避期间观测到取消同样以 `cancelled` 收尾（已烧成本照实入账） | ❌ |
 | `setup_error` | agent 构建失败（缺 `api_key_env` / MCP server 起不来 / 未知工具名）或任务 workdir 隔离 setup 失败（git 缺失 / 非 repo 根 / 临时目录不可写）；确定性——重试轮在此失败时保留前几轮的真实成本 | ❌ |
@@ -427,6 +428,8 @@ tiny-agent --config examples/web-search.json --task "搜一下 Anthropic 最近�
   "mcp_servers": [],
   "code": {"enabled": false},
   "reasoning_effort": "可选，思考程度字符串原样透传（none/low/medium/high/xhigh/max），不校验",
+  "strip_think_tags": true,
+  "gateway_fixes_preset": null,
   "limits": {
     "max_turns": 30,
     "timeout_secs": 600,
@@ -443,6 +446,12 @@ tiny-agent --config examples/web-search.json --task "搜一下 Anthropic 最近�
 ```
 
 API key 从 `api_key_env` 指定的环境变量读取，不写进配置文件。
+
+两个较新的键（宿主集成需求单批次）：`strip_think_tags`（默认 `true`）——把 openai 回复流里内联的
+`<think>…</think>` 块剥进 `thinking` 事件（正文保证无标签残留）；设 `false` 即逐字节透传。
+`gateway_fixes_preset`（可选对象）——预置 openai 兼容网关的请求体修复位（`max_completion_tokens` /
+`no_stream_options` / `no_reasoning_effort`，默认全 `false`），让**首个请求**就带上学到的形状、
+教学 400 往返整个消失；把此前导出的 `gateway_fixes` 喂回这里即可。
 
 `inject_environment`（默认 `true`）：构造 agent 时在 system prompt **最前面**插入一段运行环境事实：
 
@@ -626,8 +635,10 @@ TinyAgent 的定位是**可审计、可无人值守的 agent 执行单元**—�
     { "turn": 2, "duration_ms": 950, "tool_calls": 0 }
   ],
   "compressions": [
-    { "trigger": "preflight", "dropped": 8, "kept": 6, "estimated_tokens_before": 152000, "estimated_tokens_after": 41000, "measured_tokens_before": 148220 }
+    { "trigger": "preflight", "dropped": 8, "folded_ids": ["m3","m4","m5","m6","m7","m8","m9","m10"], "kept": 6, "estimated_tokens_before": 152000, "estimated_tokens_after": 41000, "measured_tokens_before": 148220 }
   ],
+  "config_fingerprint": "3f9a1c2e4b5d6071",
+  "gateway_fixes": { "max_completion_tokens": true, "no_stream_options": false, "no_reasoning_effort": false },
   "plan": [
     { "subject": "跑测试", "status": "completed" },
     { "subject": "修失败用例", "status": "in_progress" },
@@ -644,12 +655,21 @@ TinyAgent 的定位是**可审计、可无人值守的 agent 执行单元**—�
   与 `plan`/`meta` 的稀疏后插不同，这组键是**纯增量**（新键，旧键不动），按 key 取值的消费方不受影响。
   `model`/`provider` 来自实际运行的配置（批量任务片段覆盖了 `model` 就记覆盖后的值）；`provider` 记
   配置声明的协议族（anthropic / openai），绑定层注入自定义 provider 回调时仍是配置声明值。
+  两个较新的增量键直接服务运行台账（宿主集成需求单 FR-3/FR-4）：`config_fingerprint`——生效
+  （clamp/overlay 合并后）配置的稳定 16 hex 指纹，覆盖 harness 形状字段 + 内核版本，排除
+  `task`/`workdir`（运行输入）与凭据**值**（MCP header/env 只进排序键名，URL 过 userinfo 脱敏）；
+  同配置同指纹，模型/限制/工具/MCP/沙箱任一变动即变。**指纹是 Agent 构造时的快照**——常驻
+  Agent 的热更新换挡（`set_model` 等）改变生效形状但不改已出账指纹，换挡后对比台账请重建
+  Agent（或每 run 一建）。`gateway_fixes`——openai 兼容网关迄今为止学到的请求体修复（三布尔位，
+  凭据无关），仅当至少学到一位才出现；喂回下个进程配置的 `gateway_fixes_preset` 可跳过教学 400。
+  这是 provider 的进程内累计集（预置 + 此后学到的，OR 合并），**不是**单 run 增量——同一 Agent
+  多次 run 导出同值；要逐 run 增量请自行 diff 相邻 outcome。
 - **`schema_version` 契约**：`1` 期间**只加键、不删键、不改既有键的类型**；新增键一律可选
   （旧消费方忽略即可继续工作，稀疏键如 `plan`/`compressions`/`duration_ms` 缺省即不出现）；
   只有"删除键 / 改变键类型"这类破坏性变更才升版本号。消费方应**按键取值**、遇到未知键跳过，
   不要按位置或整体结构做严格校验。批量报告 `report.json` 同款（顶层另有 `agent_version`）。
 - `plan`（可选）：agent 通过 `todo` 工具记录的任务计划与每步状态（末次调用的全量列表）。**仅当 agent 用过 `todo` 才出现**，否则该键不存在——不用 `todo` 的结果文件与启用前逐字节相同。`tool_calls[]` 里 `task`（子 agent）条目另带一个可选 `meta` 字段（`turns`/`tools`/`tokens`/`stop_reason` 的紧凑 trace），同理仅在子 agent 调用时出现
-- `turn_timings`：每轮耗时（毫秒）与该轮工具调用数，**单个 attempt 内**与 `turns` 逐轮对齐；重试梯折叠后 `turns` 含失败 attempt 的轮次，`turn_timings` 只覆盖成功 attempt（行内轮编号按其所在 attempt 计）；`duration_ms` 是该工具真实执行的耗时（排队与取消检查点不计入；因取消/打转未启动的占位记录不带该键）。`compressions`（可选）：上下文压缩审计——触发路径（`preflight`/`overflow`/`manual`）、折叠/保留消息数、压缩前后 token 估算（与 preflight 闸门同口径）及最近锚点请求的 provider 实测值（`measured_tokens_before`，无锚点时为 null）；**仅当发生过压缩才出现**。失败轮里已发生的压缩同样进审计（错误路径也是账单面）
+- `turn_timings`：每轮耗时（毫秒）与该轮工具调用数，**单个 attempt 内**与 `turns` 逐轮对齐；重试梯折叠后 `turns` 含失败 attempt 的轮次，`turn_timings` 只覆盖成功 attempt（行内轮编号按其所在 attempt 计）；`duration_ms` 是该工具真实执行的耗时（排队与取消检查点不计入；因取消/打转未启动的占位记录不带该键）。`compressions`（可选）：上下文压缩审计——触发路径（`preflight`/`overflow`/`manual`）、折叠/保留消息数、压缩前后 token 估算（与 preflight 闸门同口径）及最近锚点请求的 provider 实测值（`measured_tokens_before`，无锚点时为 null）；每条记录另带 `folded_ids`——被折叠中段的消息 id 精确清单（原文在 session 归档里，跨 save/load id 不变），导出侧按 id 重建「这段摘要替换了什么」，不用数位置；**仅当发生过压缩才出现**。失败轮里已发生的压缩同样进审计（错误路径也是账单面）
 - `attempts` 是实际执行的 agent 运行次数（`>1` 表示发生了瞬态重试，见下文「单跑瞬态重试」）。批量侧：终态先于 agent 构建时记 `0`（任务片段非法、隔离 setup 失败、从未启动即取消）；重试轮构建失败保留已进入的 attempt 计数
 - `input_tokens` / `output_tokens` 是本次运行累计的 token 用量；`cache_creation_input_tokens` /
   `cache_read_input_tokens` 是 prompt 缓存写/读累计（Anthropic 两者都报，OpenAI 只报读）。`input_tokens`
@@ -664,7 +684,7 @@ TinyAgent 的定位是**可审计、可无人值守的 agent 执行单元**—�
 
 | code | 含义 |
 |---|---|
-| `0` | 正常完成（`stop_reason == "end_turn"`）|
+| `0` | 正常完成——`stop_reason == "end_turn"`，或 `arbitration_capped`（钩子续跑帽；exit 0 属设计口径，result.json 的 `success` 仍严格只认 `end_turn`）|
 | `124` | 超时（`timeout`，沿用 GNU `timeout` 约定）|
 | `125` | 预算超限（`budget_exceeded`，累计 token 触顶 `max_total_tokens`）|
 | `130` | 用户取消（`cancelled`，128 + SIGINT）|
@@ -680,7 +700,7 @@ TUI 模式下 `Ctrl-C` 是普通按键，按上面的按键表处理。
 
 `--json` 模式额外在每个事件吐一行 NDJSON（`type`: `turn` / `text` / `thinking` / `code_log` /
 `tool_input` / `tool_call` / `tool_result` / `usage` / `compressed` / `pruned` / `salvage` / `warning` /
-`note_injected` / `subagent` / `todo` / `done`，重试轮次之间另吐 `retry`，以及仅在 run_code 沙箱
+`note_injected` / `turn_arbitration` / `subagent` / `todo` / `done`，重试轮次之间另吐 `retry`，以及仅在 run_code 沙箱
 编译并启用时出现的流首 `code` 记录——`code` 是 harness 层记录、非 `AgentEvent` 变体），
 可在结果文件落盘前实时跟进进度。`tool_input` 是工具参数的流式增量
 （`{"type":"tool_input","id","name","delta"}`，键为 tool_use id）：模型边构造参数边透出，
@@ -690,6 +710,12 @@ GUI 可渲染"正在构造调用…"（headless 终端不重复打印——完�
 运行累计（`task` 子 agent 的多轮累计、run_code 内层 llm、宿主工具自行上报的用量——在该工具的
 `tool_call` 与 `tool_result` 之间发出，**不是**对当前历史上下文的测量）。两种风味都计入运行
 累计总额；两者对你含义不同时按该标记分支。
+`turn_arbitration` 仅在宿主的轮末仲裁钩子否决了模型完成时出现（FR-1）：
+`{"type":"turn_arbitration","turn","continued","note"}`——`continued:true` 表示后面还有一轮
+（note 走监督者旁注管线，投递点落 `note_injected` 事件）；`continued:false` 表示续跑帽已满，
+run 以 `arbitration_capped` 收尾、未投递的 note 只保留在本事件里。`compressed` 事件现带
+`folded_ids`（FR-6）：被折叠中段的消息 id 精确清单——原文在 session 归档里，UI/导出按 id
+定位「这段摘要替换了什么」，不用数位置。
 这组 `type` 是**契约**：内核 `AgentEvent::ndjson_type()` 对每个事件变体穷尽赋值（新增变体不改它
 就编不过），`agent_tests` 里另有逐变体钉名测试——消费方按 `type` 分支即可，不会遇到无名的流事件。
 
@@ -1124,21 +1150,21 @@ crates/core/src/  # kernel crate (package tiny-agent-core, lib name tiny_agent):
 ├── lib.rs            (  608)  # lib root: build_agent* / assemble (tool table, ToolCtx, code install, skill injection)
 ├── fsutil.rs         (  463)  # atomic-write primitives (O_EXCL temp + fsync + dir fsync; shared by session/result/report)
 ├── diag.rs           (  168)  # diagnostics channel: global sink installable by GUI hosts (falls back to stderr, byte-identical) — soft-failure warnings of skills/MCP/session/run_code go through it
-├── config.rs         ( 3018)  # config parsing + task-fragment merge + batch override whitelist
+├── config.rs         ( 3177)  # config parsing + task-fragment merge + batch override whitelist
 ├── provider/  # LLM backends
-│   ├── mod.rs            ( 1133)  # shared Message/Block, SSE reader, CancellableSse
-│   ├── openai.rs         ( 2291)  # OpenAI-compatible (include_usage; 400 fallbacks: max_tokens→max_completion_tokens / drop stream_options)
+│   ├── mod.rs            ( 1156)  # shared Message/Block, SSE reader, CancellableSse
+│   ├── openai.rs         ( 2310)  # OpenAI-compatible (include_usage; 400 fallbacks: max_tokens→max_completion_tokens / drop stream_options)
 │   ├── anthropic.rs      ( 1246)  # Anthropic native (message_start/message_delta usage)
 │   └── mock.rs           (  345)  # scripted Provider for tests (cfg(any(test, feature="mock")))
-├── agent.rs          ( 4567)  # core loop + usage accounting + cancel + context compression (preflight/overflow dual trigger + rolling chunked summaries) + adjacent-message normalization + same-turn multi-task parallelism
-├── agent_tests.rs    (11161)  # core-loop regression tests (scripted provider::mock, no network)
+├── agent.rs          ( 4572)  # core loop + usage accounting + cancel + context compression (preflight/overflow dual trigger + rolling chunked summaries) + adjacent-message normalization + same-turn multi-task parallelism
+├── agent_tests.rs    (11424)  # core-loop regression tests (scripted provider::mock, no network)
 ├── usage_probe.rs    (   94)  # thread-local usage side channel for parallel workers: recovers billed usage after a panic unwind at the join point (keeps result.json and the shared counter from diverging)
 ├── compress.rs       (  996)  # compression engine (find_safe_cut / chunked summaries / saturating usage merge + block-level billing primitives)
 ├── context_report.rs (  886)  # context composition breakdown (ContextBreakdown estimate: 3 system parts / 4 tool classes / message typing + anchor calibration)
 ├── retry.rs          (  158)  # exponential backoff shared by batch --retries and single-run transient retry (±25% jitter against lockstep)
 ├── session.rs        (  522)  # session persistence (atomic writes + fold archive)
 ├── skills.rs         ( 1089)  # three-tier skill loading (built-in / user dir / project)
-├── hooks.rs          (  294)  # hooks gate (Deny / Modify / audit)
+├── hooks.rs          (  296)  # hooks gate (Deny / Modify / audit)
 ├── tools/  # toolset: built-in tools + MCP wrappers + task sub-agent + run_code (feature code)
 │   ├── mod.rs            ( 1509)  # Tool trait + ToolCtx + CallbackTool/SharedTool + whitelist assembly
 │   ├── shell.rs          ( 1297)  # shell tool (unix: sh -c; Windows: cmd /C + raw_arg verbatim command passing, defeating std quoting)
@@ -1169,7 +1195,7 @@ src/  # CLI crate (package tiny-agent, bin tiny-agent): process shell + headless
 ├── main.rs           ( 1024)  # CLI entry + assembly (build_agent) + --session none
 ├── signal.rs         (  123)  # headless SIGINT → cancel (first press graceful / second hard-exit 130)
 ├── batch.rs          ( 3999)  # batch tasks + --retries/--failed + report merging
-├── harness.rs        ( 2380)  # headless mode + result.json + NDJSON + exit codes
+├── harness.rs        ( 2385)  # headless mode + result.json + NDJSON + exit codes
 ├── harness_tests.rs  ( 1212)  # harness behavior tests (retry ladder / result.json / NDJSON; moved here with harness from the kernel's agent_tests.rs)
 ├── tui.rs            (   20)  # TUI module root (feature tui): mod declarations + public exports (run / transcript_rows)
 └── tui/  # TUI submodules (same tui gate): split from the original 8.7k-line single file by concern
