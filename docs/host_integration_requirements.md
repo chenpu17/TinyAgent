@@ -2,8 +2,9 @@
 
 | 项 | 值 |
 |---|---|
-| 状态 | v1.0（初稿，待核心侧评审排期） |
+| 状态 | v1.1（已获答复单 v1.0；本版按答复对齐口径并更正 FR-2 动机） |
 | 日期 | 2026-11-02 |
+| 修订记录 | v1.1（2026-11-03）：按答复单 `host_integration_requirements_response.md` 对齐——FR-2 动机更正（`reasoning_content` 解析基线已在，系需求方 grep 输出截断误判；范围收敛为内联 `<think>` 剥离）；FR-1 事件口径（只发非默认决策）与定版语义指向答复单；FR-3 导出语义（含预置位的进程内累计）。v1.0：初稿 |
 | 需求方 | TinyWorker（宿主：tauri 桌面壳 + webui 服务器壳，path 依赖 `tiny-agent-core`） |
 | 需求来源 | ① DeepSeek Harness（dsh，2026-08-13 开源，MIT）架构调研对照；② TinyWorker 七轮审计的记录在案项（受核心签名约束而搁置者） |
 | 通道 | 「需求单 → 用户中转」（RSI 红线确立的 TinyAgent 改动通道），本单为该通道第一份 |
@@ -44,21 +45,21 @@ dsh 的核心论点（[NYU RITS 解读](https://rits.shanghai.nyu.edu/ai/deepsee
 - `Stop`（默认）：照常收尾，行为与今日完全一致；
 - `Continue { note: String }`：不发 `Done`，note 以监督者旁注同款标记前缀并入尾用户消息，进入下一轮；继续轮数设上限（建议复用/对齐 `STUCK_STOP_AT` 的计数纪律），超限降级为 Stop 并在 stop_reason 标注仲裁来源。
 
-**约束**：serial 调用（同现有 hooks 纪律）；实现内出错返回 `Stop` 而非 panic（hook panic 会留 unpaired tool_use——trait 文档既有告诫）；`--resume` 重建不带 hooks 的现状维持并在文档标注；每次仲裁（无论结果）发一条事件供宿主审计。
+**约束**：serial 调用（同现有 hooks 纪律）；实现内出错返回 `Stop` 而非 panic（hook panic 会留 unpaired tool_use——trait 文档既有告诫）；`--resume` 重建不带 hooks 的现状维持并在文档标注。事件口径（v1.1 对齐答复单 §2.1）：`TurnArbitration` 只发**非默认决策**（Continue 被兑现或被降级）——Rust trait 无法区分「未覆盖的默认 Stop」与「显式 Stop」，且默认路径零漂移要求事件流逐字节不变；显式 `Stop` 与无钩子 run 一致。定版语义以答复单 §2.1 为准：续跑帽 6（对齐 `STUCK_STOP_AT`）、确定性守卫（续跑帽耗尽 / `max_turns` 已到）在决策点预检并降级为 `stop_reason = "arbitration_capped"`（exit 0，note 只留在事件里）、竞态类守卫（cancel/预算/超时）轮首永远赢、子代理 run 与强制终止面（`max_tokens` 含 salvage/`stuck_loop`/Err/零块轮）从不仲裁。
 
 **验收**：① 默认实现零行为漂移（既有全套测试不动）；② Continue 注入后模型可见 note 且历史/归档一致；③ 仲裁上限触发后 stop_reason 可辨；④ Continue 期间 cancel 仍即时生效；⑤ 压缩与仲裁同轮相遇时顺序确定（仲裁发生在当轮消息面定稿后）。
 
 **规模**：中。宿主收益：观察者判停从「事后停调度」升级为「当场驳回虚假完成」，直接服务 RSI 判停闭环。
 
-### FR-2 openai 兼容层解析 `reasoning_content` / `<think>`（P1）
+### FR-2 openai 兼容层推理通道（P1）——v1.1 更正动机、收敛范围
 
-**动机**：`provider/openai.rs` 目前不处理推理通道——DeepSeek-R/V3.2 thinking 经 OpenAI 协议回 `reasoning_content` 增量、vLLM 系（Qwen3 等，含 vllm-ascend 部署）常回内联 `<think>` 标签，两类现状下要么静默丢弃要么混入正文。宿主侧实测痛点（deepseek-flash 裁决输出不可解析、GLM 推理吃光预算）均与此层相关；RSI 对比评测（同任务跨模型）必须能分离推理与正文。
+**动机（v1.1 更正）**：v1.0 称「现状完全不处理推理通道」，系需求方 grep 输出截断（`head -14` 掩蔽了 openai.rs 中段的匹配行）导致的误判——基线 `0d17f94` 起 openai 层已把 `delta.reasoning_content`（DeepSeek-R1/GLM/o 系直连）与 OpenRouter 的 `delta.reasoning` 归一化字段解析为 `ThinkingDelta`（钉子测试 `stream_reasoning_content_surfaces_thinking_not_text` 在案），该形态打回成立。真实缺口仅剩：vLLM 系（Qwen3 等，含 vllm-ascend 部署）不开 reasoning-parser 时正文内联 `<think>…</think>` 混入正文。RSI 对比评测（同任务跨模型）必须能分离推理与正文的诉求不变。
 
-**内容**：按协议变体解析推理通道并映射到既有 `ThinkingDelta` 事件（anthropic.rs 已有该事件与「thinking 不入历史」的成熟语义）：① `reasoning_content` 字段增量；② 内联 `<think>…</think>` 剥离（可配开关，默认开启时须保证正文不含标签残留）；③ 推理不影响历史与计费口径的既有决策维持并写明。
+**内容（v1.1 收敛）**：流式状态机剥离内联 `<think>…</think>` 并映射到既有 `ThinkingDelta`（anthropic.rs 已有该事件与「thinking 不入历史」的成熟语义）；开关 `Config::strip_think_tags` 默认开，关闭即逐字节透传；跨任意 chunk 边界正确（半截标签不误切，未闭合块按 thinking 冲——fail-closed）；推理不入历史与计费口径的既定决策维持。
 
-**验收**：① mock 端点分别以 `reasoning_content` 与 `<think>` 供流，ThinkingDelta 与正文正确分离；② 历史不出现推理块；③ 两种形态混跑同一会话不串线；④ 宿主事件流（NDJSON/bindings）透传零改动。
+**验收**：① `<think>` 形态流供入，ThinkingDelta 与正文正确分离、正文无标签残留；② 历史不出现推理块；③ 同流混跑不串线；④ 关闭开关逐字节透传。`reasoning_content` 形态的验收由既有钉子测试承担，无需新增。
 
-**规模**：中偏小。
+**规模**：中偏小。（答复单已落地：`ThinkStripper` + 6 组跨 chunk 边界钉子。）
 
 ### FR-3 学到的网关修复可导出 / 可预置（P2）
 
@@ -66,7 +67,7 @@ dsh 的核心论点（[NYU RITS 解读](https://rits.shanghai.nyu.edu/ai/deepsee
 
 **内容**：① `RunOutcome`（或事件）携带本次学到的修复集；② `Config` 增加可选预置入口，宿主把上次学到的修复喂回来跳过学习轮。凭据纪律同现行：指纹/导出只含修复布尔位，不含任何密钥值。
 
-**验收**：① 预置修复后首轮请求即带修复（不再触发教学 400）；② 导出/预置往返等价；③ 未预置路径行为不变。
+**验收**：① 预置修复后首轮请求即带修复（不再触发教学 400）；② 导出/预置往返等价；③ 未预置路径行为不变。导出语义（v1.1 对齐答复单 §2.3）：为**含预置位的进程内累计**（同一 Agent 多次 run 导出同一值），非单 run 增量——需逐 run 增量的宿主自行 diff 相邻 outcome。
 
 **规模**：小。
 
