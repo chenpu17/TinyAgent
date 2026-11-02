@@ -10881,3 +10881,52 @@ fn run_outcome_carries_the_effective_config_fingerprint() {
     let cfg2 = cfg_with(6, 0, 0);
     assert_ne!(cfg2.fingerprint(), cfg.fingerprint());
 }
+
+#[test]
+fn gateway_fixes_export_serializes_only_when_non_default() {
+    // FR-3 出账面：没学到修复 → result.json 不出现 gateway_fixes 键
+    // （既有产出字节不变）；学到任一位 → 键出现且位如实。
+    fn outcome(fixes: crate::provider::GatewayFixes) -> RunOutcome {
+        RunOutcome {
+            final_text: "done".into(),
+            turns: 1,
+            stop_reason: "end_turn".into(),
+            tool_calls: vec![],
+            compressions: vec![],
+            turn_timings: vec![],
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            elapsed: std::time::Duration::from_secs(1),
+            config_fingerprint: String::new(),
+            gateway_fixes: fixes,
+        }
+    }
+    let v = serde_json::to_value(outcome(Default::default())).unwrap();
+    assert!(v.get("gateway_fixes").is_none(), "no-fix export is skipped");
+    let v = serde_json::to_value(outcome(crate::provider::GatewayFixes {
+        no_reasoning_effort: true,
+        ..Default::default()
+    }))
+    .unwrap();
+    assert_eq!(v["gateway_fixes"]["no_reasoning_effort"], true);
+    assert_eq!(v["gateway_fixes"]["max_completion_tokens"], false);
+}
+
+#[test]
+fn mock_provider_exports_no_gateway_fixes() {
+    // 非学习型 provider 走 trait 默认实现：MockProvider 的 run 出账为
+    // 默认（全 false）——bindings/自定义 provider 注入路径零改动。
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, _) = MockProvider::new(vec![mock::resp_text("ok", None)]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("task")],
+        test_ctx(),
+    );
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o.gateway_fixes, crate::provider::GatewayFixes::default());
+}

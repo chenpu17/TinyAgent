@@ -402,6 +402,48 @@ pub trait Provider: Send + Sync {
     /// Send one chat request, streaming text deltas to `on_event`.
     /// Returns the fully-assembled assistant message.
     fn chat(&self, req: &ChatRequest, on_event: &mut dyn FnMut(ChatEvent)) -> Result<ChatResponse>;
+
+    /// Cumulative gateway-body fixes this provider instance has learned so
+    /// far (宿主集成需求单 FR-3). Only the openai-compatible provider learns
+    /// any; the default is "none learned". Exported into
+    /// [`crate::agent::RunOutcome::gateway_fixes`] at run end, so a host can
+    /// persist the bits and feed them back via
+    /// [`crate::Config::gateway_fixes_preset`] in the NEXT process — skipping
+    /// the teaching 400 and its wasted round-trip. Credential-free by
+    /// construction: three boolean bits, no key or endpoint material.
+    fn gateway_fixes(&self) -> GatewayFixes {
+        GatewayFixes::default()
+    }
+}
+
+/// The openai-compat gateway body fixes: learned from a 400 that named an
+/// unaccepted field, or PRESET from a previous process's export (FR-3). This
+/// is the whole export/import shape — plain data, serializable, and free of
+/// anything credential-shaped by construction. Field semantics match the
+/// private `LearnedFixes` bits in the openai provider; the struct is the
+/// public boundary so the wire shape (result.json / config JSON) can't drift
+/// from the bits a preset consumes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GatewayFixes {
+    /// Rename `max_tokens` → `max_completion_tokens` on every request
+    /// (reasoning models on gateways that only accept the new name).
+    #[serde(default)]
+    pub max_completion_tokens: bool,
+    /// Omit the `stream_options` block (old gateways/vLLM reject it; usage
+    /// then goes unreported).
+    #[serde(default)]
+    pub no_stream_options: bool,
+    /// Omit the `reasoning_effort` field (old gateways don't know it).
+    #[serde(default)]
+    pub no_reasoning_effort: bool,
+}
+
+impl GatewayFixes {
+    /// serde `skip_serializing_if` predicate: a no-fix export is omitted from
+    /// result.json entirely, keeping pre-FR-3 outputs byte-identical.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Build the provider a config names (Anthropic or OpenAI), sharing `client`
@@ -416,7 +458,10 @@ pub fn build(cfg: &Config, api_key: &str, client: reqwest::blocking::Client) -> 
     let idle = Duration::from_secs(cfg.limits.stream_idle_secs.max(1));
     match cfg.provider {
         ProviderKind::Anthropic => Box::new(Anthropic::new(client, base, api_key, idle)),
-        ProviderKind::Openai => Box::new(OpenAi::new(client, base, api_key, idle)),
+        ProviderKind::Openai => Box::new(
+            OpenAi::new(client, base, api_key, idle)
+                .with_preset(cfg.gateway_fixes_preset.unwrap_or_default()),
+        ),
     }
 }
 

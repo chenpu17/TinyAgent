@@ -693,6 +693,14 @@ pub struct RunOutcome {
     /// in run ledgers read this instead of re-deriving config identity from
     /// scattered fields.
     pub config_fingerprint: String,
+    /// Cumulative gateway-body fixes the provider has learned (FR-3, see
+    /// [`Provider::gateway_fixes`]). Skipped in the serialization when no fix
+    /// has been learned — pre-FR-3 result.json stays byte-identical. A host
+    /// persists this into the next process's `Config::gateway_fixes_preset`
+    /// to skip the teaching 400; the export carries boolean bits only, never
+    /// credentials.
+    #[serde(skip_serializing_if = "crate::provider::GatewayFixes::is_default")]
+    pub gateway_fixes: crate::provider::GatewayFixes,
 }
 
 /// A run that failed after burning tokens / running tools. Carries the partial
@@ -2911,6 +2919,7 @@ impl Agent {
             cache_read_input_tokens: self.usage.cache_read_input_tokens,
             elapsed: start.elapsed(),
             config_fingerprint: self.config_fingerprint.clone(),
+            gateway_fixes: self.provider.gateway_fixes(),
         })
     }
 

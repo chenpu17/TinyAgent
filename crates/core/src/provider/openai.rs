@@ -42,6 +42,22 @@ impl OpenAi {
         }
     }
 
+    /// Preset gateway fixes learned in a PREVIOUS process (FR-3):
+    /// `provider::build` feeds `Config::gateway_fixes_preset` here so the
+    /// very first request already carries the adjusted body shape — the
+    /// teaching 400 (and its wasted round-trip) is skipped entirely. Bits the
+    /// host didn't preset stay false; learning continues on top (a fix that
+    /// fires again just re-records the same bit).
+    pub fn with_preset(self, preset: super::GatewayFixes) -> Self {
+        if preset != super::GatewayFixes::default() {
+            let mut fixes = self.fixes.lock().unwrap_or_else(|p| p.into_inner());
+            fixes.max_completion_tokens |= preset.max_completion_tokens;
+            fixes.no_stream_options |= preset.no_stream_options;
+            fixes.no_reasoning_effort |= preset.no_reasoning_effort;
+        }
+        self
+    }
+
     /// One internal Message may expand to several wire messages
     /// (tool results become separate `tool` role messages).
     fn message_jsons(m: &Message) -> Vec<Value> {
@@ -207,6 +223,17 @@ impl LearnedFixes {
             BodyFix::MaxCompletionTokens => self.max_completion_tokens = true,
             BodyFix::DropStreamOptions => self.no_stream_options = true,
             BodyFix::DropReasoningEffort => self.no_reasoning_effort = true,
+        }
+    }
+
+    /// Export projection (FR-3): the public, serializable bit set — this is
+    /// what `gateway_fixes()` reports and what a host persists into the next
+    /// process's `Config::gateway_fixes_preset`.
+    fn to_fixes(&self) -> super::GatewayFixes {
+        super::GatewayFixes {
+            max_completion_tokens: self.max_completion_tokens,
+            no_stream_options: self.no_stream_options,
+            no_reasoning_effort: self.no_reasoning_effort,
         }
     }
 }
@@ -382,6 +409,14 @@ impl Provider for OpenAi {
 
         let mut sse = CancellableSse::new(resp, req.cancel.clone(), self.idle)?;
         Self::parse_loop(&mut sse, on_event)
+    }
+
+    fn gateway_fixes(&self) -> super::GatewayFixes {
+        // Same poison-tolerant lock as the two sites in `chat`.
+        self.fixes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .to_fixes()
     }
 }
 
@@ -1813,5 +1848,99 @@ mod tests {
         );
         // The cap kept the HEAD of the body (where diagnostics live).
         assert!(msg.contains("EEEEEE"), "{msg:.120}…");
+    }
+
+    /// FR-3 预置路径：上一进程学到的修复经 `Config::gateway_fixes_preset`
+    /// → `with_preset` 回来后，本进程的**第一个请求**就带修复后的形状——
+    /// 教学 400 及其重试往返整个消失（mock 只收到 1 个请求，且直接是改名
+    /// 后的字段）。导出面 `gateway_fixes()` 如实回报预置位（导出/预置
+    /// 往返等价）。
+    #[test]
+    fn preset_fixes_skip_the_teaching_400() {
+        let (url, bodies) = max_tokens_400_mock();
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("reqwest client");
+        let preset = crate::provider::GatewayFixes {
+            max_completion_tokens: true,
+            ..Default::default()
+        };
+        let provider =
+            OpenAi::new(client, url, "k", std::time::Duration::from_secs(30)).with_preset(preset);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let m1 = vec![Message::user(vec![Block::Text("turn one".into())])];
+        let req1 = ChatRequest {
+            system: None,
+            messages: &m1,
+            tools: &[],
+            model: "m",
+            max_tokens: 100,
+            per_request_timeout: Some(std::time::Duration::from_secs(10)),
+            cancel: cancel.clone(),
+            cache: true,
+            reasoning_effort: None,
+            temperature: None,
+        };
+        let r1 = provider
+            .chat(&req1, &mut |_| {})
+            .expect("first request succeeds on the preset");
+        assert_eq!(r1.stop_reason, "end_turn");
+        let received = bodies.lock().unwrap().clone();
+        assert_eq!(
+            received.len(),
+            1,
+            "preset must skip the teaching 400 entirely; saw {} requests",
+            received.len()
+        );
+        assert!(received[0].get("max_completion_tokens").is_some());
+        assert!(received[0].get("max_tokens").is_none());
+        // 导出/预置往返等价。
+        assert_eq!(provider.gateway_fixes(), preset);
+    }
+
+    /// FR-3 导出路径：一个真实 400 教出来的修复，经 `gateway_fixes()` 可
+    /// 被宿主取走（放进下一进程的 Config 预置）。位与位分离：只有真的
+    /// 学到的那一位为 true。
+    #[test]
+    fn learned_fixes_export_through_gateway_fixes() {
+        let (url, _bodies) = max_tokens_400_mock();
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("reqwest client");
+        let provider = OpenAi::new(client, url, "k", std::time::Duration::from_secs(30));
+        assert_eq!(
+            provider.gateway_fixes(),
+            crate::provider::GatewayFixes::default()
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let m1 = vec![Message::user(vec![Block::Text("turn one".into())])];
+        let req1 = ChatRequest {
+            system: None,
+            messages: &m1,
+            tools: &[],
+            model: "m",
+            max_tokens: 100,
+            per_request_timeout: Some(std::time::Duration::from_secs(10)),
+            cancel,
+            cache: true,
+            reasoning_effort: None,
+            temperature: None,
+        };
+        provider
+            .chat(&req1, &mut |_| {})
+            .expect("run recovers after the teaching 400");
+        assert_eq!(
+            provider.gateway_fixes(),
+            crate::provider::GatewayFixes {
+                max_completion_tokens: true,
+                no_stream_options: false,
+                no_reasoning_effort: false,
+            },
+            "exactly the learned bit exports"
+        );
     }
 }

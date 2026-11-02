@@ -499,6 +499,7 @@ mod tests {
             inject_environment: false,
             salvage_on_max_tokens: true,
             code: Default::default(),
+            gateway_fixes_preset: None,
         };
         let mut cfg = cfg;
         cfg.limits.max_total_tokens = max_total_tokens;
@@ -786,6 +787,7 @@ mod tests {
             cache_read_input_tokens: 0,
             elapsed: std::time::Duration::from_secs_f64(1.0),
             config_fingerprint: String::new(),
+            gateway_fixes: Default::default(),
         };
         let out = outcome_to_output(&o, "a", usize::MAX);
         assert_eq!(out.content, "all done");
@@ -838,6 +840,7 @@ mod tests {
             cache_read_input_tokens: 50,
             elapsed: std::time::Duration::from_secs_f64(3.0),
             config_fingerprint: String::new(),
+            gateway_fixes: Default::default(),
         };
         let out = outcome_to_output(&o, "scout", usize::MAX);
         // content is the clean summary — no trace mixed in.
@@ -911,6 +914,7 @@ mod tests {
             cache_read_input_tokens: 0,
             elapsed: std::time::Duration::from_secs_f64(2.0),
             config_fingerprint: String::new(),
+            gateway_fixes: Default::default(),
         };
         let out = outcome_to_output(&o, "scout", usize::MAX);
         assert!(!out.is_error, "short stop must not be is_error");
@@ -940,6 +944,7 @@ mod tests {
             cache_read_input_tokens: 0,
             elapsed: std::time::Duration::from_secs_f64(1.0),
             config_fingerprint: String::new(),
+            gateway_fixes: Default::default(),
         };
         let out = outcome_to_output(&o, "scout", 1000);
         assert!(
@@ -1081,6 +1086,7 @@ mod tests {
             inject_environment: false,
             salvage_on_max_tokens: true,
             code: Default::default(),
+            gateway_fixes_preset: None,
         }
     }
 }

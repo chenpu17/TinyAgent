@@ -85,7 +85,8 @@ pub use context_report::{
 };
 pub use hooks::{Hooks, ToolDecision, TurnStopDecision, TurnStopInfo};
 pub use provider::{
-    Block, ChatRequest, ChatResponse, Message, Provider, Role, SimpleChatResponse, ToolDef, Usage,
+    Block, ChatRequest, ChatResponse, GatewayFixes, Message, Provider, Role, SimpleChatResponse,
+    ToolDef, Usage,
 };
 pub use tools::{
     load_document_block, BudgetGate, CallbackTool, Tool, ToolConcurrency, ToolCtx, ToolOrigin,

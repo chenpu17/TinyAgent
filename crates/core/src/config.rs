@@ -701,6 +701,15 @@ pub struct Config {
     /// itself requires the `code` cargo feature, design §9).
     #[serde(default)]
     pub code: CodeConfig,
+    /// Gateway body fixes learned in a PREVIOUS process, preset into the
+    /// openai-compat provider (宿主集成需求单 FR-3): the first request of
+    /// this process already carries the adjusted shape, skipping the teaching
+    /// 400. Feed it the `RunOutcome::gateway_fixes` export from the previous
+    /// process (round-trip equivalent). Credential-free by construction —
+    /// three boolean bits ([`crate::provider::GatewayFixes`]). `None` (the
+    /// default) keeps today's learn-from-scratch behavior.
+    #[serde(default)]
+    pub gateway_fixes_preset: Option<crate::provider::GatewayFixes>,
 }
 
 /// Strip the `\\?\` verbatim prefix Windows' `canonicalize()` produces:
@@ -844,7 +853,7 @@ impl Config {
     ///
     /// 进哈希：内核版本（harness 配对的另一半）+ 全部 harness 形状字段
     /// （provider/base_url/model/max_tokens/系统提示词/工具白名单/限制
-    /// 全家/MCP 拓扑/推理档位/缺位工具注记/代码沙箱配置）。
+    /// 全家/MCP 拓扑/推理档位/缺位工具注记/代码沙箱配置/网关修复预置）。
     /// 不进哈希（运行输入，非 harness 形状，且跨机器不可移植）：`task`
     /// （请求本身）与 `workdir`（运行环境）。
     /// 凭据纪律（约束 ⑤，config 手写 Debug 纪律的延伸）：**只进键名不进
@@ -896,6 +905,7 @@ impl Config {
             "reasoning_effort": self.reasoning_effort,
             "tool_absent_notes": self.tool_absent_notes,
             "code": self.code,
+            "gateway_fixes_preset": self.gateway_fixes_preset,
         });
         let digest = Sha256::digest(canonical.to_string().as_bytes());
         let mut out = String::with_capacity(16);
@@ -2868,5 +2878,43 @@ mod tests {
             c.fingerprint(),
             "url host IS harness shape"
         );
+    }
+
+    // ── 网关修复预置（宿主集成需求单 FR-3）：Config 往返 + 指纹敏感 ──────────
+
+    #[test]
+    fn gateway_fixes_preset_round_trips_through_config_json() {
+        // 预置位从上一进程的导出喂回：config JSON 往返等价；缺省 → None
+        // （learn-from-scratch 行为不变）；未知键依旧被 deny_unknown_fields 拒。
+        let c: Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"K","model":"m",
+            "gateway_fixes_preset":{"max_completion_tokens":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            c.gateway_fixes_preset,
+            Some(crate::provider::GatewayFixes {
+                max_completion_tokens: true,
+                no_stream_options: false,
+                no_reasoning_effort: false,
+            })
+        );
+        let c2: Config =
+            serde_json::from_str(r#"{"provider":"openai","api_key_env":"K","model":"m"}"#).unwrap();
+        assert_eq!(c2.gateway_fixes_preset, None);
+    }
+
+    #[test]
+    fn gateway_fixes_preset_moves_the_fingerprint() {
+        // 预置改变出线请求形状（harness 形状），必须进指纹——两台机器的台账
+        // 才能区分「学过」与「没学过」的配置。
+        let base: Config =
+            serde_json::from_str(r#"{"provider":"openai","api_key_env":"K","model":"m"}"#).unwrap();
+        let mut preset = base.clone();
+        preset.gateway_fixes_preset = Some(crate::provider::GatewayFixes {
+            no_stream_options: true,
+            ..Default::default()
+        });
+        assert_ne!(preset.fingerprint(), base.fingerprint());
     }
 }
