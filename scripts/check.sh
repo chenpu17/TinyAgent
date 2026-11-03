@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # 本地 CI 一把过：把 .github/workflows/ci.yml 里 fmt / test / code / e2e 四个 job 的
 # 命令原样搬到本地跑。命令与 ci.yml 必须逐字一致——本地绿灯才等于 CI 绿灯；
-# 改了 ci.yml 记得回来同步这里（参数、-D warnings、--features mock 都别漏）。
+# 改了 ci.yml 记得回来同步这里（参数、-D warnings、--features mock、--locked 都别漏；
+# round-2 评审 R4-P3-1：九条 cargo 命令漏了 --locked，与 ci.yml 的「逐字一致」
+# 自称重新开了分叉，现全部补齐）。
 #
 # 用法：
 #   ./scripts/check.sh              # 跑默认全集（fmt clippy test e2e docs）
@@ -51,26 +53,26 @@ group_clippy() {
     # 四个配置缺一不可：feature 后的代码在其他配置里根本看不到
     # （tui / code / tui×code 交叉面），单跑一两个即漏检。
     run_check "clippy: headless" \
-        cargo clippy -p tiny-agent-core -p tiny-agent --all-targets -- -D warnings
+        cargo clippy --locked -p tiny-agent-core -p tiny-agent --all-targets -- -D warnings
     run_check "clippy: tui" \
-        cargo clippy -p tiny-agent --features tui --all-targets -- -D warnings
+        cargo clippy --locked -p tiny-agent --features tui --all-targets -- -D warnings
     run_check "clippy: code" \
-        cargo clippy -p tiny-agent-core -p tiny-agent --features code --all-targets -- -D warnings
+        cargo clippy --locked -p tiny-agent-core -p tiny-agent --features code --all-targets -- -D warnings
     run_check "clippy: tui,code" \
-        cargo clippy -p tiny-agent --features tui,code --all-targets -- -D warnings
+        cargo clippy --locked -p tiny-agent --features tui,code --all-targets -- -D warnings
 }
 
 group_test() {
     # 带 mock 的命令才真正编到 lib_api.rs（集成测试的 lib 不带 cfg(test)），
     # 不带 mock 会把它编成 0 个测试照样全绿——别嫌慢省掉。
     run_check "test: default" \
-        cargo test -p tiny-agent-core -p tiny-agent
+        cargo test --locked -p tiny-agent-core -p tiny-agent
     run_check "test: core mock" \
-        cargo test -p tiny-agent-core --features mock
+        cargo test --locked -p tiny-agent-core --features mock
     run_check "test: tui,mock" \
-        cargo test -p tiny-agent --features tui,mock
+        cargo test --locked -p tiny-agent --features tui,mock
     run_check "test: code,mock" \
-        cargo test -p tiny-agent-core -p tiny-agent --features code,mock
+        cargo test --locked -p tiny-agent-core -p tiny-agent --features code,mock
 }
 
 group_e2e() {
@@ -78,7 +80,7 @@ group_e2e() {
     # e2e_scenarios.py 自己只在二进制不存在时才 build——这里显式 build 一次，
     # 保证它测的是当前源码而不是上次遗留的 target 产物。
     run_check "build: code" \
-        cargo build --features code
+        cargo build --locked --features code
     # 内置 SSE 场景 mock（线程化、零密钥），走真实 CLI/HTTP 栈守四个 loop 级
     # 行为：打转护栏、并行 task fan-out、SIGINT exit 130、模型路由/批量并发。
     # 改了 loop / 取消 / 打转行为后必跑（CLAUDE.md「离线 / 视觉验证」）。
@@ -104,22 +106,22 @@ group_bench() {
     # 顺手 lint 一遍：bench 的 agent_bench 模块门在 mock 后，四个 CI clippy 配置
     # （都不带 mock）根本看不到它——不在这里补就永远没人 lint。
     run_check "clippy: bench (mock)" \
-        cargo clippy -p tiny-agent-core --features mock --all-targets -- -D warnings
+        cargo clippy --locked -p tiny-agent-core --features mock --all-targets -- -D warnings
     run_check "bench: loop_bench" \
-        cargo bench -p tiny-agent-core --features mock --bench loop_bench -- --quick
+        cargo bench --locked -p tiny-agent-core --features mock --bench loop_bench -- --quick
 }
 
 group_bindings() {
     # 默认不跑：需要 bindings/{python,node} 的依赖环境（maturin / napi），
     # 纯净 checkout 上跑不通。本地装好了再手动 `./scripts/check.sh bindings`。
     run_check "clippy: tiny-agent-py" \
-        cargo clippy -p tiny-agent-py --all-targets -- -D warnings
+        cargo clippy --locked -p tiny-agent-py --all-targets -- -D warnings
     run_check "clippy: tiny-agent-py code" \
-        cargo clippy -p tiny-agent-py --features code --all-targets -- -D warnings
+        cargo clippy --locked -p tiny-agent-py --features code --all-targets -- -D warnings
     run_check "clippy: tiny-agent-node" \
-        cargo clippy -p tiny-agent-node --all-targets -- -D warnings
+        cargo clippy --locked -p tiny-agent-node --all-targets -- -D warnings
     run_check "clippy: tiny-agent-node code" \
-        cargo clippy -p tiny-agent-node --features code --all-targets -- -D warnings
+        cargo clippy --locked -p tiny-agent-node --features code --all-targets -- -D warnings
 }
 
 usage() {

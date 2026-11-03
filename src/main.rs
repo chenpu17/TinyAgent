@@ -218,6 +218,13 @@ fn main() -> Result<()> {
     }
     // CLI overrides for quick A/B runs without editing the config.
     if let Some(m) = cli.model {
+        // Same masking guard as --task "": an explicitly-empty --model would
+        // silently override a non-empty config model, and the run would carry
+        // `"model": ""` all the way to the gateway — failing far from the
+        // root cause (round-2 review R2-P3-1).
+        if m.trim().is_empty() {
+            bail!("--model must not be empty");
+        }
         cfg.model = m;
     }
     if let Some(n) = cli.max_turns {
@@ -676,14 +683,27 @@ fn choose_config_path(
 }
 
 /// `$XDG_CONFIG_HOME/tinyagent/config.json` when `XDG_CONFIG_HOME` is a
-/// non-empty absolute path; otherwise `$HOME/.config/tinyagent/config.json`.
-/// `None` when neither yields a base (e.g. `$HOME` unset). Reads the real
-/// environment; the pure, testable core is `default_config_path_in`.
+/// non-empty absolute path; otherwise `$HOME/.config/tinyagent/config.json`
+/// (falling back to `%USERPROFILE%` when `$HOME` is unset or empty — Windows
+/// native shells don't set `HOME`, and without the fallback the default
+/// config was never found there, round-2 review R2-P3-2). `None` when
+/// neither yields a base. Reads the real environment; the pure, testable
+/// cores are `pick_home` and `default_config_path_in`.
 fn default_config_path() -> Option<PathBuf> {
-    default_config_path_in(
-        std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
-        std::env::var("HOME").ok().as_deref(),
-    )
+    let home_var = std::env::var("HOME").ok();
+    let up_var = std::env::var("USERPROFILE").ok();
+    let home = pick_home(home_var.as_deref(), up_var.as_deref());
+    default_config_path_in(std::env::var("XDG_CONFIG_HOME").ok().as_deref(), home)
+}
+
+/// Which of `$HOME` / `%USERPROFILE%` anchors the default config path:
+/// a non-empty `HOME` wins (Git Bash / MSYS2 custom `HOME` keeps working),
+/// an unset or empty one falls back to `USERPROFILE`; `None` when neither
+/// is usable. Pure so the fallback precedence is pin-able without env
+/// mutation (wave-2 re-review W2-P3-1).
+fn pick_home<'a>(home: Option<&'a str>, user_profile: Option<&'a str>) -> Option<&'a str> {
+    home.filter(|h| !h.is_empty())
+        .or_else(|| user_profile.filter(|h| !h.is_empty()))
 }
 
 fn default_config_path_in(xdg: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
@@ -731,7 +751,7 @@ fn missing_config_error(default: Option<&Path>) -> anyhow::Error {
 mod tests {
     use super::{
         choose_config_path, default_config_path_in, default_tui_mode, is_default_report,
-        is_default_session, next_resumed_id, session_target, Block, Message, TuiDefault,
+        is_default_session, next_resumed_id, pick_home, session_target, Block, Message, TuiDefault,
     };
     use std::path::{Path, PathBuf};
 
@@ -973,6 +993,22 @@ mod tests {
     fn default_path_none_without_home_or_xdg() {
         // No usable XDG and no $HOME → cannot locate a default.
         assert!(default_config_path_in(None, None).is_none());
+    }
+
+    #[test]
+    fn pick_home_prefers_home_then_userprofile() {
+        // W2-P3-1: the USERPROFILE fallback (R2-P3-2) as a pure precedence
+        // pin — a non-empty HOME always wins (Git Bash custom HOME keeps
+        // working), unset/empty HOME falls to USERPROFILE (Windows native
+        // shells), and neither usable → None.
+        assert_eq!(pick_home(Some("/h"), Some("C:\\Users\\u")), Some("/h"));
+        assert_eq!(
+            pick_home(Some(""), Some("C:\\Users\\u")),
+            Some("C:\\Users\\u")
+        );
+        assert_eq!(pick_home(None, Some("C:\\Users\\u")), Some("C:\\Users\\u"));
+        assert_eq!(pick_home(None, Some("")), None);
+        assert_eq!(pick_home(None, None), None);
     }
 
     #[test]

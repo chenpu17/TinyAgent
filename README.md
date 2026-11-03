@@ -53,7 +53,7 @@ The complete programmatic surface — minimal usage, custom tools, custom provid
 
 1. `--config <path>` (explicit; even a missing file is used as-is — you get the read error, not a fallback)
 2. `$TINYAGENT_CONFIG` (used only if non-empty)
-3. `$XDG_CONFIG_HOME/tinyagent/config.json`, otherwise `~/.config/tinyagent/config.json`
+3. `$XDG_CONFIG_HOME/tinyagent/config.json`, otherwise `~/.config/tinyagent/config.json` (`$HOME`-based; on Windows native shells without `$HOME`, `%USERPROFILE%\.config\tinyagent\config.json`)
 
 With your model config in `~/.config/tinyagent/config.json`, just run `tiny-agent --tui` (much like `claude` / `codex`). When no config is found at all, a minimal sample config and its absolute path are printed to get you started.
 
@@ -913,6 +913,7 @@ Process exit codes:
 | `124` | timeout (`timeout`, following the GNU `timeout` convention)|
 | `125` | budget exceeded (`budget_exceeded`, cumulative tokens hit `max_total_tokens`)|
 | `130` | user cancel (`cancelled`, 128 + SIGINT)|
+| `2` | CLI usage error (clap: unknown flag / duplicate flag / missing value)|
 | `1` | anything else (`max_turns_reached` / `max_tokens` / provider errors / `stream_truncated`-family partial streams, …)|
 
 In headless mode `Ctrl-C` is a **graceful cancel**: the first press interrupts between streaming chunks
@@ -1498,11 +1499,11 @@ crates/core/src/  # kernel crate (package tiny-agent-core, lib name tiny_agent):
 ├── lib.rs                (  608)  # lib root: build_agent* / assemble (tool table, ToolCtx, code install, skill injection)
 ├── fsutil.rs             (  463)  # atomic-write primitives (O_EXCL temp + fsync + dir fsync; shared by session/result/report)
 ├── diag.rs               (  168)  # diagnostics channel: global sink installable by GUI hosts (falls back to stderr, byte-identical) — soft-failure warnings of skills/MCP/session/run_code go through it
-├── config.rs             ( 3177)  # config parsing + task-fragment merge + batch override whitelist
+├── config.rs             ( 3181)  # config parsing + task-fragment merge + batch override whitelist
 ├── provider/  # LLM backends
-│   ├── mod.rs                ( 1165)  # shared Message/Block, SSE reader, CancellableSse
+│   ├── mod.rs                ( 1178)  # shared Message/Block, SSE reader, CancellableSse
 │   ├── openai.rs             ( 2388)  # OpenAI-compatible (include_usage; 400 fallbacks: max_tokens→max_completion_tokens / drop stream_options)
-│   ├── openai_review_pins.rs (  982)  # openai review pins (loopback HTTP: status matrix/credential discipline/retry body; ThinkStripper differential + idle timeout)
+│   ├── openai_review_pins.rs (  995)  # openai review pins (loopback HTTP: status matrix/credential discipline/retry body; ThinkStripper differential + idle timeout)
 │   ├── sse_review_pins.rs    (  245)  # SSE parser review pins (chunk-boundary invariance across 17 stream shapes, sync vs worker path)
 │   ├── anthropic.rs          ( 1246)  # Anthropic native (message_start/message_delta usage)
 │   └── mock.rs               (  352)  # scripted Provider for tests (cfg(any(test, feature="mock")))
@@ -1512,7 +1513,7 @@ crates/core/src/  # kernel crate (package tiny-agent-core, lib name tiny_agent):
 ├── compress.rs           (  996)  # compression engine (find_safe_cut / chunked summaries / saturating usage merge + block-level billing primitives)
 ├── context_report.rs     (  886)  # context composition breakdown (ContextBreakdown estimate: 3 system parts / 4 tool classes / message typing + anchor calibration)
 ├── retry.rs              (  158)  # exponential backoff shared by batch --retries and single-run transient retry (±25% jitter against lockstep)
-├── session.rs            (  522)  # session persistence (atomic writes + fold archive)
+├── session.rs            (  533)  # session persistence (atomic writes + fold archive)
 ├── skills.rs             ( 1089)  # three-tier skill loading (built-in / user dir / project)
 ├── hooks.rs              (  301)  # hooks gate (Deny / Modify / audit)
 ├── tools/  # toolset: built-in tools + MCP wrappers + task sub-agent + run_code (feature code)
@@ -1542,20 +1543,20 @@ crates/core/src/  # kernel crate (package tiny-agent-core, lib name tiny_agent):
 └── m0_probes.rs          (  337)  # M0 mechanism probes (cfg(test), #[path]-declared in lib.rs): reserve/settle ledger, shared Provider cell, per-request model routing in-process prototype (A-L2b/2c/9 — reused directly by the M3 llm primitive)
 
 src/  # CLI crate (package tiny-agent, bin tiny-agent): process shell + headless rendering + batch + TUI
-├── main.rs               ( 1029)  # CLI entry + assembly (build_agent) + --session none
+├── main.rs               ( 1065)  # CLI entry + assembly (build_agent) + --session none
 ├── signal.rs             (  123)  # headless SIGINT → cancel (first press graceful / second hard-exit 130)
-├── batch.rs              ( 4013)  # batch tasks + --retries/--failed + report merging
-├── harness.rs            ( 2406)  # headless mode + result.json + NDJSON + exit codes
+├── batch.rs              ( 4046)  # batch tasks + --retries/--failed + report merging
+├── harness.rs            ( 2454)  # headless mode + result.json + NDJSON + exit codes
 ├── harness_tests.rs      ( 1212)  # harness behavior tests (retry ladder / result.json / NDJSON; moved here with harness from the kernel's agent_tests.rs)
 ├── tui.rs                (   20)  # TUI module root (feature tui): mod declarations + public exports (run / transcript_rows)
 └── tui/  # TUI submodules (same tui gate): split from the original 8.7k-line single file by concern
     ├── app.rs                ( 1834)  # session assembly: run entry / worker thread / event & input channels / ui_loop event body / Ctrl-C double-press window
     ├── input.rs              (  361)  # multi-line InputBuffer editor / input history recall / horizontal input scrolling
-    ├── slash.rs              (  543)  # slash commands: classify grammar / read-only replies / completion popup state machine / /context report
+    ├── slash.rs              (  549)  # slash commands: classify grammar / read-only replies / completion popup state machine / /context report
     ├── theme.rs              (  147)  # theme: single source for history-row & chrome colors / light-dark switch TINYAGENT_TUI_THEME / number formatting helpers
     ├── markdown.rs           (  632)  # markdown & ANSI rendering: render_markdown / escape parsing / fence scanning (shared with streaming splits) / MdCache single-slot cache
     ├── transcript.rs         ( 1198)  # conversation Row model and all build/mutation logic: history rendering / streaming increments & incremental splits / /export dump / resume rebuild
     ├── render.rs             (  490)  # terminal drawing: scrollback commit_rows / live-region render / input & status bar chrome / width & control-char utilities
-    └── tests.rs              ( 4143)  # TUI regression tests (TestBackend cell-grid assertions + input / completion / streaming-split logic)
+    └── tests.rs              ( 4164)  # TUI regression tests (TestBackend cell-grid assertions + input / completion / streaming-split logic)
 ```
 <!-- END CODE STRUCTURE -->

@@ -883,7 +883,20 @@ impl SseSource for CancellableSse {
                 Ok(Ok(d)) => return Ok(Some(d)),
                 Ok(Err(msg)) => return Err(StreamAbort::StreamError(msg)),
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(None), // reader ended
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    // The reader can end in the same poll slice a cancel flip
+                    // lands (round-2 review R4-P2-1: flip and EOF inside one
+                    // POLL_SLICE window — exactly the TTFB case wave-2 P1-2
+                    // patched for the abort path). Returning clean EOF here
+                    // without re-sampling lets the caller stamp the zero-data
+                    // truncation diagnosis over a cancelled stream. The
+                    // loop-top check above can't see a flip that lands during
+                    // this recv_timeout window, so re-check on the way out.
+                    if self.cancel.load(Ordering::Relaxed) {
+                        return Err(StreamAbort::Cancelled);
+                    }
+                    return Ok(None); // reader ended
+                }
             }
         }
     }

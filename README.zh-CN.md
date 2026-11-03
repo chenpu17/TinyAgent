@@ -57,7 +57,7 @@ Releases 的 musl 静态产物只带 `code`（无 TUI——「嵌入式低配 Li
 
 1. `--config <path>`(显式;即使文件不存在也直接用它,报读错误而非回落)
 2. `$TINYAGENT_CONFIG`(非空才用)
-3. `$XDG_CONFIG_HOME/tinyagent/config.json`,否则 `~/.config/tinyagent/config.json`
+3. `$XDG_CONFIG_HOME/tinyagent/config.json`,否则 `~/.config/tinyagent/config.json`(基于 `$HOME`;Windows 原生 shell 无 `$HOME` 时用 `%USERPROFILE%\.config\tinyagent\config.json`)
 
 把模型配置放进 `~/.config/tinyagent/config.json` 后,直接 `tiny-agent --tui`
 即可启动(类似 `claude` / `codex`)。首次找不到任何配置时,会打印一个最小
@@ -692,6 +692,7 @@ TinyAgent 的定位是**可审计、可无人值守的 agent 执行单元**—�
 | `124` | 超时（`timeout`，沿用 GNU `timeout` 约定）|
 | `125` | 预算超限（`budget_exceeded`，累计 token 触顶 `max_total_tokens`）|
 | `130` | 用户取消（`cancelled`，128 + SIGINT）|
+| `2` | CLI 用法错误（clap：未知 flag / 重复 flag / 缺值）|
 | `1` | 其它（`max_turns_reached` / `max_tokens` / provider 错误 / `stream_truncated` 族部分流等）|
 
 headless 模式下 `Ctrl-C` 走**优雅取消**：首次 Ctrl-C 在流式 chunk 间（≤200ms）中断，照常写好
@@ -1154,11 +1155,11 @@ crates/core/src/  # kernel crate (package tiny-agent-core, lib name tiny_agent):
 ├── lib.rs                (  608)  # lib root: build_agent* / assemble (tool table, ToolCtx, code install, skill injection)
 ├── fsutil.rs             (  463)  # atomic-write primitives (O_EXCL temp + fsync + dir fsync; shared by session/result/report)
 ├── diag.rs               (  168)  # diagnostics channel: global sink installable by GUI hosts (falls back to stderr, byte-identical) — soft-failure warnings of skills/MCP/session/run_code go through it
-├── config.rs             ( 3177)  # config parsing + task-fragment merge + batch override whitelist
+├── config.rs             ( 3181)  # config parsing + task-fragment merge + batch override whitelist
 ├── provider/  # LLM backends
-│   ├── mod.rs                ( 1165)  # shared Message/Block, SSE reader, CancellableSse
+│   ├── mod.rs                ( 1178)  # shared Message/Block, SSE reader, CancellableSse
 │   ├── openai.rs             ( 2388)  # OpenAI-compatible (include_usage; 400 fallbacks: max_tokens→max_completion_tokens / drop stream_options)
-│   ├── openai_review_pins.rs (  982)  # openai review pins (loopback HTTP: status matrix/credential discipline/retry body; ThinkStripper differential + idle timeout)
+│   ├── openai_review_pins.rs (  995)  # openai review pins (loopback HTTP: status matrix/credential discipline/retry body; ThinkStripper differential + idle timeout)
 │   ├── sse_review_pins.rs    (  245)  # SSE parser review pins (chunk-boundary invariance across 17 stream shapes, sync vs worker path)
 │   ├── anthropic.rs          ( 1246)  # Anthropic native (message_start/message_delta usage)
 │   └── mock.rs               (  352)  # scripted Provider for tests (cfg(any(test, feature="mock")))
@@ -1168,7 +1169,7 @@ crates/core/src/  # kernel crate (package tiny-agent-core, lib name tiny_agent):
 ├── compress.rs           (  996)  # compression engine (find_safe_cut / chunked summaries / saturating usage merge + block-level billing primitives)
 ├── context_report.rs     (  886)  # context composition breakdown (ContextBreakdown estimate: 3 system parts / 4 tool classes / message typing + anchor calibration)
 ├── retry.rs              (  158)  # exponential backoff shared by batch --retries and single-run transient retry (±25% jitter against lockstep)
-├── session.rs            (  522)  # session persistence (atomic writes + fold archive)
+├── session.rs            (  533)  # session persistence (atomic writes + fold archive)
 ├── skills.rs             ( 1089)  # three-tier skill loading (built-in / user dir / project)
 ├── hooks.rs              (  301)  # hooks gate (Deny / Modify / audit)
 ├── tools/  # toolset: built-in tools + MCP wrappers + task sub-agent + run_code (feature code)
@@ -1198,20 +1199,20 @@ crates/core/src/  # kernel crate (package tiny-agent-core, lib name tiny_agent):
 └── m0_probes.rs          (  337)  # M0 mechanism probes (cfg(test), #[path]-declared in lib.rs): reserve/settle ledger, shared Provider cell, per-request model routing in-process prototype (A-L2b/2c/9 — reused directly by the M3 llm primitive)
 
 src/  # CLI crate (package tiny-agent, bin tiny-agent): process shell + headless rendering + batch + TUI
-├── main.rs               ( 1029)  # CLI entry + assembly (build_agent) + --session none
+├── main.rs               ( 1065)  # CLI entry + assembly (build_agent) + --session none
 ├── signal.rs             (  123)  # headless SIGINT → cancel (first press graceful / second hard-exit 130)
-├── batch.rs              ( 4013)  # batch tasks + --retries/--failed + report merging
-├── harness.rs            ( 2406)  # headless mode + result.json + NDJSON + exit codes
+├── batch.rs              ( 4046)  # batch tasks + --retries/--failed + report merging
+├── harness.rs            ( 2454)  # headless mode + result.json + NDJSON + exit codes
 ├── harness_tests.rs      ( 1212)  # harness behavior tests (retry ladder / result.json / NDJSON; moved here with harness from the kernel's agent_tests.rs)
 ├── tui.rs                (   20)  # TUI module root (feature tui): mod declarations + public exports (run / transcript_rows)
 └── tui/  # TUI submodules (same tui gate): split from the original 8.7k-line single file by concern
     ├── app.rs                ( 1834)  # session assembly: run entry / worker thread / event & input channels / ui_loop event body / Ctrl-C double-press window
     ├── input.rs              (  361)  # multi-line InputBuffer editor / input history recall / horizontal input scrolling
-    ├── slash.rs              (  543)  # slash commands: classify grammar / read-only replies / completion popup state machine / /context report
+    ├── slash.rs              (  549)  # slash commands: classify grammar / read-only replies / completion popup state machine / /context report
     ├── theme.rs              (  147)  # theme: single source for history-row & chrome colors / light-dark switch TINYAGENT_TUI_THEME / number formatting helpers
     ├── markdown.rs           (  632)  # markdown & ANSI rendering: render_markdown / escape parsing / fence scanning (shared with streaming splits) / MdCache single-slot cache
     ├── transcript.rs         ( 1198)  # conversation Row model and all build/mutation logic: history rendering / streaming increments & incremental splits / /export dump / resume rebuild
     ├── render.rs             (  490)  # terminal drawing: scrollback commit_rows / live-region render / input & status bar chrome / width & control-char utilities
-    └── tests.rs              ( 4143)  # TUI regression tests (TestBackend cell-grid assertions + input / completion / streaming-split logic)
+    └── tests.rs              ( 4164)  # TUI regression tests (TestBackend cell-grid assertions + input / completion / streaming-split logic)
 ```
 <!-- END CODE STRUCTURE -->

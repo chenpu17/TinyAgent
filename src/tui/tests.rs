@@ -1053,6 +1053,27 @@ fn slash_help_reply_is_a_multiline_list() {
     assert!(help.lines().any(|l| l.starts_with("  /export")));
 }
 
+#[test]
+fn slash_model_reply_redacts_url_userinfo() {
+    // Round-2 review (R2-IMP-1 promoted): `/model` echoes base_url — a
+    // `https://user:pass@host` endpoint must not put the password on screen.
+    // Same credential-display discipline as every other URL surface.
+    let cfg: Config = serde_json::from_str(
+        r#"{"provider":"anthropic","api_key_env":"K","model":"m",
+            "base_url":"https://alice:s3cret@example.com/v1"}"#,
+    )
+    .unwrap();
+    let reply = slash_reply(&SlashCmd::Model, &cfg);
+    assert!(
+        reply.contains("https://***@example.com/v1"),
+        "userinfo must be masked: {reply:?}"
+    );
+    assert!(
+        !reply.contains("alice") && !reply.contains("s3cret"),
+        "credential fragments must not survive: {reply:?}"
+    );
+}
+
 /// Hand-built breakdown for the render tests — numbers chosen so the
 /// sections, bars, percentages and the window line all have something
 /// to show.

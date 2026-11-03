@@ -93,7 +93,13 @@ pub(super) fn slash_reply(cmd: &SlashCmd, cfg: &Config) -> String {
             cfg.model,
             cfg.provider,
             cfg.max_tokens,
-            cfg.base_url.as_deref().unwrap_or("(default)"),
+            // Same credential-display discipline as every other URL surface:
+            // a `https://user:pass@host` base_url echoed raw into the TUI
+            // would put the password on screen (round-2 review).
+            cfg.base_url
+                .as_deref()
+                .map(|u| tiny_agent::config::redact_url_credentials(u).into_owned())
+                .unwrap_or_else(|| "(default)".to_string()),
         ),
         SlashCmd::Limits => format!(
             "limits: max_turns {} · timeout_secs {}",

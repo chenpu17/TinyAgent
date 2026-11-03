@@ -362,7 +362,11 @@ impl fmt::Debug for McpServerConfig {
 /// debuggability. A direct dependency plus that drift for ~15 lines of
 /// bounded scanning is the worse trade; every slice below lands on a
 /// separator the scan itself found, so the function cannot panic.
-pub(crate) fn redact_url_credentials(url: &str) -> Cow<'_, str> {
+///
+/// `pub` (round-2 review: the CLI's `/model` slash reply prints `base_url`
+/// and must run it through the same mask — credential-display discipline
+/// belongs to every surface that echoes a URL, not only Debug prints).
+pub fn redact_url_credentials(url: &str) -> Cow<'_, str> {
     // No `scheme://` → no authority to scan (relative refs, `localhost:8080`,
     // garbage): display verbatim — the untrusted-input fallback IS display.
     let Some(scheme_end) = url.find("://") else {

@@ -954,9 +954,22 @@ fn zero_payload_cancel_abort_carries_no_truncation_diagnosis() {
             } else {
                 // TTFB-window flip: the cancel arrives while the stream is
                 // still open (no EOF yet), so the abort is Cancelled, not a
-                // clean end.
+                // clean end. The store STRICTLY precedes the EOF and the gap
+                // is 5ms — well inside one POLL_SLICE (200ms). Routing
+                // analysis (wave-2 re-review W2-P2-1): with the fix, EVERY
+                // route yields Cancelled — the consumer's current recv slice
+                // is interrupted by the early Disconnected (arm re-samples
+                // the flag), or a slice boundary lands first (loop-top check
+                // sees the flag); either way the pin cannot flake. Without
+                // the Disconnected-arm re-sample, the early-EOF route
+                // (usually taken: EOF lands inside the running slice)
+                // returns clean EOF → truncation → FAIL, which is what makes
+                // this pin a mutation killer. Honest bound: if a slice
+                // boundary happens to fall inside the 5ms window (~2.5% of
+                // runs), the loop-top route masks the mutation — repeat runs
+                // drive the escape probability to zero.
                 self.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
-                std::thread::sleep(Duration::from_millis(200));
+                std::thread::sleep(Duration::from_millis(5));
                 Ok(0)
             }
         }

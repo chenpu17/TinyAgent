@@ -406,18 +406,29 @@ mod tests {
         // A future-version file is unreadable here but valid for the binary
         // that wrote it — same preservation as garbage: rename aside (not
         // left in place for the next save to clobber), then fresh start.
+        // Built from a real save() with only the version bumped: hand-writing
+        // the provider wire shape ({"type":"text",…}) for the messages fails
+        // serde parse → the corrupt branch runs and the version branch is
+        // never reached (round-2 review R1-P3-1: the test stayed green while
+        // pinning the wrong branch). Deriving the payload from the real
+        // serializer keeps this on the version branch even if the message
+        // format evolves.
         let dir = std::env::temp_dir().join(format!("ta-future-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("s.json");
-        let raw = serde_json::json!({
-            "version": 9999,
-            "model": "m",
-            "messages": [
-                {"role": "user", "content": [{"type": "text", "text": "from the future"}]}
-            ]
-        })
-        .to_string();
-        std::fs::write(&path, &raw).unwrap();
+        save(
+            &path,
+            "m",
+            &[Message::user(vec![Block::Text("from the future".into())])],
+        )
+        .unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let bumped = raw.replace(
+            &format!("\"version\": {SESSION_VERSION}"),
+            "\"version\": 9999",
+        );
+        assert_ne!(bumped, raw, "version bump must land in the payload");
+        std::fs::write(&path, &bumped).unwrap();
         assert!(
             load(&path).unwrap().is_none(),
             "future version → fresh start"
@@ -426,7 +437,7 @@ mod tests {
         let kept = dir.join("s.json.corrupt");
         assert_eq!(
             std::fs::read_to_string(&kept).unwrap(),
-            raw,
+            bumped,
             "preserved copy keeps the future-version payload verbatim"
         );
         std::fs::remove_dir_all(&dir).ok();

@@ -924,11 +924,14 @@ fn run_error_to_napi(e: &ta::RunError) -> Error {
 }
 
 /// Spawn `work` on a dedicated thread and wire its result into `deferred`:
-/// Ok(value) resolves, Err rejects, and a PANIC rejects too (debug builds —
-/// release is `panic = "abort"`, where no unwinding happens at all) so the
-/// JS side is never left with an unsettled Promise. The 8 MiB stack matches
-/// the libuv worker default the AsyncTask shape used to run on, keeping
-/// headroom for deep JSON (de)serialization and provider call chains.
+/// Ok(value) resolves, Err rejects, and a PANIC rejects too (any build with
+/// unwinding: debug, and release as CI ships it — release.yml pins
+/// `CARGO_PROFILE_RELEASE_PANIC: unwind` so the catch_unwind keeps working
+/// in published artifacts; only a plain local `cargo build --release`
+/// without that env compiles panic=abort, where nothing can be caught) so
+/// the JS side is never left with an unsettled Promise. The 8 MiB stack
+/// matches the libuv worker default the AsyncTask shape used to run on,
+/// keeping headroom for deep JSON (de)serialization and provider call chains.
 ///
 /// Generic over the settled value: `run` / `chat` / `compact` settle with an
 /// [`Outcome`] (a pre-serialized JSON `Value`), the async constructor

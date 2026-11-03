@@ -781,7 +781,8 @@ pub fn run(
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."))
         .join("results");
-    std::fs::create_dir_all(&results_dir)?;
+    std::fs::create_dir_all(&results_dir)
+        .with_context(|| format!("cannot create results dir {}", results_dir.display()))?;
     // Account the bad fragments: terminal result file (same single exit as
     // every other pre-run failure) + a TaskReport seeded into the report
     // mutex so report.json and the summary count them. Zero turns, zero
@@ -1092,7 +1093,14 @@ fn run_one_attempt(
     // RFC 3339 start-of-TASK timestamp (not per-attempt): retries of one task
     // share the task's start, so the bill attributes to when work began.
     started_at: &str,
-) -> TaskReport {
+    // Returns (report, config_fingerprint). The fingerprint is None only for
+    // terminals that never built an agent (bad_task / setup_error — the same
+    // "no effective config ran" contract as their results files); once built,
+    // it rides down to run_one so the backoff-cancel terminal's rewritten
+    // results file keeps the fingerprint too (round-2 review R1-P2-1: the
+    // hardcoded None there contradicted the README contract that puts
+    // "cancel during backoff" in the fingerprint-mandatory set).
+) -> (TaskReport, Option<String>) {
     let start = std::time::Instant::now();
     // `usage` is the token cost to bill this report. bad_task burns nothing
     // (zero, turns=0); setup_error bills the accumulated cost when it hits a
@@ -1162,7 +1170,8 @@ fn run_one_attempt(
         );
         let mut r = bad(stop, msg, &acc.usage, acc.turns);
         r.model = model;
-        r
+        // Never built an agent (checked above) — no fingerprint, per contract.
+        (r, None)
     };
 
     let mut cfg = base.clone();
@@ -1255,7 +1264,7 @@ fn run_one_attempt(
             // set_hooks，该 stop_reason 在 batch 里不可达；哪天批处理获得
             // 钩子面，先定这里的口径再放开。
             let success = error.is_none() && o.stop_reason == "end_turn";
-            TaskReport {
+            let report = TaskReport {
                 name: name.into(),
                 success,
                 stop_reason: o.stop_reason,
@@ -1268,7 +1277,10 @@ fn run_one_attempt(
                 cache_read_input_tokens: o.cache_read_input_tokens,
                 model: meta.model.clone(),
                 started_at: meta.started_at.clone(),
-            }
+            };
+            // Agent built (pre-run meta stamped it) — hand the fingerprint to
+            // run_one for any post-attempt terminal rewrite (R1-P2-1).
+            (report, meta.config_fingerprint.clone())
         }
         Err(re) => {
             // This attempt failed transiently, but it already burned tokens
@@ -1327,7 +1339,10 @@ fn run_one_attempt(
             // fail before apply). This run happened after `cfg.apply`, so a
             // fragment's model override must own the bill even on failure.
             r.model = meta.model.clone();
-            r
+            // Agent built — the fingerprint rides down even though the run
+            // failed transiently (the next attempt may be cancelled during
+            // backoff, and its rewritten results file keeps attribution).
+            (r, meta.config_fingerprint.clone())
         }
     }
 }
@@ -1484,7 +1499,9 @@ fn run_one(
     // attempt, so each failed attempt's tokens/tools can only be recovered via
     // the RunError it returns — accumulate here and fold into the final result.
     let mut acc = RunCost::default();
-    let mut report = run_one_attempt(
+    // The built agent's fingerprint rides down from every attempt (R1-P2-1):
+    // None until an attempt gets as far as building the agent.
+    let (mut report, mut attempt_fp) = run_one_attempt(
         base,
         name,
         &partial,
@@ -1531,7 +1548,12 @@ fn run_one(
                     provider: base.provider.as_str().to_string(),
                     started_at: started_at.clone(),
                     code: None,
-                    config_fingerprint: None,
+                    // R1-P2-1: an agent DID build (the failed attempt ran
+                    // for real), so the fingerprint-mandatory contract
+                    // applies here too — carry it down from the attempt
+                    // instead of the old hardcoded None that contradicted
+                    // the README's "cancel during backoff" row.
+                    config_fingerprint: attempt_fp.clone(),
                 },
             );
             report = TaskReport {
@@ -1558,7 +1580,7 @@ fn run_one(
             break;
         }
         attempt += 1;
-        report = run_one_attempt(
+        let (r, fp) = run_one_attempt(
             base,
             name,
             &partial,
@@ -1569,6 +1591,8 @@ fn run_one(
             cancel,
             &started_at,
         );
+        report = r;
+        attempt_fp = fp;
     }
     // run_one_attempt stamps per-attempt elapsed; overwrite with the total
     // across attempts + backoffs so report.json reflects real wall cost.
@@ -2543,6 +2567,15 @@ mod tests {
             "results file: {raw}"
         );
         assert_eq!(v["attempts"].as_u64().unwrap(), 1);
+        // R1-P2-1: the rewritten cancelled terminal keeps the fingerprint —
+        // attempt 1 got as far as building the agent (it ran and failed on
+        // the request), so the fingerprint-mandatory contract covers
+        // "cancel during backoff" too; the old hardcoded None contradicted
+        // the README row that puts this terminal in the always-present set.
+        assert!(
+            v["config_fingerprint"].is_string(),
+            "cancelled-during-backoff results file must carry config_fingerprint: {raw}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -259,3 +259,29 @@ napi 的 TSFN 会让 libuv 句柄常驻，脚本自然结束后**不会自行退
 **`runCode` 开关**（绑定默认不带 `code` feature，`npm run build -- --features code` 编入）：`a.enableCode()`
 / `a.disableCode()` 运行期开关、`a.setCodeConfig({...})` 整包替换 code 配置（对象形状同配置文件的
 `code` 节，未知键报错、缺省键重置为默认值）。未编入该 feature 时三个方法返回带重建提示的明确错误。
+
+**绑定层语义边界**（round-2 外评审 R3 定版，两侧对照实测）：
+
+- **数值契约不对称**：自定义 provider 返回的 `usage` 数字，Python 侧走 PyO3 i64 门——`2^53+1`
+  也能精确送达；Node 侧 napi 数值是 f64，超过 `u32::MAX`（约 42.9 亿）的整数会被 serde 当浮点
+  拒进 u64（`"invalid type: floating point … expected u64"`），**整个 run 失败**。内置 HTTP
+  provider 不经此路径（usage 来自响应体 JSON 文本直解，u64 全域可用）；只有宿主自建 provider
+  喂超天量 usage 才会撞上——两侧接受集合按平台现实记录在案，不为假想消费方抹平。
+- **事件回调同步性不对称**：Python `on_event` 在 GIL 内**同步**执行、阻塞 run——回调内调
+  cancel 是确定性的（`TurnStart` 里翻 → 走 pre-POST 诚实成本信封；流中翻 → 优雅
+  `stop_reason: "cancelled"`）。Node 侧 TSFN **异步投递不等待**——同一探针三连跑出现竞态，
+  回调内 cancel 是 best-effort；需要「回调看到 X 就停」的强因果请用 Python 形态或改在回调外决策。
+- **宿主输入的 schema 深度**：内核对**模型侧**流式解析有 128 层深度限制，但**宿主传入**的工具
+  定义 JSON 没有对应防线——200k 层深嵌套的 Tool schema 会让 Python 进程原生栈溢出
+  （`0xC00000FD`，PyO3 捕不到）或 Node V8 fatal abort，两侧均不可捕获。输入源是宿主自身
+  （自伤级），修复需要边界深度巡检 + 全链路迭代化，记账待真实需求出现再做；宿主请自行约束
+  传入 schema 的嵌套深度。
+- **转发缺口全清单**（在 `on_turn_stopping` / `inject_note` / `set_tool_absent_notes` /
+  history seeding 四项挂账之外，两侧对称还缺 19 项，wave-2 复审核实）：`provider` /
+  `config_fingerprint` / `limits` / `system_prompt` / `tool_names` / `tool_defs` /
+  `cancelled` / `code_audit` / `set_shutdown` / `clear_messages` / `enable_session`(+archive)
+  / `set_code_tool` / `SUPERVISOR_NOTE_MARKER` / `extract_plan` / `preview` /
+  `numeric_id_suffix` / `ends_with_user` / `supervisor_handle`（连带
+  `SupervisorHandle::drain_pending`）——**session 持久化与监督者旁注注入面在绑定侧目前完全
+  不可达**。`gateway_fixes` / `strip_think_tags` / `tool_absent_notes` / `salvage` 经 serde
+  纯透传，两侧零代码对称无缺口。

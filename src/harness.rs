@@ -1700,6 +1700,54 @@ mod tests {
     }
 
     #[test]
+    fn write_result_failure_path_carries_config_fingerprint_exactly_when_present() {
+        // Round-2 review R4-P3-2: the FR-4 contract says the fingerprint is an
+        // always-present ledger key on every terminal whose run got as far as
+        // building the agent — failed runs included (503 ladder, request_error,
+        // cancel-during-backoff) — and absent only on the attribution-empty
+        // terminals (bad_task / never-started / panic). The None-outcome
+        // branch carried that field with zero test coverage (its fix landed
+        // after the last pin batch; a revert of the branch compiled clean,
+        // proving no pin would have caught its removal). Both sides here:
+        let dir = std::env::temp_dir().join(format!("ta-res-fp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Failed run WITH an attribution meta (agent built): key present.
+        let mut built = meta();
+        built.config_fingerprint = Some("d17708fd5e031791".into());
+        let fpath = dir.join("failed-fp.json");
+        write_result(&fpath, None, Some("provider 503"), 1, "error", None, &built).unwrap();
+        let f: Value = serde_json::from_str(&std::fs::read_to_string(&fpath).unwrap()).unwrap();
+        assert_eq!(f["success"], false);
+        assert_eq!(
+            f["config_fingerprint"], "d17708fd5e031791",
+            "failure whose agent built keeps the fingerprint"
+        );
+
+        // Attribution-empty terminal (meta with no fingerprint — bad_task /
+        // never-started / panic): key absent entirely, not null.
+        let npath = dir.join("failed-nofp.json");
+        write_result(
+            &npath,
+            None,
+            Some("worker panic"),
+            0,
+            "panic",
+            None,
+            &meta(),
+        )
+        .unwrap();
+        let n: Value = serde_json::from_str(&std::fs::read_to_string(&npath).unwrap()).unwrap();
+        assert!(
+            n.get("config_fingerprint").is_none(),
+            "attribution-empty terminal must OMIT the key, not write null: {}",
+            n
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn exit_code_distinguishes_outcomes() {
         assert_eq!(exit_code_for("end_turn"), 0);
         assert_eq!(exit_code_for("timeout"), 124);

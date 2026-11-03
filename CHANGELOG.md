@@ -97,6 +97,56 @@
 
 ### Fixed
 
+- **2026-11-03 外部对抗评审 round-2（4 位新评审分片：持久化/批处理、TUI/CLI/config、bindings FFI、钉子质量变异测试+CI 复核）**：
+  - **SSE 零数据流 cancel 残余竞态（评审 R4-P2-1，变异测试顺带实锤钉子 flake）**：`CancellableSse::
+    next_payload` 的 `Disconnected` 臂不回采样 cancel flag——TTFB 窗口内 cancel 翻转与流 EOF 落进同一
+    poll 切片时，被当 clean-EOF 标成 `stream_truncated` 并把「gateway returned a non-streaming body?」
+    假指控塞进历史（wave-2 P1-2 要堵的 abort 路径的更窄残余）。现在该臂出闸前重查 flag；配套钉子
+    （flip 与 EOF 的间隔从 1×POLL_SLICE 加宽到 2×）消除编译负载下的 flaky FAIL（空载 6 连跑全绿、
+    负载下实锤 FAIL 2 次）。该臂的亚切片窗口黑盒不可确定性触达，产品侧属防御纵深、钉子钉可观测契约
+    （两侧注释均已写明）。
+  - **batch 退避中取消丢 `config_fingerprint`（评审 R1-P2-1）**：run_one 的退避取消终态硬编码
+    `config_fingerprint: None` 覆盖掉 attempt 刚写下的带指纹记录，违背 README「cancel during backoff
+    在指纹必在集合」的契约（单跑同场景指纹恒在，batch 不对称）。`run_one_attempt` 现在把构建过的
+    agent 指纹顺流回 run_one（`(TaskReport, Option<String>)`，未达构建的终态仍 None），既有
+    cancel_during_retry_backoff 钉子补指纹断言。
+  - **`--model ""` 静默掩盖（评审 R2-P3-1）**：空串会压掉配置文件里的非空 model，请求体带
+    `"model": ""` 打到网关才失败——补与 `--task ""` 同款的显式拒绝（anyhow bail，exit 1）。
+  - **Windows 原生 shell（无 `$HOME`）默认配置永不命中（评审 R2-P3-2）**：`%USERPROFILE%\.config\
+    tinyagent\config.json` 存在也找不到，报错指引的 `~/.config/...` 同样无效。`default_config_path`
+    在 `HOME` 未设/空时回落 `USERPROFILE`（HOME 优先，Git Bash 自定义 HOME 行为不变）。
+  - **TUI `/model` 回显未脱敏（评审 R2-IMP-1 升格修）**：斜杠命令把原始 `base_url`（可能含
+    `user:pass@host` userinfo）打上屏——`redact_url_credentials` 由 `pub(crate)` 转 `pub`
+    （additive），回显统一过脱敏，与全库凭据显示纪律对齐。
+  - **batch results 目录创建失败裸报错（评审 R1-P3-2）**：`os error 183` 无路径提示——补
+    `cannot create results dir <path>` context。
+  - **node 绑定注释与 release.yml 矛盾（评审 R3-3）**：lib.rs 称「release panic=abort、catch_unwind
+    全失效」，实际发布产物经 `CARGO_PROFILE_RELEASE_PANIC: unwind` 构建（Promise reject 生效），
+    仅本地裸 release 构建 abort——注释改述真实形态。
+  - **测试/门禁修正**：①session future_version 测试此前手写 provider 线格式（`{"type":"text"}`），
+    文件在 serde parse 就炸走 corrupt 分支，**版本分支从未被执行**（评审 R1-P3-1，测试绿但钉错
+    分支）——改由真实 `save()` 产物仅顶版本号派生；②失败 run 指纹修复（上轮 C-F1）零测试覆盖
+    （评审 R4-P3-2：revert 后编译干净即无独立钉的反证）——harness 补双侧钉（带归属必在 /
+    归属空缺席键非 null）；③`check.sh` 九条 cargo 命令补 `--locked`（评审 R4-P3-1：脚本自称与
+    ci.yml「逐字一致」的分叉重新打开；本地-only 的 bench/bindings 组同步补齐）。
+  - **文档对账**：双语 README 退出码表补 clap 用法错误 `exit 2` 行（实测未知/重复 flag 均为 2）；
+    `docs/lib_api.md` 绑定语义边界四条定版——自定义 provider usage 数值契约不对称（Python i64 门
+    2^53+1 精确送达 vs Node napi f64 超 `u32::MAX` 整 run 失败）、事件回调同步性不对称（Python
+    GIL 内同步阻塞 run / Node TSFN 异步 best-effort）、宿主传入 schema 深度无防线（200k 层嵌套
+    两侧原生栈溢出不可捕获，模型侧 128 层限制不覆盖宿主输入）、转发缺口全清单（挂账四项之外两侧
+    对称再缺 16 项，session 持久化绑定侧完全不可达）。
+  - 仅记账（评审报告留存）：退避取消/panic 覆写 results 文件抹上一 attempt 完整归因（合并优于覆盖，
+    指纹部分本轮已修）；Windows 保留设备名任务名（`con.json`）跨平台批目录告警；合法 JSON 掐头
+    历史静默载入（威胁模型已文档化）；node MCP 子进程回收依赖 V8 GC；核心 panic 后 node 同步方法
+    永久误报 busy（PoisonError 映射）等。变异实验矩阵：14 根修复关键钉 revert 全 FAIL→恢复 PASS，
+    零无效钉。
+  - **Wave-2 复核（REQUEST-CHANGES → 返工后 APPROVE）**：①W2-P2-1——零载荷 cancel 钉子加宽到
+    2×POLL_SLICE 后全程走 loop-top 检查，revert Disconnected 臂回采样变异仍 PASS（产品修复无钉，
+    复核员 r5 探针实锤该臂可小间隔确定性触达）；钉子改 5ms 小间隔形态（EOF 落在当前 recv 切片内，
+    修复在位时全路由均 Cancelled 不 flake；注释写明 ~2.5% 边界逃逸概率与重复跑归零论证），变异实测
+    revert 8/8 FAIL、恢复 3/3 PASS。②W2-P3-1——USERPROFILE fallback 抽成纯函数 `pick_home` 补
+    优先级钉（HOME 非空恒赢/空串回落/双无 None），双语 README 配置查找序同步新语义。③W2-P3-2——
+    转发缺口清单漏 `ends_with_user` / `supervisor_handle`（连带 `drain_pending`），16→19 项更正。
 - **2026-11-03 外部对抗评审修复**（4 位独立评审 subagent 分片深审内核循环 / provider 流式 / CLI+文档对账 /
   bindings+构建+CI，全部动态验证；钉子 34 根转正：`tests/kernel_review_pins.rs` 12 根、
   `provider/sse_review_pins.rs` 5 根、`provider/openai_review_pins.rs` 17 根（含 wave-2 返工钉））：
