@@ -147,6 +147,11 @@
     revert 8/8 FAIL、恢复 3/3 PASS。②W2-P3-1——USERPROFILE fallback 抽成纯函数 `pick_home` 补
     优先级钉（HOME 非空恒赢/空串回落/双无 None），双语 README 配置查找序同步新语义。③W2-P3-2——
     转发缺口清单漏 `ends_with_user` / `supervisor_handle`（连带 `drain_pending`），16→19 项更正。
+  - **CI 追加**：macos arm64 节流 runner（capacity constraints）上 plain 组首次实跑——round-1 idle 钉
+    的 `elapsed < 5s` 天花板（idle=1s，容差 4s）被测试线程失速击穿，exit 101 假红（ubuntu/windows/
+    本地 4 核压力全绿，无日志权限无法点名具体测试；该钉是回归 delta 内唯一带硬时限断言者）。天花板
+    放宽到 15s——意图不变（mock 停摆 60s，检测「abort 贴近 idle 而非跑满停摆」的语义对任何 ≤60s 的
+    天花板都成立）；batch 的 4 处 `elapsed < 2s`「不进退避梯」天花板即断言、且属存量绿测试，刻意不动。
 - **2026-11-03 外部对抗评审修复**（4 位独立评审 subagent 分片深审内核循环 / provider 流式 / CLI+文档对账 /
   bindings+构建+CI，全部动态验证；钉子 34 根转正：`tests/kernel_review_pins.rs` 12 根、
   `provider/sse_review_pins.rs` 5 根、`provider/openai_review_pins.rs` 17 根（含 wave-2 返工钉））：

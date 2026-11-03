@@ -901,9 +901,15 @@ fn idle_timeout_aborts_stream_labels_stream_idle_and_keeps_partial() {
     );
     let started = std::time::Instant::now();
     let second = src.next_payload();
+    // Ceiling 15s (not a tight ~5s): the pin's job is to prove the abort
+    // fires near idle (1s) INSTEAD of the mock's 60s stall — any ceiling
+    // well under 60s keeps that meaning, and the wide slack tolerates a
+    // heavily throttled CI runner starving this test thread for seconds
+    // (macos arm64 capacity-constrained runners: observed as a CI-only
+    // flake, exit 101, never reproducible locally under synthetic load).
     assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "idle must fire near 1s"
+        started.elapsed() < Duration::from_secs(15),
+        "idle must fire near 1s, not run toward the 60s mock stall"
     );
     match second {
         Err(super::StreamAbort::IdleTimeout) => {}
