@@ -1524,7 +1524,7 @@ crates/core/src/  # kernel crate (package tiny-agent-core, lib name tiny_agent):
 ├── hooks.rs              (  335)  # hooks gate (Deny / Modify / audit)
 ├── tools/  # toolset: built-in tools + MCP wrappers + task sub-agent + run_code (feature code)
 │   ├── mod.rs                ( 1573)  # Tool trait + ToolCtx + CallbackTool/SharedTool + whitelist assembly
-│   ├── shell.rs              ( 1297)  # shell tool (unix: sh -c; Windows: cmd /C + raw_arg verbatim command passing, defeating std quoting)
+│   ├── shell.rs              ( 1305)  # shell tool (unix: sh -c; Windows: cmd /C + raw_arg verbatim command passing, defeating std quoting)
 │   ├── file.rs               ( 1672)  # read_file / write_file / edit_file / list_dir
 │   ├── image.rs              (   87)  # load_image tool
 │   ├── document.rs           (  100)  # PDF → Block::Document loading (lib API load_document_block)

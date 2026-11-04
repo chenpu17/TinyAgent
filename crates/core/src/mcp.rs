@@ -2420,7 +2420,7 @@ mod tests {
         let err = recv_cancelable(&rx, "tools/call", Some(&cancel)).unwrap_err();
         assert!(err.to_string().contains("cancelled"), "err: {err}");
         assert!(
-            t0.elapsed() < Duration::from_secs(5),
+            t0.elapsed() < Duration::from_secs(15),
             "cancel must land within a slice, took {:?}",
             t0.elapsed()
         );
@@ -2478,7 +2478,7 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("timed out"), "{msg}");
         assert!(
-            t0.elapsed() < Duration::from_secs(5),
+            t0.elapsed() < Duration::from_secs(15),
             "must give up near the 150ms deadline, took {:?}",
             t0.elapsed()
         );
@@ -2497,7 +2497,7 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("cancelled"), "{msg}");
         assert!(
-            t0.elapsed() < Duration::from_secs(5),
+            t0.elapsed() < Duration::from_secs(15),
             "cancel must land within ~a slice, took {:?}",
             t0.elapsed()
         );
@@ -2550,7 +2550,7 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("cancelled"), "err: {err}");
         assert!(
-            t0.elapsed() < Duration::from_secs(5),
+            t0.elapsed() < Duration::from_secs(15),
             "must unblock within ~a slice, took {:?}",
             t0.elapsed()
         );

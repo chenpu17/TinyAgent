@@ -1194,8 +1194,13 @@ mod tests {
             "reclaim note missing: {}",
             out.content
         );
+        // 15s ceiling (round-3 CI follow-up, e1448dc 同款): normal run is
+        // ~grace(2s)+spawn on a healthy runner; a REGRESSION holds the full
+        // 60s sleep — any ceiling well under that keeps the pin's power,
+        // while fresh-runner stalls (ubuntu-26 migration, cold JVM/AV scans)
+        // need headroom above 6s.
         assert!(
-            start.elapsed() < Duration::from_secs(6),
+            start.elapsed() < Duration::from_secs(15),
             "took {:?}",
             start.elapsed()
         );
@@ -1288,8 +1293,11 @@ mod tests {
             "stdout is stuck in the held pipe and must be reported lost: {}",
             out.content
         );
+        // 15s ceiling (round-3 CI follow-up, e1448dc 同款): normal ≈ two
+        // graces (4s) + spawn; a regression hangs on the held pipe — well
+        // past 15s. Fresh-runner stall headroom.
         assert!(
-            start.elapsed() < Duration::from_secs(8),
+            start.elapsed() < Duration::from_secs(15),
             "two graces (2s+2s) + spawn, took {:?}",
             start.elapsed()
         );
