@@ -69,12 +69,13 @@ fn rename_into_place(tmp: &Path, path: &Path) -> std::io::Result<()> {
             // copy in atomic_write), and the rename moves the tmp's
             // attributes onto the target — overwriting keeps the read-only
             // bit, just as unix keeps the replaced file's mode.
+            let mut cleared_readonly = false;
             if first.raw_os_error() == Some(ERROR_ACCESS_DENIED) {
                 if let Ok(meta) = std::fs::metadata(path) {
                     let mut perms = meta.permissions();
                     if perms.readonly() {
                         perms.set_readonly(false);
-                        let _ = std::fs::set_permissions(path, perms);
+                        cleared_readonly = std::fs::set_permissions(path, perms).is_ok();
                     }
                 }
             }
@@ -84,6 +85,19 @@ fn rename_into_place(tmp: &Path, path: &Path) -> std::io::Result<()> {
                 match std::fs::rename(tmp, path) {
                     Ok(()) => return Ok(()),
                     Err(e) => last = e,
+                }
+            }
+            // Every retry failed: the write didn't happen, so the target
+            // must not silently lose its read-only bit (round-3 review
+            // R2-05 — the attribute was ours to borrow, not to keep).
+            // Best-effort again: the file may now be held even harder; if
+            // the restore fails there is nothing more to do and `last` —
+            // the rename's own error — stays the reported failure.
+            if cleared_readonly {
+                if let Ok(meta) = std::fs::metadata(path) {
+                    let mut perms = meta.permissions();
+                    perms.set_readonly(true);
+                    let _ = std::fs::set_permissions(path, perms);
                 }
             }
             Err(last)

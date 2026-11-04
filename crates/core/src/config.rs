@@ -610,6 +610,53 @@ fn default_deny_paths() -> Vec<String> {
     .collect()
 }
 
+/// Which of `$HOME` / `%USERPROFILE%` anchors "~" for the default config and
+/// global-skills paths: a non-empty `HOME` wins (Git Bash / MSYS2 custom
+/// `HOME` keeps working), an unset or empty one falls back to `USERPROFILE`;
+/// `None` when neither is usable. Pure so the fallback precedence is pin-able
+/// without env mutation (round-2 wave-2 W2-P3-1). Moved here from the CLI's
+/// `main.rs` in round-3 (review R2-02) so the skills side shares ONE
+/// implementation instead of growing a third diverging copy.
+pub fn pick_home<'a>(home: Option<&'a str>, user_profile: Option<&'a str>) -> Option<&'a str> {
+    home.filter(|h| !h.is_empty())
+        .or_else(|| user_profile.filter(|h| !h.is_empty()))
+}
+
+/// Alias-dead-rule detector behind `warn_alias_path_rules` (round-3 review
+/// R4-01). Pure (path in, resolution out) so the precedence is pin-able:
+/// `Some(resolved)` when the rule's literal spelling differs from its
+/// kernel resolution beyond ASCII case — the junction-link-name / 8.3-short-
+/// name / symlink shapes. `None` for glob entries (nothing concrete to
+/// resolve), missing paths, and rules already spelled canonically.
+fn alias_resolved_path(rule: &str, workdir: &Path) -> Option<PathBuf> {
+    if rule.contains('*') || rule.contains('?') || rule.contains('[') {
+        return None;
+    }
+    let p = Path::new(rule);
+    let full = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        workdir.join(p)
+    };
+    let canonical = full.canonicalize().ok()?;
+    // Compare modulo the verbatim prefix (`canonicalize` returns `\\?\C:\…`)
+    // and ASCII case (NTFS is case-insensitive; a case-only spelling
+    // difference is benign). Separator-normalize first (W2-05): a literal
+    // spelled with `/` must not warn just because canonicalize emits `\` —
+    // that's spelling, not an alias. What remains different is a real
+    // alias: the rule text names one path, the kernel resolves another.
+    let strip_verbatim = |p: &Path| -> String {
+        p.to_string_lossy()
+            .replace('\\', "/")
+            .trim_start_matches("//?/")
+            .to_ascii_lowercase()
+    };
+    if strip_verbatim(&canonical) == strip_verbatim(&full) {
+        return None;
+    }
+    Some(canonical)
+}
+
 /// The parsed, validated configuration — one JSON file, the whole surface of
 /// a headless run or TUI conversation. Load it with [`Config::load`] (which
 /// also normalizes `workdir` and validates MCP entries), then hand it to
@@ -984,7 +1031,55 @@ impl Config {
         // `llm` call with a confusing provider error. Every config entry
         // point (file load, Python inline dict) routes through here.
         self.code.normalize_and_validate_llm()?;
+        // R4-01 (round-3 review): alias-spelled deny/allow rules are silent
+        // dead rules — matching is kernel-truth (canonicalized) while the
+        // rule string stays lexical. Warn once here so the dead rule is
+        // visible at startup instead of at the first bewildered read that
+        // went through. Needs the normalized workdir → hence after the
+        // resolve above.
+        self.warn_alias_path_rules();
         Ok(())
+    }
+
+    /// Diagnose [`CodeConfig::deny_paths`] / [`CodeConfig::fs_write_dirs`]
+    /// entries that are silent dead rules (round-3 review R4-01, sharpened
+    /// by Wave-2 W2-05): ① an ABSOLUTE rule never matches — patterns are
+    /// matched against workdir-relative paths, so no absolute spelling
+    /// (canonical or not) can ever hit; ② an alias spelling (junction link
+    /// name, 8.3 short name, symlink) whose kernel resolution differs from
+    /// the literal text. Glob entries (containing `*`, `?`, `[`) and
+    /// non-existent paths are skipped in the alias arm — nothing to
+    /// resolve. Never fails: this is a diagnostic, not a validation (a
+    /// warning must not turn a working config into a load error).
+    fn warn_alias_path_rules(&self) {
+        let Some(workdir) = &self.workdir else {
+            return;
+        };
+        for (kind, rules) in [
+            ("deny_paths", &self.code.deny_paths),
+            ("fs_write_dirs", &self.code.fs_write_dirs),
+        ] {
+            for rule in rules.iter() {
+                if Path::new(rule).is_absolute() {
+                    crate::diag::diag_warn!(
+                        "[config] {kind} rule `{rule}` is an absolute path — rules \
+                         match workdir-relative paths, so an absolute spelling never \
+                         matches anything; use a workdir-relative pattern"
+                    );
+                    continue;
+                }
+                let Some(resolved) = alias_resolved_path(rule, workdir) else {
+                    continue;
+                };
+                crate::diag::diag_warn!(
+                    "[config] {kind} rule `{rule}` resolves to {} — rules match \
+                     kernel-resolved paths, so an alias spelling (junction link name, \
+                     8.3 short name, symlink) is a silent dead rule; spell it with the \
+                     canonical long name",
+                    resolved.display()
+                );
+            }
+        }
     }
 
     /// The endpoint requests go to: `base_url` if set, else the provider's
@@ -3177,5 +3272,64 @@ mod tests {
             mk_pair(false).fingerprint(),
             "mcp_servers declared order IS harness topology (documented)"
         );
+    }
+}
+
+#[cfg(test)]
+mod round3_alias_pins {
+    use super::*;
+
+    /// R4-01（round-3 评审）：deny/fs_write 规则的别名拼写是静默死规则——
+    /// 匹配走 kernel-truth（canonicalize），规则串停在词法形态。探测器的
+    /// 判定：别名拼写（unix symlink / Windows junction）→ Some(真身)；
+    /// 规范拼写 / glob / 不存在的路径 → None（不告警）。变异杀伤：删掉
+    /// canonicalize 比较臂 → 别名拼写落 None → 本钉炸。
+    #[test]
+    fn alias_path_rules_detect_symlink_spelling() {
+        let base = std::env::temp_dir().join(format!("ta-alias-{}", std::process::id()));
+        let wd = base.join("wd");
+        let real = wd.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        // Kernel-truth base: temp_dir can arrive as an 8.3 short-name path
+        // (ADMINI~1), and the detector would (correctly!) flag the base
+        // itself as an alias — canonicalize it away so the pin exercises
+        // exactly the junction component.
+        let wd = wd.canonicalize().unwrap();
+        let real = real.canonicalize().unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, wd.join("vault")).unwrap();
+        #[cfg(windows)]
+        {
+            let st = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(wd.join("vault"))
+                .arg(&real)
+                .status()
+                .expect("spawn cmd for mklink /J");
+            assert!(st.success(), "junction creation failed");
+        }
+        let got = alias_resolved_path("vault", &wd)
+            .expect("alias spelling must resolve to a different path");
+        assert!(got.ends_with("real"), "{got:?}");
+        // 规范拼写 → None（大小写差异也容忍——NTFS 大小写不敏感是良性的）
+        assert_eq!(alias_resolved_path("real", &wd), None);
+        // glob / 缺失路径 → None（无可解析对象）
+        assert_eq!(alias_resolved_path("**/vault/**", &wd), None);
+        assert_eq!(alias_resolved_path("ghost", &wd), None);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// pick_home 优先级钉（与 CLI main.rs 既有钉同款断言；round-3 R2-02
+    /// 把实现移入 core 供 skills 侧共用后，core 侧自己也要有钉）。
+    #[test]
+    fn pick_home_prefers_home_then_userprofile() {
+        assert_eq!(pick_home(Some("/h"), Some(r"C:\Users\u")), Some("/h"));
+        assert_eq!(
+            pick_home(Some(""), Some(r"C:\Users\u")),
+            Some(r"C:\Users\u")
+        );
+        assert_eq!(pick_home(None, Some(r"C:\Users\u")), Some(r"C:\Users\u"));
+        assert_eq!(pick_home(None, Some("")), None);
+        assert_eq!(pick_home(None, None), None);
     }
 }

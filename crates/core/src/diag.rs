@@ -77,7 +77,18 @@ pub(crate) fn emit(level: DiagLevel, msg: &str) {
     let sink = SINK.read().unwrap_or_else(|e| e.into_inner()).clone();
     match sink {
         Some(f) => f(level, msg),
-        None => eprintln!("{msg}"),
+        // stderr fallback, best-effort by contract (round-3 review R2-03):
+        // `eprintln!` PANICS when stderr is a pipe whose reader is gone —
+        // under release `panic="abort"` that kills an embedded host (the
+        // stdout side of this got the same treatment in main's EPIPE note).
+        // Swallow the write error instead; a lost warning beats a dead
+        // process. Known residual (documented, unfixable here): a host
+        // whose stderr handle is NULL/absent silently discards the bytes —
+        // install a sink to actually receive diagnostics.
+        None => {
+            use std::io::Write;
+            let _ = writeln!(std::io::stderr(), "{msg}");
+        }
     }
 }
 

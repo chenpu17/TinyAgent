@@ -34,10 +34,10 @@
   "prelude_source_sha256": "1db898a6aa06f534a52e70602c2c6d3ba32b732dc1d6a20cea7e114e97363307",
   "readme_code_spec": {
     "en": {
-      "sha256": "db860b6a83a1adf58011bd6b6410d634d1e931a3d43db0eb46958a618eb5dad9"
+      "sha256": "8a1ca030c6cced5bd76a2da315832d850b72b3f36dffe0d33490e1fc3837138e"
     },
     "zh": {
-      "sha256": "7fc8df8739f7ad5491ac76b95b0cee88553c0ef00fc55b2012790382d85a8dc9"
+      "sha256": "373567f4cdcae0776c96714112f3a922af2506d774db968a0a657d6b5c2fab99"
     }
   }
 }

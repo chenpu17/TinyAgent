@@ -116,6 +116,96 @@ def cross_check_readme_spec(section, which):
                 "config.rs but the README table row does not carry that default. "
                 "Update the README block (or revert config.rs), then re-run."
             )
+
+    # Enum knobs (round-3 review R3-01: the sibling gap of the boolean check —
+    # `skill_injection: SkillInjection::OnDemand → Eager` flipped past BOTH
+    # older gates because neither extracts enums). The serde label is
+    # snake_case (`rename_all`), matching the JSON example line AND the
+    # table row's default cell (quoted, like the JSON spelling).
+    em = re.search(r"\bskill_injection:\s*SkillInjection::(\w+)", body)
+    if not em:
+        raise SystemExit("config.rs: default field skill_injection not found (extractor drift)")
+    variant = em.group(1)
+    ENUM_LABELS = {"Off": "off", "OnDemand": "on_demand", "Eager": "eager"}
+    if variant not in ENUM_LABELS:
+        raise SystemExit(
+            f"config.rs: SkillInjection variant {variant} is not in the extractor's "
+            "label map — add it consciously (its serde spelling) before the gate "
+            "can check it."
+        )
+    label = ENUM_LABELS[variant]
+    if not re.search(rf'^\s*"skill_injection": "{label}",?\s*$', section, re.M):
+        raise SystemExit(
+            f"README[{which}] code-config spec is stale: skill_injection default is "
+            f'{label} in config.rs but the JSON example line does not carry exactly '
+            "that value. Update the README block (or revert config.rs), then re-run."
+        )
+    rows = [ln for ln in section.splitlines() if ln.lstrip().startswith("| `skill_injection`")]
+    if len(rows) != 1:
+        raise SystemExit(
+            f"README[{which}] code-config spec: expected exactly one table row for "
+            f"skill_injection, found {len(rows)} (extractor drift)."
+        )
+    cell = re.match(
+        r"\|\s*`skill_injection`\s*\|\s*`?([^`|]+?)`?\s*\|", rows[0].lstrip()
+    )
+    if not cell or cell.group(1).strip() != f'"{label}"':
+        raise SystemExit(
+            f"README[{which}] code-config spec is stale: skill_injection default is "
+            f'{label} in config.rs but its table row\'s default cell is not "{label}". '
+            "Update the README block (or revert config.rs), then re-run."
+        )
+
+    # Vec/array knobs (same R3-01 sweep): the default expression's resolved
+    # literal must equal the table row's default cell (compact JSON spelling),
+    # and for fs_write_dirs also the JSON example line. A default_*() call is
+    # resolved to its function body's string array; any NEW shape must be
+    # added consciously or the gate fails loud.
+    def vec_default(field_expr: str) -> str:
+        if field_expr == "Vec::new()":
+            return "[]"
+        fm = re.match(r"(\w+)\(\)", field_expr)
+        if fm:
+            fnm = re.search(rf"fn {fm.group(1)}\(\) -> Vec<String> \{{(.*?)\n\}}", src, re.S)
+            if not fnm:
+                raise SystemExit(
+                    f"config.rs: default fn {fm.group(1)} not found (extractor drift)"
+                )
+            globs = re.findall(r'"([^"]+)"', fnm.group(1))
+            return "[" + ", ".join(f'"{g}"' for g in globs) + "]"
+        raise SystemExit(
+            f"config.rs: default field expression {field_expr} is not a shape the "
+            "extractor resolves (Vec::new() or a default_*() fn) — extend the "
+            "extractor consciously."
+        )
+
+    for name in ("deny_paths", "fs_write_dirs"):
+        vm = re.search(rf"\b{name}:\s*([^,\n]+)", body)
+        if not vm:
+            raise SystemExit(f"config.rs: default field {name} not found (extractor drift)")
+        value = vec_default(vm.group(1).strip())
+        rows = [ln for ln in section.splitlines() if ln.lstrip().startswith(f"| `{name}`")]
+        if len(rows) != 1:
+            raise SystemExit(
+                f"README[{which}] code-config spec: expected exactly one table row for "
+                f"{name}, found {len(rows)} (extractor drift)."
+            )
+        cell = re.match(r"\|\s*`" + re.escape(name) + r"`\s*\|\s*`?([^`|]+?)`?\s*\|", rows[0].lstrip())
+        if not cell or cell.group(1).strip() != value:
+            raise SystemExit(
+                f"README[{which}] code-config spec is stale: {name} default resolves to "
+                f"{value} in config.rs but its table row's default cell does not equal "
+                "exactly that. Update the README block (or revert config.rs), then re-run."
+            )
+        if name == "fs_write_dirs":
+            # The JSON example shows fs_write_dirs' DEFAULT ([]); deny_paths'
+            # example intentionally shows a configured value instead.
+            if not re.search(r'^\s*"fs_write_dirs": \[\],?\s*$', section, re.M):
+                raise SystemExit(
+                    f"README[{which}] code-config spec is stale: fs_write_dirs default "
+                    "is [] in config.rs but the JSON example line does not carry exactly "
+                    "that. Update the README block (or revert config.rs), then re-run."
+                )
     # LlmConfig derives Default (no impl block): the nested defaults come
     # from the field types — bool → false, Option → null, Vec → [].
     lm = re.search(r"struct LlmConfig \{(.*?)\n\}", src, re.S)

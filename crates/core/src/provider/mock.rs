@@ -9,6 +9,15 @@
 //! pins live at the parse level). Mock tests assert history/ledger invariants,
 //! which are channel-shape-agnostic.
 //!
+//! Second boundary (round-3 review R2-07, documented): `ErrAfter`/`OkAfter`
+//! sleep the FULL delay without reading the cancel flag, and there is no
+//! streaming path to interrupt — this mock is CANCEL-LATENCY BLIND. A real
+//! provider breaks a stream within ~200ms of cancel (`CancellableSse`); a
+//! future "cancel interrupts an in-flight request within Xms" pin must NOT
+//! sit on this mock — it would sleep the whole scripted delay and pass
+//! vacuously. Existing pins avoid the shape (deadline attribution, not
+//! latency).
+//!
 //! The provider is consumed by `Agent::new` (which takes `Box<dyn Provider>`),
 //! so the recorded state lives behind an `Arc` the test clones before boxing;
 //! after the run it reads `state.captured` / `state.calls()`.

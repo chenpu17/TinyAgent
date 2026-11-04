@@ -29,6 +29,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use tiny_agent::config::pick_home;
 
 #[derive(Parser)]
 #[command(
@@ -485,6 +486,20 @@ fn main() -> Result<()> {
         }
     }
     let client = provider::new_client(cfg.limits.timeout_secs);
+    // Headless 专用：SIGINT 处理器在装配**之前**装好（round-3 评审 R2-04）。
+    // build_agent 可能在 MCP 握手上花秒级时间——此前的注册点在装配之后，
+    // 窗口内 Ctrl-C 走默认终止：无 graceful cancel、无 result.json，unix 上
+    // 已 spawn 的 MCP 子进程孤儿化。提前装好之后，装配窗内的 Ctrl-C 落到
+    // flag 上，下面的 run 一启动即以 cancelled 收尾，result.json 照常落盘
+    // （与 batch 路径在任务装配前注册的时序范式对齐）。TUI 不装——
+    // crossterm 在 raw mode 下把 Ctrl-C 当键事件读，装了反而多一层。
+    let headless_cancel = if tui_mode {
+        None
+    } else {
+        let cancel = Arc::new(AtomicBool::new(false));
+        signal::install_sigint_cancel(cancel.clone());
+        Some(cancel)
+    };
     let mut agent = build_agent(&cfg, initial, &client)?;
     if let Some(path) = session {
         agent.enable_session(path.to_path_buf());
@@ -516,9 +531,10 @@ fn main() -> Result<()> {
         // Wire Ctrl-C into the graceful-cancel path (headless only): first
         // SIGINT flips a shared flag → the stream breaks within ~200ms →
         // result.json is still written (stop_reason=cancelled) → exit 130.
-        // Second SIGINT exits at once. The TUI doesn't need this — crossterm
-        // reads Ctrl-C as a key event in raw mode.
-        let cancel = Arc::new(AtomicBool::new(false));
+        // Second SIGINT exits at once. The flag itself was armed BEFORE
+        // assembly (see `headless_cancel` above) so the window is covered
+        // too; here it only meets the agent.
+        let cancel = headless_cancel.expect("headless branch implies the SIGINT flag is armed");
         agent.set_cancel(cancel.clone());
         // Headless Ctrl-C always precedes process exit, so the per-turn cancel
         // and the session-end teardown coincide here: arm the MCP shutdown-reaper
@@ -528,7 +544,9 @@ fn main() -> Result<()> {
         // (In the TUI these are SEPARATE flags: a per-turn Esc must NOT kill the
         // server the next turn reuses.)
         agent.set_shutdown(cancel.clone());
-        signal::install_sigint_cancel(cancel);
+        // (SIGINT handler was already installed before assembly — see
+        // `headless_cancel`; a second install here would re-register the
+        // same flag, benign on unix (overwriting) but fragile redundancy.)
         let code = harness::run(&mut agent, cli.output.as_deref(), cli.json, cli.retries)?;
         // Drop the agent before exit so MCP stdio children are killed via
         // StdioTransport::drop — std::process::exit skips destructors, which
@@ -688,22 +706,13 @@ fn choose_config_path(
 /// native shells don't set `HOME`, and without the fallback the default
 /// config was never found there, round-2 review R2-P3-2). `None` when
 /// neither yields a base. Reads the real environment; the pure, testable
-/// cores are `pick_home` and `default_config_path_in`.
+/// cores are `tiny_agent::config::pick_home` (shared with the skills side
+/// since round-3 review R2-02) and `default_config_path_in`.
 fn default_config_path() -> Option<PathBuf> {
     let home_var = std::env::var("HOME").ok();
     let up_var = std::env::var("USERPROFILE").ok();
     let home = pick_home(home_var.as_deref(), up_var.as_deref());
     default_config_path_in(std::env::var("XDG_CONFIG_HOME").ok().as_deref(), home)
-}
-
-/// Which of `$HOME` / `%USERPROFILE%` anchors the default config path:
-/// a non-empty `HOME` wins (Git Bash / MSYS2 custom `HOME` keeps working),
-/// an unset or empty one falls back to `USERPROFILE`; `None` when neither
-/// is usable. Pure so the fallback precedence is pin-able without env
-/// mutation (wave-2 re-review W2-P3-1).
-fn pick_home<'a>(home: Option<&'a str>, user_profile: Option<&'a str>) -> Option<&'a str> {
-    home.filter(|h| !h.is_empty())
-        .or_else(|| user_profile.filter(|h| !h.is_empty()))
 }
 
 fn default_config_path_in(xdg: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
@@ -751,9 +760,10 @@ fn missing_config_error(default: Option<&Path>) -> anyhow::Error {
 mod tests {
     use super::{
         choose_config_path, default_config_path_in, default_tui_mode, is_default_report,
-        is_default_session, next_resumed_id, pick_home, session_target, Block, Message, TuiDefault,
+        is_default_session, next_resumed_id, session_target, Block, Message, TuiDefault,
     };
     use std::path::{Path, PathBuf};
+    use tiny_agent::config::pick_home;
 
     /// A message carrying an explicit id (the shape a resumed history gets
     /// from session files — or a hand edit).

@@ -137,18 +137,26 @@ impl SkillIndex {
 
 /// Global skills dir: mirrors `main::default_config_path_in` (hand-rolled XDG,
 /// no `dirs` crate) but joins `tinyagent/skills` instead of `tinyagent/config.json`.
+/// Home resolution shares [`crate::config::pick_home`] with the config side —
+/// the round-3 review R2-02 fix: a Windows-native shell without `$HOME` used to
+/// make the global skills dir silently vanish while the config side (round-2
+/// R2-P3-2) already fell back to `%USERPROFILE%`.
 pub fn default_global_skills_dir() -> Option<PathBuf> {
     default_global_skills_dir_in(
         std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
         std::env::var("HOME").ok().as_deref(),
+        std::env::var("USERPROFILE").ok().as_deref(),
     )
 }
 
-fn default_global_skills_dir_in(xdg: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
+fn default_global_skills_dir_in(
+    xdg: Option<&str>,
+    home: Option<&str>,
+    user_profile: Option<&str>,
+) -> Option<PathBuf> {
     let base = match xdg {
         Some(x) if !x.is_empty() && Path::new(x).is_absolute() => PathBuf::from(x),
-        _ => home
-            .filter(|h| !h.is_empty())
+        _ => crate::config::pick_home(home, user_profile)
             .map(|h| PathBuf::from(h).join(".config"))?,
     };
     Some(base.join("tinyagent").join("skills"))
@@ -197,6 +205,26 @@ pub fn scan(dirs: &[PathBuf]) -> (SkillIndex, Vec<String>) {
             // unlike `path().is_dir()`.
             match e.file_type() {
                 Ok(ft) if ft.is_dir() => {}
+                Ok(ft) if ft.is_symlink() => {
+                    // A symlink/junction entry is refused (see above) — but
+                    // SILENTLY skipping it left dotfiles-manager users (symlink
+                    // farms) with a fully dead skills set and zero diagnostics,
+                    // out of line with the "broken skill warned" contract
+                    // (round-3 review R2-06). Warn once per entry; loose plain
+                    // files stay silent (nothing suggests a skill was intended).
+                    // The `continue` is the SECURITY half of this arm: without
+                    // it the entry falls through to the SKILL.md reader and
+                    // the link is FOLLOWED — loading skill content from
+                    // outside the skills tree, the exact injection the
+                    // dir-only guard exists to stop (caught on Windows by
+                    // scan_warns_on_junctioned_skill_dir in Wave-2: the
+                    // warn-only arm both warned AND loaded).
+                    warnings.push(format!(
+                        "skill dir {} is a symlink/junction, skipped (skills must be real directories)",
+                        e.path().display()
+                    ));
+                    continue;
+                }
                 _ => continue,
             }
             let sub = e.path();
@@ -851,9 +879,14 @@ mod tests {
         std::os::unix::fs::symlink(real.join("outside"), dir.join("outside")).unwrap();
         let (idx, warns) = scan(std::slice::from_ref(&dir));
         assert!(idx.is_empty(), "symlinked skill dir must be skipped");
-        // Silent skip (same as a loose file) — nothing is wrong with the
-        // tree; the entry simply isn't a real directory.
-        assert!(warns.is_empty(), "{warns:?}");
+        // Refused AND named (round-3 review R2-06): a symlink farm (a
+        // dotfiles manager's whole skills set) used to die silently, out of
+        // line with the "broken skill warned" contract. Loose plain files
+        // stay silent; only the link-shaped skip warns.
+        assert!(
+            warns.len() == 1 && warns[0].contains("symlink/junction, skipped"),
+            "{warns:?}"
+        );
         std::fs::remove_dir_all(&real).ok();
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1067,23 +1100,74 @@ mod tests {
             "C:/custom/xdg"
         };
         assert_eq!(
-            default_global_skills_dir_in(Some(xdg), None),
+            default_global_skills_dir_in(Some(xdg), None, None),
             Some(PathBuf::from(xdg).join("tinyagent").join("skills"))
         );
         assert_eq!(
-            default_global_skills_dir_in(None, Some("/home/me")),
+            default_global_skills_dir_in(None, Some("/home/me"), None),
             Some(PathBuf::from("/home/me/.config/tinyagent/skills"))
         );
         // empty xdg falls back to home
         assert_eq!(
-            default_global_skills_dir_in(Some(""), Some("/home/me")),
+            default_global_skills_dir_in(Some(""), Some("/home/me"), None),
             Some(PathBuf::from("/home/me/.config/tinyagent/skills"))
         );
         // non-absolute xdg is ignored
         assert_eq!(
-            default_global_skills_dir_in(Some("rel/path"), Some("/home/me")),
+            default_global_skills_dir_in(Some("rel/path"), Some("/home/me"), None),
             Some(PathBuf::from("/home/me/.config/tinyagent/skills"))
         );
-        assert_eq!(default_global_skills_dir_in(None, None), None);
+        assert_eq!(default_global_skills_dir_in(None, None, None), None);
+        // R2-02: no HOME → USERPROFILE fallback (same precedence as the
+        // config side's pick_home; Windows-native shells don't set HOME).
+        assert_eq!(
+            default_global_skills_dir_in(None, None, Some("C:\\Users\\me")),
+            Some(PathBuf::from("C:\\Users\\me\\.config\\tinyagent\\skills"))
+        );
+        // Non-empty HOME still wins over USERPROFILE (pick_home precedence).
+        assert_eq!(
+            default_global_skills_dir_in(None, Some("/h"), Some("C:\\Users\\me")),
+            Some(PathBuf::from("/h/.config/tinyagent/skills"))
+        );
+        // Empty HOME falls through too.
+        assert_eq!(
+            default_global_skills_dir_in(None, Some(""), Some("C:\\Users\\me")),
+            Some(PathBuf::from("C:\\Users\\me\\.config\\tinyagent\\skills"))
+        );
+    }
+
+    /// W2-08（round-3 Wave-2）: symlink/junction 跳过警告的 Windows 半边——
+    /// unix 钉（scan_skips_symlinked_skill_dir）只证明共享臂的 unix 门，
+    /// Windows CI 对 junction→warn 无回归保护。junction 用 `mklink /J`
+    /// （无需管理员特权，与 alias 探测钉同款手法）。
+    #[cfg(windows)]
+    #[test]
+    fn scan_warns_on_junctioned_skill_dir() {
+        let real = tmpd("junc-real");
+        write_skill(
+            &real,
+            "outside",
+            "---
+name: outside
+description: o
+---
+",
+        );
+        let dir = tmpd("junc-skills");
+        let st = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(dir.join("outside"))
+            .arg(real.join("outside"))
+            .status()
+            .expect("spawn cmd for mklink /J");
+        assert!(st.success(), "junction creation failed");
+        let (idx, warns) = scan(std::slice::from_ref(&dir));
+        assert!(idx.is_empty(), "junctioned skill dir must be skipped");
+        assert!(
+            warns.len() == 1 && warns[0].contains("symlink/junction, skipped"),
+            "{warns:?}"
+        );
+        std::fs::remove_dir_all(&real).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

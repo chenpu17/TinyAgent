@@ -561,6 +561,7 @@ Anthropic 原生 provider 默认开启 prompt caching：每个请求自动在 **
 
 - `shell` 工具原样执行模型生成的命令（`sh -c` / `cmd /C`），无任何命令过滤。
   模型可以 `rm -rf`、`curl ... | sh`、访问网络——与其赋予进程的权限一致。
+- **每个子进程继承完整宿主环境变量**（shell 工具、MCP stdio server、代码沙箱经 `shell`）。其中包括 `api_key_env` 指向的凭据值——它按设计就驻留在进程 env 里，所以每个被 spawn 的子进程都读得到（round-3 探针：种入的环境变量经「直调 shell」与「guest→shell」双路可达）。config 从不落盘凭据值本身，但把凭据挡在子进程之外只有进程级隔离（容器 / 受限用户）这一条路。
 - 文件工具默认不限制路径：`read_file ../../etc/passwd`、
   `write_file /etc/cron.d/x` 都会被执行。
 - **在 CI / 评测 pipeline 中批量运行不可信的第三方 task 时**，务必：
@@ -827,8 +828,8 @@ run 以 `arbitration_capped` 收尾、未投递的 note 只保留在本事件里
 | `include` | `false` | 库通道开关（code_memory M1）：开启后 guest 增 `include(path)`（加载 `lib/` 下已登记代码库，幂等 + 循环截断，经 `__include` 保留名）与 `saveLib(path, src)`（写库 + `__hash_file` 宿主哈希登记 `lib/INDEX.md`，恒 `st=draft`）两个助手，及描述的【库】段；准入 = `st=ok` 或本会话登记过（clone 共享、不跨会话）。关闭时保留名明确拒绝、模型可见契约与无此特性的旧二进制一致。调用期生效（资源限制先例）；batch 片段只能关不能开 |
 | `call_batch` | `false` | 批量通道开关（code_llm M2，评测门）：开启后 guest 增 `tools.callBatch([{name, args}, …])`（并发执行一批只读工具调用，经 `__call_batch` 保留名逐 entry 走与单次调用完全相同的闸门链；8/波扇出、按提交序返回数组、单项失败为 Error 条目不中止批次）与描述的【批量】段。只读面 = `batchable()` 工具（v1 白名单 `read_file` + `llm` + MCP `readOnlyHint`，缺注解为否）。关闭时保留名按未知工具报错、模型可见契约与旧二进制一致。调用期生效；batch 片段只能关不能开 |
 | `llm` | `{enabled:false, default_model:null, models:[]}` | 内层模型判别开关（code_llm M3）：`llm` 嵌套对象三字段——`enabled`（默认关；开启后 guest 增 `llm` 判别原语，见下节）、`default_model`（开启时必填：省略 `model` 参数的内层调用用它）、`models`（显式 `model` 参数的允许列表，可含多档判别模型；`default_model` 必须在列表内）。开启时顶层工具表与该名撞名报错（名字保留）；注册表是构建期快照，`set_code_config` 热翻开关两个方向都不被感知——首次执行后改 `llm` 会经 diag 发一条明确的「已冻结、需重建 agent」警告（不再静默成功）。batch 片段不能改 `llm.enabled`/`default_model`，`models` 只能收紧（交集） |
-| `deny_paths` | `.env`、密钥类目录等 | **经工具的**文件读写拒绝清单（glob：`*` 单段、`**` 跨段），定位**防误读不防恶意**。`shell` 命令不经此层（`cat .env` 照常，见下一行） |
-| `fs_write_dirs` | `[]` = 整个 workdir 可写 | 经工具的写路径白名单（相对 workdir；交集语义，可收紧到无处可写）。**仅约束 4 个文件工具与 `copy_bytes`**——`shell`（含其重定向写入）不经此层与写侧 symlink 拒绝；敌对 guest 的对策是 `restrict_to_workdir` / hooks Deny / 从 `tools` 去 `shell`（A-8 读写两侧同界，有钉住测试） |
+| `deny_paths` | `[".env*", "**/.env*", "**/id_rsa*", "**/id_ed25519*", "**/id_ecdsa*", "**/*.pem", "**/.git/**", "**/.git", "**/.git-credentials", "**/.netrc", ".aws/**", "**/.aws/**"]` | **经工具的**文件读写拒绝清单（glob：`*` 单段、`**` 跨段），定位**防误读不防恶意**。`shell` 命令不经此层（`cat .env` 照常，见下一行）；MCP 工具与宿主注入的 CallbackTool（`with_code_access`）同样不经此层（round-3 探针：guest 经 MCP 文件 server 读到了 deny 名单里的 `.env`）——敌对 guest 的完整对策仍是 `restrict_to_workdir` / hooks Deny / 移除对应工具 |
+| `fs_write_dirs` | `[]` | 经工具的写路径白名单（相对 workdir；交集语义，可收紧到无处可写；空 = 整个 workdir 可写）。**仅约束 4 个文件工具与 `copy_bytes`**——`shell`（含其重定向写入）不经此层与写侧 symlink 拒绝；敌对 guest 的对策是 `restrict_to_workdir` / hooks Deny / 从 `tools` 去 `shell`（A-8 读写两侧同界，有钉住测试） |
 | `max_tool_calls` | 200 | 沙箱内工具调用次数上限（含失败调用）。AppWorld 高循环任务实证：金标方案 91–244 次调用，旧默认 50 连"先摸元数据再批量写"的两阶段打法都装不下（实测摸底阶段即触顶、正事零执行） |
 | `timeout_secs` | 120 | 墙钟；`0` = 无墙钟（仍受 cancel / fuel / mem 约束） |
 | `fuel` | 5e9 | 指令预算（纯计算循环；debug 构建实测 ≈ 11.6s/1e9，release 更快）。默认 5e9 的依据：v2 P2 A/B 实测 2.5 MB 文件 `readAll` 整读（guest 内 JSON 解析 + 建数组）超 1e9，首试即 fuel 耗尽、靠模型重试自救；5e9 覆盖该场景且仍低于默认 `timeout_secs=120` |
@@ -977,7 +978,7 @@ https://agentskills.io/specification)——三级渐进式披露、6 字段 fron
 
 启动时扫描两个目录，**项目覆盖全局**（同名以项目为准）：
 
-- 全局：`~/.config/tinyagent/skills/`（或 `$XDG_CONFIG_HOME/tinyagent/skills/`）——个人通用技能。
+- 全局：`~/.config/tinyagent/skills/`（或 `$XDG_CONFIG_HOME/tinyagent/skills/`）——个人通用技能。Windows 原生 shell（无 `$HOME`）下回落 `%USERPROFILE%\.config\tinyagent\skills\`（与默认配置路径同一优先级；round-3 评审 R2-02）。
 - 项目：`<工作目录>/.tinyagent/skills/`——随仓库分发、团队共享。
 - 内置：二进制内嵌的技能（目前仅 `code` feature 启用时的 `run-code`，即 run_code 沙箱的完整用法指南）——
   只在对应功能开启时出现在列表里，磁盘同名技能目录可覆盖它。
@@ -1153,34 +1154,34 @@ cargo bench -p tiny-agent-core --features mock --bench loop_bench -- --quick
 ```text
 crates/core/src/  # kernel crate (package tiny-agent-core, lib name tiny_agent): agent loop / tools / providers / config / assembly
 ├── lib.rs                (  608)  # lib root: build_agent* / assemble (tool table, ToolCtx, code install, skill injection)
-├── fsutil.rs             (  463)  # atomic-write primitives (O_EXCL temp + fsync + dir fsync; shared by session/result/report)
-├── diag.rs               (  168)  # diagnostics channel: global sink installable by GUI hosts (falls back to stderr, byte-identical) — soft-failure warnings of skills/MCP/session/run_code go through it
-├── config.rs             ( 3181)  # config parsing + task-fragment merge + batch override whitelist
+├── fsutil.rs             (  477)  # atomic-write primitives (O_EXCL temp + fsync + dir fsync; shared by session/result/report)
+├── diag.rs               (  179)  # diagnostics channel: global sink installable by GUI hosts (falls back to stderr, byte-identical) — soft-failure warnings of skills/MCP/session/run_code go through it
+├── config.rs             ( 3335)  # config parsing + task-fragment merge + batch override whitelist
 ├── provider/  # LLM backends
-│   ├── mod.rs                ( 1178)  # shared Message/Block, SSE reader, CancellableSse
+│   ├── mod.rs                ( 1191)  # shared Message/Block, SSE reader, CancellableSse
 │   ├── openai.rs             ( 2388)  # OpenAI-compatible (include_usage; 400 fallbacks: max_tokens→max_completion_tokens / drop stream_options)
-│   ├── openai_review_pins.rs ( 1001)  # openai review pins (loopback HTTP: status matrix/credential discipline/retry body; ThinkStripper differential + idle timeout)
+│   ├── openai_review_pins.rs ( 1003)  # openai review pins (loopback HTTP: status matrix/credential discipline/retry body; ThinkStripper differential + idle timeout)
 │   ├── sse_review_pins.rs    (  245)  # SSE parser review pins (chunk-boundary invariance across 17 stream shapes, sync vs worker path)
 │   ├── anthropic.rs          ( 1246)  # Anthropic native (message_start/message_delta usage)
-│   └── mock.rs               (  352)  # scripted Provider for tests (cfg(any(test, feature="mock")))
-├── agent.rs              ( 4611)  # core loop + usage accounting + cancel + context compression (preflight/overflow dual trigger + rolling chunked summaries) + adjacent-message normalization + same-turn multi-task parallelism
-├── agent_tests.rs        (11424)  # core-loop regression tests (scripted provider::mock, no network)
+│   └── mock.rs               (  361)  # scripted Provider for tests (cfg(any(test, feature="mock")))
+├── agent.rs              ( 4715)  # core loop + usage accounting + cancel + context compression (preflight/overflow dual trigger + rolling chunked summaries) + adjacent-message normalization + same-turn multi-task parallelism
+├── agent_tests.rs        (11634)  # core-loop regression tests (scripted provider::mock, no network)
 ├── usage_probe.rs        (   94)  # thread-local usage side channel for parallel workers: recovers billed usage after a panic unwind at the join point (keeps result.json and the shared counter from diverging)
 ├── compress.rs           (  996)  # compression engine (find_safe_cut / chunked summaries / saturating usage merge + block-level billing primitives)
 ├── context_report.rs     (  886)  # context composition breakdown (ContextBreakdown estimate: 3 system parts / 4 tool classes / message typing + anchor calibration)
 ├── retry.rs              (  158)  # exponential backoff shared by batch --retries and single-run transient retry (±25% jitter against lockstep)
 ├── session.rs            (  533)  # session persistence (atomic writes + fold archive)
-├── skills.rs             ( 1089)  # three-tier skill loading (built-in / user dir / project)
-├── hooks.rs              (  301)  # hooks gate (Deny / Modify / audit)
+├── skills.rs             ( 1173)  # three-tier skill loading (built-in / user dir / project)
+├── hooks.rs              (  335)  # hooks gate (Deny / Modify / audit)
 ├── tools/  # toolset: built-in tools + MCP wrappers + task sub-agent + run_code (feature code)
-│   ├── mod.rs                ( 1509)  # Tool trait + ToolCtx + CallbackTool/SharedTool + whitelist assembly
+│   ├── mod.rs                ( 1573)  # Tool trait + ToolCtx + CallbackTool/SharedTool + whitelist assembly
 │   ├── shell.rs              ( 1297)  # shell tool (unix: sh -c; Windows: cmd /C + raw_arg verbatim command passing, defeating std quoting)
 │   ├── file.rs               ( 1672)  # read_file / write_file / edit_file / list_dir
 │   ├── image.rs              (   87)  # load_image tool
 │   ├── document.rs           (  100)  # PDF → Block::Document loading (lib API load_document_block)
 │   ├── skill.rs              (  981)  # read_skill / list_skill (outside the whitelist; injected by assembly)
 │   ├── mcp.rs                (  674)  # MCP tool wrapper (sanitize_name + wire_name dispatch)
-│   ├── subagent.rs           ( 1101)  # task sub-agent tool (own context + turn cap; non-recursive)
+│   ├── subagent.rs           ( 1105)  # task sub-agent tool (own context + turn cap; non-recursive)
 │   ├── todo.rs               (  311)  # todo tool (task plan, full replacement; plan lands in result.json)
 │   ├── run_code.rs           (  103)  # run_code facade (feature code): mod declarations + symbol re-exports; implementation in run_code/ submodules
 │   ├── llm.rs                (  740)  # llm judgment primitive (feature code + code.llm gate): single-shot stateless inner model call — LD-17 reserve/settle, LD-18 label normalization, shared Provider cell
@@ -1199,14 +1200,14 @@ crates/core/src/  # kernel crate (package tiny-agent-core, lib name tiny_agent):
 └── m0_probes.rs          (  337)  # M0 mechanism probes (cfg(test), #[path]-declared in lib.rs): reserve/settle ledger, shared Provider cell, per-request model routing in-process prototype (A-L2b/2c/9 — reused directly by the M3 llm primitive)
 
 src/  # CLI crate (package tiny-agent, bin tiny-agent): process shell + headless rendering + batch + TUI
-├── main.rs               ( 1065)  # CLI entry + assembly (build_agent) + --session none
+├── main.rs               ( 1075)  # CLI entry + assembly (build_agent) + --session none
 ├── signal.rs             (  123)  # headless SIGINT → cancel (first press graceful / second hard-exit 130)
 ├── batch.rs              ( 4046)  # batch tasks + --retries/--failed + report merging
-├── harness.rs            ( 2454)  # headless mode + result.json + NDJSON + exit codes
+├── harness.rs            ( 2578)  # headless mode + result.json + NDJSON + exit codes
 ├── harness_tests.rs      ( 1212)  # harness behavior tests (retry ladder / result.json / NDJSON; moved here with harness from the kernel's agent_tests.rs)
 ├── tui.rs                (   20)  # TUI module root (feature tui): mod declarations + public exports (run / transcript_rows)
 └── tui/  # TUI submodules (same tui gate): split from the original 8.7k-line single file by concern
-    ├── app.rs                ( 1834)  # session assembly: run entry / worker thread / event & input channels / ui_loop event body / Ctrl-C double-press window
+    ├── app.rs                ( 1839)  # session assembly: run entry / worker thread / event & input channels / ui_loop event body / Ctrl-C double-press window
     ├── input.rs              (  361)  # multi-line InputBuffer editor / input history recall / horizontal input scrolling
     ├── slash.rs              (  549)  # slash commands: classify grammar / read-only replies / completion popup state machine / /context report
     ├── theme.rs              (  147)  # theme: single source for history-row & chrome colors / light-dark switch TINYAGENT_TUI_THEME / number formatting helpers

@@ -681,6 +681,17 @@ pub struct RunOutcome {
     /// `"arbitration_capped"` (a turn-stopping hook kept extending the run
     /// past its continuation cap — see [`Hooks::on_turn_stopping`]).
     pub stop_reason: String,
+    /// How many accepted turn-stopping arbitrations ([`Hooks::on_turn_stopping`]
+    /// returning `Continue`) this run consumed. Previously visible only as
+    /// `turn_arbitration` events on the `--json` stream — a host reading just
+    /// `RunOutcome`/result.json (quiet-run consumers, batch-style) had no way
+    /// to tell an extended run from a plain one (round-3 review R1-03: an
+    /// accepted arbitration was zero-trace on every ledger surface). Sparse
+    /// in the serialization (0 → key absent), so non-arbitrated results stay
+    /// byte-identical; folded across retry attempts like `turns` (a failed
+    /// attempt's arbitrations count too — honest bill, see [`RunCost`]).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub arbitrations_used: u32,
     /// Every tool call this run executed or refused, in execution order
     /// (parallel batches in completion order).
     pub tool_calls: Vec<ToolCallRecord>,
@@ -718,7 +729,12 @@ pub struct RunOutcome {
     /// scattered fields. Construction-time snapshot: a long-lived `Agent`'s
     /// hot-swap setters (`set_model` et al) change the effective shape but
     /// not this value — rebuild (or build per run) after swapping to get a
-    /// fresh pairing key.
+    /// fresh pairing key. CROSS-KEY CAVEAT (round-3 review R1-02): the
+    /// `model` key next to this one in result.json is the LIVE value
+    /// (`ResultMeta` reads it after the run), so after a hot-swap the pair
+    /// `(model, config_fingerprint)` never co-existed in any config — join
+    /// ledgers on the fingerprint alone, or rebuild the agent after
+    /// swapping; don't treat the pair as a config identity.
     pub config_fingerprint: String,
     /// Cumulative gateway-body fixes the provider has learned (FR-3, see
     /// [`Provider::gateway_fixes`]). Skipped in the serialization when no fix
@@ -760,8 +776,28 @@ pub struct RunError {
     /// the schema matches the success path (a CI consumer reads `.turns` /
     /// `.elapsed_secs` regardless of `.success`).
     pub turns: u32,
+    /// Accepted turn-stopping arbitrations consumed before the error — same
+    /// honest audit as `turns` (round-3 review R1-03; folded into
+    /// [`RunCost`]/[`RunOutcome`] by the retry ladders).
+    pub arbitrations_used: u32,
+    /// Gateway-body fixes the provider held when the run errored
+    /// (round-3 review R1-04: previously the ledger surfaces only carried
+    /// them on the success path, so a failed run couldn't answer "had this
+    /// run already learned its way past the teaching 400?"). Same semantics
+    /// as [`RunOutcome::gateway_fixes`]: the provider's running cumulative
+    /// set (OR of the process preset + everything learned since) — NOT a
+    /// per-run delta, so a preset-carrying provider reports its preset bits
+    /// even when this run itself learned nothing. Sparse in the
+    /// serialization (all-default → key absent), same rule as the success
+    /// side.
+    pub gateway_fixes: crate::provider::GatewayFixes,
     /// Compute time elapsed before the error.
     pub elapsed: Duration,
+}
+
+/// `serde` `skip_serializing_if` predicate for [`RunOutcome::arbitrations_used`].
+fn is_zero(v: &u32) -> bool {
+    *v == 0
 }
 
 impl std::fmt::Display for RunError {
@@ -838,12 +874,25 @@ pub(crate) fn is_transient_error(e: &anyhow::Error) -> bool {
 impl serde::Serialize for RunError {
     fn serialize<S: serde::Serializer>(&self, ser: S) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut s = ser.serialize_struct("RunError", 6)?;
+        let mut s = ser.serialize_struct("RunError", 8)?;
         s.serialize_field("error", &self.source.to_string())?;
         s.serialize_field("usage", &self.usage)?;
         s.serialize_field("tool_calls", &self.tool_calls)?;
         s.serialize_field("compressions", &self.compressions)?;
         s.serialize_field("turns", &self.turns)?;
+        // Sparse like RunOutcome's twin fields: zero arbitrations / no fixes
+        // learned omit the key (bindings' failure payloads stay byte-identical
+        // for runs that never used either).
+        if self.arbitrations_used != 0 {
+            s.serialize_field("arbitrations_used", &self.arbitrations_used)?;
+        } else {
+            s.skip_field("arbitrations_used")?;
+        }
+        if !self.gateway_fixes.is_default() {
+            s.serialize_field("gateway_fixes", &self.gateway_fixes)?;
+        } else {
+            s.skip_field("gateway_fixes")?;
+        }
         s.serialize_field("elapsed", &self.elapsed)?;
         s.end()
     }
@@ -867,6 +916,13 @@ pub struct RunCost {
     /// Turns accumulated across failed attempts (folded into the outcome so
     /// `result.json`'s `turns`/`elapsed_secs` stay consistent on success).
     pub turns: u32,
+    /// Accepted arbitrations consumed by failed attempts (round-3 review
+    /// R1-03 — same honest bill as `turns`).
+    pub arbitrations_used: u32,
+    /// Gateway fixes learned by failed attempts' providers (round-3 review
+    /// R1-04 — OR-folded: bits persist even though the failed provider dies
+    /// with the attempt).
+    pub gateway_fixes: crate::provider::GatewayFixes,
     /// Wall-clock time spent in failed attempts.
     pub elapsed: Duration,
 }
@@ -897,6 +953,8 @@ impl RunCost {
         self.tool_calls.extend(re.tool_calls.iter().cloned());
         self.compressions.extend(re.compressions.iter().cloned());
         self.turns = self.turns.saturating_add(re.turns);
+        self.arbitrations_used = self.arbitrations_used.saturating_add(re.arbitrations_used);
+        self.gateway_fixes.fold_or(&re.gateway_fixes);
         self.elapsed = self.elapsed.saturating_add(re.elapsed);
     }
 
@@ -920,6 +978,8 @@ impl RunCost {
         self.compressions.append(&mut o.compressions);
         o.compressions = std::mem::take(&mut self.compressions);
         o.turns = o.turns.saturating_add(self.turns);
+        o.arbitrations_used = o.arbitrations_used.saturating_add(self.arbitrations_used);
+        o.gateway_fixes.fold_or(&self.gateway_fixes);
         o.elapsed = o.elapsed.saturating_add(self.elapsed);
     }
 }
@@ -963,6 +1023,12 @@ const STUCK_STOP_AT: u32 = 6;
 /// `stop_reason = "arbitration_capped"`，note 只保留在 `TurnArbitration`
 /// 事件里，不再入队。
 const TURN_ARBITRATION_CAP: u32 = STUCK_STOP_AT;
+
+/// 轮末仲裁钩子的「慢」观测阈值（[`Hooks::on_turn_stopping`]，round-3 评审
+/// R1-05）。钩子窗是串行的、无超时无 watchdog（设计如此），只做 observe-only
+/// 计时：超过即 `diag_warn` 一次，不超时、不打断。5s 的量级取在「正常钩子
+/// （内存查表/一次本地审计）远低于此」与「宿主调试期够早看见卡死」之间。
+const ARBITRATION_HOOK_SLOW_WARN: std::time::Duration = std::time::Duration::from_millis(5_000);
 
 /// 纠偏提示（对模型的一次性警告，随第 N 次重复的 tool_result 下发）。
 fn stuck_nudge(n: u32) -> String {
@@ -1631,6 +1697,19 @@ impl Agent {
         self.ctx.hooks = Some(hooks);
     }
 
+    /// Detach the hooks layer installed by [`Agent::set_hooks`] (round-3
+    /// review R1-08). Previously the only way to stop intercepting
+    /// mid-session was rebuilding the agent — an MCP-handshake-cost
+    /// operation the hot-swap setters exist to avoid. After this, runs take
+    /// the default zero-drift paths again (no arbitration, no decisions),
+    /// exactly like an agent that never had hooks. Same inheritance rule as
+    /// `set_hooks`: `task` sub-agents spawned AFTER the clear see no layer;
+    /// children already spawned keep the Arc they cloned. (`--resume`
+    /// rebuilds start hook-less — the same end state, by a different door.)
+    pub fn clear_hooks(&mut self) {
+        self.ctx.hooks = None;
+    }
+
     // ── run_code switch face (code feature, design §8.6) ─────────────────────
 
     /// Install the single top-level `run_code` instance ([`crate::assemble`]
@@ -1913,6 +1992,7 @@ impl Agent {
         records: &[ToolCallRecord],
         compressions: &[CompressionRecord],
         turns: u32,
+        arbitrations_used: u32,
         elapsed: Duration,
     ) -> RunError {
         RunError {
@@ -1921,6 +2001,8 @@ impl Agent {
             tool_calls: records.to_vec(),
             compressions: compressions.to_vec(),
             turns,
+            arbitrations_used,
+            gateway_fixes: self.provider.gateway_fixes(),
             elapsed,
         }
     }
@@ -2459,6 +2541,7 @@ impl Agent {
                                 &records,
                                 &compressions,
                                 turns,
+                                arbitrations_used,
                                 start.elapsed(),
                             ));
                         }
@@ -2535,6 +2618,7 @@ impl Agent {
                                 &records,
                                 &compressions,
                                 turns,
+                                arbitrations_used,
                                 start.elapsed(),
                             ));
                         }
@@ -2563,6 +2647,7 @@ impl Agent {
                             &records,
                             &compressions,
                             turns,
+                            arbitrations_used,
                             start.elapsed(),
                         ));
                     }
@@ -2589,6 +2674,7 @@ impl Agent {
                             &records,
                             &compressions,
                             turns,
+                            arbitrations_used,
                             start.elapsed(),
                         ));
                     }
@@ -2678,6 +2764,7 @@ impl Agent {
                     &records,
                     &compressions,
                     turns,
+                    arbitrations_used,
                     start.elapsed(),
                 ));
             }
@@ -2873,18 +2960,34 @@ impl Agent {
                             continuations_used: arbitrations_used,
                             continuations_cap: TURN_ARBITRATION_CAP,
                         };
-                        match h.on_turn_stopping(&info) {
+                        // 慢钩子观测（round-3 评审 R1-05）：on_turn_stopping
+                        // 是全 run 唯一无兜底的串行窗（下面的 cancel 复查是
+                        // 出口前最后一次），钩子睡多久 cancel 就被推迟多久。
+                        // 行为与 trait 文档一致、不超时不打断（serial 契约
+                        // 不能破），但「慢」应当可见——超过阈值 diag_warn
+                        // 一次，宿主侧据此诊断自己卡死的钩子。
+                        let hook_started = Instant::now();
+                        let decision = h.on_turn_stopping(&info);
+                        let hook_elapsed = hook_started.elapsed();
+                        if hook_elapsed >= ARBITRATION_HOOK_SLOW_WARN {
+                            crate::diag::diag_warn!(
+                                "[arbitration] on_turn_stopping took {}ms — the run \
+                                 (and a cancel request) waits on it serially",
+                                hook_elapsed.as_millis()
+                            );
+                        }
+                        match decision {
                             crate::hooks::TurnStopDecision::Stop => {}
                             crate::hooks::TurnStopDecision::Continue { note } => {
-                                // 确定性守卫预检（外审 FR-1 P1）：续跑帽耗尽，
-                                // 或 turns 已到 max_turns（下一轮根本无法启动
-                                // ——轮首护栏必以 max_turns_reached 收尾，把
-                                // 无钩子时 exit 0 的成功收尾翻成护栏失败），
-                                // 都按 capped 同款降级：run 干净收尾在模型的
-                                // 最后一轮上，note 不入队不入史，只留在事件
-                                // 里。budget/deadline 是竞态类守卫，不预检
-                                // ——轮首护栏永远赢（见 TurnArbitration 文档）。
-                                if arbitrations_used >= TURN_ARBITRATION_CAP
+                                // 空白 note 守卫（round-3 评审 R1-01）：与
+                                // `inject_note` 同款纪律——空白 note 会成为
+                                // 一块只有标记前缀的空历史块，却白耗一次全
+                                // 额计费请求与一档续跑帽。按 `Stop` 同款零
+                                // 漂移收尾：不发事件、不耗帽、不入队——两
+                                // 条入口进同一条投递管线，守卫两条都要装。
+                                if note.trim().is_empty() {
+                                    // fall through to the shared Stop exit below
+                                } else if arbitrations_used >= TURN_ARBITRATION_CAP
                                     || turns >= self.limits.max_turns
                                 {
                                     stop_reason = "arbitration_capped".into();
@@ -2978,6 +3081,7 @@ impl Agent {
             final_text,
             turns,
             stop_reason,
+            arbitrations_used,
             tool_calls: records,
             compressions,
             turn_timings,

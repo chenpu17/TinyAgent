@@ -98,6 +98,12 @@ export TINYAGENT_API_KEY='your-api-key'
 - **工具和文件权限**：只开放任务需要的能力，配置工作目录、`deny_paths` 和
   `fs_write_dirs`。guest 没有直接网络或文件访问；授予的工具仍按它们自身的权限
   执行。尤其是 `shell`，不能把 guest 文件路径规则当作 shell 的隔离措施。
+  两条拼写纪律（round-3 评审 R4-01/R4-03）：①`deny_paths` / `fs_write_dirs`
+  规则一律用**规范长名**（kernel 解析后的目标名）——junction 链接名、8.3
+  短名、symlink 拼写的规则是静默死规则（匹配走 canonicalize 后的路径；配置
+  加载时会对存在的具体路径做别名探测并 diag_warn）；②MCP 工具与宿主注入的
+  `CallbackTool`（`with_code_access`）不经这层拦截——敌对 guest 的完整对策
+  仍是 `restrict_to_workdir` / hooks Deny / 移除对应工具。
 
 一次工具调用或已有 shell 管道能完成的任务，直接执行通常更简单。大量复杂
 语义判断需要另行评估质量与调用成本，不能仅凭“所有”“批量”要求模型使用代码。

@@ -923,6 +923,11 @@ fn ui_loop(
                         // 行承担，这里标决策点本身；capped 的 note 不会投递
                         // （只活在事件里），所以把它带上——否则这段意图在
                         // 会话里就无迹可寻了。warn 级与 NoteInjected 对齐。
+                        // 流式卫生（round-3 评审 R1-10）：与 Warning 臂同款
+                        // 重置——仲裁行之后到下轮 TurnStart 之间，残留的
+                        // streaming 状态会把系统行错当 in-flight 流式行。
+                        sub_streaming_name = None;
+                        thinking_stream = None;
                         if continued {
                             rows.push(Row::sys_warn(
                                 "[arbitration: completion rejected — one more turn]",

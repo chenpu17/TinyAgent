@@ -138,13 +138,22 @@ def fingerprint() -> dict:
         cwd=ROOT, capture_output=True, text=True).stdout
     untracked = git_out("status", "--short")
     dirty_material = (diff + "\n" + untracked).encode()
-    version = subprocess.run([str(BIN), "--version", "--json"],
-                             capture_output=True, text=True)
+    # Round-3 review R3-05: a missing release binary used to crash
+    # fingerprint() with a bare FileNotFoundError on every non-G0 path
+    # (prepare-*/run-*/finalize-* all call it before any exists-check) —
+    # the --version probe ran unconditionally even though the
+    # binary_hash/binary_manifest dict entries below were already
+    # None-tolerant. Guard the probe with the same BIN.exists() the dict
+    # uses: the guidance becomes "build the release binary", not a
+    # traceback.
     features = {}
-    try:
-        features = json.loads(version.stdout)
-    except json.JSONDecodeError:
-        pass
+    if BIN.exists():
+        version = subprocess.run([str(BIN), "--version", "--json"],
+                                 capture_output=True, text=True)
+        try:
+            features = json.loads(version.stdout)
+        except json.JSONDecodeError:
+            pass
     return {
         "code_head": head,
         "dirty_diff_hash": hashlib.sha256(dirty_material).hexdigest(),
@@ -291,7 +300,7 @@ def build_config(task: str, arm: str, wd: Path, base_url: str, model: str,
     }
     if task == "t2":
         if g2_instance:
-            cmd = ["python3", str(ROOT / "scripts" / "code_value_mcp_server.py"),
+            cmd = [sys.executable, str(ROOT / "scripts" / "code_value_mcp_server.py"),
                    "--subscriptions", str(g2_data_dir / "subscriptions.json"),
                    "--events", str(g2_data_dir / "events.json")]
         else:

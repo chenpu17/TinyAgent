@@ -750,6 +750,13 @@ pub fn write_result(
             // FR-4: the effective-config fingerprint is an ALWAYS-present
             // ledger key (pin "model + harness" per run).
             result["config_fingerprint"] = json!(o.config_fingerprint.clone());
+            // FR-1 audit (round-3 review R1-03): an accepted arbitration was
+            // previously visible only on the --json event stream — a ledger
+            // reading just result.json couldn't tell an extended run from a
+            // plain one. Sparse: 0 omits the key (byte-identical outputs).
+            if o.arbitrations_used > 0 {
+                result["arbitrations_used"] = json!(o.arbitrations_used);
+            }
             // FR-3: gateway fixes export — sparse like plan/compressions: a
             // run that learned nothing omits the key (pre-FR-3 result.json
             // stays byte-identical); feed a non-empty export back via the
@@ -838,6 +845,16 @@ pub fn write_result(
             // never-started / panic) where no effective config ever ran.
             if let Some(fp) = &meta.config_fingerprint {
                 result["config_fingerprint"] = json!(fp);
+            }
+            // 失败分支的诚实账单（round-3 评审 R1-03/R1-04）：失败 attempt
+            // 消耗的仲裁与学到的 gateway 修复随 RunCost 折到这里，失败
+            // result.json 也答得出「这轮学到哪了/被驳回过几次」。sparse 同
+            // 两条成功分支规则。
+            if acc.arbitrations_used > 0 {
+                result["arbitrations_used"] = json!(acc.arbitrations_used);
+            }
+            if !acc.gateway_fixes.is_default() {
+                result["gateway_fixes"] = json!(acc.gateway_fixes);
             }
             result
         }
@@ -1035,6 +1052,27 @@ impl<Out: Write, Err: Write> HumanRenderer<Out, Err> {
                 }
                 self.current_sub_name = None;
             }
+            AgentEvent::TurnArbitration {
+                continued, note, ..
+            } => {
+                // 轮末仲裁（FR-1）——与 NoteInjected 同款「人必须看见」纪律
+                // （round-3 评审 R1-09：此前落进 wildcard，人面模式对仲裁
+                // 完全无痕）。今日 CLI 从不 set_hooks，此臂不可达；装上是
+                // 为哪天 CLI 获得钩子面时不再无声缺口。文案与 TUI 臂对齐。
+                if !self.at_line_start {
+                    let _ = writeln!(self.out);
+                    self.at_line_start = true;
+                }
+                if *continued {
+                    let _ = writeln!(
+                        self.err,
+                        "[arbitration: completion rejected — one more turn]"
+                    );
+                } else {
+                    let _ = writeln!(self.err, "[arbitration capped — note not delivered] {note}");
+                }
+                self.current_sub_name = None;
+            }
             AgentEvent::Usage {
                 input_tokens,
                 output_tokens,
@@ -1179,6 +1217,7 @@ mod tests {
             final_text: "done".into(),
             turns: 2,
             stop_reason: "end_turn".into(),
+            arbitrations_used: 0,
             tool_calls: vec![ToolCallRecord {
                 name: "read_file".into(),
                 input: json!({"path": "a.txt"}),
@@ -1368,6 +1407,7 @@ mod tests {
             final_text: "done".into(),
             turns: 1,
             stop_reason: "end_turn".into(),
+            arbitrations_used: 0,
             tool_calls: vec![],
             compressions: vec![],
             turn_timings: vec![],
@@ -1422,6 +1462,7 @@ mod tests {
             final_text: "done".into(),
             turns: 1,
             stop_reason: "end_turn".into(),
+            arbitrations_used: 0,
             tool_calls: vec![
                 ToolCallRecord {
                     name: "todo".into(),
@@ -1466,6 +1507,7 @@ mod tests {
             final_text: "done".into(),
             turns: 1,
             stop_reason: "end_turn".into(),
+            arbitrations_used: 0,
             tool_calls: vec![ToolCallRecord {
                 name: "shell".into(),
                 input: json!({"command":"ls"}),
@@ -1520,6 +1562,7 @@ mod tests {
             final_text: "done".into(),
             turns: 1,
             stop_reason: "end_turn".into(),
+            arbitrations_used: 0,
             tool_calls: vec![],
             compressions: vec![],
             turn_timings: vec![],
@@ -1567,6 +1610,7 @@ mod tests {
             final_text: "done".into(),
             turns: 1,
             stop_reason: "end_turn".into(),
+            arbitrations_used: 0,
             tool_calls: vec![
                 ToolCallRecord {
                     name: "task".into(),
@@ -1643,6 +1687,8 @@ mod tests {
             }],
             compressions: vec![],
             turns: 3,
+            arbitrations_used: 0,
+            gateway_fixes: Default::default(),
             elapsed: std::time::Duration::from_secs(12),
         };
         let path = dir.join("fail.json");
@@ -1695,6 +1741,79 @@ mod tests {
         assert_eq!(zparsed["input_tokens"], 0);
         assert_eq!(zparsed["output_tokens"], 0);
         assert_eq!(zparsed["tool_calls"].as_array().unwrap().len(), 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_result_carries_arbitration_and_gateway_ledger_keys() {
+        // W2-06（round-3 Wave-2）: write_result 的 json! 插入面直接钉——
+        // 成功分支 arbitrations_used>0 → 键在且值对；失败分支 acc 带非零
+        // 仲裁与非默认 gateway_fixes → 两键都在。sparse 规则的缺席半边由
+        // 既有各测试的 0 值夹具覆盖（0/默认时键不出现）。
+        let dir = std::env::temp_dir().join(format!("ta-res-arb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut o = RunOutcome {
+            final_text: "done".into(),
+            turns: 3,
+            stop_reason: "end_turn".into(),
+            arbitrations_used: 2,
+            tool_calls: vec![],
+            compressions: vec![],
+            turn_timings: vec![],
+            input_tokens: 10,
+            output_tokens: 1,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            elapsed: std::time::Duration::from_secs(1),
+            config_fingerprint: "fp".into(),
+            gateway_fixes: Default::default(),
+        };
+        let path = dir.join("arb.json");
+        write_result(&path, Some(&o), None, 1, "error", None, &meta()).unwrap();
+        let parsed: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed["arbitrations_used"], 2);
+        assert!(
+            parsed.get("gateway_fixes").is_none(),
+            "no fixes → key absent"
+        );
+
+        // 失败分支：acc 两键齐落。
+        let acc = RunCost {
+            usage: crate::provider::Usage::default(),
+            tool_calls: vec![],
+            compressions: vec![],
+            turns: 1,
+            arbitrations_used: 1,
+            gateway_fixes: tiny_agent::provider::GatewayFixes {
+                no_reasoning_effort: true,
+                ..Default::default()
+            },
+            elapsed: std::time::Duration::from_secs(2),
+        };
+        let fpath = dir.join("fail-arb.json");
+        write_result(
+            &fpath,
+            None,
+            Some("provider 503"),
+            2,
+            "error",
+            Some(&acc),
+            &meta(),
+        )
+        .unwrap();
+        let fparsed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&fpath).unwrap()).unwrap();
+        assert_eq!(fparsed["arbitrations_used"], 1);
+        assert_eq!(fparsed["gateway_fixes"]["no_reasoning_effort"], true);
+
+        // 成功分支零仲裁 → 键缺席（字节不变纪律）。
+        o.arbitrations_used = 0;
+        let zpath = dir.join("zero-arb.json");
+        write_result(&zpath, Some(&o), None, 1, "error", None, &meta()).unwrap();
+        let zparsed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&zpath).unwrap()).unwrap();
+        assert!(zparsed.get("arbitrations_used").is_none());
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2057,6 +2176,7 @@ mod tests {
             final_text: "done".into(),
             turns: 1,
             stop_reason: "end_turn".into(),
+            arbitrations_used: 0,
             tool_calls: vec![],
             compressions: vec![],
             turn_timings: vec![],
@@ -2092,6 +2212,7 @@ mod tests {
             final_text: "done".into(),
             turns: 1,
             stop_reason: "end_turn".into(),
+            arbitrations_used: 0,
             tool_calls: vec![],
             compressions: vec![],
             turn_timings: vec![],
@@ -2146,6 +2267,7 @@ mod tests {
             final_text: String::new(),
             turns: 0,
             stop_reason: "cancelled".into(),
+            arbitrations_used: 0,
             tool_calls: vec![],
             compressions: vec![],
             turn_timings: vec![],
@@ -2178,6 +2300,7 @@ mod tests {
             final_text: String::new(),
             turns: 1,
             stop_reason: "cancelled".into(),
+            arbitrations_used: 0,
             tool_calls: vec![ToolCallRecord {
                 name: "shell".into(),
                 input: json!({"command":"ls"}),
@@ -2215,6 +2338,7 @@ mod tests {
             final_text: "done".into(),
             turns: 2,
             stop_reason: "end_turn".into(),
+            arbitrations_used: 0,
             tool_calls: vec![ToolCallRecord {
                 name: "shell".into(),
                 input: json!({"command":"ls"}),

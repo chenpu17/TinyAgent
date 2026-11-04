@@ -60,6 +60,9 @@ export interface RunOutcome {
   final_text: string;
   turns: number;
   stop_reason: string;
+  /** Accepted turn-stopping arbitrations this run consumed (FR-1);
+   *  sparse — absent (0) for a run no hook extended. */
+  arbitrations_used?: number;
   tool_calls: ToolCall[];
   /** Compression audit trail; present only when the run compressed. */
   compressions?: CompressionRecord[];
@@ -71,6 +74,18 @@ export interface RunOutcome {
   cache_read_input_tokens: number;
   /** Elapsed wall-clock time for the run. */
   elapsed: { secs: number; nanos: number };
+  /** FR-4 pairing key: stable fingerprint of the construction-time config
+   *  (hot-swap setters do NOT move it — join ledgers on this, not on the
+   *  (model, fingerprint) pair). Always present. */
+  config_fingerprint: string;
+  /** FR-3 gateway-body fix bits learned by the provider; sparse — absent
+   *  when no fix is held (preset ∪ learned cumulative, not a per-run
+   *  delta). */
+  gateway_fixes?: {
+    max_completion_tokens?: boolean;
+    no_stream_options?: boolean;
+    no_reasoning_effort?: boolean;
+  };
 }
 
 /** An AgentEvent, externally-tagged (e.g. { TextDelta: "..." }, { Done: { stop_reason } }). */

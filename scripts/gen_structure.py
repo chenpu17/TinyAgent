@@ -230,6 +230,19 @@ def main() -> None:
             raise SystemExit(
                 f"gen_structure: {readme.name} markers missing — re-add the BEGIN/END block"
             )
+        # Round-3 review R3-04: the split above keeps only the FIRST block —
+        # a second BEGIN..END pseudo-tree past the first END (a stale copy
+        # pasted into the body) used to ride the tail verbatim, unvalidated,
+        # with readers treating it as gate output. Exactly one block is the
+        # contract; more than one is refused loudly (same discipline as
+        # sync_run_code_contract.py's appendix-title count check).
+        if current.count(BEGIN) != 1 or current.count(END) != 1:
+            raise SystemExit(
+                f"gen_structure: {readme.name} must carry exactly ONE "
+                f"BEGIN..END structure block (found {current.count(BEGIN)} BEGIN / "
+                f"{current.count(END)} END) — a second tree would ride the tail "
+                "unvalidated."
+            )
         head, rest = current.split(BEGIN, 1)
         _, tail = rest.split(END, 1)
 

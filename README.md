@@ -731,6 +731,12 @@ one-shot calls and carry no cache breakpoints.
 
 - The `shell` tool executes model-generated commands verbatim (`sh -c` / `cmd /C`) with no command
   filtering. The model can `rm -rf`, `curl ... | sh`, reach the network — everything the process can.
+- **Every child process inherits the full host environment** (shell tools, MCP stdio servers, and the
+  code sandbox via `shell`). That includes the credential value `api_key_env` points at — it lives in
+  the process env by design, so every spawned child can read it (round-3 probe: a seeded env var was
+  reachable from both a direct shell call and a guest→shell call). The config never stores the value
+  itself, but process-level isolation (container / restricted user) is the only thing that keeps it
+  from the children.
 - File tools do not restrict paths by default: `read_file ../../etc/passwd` and
   `write_file /etc/cron.d/x` will be executed.
 - **When batch-running untrusted third-party tasks in CI / eval pipelines**, always:
@@ -1101,8 +1107,8 @@ tools + the configured paths.
 | `include` | `false` | the library channel switch (code_memory M1): when on, the guest gains `include(path)` (load a registered library under `lib/`; idempotent + cycle-cut, via the `__include` reserved name) and `saveLib(path, src)` (write + host-side sha256 via `__hash_file`, registering into `lib/INDEX.md`, always `st=draft`) helpers, plus the skill's Library section; admission = `st=ok` or registered this session (clone-shared, not across sessions). Off: reserved names refuse explicitly, and the model-visible contract matches a binary without the feature. Effective at call time (resource-limit precedent); batch fragments can only turn it off |
 | `call_batch` | `false` | the batch channel switch (code_llm M2, eval-gated): when on, the guest gains `tools.callBatch([{name, args}, …])` (concurrently execute a batch of read-only tool calls; via the `__call_batch` reserved name, each entry walks exactly the same gate chain as a single call; 8 per wave fan-out, array returned in submission order, a failed entry becomes an Error item without aborting the batch) plus the skill's Batch section. The read-only face = `batchable()` tools (v1 whitelist `read_file` + `llm` + MCP `readOnlyHint`; a missing annotation counts as no). Off: the reserved name errors as an unknown tool; model-visible contract matches the old binary. Effective at call time; batch fragments can only turn it off |
 | `llm` | `{enabled:false, default_model:null, models:[]}` | the inner-model judgment switch (code_llm M3): the nested `llm` object has three fields — `enabled` (off by default; when on the guest gains the `llm` judgment primitive, next section), `default_model` (required when enabled: inner calls omitting the `model` parameter use it), `models` (the allow-list for explicit `model` parameters, may hold several judgment tiers; `default_model` must be in it). When enabled, a top-level tool of that name errors at assembly (the name is reserved); the registry is a build-time snapshot — `set_code_config` flips are not seen in either direction; changing `llm` after first execution emits an explicit "frozen, rebuild the agent" diag warning (no more silent success). Batch fragments cannot touch `llm.enabled`/`default_model`; `models` can only tighten (intersection) |
-| `deny_paths` | `.env`, secret-type dirs, … | the deny-list for file reads/writes **through the tools** (globs: `*` one segment, `**` across segments); positioned as **accident-proofing, not adversarial**. `shell` commands bypass this layer (`cat .env` still works — next row) |
-| `fs_write_dirs` | `[]` = the whole workdir writable | the write-path allow-list **through the tools** (relative to workdir; intersection semantics — can tighten to nowhere-writable). **Binds only the 4 file tools and `copy_bytes`** — `shell` (including its redirected writes) bypasses this layer and the write-side symlink refusal; the countermeasure for a hostile guest is `restrict_to_workdir` / hooks Deny / dropping `shell` from `tools` (A-8: read and write sides share the boundary; pinned tests exist) |
+| `deny_paths` | `[".env*", "**/.env*", "**/id_rsa*", "**/id_ed25519*", "**/id_ecdsa*", "**/*.pem", "**/.git/**", "**/.git", "**/.git-credentials", "**/.netrc", ".aws/**", "**/.aws/**"]` | the deny-list for file reads/writes **through the tools** (globs: `*` one segment, `**` across segments); positioned as **accident-proofing, not adversarial**. `shell` commands bypass this layer (`cat .env` still works — next row); so do MCP tools and host-injected CallbackTool/`with_code_access` (round-3 probe: a guest read a deny'd `.env` via an MCP file server) — the full countermeasure set for a hostile guest stays `restrict_to_workdir` / hooks Deny / removing the tool |
+| `fs_write_dirs` | `[]` | the write-path allow-list **through the tools** (empty = the whole workdir writable) (relative to workdir; intersection semantics — can tighten to nowhere-writable). **Binds only the 4 file tools and `copy_bytes`** — `shell` (including its redirected writes) bypasses this layer and the write-side symlink refusal; the countermeasure for a hostile guest is `restrict_to_workdir` / hooks Deny / dropping `shell` from `tools` (A-8: read and write sides share the boundary; pinned tests exist) |
 | `max_tool_calls` | 200 | the cap on in-sandbox tool calls (failed calls included). Grounded in AppWorld high-loop tasks: gold solutions take 91–244 calls; the old default of 50 couldn't even fit the "survey metadata first, then batch-write" two-phase play (measured: the survey phase alone hit the cap, zero real work done) |
 | `timeout_secs` | 120 | wall clock; `0` = none (cancel / fuel / mem still bound it) |
 | `fuel` | 5e9 | the instruction budget (pure compute loops; debug builds measured ≈11.6s/1e9, release faster). Why 5e9 by default: v2 P2 A/B measured a 2.5 MB file `readAll` whole-read (in-guest JSON parse + array build) exceeding 1e9 — first attempt died on fuel and needed a model self-rescue; 5e9 covers that and still sits under the default `timeout_secs=120` |
@@ -1295,7 +1301,7 @@ session/permission/sub-agent model; TinyAgent doesn't implement them.)
 
 Two directories are scanned at startup, **project overrides global** (same name → project wins):
 
-- Global: `~/.config/tinyagent/skills/` (or `$XDG_CONFIG_HOME/tinyagent/skills/`) — personal general skills.
+- Global: `~/.config/tinyagent/skills/` (or `$XDG_CONFIG_HOME/tinyagent/skills/`) — personal general skills. On Windows-native shells without `$HOME`, the home anchor falls back to `%USERPROFILE%\.config\tinyagent\skills\` (same precedence as the default config path; round-3 review R2-02).
 - Project: `<working directory>/.tinyagent/skills/` — ships with the repo, shared by a team.
 - Built-in: skills embedded in the binary (currently only `run-code`, present when the `code` feature
   is enabled — the full usage guide for the run_code sandbox) — appear in the list only when the
@@ -1497,34 +1503,34 @@ one-line responsibility is maintained in that script's ENTRIES.
 ```text
 crates/core/src/  # kernel crate (package tiny-agent-core, lib name tiny_agent): agent loop / tools / providers / config / assembly
 ├── lib.rs                (  608)  # lib root: build_agent* / assemble (tool table, ToolCtx, code install, skill injection)
-├── fsutil.rs             (  463)  # atomic-write primitives (O_EXCL temp + fsync + dir fsync; shared by session/result/report)
-├── diag.rs               (  168)  # diagnostics channel: global sink installable by GUI hosts (falls back to stderr, byte-identical) — soft-failure warnings of skills/MCP/session/run_code go through it
-├── config.rs             ( 3181)  # config parsing + task-fragment merge + batch override whitelist
+├── fsutil.rs             (  477)  # atomic-write primitives (O_EXCL temp + fsync + dir fsync; shared by session/result/report)
+├── diag.rs               (  179)  # diagnostics channel: global sink installable by GUI hosts (falls back to stderr, byte-identical) — soft-failure warnings of skills/MCP/session/run_code go through it
+├── config.rs             ( 3335)  # config parsing + task-fragment merge + batch override whitelist
 ├── provider/  # LLM backends
-│   ├── mod.rs                ( 1178)  # shared Message/Block, SSE reader, CancellableSse
+│   ├── mod.rs                ( 1191)  # shared Message/Block, SSE reader, CancellableSse
 │   ├── openai.rs             ( 2388)  # OpenAI-compatible (include_usage; 400 fallbacks: max_tokens→max_completion_tokens / drop stream_options)
-│   ├── openai_review_pins.rs ( 1001)  # openai review pins (loopback HTTP: status matrix/credential discipline/retry body; ThinkStripper differential + idle timeout)
+│   ├── openai_review_pins.rs ( 1003)  # openai review pins (loopback HTTP: status matrix/credential discipline/retry body; ThinkStripper differential + idle timeout)
 │   ├── sse_review_pins.rs    (  245)  # SSE parser review pins (chunk-boundary invariance across 17 stream shapes, sync vs worker path)
 │   ├── anthropic.rs          ( 1246)  # Anthropic native (message_start/message_delta usage)
-│   └── mock.rs               (  352)  # scripted Provider for tests (cfg(any(test, feature="mock")))
-├── agent.rs              ( 4611)  # core loop + usage accounting + cancel + context compression (preflight/overflow dual trigger + rolling chunked summaries) + adjacent-message normalization + same-turn multi-task parallelism
-├── agent_tests.rs        (11424)  # core-loop regression tests (scripted provider::mock, no network)
+│   └── mock.rs               (  361)  # scripted Provider for tests (cfg(any(test, feature="mock")))
+├── agent.rs              ( 4715)  # core loop + usage accounting + cancel + context compression (preflight/overflow dual trigger + rolling chunked summaries) + adjacent-message normalization + same-turn multi-task parallelism
+├── agent_tests.rs        (11634)  # core-loop regression tests (scripted provider::mock, no network)
 ├── usage_probe.rs        (   94)  # thread-local usage side channel for parallel workers: recovers billed usage after a panic unwind at the join point (keeps result.json and the shared counter from diverging)
 ├── compress.rs           (  996)  # compression engine (find_safe_cut / chunked summaries / saturating usage merge + block-level billing primitives)
 ├── context_report.rs     (  886)  # context composition breakdown (ContextBreakdown estimate: 3 system parts / 4 tool classes / message typing + anchor calibration)
 ├── retry.rs              (  158)  # exponential backoff shared by batch --retries and single-run transient retry (±25% jitter against lockstep)
 ├── session.rs            (  533)  # session persistence (atomic writes + fold archive)
-├── skills.rs             ( 1089)  # three-tier skill loading (built-in / user dir / project)
-├── hooks.rs              (  301)  # hooks gate (Deny / Modify / audit)
+├── skills.rs             ( 1173)  # three-tier skill loading (built-in / user dir / project)
+├── hooks.rs              (  335)  # hooks gate (Deny / Modify / audit)
 ├── tools/  # toolset: built-in tools + MCP wrappers + task sub-agent + run_code (feature code)
-│   ├── mod.rs                ( 1509)  # Tool trait + ToolCtx + CallbackTool/SharedTool + whitelist assembly
+│   ├── mod.rs                ( 1573)  # Tool trait + ToolCtx + CallbackTool/SharedTool + whitelist assembly
 │   ├── shell.rs              ( 1297)  # shell tool (unix: sh -c; Windows: cmd /C + raw_arg verbatim command passing, defeating std quoting)
 │   ├── file.rs               ( 1672)  # read_file / write_file / edit_file / list_dir
 │   ├── image.rs              (   87)  # load_image tool
 │   ├── document.rs           (  100)  # PDF → Block::Document loading (lib API load_document_block)
 │   ├── skill.rs              (  981)  # read_skill / list_skill (outside the whitelist; injected by assembly)
 │   ├── mcp.rs                (  674)  # MCP tool wrapper (sanitize_name + wire_name dispatch)
-│   ├── subagent.rs           ( 1101)  # task sub-agent tool (own context + turn cap; non-recursive)
+│   ├── subagent.rs           ( 1105)  # task sub-agent tool (own context + turn cap; non-recursive)
 │   ├── todo.rs               (  311)  # todo tool (task plan, full replacement; plan lands in result.json)
 │   ├── run_code.rs           (  103)  # run_code facade (feature code): mod declarations + symbol re-exports; implementation in run_code/ submodules
 │   ├── llm.rs                (  740)  # llm judgment primitive (feature code + code.llm gate): single-shot stateless inner model call — LD-17 reserve/settle, LD-18 label normalization, shared Provider cell
@@ -1543,14 +1549,14 @@ crates/core/src/  # kernel crate (package tiny-agent-core, lib name tiny_agent):
 └── m0_probes.rs          (  337)  # M0 mechanism probes (cfg(test), #[path]-declared in lib.rs): reserve/settle ledger, shared Provider cell, per-request model routing in-process prototype (A-L2b/2c/9 — reused directly by the M3 llm primitive)
 
 src/  # CLI crate (package tiny-agent, bin tiny-agent): process shell + headless rendering + batch + TUI
-├── main.rs               ( 1065)  # CLI entry + assembly (build_agent) + --session none
+├── main.rs               ( 1075)  # CLI entry + assembly (build_agent) + --session none
 ├── signal.rs             (  123)  # headless SIGINT → cancel (first press graceful / second hard-exit 130)
 ├── batch.rs              ( 4046)  # batch tasks + --retries/--failed + report merging
-├── harness.rs            ( 2454)  # headless mode + result.json + NDJSON + exit codes
+├── harness.rs            ( 2578)  # headless mode + result.json + NDJSON + exit codes
 ├── harness_tests.rs      ( 1212)  # harness behavior tests (retry ladder / result.json / NDJSON; moved here with harness from the kernel's agent_tests.rs)
 ├── tui.rs                (   20)  # TUI module root (feature tui): mod declarations + public exports (run / transcript_rows)
 └── tui/  # TUI submodules (same tui gate): split from the original 8.7k-line single file by concern
-    ├── app.rs                ( 1834)  # session assembly: run entry / worker thread / event & input channels / ui_loop event body / Ctrl-C double-press window
+    ├── app.rs                ( 1839)  # session assembly: run entry / worker thread / event & input channels / ui_loop event body / Ctrl-C double-press window
     ├── input.rs              (  361)  # multi-line InputBuffer editor / input history recall / horizontal input scrolling
     ├── slash.rs              (  549)  # slash commands: classify grammar / read-only replies / completion popup state machine / /context report
     ├── theme.rs              (  147)  # theme: single source for history-row & chrome colors / light-dark switch TINYAGENT_TUI_THEME / number formatting helpers

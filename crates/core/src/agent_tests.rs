@@ -4549,6 +4549,8 @@ fn api_status_error_retry_taxonomy() {
             tool_calls: vec![],
             compressions: vec![],
             turns: 1,
+            arbitrations_used: 0,
+            gateway_fixes: Default::default(),
             elapsed: std::time::Duration::ZERO,
         }
         .is_transient()
@@ -4570,6 +4572,8 @@ fn api_status_error_retry_taxonomy() {
         tool_calls: vec![],
         compressions: vec![],
         turns: 1,
+        arbitrations_used: 0,
+        gateway_fixes: Default::default(),
         elapsed: std::time::Duration::ZERO,
     };
     assert!(!wrapped.is_transient(), "chain walk must find the status");
@@ -4581,6 +4585,8 @@ fn api_status_error_retry_taxonomy() {
         tool_calls: vec![],
         compressions: vec![],
         turns: 1,
+        arbitrations_used: 0,
+        gateway_fixes: Default::default(),
         elapsed: std::time::Duration::ZERO,
     };
     assert!(plain.is_transient());
@@ -4605,6 +4611,8 @@ fn is_transient_treats_408_request_timeout_and_425_too_early_as_retryable() {
             tool_calls: vec![],
             compressions: vec![],
             turns: 1,
+            arbitrations_used: 0,
+            gateway_fixes: Default::default(),
             elapsed: std::time::Duration::ZERO,
         }
         .is_transient()
@@ -10894,6 +10902,7 @@ fn gateway_fixes_export_serializes_only_when_non_default() {
             final_text: "done".into(),
             turns: 1,
             stop_reason: "end_turn".into(),
+            arbitrations_used: 0,
             tool_calls: vec![],
             compressions: vec![],
             turn_timings: vec![],
@@ -11421,4 +11430,205 @@ fn zero_block_final_turn_never_consults_arbitration() {
     assert!(!events
         .iter()
         .any(|e| matches!(e, AgentEvent::TurnArbitration { .. })));
+}
+
+// ── round-3 评审钉子（R1-01 空白 note / R1-03 仲裁台账 / R1-04 失败账单 /
+//    R1-08 clear_hooks）─────────────────────────────────────────────────
+
+/// 只回空白 note 的 Continue 钩子（R1-01 守卫钉的探针形态）。
+struct BlankNoteArbitration;
+impl Hooks for BlankNoteArbitration {
+    fn on_turn_stopping(&self, _info: &TurnStopInfo) -> TurnStopDecision {
+        TurnStopDecision::Continue { note: "   ".into() }
+    }
+}
+
+/// Continue N 次后转 Stop（R1-03 台账钉的探针形态）。
+struct ContinueNTimesArbitration {
+    remaining: std::sync::atomic::AtomicU32,
+}
+impl Hooks for ContinueNTimesArbitration {
+    fn on_turn_stopping(&self, _info: &TurnStopInfo) -> TurnStopDecision {
+        if self
+            .remaining
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            TurnStopDecision::Continue {
+                note: "one more".into(),
+            }
+        } else {
+            TurnStopDecision::Stop
+        }
+    }
+}
+
+#[test]
+fn blank_arbitration_note_is_treated_as_stop_with_zero_drift() {
+    // R1-01：空白 note 的 Continue 与 `inject_note` 同款守卫——零漂移收尾：
+    // 不续跑（不白耗一次全额计费请求）、不发 TurnArbitration、不耗帽、
+    // 无旁注标记块入史。守卫只装在仲裁入口而漏了 inject_note（或反之）
+    // 的变异在本钉上必炸（turns/事件数同时变）。
+    let (prov, state) = MockProvider::new(vec![mock::resp_text("claimed done", None)]);
+    let mut agent = Agent::new(
+        &cfg_with(8, 0, 0),
+        Box::new(prov),
+        vec![],
+        vec![user_text("task")],
+        test_ctx(),
+    );
+    agent.set_hooks(Arc::new(BlankNoteArbitration));
+    let mut events = Vec::new();
+    let outcome = agent.run(&mut |e| events.push(e)).unwrap();
+    assert_eq!(
+        state.calls(),
+        1,
+        "blank note must NOT buy another billed request"
+    );
+    assert_eq!(outcome.turns, 1);
+    assert_eq!(outcome.stop_reason, "end_turn");
+    assert_eq!(outcome.arbitrations_used, 0);
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::TurnArbitration { .. })));
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::NoteInjected { .. })));
+    // 历史无旁注标记块（空白 note 若入队，会形成只有标记前缀的空块）。
+    assert!(!agent.messages().iter().any(|m| m
+        .content
+        .iter()
+        .any(|b| matches!(b, Block::Text(t) if t.contains(SUPERVISOR_NOTE_MARKER)))));
+    // 序列化面：0 → 键缺席（无仲裁 result.json 字节不变纪律）。
+    let v = serde_json::to_value(&outcome).unwrap();
+    assert!(v.get("arbitrations_used").is_none(), "{v}");
+}
+
+#[test]
+fn accepted_arbitration_lands_in_outcome_and_serialized_key() {
+    // R1-03：被兑现的仲裁在 RunOutcome 台账面可数（此前只在 --json 事件流
+    // 可见，quiet-run 宿主对成功的驳回完全失明）；序列化键随非零出现。
+    let (prov, state) = MockProvider::new(vec![
+        mock::resp_text("first", None),
+        mock::resp_text("second", None),
+        mock::resp_text("third", None),
+    ]);
+    let mut agent = Agent::new(
+        &cfg_with(8, 0, 0),
+        Box::new(prov),
+        vec![],
+        vec![user_text("task")],
+        test_ctx(),
+    );
+    agent.set_hooks(Arc::new(ContinueNTimesArbitration {
+        remaining: std::sync::atomic::AtomicU32::new(2),
+    }));
+    let mut events = Vec::new();
+    let outcome = agent.run(&mut |e| events.push(e)).unwrap();
+    assert_eq!(state.calls(), 3);
+    assert_eq!(outcome.arbitrations_used, 2);
+    let v = serde_json::to_value(&outcome).unwrap();
+    assert_eq!(v["arbitrations_used"], 2);
+    let continued = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                AgentEvent::TurnArbitration {
+                    continued: true,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(continued, 2, "event count and ledger count must agree");
+}
+
+#[test]
+fn clear_hooks_restores_default_zero_drift_paths() {
+    // R1-08：撤销正门——clear_hooks 之后 run 走无钩子默认路径（零漂移），
+    // 与 set_hooks 装上前的行为逐字节一致；无需重建 agent。
+    let (prov, state) = MockProvider::new(vec![mock::resp_text("claimed done", None)]);
+    let mut agent = Agent::new(
+        &cfg_with(8, 0, 0),
+        Box::new(prov),
+        vec![],
+        vec![user_text("task")],
+        test_ctx(),
+    );
+    agent.set_hooks(Arc::new(AlwaysContinueArbitration {
+        note: "keep going".into(),
+    }));
+    agent.clear_hooks();
+    let mut events = Vec::new();
+    let outcome = agent.run(&mut |e| events.push(e)).unwrap();
+    assert_eq!(state.calls(), 1, "no hooks means no forced continuation");
+    assert_eq!(outcome.stop_reason, "end_turn");
+    assert_eq!(outcome.arbitrations_used, 0);
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::TurnArbitration { .. })));
+}
+
+#[test]
+fn run_cost_folds_failed_attempt_arbitrations_and_gateway_fixes() {
+    // R1-03/R1-04：失败 attempt 的仲裁计数（saturating 累加）与已学
+    // gateway 修复位（OR 折叠，学习单调）随 RunCost 折叠、经 fold_into 落
+    // 到成功 outcome；RunError 的自定义 Serialize 对零值两键缺席（bindings
+    // 失败载荷字节不变）、非零出现（失败 result.json 答得出「学到哪了」）。
+    let mut acc = RunCost::default();
+    let e1 = RunError {
+        source: anyhow::anyhow!("boom"),
+        usage: Usage::default(),
+        tool_calls: vec![],
+        compressions: vec![],
+        turns: 1,
+        arbitrations_used: 2,
+        gateway_fixes: crate::provider::GatewayFixes {
+            no_stream_options: true,
+            ..Default::default()
+        },
+        elapsed: std::time::Duration::ZERO,
+    };
+    acc.add_failed(&e1);
+    acc.add_failed(&e1);
+    assert_eq!(acc.turns, 2);
+    assert_eq!(acc.arbitrations_used, 4);
+    assert!(acc.gateway_fixes.no_stream_options);
+    let v = serde_json::to_value(&e1).unwrap();
+    assert_eq!(v["arbitrations_used"], 2);
+    assert_eq!(v["gateway_fixes"]["no_stream_options"], true);
+    let clean = RunError {
+        source: anyhow::anyhow!("boom"),
+        usage: Usage::default(),
+        tool_calls: vec![],
+        compressions: vec![],
+        turns: 1,
+        arbitrations_used: 0,
+        gateway_fixes: Default::default(),
+        elapsed: std::time::Duration::ZERO,
+    };
+    let v = serde_json::to_value(&clean).unwrap();
+    assert!(v.get("arbitrations_used").is_none(), "{v}");
+    assert!(v.get("gateway_fixes").is_none(), "{v}");
+    let mut o = RunOutcome {
+        final_text: String::new(),
+        turns: 1,
+        stop_reason: "end_turn".into(),
+        arbitrations_used: 0,
+        tool_calls: vec![],
+        compressions: vec![],
+        turn_timings: vec![],
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        elapsed: std::time::Duration::ZERO,
+        config_fingerprint: String::new(),
+        gateway_fixes: Default::default(),
+    };
+    acc.fold_into(&mut o);
+    assert_eq!(o.turns, 3, "successful attempt 1 + two failed");
+    assert_eq!(o.arbitrations_used, 4);
+    assert!(o.gateway_fixes.no_stream_options);
 }

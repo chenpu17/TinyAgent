@@ -98,6 +98,8 @@ fn run_error_of(e: anyhow::Error) -> RunError {
         tool_calls: vec![],
         compressions: vec![],
         turns: 0,
+        arbitrations_used: 0,
+        gateway_fixes: Default::default(),
         elapsed: Duration::ZERO,
     }
 }

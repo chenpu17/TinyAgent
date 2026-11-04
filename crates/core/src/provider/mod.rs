@@ -448,6 +448,19 @@ impl GatewayFixes {
     pub fn is_default(&self) -> bool {
         *self == Self::default()
     }
+
+    /// Accumulate another instance's bits into this one (bitwise OR — the
+    /// same merge semantics as the preset round-trip: learning is
+    /// monotonic, a bit once set stays set). Lives here, next to the field
+    /// list, so a future fix bit updates the fold in the same commit; the
+    /// retry ladders' [`RunCost`](crate::agent::RunCost) uses it to carry a
+    /// failed attempt's learned bits past the failed provider's death
+    /// (round-3 review R1-04).
+    pub fn fold_or(&mut self, other: &Self) {
+        self.max_completion_tokens |= other.max_completion_tokens;
+        self.no_stream_options |= other.no_stream_options;
+        self.no_reasoning_effort |= other.no_reasoning_effort;
+    }
 }
 
 /// Build the provider a config names (Anthropic or OpenAI), sharing `client`

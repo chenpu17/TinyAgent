@@ -67,9 +67,16 @@ pub enum TurnStopDecision {
     /// through the supervisor-note delivery pipeline (the same marked block,
     /// FIFO, at-most-once, panic-safe machinery as
     /// [`crate::Agent::supervisor_handle`]) and reaches the model before the
-    /// next request. Continuations are capped per run — see
-    /// [`TurnStopInfo::continuations_cap`]; past the cap the decision
-    /// degrades to `Stop` with `stop_reason = "arbitration_capped"`.
+    /// next request. A whitespace-only `note` is treated as `Stop` — the
+    /// same blank guard `inject_note` applies (an empty note would become a
+    /// history block that is all marker prefix and no content, at the cost
+    /// of a full billed request and one cap slot); it fires no
+    /// `TurnArbitration` event and consumes no cap. Continuations are
+    /// capped per run — see [`TurnStopInfo::continuations_cap`]; past the
+    /// cap the decision degrades to `Stop` with
+    /// `stop_reason = "arbitration_capped"`, the note preserved only in that
+    /// event (capped notes never enter history); accepted continuations are
+    /// counted in [`crate::agent::RunOutcome::arbitrations_used`].
     Continue {
         /// Text merged into the tail user turn as a marked block for the
         /// model (why the completion was rejected / what to do next).
@@ -176,14 +183,41 @@ pub struct TurnStopInfo<'a> {
 ///   new panic CLASS). Inside a sub-agent it stays on that worker thread and
 ///   the parent batch's join absorbs it as the "parallel tool worker
 ///   panicked" error output. Return `Deny` on bad input rather than
-///   panicking.
+///   panicking. RELEASE CAVEAT (round-3 review R1-07): the release profile
+///   builds with `panic = "abort"` — there the panic does NOT unwind
+///   through `Agent::run` at all; it terminates the process immediately
+///   (no run exit, no deferred note flush, no `Done`, no result.json, and
+///   batch's worker-absorption never sees it). The unwind semantics above
+///   hold in the test profile and any host that overrides the profile;
+///   implementers must not rely on unwinding — return `Deny`/`Stop` on bad
+///   input.
 /// - `Modify` on a `todo` call changes only what EXECUTES; the `plan` field
 ///   in `result.json` is derived from the recorded (original) input — the
 ///   plan reflects what the model wanted to send. A denied `todo` is recorded
 ///   `is_error` and so never enters the plan.
 /// - An agent rebuilt from `--resume` does NOT carry hooks over (the layer
 ///   lives on the agent instance, not in the session file) — callers must
-///   `set_hooks` again after rebuilding.
+///   `set_hooks` again after rebuilding (or [`crate::Agent::clear_hooks`]
+///   to detach mid-session without a rebuild).
+///
+/// # Reentrancy (round-3 review R1-06)
+///
+/// The hook execution windows hold NO core lock — the supervisor-note mutex
+/// is only ever held for the microseconds of a queue drain, and the
+/// provider's learned-fixes mutex is not held across the run loop — so a
+/// hook may safely call back into the note-injection face:
+/// [`crate::Agent::supervisor_handle`]'s `inject_note` / `drain_pending`
+/// are reentrancy-safe (a note injected from inside `on_turn_stopping`
+/// lands via the run-exit flush; probed, not just reasoned). Calling any
+/// `&mut self` agent API (`run`, `compact`, …) from inside a hook is
+/// impossible on the same thread (the run holds the borrow), and locking a
+/// host-owned `Arc<Mutex<Agent>>` from inside a hook deadlocks on the
+/// host's own lock — that self-lock is the host's bug to avoid, but it is
+/// why the safe surface above is deliberately named. Slow hooks are
+/// OBSERVED, not bounded: `on_turn_stopping` runs in a serial window where
+/// a cancel waits for it; over a 5s threshold the core emits one
+/// `diag_warn` (no timeout, no interruption — see
+/// [`TurnStopDecision::Continue`]).
 pub trait Hooks: Send + Sync {
     /// Gate a tool call before execution. `tool` is the tool's name, `input`
     /// the model's original arguments, `ctx` the execution context (inspect

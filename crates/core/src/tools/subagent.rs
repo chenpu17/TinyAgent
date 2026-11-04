@@ -786,6 +786,7 @@ mod tests {
             final_text: "all done".into(),
             turns: 2,
             stop_reason: "end_turn".into(),
+            arbitrations_used: 0,
             tool_calls: vec![],
             compressions: vec![],
             turn_timings: vec![],
@@ -814,6 +815,7 @@ mod tests {
             final_text: "summary".into(),
             turns: 3,
             stop_reason: "end_turn".into(),
+            arbitrations_used: 0,
             tool_calls: vec![
                 ToolCallRecord {
                     name: "shell".into(),
@@ -913,6 +915,7 @@ mod tests {
             final_text: "partial".into(),
             turns: 25,
             stop_reason: "max_turns_reached".into(),
+            arbitrations_used: 0,
             tool_calls: vec![],
             compressions: vec![],
             turn_timings: vec![],
@@ -943,6 +946,7 @@ mod tests {
             final_text: big,
             turns: 1,
             stop_reason: "end_turn".into(),
+            arbitrations_used: 0,
             tool_calls: vec![],
             compressions: vec![],
             turn_timings: vec![],

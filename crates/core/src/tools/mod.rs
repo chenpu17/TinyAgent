@@ -902,6 +902,15 @@ pub fn confined_to(root: &Path, full: &Path, label: &str) -> Result<PathBuf> {
                             None => bail!("path escapes the {label}: {}", full.display()),
                         };
                     } else if comp.as_os_str() != std::ffi::OsStr::new(".") {
+                        // R2-01 guard: this component is about to accumulate
+                        // lexically (it doesn't exist), so a caller's create
+                        // would materialize it — a DOS reserved device name
+                        // here becomes a cursed literal file (see the helper
+                        // doc). Windows-only check; unix passes through.
+                        #[cfg(windows)]
+                        if is_windows_reserved_device_name(comp) {
+                            bail!("path names a Windows reserved device: {}", full.display());
+                        }
                         let cand = cur.join(comp);
                         cur = match cand.canonicalize() {
                             // The component really exists: the kernel
@@ -993,6 +1002,31 @@ pub fn confined_to(root: &Path, full: &Path, label: &str) -> Result<PathBuf> {
             }
         }
     }
+}
+
+/// DOS reserved device names (round-3 review R2-01). Under the `\\?\`
+/// verbatim prefix — what canonicalized roots hand back — the kernel SKIPS
+/// DOS device resolution, so the lexical (not-yet-existing) lane of
+/// [`confined_to`] can return a path that a caller's create happily turns
+/// into a literal file named `nul`/`nul.txt`/`con.txt`/… : the file exists
+/// for tools that spell it verbatim (this crate's own I/O) and is the
+/// DEVICE for every bare-spelling consumer (git, `del`, shells, Explorer) —
+/// unopenable and undeletable from outside. Guard: any lexically-joined
+/// component whose stem (name up to the first dot, case-insensitive) is a
+/// reserved name bails with an explicit error instead. Windows-only — on
+/// unix these are ordinary legal filenames. Applies to INTERMEDIATE
+/// components too (`nul/x.txt` would create a literal `nul` directory the
+/// same way). Entries that physically EXIST take the canonical lane and are
+/// untouched: reads of a pre-existing verbatim-spelled `nul` keep working.
+#[cfg(windows)]
+fn is_windows_reserved_device_name(comp: &std::ffi::OsStr) -> bool {
+    const RESERVED: [&str; 22] = [
+        "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+        "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+    ];
+    let name = comp.to_str().unwrap_or("");
+    let stem = name.split('.').next().unwrap_or("");
+    RESERVED.iter().any(|r| stem.eq_ignore_ascii_case(r))
 }
 
 /// Check that `full` stays inside the workdir. Thin wrapper over [`confined_to`]
@@ -1434,6 +1468,36 @@ mod tests {
         let ok = confined_to(&root, &root.join("missing/new.txt"), "working directory").unwrap();
         assert!(ok.ends_with("missing/new.txt"), "{ok:?}");
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// R2-01（round-3 评审）：词法车道对 DOS 保留设备名的守卫——`nul`、
+    /// `nul.txt`、`con.txt`、`aux.txt`、`com1`、`LPT9`（大小写不敏感）与
+    /// 中间组件 `nul/x.txt` 全部显式报错；没有守卫时 `\\?\` 逐字路径会把
+    /// 它们创建成字面文件（外部 git/del/cat 以裸拼写永远解析到设备， curse
+    /// 文件不可读不可删）。对照：非保留名的相似拼写照常 Ok。变异杀伤：删
+    /// 守卫 → 全部 Ok → 本钉炸。
+    #[cfg(windows)]
+    #[test]
+    fn confined_to_rejects_windows_reserved_device_names() {
+        let root = workdir("devname");
+        for name in [
+            "nul",
+            "nul.txt",
+            "CON.txt",
+            "aux.txt",
+            "com1",
+            "LPT9",
+            "nul.d\\x.txt",
+        ] {
+            let err = confined_to(&root, &root.join(name), "working directory").unwrap_err();
+            assert!(err.to_string().contains("reserved device"), "{name}: {err}");
+        }
+        // 对照组：stem 不保留的相似拼写照常走词法车道。
+        for name in ["null.txt", "nulp", "console.txt", "auxiliary.txt"] {
+            let ok = confined_to(&root, &root.join(name), "working directory").unwrap();
+            assert!(ok.ends_with(name), "{name}: {ok:?}");
+        }
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// 实现了 `panic_audit_row` 的测试工具：审计行不只是 guest-only 的

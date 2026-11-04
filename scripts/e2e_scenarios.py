@@ -221,7 +221,7 @@ def done_event(events):
 def main():
     if not os.path.exists(BIN):
         print(f"[setup] building {BIN} (code feature) ...")
-        subprocess.run(["cargo", "build", "--features", "code"], cwd=REPO, check=True)
+        subprocess.run(["cargo", "build", "--locked", "--features", "code"], cwd=REPO, check=True)
 
     # Ephemeral port: no collision with a dev's local mock or parallel CI jobs.
     sock = socket.socket()

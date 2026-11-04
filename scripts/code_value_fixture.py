@@ -201,7 +201,7 @@ def t2_data():
 
 def mcp_server_command(root: Path, log_path: Path = None):
     """T2 的 stdio MCP mock 启动参数（config 的 mcp_servers 与参考解共用）。"""
-    args = ["python3", str(ROOT / "scripts" / "code_value_mcp_server.py"),
+    args = [sys.executable, str(ROOT / "scripts" / "code_value_mcp_server.py"),
             "--subscriptions", str(root / "t2" / "server" / "subscriptions.json"),
             "--events", str(root / "t2" / "server" / "events.json")]
     if log_path is not None:
