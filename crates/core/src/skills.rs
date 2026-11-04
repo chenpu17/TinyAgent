@@ -1120,19 +1120,42 @@ mod tests {
         assert_eq!(default_global_skills_dir_in(None, None, None), None);
         // R2-02: no HOME → USERPROFILE fallback (same precedence as the
         // config side's pick_home; Windows-native shells don't set HOME).
+        // Expected paths are BUILT with join(), never spelled as literals:
+        // PathBuf PartialEq compares components, and on unix a
+        // backslash-spelled literal is ONE component (`C:\Users\me\...`
+        // contains no `/`) while the join()-built actual carries `/` —
+        // the mismatch broke this pin on every linux CI runner while
+        // windows passed (components equality folds both separators).
+        // The test's own header comment has warned about exactly this
+        // since before round-3; the round-3 additions violated it.
         assert_eq!(
             default_global_skills_dir_in(None, None, Some("C:\\Users\\me")),
-            Some(PathBuf::from("C:\\Users\\me\\.config\\tinyagent\\skills"))
+            Some(
+                PathBuf::from("C:\\Users\\me")
+                    .join(".config")
+                    .join("tinyagent")
+                    .join("skills")
+            )
         );
         // Non-empty HOME still wins over USERPROFILE (pick_home precedence).
         assert_eq!(
             default_global_skills_dir_in(None, Some("/h"), Some("C:\\Users\\me")),
-            Some(PathBuf::from("/h/.config/tinyagent/skills"))
+            Some(
+                PathBuf::from("/h")
+                    .join(".config")
+                    .join("tinyagent")
+                    .join("skills")
+            )
         );
         // Empty HOME falls through too.
         assert_eq!(
             default_global_skills_dir_in(None, Some(""), Some("C:\\Users\\me")),
-            Some(PathBuf::from("C:\\Users\\me\\.config\\tinyagent\\skills"))
+            Some(
+                PathBuf::from("C:\\Users\\me")
+                    .join(".config")
+                    .join("tinyagent")
+                    .join("skills")
+            )
         );
     }
 

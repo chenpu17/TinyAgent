@@ -1520,7 +1520,7 @@ crates/core/src/  # kernel crate (package tiny-agent-core, lib name tiny_agent):
 ├── context_report.rs     (  886)  # context composition breakdown (ContextBreakdown estimate: 3 system parts / 4 tool classes / message typing + anchor calibration)
 ├── retry.rs              (  158)  # exponential backoff shared by batch --retries and single-run transient retry (±25% jitter against lockstep)
 ├── session.rs            (  533)  # session persistence (atomic writes + fold archive)
-├── skills.rs             ( 1173)  # three-tier skill loading (built-in / user dir / project)
+├── skills.rs             ( 1196)  # three-tier skill loading (built-in / user dir / project)
 ├── hooks.rs              (  335)  # hooks gate (Deny / Modify / audit)
 ├── tools/  # toolset: built-in tools + MCP wrappers + task sub-agent + run_code (feature code)
 │   ├── mod.rs                ( 1573)  # Tool trait + ToolCtx + CallbackTool/SharedTool + whitelist assembly
