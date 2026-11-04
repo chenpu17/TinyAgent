@@ -74,8 +74,20 @@ jobs:
       - run: cargo clippy --locked -p tiny-agent-core -p tiny-agent --all-targets -- -D warnings
       - run: cargo clippy --locked -p tiny-agent --features tui --all-targets -- -D warnings
       - run: cargo test --locked -p tiny-agent-core -p tiny-agent
+      - name: surface failing tests (annotations, temporary)
+        if: failure()
+        run: |
+          cargo test --locked -p tiny-agent-core -p tiny-agent 2>&1 | sed -n '/^failures:$/,$p' | grep -v "^test result" | sed 's/^/::error::/' | head -120
       - run: cargo test --locked -p tiny-agent-core --features mock
+      - name: surface failing tests (annotations, temporary)
+        if: failure()
+        run: |
+          cargo test --locked -p tiny-agent-core --features mock 2>&1 | sed -n '/^failures:$/,$p' | grep -v "^test result" | sed 's/^/::error::/' | head -120
       - run: cargo test --locked -p tiny-agent --features tui,mock
+      - name: surface failing tests (annotations, temporary)
+        if: failure()
+        run: |
+          cargo test --locked -p tiny-agent --features tui,mock 2>&1 | sed -n '/^failures:$/,$p' | grep -v "^test result" | sed 's/^/::error::/' | head -120
 
   code:
     # `code` feature（run_code 沙箱）门禁：第三个 clippy 配置——run_code.rs
@@ -101,6 +113,10 @@ jobs:
       # set_code_* 交互）在任一单 feature 配置里都不可见（外审：CI 盲区）。
       - run: cargo clippy --locked -p tiny-agent --features tui,code --all-targets -- -D warnings
       - run: cargo test --locked -p tiny-agent-core -p tiny-agent --features code,mock
+      - name: surface failing tests (annotations, temporary)
+        if: failure()
+        run: |
+          cargo test --locked -p tiny-agent-core -p tiny-agent --features code,mock 2>&1 | sed -n '/^failures:$/,$p' | grep -v "^test result" | sed 's/^/::error::/' | head -120
 
   e2e:
     # 场景化端到端门（离线、零密钥）：内置 SSE 场景 mock + 真实 CLI/HTTP
