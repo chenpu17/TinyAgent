@@ -1159,7 +1159,7 @@ crates/core/src/  # kernel crate (package tiny-agent-core, lib name tiny_agent):
 ├── provider/  # LLM backends
 │   ├── mod.rs                ( 1178)  # shared Message/Block, SSE reader, CancellableSse
 │   ├── openai.rs             ( 2388)  # OpenAI-compatible (include_usage; 400 fallbacks: max_tokens→max_completion_tokens / drop stream_options)
-│   ├── openai_review_pins.rs (  995)  # openai review pins (loopback HTTP: status matrix/credential discipline/retry body; ThinkStripper differential + idle timeout)
+│   ├── openai_review_pins.rs ( 1001)  # openai review pins (loopback HTTP: status matrix/credential discipline/retry body; ThinkStripper differential + idle timeout)
 │   ├── sse_review_pins.rs    (  245)  # SSE parser review pins (chunk-boundary invariance across 17 stream shapes, sync vs worker path)
 │   ├── anthropic.rs          ( 1246)  # Anthropic native (message_start/message_delta usage)
 │   └── mock.rs               (  352)  # scripted Provider for tests (cfg(any(test, feature="mock")))
