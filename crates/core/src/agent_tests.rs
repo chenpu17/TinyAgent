@@ -11632,3 +11632,194 @@ fn run_cost_folds_failed_attempt_arbitrations_and_gateway_fixes() {
     assert_eq!(o.arbitrations_used, 4);
     assert!(o.gateway_fixes.no_stream_options);
 }
+
+// ── 取消 / stream_idle 提前退出路径的诚实用量账单（宿主 R12：中止轮烧掉的
+// token 是真实成本，RunOutcome/RunError 必须携带本 run 内已回传的累计用量）──
+
+#[test]
+fn cancel_mid_run_keeps_completed_requests_usage() {
+    // 第一个请求已完成（usage 已回传入账），第二个请求尚未发出即被取消
+    // （工具执行内落下的 cancel 在轮循环顶接管）→ Ok(RunOutcome) 必须
+    // 携带第一请求的用量。第二个脚本 turn 带毒（usage 999）：若被发出，
+    // 断言会立刻暴露。
+    let cfg = cfg_with(5, 0, 0);
+    let flag = Arc::new(AtomicBool::new(false));
+    let (prov, state) = MockProvider::new(vec![
+        mock::resp_tool("t1", "echo", json!({}), mock::mk_usage(100, 20)),
+        mock::resp_text("never sent", mock::mk_usage(999, 999)),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(EchoTool::cancel_on_run("echo", flag.clone()))],
+        vec![user_text("hi")],
+        test_ctx(),
+    );
+    agent.set_cancel(flag);
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o.stop_reason, "cancelled");
+    assert_eq!(
+        (o.input_tokens, o.output_tokens),
+        (100, 20),
+        "completed request's usage must survive the cancel"
+    );
+    assert_eq!(
+        (o.cache_creation_input_tokens, o.cache_read_input_tokens),
+        (0, 0)
+    );
+    assert_eq!(state.calls(), 1, "second request must never be sent");
+}
+
+#[test]
+fn cancel_middleware_inflight_second_request_keeps_first_usage() {
+    // 与上一枚同型，但第二个请求真的发出并被「取消」——仿真 provider 在
+    // 流中途收到 cancel 的返回形状（stop_reason=cancelled、usage=None，
+    // 与 OpenAI 网关一致：usage 只搭最终 chunk，中途取消永远等不到）。
+    // 在途请求未回传用量，如实不记；已完成请求的用量必须仍在。
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, _state) = MockProvider::new(vec![
+        mock::resp_tool("t1", "echo", json!({}), mock::mk_usage(100, 20)),
+        MockTurn::Ok(ChatResponse {
+            blocks: vec![Block::Text("partial".into())],
+            stop_reason: "cancelled".into(),
+            usage: None,
+        }),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(EchoTool::new("echo"))],
+        vec![user_text("hi")],
+        test_ctx(),
+    );
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o.stop_reason, "cancelled");
+    assert_eq!(
+        (o.input_tokens, o.output_tokens),
+        (100, 20),
+        "first request's usage must ride the cancelled-run outcome"
+    );
+}
+
+#[test]
+fn stream_idle_after_completed_request_keeps_usage() {
+    // 第一请求完成入账，第二请求流静默被内核判死（stream_idle）→ 现有
+    // 建模为 Ok(RunOutcome, stop_reason="stream_idle")，累计用量必须照带。
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, _state) = MockProvider::new(vec![
+        mock::resp_tool("t1", "echo", json!({}), mock::mk_usage(100, 20)),
+        MockTurn::Ok(ChatResponse {
+            blocks: vec![],
+            stop_reason: "stream_idle".into(),
+            usage: None,
+        }),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(EchoTool::new("echo"))],
+        vec![user_text("hi")],
+        test_ctx(),
+    );
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o.stop_reason, "stream_idle");
+    assert_eq!(
+        (o.input_tokens, o.output_tokens),
+        (100, 20),
+        "completed request's usage must survive the stream_idle kill"
+    );
+}
+
+#[test]
+fn zero_usage_cancel_reports_zero_usage() {
+    // 首请求未完成就被取消：在途请求 provider 从未回传用量，如实 0，
+    // 严禁虚报。与 run_with_preset_cancel_returns_immediately_zero_requests
+    // 互补：那枚钉「预置取消零请求」，这枚钉「运行中第一请求在途被取消、
+    // usage 未回传」的形状（真实 provider 的 Ok(cancelled, usage=None)）。
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, state) = MockProvider::new(vec![MockTurn::Ok(ChatResponse {
+        blocks: vec![],
+        stop_reason: "cancelled".into(),
+        usage: None,
+    })]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("hi")],
+        test_ctx(),
+    );
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o.stop_reason, "cancelled");
+    assert_eq!(
+        o.input_tokens
+            + o.output_tokens
+            + o.cache_creation_input_tokens
+            + o.cache_read_input_tokens,
+        0,
+        "no usage was ever received: the outcome must report zeros"
+    );
+    assert_eq!(state.calls(), 1, "exactly one (aborted) request was made");
+}
+
+#[test]
+fn provider_err_after_completed_request_keeps_usage() {
+    // 提前退出构造点的 Err 侧对偶（run_error）：第一请求完成入账，第二
+    // 请求 provider 硬错误 → Err(RunError) 必须携带第一请求的累计用量
+    // （重试梯/宿主账单靠它并账——流错误形状已有
+    // stream_error_stop_reason_maps_to_run_error_with_usage 钉单请求侧，
+    // 这枚钉跨请求累计侧）。
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, _state) = MockProvider::new(vec![
+        mock::resp_tool("t1", "echo", json!({}), mock::mk_usage(100, 20)),
+        MockTurn::Err("provider blew up".into()),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(EchoTool::new("echo"))],
+        vec![user_text("hi")],
+        test_ctx(),
+    );
+    let err = match agent.run(&mut |_| {}) {
+        Err(e) => e,
+        Ok(_) => panic!("provider Err must surface as RunError"),
+    };
+    assert_eq!(
+        (err.usage.input_tokens, err.usage.output_tokens),
+        (100, 20),
+        "completed request's usage must ride the failed run's RunError"
+    );
+}
+
+#[test]
+fn cancelled_stream_with_partial_usage_bills_the_received_part() {
+    // 语义红线的另一半：在途请求被取消时 provider「已回传」的用量必须
+    // 入账（Anthropic message_start 在流头部就带 input/cache 三轴——中途
+    // 取消不抹掉已计费的部分），未回传的（OpenAI 尾帧 usage）如实缺席。
+    // parse_loop 返回 Some(部分用量) + stop_reason=cancelled 的真实形状。
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, _state) = MockProvider::new(vec![MockTurn::Ok(ChatResponse {
+        blocks: vec![Block::Text("partial".into())],
+        stop_reason: "cancelled".into(),
+        usage: mock::mk_usage_cache(70, 0, 30, 10),
+    })]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("hi")],
+        test_ctx(),
+    );
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o.stop_reason, "cancelled");
+    assert_eq!(
+        (
+            o.input_tokens,
+            o.cache_creation_input_tokens,
+            o.cache_read_input_tokens
+        ),
+        (70, 30, 10),
+        "usage the provider already reported before the cancel must be billed"
+    );
+}

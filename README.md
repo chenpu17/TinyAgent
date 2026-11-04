@@ -1514,7 +1514,7 @@ crates/core/src/  # kernel crate (package tiny-agent-core, lib name tiny_agent):
 │   ├── anthropic.rs          ( 1246)  # Anthropic native (message_start/message_delta usage)
 │   └── mock.rs               (  361)  # scripted Provider for tests (cfg(any(test, feature="mock")))
 ├── agent.rs              ( 4715)  # core loop + usage accounting + cancel + context compression (preflight/overflow dual trigger + rolling chunked summaries) + adjacent-message normalization + same-turn multi-task parallelism
-├── agent_tests.rs        (11634)  # core-loop regression tests (scripted provider::mock, no network)
+├── agent_tests.rs        (11825)  # core-loop regression tests (scripted provider::mock, no network)
 ├── usage_probe.rs        (   94)  # thread-local usage side channel for parallel workers: recovers billed usage after a panic unwind at the join point (keeps result.json and the shared counter from diverging)
 ├── compress.rs           (  996)  # compression engine (find_safe_cut / chunked summaries / saturating usage merge + block-level billing primitives)
 ├── context_report.rs     (  886)  # context composition breakdown (ContextBreakdown estimate: 3 system parts / 4 tool classes / message typing + anchor calibration)
