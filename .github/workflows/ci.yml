@@ -72,6 +72,32 @@ jobs:
       # 锁文件组合，而不是解析器当天挑的版本——semver 兼容新版本发布后
       # CI 绿灯与锁文件构建不再分叉。
       - run: cargo clippy --locked -p tiny-agent-core -p tiny-agent --all-targets -- -D warnings
+      # 临时诊断（10def62 同款手法，logs 403 下的读侧）：unix 侧 clippy 确定性
+      # 红且本地 windows 复现不了（cfg(unix) 代码不在 windows 编译面），把
+      # clippy 无 -D warnings 的 JSON 输出经 python3 转 ::error:: annotations
+      # 点名 lint 与位置——定位修复后整块删除。
+      - name: surface clippy lint (annotations, temporary)
+        if: failure()
+        run: |
+          cargo clippy --locked -p tiny-agent-core -p tiny-agent --all-targets --message-format=json 2>/dev/null \
+            | python3 -c "
+import json, sys
+n = 0
+for line in sys.stdin:
+    try:
+        m = json.loads(line)
+    except Exception:
+        continue
+    r = m.get('rendered') or ''
+    if not r or n >= 10:
+        continue
+    spans = m.get('spans') or [{}]
+    s = spans[0]
+    loc = f\"{s.get('file_name','?')}:{s.get('line_start',0)}:{s.get('column_start',0)}\"
+    msg = r.replace(chr(10), ' | ')[:280]
+    print(f'::error file={loc}::{msg}')
+    n += 1
+"
       - run: cargo clippy --locked -p tiny-agent --features tui --all-targets -- -D warnings
       - run: cargo test --locked -p tiny-agent-core -p tiny-agent
       - run: cargo test --locked -p tiny-agent-core --features mock
@@ -97,6 +123,28 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo clippy --locked -p tiny-agent-core -p tiny-agent --features code --all-targets -- -D warnings
+      - name: surface clippy lint (annotations, temporary)
+        if: failure()
+        run: |
+          cargo clippy --locked -p tiny-agent-core -p tiny-agent --features code --all-targets --message-format=json 2>/dev/null \
+            | python3 -c "
+import json, sys
+n = 0
+for line in sys.stdin:
+    try:
+        m = json.loads(line)
+    except Exception:
+        continue
+    r = m.get('rendered') or ''
+    if not r or n >= 10:
+        continue
+    spans = m.get('spans') or [{}]
+    s = spans[0]
+    loc = f\"{s.get('file_name','?')}:{s.get('line_start',0)}:{s.get('column_start',0)}\"
+    msg = r.replace(chr(10), ' | ')[:280]
+    print(f'::error file={loc}::{msg}')
+    n += 1
+"
       # 第四个 clippy 配置：tui×code 交叉面（TUI 的 CodeLog 渲染、/code 命令、
       # set_code_* 交互）在任一单 feature 配置里都不可见（外审：CI 盲区）。
       - run: cargo clippy --locked -p tiny-agent --features tui,code --all-targets -- -D warnings
