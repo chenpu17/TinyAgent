@@ -79,25 +79,7 @@ jobs:
       - name: surface clippy lint (annotations, temporary)
         if: failure()
         run: |
-          cargo clippy --locked -p tiny-agent-core -p tiny-agent --all-targets --message-format=json 2>/dev/null \
-            | python3 -c "
-import json, sys
-n = 0
-for line in sys.stdin:
-    try:
-        m = json.loads(line)
-    except Exception:
-        continue
-    r = m.get('rendered') or ''
-    if not r or n >= 10:
-        continue
-    spans = m.get('spans') or [{}]
-    s = spans[0]
-    loc = f\"{s.get('file_name','?')}:{s.get('line_start',0)}:{s.get('column_start',0)}\"
-    msg = r.replace(chr(10), ' | ')[:280]
-    print(f'::error file={loc}::{msg}')
-    n += 1
-"
+          cargo clippy --locked -p tiny-agent-core -p tiny-agent --all-targets --message-format=json 2>/dev/null | python3 -c "import sys,base64; exec(base64.b64decode('aW1wb3J0IGpzb24sIHN5cwpuID0gMApmb3IgbGluZSBpbiBzeXMuc3RkaW46CiAgICB0cnk6CiAgICAgICAgbSA9IGpzb24ubG9hZHMobGluZSkKICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAgICAgY29udGludWUKICAgIHIgPSBtLmdldCgicmVuZGVyZWQiKSBvciAiIgogICAgaWYgbm90IHIgb3IgbiA+PSAxMDoKICAgICAgICBjb250aW51ZQogICAgc3BhbnMgPSBtLmdldCgic3BhbnMiKSBvciBbe31dCiAgICBzID0gc3BhbnNbMF0KICAgIGxvYyA9ICIlczolczolcyIgJSAocy5nZXQoImZpbGVfbmFtZSIsICI/IiksIHMuZ2V0KCJsaW5lX3N0YXJ0IiwgMCksIHMuZ2V0KCJjb2x1bW5fc3RhcnQiLCAwKSkKICAgIG1zZyA9IHIucmVwbGFjZShjaHIoMTApLCAiIHwgIilbOjI4MF0KICAgIHByaW50KCI6OmVycm9yIGZpbGU9JXM6OiVzIiAlIChsb2MsIG1zZykpCiAgICBuICs9IDEK').decode())"
       - run: cargo clippy --locked -p tiny-agent --features tui --all-targets -- -D warnings
       - run: cargo test --locked -p tiny-agent-core -p tiny-agent
       - run: cargo test --locked -p tiny-agent-core --features mock
@@ -126,25 +108,7 @@ for line in sys.stdin:
       - name: surface clippy lint (annotations, temporary)
         if: failure()
         run: |
-          cargo clippy --locked -p tiny-agent-core -p tiny-agent --features code --all-targets --message-format=json 2>/dev/null \
-            | python3 -c "
-import json, sys
-n = 0
-for line in sys.stdin:
-    try:
-        m = json.loads(line)
-    except Exception:
-        continue
-    r = m.get('rendered') or ''
-    if not r or n >= 10:
-        continue
-    spans = m.get('spans') or [{}]
-    s = spans[0]
-    loc = f\"{s.get('file_name','?')}:{s.get('line_start',0)}:{s.get('column_start',0)}\"
-    msg = r.replace(chr(10), ' | ')[:280]
-    print(f'::error file={loc}::{msg}')
-    n += 1
-"
+          cargo clippy --locked -p tiny-agent-core -p tiny-agent --features code --all-targets --message-format=json 2>/dev/null | python3 -c "import sys,base64; exec(base64.b64decode('aW1wb3J0IGpzb24sIHN5cwpuID0gMApmb3IgbGluZSBpbiBzeXMuc3RkaW46CiAgICB0cnk6CiAgICAgICAgbSA9IGpzb24ubG9hZHMobGluZSkKICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAgICAgY29udGludWUKICAgIHIgPSBtLmdldCgicmVuZGVyZWQiKSBvciAiIgogICAgaWYgbm90IHIgb3IgbiA+PSAxMDoKICAgICAgICBjb250aW51ZQogICAgc3BhbnMgPSBtLmdldCgic3BhbnMiKSBvciBbe31dCiAgICBzID0gc3BhbnNbMF0KICAgIGxvYyA9ICIlczolczolcyIgJSAocy5nZXQoImZpbGVfbmFtZSIsICI/IiksIHMuZ2V0KCJsaW5lX3N0YXJ0IiwgMCksIHMuZ2V0KCJjb2x1bW5fc3RhcnQiLCAwKSkKICAgIG1zZyA9IHIucmVwbGFjZShjaHIoMTApLCAiIHwgIilbOjI4MF0KICAgIHByaW50KCI6OmVycm9yIGZpbGU9JXM6OiVzIiAlIChsb2MsIG1zZykpCiAgICBuICs9IDEK').decode())"
       # 第四个 clippy 配置：tui×code 交叉面（TUI 的 CodeLog 渲染、/code 命令、
       # set_code_* 交互）在任一单 feature 配置里都不可见（外审：CI 盲区）。
       - run: cargo clippy --locked -p tiny-agent --features tui,code --all-targets -- -D warnings
