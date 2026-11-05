@@ -68,11 +68,20 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          # r4-cache-bust: 8bb70ab 时代的缓存条目在 ca375f9 大 diff 后触发 unix 侧
-          # clippy 恢复态首次编译 exit 101（clean -p 重检即绿、全新 run 同条目
-          # 又红、windows 独立条目无毒——增量 session 损坏 ICE 形态）。bump key
-          # 甩掉毒缓存，观察一轮后可视稳定情况移除。
+          # r4-cache-bust（已证伪缓存假设，暂留作 cache 世代标记）
           key: r4-cache-bust
+
+      # unix runner 磁盘压力缓解（round-4 CI 排障）：首次全量编译（deps+两包，
+      # wasmtime 树尤巨）在 ubuntu 26 新镜像/macos arm64 小磁盘上撞资源峰值
+      # exit 101，clean -p 后重编（deps 已就位）即绿、下轮首编又红。删预装
+      # 大件（dotnet/android/ghc ~25GB），windows 磁盘大不受限故 if 门住。
+      - name: free runner disk
+        if: runner.os != 'Windows'
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost 2>/dev/null || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          df -h / | tail -1
       # 两个 clippy 都带 -D warnings：本地现状零警告，门禁就该硬。
       # --locked 与 msrv job 同口径（外审 D-F6）：门禁校验用户实际拿到的
       # 锁文件组合，而不是解析器当天挑的版本——semver 兼容新版本发布后
@@ -85,6 +94,7 @@ jobs:
       - name: surface clippy lint (annotations, temporary)
         if: failure()
         run: |
+          df -h / | tail -1 | sed 's/^/::error::disk-at-failure: /'
           cargo clean -p tiny-agent-core -p tiny-agent 2>/dev/null || true
           cargo clippy --locked -p tiny-agent-core -p tiny-agent --all-targets -- -D warnings --message-format=json 2>&1 | python3 -c "import sys,base64; exec(base64.b64decode('aW1wb3J0IGpzb24sIHN5cwpuID0gMApmb3IgbGluZSBpbiBzeXMuc3RkaW46CiAgICBsaW5lID0gbGluZS5yc3RyaXAoKQogICAgaWYgbm90IGxpbmU6CiAgICAgICAgY29udGludWUKICAgIG0gPSBOb25lCiAgICB0cnk6CiAgICAgICAgbSA9IGpzb24ubG9hZHMobGluZSkKICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAgICAgaWYgbiA8IDEwOgogICAgICAgICAgICBwcmludCgiOjplcnJvcjo6IiArIGxpbmVbOjI4MF0pCiAgICAgICAgICAgIG4gKz0gMQogICAgICAgIGNvbnRpbnVlCiAgICByID0gbS5nZXQoInJlbmRlcmVkIikgb3IgIiIKICAgIGlmIG5vdCByOgogICAgICAgIGNvbnRpbnVlCiAgICBpZiBuIDwgMTA6CiAgICAgICAgc3BhbnMgPSBtLmdldCgic3BhbnMiKSBvciBbe31dCiAgICAgICAgcyA9IHNwYW5zWzBdCiAgICAgICAgbG9jID0gIiVzOiVzOiVzIiAlIChzLmdldCgiZmlsZV9uYW1lIiwgIj8iKSwgcy5nZXQoImxpbmVfc3RhcnQiLCAwKSwgcy5nZXQoImNvbHVtbl9zdGFydCIsIDApKQogICAgICAgIHByaW50KCI6OmVycm9yIGZpbGU9JXM6OiVzIiAlIChsb2MsIHIucmVwbGFjZShjaHIoMTApLCAiIHwgIilbOjI4MF0pKQogICAgICAgIG4gKz0gMQo=').decode())"
       - run: cargo clippy --locked -p tiny-agent --features tui --all-targets -- -D warnings
@@ -112,15 +122,25 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          # r4-cache-bust: 8bb70ab 时代的缓存条目在 ca375f9 大 diff 后触发 unix 侧
-          # clippy 恢复态首次编译 exit 101（clean -p 重检即绿、全新 run 同条目
-          # 又红、windows 独立条目无毒——增量 session 损坏 ICE 形态）。bump key
-          # 甩掉毒缓存，观察一轮后可视稳定情况移除。
+          # r4-cache-bust（已证伪缓存假设，暂留作 cache 世代标记）
           key: r4-cache-bust
+
+      # unix runner 磁盘压力缓解（round-4 CI 排障）：首次全量编译（deps+两包，
+      # wasmtime 树尤巨）在 ubuntu 26 新镜像/macos arm64 小磁盘上撞资源峰值
+      # exit 101，clean -p 后重编（deps 已就位）即绿、下轮首编又红。删预装
+      # 大件（dotnet/android/ghc ~25GB），windows 磁盘大不受限故 if 门住。
+      - name: free runner disk
+        if: runner.os != 'Windows'
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost 2>/dev/null || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          df -h / | tail -1
       - run: cargo clippy --locked -p tiny-agent-core -p tiny-agent --features code --all-targets -- -D warnings
       - name: surface clippy lint (annotations, temporary)
         if: failure()
         run: |
+          df -h / | tail -1 | sed 's/^/::error::disk-at-failure: /'
           cargo clean -p tiny-agent-core -p tiny-agent 2>/dev/null || true
           cargo clippy --locked -p tiny-agent-core -p tiny-agent --features code --all-targets -- -D warnings --message-format=json 2>&1 | python3 -c "import sys,base64; exec(base64.b64decode('aW1wb3J0IGpzb24sIHN5cwpuID0gMApmb3IgbGluZSBpbiBzeXMuc3RkaW46CiAgICBsaW5lID0gbGluZS5yc3RyaXAoKQogICAgaWYgbm90IGxpbmU6CiAgICAgICAgY29udGludWUKICAgIG0gPSBOb25lCiAgICB0cnk6CiAgICAgICAgbSA9IGpzb24ubG9hZHMobGluZSkKICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAgICAgaWYgbiA8IDEwOgogICAgICAgICAgICBwcmludCgiOjplcnJvcjo6IiArIGxpbmVbOjI4MF0pCiAgICAgICAgICAgIG4gKz0gMQogICAgICAgIGNvbnRpbnVlCiAgICByID0gbS5nZXQoInJlbmRlcmVkIikgb3IgIiIKICAgIGlmIG5vdCByOgogICAgICAgIGNvbnRpbnVlCiAgICBpZiBuIDwgMTA6CiAgICAgICAgc3BhbnMgPSBtLmdldCgic3BhbnMiKSBvciBbe31dCiAgICAgICAgcyA9IHNwYW5zWzBdCiAgICAgICAgbG9jID0gIiVzOiVzOiVzIiAlIChzLmdldCgiZmlsZV9uYW1lIiwgIj8iKSwgcy5nZXQoImxpbmVfc3RhcnQiLCAwKSwgcy5nZXQoImNvbHVtbl9zdGFydCIsIDApKQogICAgICAgIHByaW50KCI6OmVycm9yIGZpbGU9JXM6OiVzIiAlIChsb2MsIHIucmVwbGFjZShjaHIoMTApLCAiIHwgIilbOjI4MF0pKQogICAgICAgIG4gKz0gMQo=').decode())"
       # 第四个 clippy 配置：tui×code 交叉面（TUI 的 CodeLog 渲染、/code 命令、
