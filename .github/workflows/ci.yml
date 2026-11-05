@@ -111,6 +111,8 @@ jobs:
           wc -c err.txt | awk '{print "::error::err-bytes=" $1}'
           head -c 300 err.txt | tr -cd '[:print:]' | awk '{print "::error::head300=" substr($0,1,150)}'
           awk '{print substr($0,1,200)}' err.txt | sed 's/[^[:print:]]//g' | sed 's/%/%25/g' | head -10 | sed 's/^/::error::/' || true
+          base64 -w0 err.txt | awk '{n=split($0,a,""); s=""; for(i=1;i<=n;i+=3800) print "::error::B64" substr($0,i,3800)}'
+
           git config user.email ci@example.invalid
           git config user.name ci-dump
           git checkout -B ci-debug/clippy-stderr
@@ -172,6 +174,8 @@ jobs:
           wc -c err.txt | awk '{print "::error::err-bytes=" $1}'
           head -c 300 err.txt | tr -cd '[:print:]' | awk '{print "::error::head300=" substr($0,1,150)}'
           awk '{print substr($0,1,200)}' err.txt | sed 's/[^[:print:]]//g' | sed 's/%/%25/g' | head -10 | sed 's/^/::error::/' || true
+          base64 -w0 err.txt | awk '{n=split($0,a,""); s=""; for(i=1;i<=n;i+=3800) print "::error::B64" substr($0,i,3800)}'
+
           git config user.email ci@example.invalid
           git config user.name ci-dump
           git checkout -B ci-debug/clippy-stderr
