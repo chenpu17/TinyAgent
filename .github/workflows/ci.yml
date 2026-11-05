@@ -75,9 +75,6 @@ jobs:
           toolchain: 1.99.1
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          # r4-cache-bust（已证伪缓存假设，暂留作 cache 世代标记）
-          key: r4-cache-bust
 
       # unix runner 磁盘压力缓解（round-4 CI 排障）：首次全量编译（deps+两包，
       # wasmtime 树尤巨）在 ubuntu 26 新镜像/macos arm64 小磁盘上撞资源峰值
@@ -135,9 +132,6 @@ jobs:
           toolchain: 1.99.1
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          # r4-cache-bust（已证伪缓存假设，暂留作 cache 世代标记）
-          key: r4-cache-bust
 
       # unix runner 磁盘压力缓解（round-4 CI 排障）：首次全量编译（deps+两包，
       # wasmtime 树尤巨）在 ubuntu 26 新镜像/macos arm64 小磁盘上撞资源峰值
@@ -183,12 +177,6 @@ jobs:
           # 有意升级（本地直连官方 stable 复验 unix 面后再动）。
           toolchain: 1.99.1
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          # r4-cache-bust: 8bb70ab 时代的缓存条目在 ca375f9 大 diff 后触发 unix 侧
-          # clippy 恢复态首次编译 exit 101（clean -p 重检即绿、全新 run 同条目
-          # 又红、windows 独立条目无毒——增量 session 损坏 ICE 形态）。bump key
-          # 甩掉毒缓存，观察一轮后可视稳定情况移除。
-          key: r4-cache-bust
       - run: cargo build --locked --features code
       - run: python3 scripts/e2e_scenarios.py
 
@@ -216,12 +204,6 @@ jobs:
           toolchain: 1.99.1
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          # r4-cache-bust: 8bb70ab 时代的缓存条目在 ca375f9 大 diff 后触发 unix 侧
-          # clippy 恢复态首次编译 exit 101（clean -p 重检即绿、全新 run 同条目
-          # 又红、windows 独立条目无毒——增量 session 损坏 ICE 形态）。bump key
-          # 甩掉毒缓存，观察一轮后可视稳定情况移除。
-          key: r4-cache-bust
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
@@ -272,12 +254,6 @@ jobs:
           toolchain: 1.99.1
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          # r4-cache-bust: 8bb70ab 时代的缓存条目在 ca375f9 大 diff 后触发 unix 侧
-          # clippy 恢复态首次编译 exit 101（clean -p 重检即绿、全新 run 同条目
-          # 又红、windows 独立条目无毒——增量 session 损坏 ICE 形态）。bump key
-          # 甩掉毒缓存，观察一轮后可视稳定情况移除。
-          key: r4-cache-bust
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "20"
@@ -317,12 +293,6 @@ jobs:
           # 有意升级（本地直连官方 stable 复验 unix 面后再动）。
           toolchain: 1.99.1
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          # r4-cache-bust: 8bb70ab 时代的缓存条目在 ca375f9 大 diff 后触发 unix 侧
-          # clippy 恢复态首次编译 exit 101（clean -p 重检即绿、全新 run 同条目
-          # 又红、windows 独立条目无毒——增量 session 损坏 ICE 形态）。bump key
-          # 甩掉毒缓存，观察一轮后可视稳定情况移除。
-          key: r4-cache-bust
       - run: rustup target add x86_64-unknown-linux-musl
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --locked --release --target x86_64-unknown-linux-musl
@@ -367,12 +337,6 @@ jobs:
         with:
           toolchain: 1.86.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          # r4-cache-bust: 8bb70ab 时代的缓存条目在 ca375f9 大 diff 后触发 unix 侧
-          # clippy 恢复态首次编译 exit 101（clean -p 重检即绿、全新 run 同条目
-          # 又红、windows 独立条目无毒——增量 session 损坏 ICE 形态）。bump key
-          # 甩掉毒缓存，观察一轮后可视稳定情况移除。
-          key: r4-cache-bust
       - run: cargo check --locked
       # 绑定成员的 MSRV 验证（外审 D-F7，wave-2 复核定版）：python 在 1.86
       # 全绿（pyo3 0.22 + maturin-build 地板更低），此处逐包验证（pyo3 需要
