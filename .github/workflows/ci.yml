@@ -24,6 +24,32 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # round-4 CI 排障的独立复现 job（临时）：不依赖失败 job 内的诡异环境，
+  # 同 runner 形态复跑同一条 clippy 命令，stderr 无论成败都 dump 到
+  # ci-debug/clippy-stderr 分支（dump 步 if: always() 无条件执行）。
+  debug-clippy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
+        with:
+          toolchain: 1.99.1
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: reproduce clippy
+        run: |
+          cargo clippy --locked -p tiny-agent-core -p tiny-agent --all-targets -- -D warnings 2>err.txt; echo "rc=$?"
+          echo "err-bytes: $(wc -c < err.txt)"
+      - name: dump stderr to branch
+        if: always()
+        run: |
+          git config user.email ci@example.invalid
+          git config user.name ci-dump
+          git checkout -B ci-debug/clippy-stderr
+          git add err.txt
+          git commit -m 'clippy stderr dump [skip ci]'
+          git push https://x-access-token:${{ github.token }}@github.com/chenpu17/TinyAgent.git ci-debug/clippy-stderr --force
   fmt:
     # rustfmt 门禁：全 workspace（根 crate + 双绑定）--check 模式，零改动。
     # 存量 305 处已在一个纯格式 commit 里清零（见 .git-blame-ignore-revs），
