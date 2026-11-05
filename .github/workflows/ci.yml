@@ -9,8 +9,8 @@ on:
 permissions:
   contents: write
 # contents: write —— round-4 CI 排障临时提升：诊断步把 clippy stderr
-dump 到 ci-debug/clippy-stderr 分支（annotations 通道被 GitHub 静默
-拒收九轮，logs 403，git 分支是唯一可靠通道）。定位后恢复 read 并删 dump 步。
+# dump 到 ci-debug/clippy-stderr 分支（annotations 通道被 GitHub 静默
+# 拒收九轮，logs 403，git 分支是唯一可靠通道）。定位后恢复 read 并删 dump 步。
 
 # 第三方 action 全部固定到 commit SHA（`@<SHA> # vN`），由 Dependabot 周更
 # （.github/dependabot.yml 支持 SHA+注释形态）。dtolnay/rust-toolchain 此前
