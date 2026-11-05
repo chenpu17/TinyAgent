@@ -105,6 +105,8 @@ jobs:
           echo '--- stderr (full) ---' >> "$GITHUB_STEP_SUMMARY"
           head -c 4000 err.txt >> "$GITHUB_STEP_SUMMARY" || true
           echo >> "$GITHUB_STEP_SUMMARY"
+          wc -c err.txt | awk '{print "::error::err-bytes=" $1}'
+          head -c 300 err.txt | tr -cd '[:print:]' | awk '{print "::error::head300=" substr($0,1,150)}'
           awk '{print substr($0,1,200)}' err.txt | sed 's/[^[:print:]]//g' | sed 's/%/%25/g' | head -10 | sed 's/^/::error::/' || true
       - run: cargo clippy --locked -p tiny-agent --features tui --all-targets -- -D warnings
       - run: cargo test --locked -p tiny-agent-core -p tiny-agent
@@ -156,6 +158,8 @@ jobs:
           echo '--- stderr (full) ---' >> "$GITHUB_STEP_SUMMARY"
           head -c 4000 err.txt >> "$GITHUB_STEP_SUMMARY" || true
           echo >> "$GITHUB_STEP_SUMMARY"
+          wc -c err.txt | awk '{print "::error::err-bytes=" $1}'
+          head -c 300 err.txt | tr -cd '[:print:]' | awk '{print "::error::head300=" substr($0,1,150)}'
           awk '{print substr($0,1,200)}' err.txt | sed 's/[^[:print:]]//g' | sed 's/%/%25/g' | head -10 | sed 's/^/::error::/' || true
       # 第四个 clippy 配置：tui×code 交叉面（TUI 的 CodeLog 渲染、/code 命令、
       # set_code_* 交互）在任一单 feature 配置里都不可见（外审：CI 盲区）。
