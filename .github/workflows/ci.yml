@@ -31,7 +31,11 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
-          toolchain: stable
+          # round-4 CI 排障：stable 浮动 tag 疑于 8bb70ab→ca375f9 四小时窗口滚动到
+          # 新版本（本地 rsproxy 镜像滞后故 update 显示 unchanged，无法本地复现）。
+          # 钉到 1.99.1 = 8bb70ab 全绿时代的版本；若本轮转绿即漂移实锤，之后再
+          # 有意升级（本地直连官方 stable 复验 unix 面后再动）。
+          toolchain: 1.99.1
           components: rustfmt
       - run: cargo fmt --all --check
       # run_code 三处同源契约（工具描述 / skill 正文 / 附录 A 指纹）：微调
@@ -64,7 +68,11 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
-          toolchain: stable
+          # round-4 CI 排障：stable 浮动 tag 疑于 8bb70ab→ca375f9 四小时窗口滚动到
+          # 新版本（本地 rsproxy 镜像滞后故 update 显示 unchanged，无法本地复现）。
+          # 钉到 1.99.1 = 8bb70ab 全绿时代的版本；若本轮转绿即漂移实锤，之后再
+          # 有意升级（本地直连官方 stable 复验 unix 面后再动）。
+          toolchain: 1.99.1
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
@@ -96,7 +104,9 @@ jobs:
         run: |
           df -h / | tail -1 | sed 's/^/::error::disk-at-failure: /'
           cargo clean -p tiny-agent-core -p tiny-agent 2>/dev/null || true
-          cargo clippy --locked -p tiny-agent-core -p tiny-agent --all-targets -- -D warnings --message-format=json 2>&1 | python3 -c "import sys,base64; exec(base64.b64decode('aW1wb3J0IGpzb24sIHN5cwpuID0gMApmb3IgbGluZSBpbiBzeXMuc3RkaW46CiAgICBsaW5lID0gbGluZS5yc3RyaXAoKQogICAgaWYgbm90IGxpbmU6CiAgICAgICAgY29udGludWUKICAgIG0gPSBOb25lCiAgICB0cnk6CiAgICAgICAgbSA9IGpzb24ubG9hZHMobGluZSkKICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAgICAgaWYgbiA8IDEwOgogICAgICAgICAgICBwcmludCgiOjplcnJvcjo6IiArIGxpbmVbOjI4MF0pCiAgICAgICAgICAgIG4gKz0gMQogICAgICAgIGNvbnRpbnVlCiAgICByID0gbS5nZXQoInJlbmRlcmVkIikgb3IgIiIKICAgIGlmIG5vdCByOgogICAgICAgIGNvbnRpbnVlCiAgICBpZiBuIDwgMTA6CiAgICAgICAgc3BhbnMgPSBtLmdldCgic3BhbnMiKSBvciBbe31dCiAgICAgICAgcyA9IHNwYW5zWzBdCiAgICAgICAgbG9jID0gIiVzOiVzOiVzIiAlIChzLmdldCgiZmlsZV9uYW1lIiwgIj8iKSwgcy5nZXQoImxpbmVfc3RhcnQiLCAwKSwgcy5nZXQoImNvbHVtbl9zdGFydCIsIDApKQogICAgICAgIHByaW50KCI6OmVycm9yIGZpbGU9JXM6OiVzIiAlIChsb2MsIHIucmVwbGFjZShjaHIoMTApLCAiIHwgIilbOjI4MF0pKQogICAgICAgIG4gKz0gMQo=').decode())"
+          cargo clippy --locked -p tiny-agent-core -p tiny-agent --all-targets -- -D warnings 2>clippy-err.txt; echo "clippy rc=$?"
+          wc -l clippy-err.txt
+          head -30 clippy-err.txt | sed 's/^/::error::/'
       - run: cargo clippy --locked -p tiny-agent --features tui --all-targets -- -D warnings
       - run: cargo test --locked -p tiny-agent-core -p tiny-agent
       - run: cargo test --locked -p tiny-agent-core --features mock
@@ -118,7 +128,11 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
-          toolchain: stable
+          # round-4 CI 排障：stable 浮动 tag 疑于 8bb70ab→ca375f9 四小时窗口滚动到
+          # 新版本（本地 rsproxy 镜像滞后故 update 显示 unchanged，无法本地复现）。
+          # 钉到 1.99.1 = 8bb70ab 全绿时代的版本；若本轮转绿即漂移实锤，之后再
+          # 有意升级（本地直连官方 stable 复验 unix 面后再动）。
+          toolchain: 1.99.1
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
@@ -142,7 +156,9 @@ jobs:
         run: |
           df -h / | tail -1 | sed 's/^/::error::disk-at-failure: /'
           cargo clean -p tiny-agent-core -p tiny-agent 2>/dev/null || true
-          cargo clippy --locked -p tiny-agent-core -p tiny-agent --features code --all-targets -- -D warnings --message-format=json 2>&1 | python3 -c "import sys,base64; exec(base64.b64decode('aW1wb3J0IGpzb24sIHN5cwpuID0gMApmb3IgbGluZSBpbiBzeXMuc3RkaW46CiAgICBsaW5lID0gbGluZS5yc3RyaXAoKQogICAgaWYgbm90IGxpbmU6CiAgICAgICAgY29udGludWUKICAgIG0gPSBOb25lCiAgICB0cnk6CiAgICAgICAgbSA9IGpzb24ubG9hZHMobGluZSkKICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAgICAgaWYgbiA8IDEwOgogICAgICAgICAgICBwcmludCgiOjplcnJvcjo6IiArIGxpbmVbOjI4MF0pCiAgICAgICAgICAgIG4gKz0gMQogICAgICAgIGNvbnRpbnVlCiAgICByID0gbS5nZXQoInJlbmRlcmVkIikgb3IgIiIKICAgIGlmIG5vdCByOgogICAgICAgIGNvbnRpbnVlCiAgICBpZiBuIDwgMTA6CiAgICAgICAgc3BhbnMgPSBtLmdldCgic3BhbnMiKSBvciBbe31dCiAgICAgICAgcyA9IHNwYW5zWzBdCiAgICAgICAgbG9jID0gIiVzOiVzOiVzIiAlIChzLmdldCgiZmlsZV9uYW1lIiwgIj8iKSwgcy5nZXQoImxpbmVfc3RhcnQiLCAwKSwgcy5nZXQoImNvbHVtbl9zdGFydCIsIDApKQogICAgICAgIHByaW50KCI6OmVycm9yIGZpbGU9JXM6OiVzIiAlIChsb2MsIHIucmVwbGFjZShjaHIoMTApLCAiIHwgIilbOjI4MF0pKQogICAgICAgIG4gKz0gMQo=').decode())"
+          cargo clippy --locked -p tiny-agent-core -p tiny-agent --features code --all-targets -- -D warnings 2>clippy-err.txt; echo "clippy rc=$?"
+          wc -l clippy-err.txt
+          head -30 clippy-err.txt | sed 's/^/::error::/'
       # 第四个 clippy 配置：tui×code 交叉面（TUI 的 CodeLog 渲染、/code 命令、
       # set_code_* 交互）在任一单 feature 配置里都不可见（外审：CI 盲区）。
       - run: cargo clippy --locked -p tiny-agent --features tui,code --all-targets -- -D warnings
@@ -161,7 +177,11 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
-          toolchain: stable
+          # round-4 CI 排障：stable 浮动 tag 疑于 8bb70ab→ca375f9 四小时窗口滚动到
+          # 新版本（本地 rsproxy 镜像滞后故 update 显示 unchanged，无法本地复现）。
+          # 钉到 1.99.1 = 8bb70ab 全绿时代的版本；若本轮转绿即漂移实锤，之后再
+          # 有意升级（本地直连官方 stable 复验 unix 面后再动）。
+          toolchain: 1.99.1
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           # r4-cache-bust: 8bb70ab 时代的缓存条目在 ca375f9 大 diff 后触发 unix 侧
@@ -189,7 +209,11 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
-          toolchain: stable
+          # round-4 CI 排障：stable 浮动 tag 疑于 8bb70ab→ca375f9 四小时窗口滚动到
+          # 新版本（本地 rsproxy 镜像滞后故 update 显示 unchanged，无法本地复现）。
+          # 钉到 1.99.1 = 8bb70ab 全绿时代的版本；若本轮转绿即漂移实锤，之后再
+          # 有意升级（本地直连官方 stable 复验 unix 面后再动）。
+          toolchain: 1.99.1
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
@@ -241,7 +265,11 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
-          toolchain: stable
+          # round-4 CI 排障：stable 浮动 tag 疑于 8bb70ab→ca375f9 四小时窗口滚动到
+          # 新版本（本地 rsproxy 镜像滞后故 update 显示 unchanged，无法本地复现）。
+          # 钉到 1.99.1 = 8bb70ab 全绿时代的版本；若本轮转绿即漂移实锤，之后再
+          # 有意升级（本地直连官方 stable 复验 unix 面后再动）。
+          toolchain: 1.99.1
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
@@ -283,7 +311,11 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
-          toolchain: stable
+          # round-4 CI 排障：stable 浮动 tag 疑于 8bb70ab→ca375f9 四小时窗口滚动到
+          # 新版本（本地 rsproxy 镜像滞后故 update 显示 unchanged，无法本地复现）。
+          # 钉到 1.99.1 = 8bb70ab 全绿时代的版本；若本轮转绿即漂移实锤，之后再
+          # 有意升级（本地直连官方 stable 复验 unix 面后再动）。
+          toolchain: 1.99.1
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           # r4-cache-bust: 8bb70ab 时代的缓存条目在 ca375f9 大 diff 后触发 unix 侧
@@ -367,7 +399,11 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
-          toolchain: stable
+          # round-4 CI 排障：stable 浮动 tag 疑于 8bb70ab→ca375f9 四小时窗口滚动到
+          # 新版本（本地 rsproxy 镜像滞后故 update 显示 unchanged，无法本地复现）。
+          # 钉到 1.99.1 = 8bb70ab 全绿时代的版本；若本轮转绿即漂移实锤，之后再
+          # 有意升级（本地直连官方 stable 复验 unix 面后再动）。
+          toolchain: 1.99.1
       # --locked 只锁依赖树、锁不住 cargo-audit 自身的版本——这里显式钉版；
       # Dependabot 不认 run 步骤（只看 uses: 引用），升版本靠手动改这一行。
       - run: cargo install --locked cargo-audit --version 0.22.2
