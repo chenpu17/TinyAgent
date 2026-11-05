@@ -105,8 +105,7 @@ jobs:
           echo '--- stderr (full) ---' >> "$GITHUB_STEP_SUMMARY"
           head -c 4000 err.txt >> "$GITHUB_STEP_SUMMARY" || true
           echo >> "$GITHUB_STEP_SUMMARY"
-          head -10 err.txt | tr -cd '	
- -~' | sed 's/%/%25/g' | sed 's/^/::error::/' || true
+          head -10 err.txt | sed 's/[^[:print:]]//g' | sed 's/%/%25/g' | sed 's/^/::error::/' || true
       - run: cargo clippy --locked -p tiny-agent --features tui --all-targets -- -D warnings
       - run: cargo test --locked -p tiny-agent-core -p tiny-agent
       - run: cargo test --locked -p tiny-agent-core --features mock
@@ -157,8 +156,7 @@ jobs:
           echo '--- stderr (full) ---' >> "$GITHUB_STEP_SUMMARY"
           head -c 4000 err.txt >> "$GITHUB_STEP_SUMMARY" || true
           echo >> "$GITHUB_STEP_SUMMARY"
-          head -10 err.txt | tr -cd '	
- -~' | sed 's/%/%25/g' | sed 's/^/::error::/' || true
+          head -10 err.txt | sed 's/[^[:print:]]//g' | sed 's/%/%25/g' | sed 's/^/::error::/' || true
       # 第四个 clippy 配置：tui×code 交叉面（TUI 的 CodeLog 渲染、/code 命令、
       # set_code_* 交互）在任一单 feature 配置里都不可见（外审：CI 盲区）。
       - run: cargo clippy --locked -p tiny-agent --features tui,code --all-targets -- -D warnings
