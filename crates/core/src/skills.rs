@@ -1382,7 +1382,7 @@ description: o
         let link = tmpd("rootlink-link");
         let link_path = link.join("skills");
         symlink(&real, &link_path).expect("create root symlink");
-        let (idx, warns) = scan(&[link_path.clone()]);
+        let (idx, warns) = scan(std::slice::from_ref(&link_path));
         assert!(idx.is_empty(), "symlinked skills root must be skipped");
         assert!(
             warns.len() == 1 && warns[0].contains("symlink/junction, skipped"),
@@ -1442,7 +1442,7 @@ description: o
         )
         .unwrap();
         symlink(&outside_md, sub.join("SKILL.md")).expect("create SKILL.md symlink");
-        let (idx, warns) = scan(&[dir.clone()]);
+        let (idx, warns) = scan(std::slice::from_ref(&dir));
         assert!(idx.is_empty(), "symlinked SKILL.md must be skipped");
         assert!(
             warns.len() == 1 && warns[0].contains("SKILL.md is a symlink"),

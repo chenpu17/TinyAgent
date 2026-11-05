@@ -7,10 +7,7 @@ on:
 
 # 最低权限基线：CI 只读代码、不碰 Release/PR 写面。
 permissions:
-  contents: write
-# contents: write —— round-4 CI 排障临时提升：诊断步把 clippy stderr
-# dump 到 ci-debug/clippy-stderr 分支（annotations 通道被 GitHub 静默
-# 拒收九轮，logs 403，git 分支是唯一可靠通道）。定位后恢复 read 并删 dump 步。
+  contents: read
 
 # 第三方 action 全部固定到 commit SHA（`@<SHA> # vN`），由 Dependabot 周更
 # （.github/dependabot.yml 支持 SHA+注释形态）。dtolnay/rust-toolchain 此前
@@ -24,32 +21,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # round-4 CI 排障的独立复现 job（临时）：不依赖失败 job 内的诡异环境，
-  # 同 runner 形态复跑同一条 clippy 命令，stderr 无论成败都 dump 到
-  # ci-debug/clippy-stderr 分支（dump 步 if: always() 无条件执行）。
-  debug-clippy:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
-        with:
-          toolchain: 1.99.1
-          components: clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-      - name: reproduce clippy
-        run: |
-          cargo clippy --locked -p tiny-agent-core -p tiny-agent --all-targets -- -D warnings 2>err.txt; echo "rc=$?"
-          echo "err-bytes: $(wc -c < err.txt)"
-      - name: dump stderr to branch
-        if: always()
-        run: |
-          git config user.email ci@example.invalid
-          git config user.name ci-dump
-          git checkout -B ci-debug/clippy-stderr
-          git add err.txt
-          git commit -m 'clippy stderr dump [skip ci]'
-          git push https://x-access-token:${{ github.token }}@github.com/chenpu17/TinyAgent.git ci-debug/clippy-stderr --force
   fmt:
     # rustfmt 门禁：全 workspace（根 crate + 双绑定）--check 模式，零改动。
     # 存量 305 处已在一个纯格式 commit 里清零（见 .git-blame-ignore-revs），
@@ -60,11 +31,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
-          # round-4 CI 排障：stable 浮动 tag 疑于 8bb70ab→ca375f9 四小时窗口滚动到
-          # 新版本（本地 rsproxy 镜像滞后故 update 显示 unchanged，无法本地复现）。
-          # 钉到 1.99.1 = 8bb70ab 全绿时代的版本；若本轮转绿即漂移实锤，之后再
-          # 有意升级（本地直连官方 stable 复验 unix 面后再动）。
-          toolchain: 1.99.1
+          toolchain: stable
           components: rustfmt
       - run: cargo fmt --all --check
       # run_code 三处同源契约（工具描述 / skill 正文 / 附录 A 指纹）：微调
@@ -97,56 +64,14 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
-          # round-4 CI 排障：stable 浮动 tag 疑于 8bb70ab→ca375f9 四小时窗口滚动到
-          # 新版本（本地 rsproxy 镜像滞后故 update 显示 unchanged，无法本地复现）。
-          # 钉到 1.99.1 = 8bb70ab 全绿时代的版本；若本轮转绿即漂移实锤，之后再
-          # 有意升级（本地直连官方 stable 复验 unix 面后再动）。
-          toolchain: 1.99.1
+          toolchain: stable
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-
-      # unix runner 磁盘压力缓解（round-4 CI 排障）：首次全量编译（deps+两包，
-      # wasmtime 树尤巨）在 ubuntu 26 新镜像/macos arm64 小磁盘上撞资源峰值
-      # exit 101，clean -p 后重编（deps 已就位）即绿、下轮首编又红。删预装
-      # 大件（dotnet/android/ghc ~25GB），windows 磁盘大不受限故 if 门住。
-      - name: free runner disk
-        if: runner.os != 'Windows'
-        run: |
-          df -h / | tail -1
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost 2>/dev/null || true
-          sudo rm -rf /opt/hostedtoolcache/CodeQL 2>/dev/null || true
-          df -h / | tail -1
       # 两个 clippy 都带 -D warnings：本地现状零警告，门禁就该硬。
       # --locked 与 msrv job 同口径（外审 D-F6）：门禁校验用户实际拿到的
       # 锁文件组合，而不是解析器当天挑的版本——semver 兼容新版本发布后
       # CI 绿灯与锁文件构建不再分叉。
       - run: cargo clippy --locked -p tiny-agent-core -p tiny-agent --all-targets -- -D warnings
-      # 临时诊断（10def62 同款手法，logs 403 下的读侧）：unix 侧 clippy 确定性
-      # 红且本地 windows 复现不了（cfg(unix) 代码不在 windows 编译面），把
-      # clippy 无 -D warnings 的 JSON 输出经 python3 转 ::error:: annotations
-      # 点名 lint 与位置——定位修复后整块删除。
-      - name: surface clippy lint (annotations, temporary)
-        if: failure()
-        run: |
-          df -h / | tail -1 | sed 's/^/::error::disk-at-failure: /'
-          cargo clean -p tiny-agent-core -p tiny-agent 2>/dev/null || true
-          cargo clippy --locked -p tiny-agent-core -p tiny-agent --all-targets -- -D warnings 2>err.txt; echo "clippy rc=$?"
-          echo '--- stderr (full) ---' >> "$GITHUB_STEP_SUMMARY"
-          head -c 4000 err.txt >> "$GITHUB_STEP_SUMMARY" || true
-          echo >> "$GITHUB_STEP_SUMMARY"
-          wc -c err.txt | awk '{print "::error::err-bytes=" $1}'
-          head -c 300 err.txt | tr -cd '[:print:]' | awk '{print "::error::head300=" substr($0,1,150)}'
-          awk '{print substr($0,1,200)}' err.txt | sed 's/[^[:print:]]//g' | sed 's/%/%25/g' | head -10 | sed 's/^/::error::/' || true
-          base64 -w0 err.txt | awk '{n=split($0,a,""); s=""; for(i=1;i<=n;i+=3800) print "::error::B64" substr($0,i,3800)}'
-
-          git config user.email ci@example.invalid
-          git config user.name ci-dump
-          git checkout -B ci-debug/clippy-stderr
-          git add err.txt
-          git commit -m 'clippy stderr dump [skip ci]'
-          git push https://x-access-token:${GITHUB_TOKEN}@github.com/chenpu17/TinyAgent.git ci-debug/clippy-stderr --force
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
       - run: cargo clippy --locked -p tiny-agent --features tui --all-targets -- -D warnings
       - run: cargo test --locked -p tiny-agent-core -p tiny-agent
       - run: cargo test --locked -p tiny-agent-core --features mock
@@ -168,48 +93,10 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
-          # round-4 CI 排障：stable 浮动 tag 疑于 8bb70ab→ca375f9 四小时窗口滚动到
-          # 新版本（本地 rsproxy 镜像滞后故 update 显示 unchanged，无法本地复现）。
-          # 钉到 1.99.1 = 8bb70ab 全绿时代的版本；若本轮转绿即漂移实锤，之后再
-          # 有意升级（本地直连官方 stable 复验 unix 面后再动）。
-          toolchain: 1.99.1
+          toolchain: stable
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-
-      # unix runner 磁盘压力缓解（round-4 CI 排障）：首次全量编译（deps+两包，
-      # wasmtime 树尤巨）在 ubuntu 26 新镜像/macos arm64 小磁盘上撞资源峰值
-      # exit 101，clean -p 后重编（deps 已就位）即绿、下轮首编又红。删预装
-      # 大件（dotnet/android/ghc ~25GB），windows 磁盘大不受限故 if 门住。
-      - name: free runner disk
-        if: runner.os != 'Windows'
-        run: |
-          df -h / | tail -1
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost 2>/dev/null || true
-          sudo rm -rf /opt/hostedtoolcache/CodeQL 2>/dev/null || true
-          df -h / | tail -1
       - run: cargo clippy --locked -p tiny-agent-core -p tiny-agent --features code --all-targets -- -D warnings
-      - name: surface clippy lint (annotations, temporary)
-        if: failure()
-        run: |
-          df -h / | tail -1 | sed 's/^/::error::disk-at-failure: /'
-          cargo clean -p tiny-agent-core -p tiny-agent 2>/dev/null || true
-          cargo clippy --locked -p tiny-agent-core -p tiny-agent --features code --all-targets -- -D warnings 2>err.txt; echo "clippy rc=$?"
-          echo '--- stderr (full) ---' >> "$GITHUB_STEP_SUMMARY"
-          head -c 4000 err.txt >> "$GITHUB_STEP_SUMMARY" || true
-          echo >> "$GITHUB_STEP_SUMMARY"
-          wc -c err.txt | awk '{print "::error::err-bytes=" $1}'
-          head -c 300 err.txt | tr -cd '[:print:]' | awk '{print "::error::head300=" substr($0,1,150)}'
-          awk '{print substr($0,1,200)}' err.txt | sed 's/[^[:print:]]//g' | sed 's/%/%25/g' | head -10 | sed 's/^/::error::/' || true
-          base64 -w0 err.txt | awk '{n=split($0,a,""); s=""; for(i=1;i<=n;i+=3800) print "::error::B64" substr($0,i,3800)}'
-
-          git config user.email ci@example.invalid
-          git config user.name ci-dump
-          git checkout -B ci-debug/clippy-stderr
-          git add err.txt
-          git commit -m 'clippy stderr dump [skip ci]'
-          git push https://x-access-token:${GITHUB_TOKEN}@github.com/chenpu17/TinyAgent.git ci-debug/clippy-stderr --force
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
       # 第四个 clippy 配置：tui×code 交叉面（TUI 的 CodeLog 渲染、/code 命令、
       # set_code_* 交互）在任一单 feature 配置里都不可见（外审：CI 盲区）。
       - run: cargo clippy --locked -p tiny-agent --features tui,code --all-targets -- -D warnings
@@ -228,11 +115,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
-          # round-4 CI 排障：stable 浮动 tag 疑于 8bb70ab→ca375f9 四小时窗口滚动到
-          # 新版本（本地 rsproxy 镜像滞后故 update 显示 unchanged，无法本地复现）。
-          # 钉到 1.99.1 = 8bb70ab 全绿时代的版本；若本轮转绿即漂移实锤，之后再
-          # 有意升级（本地直连官方 stable 复验 unix 面后再动）。
-          toolchain: 1.99.1
+          toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo build --locked --features code
       - run: python3 scripts/e2e_scenarios.py
@@ -254,11 +137,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
-          # round-4 CI 排障：stable 浮动 tag 疑于 8bb70ab→ca375f9 四小时窗口滚动到
-          # 新版本（本地 rsproxy 镜像滞后故 update 显示 unchanged，无法本地复现）。
-          # 钉到 1.99.1 = 8bb70ab 全绿时代的版本；若本轮转绿即漂移实锤，之后再
-          # 有意升级（本地直连官方 stable 复验 unix 面后再动）。
-          toolchain: 1.99.1
+          toolchain: stable
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
@@ -304,11 +183,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
-          # round-4 CI 排障：stable 浮动 tag 疑于 8bb70ab→ca375f9 四小时窗口滚动到
-          # 新版本（本地 rsproxy 镜像滞后故 update 显示 unchanged，无法本地复现）。
-          # 钉到 1.99.1 = 8bb70ab 全绿时代的版本；若本轮转绿即漂移实锤，之后再
-          # 有意升级（本地直连官方 stable 复验 unix 面后再动）。
-          toolchain: 1.99.1
+          toolchain: stable
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -344,11 +219,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
-          # round-4 CI 排障：stable 浮动 tag 疑于 8bb70ab→ca375f9 四小时窗口滚动到
-          # 新版本（本地 rsproxy 镜像滞后故 update 显示 unchanged，无法本地复现）。
-          # 钉到 1.99.1 = 8bb70ab 全绿时代的版本；若本轮转绿即漂移实锤，之后再
-          # 有意升级（本地直连官方 stable 复验 unix 面后再动）。
-          toolchain: 1.99.1
+          toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: rustup target add x86_64-unknown-linux-musl
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
@@ -420,11 +291,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
-          # round-4 CI 排障：stable 浮动 tag 疑于 8bb70ab→ca375f9 四小时窗口滚动到
-          # 新版本（本地 rsproxy 镜像滞后故 update 显示 unchanged，无法本地复现）。
-          # 钉到 1.99.1 = 8bb70ab 全绿时代的版本；若本轮转绿即漂移实锤，之后再
-          # 有意升级（本地直连官方 stable 复验 unix 面后再动）。
-          toolchain: 1.99.1
+          toolchain: stable
       # --locked 只锁依赖树、锁不住 cargo-audit 自身的版本——这里显式钉版；
       # Dependabot 不认 run 步骤（只看 uses: 引用），升版本靠手动改这一行。
       - run: cargo install --locked cargo-audit --version 0.22.2
