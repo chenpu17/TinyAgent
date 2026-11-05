@@ -101,9 +101,12 @@ jobs:
         run: |
           df -h / | tail -1 | sed 's/^/::error::disk-at-failure: /'
           cargo clean -p tiny-agent-core -p tiny-agent 2>/dev/null || true
-          cargo clippy --locked -p tiny-agent-core -p tiny-agent --all-targets -- -D warnings 2>clippy-err.txt; echo "clippy rc=$?"
-          wc -l clippy-err.txt
-          head -30 clippy-err.txt | sed 's/^/::error::/'
+          cargo clippy --locked -p tiny-agent-core -p tiny-agent --all-targets -- -D warnings 2>err.txt; echo "clippy rc=$?"
+          echo '--- stderr (full) ---' >> "$GITHUB_STEP_SUMMARY"
+          head -c 4000 err.txt >> "$GITHUB_STEP_SUMMARY" || true
+          echo >> "$GITHUB_STEP_SUMMARY"
+          head -10 err.txt | tr -cd '	
+ -~' | sed 's/%/%25/g' | sed 's/^/::error::/' || true
       - run: cargo clippy --locked -p tiny-agent --features tui --all-targets -- -D warnings
       - run: cargo test --locked -p tiny-agent-core -p tiny-agent
       - run: cargo test --locked -p tiny-agent-core --features mock
@@ -150,9 +153,12 @@ jobs:
         run: |
           df -h / | tail -1 | sed 's/^/::error::disk-at-failure: /'
           cargo clean -p tiny-agent-core -p tiny-agent 2>/dev/null || true
-          cargo clippy --locked -p tiny-agent-core -p tiny-agent --features code --all-targets -- -D warnings 2>clippy-err.txt; echo "clippy rc=$?"
-          wc -l clippy-err.txt
-          head -30 clippy-err.txt | sed 's/^/::error::/'
+          cargo clippy --locked -p tiny-agent-core -p tiny-agent --features code --all-targets -- -D warnings 2>err.txt; echo "clippy rc=$?"
+          echo '--- stderr (full) ---' >> "$GITHUB_STEP_SUMMARY"
+          head -c 4000 err.txt >> "$GITHUB_STEP_SUMMARY" || true
+          echo >> "$GITHUB_STEP_SUMMARY"
+          head -10 err.txt | tr -cd '	
+ -~' | sed 's/%/%25/g' | sed 's/^/::error::/' || true
       # 第四个 clippy 配置：tui×code 交叉面（TUI 的 CodeLog 渲染、/code 命令、
       # set_code_* 交互）在任一单 feature 配置里都不可见（外审：CI 盲区）。
       - run: cargo clippy --locked -p tiny-agent --features tui,code --all-targets -- -D warnings
