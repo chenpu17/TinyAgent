@@ -296,20 +296,37 @@ pub(crate) fn text_units(s: &str) -> usize {
 
 /// Size of a single block under the token-estimate yardstick. This is the
 /// token-channel twin of [`block_chars`]: text-bearing content goes through
-/// [`text_units`] (CJK-aware), while images, PDFs and tool-use JSON keep
-/// their byte-derived weights. Kept a separate function from `block_chars`
-/// ON PURPOSE — the legacy `compress_threshold_chars` gate and prune/quote
-/// budgets still speak bytes (`total_chars`), and changing them would alter
-/// thresholds unrelated to the CJK under-count.
+/// [`text_units`] (CJK-aware), while images and PDFs keep their byte-derived
+/// weights. Kept a separate function from `block_chars` ON PURPOSE — the
+/// legacy `compress_threshold_chars` gate and prune/quote budgets still speak
+/// bytes (`total_chars`), and changing them would alter thresholds unrelated
+/// to the CJK under-count.
 pub(crate) fn block_units(b: &Block) -> usize {
     match b {
         Block::Text(t) => text_units(t),
+        // Tool-use argument JSON rides the CJK-aware UNITS channel too
+        // (round-4 R4D-F1): a `write_file` input carrying Chinese content was
+        // byte-counted (≈0.75 tok/char) while the same string as Text counted
+        // ≈2.25 tok/char — a 2.0–3.3x systematic under-estimate that delayed
+        // the preflight gate in CJK-heavy tool sessions and forced an extra
+        // overflow compression per run. Byte-identical for ASCII input (every
+        // ASCII char is 1 unit), so non-CJK sessions are unaffected.
+        Block::ToolUse { input, .. } => text_units(&input.to_string()),
         // A tool result may carry an image payload (e.g. load_image).
         Block::ToolResult { content, image, .. } => {
             text_units(content) + image.as_deref().map(image_payload_len).unwrap_or(0)
         }
         _ => block_chars(b),
     }
+}
+
+/// Per-tool schema yardstick shared by `Agent`'s `tool_schema_chars` cache and
+/// `context_report`'s per-tool bucket: [`text_units`] over name, description
+/// and schema JSON (round-4 R4D-F1 — the same channel change as the ToolUse
+/// arm above; MCP tools with CJK descriptions were byte-counted). Byte-
+/// identical for ASCII-only schemas.
+pub(crate) fn tool_schema_units(name: &str, description: &str, schema_json: &str) -> usize {
+    text_units(name) + text_units(description) + text_units(schema_json)
 }
 
 /// Size of a single block under the shared chars yardstick (the `/4` happens
@@ -992,5 +1009,71 @@ mod tests {
     fn units_floor_once_on_the_total() {
         // "a汉b" = 11 units; 11/4 = 2 (per-segment division would give 0+2+0).
         assert_eq!(estimate_tokens(&[user_text("a汉b")], None, 0), 2);
+    }
+
+    /// R4D-F1: ToolUse argument JSON rides the CJK-aware units channel — the
+    /// same content must estimate the same whether it arrives as a Text block
+    /// or as a write_file input JSON string value, and the ASCII path keeps
+    /// the historical byte count exactly.
+    #[test]
+    fn tool_use_input_json_is_cjk_aware_not_byte_counted() {
+        let cjk = "汉".repeat(1_000);
+        let as_text = estimate_tokens(&[user_text(&cjk)], None, 0);
+        let use_block = Message::assistant(vec![Block::ToolUse {
+            id: "t1".into(),
+            name: "write_file".into(),
+            input: serde_json::json!({ "path": "a.txt", "content": cjk }),
+        }]);
+        let est = estimate_tokens(&[use_block], None, 0);
+        // JSON shape overhead (keys + braces ≈ 25 ASCII chars) on top of the
+        // same CJK body: close to the Text-channel figure, far from the
+        // 375 (=1500 bytes/4) the byte channel would have reported.
+        assert!(est >= as_text, "units channel must not under-count vs Text");
+        assert!(
+            est < as_text + 100 / CHARS_PER_TOKEN + 1,
+            "JSON overhead must stay small: {est} vs {as_text}"
+        );
+        // ASCII input: byte-identical to the historical count (every ASCII
+        // char is 1 unit, /4 lands the same — no global threshold shift).
+        let use_ascii = Message::assistant(vec![Block::ToolUse {
+            id: "t2".into(),
+            name: "write_file".into(),
+            input: serde_json::json!({ "path": "a.txt", "content": "x".repeat(1_000) }),
+        }]);
+        let json_str = serde_json::to_string(&serde_json::json!({
+            "path": "a.txt",
+            "content": "x".repeat(1_000),
+        }))
+        .unwrap();
+        assert_eq!(
+            estimate_tokens(&[use_ascii], None, 0),
+            json_str.len() / CHARS_PER_TOKEN,
+            "ASCII ToolUse input must keep the byte-derived figure"
+        );
+    }
+
+    /// R4D-F1: the per-tool schema yardstick (tool_schema_units) is
+    /// CJK-aware — an ASCII schema keeps its byte count, a CJK description
+    /// counts 9/char like the Text channel, and name+description+schema sum
+    /// without cross-term drift.
+    #[test]
+    fn tool_schema_units_match_text_channel_per_part() {
+        let name = "write_file";
+        let desc_en = "write a file";
+        let schema_en = r#"{"type":"object"}"#;
+        assert_eq!(
+            tool_schema_units(name, desc_en, schema_en),
+            name.len() + desc_en.len() + schema_en.len(), // units == bytes for ASCII
+        );
+        let desc_zh = "写文件";
+        assert_eq!(
+            tool_schema_units(name, desc_zh, schema_en),
+            text_units(name) + text_units(desc_zh) + text_units(schema_en)
+        );
+        assert!(
+            tool_schema_units(name, desc_zh, schema_en)
+                > (name.len() + desc_zh.len() + schema_en.len()),
+            "CJK description must weigh more than its UTF-8 bytes"
+        );
     }
 }

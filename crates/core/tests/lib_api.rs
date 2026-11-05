@@ -497,6 +497,40 @@ fn eager_injection_prepends_before_headless_task_message() {
     }
 }
 
+/// R4D-F3：边界合并必须保留宿主给的稳定消息 id——合成对的消息级 id 为空
+/// （assign_missing_ids 只填缺失的），合并丢 id 会让合并后的消息拿到新铸
+/// id，宿主按原 id 锚定的 undo/audit 失锚一轮。
+#[cfg(feature = "code")]
+#[test]
+fn eager_boundary_merge_keeps_the_task_message_stable_id() {
+    use tiny_agent::provider::new_client;
+    let dir = fr1_scratch("eager-id");
+    let cfg = fr1_config("eager", &dir);
+    let client = new_client(0);
+    let (provider, _s) = MockProvider::new(vec![]);
+    let mut task = tiny_agent::Message::user(vec![tiny_agent::Block::Text(
+        "用 run_code 计算 1 到 100 的和".into(),
+    )]);
+    task.id = Some("host-task-anchor".into());
+    let agent = tiny_agent::build_agent_with_provider(
+        &cfg,
+        Box::new(provider),
+        vec![task],
+        &client,
+        vec![],
+        "",
+    )
+    .expect("assemble eager over anchored task");
+    let msgs = agent.messages();
+    assert_eq!(msgs.len(), 2, "pair + merged task: {msgs:?}");
+    // 合并后的 user 消息带着宿主的锚 id（不是新铸的 m<n>）。
+    assert_eq!(
+        msgs[1].id.as_deref(),
+        Some("host-task-anchor"),
+        "merge must preserve the host's stable id: {msgs:?}"
+    );
+}
+
 /// A-1 eager + 已披露历史不重注（FD-3 内容判定，e2e 修订）：历史里已有
 /// `read_skill("run-code")` 交换（eager 会话 resume 的合成对、或真实调用）
 /// 时正文已在历史中，再注入即重复——原样保留。

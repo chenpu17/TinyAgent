@@ -337,7 +337,15 @@ fn walk_skill(root: &Path, cur: &Path, depth: usize, max_depth: usize, out: &mut
         }
         let path = e.path();
         let rel = match path.strip_prefix(root) {
-            Ok(r) => r.to_string_lossy().into_owned(),
+            Ok(r) => {
+                // Normalize to forward slashes unconditionally (round-4
+                // R4B-F3): on Windows `to_string_lossy` yields backslash
+                // paths that `read_skill`'s `safe_relative_path` rejects
+                // outright — a model copying a listed path verbatim burned
+                // a turn on a guaranteed rejection. `/` is valid input to
+                // `Path::join` on every platform, so list and read agree.
+                r.to_string_lossy().replace('\\', "/")
+            }
             Err(_) => continue,
         };
         out.push(rel);
@@ -811,13 +819,15 @@ mod tests {
             .unwrap();
         assert!(!out.is_error, "{}", out.content);
         assert!(out.content.contains("SKILL.md"), "{}", out.content);
-        // walk_skill emits paths with the platform separator (\ on Windows).
-        let sep = if cfg!(unix) { "/" } else { "\\" };
+        // walk_skill normalizes to forward slashes on every platform
+        // (R4B-F3): read_skill's safe_relative_path rejects `\`, so a
+        // backslash listing could never be fed back verbatim.
         assert!(
-            out.content.contains(&format!("scripts{sep}release.sh")),
+            out.content.contains("scripts/release.sh"),
             "{}",
             out.content
         );
+        assert!(!out.content.contains('\\'), "{}", out.content);
         assert!(out.content.contains("references.md"), "{}", out.content);
         fs::remove_dir_all(&dir).ok();
     }

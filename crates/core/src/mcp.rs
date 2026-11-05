@@ -876,10 +876,20 @@ impl StdioTransport {
                             // A line over the cap (or a read error) ends the
                             // stream: fail every waiter so callers don't sit
                             // out the full CALL_TIMEOUT on a dead/abusive server.
+                            // Latch DIRECTLY (shared `dead`, not the local
+                            // `death`): a panicking host sink under unwind
+                            // must not skip the latch — `death` alone only
+                            // feeds the post-loop write, which the unwind
+                            // would never reach, leaving every later call
+                            // sitting out CALL_TIMEOUT (round-4 R4C-F1 /
+                            // Wave-2 N3). The post-loop write below is
+                            // idempotent for the paths that reach it.
+                            *dead.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some(format!("{e:#}"));
+                            death = Some(format!("{e:#}"));
                             crate::diag::diag_warn!(
                                 "[warn] MCP '{warn_name}' stdio read stopped: {e:#}"
                             );
-                            death = Some(format!("{e:#}"));
                             break;
                         }
                     }
@@ -1970,17 +1980,21 @@ impl SseTransport {
                                 }
                                 // A line over the cap or a read error: the stream is
                                 // unusable and this reader never reconnects on it.
-                                // Latch the reason, fail every waiter so callers
-                                // don't block until CALL_TIMEOUT on a dead/abusive
-                                // server. The URL names WHICH server's stream died
-                                // — several MCP servers can be configured side by
-                                // side.
+                                // Latch the reason BEFORE the diag (a panicking
+                                // host sink under unwind must not skip the
+                                // latch — round-4 R4C-F1), then fail every
+                                // waiter so callers don't block until
+                                // CALL_TIMEOUT on a dead/abusive server. The
+                                // URL names WHICH server's stream died —
+                                // several MCP servers can be configured side
+                                // by side.
                                 let reason = redacted_chain(&e);
+                                *dead.lock().unwrap_or_else(|e| e.into_inner()) =
+                                    Some(reason.clone());
                                 crate::diag::diag_warn!(
                                     "[warn] MCP SSE read stopped for {}: {reason}",
                                     redact_url_credentials(&url)
                                 );
-                                *dead.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason);
                                 pending_fail_all(&pending, "");
                                 return;
                             }
@@ -2011,11 +2025,15 @@ impl SseTransport {
                                     }
                                     Err(e) => {
                                         let reason = format!("{e:#}");
+                                        // Latch BEFORE the diag: a panicking
+                                        // host sink under unwind must not skip
+                                        // the latch (round-4 R4C-F1 — same
+                                        // shape as the read-error arm above).
+                                        *dead.lock().unwrap_or_else(|e| e.into_inner()) =
+                                            Some(reason.clone());
                                         crate::diag::diag_warn!(
                                             "[warn] MCP SSE endpoint rejected: {reason}"
                                         );
-                                        *dead.lock().unwrap_or_else(|e| e.into_inner()) =
-                                            Some(reason);
                                         let _ = endpoint_tx.send(None);
                                         pending_fail_all(&pending, "");
                                         return;

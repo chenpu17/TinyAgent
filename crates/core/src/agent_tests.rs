@@ -11823,3 +11823,81 @@ fn cancelled_stream_with_partial_usage_bills_the_received_part() {
         "usage the provider already reported before the cancel must be billed"
     );
 }
+
+#[test]
+fn orphan_tool_results_are_dropped_at_ingest() {
+    // R4D-F2 (round-9 open question promoted): a hand-edited / foreign
+    // history can lead with an orphan ToolResult — the wire 400s it
+    // deterministically (leading `role:"tool"` on both providers,
+    // non-transient, un-retried), bricking every resume of the file. The
+    // ingest sweep drops the orphans and keeps the salvageable pairs.
+    let ghost_msg = || {
+        Message::user(vec![Block::ToolResult {
+            tool_use_id: "ghost-0".into(),
+            content: "orphan".into(),
+            image: None,
+            is_error: false,
+        }])
+    };
+    let mut history = vec![
+        ghost_msg(), // messages[0] = orphan ToolResult, the exact round-9 shape
+        Message::assistant(vec![Block::ToolUse {
+            id: "u1".into(),
+            name: "shell".into(),
+            input: json!({"command": "ls"}),
+        }]),
+        Message::user(vec![
+            Block::ToolResult {
+                tool_use_id: "u1".into(),
+                content: "ok".into(),
+                image: None,
+                is_error: false,
+            },
+            Block::ToolResult {
+                tool_use_id: "ghost-9".into(),
+                content: "orphan too".into(),
+                image: None,
+                is_error: false,
+            },
+        ]),
+    ];
+    let dropped = drop_orphan_tool_results(&mut history);
+    assert_eq!(dropped, 2);
+    // The ghost-only message is gone entirely (3 → 2); the mixed message
+    // lost only its ghost half, the paired result survives.
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[1].content.len(), 1);
+    // Idempotent: a second sweep is a no-op.
+    assert_eq!(drop_orphan_tool_results(&mut history), 0);
+}
+
+#[test]
+fn ghost_first_initial_history_starts_clean_through_agent_ingest() {
+    // Wiring pin THROUGH the chokepoint: an agent built on the round-9
+    // session shape (messages[0] = orphan ToolResult) must not carry the
+    // orphan into its request history — the provider would 400 it on the
+    // very first request, non-transient.
+    let cfg = cfg_with(3, 0, 0);
+    let (prov, _) = MockProvider::new(vec![mock::resp_text("done", mock::mk_usage(1, 1))]);
+    let ghost = Message::user(vec![Block::ToolResult {
+        tool_use_id: "ghost-0".into(),
+        content: "orphan".into(),
+        image: None,
+        is_error: false,
+    }]);
+    let agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![ghost, user_text("go")],
+        test_ctx(),
+    );
+    let msgs = agent.messages();
+    assert_eq!(
+        msgs.len(),
+        1,
+        "ghost-only message must be dropped: {msgs:?}"
+    );
+    assert_eq!(msgs[0].role, Role::User);
+    assert!(matches!(&msgs[0].content[0], Block::Text(t) if t == "go"));
+}

@@ -1348,9 +1348,15 @@ impl Agent {
             );
         }
         let tool_defs: Vec<ToolDef> = tools.iter().map(|t| t.def()).collect();
+        // CJK-aware UNITS channel (compress::tool_schema_units, round-4
+        // R4D-F1): byte counting under-estimated CJK descriptions/schemas 3x
+        // and delayed the preflight gate. Byte-identical for ASCII-only
+        // schemas.
         let tool_schema_chars = tool_defs
             .iter()
-            .map(|t| t.name.len() + t.description.len() + t.schema.to_string().len())
+            .map(|t| {
+                crate::compress::tool_schema_units(&t.name, &t.description, &t.schema.to_string())
+            })
             .sum();
         // Prepend runtime environment facts (OS / Shell / cwd) to the system
         // prompt so the model emits platform-correct commands (e.g. it learns
@@ -1384,6 +1390,7 @@ impl Agent {
         // task, an old-format session file) get agent-minted ids here; ones
         // that already carry an id (resumed save, host-supplied) keep it.
         let mut messages = initial;
+        drop_orphan_tool_results(&mut messages);
         let mut next_msg_id = 0u64;
         assign_missing_ids(&mut messages, &mut next_msg_id);
         // Box→Arc at the single chokepoint (see the field doc): callers keep
@@ -3969,6 +3976,52 @@ fn assign_missing_ids(messages: &mut [Message], next: &mut u64) {
             messages[i].id = Some(id);
         }
     }
+}
+
+/// Drop `ToolResult` blocks whose `tool_use_id` never appears in any
+/// `ToolUse` block of the same history — the result-side twin of session's
+/// `repair_dangling_tool_use` (which fixes a dangling trailing tool_USE).
+/// The round-9 open question "messages[0] carrying a ToolResult" promoted by
+/// round-4 R4D-F2: no path in this repo produces one (the paired save is
+/// atomic per turn and the crash window lands on the USE side), but a
+/// hand-edited or foreign session file / host-supplied history can, and the
+/// wire rejects it deterministically — a leading `{role:"tool"}` message is
+/// a 400 on both providers, non-transient, never retried, and the file isn't
+/// renamed aside, so every subsequent resume dies the same way. Dropping the
+/// orphan at the single ingest chokepoint (with one summary warning) lets
+/// the run proceed on the salvageable history. Also drops messages left with
+/// empty content. Returns the number of dropped blocks.
+fn drop_orphan_tool_results(messages: &mut Vec<Message>) -> usize {
+    let use_ids: std::collections::HashSet<String> = messages
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .filter_map(|b| match b {
+            Block::ToolUse { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    let mut dropped = 0usize;
+    for m in messages.iter_mut() {
+        m.content.retain(|b| match b {
+            Block::ToolResult { tool_use_id, .. } => {
+                let orphan = !use_ids.contains(tool_use_id.as_str());
+                if orphan {
+                    dropped += 1;
+                }
+                !orphan
+            }
+            _ => true,
+        });
+    }
+    messages.retain(|m| !m.content.is_empty());
+    if dropped > 0 {
+        crate::diag::diag_warn!(
+            "[agent] dropped {dropped} orphan tool_result block(s) at ingest \
+             (tool_use_id never appears in this history — hand-edited or \
+             foreign session file?); the run continues without them"
+        );
+    }
+    dropped
 }
 impl Agent {
     /// Host-initiated history compression — the idle-time entry point the

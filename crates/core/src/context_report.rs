@@ -275,8 +275,15 @@ pub(crate) fn build(
     // ── Tools: one segment per tool, bucketed by origin ───────────────────
     let mut tools_bd = ToolsBreakdown::default();
     for (t, def) in tools.iter().zip(tool_defs) {
-        let chars = def.name.len() + def.description.len() + def.schema.to_string().len();
-        let tokens = alloc(chars, &mut acc, &mut prev_q);
+        // Same CJK-aware units yardstick as Agent's tool_schema_chars cache
+        // (compress::tool_schema_units, round-4 R4D-F1) — the bucket total
+        // must stay equal to the cached sum the estimate gate uses.
+        let units = crate::compress::tool_schema_units(
+            &def.name,
+            &def.description,
+            &def.schema.to_string(),
+        );
+        let tokens = alloc(units, &mut acc, &mut prev_q);
         let entry = ToolEntry {
             name: def.name.clone(),
             tokens,
@@ -438,7 +445,13 @@ pub(crate) fn build(
                 system_text,
                 tool_defs
                     .iter()
-                    .map(|d| d.name.len() + d.description.len() + d.schema.to_string().len())
+                    .map(|d| {
+                        crate::compress::tool_schema_units(
+                            &d.name,
+                            &d.description,
+                            &d.schema.to_string(),
+                        )
+                    })
                     .sum()
             ) as u64,
             "uncalibrated breakdown must equal compress::estimate_tokens"
@@ -662,7 +675,9 @@ mod tests {
 
         let tool_schema_chars: usize = defs
             .iter()
-            .map(|t| t.name.len() + t.description.len() + t.schema.to_string().len())
+            .map(|t| {
+                crate::compress::tool_schema_units(&t.name, &t.description, &t.schema.to_string())
+            })
             .sum();
         let expected = estimate_tokens(&messages, system, tool_schema_chars) as u64;
         assert_eq!(

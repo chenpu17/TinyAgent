@@ -15,7 +15,7 @@
     "crates/core/src/tools/run_code/tool.rs": "765ef145c45ee14ac0bb96d932eaa970313487b32a0c5c02724b76d9713ba848",
     "crates/core/src/tools/run_code/test_util.rs": "4aa1cc87def60ae0b40eb646eb409cd0bd97a276f27b9e92217c52e1ded666dd",
     "crates/core/src/tools/run_code_skill.md": "cbf2f0669819c001835bc6e42e9b387000785c5f4d9754a7b8e118b559b1336c",
-    "crates/core/src/tools/skill.rs": "b3721534688ad5a2decc2d19e288aa803ff5d53208890f888727431719004a72",
+    "crates/core/src/tools/skill.rs": "99d0879b2e0dc2e1f279d57279979145c12001aba7102675b93321cbead89f4d",
     "docs/finetune_support_design.md": "8c0a6d502e7a87846e2518692be40de56c9128a0963e9a9228d73ca49ad0c208"
   },
   "prompt_bodies": {

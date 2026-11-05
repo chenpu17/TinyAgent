@@ -190,9 +190,39 @@ pub fn scan(dirs: &[PathBuf]) -> (SkillIndex, Vec<String>) {
     let mut index = SkillIndex::default();
     let mut warnings = Vec::new();
     for dir in dirs {
+        // The ROOT itself must be a real directory, same threat model as the
+        // per-entry guard below one level up: `read_dir` follows a symlinked
+        // root transparently, so a linked root (dotfiles farm / an untrusted
+        // repo's `.tinyagent/skills -> /outside/tree`) would load every entry
+        // from outside the skills tree with ZERO warnings — the entry-level
+        // dir-only guard never sees a link at all (round-4 R4B-F1). A root
+        // that doesn't exist at all stays the normal no-skills case (handled
+        // by read_dir's NotFound arm below); every other read failure — a
+        // plain-FILE path, a permission denial — warns instead of silently
+        // killing the tier while malformed entries warn loudly (round-4
+        // R4B-F7: rebalance that diagnostic asymmetry).
+        if let Ok(m) = std::fs::symlink_metadata(dir) {
+            if m.file_type().is_symlink() {
+                warnings.push(format!(
+                    "skills dir {} is a symlink/junction, skipped (skills roots must be real directories)",
+                    dir.display()
+                ));
+                continue;
+            }
+        }
         let entries = match std::fs::read_dir(dir) {
             Ok(rd) => rd,
-            Err(_) => continue, // missing dir is normal — no skills installed there
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                continue; // missing dir is normal — no skills installed there
+            }
+            Err(e) => {
+                warnings.push(format!(
+                    "skills dir {} is not readable ({}), skipped",
+                    dir.display(),
+                    e
+                ));
+                continue;
+            }
         };
         for e in entries.flatten() {
             // A skill directory must be a REAL directory: a symlinked entry
@@ -229,6 +259,30 @@ pub fn scan(dirs: &[PathBuf]) -> (SkillIndex, Vec<String>) {
             }
             let sub = e.path();
             let skill_md = sub.join("SKILL.md");
+            // The SKILL.md read is the one file read in the whole skills stack
+            // that bypasses `confined_to`: a file-level symlink here is
+            // FOLLOWED by `read_capped`, putting attacker-chosen frontmatter
+            // (the part that lands in the SYSTEM PROMPT) into the resident
+            // intro while `read_skill` refuses the same link's body — loading
+            // an intro the skill can never actually serve (round-4 R4B-F2).
+            // Same refusal + warn contract as the directory-level guard above.
+            match std::fs::symlink_metadata(&skill_md) {
+                Ok(m) if m.file_type().is_symlink() => {
+                    warnings.push(format!(
+                        "skill dir {} SKILL.md is a symlink, skipped (skill files must be real files)",
+                        sub.display()
+                    ));
+                    continue;
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    warnings.push(format!(
+                        "skill dir {} has no readable SKILL.md, skipped",
+                        sub.display()
+                    ));
+                    continue;
+                }
+            }
             let content = match read_capped(&skill_md) {
                 Some(c) => c,
                 None => {
@@ -240,10 +294,18 @@ pub fn scan(dirs: &[PathBuf]) -> (SkillIndex, Vec<String>) {
                 }
             };
             let fm = match parse_frontmatter(&content) {
-                Some(v) => v,
-                None => {
+                FrontmatterParse::Parsed(fm) => fm,
+                FrontmatterParse::Missing => {
                     warnings.push(format!(
                         "skill dir {} SKILL.md missing name/description frontmatter, skipped",
+                        sub.display()
+                    ));
+                    continue;
+                }
+                FrontmatterParse::BlockScalar => {
+                    warnings.push(format!(
+                        "skill dir {} SKILL.md uses a YAML block scalar (| or >) for name/description, \
+                         unsupported by the line parser, skipped (write it as a single-line scalar)",
                         sub.display()
                     ));
                     continue;
@@ -313,7 +375,9 @@ pub fn scan(dirs: &[PathBuf]) -> (SkillIndex, Vec<String>) {
 /// malformed content; the caller skips with a warning (a broken built-in is a
 /// build bug, never a startup failure).
 pub fn embedded_entry(content: &str) -> Option<SkillEntry> {
-    let fm = parse_frontmatter(content)?;
+    let FrontmatterParse::Parsed(fm) = parse_frontmatter(content) else {
+        return None;
+    };
     if !valid_skill_name(&fm.name) {
         return None;
     }
@@ -357,6 +421,7 @@ fn upsert(entries: &mut Vec<SkillEntry>, e: SkillEntry) {
 /// this, applies the name/description validation rules, and assembles a
 /// [`SkillEntry`]. Kept separate from `SkillEntry` so validation stays out of
 /// the parser.
+#[derive(Debug)]
 struct ParsedFrontmatter {
     name: String,
     description: String,
@@ -366,6 +431,21 @@ struct ParsedFrontmatter {
     metadata: HashMap<String, String>,
 }
 
+/// Outcome of parsing a SKILL.md frontmatter block. `BlockScalar` is
+/// distinguished from plain `Missing` because the failure MODES differ
+/// (round-4 R4B-F4): a `|`/`>` header on a required field used to be loaded
+/// as a literal garbage description — silently violating the "broken skill
+/// skipped + warned" contract — while a missing field always skipped loudly.
+#[derive(Debug)]
+enum FrontmatterParse {
+    Parsed(ParsedFrontmatter),
+    /// No frontmatter block at all, or a required field missing/empty.
+    Missing,
+    /// name/description are a YAML block scalar (`|`/`>` header): the line
+    /// parser doesn't support multi-line scalars, so the header text would
+    /// otherwise become the literal system-prompt intro.
+    BlockScalar,
+}
 /// Parse the agentskills.io YAML frontmatter block delimited by `---` lines.
 ///
 /// All six standard fields are recognized: `name`/`description` (required),
@@ -375,10 +455,12 @@ struct ParsedFrontmatter {
 /// scalar fields; `metadata` is the one block form and is collected by a small
 /// indent-driven state machine (no nested YAML). Unknown keys are ignored —
 /// the open spec permits them (only Claude Code's upload path rejects unknown
-/// keys). Returns `None` if there is no frontmatter or either required field is
-/// missing/empty. Expects the conventional `key: value` shape (no space before
-/// the colon).
-fn parse_frontmatter(content: &str) -> Option<ParsedFrontmatter> {
+/// keys). Returns [`FrontmatterParse::Missing`] if there is no frontmatter or
+/// either required field is missing/empty, and [`FrontmatterParse::BlockScalar`]
+/// if a required field is written as a YAML block scalar (a `|`/`>` header the
+/// single-line parser cannot serve). Expects the conventional `key: value`
+/// shape (no space before the colon).
+fn parse_frontmatter(content: &str) -> FrontmatterParse {
     // Strip a UTF-8 BOM if present: Windows editors (VS Code default, PowerShell
     // `>` redirection) commonly emit one, and U+FEFF is NOT whitespace
     // (char::is_whitespace returns false for it), so trim() below wouldn't
@@ -387,9 +469,11 @@ fn parse_frontmatter(content: &str) -> Option<ParsedFrontmatter> {
     // frontmatter" warning.
     let content = content.strip_prefix('\u{feff}').unwrap_or(content);
     let mut lines = content.lines();
-    let first = lines.next()?;
+    let Some(first) = lines.next() else {
+        return FrontmatterParse::Missing;
+    };
     if first.trim() != "---" {
-        return None;
+        return FrontmatterParse::Missing;
     }
     let mut name = None;
     let mut description = None;
@@ -398,6 +482,7 @@ fn parse_frontmatter(content: &str) -> Option<ParsedFrontmatter> {
     let mut allowed_tools: Vec<String> = Vec::new();
     let mut metadata: HashMap<String, String> = HashMap::new();
     let mut in_metadata = false;
+    let mut block_scalar = false;
     for line in lines {
         let t = line.trim();
         if t == "---" {
@@ -419,8 +504,17 @@ fn parse_frontmatter(content: &str) -> Option<ParsedFrontmatter> {
             in_metadata = false;
         }
         if let Some(v) = strip_key(t, "name") {
+            // Header check on the RAW text (pre-unquote): a quoted "|-" is a
+            // plain scalar by definition — unquoting first would misdetect
+            // it as a block scalar.
+            if is_block_scalar_header(raw_scalar_value(t, "name")) {
+                block_scalar = true;
+            }
             name = Some(v);
         } else if let Some(v) = strip_key(t, "description") {
+            if is_block_scalar_header(raw_scalar_value(t, "description")) {
+                block_scalar = true;
+            }
             description = Some(v);
         } else if let Some(v) = strip_key(t, "license") {
             license = Some(v);
@@ -435,9 +529,16 @@ fn parse_frontmatter(content: &str) -> Option<ParsedFrontmatter> {
         }
         // other keys ignored
     }
-    let name = name.filter(|n| !n.is_empty())?;
-    let description = description.filter(|d| !d.is_empty())?;
-    Some(ParsedFrontmatter {
+    if block_scalar {
+        return FrontmatterParse::BlockScalar;
+    }
+    let Some(name) = name.filter(|n| !n.is_empty()) else {
+        return FrontmatterParse::Missing;
+    };
+    let Some(description) = description.filter(|d| !d.is_empty()) else {
+        return FrontmatterParse::Missing;
+    };
+    FrontmatterParse::Parsed(ParsedFrontmatter {
         name,
         description,
         license,
@@ -447,11 +548,36 @@ fn parse_frontmatter(content: &str) -> Option<ParsedFrontmatter> {
     })
 }
 
+/// Is this single-line value a YAML block scalar HEADER (`|` or `>`, with
+/// optional chomping `+`/`-` and indentation digits in any order) and nothing
+/// else? Strict match on purpose: `>-`/`|2-` are unsupported block scalars,
+/// while `>2x faster` (trailing text) stays a plain string — real-world
+/// descriptions may legitimately start with `>` (e.g. prompts), and YAML
+/// itself would reject a header with trailing garbage. Quoted values
+/// (`"|-"`) are plain scalars by definition and never reach here.
+fn is_block_scalar_header(v: &str) -> bool {
+    let mut chars = v.chars();
+    match chars.next() {
+        Some('|' | '>') => {}
+        _ => return false,
+    }
+    chars.all(|c| matches!(c, '+' | '-' | '0'..='9'))
+}
+
 /// Match `key: value` (after trim), returning the value trimmed and with a
 /// single pair of surrounding matching quotes stripped (`"` or `'`).
 fn strip_key(line: &str, key: &str) -> Option<String> {
     let rest = line.strip_prefix(&format!("{key}:"))?;
     Some(unquote(rest.trim()))
+}
+
+/// The raw (pre-unquote) scalar text after `key:` on a trimmed line, or `""`
+/// when the line doesn't have that shape. Used only by the block-scalar
+/// check, which must see quoting as the user wrote it.
+fn raw_scalar_value<'a>(line: &'a str, key: &str) -> &'a str {
+    line.strip_prefix(key)
+        .and_then(|r| r.strip_prefix(':'))
+        .map_or("", str::trim)
 }
 
 /// Split a `key: value` line at the first colon (used for `metadata` entries,
@@ -555,7 +681,10 @@ mod tests {
     }
 
     fn fm(content: &str) -> ParsedFrontmatter {
-        parse_frontmatter(content).expect("frontmatter should parse")
+        match parse_frontmatter(content) {
+            FrontmatterParse::Parsed(fm) => fm,
+            other => panic!("frontmatter should parse, got {other:?}"),
+        }
     }
 
     #[test]
@@ -643,9 +772,51 @@ mod tests {
 
     #[test]
     fn frontmatter_missing_returns_none() {
-        assert!(parse_frontmatter("no frontmatter here").is_none());
-        assert!(parse_frontmatter("---\ndescription: no name\n---\n").is_none());
-        assert!(parse_frontmatter("---\nname: no desc\n---\n").is_none());
+        assert!(matches!(
+            parse_frontmatter("no frontmatter here"),
+            FrontmatterParse::Missing
+        ));
+        assert!(matches!(
+            parse_frontmatter("---\ndescription: no name\n---\n"),
+            FrontmatterParse::Missing
+        ));
+        assert!(matches!(
+            parse_frontmatter("---\nname: no desc\n---\n"),
+            FrontmatterParse::Missing
+        ));
+    }
+
+    #[test]
+    fn frontmatter_block_scalar_on_required_field_is_unsupported() {
+        // R4B-F4: YAML block scalars (`|`/`>` headers) are legal YAML but the
+        // line parser can't serve them — the header text must not become a
+        // literal garbage description (that silently broke the "broken skill
+        // skipped + warned" contract). Strict header match: trailing text
+        // (`>2x faster`) stays a plain string.
+        assert!(matches!(
+            parse_frontmatter("---\nname: x\ndescription: >-\n  folded\n---\nbody"),
+            FrontmatterParse::BlockScalar
+        ));
+        assert!(matches!(
+            parse_frontmatter("---\nname: x\ndescription: |\n  literal\n---\nbody"),
+            FrontmatterParse::BlockScalar
+        ));
+        assert!(matches!(
+            parse_frontmatter("---\nname: |\n  x\ndescription: d\n---\nbody"),
+            FrontmatterParse::BlockScalar
+        ));
+        // Header with indentation + chomping indicators in any order.
+        assert!(matches!(
+            parse_frontmatter("---\nname: x\ndescription: |2-\n  literal\n---\nbody"),
+            FrontmatterParse::BlockScalar
+        ));
+        // Trailing text after the indicator is NOT a header (real prompts may
+        // start with '>'): still parses as a plain single-line scalar.
+        let f = fm("---\nname: x\ndescription: >2x faster than before\n---\nbody");
+        assert_eq!(f.description, ">2x faster than before");
+        // Quoted block-scalar-looking value is a plain scalar by definition.
+        let f = fm("---\nname: x\ndescription: \"|-\"\n---\nbody");
+        assert_eq!(f.description, "|-");
     }
 
     #[test]
@@ -1191,6 +1362,130 @@ description: o
             "{warns:?}"
         );
         std::fs::remove_dir_all(&real).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// R4B-F1: the skills ROOT being a symlink/junction bypasses the entry-
+    /// level dir-only guard entirely (read_dir follows it transparently and
+    /// every entry loads with zero warnings). The root itself must be refused
+    /// + warned. Unix half (real symlinks; CI test job runs ubuntu/macos).
+    #[cfg(unix)]
+    #[test]
+    fn scan_warns_on_symlinked_skills_root() {
+        use std::os::unix::fs::symlink;
+        let real = tmpd("rootlink-real");
+        write_skill(
+            &real,
+            "outside",
+            "---\nname: outside\ndescription: o\n---\n",
+        );
+        let link = tmpd("rootlink-link");
+        let link_path = link.join("skills");
+        symlink(&real, &link_path).expect("create root symlink");
+        let (idx, warns) = scan(&[link_path.clone()]);
+        assert!(idx.is_empty(), "symlinked skills root must be skipped");
+        assert!(
+            warns.len() == 1 && warns[0].contains("symlink/junction, skipped"),
+            "{warns:?}"
+        );
+        std::fs::remove_dir_all(&real).ok();
+        std::fs::remove_file(&link_path).ok();
+        std::fs::remove_dir_all(&link).ok();
+    }
+
+    /// R4B-F1 Windows half: junctioned root (mklink /J, no admin privileges —
+    /// same technique as the entry-level junction pin above).
+    #[cfg(windows)]
+    #[test]
+    fn scan_warns_on_junctioned_skills_root() {
+        let real = tmpd("rootjunc-real");
+        write_skill(
+            &real,
+            "outside",
+            "---\nname: outside\ndescription: o\n---\n",
+        );
+        let dir = tmpd("rootjunc-skills");
+        let link = dir.join("skills");
+        let st = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&real)
+            .status()
+            .expect("spawn cmd for mklink /J");
+        assert!(st.success(), "junction creation failed");
+        let (idx, warns) = scan(std::slice::from_ref(&link));
+        assert!(idx.is_empty(), "junctioned skills root must be skipped");
+        assert!(
+            warns.len() == 1 && warns[0].contains("symlink/junction, skipped"),
+            "{warns:?}"
+        );
+        std::fs::remove_dir_all(&real).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// R4B-F2: a file-level symlinked SKILL.md is the one read in the skills
+    /// stack that bypasses confined_to — the link must be refused + warned so
+    /// attacker frontmatter can't ride into the resident intro while the body
+    /// stays unreadable. Unix only (Windows file symlinks need privileges).
+    #[cfg(unix)]
+    #[test]
+    fn scan_skips_symlinked_skill_md_file() {
+        use std::os::unix::fs::symlink;
+        let dir = tmpd("mdlink-skills");
+        let sub = dir.join("linked");
+        std::fs::create_dir_all(&sub).unwrap();
+        let outside = tmpd("mdlink-outside");
+        let outside_md = outside.join("SKILL.md");
+        std::fs::write(
+            &outside_md,
+            "---\nname: linked\ndescription: injected\n---\n",
+        )
+        .unwrap();
+        symlink(&outside_md, sub.join("SKILL.md")).expect("create SKILL.md symlink");
+        let (idx, warns) = scan(&[dir.clone()]);
+        assert!(idx.is_empty(), "symlinked SKILL.md must be skipped");
+        assert!(
+            warns.len() == 1 && warns[0].contains("SKILL.md is a symlink"),
+            "{warns:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    /// R4B-F7: a skills path that is a plain FILE (true misconfiguration) used
+    /// to be silently swallowed as "missing", killing the whole tier with zero
+    /// diagnostics while malformed entries warned loudly. It must warn.
+    #[test]
+    fn scan_warns_when_skills_path_is_a_file() {
+        let dir = tmpd("notdir");
+        let file = dir.join("skills");
+        std::fs::write(&file, "not a directory").unwrap();
+        let (idx, warns) = scan(std::slice::from_ref(&file));
+        assert!(idx.is_empty());
+        assert!(
+            warns.len() == 1 && warns[0].contains("is not readable"),
+            "{warns:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// R4B-F4: a `|`/`>` block scalar on description is legal YAML the line
+    /// parser can't serve — the header text must be SKIPPED with a specific
+    /// warning, not loaded as a literal garbage intro.
+    #[test]
+    fn scan_warns_on_block_scalar_description() {
+        let dir = tmpd("blockscalar");
+        write_skill(
+            &dir,
+            "folded",
+            "---\nname: folded\ndescription: >-\n  a folded\n  multi-line intro\n---\nbody\n",
+        );
+        let (idx, warns) = scan(std::slice::from_ref(&dir));
+        assert!(idx.is_empty(), "block-scalar skill must be skipped");
+        assert!(
+            warns.len() == 1 && warns[0].contains("block scalar"),
+            "{warns:?}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

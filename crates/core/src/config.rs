@@ -645,16 +645,35 @@ fn alias_resolved_path(rule: &str, workdir: &Path) -> Option<PathBuf> {
     // spelled with `/` must not warn just because canonicalize emits `\` —
     // that's spelling, not an alias. What remains different is a real
     // alias: the rule text names one path, the kernel resolves another.
-    let strip_verbatim = |p: &Path| -> String {
-        p.to_string_lossy()
-            .replace('\\', "/")
-            .trim_start_matches("//?/")
-            .to_ascii_lowercase()
-    };
-    if strip_verbatim(&canonical) == strip_verbatim(&full) {
+    if normalize_path_for_alias_compare(&canonical) == normalize_path_for_alias_compare(&full) {
         return None;
     }
     Some(canonical)
+}
+
+/// The alias probe's path comparator: verbatim-prefix, UNC-marker and
+/// separator-normalized, ASCII-lowercased (Wave-2 返工把它从
+/// `alias_resolved_path` 的内联闭包提为独立纯函数——N1/N3 两枚形态钉需要
+/// 直接喂 `D:\汉…` / `\\?\UNC\…` 字面，绕过真实文件系统构造)。
+fn normalize_path_for_alias_compare(p: &Path) -> String {
+    let s = p.to_string_lossy().replace('\\', "/");
+    let s = s.trim_start_matches("//?/");
+    // A UNC canonical spelling is `//?/UNC/server/share/…` while the
+    // rule's literal is `//server/share/…`: drop the `UNC/` marker from
+    // the former and the `//` prefix from the latter so both compare as
+    // `server/share/…`. Without this the two shapes never matched and
+    // every canonically-resolving UNC rule was a false-positive "alias
+    // dead rule" warning whose advice (spell it canonically) was already
+    // being followed (round-4 R4A-F1). Drive paths never start with `/`,
+    // so the prefix strip is a no-op for them. `get(..4)` (not `[..4]`):
+    // the window can land mid-UTF-8 for a CJK-leading workdir
+    // (`D:\汉…` — byte 4 splits the 3-byte char) and `[..4]` PANICS on
+    // it (Wave-2 N1: startup crash on every alias probe, the round-4
+    // fix's own regression). When the prefix IS `unc/` (ASCII match only —
+    // a non-ASCII prefix never equals it), index 4 is a char boundary.
+    let unc_prefixed = s.get(..4).is_some_and(|w| w.eq_ignore_ascii_case("unc/"));
+    let s = if unc_prefixed { &s[4..] } else { s };
+    s.trim_start_matches('/').to_ascii_lowercase()
 }
 
 /// The parsed, validated configuration — one JSON file, the whole surface of
@@ -943,6 +962,18 @@ impl Config {
         use sha2::{Digest, Sha256};
         let mut tools = self.tools.clone();
         tools.sort();
+        // deny_paths / fs_write_dirs are SET-semantics (per-rule glob matching
+        // is order-independent, merge_partial already sorts+dedups overlays) —
+        // but the BASE config hashed them in declaration order, so two legal
+        // spellings of the same policy produced different fingerprints and
+        // broke cross-machine ledger comparability (round-4 R4A-F2). Canonical
+        // order (sorted + deduped) for the hash only; the live config keeps
+        // the user's spelling.
+        let mut code = self.code.clone();
+        code.deny_paths.sort();
+        code.deny_paths.dedup();
+        code.fs_write_dirs.sort();
+        code.fs_write_dirs.dedup();
         let mcp: Vec<serde_json::Value> = self
             .mcp_servers
             .iter()
@@ -988,7 +1019,7 @@ impl Config {
             "mcp_servers": mcp,
             "reasoning_effort": self.reasoning_effort,
             "tool_absent_notes": self.tool_absent_notes,
-            "code": self.code,
+            "code": code,
             "gateway_fixes_preset": self.gateway_fixes_preset,
             "strip_think_tags": self.strip_think_tags,
         });
@@ -2957,6 +2988,21 @@ mod tests {
         let mut c = base();
         c.tools = vec!["read_file".into(), "shell".into()];
         assert_eq!(c.fingerprint(), fp);
+        // ③b deny_paths / fs_write_dirs 同为集合语义（逐条 glob 匹配与顺序
+        // 无关）：同集合不同声明序（含重复条目）→ 同指纹（round-4 R4A-F2
+        // ——基准配置曾按声明序进哈希，同策略的两种合法拼写指纹不同，跨机
+        // 台账可比性断裂）。
+        let mut c = base();
+        c.code.deny_paths.reverse();
+        c.code.deny_paths.push(c.code.deny_paths[0].clone());
+        assert_eq!(c.fingerprint(), fp, "same set, reversed + duped → same fp");
+        let mut c = base();
+        c.code.fs_write_dirs = vec!["tmp".into(), "out".into()];
+        let fp2 = c.fingerprint();
+        assert_ne!(fp2, fp, "a new fs_write_dirs entry must move the fp");
+        let mut c = base();
+        c.code.fs_write_dirs = vec!["out".into(), "tmp".into()];
+        assert_eq!(c.fingerprint(), fp2, "same set, different order → same fp");
         // ④ 凭据值不进哈希：headers/env 的 VALUE 换掉 → 同指纹。
         let mut c = base();
         c.mcp_servers[0].headers = [("Authorization".to_string(), "Bearer secret-b".to_string())]
@@ -3317,6 +3363,68 @@ mod round3_alias_pins {
         assert_eq!(alias_resolved_path("**/vault/**", &wd), None);
         assert_eq!(alias_resolved_path("ghost", &wd), None);
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// R4A-F1：UNC workdir 下规范拼写的规则不得误报为别名死规则。UNC 路径
+    /// canonicalize 出 `\\?\UNC\localhost\C$\…`，而规则与 workdir join 的
+    /// 字面形态是 `\\localhost\C$\…`——探测器的比较闭包曾对两侧 strip 不
+    /// 对称（`unc/…` vs `//…`），永不相等 → 每条规范规则都吃到一条修法
+    /// 不可执行的告警。变异杀伤：撤掉 UNC/ 标记剥离 → 本钉炸。
+    /// 依赖 admin share（`\\localhost\C$`，Server SKU 常开；桌面盒常关），
+    /// 不可用即静默跳过。
+    #[cfg(windows)]
+    #[test]
+    fn unc_workdir_canonical_rule_is_not_flagged_as_alias() {
+        let plain = std::env::temp_dir().canonicalize().unwrap();
+        // canonicalize 恒返 verbatim 形态 `\\?\C:\…`——先剥前缀再取盘符
+        // （Wave-2 N2 返工：曾直接 split_at(2)，拼出的 UNC 路径是垃圾，
+        // exists() 恒 false → 本钉静默 skip 成死钉，R4A-F1 修复零运行期
+        // 守卫）。
+        let s = plain.to_string_lossy();
+        let stripped = s.strip_prefix(r"\\?\").unwrap_or(&s);
+        let (drive, tail) = stripped.split_at(2); // "C:" + "\Users\…"
+        let unc_spelling = format!(r"\\localhost\{}${}", &drive[..1], tail);
+        let unc_wd = std::path::PathBuf::from(&unc_spelling);
+        if !unc_wd.exists() {
+            // admin share disabled — nothing to assert against
+            return;
+        }
+        let sub = unc_wd.join("ta-unc-probe");
+        std::fs::create_dir_all(&sub).unwrap();
+        // 规范拼写：规则相对 UNC workdir、路径真实存在（canonicalize 必达
+        // `\\?\UNC\…` 形态）→ 必须判 None（不告警）。变异杀伤：撤比较器的
+        // UNC/`//` 剥离 → 本钉炸。
+        assert_eq!(alias_resolved_path("ta-unc-probe", &unc_wd), None);
+        std::fs::remove_dir_all(&sub).ok();
+    }
+
+    /// R4A-F1 的双形态钉（Wave-2 N1 返工）：比较器提为纯函数后直接喂字面。
+    /// ① N1：CJK 紧跟盘符（`D:\汉…`）曾让 4 字节窗口切进 UTF-8 多字节序列
+    /// panic（`[..4]` 非边界切片）——每次别名探测即启动崩溃，round-4 修复
+    /// 自己引入的回归。② N3/UNC：canonical `\\?\UNC\server\share\…` 与字面
+    /// `\\server\share\…` 必须归一到同一形态（R4A-F1 本体）。
+    /// Mutation 双杀：恢复 `[..4]` → ① panic 红；撤 UNC/`//` 剥离 → ② 红。
+    #[test]
+    fn alias_comparator_survives_cjk_and_unifies_unc_forms() {
+        // ① CJK-leading workdir：不 panic、逐字符保真（大小写折叠只动 ASCII）。
+        assert_eq!(
+            super::normalize_path_for_alias_compare(Path::new(r"D:\汉ta-wd\real")),
+            "d:/汉ta-wd/real"
+        );
+        // ② UNC 两形态归一。
+        assert_eq!(
+            super::normalize_path_for_alias_compare(Path::new(r"\\?\UNC\server\share\repo")),
+            "server/share/repo"
+        );
+        assert_eq!(
+            super::normalize_path_for_alias_compare(Path::new(r"\\server\share\repo")),
+            "server/share/repo"
+        );
+        // 盘符路径：仅分隔符/ASCII 大小写归一，原样语义。
+        assert_eq!(
+            super::normalize_path_for_alias_compare(Path::new(r"D:\Work\Repo")),
+            "d:/work/repo"
+        );
     }
 
     /// pick_home 优先级钉（与 CLI main.rs 既有钉同款断言；round-3 R2-02

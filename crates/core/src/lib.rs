@@ -548,7 +548,17 @@ fn prepend_eager_pair(eager: Option<Vec<Message>>, initial: Vec<Message>) -> Vec
     if rest.first().is_some_and(|m| m.role == Role::User) {
         let first = rest.remove(0);
         match pair.last_mut() {
-            Some(last_user) => last_user.content.extend(first.content),
+            Some(last_user) => {
+                // The task message's stable id survives the merge (round-4
+                // R4D-F3): hosts anchor undo/audit to the ids they supplied,
+                // and the synthetic pair carries none — letting the merged
+                // message fall to `assign_missing_ids` would re-mint a fresh
+                // id and break that anchor for one turn.
+                if last_user.id.is_none() {
+                    last_user.id = first.id.clone();
+                }
+                last_user.content.extend(first.content);
+            }
             None => rest.insert(0, first),
         }
     }
