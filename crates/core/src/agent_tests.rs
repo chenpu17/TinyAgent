@@ -3588,6 +3588,35 @@ fn add_mcp_server_failed_handshake_leaves_agent_unchanged() {
     assert_eq!(agent.tool_names(), before, "failed add mutates nothing");
 }
 
+#[test]
+fn lenient_mcp_assembly_skips_failed_server() {
+    // Hosts with a live UI (TinyWorker) assemble sessions eagerly: one dead
+    // plugin must degrade the toolset, not fail the session. Strict assembly
+    // keeps its old contract (CLI/batch fail fast).
+    let bad = McpServerConfig {
+        name: "nope".into(),
+        command: Some("/nonexistent-tinyagent-test-mcp".into()),
+        args: vec![],
+        url: None,
+        transport: None,
+        headers: Default::default(),
+        env: Default::default(),
+    };
+    assert!(
+        crate::tools::mcp::build(std::slice::from_ref(&bad)).is_err(),
+        "strict build stays fail-fast"
+    );
+    let (tools, failures) =
+        crate::tools::mcp::build_lenient(std::slice::from_ref(&bad)).unwrap();
+    assert!(tools.is_empty(), "no tools from a server that never started");
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].server, "nope");
+    assert!(
+        !failures[0].error.is_empty(),
+        "failure carries a user-showable reason"
+    );
+}
+
 /// 真实热增删端到端：起 examples/mcp_echo.py（本地 stdio MCP server，无网络），
 /// 覆盖「spawn → 握手 → 工具进下一请求 → 真实 tools/call → 冲突回滚 →
 /// 移除后 child 被同步回收」全链路——hermetic 用例只到路由与错误形状为止。

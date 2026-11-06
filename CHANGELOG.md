@@ -7,6 +7,15 @@
 
 ### Added
 
+- **MCP 宽松装配 `build_agent_with_lenient`（宿主降级需求，TinyWorker）**：与
+  `build_agent_with` 同签名，差别只在 MCP 起不来的处理——逐个 server 尝试，失败的跳过并
+  以 `McpFailure { server, error }` 返回（`error` 是完整 anyhow 上下文链），成功 server
+  的工具照常进工具列表；**其余装配错误仍 fail-fast**，成功 server 之间的工具名撞车也仍是
+  硬错误（配置错，降级会话遮不住）。`build_agent_with` / `build_agent_with_provider` /
+  `tools::mcp::build` 的严格语义原样保留（CLI/batch 宁可不起跑也不带着缺工具跑）。
+  动机：长驻 UI 宿主会在建会话时急切装配，一个无关插件离线曾让「新建任务」整条失败
+  （transport 级错误直怼用户）。公开面：`tiny_agent::McpFailure`（`tools::mcp` 原路径亦可）。
+
 - **监督者旁注注入（R1，TinyWorker 观察者运行中形态）**：`Agent::supervisor_handle()` 返回可
   Clone 共享句柄（与 cancel 句柄同模式，队列自构造即存在、无注册时序），run 期间任意线程
   `inject_note(text)` 注入。投递：**FIFO、至多一次、绝不无声丢失**——run 循环在每次 LLM 调用前

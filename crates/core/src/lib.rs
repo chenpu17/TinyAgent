@@ -92,6 +92,7 @@ pub use tools::{
     load_document_block, BudgetGate, CallbackTool, Tool, ToolConcurrency, ToolCtx, ToolOrigin,
     ToolOutput,
 };
+pub use tools::mcp::McpFailure;
 // The sandboxed JS tool only exists behind `--features code`; its CONFIG is
 // plain data and unconditional (above) so configs parse on any build.
 #[cfg(feature = "code")]
@@ -139,8 +140,9 @@ pub fn build_agent_with(
     // skill-intro attribution. Captured BEFORE `assemble` — its returned cfg
     // clone shadows this one and carries the appended skill intro.
     let skill_base = cfg.system_prompt.as_ref().map(|s| s.len()).unwrap_or(0);
-    let (tool_list, ctx, cfg, code, eager) = assemble(cfg, client, extra_tools, api_key)?;
-    // FR-1 eager skill injection (FD-3 + e2e 修订)：内容判定——已在历史中
+    let (tool_list, ctx, cfg, code, eager, _mcp_failures) =
+        assemble_with(cfg, client, extra_tools, api_key, false)?;
+    // FR-1 eager skill injection（FD-3 + e2e 修订）：内容判定——已在历史中
     // 披露过（eager 会话 resume / 真实 read_skill 调用）则不重注；headless
     // 与 batch 的任务消息在 initial 里，前置后边界按 append_user_turn 合并。
     let initial = prepend_eager_pair(eager, initial);
@@ -156,6 +158,40 @@ pub fn build_agent_with(
     agent.set_skill_intro_base(skill_base);
     code.install(&mut agent);
     Ok(agent)
+}
+
+/// Like [`build_agent_with`], but a configured MCP server that fails to start
+/// is skipped instead of aborting assembly.
+///
+/// Long-lived hosts use this so one dead plugin cannot block the core loop (an
+/// eagerly-built session used to fail outright with a transport-level error).
+/// The returned list names each skipped server and its full error chain, so
+/// the host can show a degraded-start notice. Every other assembly error stays
+/// fatal: **only** MCP handshakes are degraded.
+pub fn build_agent_with_lenient(
+    cfg: &Config,
+    initial: Vec<Message>,
+    client: &reqwest::blocking::Client,
+    extra_tools: Vec<Box<dyn tools::Tool>>,
+    api_key: &str,
+) -> anyhow::Result<(Agent, Vec<McpFailure>)> {
+    // Same assembly-time key check as `build_agent_with`.
+    provider::check_api_key(api_key)?;
+    // Same pre-assembly capture as `build_agent_with`.
+    let skill_base = cfg.system_prompt.as_ref().map(|s| s.len()).unwrap_or(0);
+    let (tool_list, ctx, cfg, code, eager, mcp_failures) =
+        assemble_with(cfg, client, extra_tools, api_key, true)?;
+    let initial = prepend_eager_pair(eager, initial);
+    let mut agent = Agent::try_new(
+        &cfg,
+        provider::build(&cfg, api_key, client.clone()),
+        tool_list,
+        initial,
+        ctx,
+    )?;
+    agent.set_skill_intro_base(skill_base);
+    code.install(&mut agent);
+    Ok((agent, mcp_failures))
 }
 
 /// Like [`build_agent_with`], but the caller supplies the [`Provider`] directly
@@ -184,7 +220,8 @@ pub fn build_agent_with_provider(
     // Same pre-assembly capture as `build_agent_with` (its cfg gets shadowed
     // by assemble's intro-augmented clone).
     let skill_base = cfg.system_prompt.as_ref().map(|s| s.len()).unwrap_or(0);
-    let (tool_list, ctx, cfg, code, eager) = assemble(cfg, client, extra_tools, api_key)?;
+    let (tool_list, ctx, cfg, code, eager, _mcp_failures) =
+        assemble_with(cfg, client, extra_tools, api_key, false)?;
     // Same FR-1 rule as build_agent_with (FD-3 + e2e 修订).
     let initial = prepend_eager_pair(eager, initial);
     let mut agent = Agent::try_new(&cfg, provider, tool_list, initial, ctx)?;
@@ -229,18 +266,25 @@ impl CodeInstall {
 /// any extra tools. Factored out so [`build_agent_with`] and
 /// [`build_agent_with_provider`] stay in lockstep — only the provider
 /// construction differs between them.
-#[allow(clippy::type_complexity)] // returns (tools, ctx, cfg, code, eager): cfg carries the skill-augmented system_prompt; eager = FR-1 synthetic skill pair (code feature, else None)
-fn assemble(
+///
+/// `lenient_mcp` selects the MCP start contract: `false` fails assembly on the
+/// first unreachable server (CLI/batch: a run that silently lacks tools is
+/// worse than not running), `true` skips it and reports it (hosts with a live
+/// UI, see [`build_agent_with_lenient`]).
+#[allow(clippy::type_complexity)] // returns (tools, ctx, cfg, code, eager, mcp_failures): cfg carries the skill-augmented system_prompt; eager = FR-1 synthetic skill pair (code feature, else None)
+fn assemble_with(
     cfg: &Config,
     client: &reqwest::blocking::Client,
     extra_tools: Vec<Box<dyn tools::Tool>>,
     api_key: &str,
+    lenient_mcp: bool,
 ) -> anyhow::Result<(
     Vec<Box<dyn tools::Tool>>,
     ToolCtx,
     Config,
     CodeInstall,
     Option<Vec<Message>>,
+    Vec<McpFailure>,
 )> {
     use anyhow::Context;
     // The configured branch was already canonicalized + verbatim-stripped by
@@ -257,10 +301,12 @@ fn assemble(
     // Build MCP tools ONCE. The parent boxes them into its own tool list, and
     // tools::build hands SubAgent a clone of the same set — so a `task` call
     // shares the parent's MCP connections instead of re-spawning every server.
-    let mcp_tools = if !cfg.mcp_servers.is_empty() {
-        tools::mcp::build(&cfg.mcp_servers)?
+    let (mcp_tools, mcp_failures) = if cfg.mcp_servers.is_empty() {
+        (Vec::new(), Vec::new())
+    } else if lenient_mcp {
+        tools::mcp::build_lenient(&cfg.mcp_servers)?
     } else {
-        Vec::new()
+        (tools::mcp::build(&cfg.mcp_servers)?, Vec::new())
     };
 
     // run_code (H3/H4): the tool's membership in the model-visible list is
@@ -496,7 +542,7 @@ fn assemble(
         deadline: None,
         tool_absent_notes: cfg.tool_absent_notes.clone(),
     };
-    Ok((tool_list, ctx, cfg, code, eager_pair))
+    Ok((tool_list, ctx, cfg, code, eager_pair, mcp_failures))
 }
 
 /// Prepend the eager skill pair to a caller-supplied `initial` history

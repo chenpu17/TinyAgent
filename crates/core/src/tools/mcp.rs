@@ -299,6 +299,57 @@ pub(crate) fn build(servers: &[McpServerConfig]) -> Result<Vec<McpTool>> {
     Ok(out)
 }
 
+/// One configured MCP server that a lenient assembly had to skip.
+///
+/// `server` is the config name (what the host listed in its settings);
+/// `error` is the full anyhow chain (`{e:#}`) so the host can show why —
+/// typically a transport refusal or a handshake timeout.
+#[derive(Clone, Debug)]
+pub struct McpFailure {
+    /// Config name of the server that could not be started.
+    pub server: String,
+    /// Full anyhow context chain (`{e:#}`) explaining the failure.
+    pub error: String,
+}
+
+/// Start every configured MCP server, tolerating per-server failures.
+///
+/// Same contract as [`build`] except a server that fails its handshake is
+/// reported in the returned list instead of aborting assembly — the caller
+/// keeps the tools of every server that did come up. This is the mode hosts
+/// with a long-lived UI use: a plugin being down must not sink the session
+/// (the model simply doesn't see that server's tools; the host surfaces the
+/// failure). Cross-server name collisions *among the servers that did start*
+/// are still fatal — that is a configuration error no degraded session can
+/// paper over.
+pub(crate) fn build_lenient(servers: &[McpServerConfig]) -> Result<(Vec<McpTool>, Vec<McpFailure>)> {
+    let mut out: Vec<McpTool> = Vec::new();
+    let mut display_names: Vec<String> = Vec::new();
+    let mut failures: Vec<McpFailure> = Vec::new();
+    for cfg in servers {
+        match start_server(cfg) {
+            Ok(tools) => {
+                let n = tools.len();
+                display_names.extend(tools.iter().map(|t| t.def.name.clone()));
+                out.extend(tools);
+                crate::diag::diag_info!("mcp: server '{}' ready ({} tools)", cfg.name, n);
+            }
+            Err(e) => {
+                // `{e:#}` keeps the context chain (what failed + why) — the
+                // host shows it verbatim in its degraded-start notice.
+                let error = format!("{e:#}");
+                crate::diag::diag_warn!("mcp: server '{}' unavailable: {error}", cfg.name);
+                failures.push(McpFailure {
+                    server: cfg.name.clone(),
+                    error,
+                });
+            }
+        }
+    }
+    dedup_check(&display_names)?;
+    Ok((out, failures))
+}
+
 /// Start ONE MCP server for `Agent::add_mcp_server` (hot-add). Unlike `build`
 /// this never prints — the agent layer can sit behind a raw-mode TUI, where an
 /// eprintln corrupts the screen. `existing` holds every display name the agent
