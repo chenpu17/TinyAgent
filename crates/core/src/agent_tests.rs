@@ -3602,18 +3602,56 @@ fn lenient_mcp_assembly_skips_failed_server() {
         headers: Default::default(),
         env: Default::default(),
     };
-    assert!(
-        crate::tools::mcp::build(std::slice::from_ref(&bad)).is_err(),
-        "strict build stays fail-fast"
-    );
+    let e = match crate::tools::mcp::build(std::slice::from_ref(&bad)) {
+        Err(e) => e,
+        Ok(_) => panic!("strict build stays fail-fast"),
+    };
     let (tools, failures) =
         crate::tools::mcp::build_lenient(std::slice::from_ref(&bad)).unwrap();
     assert!(tools.is_empty(), "no tools from a server that never started");
     assert_eq!(failures.len(), 1);
     assert_eq!(failures[0].server, "nope");
+    // 同一份坏配置，两个入口各走一次 start_server：宽松清单里的 error 必须
+    // 与严格 Err 出自同一条 anyhow 上下文链（逐字一致）——宿主降级提示里
+    // 给的原因，就是 fail-fast 时用户会看到的那个，而不是被改写过的转述。
+    assert_eq!(failures[0].error, format!("{e:#}"));
+}
+
+#[test]
+fn build_agent_with_lenient_degrades_bad_mcp() {
+    // Agent 级 hermetic 用例：在 mcp::build_lenient 之上再验一整条装配链——
+    // 坏插件降级为失败清单的同时，不得殃及基线工具表（白名单内建工具照常
+    // 进列表）。不上网：provider 只构造不发请求，MCP server 是起不来的坏
+    // 命令，与上层 lenient_mcp_assembly_skips_failed_server 同一株毒。
+    let mut cfg = cfg_with(5, 0, 0);
+    cfg.mcp_servers = vec![McpServerConfig {
+        name: "nope".into(),
+        command: Some("/nonexistent-tinyagent-test-mcp".into()),
+        args: vec![],
+        url: None,
+        transport: None,
+        headers: Default::default(),
+        env: Default::default(),
+    }];
+    let client = crate::provider::new_client(cfg.limits.timeout_secs);
+    let (agent, failures) = crate::build_agent_with_lenient(
+        &cfg,
+        vec![],
+        &client,
+        vec![],
+        "sk-test",
+    )
+    .expect("lenient assembly degrades a dead plugin instead of failing");
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].server, "nope");
+    let names = agent.tool_names();
     assert!(
-        !failures[0].error.is_empty(),
-        "failure carries a user-showable reason"
+        names.iter().all(|n| !n.starts_with("mcp_")),
+        "dead server's tools must not appear: {names:?}"
+    );
+    assert!(
+        !names.is_empty(),
+        "baseline whitelist tools still assembled around the dead plugin"
     );
 }
 

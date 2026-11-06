@@ -133,31 +133,11 @@ pub fn build_agent_with(
     extra_tools: Vec<Box<dyn tools::Tool>>,
     api_key: &str,
 ) -> anyhow::Result<Agent> {
-    // Deterministic configuration errors fail at assembly, not as a
-    // transient-looking `builder error` on the first request.
-    provider::check_api_key(api_key)?;
-    // The pre-assembly system-prompt length, for context_breakdown's base /
-    // skill-intro attribution. Captured BEFORE `assemble` — its returned cfg
-    // clone shadows this one and carries the appended skill intro.
-    let skill_base = cfg.system_prompt.as_ref().map(|s| s.len()).unwrap_or(0);
-    let (tool_list, ctx, cfg, code, eager, _mcp_failures) =
-        assemble_with(cfg, client, extra_tools, api_key, false)?;
-    // FR-1 eager skill injection（FD-3 + e2e 修订）：内容判定——已在历史中
-    // 披露过（eager 会话 resume / 真实 read_skill 调用）则不重注；headless
-    // 与 batch 的任务消息在 initial 里，前置后边界按 append_user_turn 合并。
-    let initial = prepend_eager_pair(eager, initial);
-    let mut agent = Agent::try_new(
-        &cfg,
-        provider::build(&cfg, api_key, client.clone()),
-        tool_list,
-        initial,
-        ctx,
-    )?;
-    // Narrow the attribution to the user's own prompt (assembly window —
-    // between try_new and return, no concurrency).
-    agent.set_skill_intro_base(skill_base);
-    code.install(&mut agent);
-    Ok(agent)
+    finish_build(cfg, initial, client, extra_tools, api_key, false, |augmented| {
+        provider::build(augmented, api_key, client.clone())
+    })
+    // 严格路径的 MCP 失败清单恒空（起不来已整条 Err），取 .0 即可。
+    .map(|(agent, _)| agent)
 }
 
 /// Like [`build_agent_with`], but a configured MCP server that fails to start
@@ -175,23 +155,9 @@ pub fn build_agent_with_lenient(
     extra_tools: Vec<Box<dyn tools::Tool>>,
     api_key: &str,
 ) -> anyhow::Result<(Agent, Vec<McpFailure>)> {
-    // Same assembly-time key check as `build_agent_with`.
-    provider::check_api_key(api_key)?;
-    // Same pre-assembly capture as `build_agent_with`.
-    let skill_base = cfg.system_prompt.as_ref().map(|s| s.len()).unwrap_or(0);
-    let (tool_list, ctx, cfg, code, eager, mcp_failures) =
-        assemble_with(cfg, client, extra_tools, api_key, true)?;
-    let initial = prepend_eager_pair(eager, initial);
-    let mut agent = Agent::try_new(
-        &cfg,
-        provider::build(&cfg, api_key, client.clone()),
-        tool_list,
-        initial,
-        ctx,
-    )?;
-    agent.set_skill_intro_base(skill_base);
-    code.install(&mut agent);
-    Ok((agent, mcp_failures))
+    finish_build(cfg, initial, client, extra_tools, api_key, true, |augmented| {
+        provider::build(augmented, api_key, client.clone())
+    })
 }
 
 /// Like [`build_agent_with`], but the caller supplies the [`Provider`] directly
@@ -214,20 +180,9 @@ pub fn build_agent_with_provider(
     extra_tools: Vec<Box<dyn tools::Tool>>,
     api_key: &str,
 ) -> anyhow::Result<Agent> {
-    // Same assembly-time key check as `build_agent_with` (the `task` child
-    // agents build their own provider from this key).
-    provider::check_api_key(api_key)?;
-    // Same pre-assembly capture as `build_agent_with` (its cfg gets shadowed
-    // by assemble's intro-augmented clone).
-    let skill_base = cfg.system_prompt.as_ref().map(|s| s.len()).unwrap_or(0);
-    let (tool_list, ctx, cfg, code, eager, _mcp_failures) =
-        assemble_with(cfg, client, extra_tools, api_key, false)?;
-    // Same FR-1 rule as build_agent_with (FD-3 + e2e 修订).
-    let initial = prepend_eager_pair(eager, initial);
-    let mut agent = Agent::try_new(&cfg, provider, tool_list, initial, ctx)?;
-    agent.set_skill_intro_base(skill_base);
-    code.install(&mut agent);
-    Ok(agent)
+    finish_build(cfg, initial, client, extra_tools, api_key, false, |_| provider)
+        // 严格路径的 MCP 失败清单恒空（起不来已整条 Err），取 .0 即可。
+        .map(|(agent, _)| agent)
 }
 
 /// What `assemble` hands back for the `code` feature: the ONE top-level
@@ -265,7 +220,10 @@ impl CodeInstall {
 /// reuses the parent's connections rather than re-spawning), then append MCP +
 /// any extra tools. Factored out so [`build_agent_with`] and
 /// [`build_agent_with_provider`] stay in lockstep — only the provider
-/// construction differs between them.
+/// construction differs between them. The tail AFTER this point (eager pair,
+/// `Agent::try_new`, skill-intro base, code install) is unified too: all three
+/// `build_agent*` entries route through [`finish_build`], so neither half can
+/// drift between the entries.
 ///
 /// `lenient_mcp` selects the MCP start contract: `false` fails assembly on the
 /// first unreachable server (CLI/batch: a run that silently lacks tools is
@@ -543,6 +501,48 @@ fn assemble_with(
         tool_absent_notes: cfg.tool_absent_notes.clone(),
     };
     Ok((tool_list, ctx, cfg, code, eager_pair, mcp_failures))
+}
+
+/// 三个 `build_agent*` 入口共用的尾段：key 检查 → 装配前的 skill_base 捕获 →
+/// [`assemble_with`] → eager 对前置 → `Agent::try_new` → skill-intro 归属窗 →
+/// code 装配。此前在 build_agent_with / build_agent_with_lenient /
+/// build_agent_with_provider 三处逐行复制，尾段每改一处都要人肉同步三份——
+/// 抽出来让编译器保证 lockstep。`make_provider` 是三个入口唯一真正的分叉点：
+/// 普通入口用它现建 provider（拿到的是装配返回的 cfg 克隆——system_prompt
+/// 已带上 skill intro，与抽出前的求值时机一致）；build_agent_with_provider
+/// 则吞下调用方注入的 provider，对 cfg 视而不见。`lenient_mcp` 原样透传给
+/// [`assemble_with`]：宽松模式的 MCP 失败清单随元组带回给宿主，严格模式的
+/// 清单恒空（失败已整条上抛，根本走不到返回）。
+fn finish_build(
+    cfg: &Config,
+    initial: Vec<Message>,
+    client: &reqwest::blocking::Client,
+    extra_tools: Vec<Box<dyn tools::Tool>>,
+    api_key: &str,
+    lenient_mcp: bool,
+    make_provider: impl FnOnce(&Config) -> Box<dyn Provider>,
+) -> anyhow::Result<(Agent, Vec<McpFailure>)> {
+    // Deterministic configuration errors fail at assembly, not as a
+    // transient-looking `builder error` on the first request. Also runs on the
+    // build_agent_with_provider entry (a custom provider doesn't waive it):
+    // the `task` child agents build their own provider from this key.
+    provider::check_api_key(api_key)?;
+    // The pre-assembly system-prompt length, for context_breakdown's base /
+    // skill-intro attribution. Captured BEFORE `assemble_with` — its returned
+    // cfg clone shadows this one and carries the appended skill intro.
+    let skill_base = cfg.system_prompt.as_ref().map(|s| s.len()).unwrap_or(0);
+    let (tool_list, ctx, cfg, code, eager, mcp_failures) =
+        assemble_with(cfg, client, extra_tools, api_key, lenient_mcp)?;
+    // FR-1 eager skill injection（FD-3 + e2e 修订）：内容判定——已在历史中
+    // 披露过（eager 会话 resume / 真实 read_skill 调用）则不重注；headless
+    // 与 batch 的任务消息在 initial 里，前置后边界按 append_user_turn 合并。
+    let initial = prepend_eager_pair(eager, initial);
+    let mut agent = Agent::try_new(&cfg, make_provider(&cfg), tool_list, initial, ctx)?;
+    // Narrow the attribution to the user's own prompt (assembly window —
+    // between try_new and return, no concurrency).
+    agent.set_skill_intro_base(skill_base);
+    code.install(&mut agent);
+    Ok((agent, mcp_failures))
 }
 
 /// Prepend the eager skill pair to a caller-supplied `initial` history

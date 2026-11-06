@@ -3,6 +3,7 @@ use crate::config::McpServerConfig;
 use crate::mcp::McpClient;
 use crate::provider::{Block, ToolDef};
 use anyhow::{bail, Result};
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -283,20 +284,8 @@ fn start_server(cfg: &McpServerConfig) -> Result<Vec<McpTool>> {
 /// sub-agent `clone()`s the same set into its child (sharing the `Arc`'d MCP
 /// connection) instead of re-calling this — re-spawning every server per task.
 pub(crate) fn build(servers: &[McpServerConfig]) -> Result<Vec<McpTool>> {
-    let mut out: Vec<McpTool> = Vec::new();
-    let mut display_names: Vec<String> = Vec::new();
-    for cfg in servers {
-        let tools = start_server(cfg)?;
-        let n = tools.len();
-        display_names.extend(tools.iter().map(|t| t.def.name.clone()));
-        out.extend(tools);
-        crate::diag::diag_info!("mcp: server '{}' ready ({} tools)", cfg.name, n);
-    }
-    // Cross-server collisions after sanitization are the real risk — e.g.
-    // server "a" + tool "b.c" and server "a.b" + tool "c" both yield
-    // `mcp_a_b_c`. Surface it at startup rather than silently shadowing a tool.
-    dedup_check(&display_names)?;
-    Ok(out)
+    let (tools, _) = build_inner(servers, false)?;
+    Ok(tools)
 }
 
 /// One configured MCP server that a lenient assembly had to skip.
@@ -304,7 +293,7 @@ pub(crate) fn build(servers: &[McpServerConfig]) -> Result<Vec<McpTool>> {
 /// `server` is the config name (what the host listed in its settings);
 /// `error` is the full anyhow chain (`{e:#}`) so the host can show why —
 /// typically a transport refusal or a handshake timeout.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct McpFailure {
     /// Config name of the server that could not be started.
     pub server: String,
@@ -322,7 +311,21 @@ pub struct McpFailure {
 /// failure). Cross-server name collisions *among the servers that did start*
 /// are still fatal — that is a configuration error no degraded session can
 /// paper over.
+///
+/// 时序坑：被跳过的 server 若与某成功者 sanitize 后重名，等它恢复后下次装配
+/// 会在 dedup_check 上硬失败——宿主如需在恢复前预检，可对照返回的 failures
+/// 清单。
 pub(crate) fn build_lenient(servers: &[McpServerConfig]) -> Result<(Vec<McpTool>, Vec<McpFailure>)> {
+    build_inner(servers, true)
+}
+
+/// `build` 与 `build_lenient` 的共同实现（曾经两段逐行复制，改一处漏一处的
+/// 风险全在人肉同步上）。`lenient=false` 是严格路径：首个起不来的 server 把
+/// 原始 anyhow 错误原样上抛（上下文链不折损），后续 server 不再启动——
+/// CLI/batch 宁可不起跑也不带着缺工具跑；`lenient=true` 把失败收进 failures
+/// 继续起下一个，宿主（长驻 UI）拿清单降级提示。dedup_check 两种模式都跑，
+/// 位置不变：严格模式走到这里必然全部成功；宽松模式只对「起来了的」集合查重。
+fn build_inner(servers: &[McpServerConfig], lenient: bool) -> Result<(Vec<McpTool>, Vec<McpFailure>)> {
     let mut out: Vec<McpTool> = Vec::new();
     let mut display_names: Vec<String> = Vec::new();
     let mut failures: Vec<McpFailure> = Vec::new();
@@ -335,17 +338,24 @@ pub(crate) fn build_lenient(servers: &[McpServerConfig]) -> Result<(Vec<McpTool>
                 crate::diag::diag_info!("mcp: server '{}' ready ({} tools)", cfg.name, n);
             }
             Err(e) => {
-                // `{e:#}` keeps the context chain (what failed + why) — the
-                // host shows it verbatim in its degraded-start notice.
-                let error = format!("{e:#}");
-                crate::diag::diag_warn!("mcp: server '{}' unavailable: {error}", cfg.name);
-                failures.push(McpFailure {
-                    server: cfg.name.clone(),
-                    error,
-                });
+                if lenient {
+                    // `{e:#}` keeps the context chain (what failed + why) — the
+                    // host shows it verbatim in its degraded-start notice.
+                    let error = format!("{e:#}");
+                    crate::diag::diag_warn!("mcp: server '{}' unavailable: {error}", cfg.name);
+                    failures.push(McpFailure {
+                        server: cfg.name.clone(),
+                        error,
+                    });
+                } else {
+                    return Err(e);
+                }
             }
         }
     }
+    // Cross-server collisions after sanitization are the real risk — e.g.
+    // server "a" + tool "b.c" and server "a.b" + tool "c" both yield
+    // `mcp_a_b_c`. Surface it at startup rather than silently shadowing a tool.
     dedup_check(&display_names)?;
     Ok((out, failures))
 }

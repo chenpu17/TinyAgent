@@ -8,11 +8,14 @@
 ### Added
 
 - **MCP 宽松装配 `build_agent_with_lenient`（宿主降级需求，TinyWorker）**：与
-  `build_agent_with` 同签名，差别只在 MCP 起不来的处理——逐个 server 尝试，失败的跳过并
+  `build_agent_with` 同参数签名，返回值多带失败清单（`Result<(Agent, Vec<McpFailure>)>`），
+  差别只在 MCP 起不来的处理——逐个 server 尝试，失败的跳过并
   以 `McpFailure { server, error }` 返回（`error` 是完整 anyhow 上下文链），成功 server
   的工具照常进工具列表；**其余装配错误仍 fail-fast**，成功 server 之间的工具名撞车也仍是
   硬错误（配置错，降级会话遮不住）。`build_agent_with` / `build_agent_with_provider` /
   `tools::mcp::build` 的严格语义原样保留（CLI/batch 宁可不起跑也不带着缺工具跑）。
+  时序坑：被跳过的 server 若与某成功者 sanitize 后重名，等它恢复后下次装配会在
+  dedup_check 上硬失败——宿主如需在恢复前预检，可对照返回的 failures 清单。
   动机：长驻 UI 宿主会在建会话时急切装配，一个无关插件离线曾让「新建任务」整条失败
   （transport 级错误直怼用户）。公开面：`tiny_agent::McpFailure`（`tools::mcp` 原路径亦可）。
 
