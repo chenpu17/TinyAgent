@@ -999,15 +999,22 @@ fn eager_injection_skips_a_folded_history() {
 /// `shell` tool spawns — until `env_passthrough` names it again. The config
 /// points `api_key_env` at a variable every test process has (`HOME` on
 /// unix, `USERNAME` on Windows), so nothing here edits the process
-/// environment; its value is only ever handed to the mock provider.
+/// environment; its value is only ever handed to the mock provider. The
+/// "absent" line is the interpreter's own: a bare `[]` from `sh`; cmd.exe
+/// leaves an undefined `%NAME%` unexpanded, so its probe has `if not defined`
+/// print a marker line instead (see `tools::shell::tests`).
 #[cfg(any(unix, windows))]
 #[test]
 fn api_key_env_is_hidden_from_tool_subprocesses() {
     use tiny_agent::provider::new_client;
     #[cfg(unix)]
-    let (probe, command) = ("HOME", r##"echo "[$HOME"]"##);
+    let (probe, command, absent) = ("HOME", r##"echo "[$HOME"]"##, "[]");
     #[cfg(windows)]
-    let (probe, command) = ("USERNAME", r"echo [%USERNAME%]");
+    let (probe, command, absent) = (
+        "USERNAME",
+        "echo [%USERNAME%] & if not defined USERNAME echo TA_PROBE_ABSENT",
+        "TA_PROBE_ABSENT",
+    );
     if std::env::var_os(probe).is_none() {
         eprintln!("skip api_key_env_is_hidden_from_tool_subprocesses: {probe} is unset");
         return;
@@ -1051,9 +1058,9 @@ fn api_key_env_is_hidden_from_tool_subprocesses() {
         contents.remove(0)
     };
     // (the output has a line holding the variable's VALUE in brackets, it
-    // has a bare `[]`). The tool's leading `$ command` line names the
-    // variable but never spells its value, so the first flag can only be
-    // raised by a real expansion.
+    // has the interpreter's "name absent" line). The tool's leading
+    // `$ command` line names the variable but never spells its value, so the
+    // first flag can only be raised by a real expansion.
     let inherited = std::env::var_os(probe)
         .expect("checked above")
         .to_string_lossy()
@@ -1063,7 +1070,7 @@ fn api_key_env_is_hidden_from_tool_subprocesses() {
         let lines: Vec<&str> = content.lines().map(str::trim).collect();
         (
             lines.contains(&expanded_line.as_str()),
-            lines.contains(&"[]"),
+            lines.contains(&absent),
         )
     };
     let hidden = ask(false);

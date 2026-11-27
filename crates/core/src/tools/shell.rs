@@ -1033,30 +1033,43 @@ mod tests {
     /// test process has (`HOME` on unix, `USERNAME` on Windows), so the test
     /// never edits the process environment; the control run first proves the
     /// probe sees it when nothing is hidden.
+    ///
+    /// How an absent name shows up is the interpreter's business: `sh` expands
+    /// an unset `$HOME` to nothing (a bare `[]`), but cmd.exe at its command
+    /// line leaves an undefined `%NAME%` UNEXPANDED — it prints `[%NAME%]`, so
+    /// a bare `[]` never appears there. The Windows probe therefore asks cmd
+    /// straight (`if not defined`) for an "absent" line instead of inferring
+    /// absence from how the echo came out (2026-11-27: the `[]` reading made
+    /// this test's first Windows run fail — `#[cfg(windows)]` is a blind spot
+    /// for every local configuration).
     #[cfg(any(unix, windows))]
     #[test]
     fn hidden_env_is_removed_from_the_spawned_shell() {
         #[cfg(unix)]
-        let (probe, command) = ("HOME", r##"echo "[$HOME"]"##);
+        let (probe, command, absent) = ("HOME", r##"echo "[$HOME"]"##, "[]");
         #[cfg(windows)]
-        let (probe, command) = ("USERNAME", r"echo [%USERNAME%]");
+        let (probe, command, absent) = (
+            "USERNAME",
+            "echo [%USERNAME%] & if not defined USERNAME echo TA_PROBE_ABSENT",
+            "TA_PROBE_ABSENT",
+        );
         let Some(inherited) = std::env::var_os(probe) else {
             eprintln!("skip hidden_env_is_removed_from_the_spawned_shell: {probe} is unset");
             return;
         };
         let mut ctx = ctx(std::env::temp_dir(), 1000);
         let inherited = inherited.to_string_lossy().into_owned();
-        // Run the probe → (the output carries the variable's VALUE, the
-        // shell printed a bare `[]`). The tool's leading `$ command` line
-        // names the variable but never spells its value, so the first flag
-        // can only be raised by a real expansion.
+        // Run the probe → (the output carries the variable's VALUE, the shell
+        // reported the name ABSENT). The tool's leading `$ command` line names
+        // the variable but never spells its value, so the first flag can only
+        // be raised by a real expansion.
         let probe_output = |ctx: &ToolCtx| -> (bool, bool) {
             let out = Shell
                 .run(&json!({"command": command}), ctx)
                 .expect("the shell tool returns an output");
             assert!(!out.is_error, "probe must exit 0: {}", out.content);
             let lines: Vec<&str> = out.content.lines().map(str::trim).collect();
-            (out.content.contains(&inherited), lines.contains(&"[]"))
+            (out.content.contains(&inherited), lines.contains(&absent))
         };
         assert_eq!(
             probe_output(&ctx),

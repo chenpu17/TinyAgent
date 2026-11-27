@@ -328,7 +328,8 @@
   这套 clippy 会以 `unused_variables` 失败——说明它真的在 lint 这部分代码）。绑定 crate：Python 另设
   `PYO3_CROSS_PYTHON_VERSION`（如 `3.12`）；Node 的 napi-build 在 Windows 目标上无条件找 `libnode.dll`（找不到就
   panic、没有跳过开关），本机没有 win32 的 node 库时把 `LIBNODE_PATH` 指向一个放了同名空占位文件的临时目录即可
-  （`cargo clippy` 不链接，只过它的存在性检查）。
+  （`cargo clippy` 不链接，只过它的存在性检查）。类型检查过了不等于行为对——cmd.exe 的运行时语义交叉检查
+  管不到，见下文「CI-only 的门，修完要对着日志逐格复核」条。
 - **思考内容展示策略**：`ThinkingDelta` 在 `harness` 的 `--json` NDJSON 发 `{"type":"thinking","delta":...}`；
   headless 终端打印写 **stderr**（不进 stdout 的 `summary`，可 `2>/dev/null` 屏蔽）；TUI 渲染为独立
   独立色斜体 `✻` 区块（`Row::Thinking`，不走 markdown/MdCache，与答复视觉分离）。**Thinking 不走
@@ -626,4 +627,23 @@
   `CARGO_INSTALL_ROOT=/tmp/… cargo +<CI 版> install --locked cargo-audit --version <ci.yml 里钉的版本>`，
   再 `cargo audit --db /tmp/…`（advisory 库也放临时目录，首次不带 `-n` 让它取一次）。audit 与 msrv 这两道门
   红过一次**环境漂移**（与代码改动无关）：RustSec 新公告（锁文件里补丁版升级即可）、runner 自带的 Python
-  升到 3.14 而 pyo3 0.22 上限 3.13（msrv job 钉解释器 3.12）。
+  升到 3.14 而 pyo3 0.22 上限 3.13（msrv job 钉解释器 3.12——这处修法本身又栽了一次，见下条）。
+- **CI-only 的门，修完要对着日志逐格复核（2026-11-27，修 CI 的提交推上去仍有两格红）**：上一条的修法推上去后
+  `msrv` 同一个报错原样再来一遍，`test (windows-latest)` 则在下游第一次跑到的测试上红。两个独立教训：
+  - **GitHub Actions 引用不存在的 step 输出不报错，展开成空串**。`actions/setup-python`（钉 a26af69，v5）的
+    action.yml 只声明 `python-version` / `cache-hit` / `python-path` 三个输出，另导出环境变量 `pythonLocation`——
+    **没有** `python-location` 输出（这个名字是把环境变量当成了输出）。于是
+    `PYO3_PYTHON: ${{ steps.py.outputs.python-location }}/bin/python3` 展开成 `/bin/python3`，日志里该 step 的
+    `env:` 段原样可见。**规则**：引用任何 action 的输出前先读它的 action.yml
+    （`gh api 'repos/<owner>/<repo>/contents/action.yml?ref=<钉的 SHA>' --jq .content | base64 -d`）；本地「复现了
+    根因」不等于「复现了修法」，CI-only 的门只能靠推上去后的日志逐 job 看结论。
+  - **`#[cfg(windows)]` 测试的运行时语义，交叉 clippy 管不到**（上一条 `#[cfg(windows)]` 配方只做类型检查 +
+    lint）。cmd.exe 在命令行（`cmd /C …`，非批处理）里对**未定义**的 `%NAME%` 不展开、原样打印——批处理文件里
+    才替换成空。两个凭据卫生探针（`tools::shell::tests::hidden_env_is_removed_from_the_spawned_shell`、
+    `tests/lib_api.rs::api_key_env_is_hidden_from_tool_subprocesses`）用 `echo [%USERNAME%]` 探测，期望隐藏后打出
+    空 `[]`（`sh` 的表现），Windows 上打出的是 `[%USERNAME%]`——隐藏本身是生效的，错的是读法。修法：让解释器
+    自己回答「名字在不在」（`echo [%USERNAME%] & if not defined USERNAME echo <标记>`，断言那一行），别从 echo 的
+    样子反推。**规则**：新写的 `#[cfg(windows)]` 测试，在它第一次真正跑在 Windows 上之前都算没验证过；上游
+    job（clippy）红着的时候下游测试**根本没跑**，修好上游之后要有下游再红一轮的准备——推修 CI 的提交前，把
+    「此后才第一次跑到的测试面」过一遍（本次是 `git diff <上次绿的提交>..HEAD -- '*.rs'` 里的 cfg 分支）。
+    两个探针同病，一次修两处：`grep -rn 'cfg(windows)' crates src bindings` 定位块再逐块读。

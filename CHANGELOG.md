@@ -534,8 +534,15 @@
   为真值源，新增工具不补样例即失败）。
 - **CI msrv job 的假红灯（2026-11-27）**：`ubuntu-latest` 自带的 `python3` 升到了 3.14，而 pyo3 0.22 的上限是
   3.13——`cargo check -p tiny-agent-py` 在构建脚本处报「interpreter version (3.14) is newer than PyO3's maximum
-  supported version」，与 MSRV 无关。msrv job 与 python-binding job 同版钉住解释器（3.12），并取 action 输出的
-  绝对路径，不押 `python3` 在 PATH 上落到谁。
+  supported version」，与 MSRV 无关。msrv job 与 python-binding job 同版钉住解释器（3.12），并取 action 声明的输出
+  `python-path`（可执行文件绝对路径），不押 `python3` 在 PATH 上落到谁。第一版引用的是该 action 并不存在的
+  `python-location` 输出——不存在的 step 输出不报错、展开成空串，`PYO3_PYTHON` 退化成 `/bin/python3`，同一个红灯
+  原样又来了一遍。
+- **凭据卫生的两个探针在 Windows 上的假红灯（2026-11-27）**：`hidden_env_is_removed_from_the_spawned_shell` 与
+  `api_key_env_is_hidden_from_tool_subprocesses` 用 `echo [%USERNAME%]` 探测隐藏效果、期望 shell 打出空括号
+  `[]`——那是 `sh` 对未设置变量的表现；cmd.exe 在命令行里对未定义的 `%NAME%` 不展开，打出的是 `[%USERNAME%]`。
+  两个测试随内核改进计划（2.5）新增，此前一直被上游的 clippy 红灯挡着、第一次在 Windows 上运行即失败；
+  隐藏本身是生效的（值没有漏进输出）。Windows 探针改为让 cmd 自己回答（`if not defined USERNAME echo <标记>`）。
 
 ### Security
 
