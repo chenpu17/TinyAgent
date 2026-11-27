@@ -532,6 +532,10 @@
   字符串，整数被判成 `missing argument 'units'`——脚本化模型不调这个工具，零成本通道一直是绿的；真实模型
   一次 run 里撞了 25 次。整数参数改在工具处校验（正整数），十二个工具各加一条合法调用探针（以 `TOOLS`
   为真值源，新增工具不补样例即失败）。
+- **CI msrv job 的假红灯（2026-11-27）**：`ubuntu-latest` 自带的 `python3` 升到了 3.14，而 pyo3 0.22 的上限是
+  3.13——`cargo check -p tiny-agent-py` 在构建脚本处报「interpreter version (3.14) is newer than PyO3's maximum
+  supported version」，与 MSRV 无关。msrv job 与 python-binding job 同版钉住解释器（3.12），并取 action 输出的
+  绝对路径，不押 `python3` 在 PATH 上落到谁。
 
 ### Security
 
@@ -566,6 +570,12 @@
   需要密钥的子进程（如对同一网关 `curl`）把变量名加进 `env_passthrough`。配套探针测试断言变量
   不可见（真 spawn 的 shell / python 子进程、热增路径、子 agent 与 guest 的继承），
   `scripts/e2e_mcp.py` 组 K 用真实二进制再走一遍。
+- **依赖 advisory 处置（CI audit job 2026-11-27 转红，三条新公告）**：兼容升级 `quinn-udp` 0.5.15 → 0.5.16
+  （RUSTSEC-2026-0538，截断数据报后接收循环空转）、`url` 2.5.8 → 2.5.9（RUSTSEC-2026-0592，嵌套 `blob:` URL
+  使 `Url::origin()` 栈溢出）、`wasmtime` 36.0.20 → 36.0.23（RUSTSEC-2026-0569：宿主函数不是经 WebAssembly
+  调用时 `Caller::get_module_export` panic；RUSTSEC-2026-0566 / 0571 讲的是 wasmtime-wasi / wasmtime-wasi-http
+  的空写入致宿主内存无界增长——这两个 crate 不在本项目的依赖树里，公告挂在 `wasmtime` 包名下）。三者的
+  MSRV 均不高于 1.86。
 
 ## [0.4.3] - 2026-10-24
 

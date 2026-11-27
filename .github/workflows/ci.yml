@@ -279,9 +279,19 @@ jobs:
       # 高于本 job 的 1.86 工具链——暂移出，待 napi 3 迁移（第九轮延后项）
       # 时一并纳入；其 rust-version="1.88" 已如实声明，cargo 对低于地板的
       # 工具链会当场报错（本地 `cargo +1.86 check -p tiny-agent-node` 复现）。
+      #
+      # 解释器与 python-binding job 同版钉住（3.12）：pyo3 0.22 的上限是 3.13，
+      # 而 2026-11 起 ubuntu-latest 自带的 python3 是 3.14——不钉的话 pyo3 的
+      # 构建脚本直接报「interpreter version (3.14) is newer than PyO3's maximum
+      # supported version (3.13)」，是与 MSRV 无关的假红灯（2026-11-27 实发）。
+      # 解释器取 action 输出的绝对路径，不押 `python3` 在 PATH 上落到谁。
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        id: py
+        with:
+          python-version: "3.12"
       - run: cargo check --locked -p tiny-agent-py
         env:
-          PYO3_PYTHON: python3
+          PYO3_PYTHON: ${{ steps.py.outputs.python-location }}/bin/python3
 
   audit:
     # cargo-audit：RustSec 公告库扫描依赖树。依赖面小（reqwest + serde +

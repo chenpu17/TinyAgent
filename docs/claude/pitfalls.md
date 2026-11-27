@@ -611,3 +611,19 @@
   独立的 `CARGO_TARGET_DIR`（免得和日常构建来回切换 profile 互相重编）。要根治可在自己的
   `[profile.dev]` 里写 `strip = "none"`（本批未代改用户配置）。CI 没有这份全局配置、release profile
   不受影响——**本地绑定测试挂在这个报错上时先查它，别去改绑定代码**。
+- **本地 clippy 绿 ≠ CI clippy 绿：工具链版本差（2026-11-27，推送后 CI 七个 job 转红的教训）**：CI 的
+  `stable` 跟着最新发布走（当时 1.100.0），本机默认工具链停在 1.93.1——新 stable 收紧的 lint 本地看不见，
+  `check.sh` 全绿推上去照样红。实发的是 `clippy::result_large_err`：`Usage` 加 `reasoning_tokens` 后
+  `RunError` 恰好 128 字节（正卡在红线上），1.93 只报返回它的四个**函数**签名（函数级 allow 压住了），
+  1.100 连**转发它的闭包**一起报（测试里的 `thread::scope` / `catch_unwind`、Python 绑定的
+  `allow_threads`）——逐处 allow 是一张只会长、且旧工具链看不见另一半的清单。处置：`RunError.usage` 装箱
+  （96 字节）+ 编译期断言 `size_of::<RunError>() < 128`（回到红线即编译失败，任何工具链都拦得住），allow
+  全删。**规则**：动公开错误类型的字段、或怀疑有新 lint 时，用与 CI 同版的工具链再跑一遍——
+  `rustup toolchain install <CI 版> --profile minimal --component clippy,rustfmt`（与默认并存，不改默认；
+  版本号看 CI 日志里的 rustc 输出，CI 跟 stable 漂），然后 `cargo +<CI 版> clippy …` 跑全部配置并
+  `cargo +<CI 版> fmt --all -- --check`；配隔离构建目录 `CARGO_TARGET_DIR=/tmp/…`（换工具链 = 整树重编，
+  别和日常构建目录混）。`cargo audit` 本地没装时可装到临时根、不碰全局：
+  `CARGO_INSTALL_ROOT=/tmp/… cargo +<CI 版> install --locked cargo-audit --version <ci.yml 里钉的版本>`，
+  再 `cargo audit --db /tmp/…`（advisory 库也放临时目录，首次不带 `-n` 让它取一次）。audit 与 msrv 这两道门
+  红过一次**环境漂移**（与代码改动无关）：RustSec 新公告（锁文件里补丁版升级即可）、runner 自带的 Python
+  升到 3.14 而 pyo3 0.22 上限 3.13（msrv job 钉解释器 3.12）。

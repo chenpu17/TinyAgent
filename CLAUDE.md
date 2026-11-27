@@ -42,7 +42,8 @@ zig 包装配方做一次 Windows 目标交叉 clippy。CI 里四个 clippy 都�
 而集成测试编译时 lib 不带 `cfg(test)`），不带 mock 的 `cargo test` 把它编成 **0 个测试
 照样全绿**——绿灯不等于 lib_api 集成测试跑过。CI 另有两道本地复现不了的 job：musl
 静态构建冒烟（每次 push 必过，"嵌入式低配 Linux"是核心交付定位）与 cargo-audit
-（RustSec 扫依赖树）——升级/新增依赖或动平台相关代码时留意这两道门。
+（RustSec 扫依赖树；本地可用同版 cargo-audit 复现，配方见 pitfalls「本地 clippy 绿 ≠ CI clippy 绿」条）
+——升级/新增依赖或动平台相关代码时留意这两道门。
 
 ### 语言绑定（workspace 成员 `bindings/python`、`bindings/node`）
 
@@ -183,6 +184,7 @@ cargo clippy -p tiny-agent-node
 - **context_breakdown 等和靠单趟 running-floor**（各段独立 /4 会差 1-2 丢不变量）；无 thinking 桶（思考增量永不进 history），`preserved_reasoning` 开时旁字段 `Message.reasoning` 另计 `reasoning` 桶；锚点失效即校准回 None。
 - **`Usage.reasoning_tokens` 为 0 不序列化**（结构体与 result.json / report.json 侧）：绑定测试别把它塞进「四轴恒在」的断言循环——非推理模型下这个键根本不出现，要测它就给 mock 一帧带 `completion_tokens_details.reasoning_tokens` 的 usage。
 - **本机 `strip = "debuginfo"` + macOS 27 的 dyld**：用户级 `~/.cargo/config.toml` 的 `[profile.dev] debug = false` 会让 cargo 给 dev profile 默认 `strip = "debuginfo"`，rustc 链接后剥 debuginfo 产出的 cdylib（绑定的 `.so` / `.node`）LINKEDIT string pool 8 字节错位，macOS 27.2 的 dyld 直接拒载（`mis-aligned LINKEDIT string pool`）——`maturin develop` / `npm run build:debug` 成功但 `import` / `require` 失败。可执行文件与 proc-macro 的布局恰好对齐，所以只有绑定暴露。绕过：`CARGO_PROFILE_DEV_STRIP=none`（环境变量，不改仓库与用户配置）；CI 无此全局配置、release profile 不受影响。
+- **本地 clippy 绿 ≠ CI clippy 绿（工具链版本差）**：CI 跟最新 stable、本机默认可能落后好几个版本，新 stable 收紧的 lint 本地看不见——动公开错误类型的字段、或本地全绿而 CI 的 clippy 格红时，装一个与 CI 同版的工具链（`rustup toolchain install <版本> --component clippy,rustfmt`，与默认并存）配隔离 `CARGO_TARGET_DIR` 把全部 clippy 配置与 `fmt --check` 再跑一遍。实发：`RunError` 恰 128 字节触发 `result_large_err`，旧版只报函数签名、新版连转发结果的闭包一起报——处置是字段装箱 + 编译期断言，不逐处 allow。audit / msrv 两格的红多半是环境漂移（RustSec 新公告、runner 自带 Python 超过 pyo3 上限），先看日志再动代码。
 - **回归评测装置（`scripts/regress_eval.py`）**：臂配置压过任务的 mock 专用调参（arm-over-mock）；清单落盘前脱敏（含 MCP 嵌套 `headers` / `env` 与 URL query）；`[skill]` 按 `XDG_CONFIG_HOME` / `HOME` 查找——**两条通道**都经 `run_env` 隔离 `XDG_CONFIG_HOME`（否则开发者本机的真实技能目录会漏进轨迹）并设 `GIT_CEILING_DIRECTORIES`（批次目录在仓库里，模型在 workdir 发的 `git` 不得解析到外层仓库——第一次真机批次把开发者未提交的 diff 发给了模型）；mock MCP server 的每个工具都要有一条合法调用探针（脚本化模型不调的工具等于没测过，`transfer_stock` 拒收整数参数零成本通道一直是绿的）；改写过的 mock 必须真执行一遍（`check` 抓出过一份只有运行时才炸的 `mock_anthropic.py` 语法错误）；动 harness 先写/跑 `scripts/tests/test_regress_eval.py`（本地 pytest，不进 CI）——七个缺陷都是先写测试才在跑之前抓出来的；批次目录 / `--base-config` 一律解析成绝对路径（run 的子进程 cwd 是 run 目录，第一次真机批次因相对路径六个 run 启动即败），一条通道第一次真跑前先用**与文档逐字相同的命令行**对 mock 排练；给 `limits` 加键要四处同步（内核 clamp / harness 的 clamp 镜像与 pytest 计数 / 两份 README / 所有配置指纹一次性偏移）。
 
 ## 离线 / 视觉验证
