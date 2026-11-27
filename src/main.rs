@@ -471,8 +471,10 @@ fn main() -> Result<()> {
     }
     // The unset-model-window note (`Limits::context_window_hint`) and the
     // unattended-run hint: once per process, before any assembly output.
-    // Headless and batch print them here; for the window the TUI shows a diag
-    // row instead (`tui::run`), for the hint it prints nothing at all.
+    // Headless and batch print them here; for the window the TUI folds its
+    // one-line form into the welcome row instead (`tui::run`, via
+    // `Limits::context_window_hint_line`), for the hint it prints nothing at
+    // all.
     if !tui_mode {
         note_context_window(&cfg);
         note_unattended(&cfg);

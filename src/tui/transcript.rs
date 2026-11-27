@@ -3,7 +3,6 @@
 //! streaming split, the `/export` transcript dump, and the resume-transcript
 //! rebuild. Pure row/text logic; terminal painting lives in `render`.
 
-use super::app::INLINE_HEIGHT;
 use super::markdown::{
     ansi_guided_lines, ansi_plain, fence_next, fence_step, line_to_owned, render_markdown,
     FenceLine, MdCache,
@@ -14,6 +13,7 @@ use super::render::{
 use super::theme::{
     dim_fg, fmt_tool_elapsed, AGENT_FG, THINKING_FG, TOOL_CALL_FG, TOOL_ERR_FG, TOOL_OK_FG, USER_FG,
 };
+use super::view::INLINE_HEIGHT;
 use crate::provider::{Block, Message, Role};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -266,7 +266,7 @@ pub(crate) fn transcript_rows(msgs: &[Message]) -> Vec<Row> {
                 Block::ToolUse { name, input, .. } => {
                     flush(&mut rows, &mut text);
                     let input = strip_controls_json(input);
-                    let collapsed = compact(&input);
+                    let collapsed = arg_summary(&input);
                     rows.push(Row::ToolCall {
                         name: name.clone(),
                         input,
@@ -1261,6 +1261,78 @@ pub(super) fn append_sub_delta(
     }
 }
 
-pub(super) fn compact(v: &serde_json::Value) -> String {
-    crate::agent::preview(&v.to_string())
+/// How much of one string argument the collapsed row shows before it is
+/// elided.
+const ARG_VALUE_CHARS: usize = 60;
+
+/// One-line summary of a tool call's arguments for its collapsed row:
+/// `key=value` pairs in the order the model wrote them —
+/// `path=src/main.rs offset=0 limit=50 content="first line\nsecond…" (+412
+/// chars)`. (The row used to print the raw JSON, quotes and braces included.)
+/// Values that would bury the line are elided, never the keys: a string
+/// longer than [`ARG_VALUE_CHARS`] shows its head and how many chars are
+/// hidden, an array or an object only its brackets — the whole argument is
+/// one `/call N` away, pretty-printed. An input that is not an object is
+/// summarized as a bare value. Cut at 200 chars like every collapsed preview.
+pub(super) fn arg_summary(v: &serde_json::Value) -> String {
+    let line = match v {
+        serde_json::Value::Object(map) => map
+            .iter()
+            .map(|(k, v)| format!("{k}={}", arg_value(v)))
+            .collect::<Vec<_>>()
+            .join(" "),
+        other => arg_value(other),
+    };
+    crate::agent::preview(&line)
+}
+
+fn arg_value(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => quoted_arg(s),
+        serde_json::Value::Array(a) if a.is_empty() => "[]".to_owned(),
+        serde_json::Value::Array(_) => "[…]".to_owned(),
+        serde_json::Value::Object(o) if o.is_empty() => "{}".to_owned(),
+        serde_json::Value::Object(_) => "{…}".to_owned(),
+        // Numbers, bools and null are short and need no quoting.
+        other => other.to_string(),
+    }
+}
+
+/// A string argument: bare when it reads as one token (a path, a flag, a
+/// word), quoted with visible escapes otherwise. A long one is cut at
+/// [`ARG_VALUE_CHARS`] chars — never mid-character — and says how many are
+/// hidden.
+fn quoted_arg(s: &str) -> String {
+    let mut chars = s.chars();
+    let head: String = chars.by_ref().take(ARG_VALUE_CHARS).collect();
+    let hidden = chars.count();
+    let quoted = hidden > 0
+        || head.is_empty()
+        || head
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '"' | '\\' | '\'') || c.is_control());
+    let mut out = String::new();
+    if quoted {
+        out.push('"');
+    }
+    for c in head.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c => out.push(c),
+        }
+    }
+    if hidden > 0 {
+        out.push('…');
+        if quoted {
+            out.push('"');
+        }
+        out.push_str(&format!(" (+{hidden} chars)"));
+    } else if quoted {
+        out.push('"');
+    }
+    out
 }

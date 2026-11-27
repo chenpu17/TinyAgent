@@ -81,7 +81,7 @@ agent.set_hooks(Arc::new(Policy));
 
 **MCP 注解旁表**（内核改进计划 1.6）：`ToolCtx::tool_annotations: Arc<BTreeMap<String, ToolAnnotations>>`——按**暴露名**（模型调用的名字）列出各 MCP server 对其工具的自述：`read_only_hint` / `destructive_hint` / `idempotent_hint` / `open_world_hint`（server 没声明时取规范默认值；`idempotentHint` 规范没有默认值，省略即 `None`）。便捷读法 `ctx.annotations(tool)`：内置工具为 `None`，MCP 工具恒有条目（什么都没声明时是 `ToolAnnotations::MISSING`）。刻意做成旁表而不是 `Tool` trait 方法：声明属于 server，内置工具 / 绑定 `CallbackTool` / run_code 注册都不必为它作答（第三方工具想声明就覆盖 `Tool::annotations`）。唯一构造点是 `Agent::try_new` + `Agent::refresh_tool_defs`（每个改工具表的入口都过这两个），所以它永远不会与 agent 实际分发的工具表不一致；`task` 子代理与 run_code guest 持构造时快照（Arc 克隆，父侧之后的增删只换父的 Arc）。每次调用把该工具的注解快照进 `ToolCallRecord.annotations`（落 result.json 的 `tool_calls[].annotations`）——审计时能回答「这次调用被 server 标成只读了吗」。**server 的自述、不是内核保证**：没有任何强制，调度上 `read_only_hint` 也只是并行提示。
 
-**模型窗口提示**（内核改进计划 1.5）：`Limits::context_window_hint()` 是纯函数——`max_context_tokens == 0`（默认）时返回一行说明（历史只按字符阈值压缩、4 字符/token 的估算对 CJK 偏低、该怎么改），设了窗口则 `None`。CLI 在启动时打印一次（TUI 里是一条 diag 行），库宿主自己选通道。不是校验：默认配置合法，溢出恢复仍是兜底。
+**模型窗口提示**（内核改进计划 1.5）：`Limits::context_window_hint()` 是纯函数——`max_context_tokens == 0`（默认）时返回一行说明（历史只按字符阈值压缩、4 字符/token 的估算对 CJK 偏低、该怎么改），设了窗口则 `None`。`Limits::context_window_hint_line()` 是同一判定的一行版（只留结论与该怎么改，同样窗口已设返回 `None`），给放不下一整段说明的宿主用。CLI 在启动时提示一次（headless / batch 把完整版打到 stderr；TUI 把一行版搭在欢迎行里），库宿主自己选通道。不是校验：默认配置合法，溢出恢复仍是兜底。
 
 **MCP 客户端契约**（内核改进计划 0.1 / 2.4；用户面说明见 README 的「超时、工具过滤、取消」小节，这里只列库侧要点）：
 ① **`tools/list` 翻页**：握手期循环带 `cursor` 直到响应没有 `nextCursor`（此前只取第一页——分页 server 第二页起的工具被静默丢弃）。上限 64 页（`MCP_LIST_MAX_PAGES`）与 256 个工具（`MCP_MAX_TOOLS`，逐 server）；跨页重名保留先出现者并告警，`nextCursor` 重复即停；**某一页请求失败则整个握手失败**（不允许带着没人察觉的残缺工具表起跑）。单页 server 的请求序列与翻页之前逐字节相同。

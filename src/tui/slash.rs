@@ -331,7 +331,8 @@ pub(super) fn render_context_report(
         ));
     } else {
         // Unset window: say what is missing and how to fix it — the same
-        // fact the startup note (`Limits::context_window_hint`) announces.
+        // fact the startup note (`Limits::context_window_hint_line`, on the
+        // welcome row) announces.
         s.push_str(
             "window: no max_context_tokens configured — set it to the model's context \
              window to compact on a token estimate\n",
@@ -729,7 +730,9 @@ pub(super) enum PopupAction {
     Dismiss,
     /// Tab/Enter: complete the command into the input but do NOT send — a
     /// bare Enter must never fire a destructive /clear by accident; the
-    /// user presses Enter a second time to actually run it.
+    /// user presses Enter a second time to actually run it. (The key
+    /// handler lets Enter run the command when the typed text already equals
+    /// the completion — nothing to complete, see `Session::on_popup_key`.)
     Complete(String),
 }
 

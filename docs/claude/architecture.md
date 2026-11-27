@@ -114,8 +114,9 @@
   `{"thinking": {"type": "enabled"}}`、中转站的路由标签、`anthropic-beta`）——内核不为每家加专门键。
 - **模型窗口提示（内核改进计划 1.5）**：`Limits::context_window_hint()` 是纯函数——`max_context_tokens == 0`（默认）时
   返回一行说明（`compress_threshold_chars` 也为 0 时换成更重的一句：没有任何东西在请求前压缩历史），设了窗口则 `None`。
-  CLI 在装配**之前**打印一次（headless / batch 走 `harness::note` → stderr，前缀 `[warn]`；TUI 在 `tui::run` 里排成第一条
-  diag 行，因为 TUI 看不到 stderr）——纯半边拆成 `context_window_line(cfg)`，测试不必抓 stderr。另一半是**思考烧穿输出
+  CLI 在装配**之前**打印一次（headless / batch 走 `harness::note` → stderr，前缀 `[warn]`，完整版；
+  TUI 看不到 stderr，取**一行版** `Limits::context_window_hint_line()` 搭进欢迎行——见下面 TUI 条目的
+  「体验修正 ①」）——纯半边拆成 `context_window_line(cfg)`，测试不必抓 stderr。另一半是**思考烧穿输出
   额度**的提示：某轮 `stop_reason == "max_tokens"` 且本轮有思考增量 → 经 diag 通道发一次（每 run 一次，子 agent 带名字），
   走 diag 而不是事件流——它是给操作者的建议，不是 run 事实。**两个默认值都不改、不是校验**：默认配置合法，溢出恢复仍是兜底
   （改默认值要等 0.4 的评测数据）。
@@ -845,9 +846,10 @@
   文案单一来源 `tool_defs_advisory_lines`（五短句、每行远小于 80 列——启动期 diag 经 stderr fallback 进
   未进 raw 的终端，长行会被终端按右缘硬折、断词）。**只提示不处置**：裁不裁工具表由宿主决定。
 - **TUI 是可选 feature**（`ratatui` + `crossterm` + `tui-markdown` + `unicode-segmentation` + `unicode-width`），
-  `src/tui/`（模块根 `tui.rs` + app/transcript/markdown/slash/render/input/theme/tests）在
+  `src/tui/`（模块根 `tui.rs`）在
   `#[cfg(feature = "tui")]` 后——2026-10 由 8.7k 行单文件按关注点拆分（纯搬移零行为变更，
-  148 个测试随迁；`crate::tui::run` 入口不变）。默认 headless 版不含它，保持体积。
+  148 个测试随迁；`crate::tui::run` 入口不变），2026-11 再把交互状态收拢成 `Session` 状态机
+  （见下面「TUI 结构」）。默认 headless 版不含它，保持体积。
 
   **内联/流式渲染**（非全屏 alternate-screen，与 Claude Code / Codex 同款）：
   `Terminal::with_options(Viewport::Inline(INLINE_HEIGHT=8))` 在主屏底部锚定一个固定高度 live 区
@@ -936,6 +938,47 @@
     `[no paused queue]`）。
     `RunPhase::{Idle,Running,Cancelling,Failed}` 驱动标题/边框/状态与 busy popup，重复取消不重复刷
     `[cancelling…]`。
+    相位的转场只经 `RunState` 的方法（`start` / `idle` / `fail` / `begin_cancelling`；`apply_flush`
+    是「队列结局 → 转场」的唯一映射），别在 reducer 或按键处理里直接写 `phase`。
+  - **TUI 结构（2026-11 重构：`Session` 状态机）**：交互状态只住在一个 `Session`（`session.rs`）里——
+    `rows` / `committed` / `queued` / `queue_paused` / `run: RunState` / `composer` / `usage` / `plan` /
+    `md_cache` / `dirty`。`ui_loop`（`app.rs`）自己不留局部状态，每轮固定四步：排空 worker 通道进
+    `Session`（`events::on_msg`）→ `view::commit` 把定稿行提交进 scrollback → 该重绘就重绘
+    （`popup.update_for` 先于 `view::draw`）→ **至多一个**终端事件（`keys::on_key` →
+    `commands::on_enter`）。模块分工：`terminal`（还原守卫 / tty 断开监控 / diag 桥）、`worker`
+    （独占 agent 的线程 + 两个消息枚举）、`session`（全部状态 + 队列 / 运行生命周期转场）、`events`
+    （worker 消息 → 状态）、`keys` / `commands`（按键 / 斜杠命令 → 状态）、`view`（提交 + 画）、
+    `render` / `transcript` / `markdown` / `slash` / `input` / `theme`（纯模型与绘制）。三个 reducer
+    都是 `impl Session`，只改 `Session`、不碰终端。**`RunPhase` 的转场只经 `RunState` 的方法**——
+    `start` / `idle` / `fail` / `begin_cancelling`（`apply_flush` 是「队列结局 → 转场」的唯一映射）；
+    流式收尾只经三个助手，哪种事件收哪条流被 loop 测试逐条钉死：`end_parent_streams`（父正文 +
+    推理流；**子气泡可以还开着**，兄弟工具可能还在跑）用于父的 `ToolCall` / `ToolResult` / `Done` /
+    `Compressed` / `Pruned` / `TurnStart`；`end_child_streams`（全部子气泡 + 推理流）用于子 agent 的
+    `ToolCall` / `ToolResult` / `Done` / `Warning` 与 `TurnArbitration`；`end_all_streams` 用于
+    `ToolInputDelta`（参数开始到达）、run 结束（finished / error）与 worker 死亡；顶层 `Warning` 臂
+    不收流。工具行只经 `push_tool_call` / `push_tool_result` 落行（子 agent 臂只是把名字换成
+    `[name] tool`）。**拆分手法**：旧 `ui_loop`（一个函数 ~1460 行、~40 个局部变量、靠 10 个位置
+    参数的辅助函数传状态）按**逐字切片**搬进各 reducer（只把状态名改写成 `self.` 路径），既有测试
+    与 pty 抓屏逐帧对照就是等价性证明；去重与转场 API 是之后在 loop 测试保护下做的。**交互行为先写
+    `tests_loop.rs`**（驱动真实 `Session`：按键 → 重绘 → 断言行 / 队列 / 发给 worker 的消息），pty
+    只留给渲染 / 终端层；夹具必须与 `ui_loop` 同构的两条纪律见踩坑详录「TUI loop 测试夹具」。
+  - **TUI 体验修正（2026-11，随重构落地）**：
+    ① **启动提示**：窗口未设的提示不再是一条独立的 diag 警告（100 列下折成四行黄字、后面再空一行，把报头挤出首屏），
+    取一行版 `Limits::context_window_hint_line()` 搭在**欢迎行**里（`render::welcome_text` 的
+    第二行、Info 级，尾巴是 `/context for details`；算术与 CJK 偏差留在 `/context`）。欢迎行是
+    `rows[0]`，空屏判定是 `rows.len() <= 1`，所以报头保得住。headless / batch 仍打印完整版。
+    ② **补全弹窗的 Enter**：输入框里**已经完整拼出**的命令（文本 == 补全结果）第一次 Enter 即
+    执行；只有缩写（`/cl`）才是「第一次补全、第二次执行」——两步规则防的是没看清就跑，完整拼出
+    的命令就是本意。带参数的命令补全带尾空格，所以裸名字 + Enter 仍只是补全；`/exit` 别名不进
+    弹窗。inline viewport 是**释放不是清除**，退出前补一帧**收尾帧**（`view::final_frame`：
+    关掉弹窗再画一次），否则直接从弹窗里跑掉的 `/quit` 会把自己的弹窗行留在屏上。
+    ③ **工具调用行的参数摘要**（`transcript::arg_summary`）：对象参数渲染成 `key=value` 对
+    （`path=notes.md content="first\nsecond"`），不再是裸 JSON；超过 60 字符的值省略成
+    `"…" (+N chars)`，非空数组 / 对象只报形状（`[…]` / `{…}`），整行过 `preview` 的 200 字符帽。
+    完整输入仍是 `/call` / `Ctrl+O`；resume 转录同款。
+    ④ **粘贴去转义**（`markdown::paste_plain`）：bracketed paste 带进来的转义序列**整段**剥掉
+    （CSI 到终止符、OSC / DCS / SOS / PM / APC 到 BEL 或 ST、两字符形式），其余控制字符删除、
+    `\n` / `\t` 保留——此前只删 ESC 字节，`[0m` 这类残片会留在输入框里。
   - **详情追加重印**：`/out [n]`、`/call [n]`、`/thinking [n]` 分别克隆第 n 新的工具结果、工具
     调用（完整输入 JSON）、思考块；`Ctrl+O` 取三者中最新一项。复用展开渲染与提交通道，不修改
     已提交历史，也不虚构同名并行调用的精确配对。失败工具结果自动展开同时受 **20 行 + 2000 字符**

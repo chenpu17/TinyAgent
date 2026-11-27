@@ -1,10 +1,15 @@
-use super::app::*;
+use super::commands::*;
+use super::events::*;
 use super::input::*;
+use super::keys::*;
 use super::markdown::*;
 use super::render::*;
+use super::session::*;
 use super::slash::*;
+use super::terminal::*;
 use super::theme::*;
 use super::transcript::*;
+use super::worker::*;
 use crate::config::Config;
 use crate::provider::{Block, Message};
 use crossterm::event::{KeyCode, KeyModifiers};
@@ -13,7 +18,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Terminal;
-use std::sync::mpsc;
+use std::sync::atomic::AtomicBool;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
@@ -488,7 +494,7 @@ fn history_first_user_after_the_welcome_line_gets_no_separator() {
     // idx 1. The old `idx > 0` rule drew a separator above it that floated
     // mid-screen with nothing to separate — separators only between turns.
     let rows = vec![
-        Row::sys_info(welcome_text("glm", 3)),
+        Row::sys_info(welcome_text("glm", 3, None)),
         Row::User("hi".into()),
     ];
     let lines = history(&rows);
@@ -499,7 +505,7 @@ fn history_first_user_after_the_welcome_line_gets_no_separator() {
     // Welcome notice and user row are separated by whitespace, not a rule.
     assert_eq!(
         row_text(&lines[0]),
-        format!("    · {}", welcome_text("glm", 3))
+        format!("    · {}", welcome_text("glm", 3, None))
     );
     assert_eq!(row_text(&lines[2]), "❯ hi");
 }
@@ -1037,8 +1043,17 @@ fn is_normal_stop_covers_both_provider_families() {
 #[test]
 fn welcome_text_names_the_ready_session() {
     assert_eq!(
-        welcome_text("glm-4.6", 7),
+        welcome_text("glm-4.6", 7, None),
         "session ready · glm-4.6 · 7 tools"
+    );
+    // The unset-window note is a second line of the SAME row: the empty
+    // screen shows the masthead while the transcript holds no row beyond
+    // the welcome one, and a note that counted as its own row hid it.
+    let text = welcome_text("glm-4.6", 7, Some("limits.max_context_tokens is not set"));
+    assert_eq!(
+        text,
+        "session ready · glm-4.6 · 7 tools\n\
+         limits.max_context_tokens is not set · /context for details"
     );
 }
 
@@ -2668,31 +2683,38 @@ fn ansi_tabs_expand_to_two_spaces_on_both_paths() {
 #[test]
 fn flush_next_queued_sends_fifo_and_appends_only_real_user_rows() {
     let (tx, rx) = mpsc::channel::<Option<Input>>();
-    let mut queued = std::collections::VecDeque::from(vec!["q1".to_string(), "q2".to_string()]);
-    let mut rows = vec![Row::Assistant("run output".into())];
+    let mut session = Session::for_test(tx, Arc::new(AtomicBool::new(false)));
+    session.queued.extend(["q1".to_string(), "q2".to_string()]);
+    session.rows.push(Row::Assistant("run output".into()));
 
-    let out = flush_next_queued(&mut queued, &mut rows, &tx);
+    let out = session.flush_next_queued();
     assert_eq!(out, Flush::Sent);
     assert!(matches!(rx.try_recv(), Ok(Some(Input::Text(t))) if t == "q1"));
-    assert_eq!(queued, std::collections::VecDeque::from(["q2".to_string()]));
-    assert!(matches!(rows.last(), Some(Row::User(t)) if t == "q1"));
+    assert_eq!(
+        session.queued,
+        std::collections::VecDeque::from(["q2".to_string()])
+    );
+    assert!(matches!(session.rows.last(), Some(Row::User(t)) if t == "q1"));
 
-    let out = flush_next_queued(&mut queued, &mut rows, &tx);
+    let out = session.flush_next_queued();
     assert_eq!(out, Flush::Sent);
     assert!(matches!(rx.try_recv(), Ok(Some(Input::Text(t))) if t == "q2"));
-    assert!(queued.is_empty());
+    assert!(session.queued.is_empty());
 
-    let before = rows.len();
-    let out = flush_next_queued(&mut queued, &mut rows, &tx);
+    let before = session.rows.len();
+    let out = session.flush_next_queued();
     assert_eq!(out, Flush::Empty);
-    assert_eq!(rows.len(), before);
+    assert_eq!(session.rows.len(), before);
 
-    queued.push_back("q3".to_string());
+    session.queued.push_back("q3".to_string());
     drop(rx);
-    let out = flush_next_queued(&mut queued, &mut rows, &tx);
+    let out = session.flush_next_queued();
     assert_eq!(out, Flush::Undeliverable);
-    assert!(rows.iter().any(|r| matches!(r, Row::User(t) if t == "q3")));
-    assert!(rows.iter().any(|r| matches!(
+    assert!(session
+        .rows
+        .iter()
+        .any(|r| matches!(r, Row::User(t) if t == "q3")));
+    assert!(session.rows.iter().any(|r| matches!(
         r,
         Row::System {
             level: SysLevel::Error,
@@ -2703,55 +2725,30 @@ fn flush_next_queued_sends_fifo_and_appends_only_real_user_rows() {
 
 #[test]
 fn apply_flush_sent_starts_a_run_and_idle_flushes_clear_state() {
-    let mut phase = RunPhase::Failed;
-    let mut run_start = None;
-    let mut activity = String::new();
-    let mut thinking = false;
-    apply_flush(
-        Flush::Sent,
-        &mut phase,
-        &mut run_start,
-        &mut activity,
-        &mut thinking,
-    );
-    assert_eq!(phase, RunPhase::Running);
-    assert!(run_start.is_some());
-    assert_eq!(activity, "thinking");
-    assert!(thinking);
-    let first_start = run_start.unwrap();
+    let (tx, _rx) = mpsc::channel::<Option<Input>>();
+    let mut session = Session::for_test(tx, Arc::new(AtomicBool::new(false)));
+    session.run.phase = RunPhase::Failed;
 
-    apply_flush(
-        Flush::Sent,
-        &mut phase,
-        &mut run_start,
-        &mut activity,
-        &mut thinking,
-    );
-    assert!(run_start.unwrap() >= first_start);
+    session.apply_flush(Flush::Sent);
+    assert_eq!(session.run.phase, RunPhase::Running);
+    let first_start = session.run.run_start.expect("a run is in flight");
+    assert_eq!(session.run.activity, "thinking");
+    assert!(session.run.thinking);
 
-    apply_flush(
-        Flush::Empty,
-        &mut phase,
-        &mut run_start,
-        &mut activity,
-        &mut thinking,
-    );
-    assert_eq!(phase, RunPhase::Idle);
-    assert!(run_start.is_none());
-    assert!(!thinking);
-    assert_eq!(activity, "thinking");
+    session.apply_flush(Flush::Sent);
+    assert!(session.run.run_start.unwrap() >= first_start);
 
-    apply_flush(
-        Flush::Undeliverable,
-        &mut phase,
-        &mut run_start,
-        &mut activity,
-        &mut thinking,
-    );
-    assert_eq!(phase, RunPhase::Failed);
-    assert!(run_start.is_none());
-    assert!(!thinking);
-    assert_eq!(activity, "thinking");
+    session.apply_flush(Flush::Empty);
+    assert_eq!(session.run.phase, RunPhase::Idle);
+    assert!(session.run.run_start.is_none());
+    assert!(!session.run.thinking);
+    assert_eq!(session.run.activity, "thinking");
+
+    session.apply_flush(Flush::Undeliverable);
+    assert_eq!(session.run.phase, RunPhase::Failed);
+    assert!(session.run.run_start.is_none());
+    assert!(!session.run.thinking);
+    assert_eq!(session.run.activity, "thinking");
 }
 
 #[test]
@@ -3645,37 +3642,54 @@ fn fmt_tokens_round_drops_only_the_trailing_point_zero() {
 }
 
 #[test]
-fn compact_truncates_json_at_two_hundred_chars() {
-    // Short values serialize verbatim (serde_json compact form).
-    assert_eq!(compact(&serde_json::json!(null)), "null");
-    assert_eq!(compact(&serde_json::json!({})), "{}");
+fn arg_summary_reads_as_key_value_pairs_and_elides_what_would_bury_the_line() {
+    // Nothing to summarize is nothing to show; a bare value is itself.
+    assert_eq!(arg_summary(&serde_json::json!({})), "");
+    assert_eq!(arg_summary(&serde_json::json!(null)), "null");
+    assert_eq!(arg_summary(&serde_json::json!([])), "[]");
+    assert_eq!(arg_summary(&serde_json::json!([1, 2])), "[…]");
+    assert_eq!(arg_summary(&serde_json::json!({"meta": {}})), "meta={}");
+    // The model's key order; a value that reads as one token stays bare.
     assert_eq!(
-        compact(&serde_json::json!({"cmd": "ls"})),
-        r#"{"cmd":"ls"}"#
+        arg_summary(
+            &serde_json::json!({"path": "src/main.rs", "offset": 0, "limit": 50, "regex": true})
+        ),
+        "path=src/main.rs offset=0 limit=50 regex=true"
     );
-    // The cap is 200 CHARS: exactly 200 serialized chars (198 x's + 2
-    // quotes) pass through with no ellipsis.
-    let full = serde_json::Value::String("x".repeat(198));
-    assert_eq!(compact(&full), format!("\"{}\"", "x".repeat(198)));
-    // One char over → hard cut at 200 chars + '…'. The closing quote is
-    // dropped mid-string: the preview is display-only, not valid JSON.
-    let over = serde_json::Value::String("x".repeat(199));
-    let out = compact(&over);
+    // Anything else is quoted, whitespace and quotes made visible…
+    assert_eq!(
+        arg_summary(&serde_json::json!({"cmd": "ls -la"})),
+        "cmd=\"ls -la\""
+    );
+    assert_eq!(arg_summary(&serde_json::json!({"q": ""})), "q=\"\"");
+    assert_eq!(
+        arg_summary(&serde_json::json!({"text": "he said \"hi\"\n\tok"})),
+        "text=\"he said \\\"hi\\\"\\n\\tok\""
+    );
+    // …and a container shows its shape only: the whole argument is /call away.
+    assert_eq!(
+        arg_summary(&serde_json::json!({"edits": [{"old": "a", "new": "b"}], "n": 3})),
+        "edits=[…] n=3"
+    );
+    // A long value keeps its head and says how much is hidden.
+    assert_eq!(
+        arg_summary(&serde_json::json!({"content": "x".repeat(150)})),
+        format!("content=\"{}…\" (+90 chars)", "x".repeat(60))
+    );
+    // Chars, not bytes: 60 CJK chars are 180 bytes and nothing is cut.
+    assert_eq!(
+        arg_summary(&serde_json::json!({"s": "看".repeat(60)})),
+        format!("s={}", "看".repeat(60))
+    );
+    // Many arguments: the line is capped at 200 chars + '…' like every
+    // collapsed preview.
+    let many: serde_json::Map<String, serde_json::Value> = (0..40)
+        .map(|i| (format!("key{i:02}"), serde_json::json!("value")))
+        .collect();
+    let out = arg_summary(&serde_json::Value::Object(many));
     assert_eq!(out.chars().count(), 201);
+    assert!(out.starts_with("key00=value key01=value"), "{out}");
     assert!(out.ends_with('…'));
-    assert!(!out.ends_with('"'));
-    // Chars, not bytes: 150 CJK chars serialize to 450+ bytes but only
-    // 152 chars — well under the cap, so nothing is cut.
-    let cjk = serde_json::Value::String("看".repeat(150));
-    assert_eq!(compact(&cjk), format!("\"{}\"", "看".repeat(150)));
-    // 250 CJK chars (252 serialized chars) cut at char 200: the result
-    // is 1 quote + 199 wide chars + '…' = 601 bytes, no multibyte tear.
-    let wide = serde_json::Value::String("看".repeat(250));
-    let out = compact(&wide);
-    assert_eq!(out.chars().count(), 201);
-    assert!(out.starts_with('"'));
-    assert!(out.ends_with('…'));
-    assert_eq!(out.len(), 1 + 199 * 3 + 3);
 }
 
 /// Helper: a single-span line with one style.
@@ -4508,42 +4522,34 @@ fn diag_bridge_sender_keeps_event_channel_connected_after_worker_exit() {
 /// same "[dropped N queued message(s)]" notice the Esc path shows.
 #[test]
 fn reset_after_worker_exit_resets_run_state_and_drops_queue() {
-    let mut phase = RunPhase::Running;
-    let mut run_start = Some(Instant::now());
-    let mut streaming = true;
-    let mut sub_streaming_name = Some("scout".to_string());
-    let mut thinking_stream = Some(String::new());
-    let mut thinking = true;
-    let mut activity = "writing".to_string();
-    let mut tool_running = ToolRunning::new();
-    tool_running.on_call("shell");
-    let mut queued: std::collections::VecDeque<String> = std::collections::VecDeque::new();
-    queued.push_back("late question".into());
-    let mut rows = vec![Row::User("go".into())];
+    let (tx, _rx) = mpsc::channel::<Option<Input>>();
+    let mut session = Session::for_test(tx, Arc::new(AtomicBool::new(false)));
+    session.run.phase = RunPhase::Running;
+    session.run.run_start = Some(Instant::now());
+    session.run.streaming = true;
+    session.run.sub_streaming_name = Some("scout".to_string());
+    session.run.thinking_stream = Some(String::new());
+    session.run.thinking = true;
+    session.run.activity = "writing".to_string();
+    session.run.tool_running.on_call("shell");
+    session.queued.push_back("late question".into());
+    session.rows = vec![Row::User("go".into())];
+    session.dirty = false;
 
-    let changed = reset_after_worker_exit(
-        &mut phase,
-        &mut run_start,
-        &mut streaming,
-        &mut sub_streaming_name,
-        &mut thinking_stream,
-        &mut thinking,
-        &mut activity,
-        &mut tool_running,
-        &mut queued,
-        &mut rows,
-    );
+    let changed = session.reset_after_worker_exit();
     assert!(changed, "a mid-run death changes state");
-    assert_eq!(phase, RunPhase::Failed);
-    assert!(run_start.is_none());
-    assert!(!streaming);
-    assert!(sub_streaming_name.is_none());
-    assert!(thinking_stream.is_none());
-    assert!(!thinking);
-    assert!(activity.is_empty());
-    assert!(tool_running.calls.is_empty());
-    assert!(queued.is_empty());
-    let sys: Vec<String> = rows
+    assert!(session.dirty, "a change asks for the repaint itself");
+    assert_eq!(session.run.phase, RunPhase::Failed);
+    assert!(session.run.run_start.is_none());
+    assert!(!session.run.streaming);
+    assert!(session.run.sub_streaming_name.is_none());
+    assert!(session.run.thinking_stream.is_none());
+    assert!(!session.run.thinking);
+    assert!(session.run.activity.is_empty());
+    assert!(session.run.tool_running.calls.is_empty());
+    assert!(session.queued.is_empty());
+    let sys: Vec<String> = session
+        .rows
         .iter()
         .filter_map(|r| match r {
             Row::System { text, .. } => Some(text.clone()),
@@ -4564,31 +4570,20 @@ fn reset_after_worker_exit_resets_run_state_and_drops_queue() {
 /// empty teardown): nothing to reset, nothing queued — no rows, no repaint.
 #[test]
 fn reset_after_worker_exit_is_a_noop_when_idle_with_no_queue() {
-    let mut phase = RunPhase::Idle;
-    let mut run_start = None;
-    let mut streaming = false;
-    let mut sub_streaming_name = None;
-    let mut thinking_stream = None;
-    let mut thinking = false;
-    let mut activity = String::new();
-    let mut tool_running = ToolRunning::new();
-    let mut queued: std::collections::VecDeque<String> = std::collections::VecDeque::new();
-    let mut rows = vec![Row::User("hi".into())];
+    let (tx, _rx) = mpsc::channel::<Option<Input>>();
+    let mut session = Session::for_test(tx, Arc::new(AtomicBool::new(false)));
+    session.rows.push(Row::User("hi".into()));
+    session.dirty = false;
 
-    let changed = reset_after_worker_exit(
-        &mut phase,
-        &mut run_start,
-        &mut streaming,
-        &mut sub_streaming_name,
-        &mut thinking_stream,
-        &mut thinking,
-        &mut activity,
-        &mut tool_running,
-        &mut queued,
-        &mut rows,
-    );
+    let changed = session.reset_after_worker_exit();
     assert!(!changed);
-    assert_eq!(rows.len(), 1, "an idle death pushes no rows: {rows:?}");
+    assert!(!session.dirty, "a no-op death must not trigger a repaint");
+    assert_eq!(
+        session.rows.len(),
+        2,
+        "an idle death pushes no rows: {:?}",
+        session.rows
+    );
 }
 
 /// ctx_from_usage sums the four provider-reported u64s saturating: a

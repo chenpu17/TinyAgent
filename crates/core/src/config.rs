@@ -191,6 +191,17 @@ impl Default for Limits {
     }
 }
 
+/// What an unset `max_context_tokens` leaves compaction running on — the one
+/// classification behind both forms of the startup note
+/// ([`Limits::context_window_hint`] / [`Limits::context_window_hint_line`]).
+enum UnsetWindow {
+    /// `compress_threshold_chars` is 0 as well: nothing compacts the history
+    /// before a request.
+    NothingCompacts,
+    /// Only the character threshold (its configured value) compacts.
+    CharsOnly(usize),
+}
+
 impl Limits {
     /// The one-time startup note for an unset model window
     /// (`max_context_tokens == 0`, the default): what the run falls back to
@@ -199,26 +210,58 @@ impl Limits {
     /// caller picks the channel (the CLI prints it once at startup; a library
     /// host shows it wherever it keeps notes). Not a validation — the default
     /// config is valid, the overflow recovery remains the backstop.
+    /// [`Self::context_window_hint_line`] is the same note in one line.
     pub fn context_window_hint(&self) -> Option<String> {
+        match self.unset_window() {
+            None => None,
+            Some(UnsetWindow::NothingCompacts) => Some(
+                "[context] limits.max_context_tokens is not set and compress_threshold_chars is 0: \
+                 nothing compacts the history before a request, so a long run ends on the \
+                 provider's context-window error (the overflow recovery then compresses and \
+                 retries once). Set max_context_tokens to the model's context window."
+                    .to_owned(),
+            ),
+            Some(UnsetWindow::CharsOnly(threshold)) => Some(format!(
+                "[context] limits.max_context_tokens is not set: history is compacted on the \
+                 character threshold alone (compress_threshold_chars = {threshold} ≈ {} tokens at 4 \
+                 chars/token; CJK text costs closer to one token per character, so a \
+                 CJK-heavy run overruns it). Set max_context_tokens to the model's context \
+                 window to compact on a token estimate instead.",
+                threshold / 4
+            )),
+        }
+    }
+
+    /// [`Self::context_window_hint`] in one line, for a surface with no room
+    /// for the paragraph (a welcome block, a status line). Same condition,
+    /// same two shapes; only what is unset and what it costs — none of the
+    /// arithmetic or the advice, which the surface points at instead. No
+    /// `[context]` prefix: the surface supplies its own marker. `None`
+    /// exactly when the full note is.
+    pub fn context_window_hint_line(&self) -> Option<String> {
+        match self.unset_window() {
+            None => None,
+            Some(UnsetWindow::NothingCompacts) => Some(
+                "limits.max_context_tokens and compress_threshold_chars are both unset — \
+                 nothing compacts the history"
+                    .to_owned(),
+            ),
+            Some(UnsetWindow::CharsOnly(_)) => Some(
+                "limits.max_context_tokens is not set — compaction follows the character \
+                 threshold alone"
+                    .to_owned(),
+            ),
+        }
+    }
+
+    fn unset_window(&self) -> Option<UnsetWindow> {
         if self.max_context_tokens > 0 {
             return None;
         }
         Some(if self.compress_threshold_chars == 0 {
-            "[context] limits.max_context_tokens is not set and compress_threshold_chars is 0: \
-             nothing compacts the history before a request, so a long run ends on the \
-             provider's context-window error (the overflow recovery then compresses and \
-             retries once). Set max_context_tokens to the model's context window."
-                .to_owned()
+            UnsetWindow::NothingCompacts
         } else {
-            format!(
-                "[context] limits.max_context_tokens is not set: history is compacted on the \
-                 character threshold alone (compress_threshold_chars = {} ≈ {} tokens at 4 \
-                 chars/token; CJK text costs closer to one token per character, so a \
-                 CJK-heavy run overruns it). Set max_context_tokens to the model's context \
-                 window to compact on a token estimate instead.",
-                self.compress_threshold_chars,
-                self.compress_threshold_chars / 4
-            )
+            UnsetWindow::CharsOnly(self.compress_threshold_chars)
         })
     }
 }
@@ -3967,6 +4010,34 @@ mod tests {
         assert!(off.contains("compress_threshold_chars is 0"), "{off}");
         // Set: nothing to say.
         lim.max_context_tokens = 200_000;
+        assert!(lim.context_window_hint().is_none());
+    }
+
+    /// The one-line form is the same note for the same condition and the
+    /// same two shapes — short enough for a welcome block, and saying the
+    /// name of the setting that fixes it.
+    #[test]
+    fn context_window_hint_line_tracks_the_full_note() {
+        let mut lim = Limits::default();
+        let line = lim
+            .context_window_hint_line()
+            .expect("unset window → a line");
+        assert!(
+            line.contains("limits.max_context_tokens") && line.contains("character threshold"),
+            "{line}"
+        );
+        assert!(!line.contains('\n') && line.chars().count() <= 90, "{line}");
+        // The char threshold is off too: the heavier shape.
+        lim.compress_threshold_chars = 0;
+        let off = lim.context_window_hint_line().expect("still a line");
+        assert!(
+            off.contains("nothing compacts the history")
+                && off.contains("compress_threshold_chars"),
+            "{off}"
+        );
+        // The two forms agree on when there is anything to say at all.
+        lim.max_context_tokens = 200_000;
+        assert!(lim.context_window_hint_line().is_none());
         assert!(lim.context_window_hint().is_none());
     }
 

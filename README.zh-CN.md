@@ -214,7 +214,7 @@ tiny-agent --config examples/harness.json --task "跑测试" --retries 3 --outpu
 
 | 键 | 动作 |
 |---|---|
-| `Enter` | 发送（运行中则为排队，当前轮结束后自动发出；补全弹窗打开时为补全选中命令，不发送）；行尾为 `\` 时改为换行（行续接，bash 语义） |
+| `Enter` | 发送（运行中则为排队，当前轮结束后自动发出）。补全弹窗打开时：把选中命令补全进输入框——但已经完整拼出的命令直接执行；行尾为 `\` 时改为换行（行续接，bash 语义） |
 | `Shift+Enter` / `Alt+Enter` / `Ctrl-J` | 输入换行（多行） |
 | `Backspace` | 删前字符（跨行合并上一行） |
 | `Ctrl-Backspace` / `Ctrl-W` | 删前一词（行首退化为合并上一行） |
@@ -249,11 +249,12 @@ scrollback 里，是真正的终端文本——鼠标拖选即选中原文，复
 仍可折叠。空对话（或 `/clear` 之后）live 区显示三行 render-only 报头：宽屏下带版本号的
 `T I N Y A G E N T` 间隔字标（版本号与输入框右缘对齐）、横跨整个工作区的双色规则线，以及一句简洁标语；
 键帽只出现在两行之下的输入框底边框上，报头不重复。窄屏先省略版本号。空态只在渲染期合成，不进
-transcript 或 `/export`。
+transcript 或 `/export`。报头上方那一行已提交的 `· session ready · <model> · <n> tools` 也是
+`limits.max_context_tokens` 未设时的提示落点：暗色的第二行、指向 `/context`，不再单发一条警告。
 对话正文在宽屏下限制为 120 列并左对齐，角色用行内图标区分——你的消息以青色 `❯ ` 和粗体正文显示、助手
 以绿色 `◆ ` 开头（无独立标题行，每条消息省一行）；长行软换行并保留悬挂缩进，代码块与展开的工具输出
 在续行继续显示 `▎` / `│` guide；行内代码与键帽共用随明暗主题切换的凸起表面。工具调用和结果以连续 `▎`
-执行导轨缩进归属于助手：调用显示紧凑参数摘要，
+执行导轨缩进归属于助手：调用显示紧凑参数摘要（`key=value` 对，长值省略；完整参数用 `/call`），
 结果显示状态、耗时和输出预览；失败结果只有同时满足不超过 20 行且不超过 2000 字符时才自动展开，避免一个超长单行
 报错冲满屏幕。`/out` 重印完整结果，`/call` 重印完整输入 JSON；两者都追加一份展开副本，不改写不可变
 scrollback。工具参数流式生成时显示 render-only 的 `receiving arguments` 活动，JSON 增量不进 transcript。
@@ -287,7 +288,8 @@ length / error 等）才显示警告。工具输出里的 ANSI SGR 颜色序列�
 `/` 开头走斜杠命令（不发给模型）。输入以 `/` 开头且还在敲命令名（未输入空格）时，输入框上方会浮出
 补全弹窗：按前缀过滤（大小写敏感），`↑`/`↓` 移动选中（循环），`Shift+Tab` 反向选择，
 `Tab`/`Enter` 把选中命令补全进输入框
-（`/export` 自动带尾空格方便输路径；补全只是填入，再按一次 `Enter` 才执行，防止误触发 `/clear`），
+（`/export` 自动带尾空格方便输路径；补全只是填入，再按一次 `Enter` 才执行，防止缩写误触发 `/clear`——
+已经完整拼出的命令第一次 `Enter` 就执行），
 `Esc` 只关弹窗。选中行带 `❯` 侧栏标记与凸起表面，底部键帽明确标出补全、执行和关闭。输入空格进入参数阶段；
 删掉 `/` 或无匹配时弹窗自动关闭；暂不支持鼠标点选；运行中同样可用（命令照常即时执行，消息照旧排队）：
 
@@ -311,7 +313,8 @@ length / error 等）才显示警告。工具输出里的 ANSI SGR 颜色序列�
 
 手动压缩：`/compact` 不等阈值，立即执行与自动压缩相同的折叠（内核 `compact_with`）；`/compact 重点保留 API 变更` 会把这段文字作为宿主指令附在摘要 prompt 后。仅空闲时可用——运行中输入会被拒绝并提示 `[busy — /compact is disabled while running]`，命令保留在编辑框。折叠是一个忙任务：状态栏显示 `compacting… · Ctrl-C cancel`，`Esc` 取消摘要请求（打印 `[cancelled]`，历史不动），其间输入的消息排在折叠之后、基于折叠后的历史运行。折叠完成提交一行 `[context compressed (manual): dropped N messages, M kept]`，摘要请求的用量计入状态栏合计并去掉过期的 `ctx` 估算；历史太短时直接回答 `[compact] nothing to fold`、不发请求；摘要请求失败则打印 `[compact] failed: …`、历史保持原样（不影响后续轮次的自动压缩）。
 
-多行粘贴：终端开启 bracketed paste，一次粘贴含换行的多行会被当作**单条**消息，不会因换行被提前发送——直接粘贴即可，无需手动改 Alt+Enter。手动输入多行可用 `Shift+Enter` / `Alt+Enter` / `Ctrl+J`，也可在行尾打 `\` 再按 `Enter` 换行（行续接）——终端不上报修饰键时（如 macOS Terminal.app）这是唯一的手动多行入口。
+多行粘贴：终端开启 bracketed paste，一次粘贴含换行的多行会被当作**单条**消息，不会因换行被提前发送——直接粘贴即可，无需手动改 Alt+Enter（顺带粘进来的转义序列，
+比如从终端里复制带出的，会被整段剥掉）。手动输入多行可用 `Shift+Enter` / `Alt+Enter` / `Ctrl+J`，也可在行尾打 `\` 再按 `Enter` 换行（行续接）——终端不上报修饰键时（如 macOS Terminal.app）这是唯一的手动多行入口。
 
 浅色终端适配：`TINYAGENT_TUI_THEME=light` 启动 TUI，系统行 / 预览 / 状态段等暗色文字换用更深的中灰（深浅底都可读），行内代码从白色改染青色（浅色底上白字几乎隐形）。未设置或其它值保持深色主题不变；不做自动探测（终端背景色上报不可靠），需要浅色就显式设这个环境变量。
 
@@ -548,7 +551,7 @@ API key 从 `api_key_env` 指定的环境变量读取，不写进配置文件。
 
 `limits.subagent_max_turns`（默认 25）：`task` 子 agent 的轮次天花板，生效值是 `min(父 max_turns, 本值)`——子 agent 是**有界的支线**，没有天花板时一个卡住的子 agent 会一直烧父的循环预算，直到父自己的 `max_turns` 用尽；父的 run 仍是真正的墙钟护栏（共享取消标志）。设 `0` = **不另设天花板**（子 agent 原样继承父的 `max_turns`）——这是最松取值，故批量任务片段只能**收紧**（更小值），片段设 0 会被忽略、放宽会被 `min` 拒绝。子 agent 的轮次**永不高于父**（本值只降不升）。GUI/长工作流宿主把父 `max_turns` 放宽到千级时，记得同步调大本值，否则子 agent 会被默认的 25 掐回去。
 
-`max_tokens`（默认 `8192`）与 `limits.max_context_tokens`（默认 `0`）是两个需要填模型自身数字的旋钮。`max_tokens` 限的是**单次请求的输出**，而思考模型的思考 token 也从这份额度里出——想得久了会把额度吃光、答复被截断（`stop_reason: "max_tokens"`）。某一轮在模型还在思考时被截断，内核会给一行提示 `[context] … hit max_tokens (…) while reasoning — thinking counts against the same output budget …`，每个 run 只提示一次：调大 `max_tokens`（或调低 `reasoning_effort`）。`limits.max_context_tokens` 是模型的**上下文窗口**：设了之后 preflight 闸门按 token 估算、在窗口的 ~85% 处压缩（见[上下文压缩](#上下文压缩)）；留 `0` 则没有按 token 的压缩，全靠 `compress_threshold_chars` 字符启发式（≈4 字符/token——CJK 文本接近 1 字符 1 token，中文占比高的 run 会冲过阈值），再往后只剩溢出恢复兜底。窗口未设时内核在启动时打印一行 `[warn] [context] limits.max_context_tokens is not set: …`（headless 与 batch 写 stderr；TUI 显示为一条 diag 行）。两个默认值都不改：默认配置依旧合法。
+`max_tokens`（默认 `8192`）与 `limits.max_context_tokens`（默认 `0`）是两个需要填模型自身数字的旋钮。`max_tokens` 限的是**单次请求的输出**，而思考模型的思考 token 也从这份额度里出——想得久了会把额度吃光、答复被截断（`stop_reason: "max_tokens"`）。某一轮在模型还在思考时被截断，内核会给一行提示 `[context] … hit max_tokens (…) while reasoning — thinking counts against the same output budget …`，每个 run 只提示一次：调大 `max_tokens`（或调低 `reasoning_effort`）。`limits.max_context_tokens` 是模型的**上下文窗口**：设了之后 preflight 闸门按 token 估算、在窗口的 ~85% 处压缩（见[上下文压缩](#上下文压缩)）；留 `0` 则没有按 token 的压缩，全靠 `compress_threshold_chars` 字符启发式（≈4 字符/token——CJK 文本接近 1 字符 1 token，中文占比高的 run 会冲过阈值），再往后只剩溢出恢复兜底。窗口未设时内核在启动时打印一行 `[warn] [context] limits.max_context_tokens is not set: …`（headless 与 batch 写 stderr；TUI 把它的一行版搭在欢迎行里，细节看 `/context`）。两个默认值都不改：默认配置依旧合法。
 
 `reasoning_effort`（可选字符串，默认不设）：思考程度，**按字符串原样透传给 provider，不做枚举校验**——各家档位碎片化且随模型代际变动，TinyAgent 不维护映射表，由 provider/server 拒绝未知值。取值参考：OpenAI `none`/`low`/`medium`/`high`/`xhigh`/`max`（随模型代际扩张）、Anthropic `low`/`medium`/`high`/`max`（Claude 4.6+ adaptive thinking；Opus 4.7 起旧 `budget_tokens` 已移除）、DeepSeek `low`/`high`/`xhigh`/`max`、GLM 仅开关（`enabled`/`disabled`）。映射：OpenAI 系直接发 `reasoning_effort` 字段（老网关不认会 400，`body_fix_for_400` 自动 drop 重试，与 `max_tokens`/`stream_options` 同款）；Anthropic 发 `thinking: {"type": "adaptive"}` + `output_config: {"effort": "..."}`（effort 在**独立顶层 `output_config` 对象**里，不在 thinking 内、也不是裸顶层字段——裸顶层会被静默忽略，这是该 API 最常见的坑），`"none"` 发 `{"type": "disabled"}`。
 
@@ -1400,7 +1403,7 @@ crates/core/src/  # kernel crate (package tiny-agent-core, lib name tiny_agent):
 ├── lib.rs                (  803)  # lib root: build_agent* / assemble (tool table, ToolCtx, code install, skill injection)
 ├── fsutil.rs             (  477)  # atomic-write primitives (O_EXCL temp + fsync + dir fsync; shared by session/result/report)
 ├── diag.rs               (  179)  # diagnostics channel: global sink installable by GUI hosts (falls back to stderr, byte-identical) — soft-failure warnings of skills/MCP/session/run_code go through it
-├── config.rs             ( 4313)  # config parsing + task-fragment merge + batch override whitelist
+├── config.rs             ( 4384)  # config parsing + task-fragment merge + batch override whitelist
 ├── provider/  # LLM backends
 │   ├── mod.rs                ( 1654)  # shared Message/Block, SSE reader, CancellableSse
 │   ├── openai.rs             ( 3088)  # OpenAI-compatible (include_usage; 400 fallbacks: max_tokens→max_completion_tokens / drop stream_options)
@@ -1444,20 +1447,28 @@ crates/core/src/  # kernel crate (package tiny-agent-core, lib name tiny_agent):
 └── m0_probes.rs          (  338)  # M0 mechanism probes (cfg(test), #[path]-declared in lib.rs): reserve/settle ledger, shared Provider cell, per-request model routing in-process prototype (A-L2b/2c/9 — reused directly by the M3 llm primitive)
 
 src/  # CLI crate (package tiny-agent, bin tiny-agent): process shell + headless rendering + batch + TUI
-├── main.rs               ( 1277)  # CLI entry + assembly (build_agent) + --session none
+├── main.rs               ( 1279)  # CLI entry + assembly (build_agent) + --session none
 ├── signal.rs             (  123)  # headless SIGINT → cancel (first press graceful / second hard-exit 130)
 ├── batch.rs              ( 4117)  # batch tasks + --retries/--failed + report merging
 ├── harness.rs            ( 2697)  # headless mode + result.json + NDJSON + exit codes
 ├── harness_tests.rs      ( 1216)  # harness behavior tests (retry ladder / result.json / NDJSON; moved here with harness from the kernel's agent_tests.rs)
-├── tui.rs                (   20)  # TUI module root (feature tui): mod declarations + public exports (run / transcript_rows)
-└── tui/  # TUI submodules (same tui gate): split from the original 8.7k-line single file by concern
-    ├── app.rs                ( 2362)  # session assembly: run entry / worker thread / event & input channels / ui_loop event body / Ctrl-C double-press window
+├── tui.rs                (   33)  # TUI module root (feature tui): mod declarations + public exports (run / transcript_rows)
+└── tui/  # TUI submodules (same tui gate): split from the original 8.7k-line single file by concern, then gathered around one Session state machine
+    ├── app.rs                (  312)  # session assembly + event loop: run entry / channels / worker start / ui_loop (drain → commit → repaint → one key) — holds no state of its own
+    ├── session.rs            (  535)  # the one Session: all interactive state + RunState (phase transitions / queue release / stream closing); the reducers are impl Session blocks in events / keys / commands
+    ├── worker.rs             (  259)  # worker side: the thread that owns the agent (run / clear / context / compact per input) + the UiMsg / Input messages crossing to and from it
+    ├── events.rs             (  530)  # reducer: worker messages → session (run-level outcomes + one arm per AgentEvent)
+    ├── keys.rs               (  271)  # reducer: keys → session (popup pick / Esc & Ctrl-C chords / line editing / history recall; returns Effect)
+    ├── commands.rs           (  384)  # reducer: Enter → send now / queue / slash command (busy refusals, worker-bound /clear /context /compact)
+    ├── view.rs               (  302)  # commit + paint: scrollback commit / live viewport draw / the final frame on quit
+    ├── terminal.rs           (  159)  # terminal ownership: restore guard / tty-disconnect monitor / kernel diag bridge
     ├── input.rs              (  333)  # multi-line InputBuffer editor / input history recall / word & line editing
-    ├── slash.rs              (  864)  # slash commands: classify grammar / read-only replies / completion popup state machine / /context report
+    ├── slash.rs              (  867)  # slash commands: classify grammar / read-only replies / completion popup state machine / /context report
     ├── theme.rs              (  191)  # theme: single source for history-row & chrome colors / light-dark switch TINYAGENT_TUI_THEME / number formatting helpers
-    ├── markdown.rs           (  722)  # markdown & ANSI rendering: render_markdown / escape parsing / fence scanning (shared with streaming splits) / MdCache single-slot cache
-    ├── transcript.rs         ( 1266)  # conversation Row model and all build/mutation logic: history rendering / streaming increments & incremental splits / /export dump / resume rebuild
-    ├── render.rs             ( 1036)  # terminal drawing: scrollback commit_rows / live-region render / input & status bar chrome / width & control-char utilities
-    └── tests.rs              ( 5106)  # TUI regression tests (TestBackend cell-grid assertions + input / completion / streaming-split logic)
+    ├── markdown.rs           (  769)  # markdown & ANSI rendering: render_markdown / escape parsing / fence scanning (shared with streaming splits) / MdCache single-slot cache
+    ├── transcript.rs         ( 1338)  # conversation Row model and all build/mutation logic: history rendering / streaming increments & incremental splits / /export dump / resume rebuild
+    ├── render.rs             ( 1049)  # terminal drawing: scrollback commit_rows / live-region render / input & status bar chrome / width & control-char utilities
+    ├── tests.rs              ( 5101)  # TUI regression tests (TestBackend cell-grid assertions + input / completion / streaming-split logic)
+    └── tests_loop.rs         ( 2399)  # loop-level TUI tests: keys and worker messages driven through a real Session the way ui_loop drives it (rows / queue / worker messages)
 ```
 <!-- END CODE STRUCTURE -->

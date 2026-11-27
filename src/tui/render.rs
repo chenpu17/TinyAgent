@@ -84,8 +84,21 @@ pub(super) fn copy_to_clipboard(text: &str) -> bool {
 
 /// The startup connection note. The branded empty state below it owns command
 /// discovery, so this committed row only records what session was opened.
-pub(super) fn welcome_text(model: &str, n_tools: usize) -> String {
-    format!("session ready · {model} · {n_tools} tools")
+///
+/// `window_note` (`Limits::context_window_hint_line`) is the one thing a
+/// default config leaves worth saying, and it rides the SAME row as a second
+/// line. It used to arrive as a warning message of its own — four wrapped
+/// yellow lines — which pushed the transcript past the empty screen's "no
+/// row beyond the welcome one" test and buried the masthead under it.
+pub(super) fn welcome_text(model: &str, n_tools: usize, window_note: Option<&str>) -> String {
+    let mut text = format!("session ready · {model} · {n_tools} tools");
+    if let Some(note) = window_note {
+        text.push('\n');
+        text.push_str(note);
+        // The arithmetic, the CJK caveat and what to set are `/context`'s.
+        text.push_str(" · /context for details");
+    }
+    text
 }
 
 /// A small raised keycap used by the welcome sheet and composer footer.

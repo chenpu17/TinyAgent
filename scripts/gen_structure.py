@@ -93,7 +93,14 @@ ENTRIES = [
     ("src", "harness.rs", "headless mode + result.json + NDJSON + exit codes"),
     ("src", "harness_tests.rs", "harness behavior tests (retry ladder / result.json / NDJSON; moved here with harness from the kernel's agent_tests.rs)"),
     ("src", "tui.rs", "TUI module root (feature tui): mod declarations + public exports (run / transcript_rows)"),
-    ("src", "tui/app.rs", "session assembly: run entry / worker thread / event & input channels / ui_loop event body / Ctrl-C double-press window"),
+    ("src", "tui/app.rs", "session assembly + event loop: run entry / channels / worker start / ui_loop (drain → commit → repaint → one key) — holds no state of its own"),
+    ("src", "tui/session.rs", "the one Session: all interactive state + RunState (phase transitions / queue release / stream closing); the reducers are impl Session blocks in events / keys / commands"),
+    ("src", "tui/worker.rs", "worker side: the thread that owns the agent (run / clear / context / compact per input) + the UiMsg / Input messages crossing to and from it"),
+    ("src", "tui/events.rs", "reducer: worker messages → session (run-level outcomes + one arm per AgentEvent)"),
+    ("src", "tui/keys.rs", "reducer: keys → session (popup pick / Esc & Ctrl-C chords / line editing / history recall; returns Effect)"),
+    ("src", "tui/commands.rs", "reducer: Enter → send now / queue / slash command (busy refusals, worker-bound /clear /context /compact)"),
+    ("src", "tui/view.rs", "commit + paint: scrollback commit / live viewport draw / the final frame on quit"),
+    ("src", "tui/terminal.rs", "terminal ownership: restore guard / tty-disconnect monitor / kernel diag bridge"),
     ("src", "tui/input.rs", "multi-line InputBuffer editor / input history recall / word & line editing"),
     ("src", "tui/slash.rs", "slash commands: classify grammar / read-only replies / completion popup state machine / /context report"),
     ("src", "tui/theme.rs", "theme: single source for history-row & chrome colors / light-dark switch TINYAGENT_TUI_THEME / number formatting helpers"),
@@ -101,13 +108,14 @@ ENTRIES = [
     ("src", "tui/transcript.rs", "conversation Row model and all build/mutation logic: history rendering / streaming increments & incremental splits / /export dump / resume rebuild"),
     ("src", "tui/render.rs", "terminal drawing: scrollback commit_rows / live-region render / input & status bar chrome / width & control-char utilities"),
     ("src", "tui/tests.rs", "TUI regression tests (TestBackend cell-grid assertions + input / completion / streaming-split logic)"),
+    ("src", "tui/tests_loop.rs", "loop-level TUI tests: keys and worker messages driven through a real Session the way ui_loop drives it (rows / queue / worker messages)"),
 ]
 
 DIR_COMMENTS = {
     "provider": "LLM backends",
     "tools": "toolset: built-in tools + MCP wrappers + task sub-agent + run_code (feature code)",
     "tools/run_code": "run_code submodules (same code gate): split from the original 11.9k single file by concern",
-    "tui": "TUI submodules (same tui gate): split from the original 8.7k-line single file by concern",
+    "tui": "TUI submodules (same tui gate): split from the original 8.7k-line single file by concern, then gathered around one Session state machine",
 }
 
 

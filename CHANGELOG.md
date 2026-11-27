@@ -16,6 +16,11 @@
   CI。离线单测在 `scripts/tests/test_e2e_anthropic_wire.py`（本地 pytest）。上线第一天就抓到下面 Fixed 里
   `--resume --task` 那一条。
 
+- **`Limits::context_window_hint_line()`——模型窗口未设提示的一行版**：与 `context_window_hint()` 同一
+  判定（`max_context_tokens` 已设返回 `None`；`compress_threshold_chars` 也未设时换成更重的一句），只留
+  结论与该怎么改，给放不下一整段说明的宿主用。TUI 用它替换掉原先启动时那条独立的 diag 警告（见
+  Changed）。
+
 - **MCP 宽松装配 `build_agent_with_lenient`（宿主降级需求，TinyWorker）**：与
   `build_agent_with` 同参数签名，返回值多带失败清单（`Result<(Agent, Vec<McpFailure>)>`），
   差别只在 MCP 起不来的处理——逐个 server 尝试，失败的跳过并
@@ -229,6 +234,21 @@
   真机矩阵 `scripts/e2e_mcp.py`（不是 CI 门禁）十组 A–K 覆盖以上全部行为。
 
 ### Changed
+
+- **TUI 重构：交互状态收拢为 `Session` 状态机，并修四处体验问题**（渲染模型与键位表不变）：
+  `src/tui/app.rs` 的 2362 行拆成按关注点的模块——`app`（装配 + `ui_loop`）、`session`（全部交互状态
+  与运行相位转场）、`events`（worker 消息 → 状态）、`keys` / `commands`（按键 / 斜杠命令 → 状态）、
+  `view`（提交 + 画）、`worker`（agent 线程）、`terminal`（终端守卫 / tty 监控 / diag 桥）；逻辑按
+  逐字切片搬移，并新增 68 个 loop 级测试（`tests_loop.rs`，驱动真实 `Session`）钉住交互行为。
+  随重构落地的四处可见变化：
+  - **首屏**：`limits.max_context_tokens` 未设时的提示不再是一条折成多行的黄色警告（它把
+    `T I N Y A G E N T` 报头挤出首屏），改为欢迎行里的 dim 第二行（尾巴带 `/context for details`），
+    报头保得住；headless / batch 的 stderr 提示不变。
+  - **补全弹窗的 Enter**：输入框里已经完整拼出的命令（如 `/clear`、`/quit`）第一次 Enter 即执行；
+    只有缩写（`/cl`）仍是「第一次补全、第二次执行」。
+  - **工具调用行**：参数摘要从裸 JSON 改成 `key=value` 对（`path=hello.txt content="… (+21 chars)"`），
+    长值与非空容器省略；完整输入仍是 `/call` / `Ctrl+O`。
+  - **粘贴**：bracketed paste 带进来的转义序列整段剥除（此前只删 ESC 字节，会留下 `[0m` 这类残片）。
 
 - **TUI 视觉、布局与输入全面重整（克制现代，保留 inline viewport + 原生 scrollback）**：
   统一角色/工具/思考/状态的语义样式、软折行悬挂缩进、代码与展开输出 guide、窄屏分级降级；

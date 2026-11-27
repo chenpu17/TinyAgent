@@ -99,6 +99,53 @@ fn is_two_char_esc_introducer(c: char) -> bool {
     )
 }
 
+/// Plain text from pasted input: the escape-sequence knowledge of
+/// [`ansi_to_lines`] (CSI, OSC and the other string sequences, two- and
+/// three-byte ESC sequences) without the styling, and with `\n` / `\t` kept
+/// exactly as pasted. Bracketed paste used to run `strip_controls`, which
+/// drops only the ESC BYTE — a pasted colour sequence left its printable
+/// tail in the composer (`[31mred[0m` for a red "red"), and that litter went
+/// to the model with the message. A bare ESC next to ordinary text still
+/// costs only the ESC ("a\x1b\nb" keeps the newline).
+pub(super) fn paste_plain(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    // Parameter/intermediate bytes up to the final byte
+                    // (@..=~); end-of-input before one drops the rest.
+                    for c2 in chars.by_ref() {
+                        if ('\x40'..='\x7e').contains(&c2) {
+                            break;
+                        }
+                    }
+                }
+                // OSC, DCS, SOS, PM, APC: run until BEL or ESC \.
+                Some(']' | 'P' | 'X' | '^' | '_') => {
+                    chars.next();
+                    let mut prev_esc = false;
+                    for c2 in chars.by_ref() {
+                        if c2 == '\x07' || (prev_esc && c2 == '\\') {
+                            break;
+                        }
+                        prev_esc = c2 == '\x1b';
+                    }
+                }
+                Some(c2) if is_two_char_esc_introducer(*c2) => {
+                    chars.next();
+                }
+                _ => {}
+            },
+            c if c.is_control() && c != '\n' && c != '\t' => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Parse tool-output text with ANSI escape sequences into styled lines.
 /// SGR color/style sequences become span styles; every other escape sequence
 /// (non-`m` CSI, OSC hyperlinks/titles, two-char ESC sequences) and every

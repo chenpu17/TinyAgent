@@ -218,7 +218,7 @@ content scrolls, the selection drifts" is gone. **Input mode** is the default:
 
 | key | action |
 |---|---|
-| `Enter` | send (queued while a turn is running; sent automatically when it ends; picks the completion-popup selection when open — does not send); with a trailing `\` it becomes a newline (line continuation, bash semantics) |
+| `Enter` | send (queued while a turn is running; sent automatically when it ends). With the completion popup open it completes the selected command into the input — except that a command typed out in full runs right away; with a trailing `\` it becomes a newline (line continuation, bash semantics) |
 | `Shift+Enter` / `Alt+Enter` / `Ctrl-J` | insert a newline (multi-line) |
 | `Backspace` | delete the previous char (merging the previous line across lines) |
 | `Ctrl-Backspace` / `Ctrl-W` | delete the previous word (degrades to merging the previous line at line start) |
@@ -262,13 +262,16 @@ conversation (or after `/clear`) shows a three-row render-only masthead: a space
 wordmark with the version pinned to the same right edge as the composer on wide screens, a two-tone rule
 across the full work area, and a concise tagline. The composer's bottom border carries the key legend
 just below; the sheet does not repeat it. Narrow terminals shed the version first. It is render-only and
-never enters the transcript or `/export`.
+never enters the transcript or `/export`. The one committed row above it, `· session ready · <model> · <n>
+tools`, is also where a note for an unset `limits.max_context_tokens` goes: a dim second line pointing at
+`/context`, not a separate warning.
 Conversation text is capped at 120 columns and left-aligned on wide screens; roles are distinguished by
 inline icons — your messages use a cyan `❯ ` and bold body text, the assistant's a green `◆ ` (no separate title
 line; one line saved per message). Long lines soft-wrap with a hanging indent; code blocks and expanded
 tool output keep their `▎` / `│` guides on continuation rows. Inline code uses the same theme-aware raised
 surface as the keycaps. Tool calls and results share a continuous `▎`
-execution rail under the assistant: calls show a compact argument summary and results show status, elapsed time,
+execution rail under the assistant: calls show a compact argument summary (`key=value` pairs with long values
+elided; `/call` has the full input) and results show status, elapsed time,
 and an output preview. Failed results auto-expand only when they fit both limits (≤20 lines and ≤2000 chars), so one huge
 single-line error cannot flood the screen. Use `/out` for full output and `/call` for full input JSON;
 both append a fresh expanded copy instead of trying to mutate immutable scrollback. While tool arguments
@@ -312,7 +315,8 @@ command name (no space yet), a completion popup floats above the input: filtered
 (case-sensitive), `↑`/`↓` move the selection (wrapping), `Shift+Tab` moves it backward, and
 `Tab`/`Enter` complete the selected command into
 the input box (`/export` appends a trailing space for the path; completion only fills in — one more
-`Enter` executes, guarding against accidental `/clear`), `Esc` closes just the popup. The selected row has a `❯`
+`Enter` executes an abbreviation, guarding against accidental `/clear`; a command typed out in full runs on
+the first `Enter`), `Esc` closes just the popup. The selected row has a `❯`
 gutter and a raised surface; footer keycaps make completion, execution, and dismissal discoverable. Typing a space
 enters the argument phase; deleting the `/` or emptying the matches closes the popup automatically; mouse
 clicking is not supported yet; available while running too (commands execute immediately, messages still
@@ -352,7 +356,8 @@ reported as `[compact] failed: …` and leaves the history as it was (it does no
 compaction of later runs).
 
 Multi-line paste: with bracketed paste enabled in the terminal, pasting a multi-line block is treated as
-**one** message — newlines never trigger an early send; just paste, no Alt+Enter needed. For manual
+**one** message — newlines never trigger an early send; just paste, no Alt+Enter needed (escape sequences
+that ride along, e.g. when copying out of a terminal, are stripped whole). For manual
 multi-line input, use `Shift+Enter`, `Alt+Enter`, or `Ctrl+J`; you can also end the line with `\` then
 press `Enter` (line continuation) — when the terminal reports no modifier keys (e.g. macOS Terminal.app)
 this is the only manual multi-line entry.
@@ -746,7 +751,8 @@ nothing compacts on tokens: the run relies on the `compress_threshold_chars` cha
 (≈4 chars per token — CJK text costs closer to one token per character, so a CJK-heavy run overruns it)
 and, past that, on the overflow recovery. Whenever the window is unset the kernel prints a one-line
 `[warn] [context] limits.max_context_tokens is not set: …` note at startup (headless and batch: stderr;
-TUI: a diag row). Neither default changes: the default configuration stays valid.
+TUI: a dim one-line version inside the welcome row, pointing at `/context`). Neither default changes:
+the default configuration stays valid.
 
 `reasoning_effort` (optional string, unset by default): the reasoning-effort level, **passed through to
 the provider verbatim as a string, with no enum validation** — every vendor's tiers are fragmented and
@@ -1875,7 +1881,7 @@ crates/core/src/  # kernel crate (package tiny-agent-core, lib name tiny_agent):
 ├── lib.rs                (  803)  # lib root: build_agent* / assemble (tool table, ToolCtx, code install, skill injection)
 ├── fsutil.rs             (  477)  # atomic-write primitives (O_EXCL temp + fsync + dir fsync; shared by session/result/report)
 ├── diag.rs               (  179)  # diagnostics channel: global sink installable by GUI hosts (falls back to stderr, byte-identical) — soft-failure warnings of skills/MCP/session/run_code go through it
-├── config.rs             ( 4313)  # config parsing + task-fragment merge + batch override whitelist
+├── config.rs             ( 4384)  # config parsing + task-fragment merge + batch override whitelist
 ├── provider/  # LLM backends
 │   ├── mod.rs                ( 1654)  # shared Message/Block, SSE reader, CancellableSse
 │   ├── openai.rs             ( 3088)  # OpenAI-compatible (include_usage; 400 fallbacks: max_tokens→max_completion_tokens / drop stream_options)
@@ -1919,20 +1925,28 @@ crates/core/src/  # kernel crate (package tiny-agent-core, lib name tiny_agent):
 └── m0_probes.rs          (  338)  # M0 mechanism probes (cfg(test), #[path]-declared in lib.rs): reserve/settle ledger, shared Provider cell, per-request model routing in-process prototype (A-L2b/2c/9 — reused directly by the M3 llm primitive)
 
 src/  # CLI crate (package tiny-agent, bin tiny-agent): process shell + headless rendering + batch + TUI
-├── main.rs               ( 1277)  # CLI entry + assembly (build_agent) + --session none
+├── main.rs               ( 1279)  # CLI entry + assembly (build_agent) + --session none
 ├── signal.rs             (  123)  # headless SIGINT → cancel (first press graceful / second hard-exit 130)
 ├── batch.rs              ( 4117)  # batch tasks + --retries/--failed + report merging
 ├── harness.rs            ( 2697)  # headless mode + result.json + NDJSON + exit codes
 ├── harness_tests.rs      ( 1216)  # harness behavior tests (retry ladder / result.json / NDJSON; moved here with harness from the kernel's agent_tests.rs)
-├── tui.rs                (   20)  # TUI module root (feature tui): mod declarations + public exports (run / transcript_rows)
-└── tui/  # TUI submodules (same tui gate): split from the original 8.7k-line single file by concern
-    ├── app.rs                ( 2362)  # session assembly: run entry / worker thread / event & input channels / ui_loop event body / Ctrl-C double-press window
+├── tui.rs                (   33)  # TUI module root (feature tui): mod declarations + public exports (run / transcript_rows)
+└── tui/  # TUI submodules (same tui gate): split from the original 8.7k-line single file by concern, then gathered around one Session state machine
+    ├── app.rs                (  312)  # session assembly + event loop: run entry / channels / worker start / ui_loop (drain → commit → repaint → one key) — holds no state of its own
+    ├── session.rs            (  535)  # the one Session: all interactive state + RunState (phase transitions / queue release / stream closing); the reducers are impl Session blocks in events / keys / commands
+    ├── worker.rs             (  259)  # worker side: the thread that owns the agent (run / clear / context / compact per input) + the UiMsg / Input messages crossing to and from it
+    ├── events.rs             (  530)  # reducer: worker messages → session (run-level outcomes + one arm per AgentEvent)
+    ├── keys.rs               (  271)  # reducer: keys → session (popup pick / Esc & Ctrl-C chords / line editing / history recall; returns Effect)
+    ├── commands.rs           (  384)  # reducer: Enter → send now / queue / slash command (busy refusals, worker-bound /clear /context /compact)
+    ├── view.rs               (  302)  # commit + paint: scrollback commit / live viewport draw / the final frame on quit
+    ├── terminal.rs           (  159)  # terminal ownership: restore guard / tty-disconnect monitor / kernel diag bridge
     ├── input.rs              (  333)  # multi-line InputBuffer editor / input history recall / word & line editing
-    ├── slash.rs              (  864)  # slash commands: classify grammar / read-only replies / completion popup state machine / /context report
+    ├── slash.rs              (  867)  # slash commands: classify grammar / read-only replies / completion popup state machine / /context report
     ├── theme.rs              (  191)  # theme: single source for history-row & chrome colors / light-dark switch TINYAGENT_TUI_THEME / number formatting helpers
-    ├── markdown.rs           (  722)  # markdown & ANSI rendering: render_markdown / escape parsing / fence scanning (shared with streaming splits) / MdCache single-slot cache
-    ├── transcript.rs         ( 1266)  # conversation Row model and all build/mutation logic: history rendering / streaming increments & incremental splits / /export dump / resume rebuild
-    ├── render.rs             ( 1036)  # terminal drawing: scrollback commit_rows / live-region render / input & status bar chrome / width & control-char utilities
-    └── tests.rs              ( 5106)  # TUI regression tests (TestBackend cell-grid assertions + input / completion / streaming-split logic)
+    ├── markdown.rs           (  769)  # markdown & ANSI rendering: render_markdown / escape parsing / fence scanning (shared with streaming splits) / MdCache single-slot cache
+    ├── transcript.rs         ( 1338)  # conversation Row model and all build/mutation logic: history rendering / streaming increments & incremental splits / /export dump / resume rebuild
+    ├── render.rs             ( 1049)  # terminal drawing: scrollback commit_rows / live-region render / input & status bar chrome / width & control-char utilities
+    ├── tests.rs              ( 5101)  # TUI regression tests (TestBackend cell-grid assertions + input / completion / streaming-split logic)
+    └── tests_loop.rs         ( 2399)  # loop-level TUI tests: keys and worker messages driven through a real Session the way ui_loop drives it (rows / queue / worker messages)
 ```
 <!-- END CODE STRUCTURE -->

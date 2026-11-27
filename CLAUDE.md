@@ -139,7 +139,7 @@ cargo clippy -p tiny-agent-node
 - **推理通道**：`reasoning_content`/`reasoning` 字段 → ThinkingDelta 是协议路径（恒开）；内联 `<think>` 剥离是内容约定（FR-2，`strip_think_tags` 默认开、跨 chunk 边界、正文 fail-closed 无残留）。两者都永不进正文；思考增量本身永不进历史，能进历史的只有显式回传的 `Message.reasoning`（下一行）。
 - **推理回传（1.1）**：内置 provider **无条件**产出 `ChatResponse.reasoning`（`Reasoning{provider, blocks}`，旁字段而非 Block 变体——`content` 形状与所有「块形状」规则不变）；`preserved_reasoning` 默认 `true`（2026-11-26 起，D1；显式关时 `try_new` 剥掉 initial 历史里的、之后每个回复的在落盘前丢弃——历史逐字节同开关出现之前；指纹只在显式 `false` 时进）；开了寿命也只有**当前轮**（`push_user` 开新 user 轮 / `set_model` / 相邻同角色合并一律整段剥；user 轮进历史的唯一入口是公开的 `agent::append_user_turn`，Agent 建好之前拼历史的宿主（CLI `--resume --task`）也走它——手抄过一次、漏了剥除；工具结果并入尾 user 消息走合并分支**不剥**；压缩折叠与工具结果裁剪保留幸存消息自己的；会话归档永不携带）；子 agent 继承开关；provider 只回显自己家族的块，OpenRouter `delta.reasoning` 仅展示不落；OpenAI 家族回显被 400 拒即学到 `BodyFix::DropReasoningEcho`（`GatewayFixes` 第四位）。两个分支都上过真端点（2026-11-26；Anthropic 分支逐请求抓包核对、回传逐字节一致；修后复测里省不省 token 随端点变：OpenAI 协议 −31%、Anthropic 协议 +26%，默认值未改）；宽松网关不校验签名，200 证明不了回传正确——工具调用轮里「空正文 + 签名」的 thinking 块必须保留并原位回传，要抓包三方核对（见 pitfalls）。`Usage.reasoning_tokens` 是 `output_tokens` 的**子集拆分**——不进 `total()`、无闸门读它、序列化只在非 0 时出键（非推理模型的 result.json / report.json 逐字节不变；NDJSON `usage` 事件则是恒出现的增量键）。
 - **请求整形（1.3）**：`extra_body` / `extra_headers` 由 provider 构造器承接（`with_extra_body` / `with_extra_headers`，`build_agent*` 按配置自动调）；加载期 `Config::validate_extra` 拒内核自有键（`EXTRA_BODY_RESERVED[_WITH_EFFORT]` / `EXTRA_HEADERS_RESERVED`），报错不回显值；`ExtraHeaders` 的 `Debug` 打码、`fingerprint` 只哈希 header 名；四个新键（含 `preserved_reasoning` / `env_passthrough`）都是 batch HARD。
-- **模型窗口提示（1.5）**：`Limits::context_window_hint()` 纯函数（窗口未设才出一行），CLI 在装配前打印一次（headless/batch 走 stderr、TUI 走 diag 行）；思考中被 `max_tokens` 截断的提示走 diag 通道、每 run 一次——都是建议不是校验，两个默认值不改。
+- **模型窗口提示（1.5）**：`Limits::context_window_hint()` 纯函数（窗口未设才出一行），CLI 在装配前提示一次（headless/batch 走 stderr；TUI 取一行版 `context_window_hint_line()` 搭在欢迎行里）；思考中被 `max_tokens` 截断的提示走 diag 通道、每 run 一次——都是建议不是校验，两个默认值不改。
 - **Hooks**：Deny 落 `Slot::Ran(error)` 不占 Cancelled，Deny 文案过 `tools::truncate`（ctx 预算）；`after_tool` 带 `ctx: &ToolCtx`（与 before 对称，审计归因 `ctx.subagent`）；Modify 只换执行输入、审计留原始输入；`--resume` 不带走 hooks。审批等待期落下的 cancel 在 **gate→执行检查点**（`ctx_cancelled`，execute_tool_call / 并行 spawn 前 / run_code 内层共用）拒绝执行；并行批另有**每波开波前 + worker 进工具体前**两道复查，已 announce 未运行的调用装配段补发取消 ToolResult（事件配平）；已过 gate 但因 pre-spawn/波间检查点未启动的调用统一转 `Slot::Ran` 占位（进 records + `after_tool(executed=false)`，过的 gate 不留未配对 before——gate 循环被打断、从未过闸的才保持 Cancelled）；并行批的 `sync_channel` 必须在 scope 闭包**内**创建（回调 panic 时 `rx` 随 unwind 销毁才不死锁）。`on_before_compact`（2.2）只在折叠**真的发生**之前同步调一次（摘要已成功之后；摘要失败 / 空摘要 / 仅 prune 都不触发），只读不能否决，是唯一 panic 会被兜住的钩子（裸 `catch_unwind`——发布构建 `panic = "abort"` 兜不住，实现仍不该 panic）；绑定层未转发。
 - **todo + meta**：plan 从 records 派生不经压缩；`meta` 审计侧信道不进模型可见 content。
 - **Skill**：三级加载；name 必须等于父目录名；`read_skill`/`list_skill` 不在白名单、由 assemble 配套注入；子 agent 不继承。frontmatter 的四个标量字段与 `metadata` 值支持 YAML 块标量（`|` / `>` + chomping / 缩进指示符，手工解析不引 YAML 依赖；按缩进判归属、值恒 trim），多行裸标量 / 块序列 / 嵌套映射仍刻意不支持。
@@ -154,7 +154,8 @@ cargo clippy -p tiny-agent-node
 - **run_code 路径拦截**：符号链接走查按**原始拼写**逐组件进行（先折叠 `..` 会把 `link` 抹掉、`link/../x` 逃逸）；绝对拼写**从根锚定**走查（字面前缀非 workdir 的折叠拼写不再跳过）；不存在目标经**最深已存在祖先 canonicalize** 判定（不再纯词法回退）。cancel/deadline 入口拒绝都同时 latch `interrupt`+`halted`（可捕获异常被 guest 捕获重试时，停机检查拒纳）。
 - **headless Ctrl-C**：首次翻 cancel 优雅收尾（exit 130），二次硬退；批量模式 worker gate 同款。
 - **消息稳定 id**：ingest 点分配（非构造时）；`next_msg_id` 不随 `clear_messages` 重置。
-- **TUI**：inline viewport + scrollback 提交模型；新增"在飞行"必须同步 holdback/inflight/LiveRow 三件套；Assistant 才增量切分，Thinking live 有界尾部、最终整块提交（>8 显示行折叠，全文 `/thinking` 重印）；队列唯一真值是 `VecDeque`、不得回潮 transcript ghost，失败暂停只能 `/resume` 释放；composer/折行/切点统一 grapheme 显示宽度，放弃 soft-cut 必须原子；正文与底部 chrome 共享左锚定 120 列工作区，角色/工具标识变更同步 `continuation_prefix`，空态/popup 共用 `truncate_line`；新暗色元素用 `dim_fg()`，键帽/选中行/行内代码共用 `keycap_bg()`；Unix tty 断开由独立监控线程收尾（crossterm EOF 内循环会满核），禁止回退成只靠主事件循环；源码按关注点拆在 `src/tui/`（app/transcript/markdown/slash/render/input/theme + tests，`tui.rs` 只是模块根）。
+- **TUI**：inline viewport + scrollback 提交模型；新增"在飞行"必须同步 holdback/inflight/LiveRow 三件套；Assistant 才增量切分，Thinking live 有界尾部、最终整块提交（>8 显示行折叠，全文 `/thinking` 重印）；队列唯一真值是 `VecDeque`、不得回潮 transcript ghost，失败暂停只能 `/resume` 释放；composer/折行/切点统一 grapheme 显示宽度，放弃 soft-cut 必须原子；正文与底部 chrome 共享左锚定 120 列工作区，角色/工具标识变更同步 `continuation_prefix`，空态/popup 共用 `truncate_line`；新暗色元素用 `dim_fg()`，键帽/选中行/行内代码共用 `keycap_bg()`；Unix tty 断开由独立监控线程收尾（crossterm EOF 内循环会满核），禁止回退成只靠主事件循环；源码按关注点拆在 `src/tui/`（`tui.rs` 只是模块根：装配与循环 `app`、交互状态 `session`、按键/命令/事件 `keys`/`commands`/`events`、提交与绘制 `view`/`render`、agent 线程 `worker`、终端守卫 `terminal`，加 transcript/markdown/slash/input/theme 与两个测试文件）。
+- **TUI 交互状态机（详录见 architecture 的「TUI 结构」）**：交互状态只住在一个 `Session` 里，`ui_loop` 不留局部状态；`RunPhase` 的转场只经 `RunState::start`/`idle`/`fail`/`begin_cancelling`，流式收尾只经 `end_parent_streams`/`end_child_streams`/`end_all_streams`（哪种事件收哪条流有 loop 测试逐条钉着），工具行只经 `push_tool_call`/`push_tool_result`——别在 reducer 或按键处理里直接写 `phase` / `streaming`。**交互行为先写 `tests_loop.rs`**（驱动真实 `Session`：按键 → 重绘 → 断言行；夹具的两条同构纪律见踩坑详录），pty 只留给渲染/终端层。
 - **文件工具 workdir 沙盒（`tools::confined_to`）**：尾段**逐组件解析走查、着陆即复检**——`缺失目录/../<外向 symlink>` 类拼写一律 Err（词法折叠会 Ok 逃逸，性质 fuzz 抓过）；**present-but-unresolvable 一律 fail-closed**（悬空 symlink/不可穿过的前缀只放行 ENOENT 真缺失——悬空外向链曾词法放行、写穿真逃逸，审计抓过），Ok 永不背 `..`/`.`、再入不动点，内向 symlink 返回真身；文件工具与 skill 沙盒共用，改它两边的语义测试都要过。
 
 ## 容易踩的坑索引（详录：`docs/claude/pitfalls.md`）
@@ -227,6 +228,7 @@ cargo clippy -p tiny-agent-node
   用于无 API key 跑通整个 loop（tool_use 配对、usage 解析、取消）。改动 provider/agent 后用它回归。
 - **进程内回归**：`agent.rs` 的 loop 不变量用 `provider/mock.rs`（脚本化 Provider，不连网）单测覆盖
   （测试体在 `agent_tests.rs`），比 mock server 更快、断言更准。新增/改动 loop 行为优先在这里加用例。
+  TUI 的交互行为同理走 `src/tui/tests_loop.rs`（见「TUI 交互状态机」条）。
 - **Slot 观测契约表**（`agent_tests.rs` 的 `slot_table_*`）：`Slot` 只有 `Cancelled`/`Ran` 两态，但进入
   路径有九条（含并行 worker panic：合成 `Ran` 错误槽、`duration_ms` 为空、`after_tool(executed=true)`）。六个用例用同一张表钉住「状态 → 五类观测面」（records / ToolResult 事件 / ToolCall 事件 /
   before_tool / after_tool），并派生出两条不变量：**before↔after 严格配对**、**ToolCall↔ToolResult 事件配平**。
@@ -236,7 +238,7 @@ cargo clippy -p tiny-agent-node
   "看起来对"**——改了渲染/光标/markdown 要真抓屏或单测断言验证。pty 驱动六个坑：裸 pty 必须
   应答 crossterm 的 `\x1b[6n` 光标查询（回 `\x1b[<行>;<列>R`，否则启动即 "cursor position
   could not be read" 退出；固定回底行会把视口钉在屏幕底部，要贴近真实布局就按真实光标位置应答）；
-  带补全弹窗的斜杠命令要**双回车**（第一个 Enter 被弹窗吃掉当选择）；
+  带补全弹窗的**缩写**斜杠命令要**双回车**（第一个 Enter 被弹窗吃掉当补全；完整拼出的命令第一次 Enter 即执行）；
   增量重绘只回写变化的 cell，剥掉 ANSI 后的可见文本是乱序拼接的——**断言用稳定子串，别断言整行
   或整句标题**（「不再出现 X」类断言取 X 的稳定片段最后一次出现之后的尾部再判）；滚动区画面疑似
   重叠须用真实终端模拟器交叉核对（根因：pyte 0.8.2 根本没实现 SU/SD——`CSI S` / `CSI T` 落 no-op，

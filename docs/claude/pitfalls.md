@@ -372,6 +372,20 @@
   **`queue_paused` 必须蕴含队列非空**：失败时队列为空不置位、`/unqueue` 取走最后一条要解除（两处都经
   `pause_for_held` 派生），取消清队直接置 false——残留标志会把后续正常运行中排入的消息误标 paused
   并在轮末扣住。
+- **TUI loop 测试夹具必须与 `ui_loop` 同构（2026-11 重构）**：2026-11 之前按键 / 命令 / 事件三个
+  reducer 内联在 `ui_loop` 的 ~1460 行里、状态是 ~40 个局部变量，交互行为（队列何时释放、哪种事件收
+  哪条流、忙时哪个命令被拒）只能靠单元测试和 pty 抓屏间接覆盖；拆成 `Session` 之后这类行为写成
+  `tests_loop.rs` 的 loop 测试（驱动真实 `Session`，不碰终端）。写夹具有两条纪律：① **两个按键
+  之间必须重绘**（`popup.update_for`）——`ui_loop` 每轮只取一个终端事件、下一轮先重绘；夹具连发
+  两个键时，第一个键清空输入框后弹窗还开着，第二个键就被 `on_popup_key` 吞掉（实发：`set_text`
+  之后直接 Enter，命令没跑）。② **断言「发给 worker 什么」之前先排空夹具自己的前置消息**
+  （`in_flight()` 的 `go`），否则 `.len() == 1` 数到的是自己的消息。三个容易记错的既定事实：
+  空屏判定是 `rows.len() <= 1`（欢迎行是 `rows[0]`，`for_test` 也会放一行）；`shape()` 给 System
+  行加 `!` 前缀，所以 `HELLO` 常量带 `!`、原始行文本不带；空闲状态栏文案是 `ready` 不是
+  `idle`。**退出路径上改了状态要补一帧**：inline viewport 是释放不是清除，最后一帧留在屏上
+  （`view::final_frame`）——从弹窗里直接跑掉的 `/quit` 曾把自己的弹窗行留成残影。去重 reducer 时
+  改错收流范围，靠的正是 `commit_advances_to_the_open_stream_and_past_every_final_row` 这类用例
+  当场抓出——先有测试再合并分支。
 - **TUI 子 agent 文本气泡不切分是既定决策，但它是平方级成本**：live 区对 SubAgent 气泡的每个
   流式 `TextDelta` 都全量重解析整块 markdown（切分/增量渲染留后续）——单气泡渲染成本
   O(气泡字节数²)。实测（bench profile，24KB 文本 / 300 个 delta）：子气泡路径 ≈371ms（≈单次
@@ -520,7 +534,8 @@
   - **模型窗口提示测纯函数那一半（1.5）**：`Limits::context_window_hint()` / `context_window_line(cfg)` 是
     纯函数；打印半边（`harness::note` → stderr）在 `cargo test` 并发下抓不住也不必抓。**每进程 / 每 run
     一次的 diag 提示别数调用次数**（窗口提示是 CLI 启动时打一次，思考烧穿提示按 run 去重）——测判定与
-    文案，不测「发了没」。
+    文案，不测「发了没」。TUI 侧不走 diag 也不必抓屏：`render::welcome_text(model, n_tools, Some(note))`
+    是纯函数，loop 测试直接断言欢迎行带着那一行、且 `rows` 仍只有一行（报头因此保得住）。
   - **MCP 注解是旁表，加字段要扫全部字面量构造点（1.6）**：`McpToolInfo` 多了三个注解与 `output_schema`，
     `ToolCallRecord` 多了 `annotations`，`ToolCtx` 多了 `tool_annotations`——Rust 测试与两个绑定里按字面量
     构造的地方都要补（编译器点名 Rust 侧；绑定侧的 JS / Python 字典不会）。旁表的唯一构造点是
