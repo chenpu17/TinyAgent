@@ -133,6 +133,9 @@
   `&String`/`&Value` 要 `.clone()`；`Option<&str>` 要显式转成 `Value::Null` 或 `json!(s)`。
 - **Anthropic 不允许相邻两条 user 消息**（400）；且 N 个 `tool_use` 必须配 N 个 `tool_result`。
   `agent::append_user_turn` 会把新 user 内容折进已有的末尾 user 消息——新增 user 入口走它，别直接 push。
+  它的另一个分支（开新 user 轮）同时结束上一轮的推理寿命（`compress::strip_reasoning`），所以 **Agent
+  存在之前就要拼历史**的宿主也得走它（2026-11 起公开）：CLI 的 `--resume --task` 曾手抄这两个分支、漏了
+  剥除，上一轮的思考块被带进新一轮的每个请求——`scripts/e2e_anthropic_wire.py` 的多轮场景抓到的。
   另有兜底：`agent::run()` 每轮发请求前 `normalize_adjacent` 把相邻同 role 合并（保块顺序，不动配对），
   防 resumed/手改的损坏历史触发 400。别依赖它当正常路径，正常仍走 append_user_turn。
 - **cancel 契约（TinyWorker 反馈落地）：run() 永不清，受理方清残留**。cancel 是电平标志、归嵌入方

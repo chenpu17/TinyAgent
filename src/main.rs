@@ -388,25 +388,7 @@ fn main() -> Result<()> {
                     .with_context(|| format!("cannot load --image {}", img.display()))?,
             );
         }
-        // If the resumed session already ends with a user message (e.g. it
-        // crashed mid-turn at a tool_result), fold the new task into that
-        // message instead of pushing another — two adjacent user messages
-        // make Anthropic reject the request with a 400.
-        if initial.last().map(|m| m.role) == Some(Role::User) {
-            if let Some(last) = initial.last_mut() {
-                last.content.extend(blocks);
-            }
-        } else {
-            let mut msg = Message::user(blocks);
-            // Pre-mint the id above every id in history AND archive: the
-            // agent's mint counter fills gaps by checking the live history
-            // only, so a resumed session would otherwise re-issue the ids of
-            // long-folded messages and collide with their archived
-            // originals. Pre-assigning here keeps the mint inside the agent
-            // unaware of the archive (assign_missing_ids keeps existing ids).
-            msg.id = Some(next_resumed_id(&initial, &resumed_archive));
-            initial.push(msg);
-        }
+        place_task(&mut initial, &resumed_archive, blocks);
     } else if !cli.image.is_empty() {
         bail!("--image requires a task (--task or config \"task\")");
     }
@@ -673,6 +655,32 @@ fn next_resumed_id(initial: &[Message], archive: &[Message]) -> String {
     format!("m{}", floor.saturating_add(1))
 }
 
+/// Put the task on the history the way a user turn enters it
+/// (`agent::append_user_turn`): folded into a trailing user message when the
+/// resumed session already ends with one (e.g. it crashed mid-turn at a
+/// tool_result — two adjacent user messages make Anthropic reject the request
+/// with a 400, and the reasoning of the loop the model is still in must be
+/// echoed with those results), else as a new turn — which ends the previous
+/// turn's reasoning lifetime. This used to be a hand-written copy of those
+/// two branches that skipped the strip, so `--resume --task` echoed the
+/// finished turn's thinking blocks through every request of the new turn
+/// (caught on the wire, 2026-11).
+///
+/// A message that is pushed gets its id pre-minted above every id in history
+/// AND archive: the agent's mint counter fills gaps by checking the live
+/// history only, so a resumed session would otherwise re-issue the ids of
+/// long-folded messages and collide with their archived originals.
+/// Pre-assigning here keeps the mint inside the agent unaware of the archive
+/// (assign_missing_ids keeps existing ids).
+fn place_task(initial: &mut Vec<Message>, archive: &[Message], blocks: Vec<Block>) {
+    let id = next_resumed_id(initial, archive);
+    let before = initial.len();
+    agent::append_user_turn(initial, blocks);
+    if initial.len() > before {
+        initial.last_mut().unwrap().id = Some(id);
+    }
+}
+
 /// Outcome of deciding whether a bare (no `--tui`, no initial task) invocation
 /// should default into the TUI. Pure (no env / stdin / cfg), so it is unit-
 /// tested directly; the stdin probe and the `feature = "tui"` gate live in the
@@ -810,11 +818,12 @@ fn missing_config_error(default: Option<&Path>) -> anyhow::Error {
 mod tests {
     use super::{
         choose_config_path, context_window_line, default_config_path_in, default_tui_mode,
-        is_default_report, is_default_session, next_resumed_id, session_target, unattended_line,
-        Block, Message, TuiDefault,
+        is_default_report, is_default_session, next_resumed_id, place_task, session_target,
+        unattended_line, Block, Message, Role, TuiDefault,
     };
     use std::path::{Path, PathBuf};
     use tiny_agent::config::pick_home;
+    use tiny_agent::provider::{Reasoning, ReasoningBlock};
 
     /// A message carrying an explicit id (the shape a resumed history gets
     /// from session files — or a hand edit).
@@ -902,6 +911,100 @@ mod tests {
         );
         // ...and via the live history itself.
         assert_eq!(next_resumed_id(&[msg_with_id(&max)], &[]), max);
+    }
+
+    /// The text blocks of a message, in order (`Block` has no `PartialEq`).
+    fn texts(m: &Message) -> Vec<&str> {
+        m.content
+            .iter()
+            .filter_map(|b| match b {
+                Block::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// An assistant reply carrying one signed thinking block, the shape a
+    /// session file written under `preserved_reasoning` restores.
+    fn thinking_reply(id: &str, text: &str) -> Message {
+        let mut m = Message::assistant(vec![Block::Text(text.into())]);
+        m.id = Some(id.to_string());
+        m.reasoning = Some(Reasoning {
+            provider: "anthropic".into(),
+            blocks: vec![ReasoningBlock {
+                before: 0,
+                text: "plan A".into(),
+                opaque: serde_json::json!({"signature": "SIG_A"}),
+            }],
+        });
+        m
+    }
+
+    #[test]
+    fn resumed_task_opens_a_new_turn_and_ends_the_previous_reasoning() {
+        // The wire check (scripts/e2e_anthropic_wire.py) caught the
+        // hand-written branch: `--resume --task` on a session whose last
+        // turn COMPLETED pushed a plain user message, so the finished
+        // turn's thinking blocks rode along into every request of the new
+        // turn. A new turn ends their lifetime; the reply itself stays.
+        let mut history = vec![
+            Message::user(vec![Block::Text("first".into())]),
+            thinking_reply("m7", "done"),
+        ];
+        place_task(
+            &mut history,
+            &[],
+            vec![Block::Text("second turn question".into())],
+        );
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[1].id.as_deref(), Some("m7"));
+        assert_eq!(texts(&history[1]), vec!["done"]);
+        assert!(
+            history[1].reasoning.is_none(),
+            "a finished turn's reasoning outlived its turn"
+        );
+        assert_eq!(history[2].role, Role::User);
+        assert_eq!(history[2].id.as_deref(), Some("m8"));
+        assert_eq!(texts(&history[2]), vec!["second turn question"]);
+    }
+
+    #[test]
+    fn resumed_task_folds_into_a_trailing_user_message_and_keeps_the_loop_alive() {
+        // The session crashed mid-turn at a tool_result: the task joins the
+        // trailing user message (no second adjacent user message) and the
+        // reasoning of the loop the model is still in stays — it is echoed
+        // back with those results, as inside any tool loop.
+        let mut tail = Message::user(vec![Block::Text("first".into())]);
+        tail.id = Some("m3".into());
+        let mut history = vec![tail, thinking_reply("m4", "calling a tool")];
+        history.push(Message::user(vec![Block::Text("(tool result)".into())]));
+        let ids: Vec<_> = history.iter().map(|m| m.id.clone()).collect();
+        place_task(&mut history, &[], vec![Block::Text("and also this".into())]);
+        assert_eq!(history.len(), 3);
+        assert_eq!(
+            history.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+            ids
+        );
+        assert_eq!(texts(&history[2]), vec!["(tool result)", "and also this"]);
+        assert_eq!(texts(&history[1]), vec!["calling a tool"]);
+        let kept = history[1]
+            .reasoning
+            .as_ref()
+            .expect("the open loop's reasoning stays");
+        assert_eq!(kept.blocks.len(), 1);
+        assert_eq!(kept.blocks[0].text, "plan A");
+    }
+
+    #[test]
+    fn fresh_task_is_the_first_turn_and_gets_the_first_id() {
+        // No history to resume: nothing to end, one user message, minted
+        // from the same counter a session file's first message always had.
+        let mut history: Vec<Message> = Vec::new();
+        place_task(&mut history, &[], vec![Block::Text("go".into())]);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].role, Role::User);
+        assert_eq!(history[0].id.as_deref(), Some("m1"));
+        assert_eq!(texts(&history[0]), vec!["go"]);
     }
 
     #[test]

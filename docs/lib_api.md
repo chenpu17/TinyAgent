@@ -121,6 +121,15 @@ agent.push_user(vec![doc, Block::Text("总结这份报告的要点".into())]);
 
 绑定层同款：Python 的 `push_user(...)` / Node 的 `pushUser(...)` 既收 `str`（=一个文本块），也收内容块 dict 或它们的序列——块有两种等价形状：带 `type` 标签的 `{"type": "image", "media_type": …, "data": …}`，以及 `messages()` 实际读回的外部标签 serde 形状 `{"image": {"media_type": …, "data": …}}`，所以前端可把历史块原样回推（附件重发）。一个块对象只按一种形状解释：同时带多个形状键（`{"text": …, "image": …}`，或 `type` 与**另一种**形状键并存）会明确报错，不会静默丢掉其中一块。`text` / `image` / `document` 之外一律拒绝：`tool_use` / `tool_result` 的 id 必须与模型自己的输出配对，宿主注入即伪造配对。
 
+**Agent 存在之前就要把一条 user 消息放进历史**（`tiny_agent::agent::append_user_turn`）：`push_user` 只能
+在 Agent 建好之后调；宿主若在构造 Agent **之前**自己拼历史——CLI 的 `--resume --task` 就是（从 session
+文件读回历史，再把新任务放上去）——要用这个自由函数，别自己 `messages.push(Message::user(…))`。它做两
+件事：末尾已是 user 消息就折进去（Anthropic 拒收相邻两条 user）；否则开一条新的 user 轮，而开新轮
+会**结束上一轮的推理寿命**（上一条 assistant 的 `Message.reasoning` 被整段剥掉，见上文「推理回传」）。
+推入的消息没有 id：留给 Agent 构造时的 ingest 分配，或调用方自己先铸（CLI 自己铸，为的是高过归档里
+的 id）。CLI 曾手抄这两个分支、漏了剥除，`--resume --task` 把上一轮的思考块带进了新一轮的每个请求
+（`scripts/e2e_anthropic_wire.py` 在线上抓到，2026-11 修）。
+
 ### Python / TypeScript 绑定
 
 两个语言绑定是 workspace 成员（`bindings/python`、`bindings/node`），各自 path-依赖内核 crate（`crates/core`），把上面同一套能力（agent loop、自定义工具、流式事件、取消、诚实 usage）导出给宿主语言。两者都**复用 `CallbackTool`** 注入自定义工具，**不改核心代码**。

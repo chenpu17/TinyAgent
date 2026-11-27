@@ -1843,7 +1843,7 @@ crates/core/src/  # kernel crate (package tiny-agent-core, lib name tiny_agent):
 │   ├── sse_review_pins.rs    (  245)  # SSE parser review pins (chunk-boundary invariance across 17 stream shapes, sync vs worker path)
 │   ├── anthropic.rs          ( 1937)  # Anthropic native (message_start/message_delta usage)
 │   └── mock.rs               (  437)  # scripted Provider for tests (cfg(any(test, feature="mock")))
-├── agent.rs              ( 5442)  # core loop + usage accounting + cancel + context compression (preflight/overflow dual trigger + rolling chunked summaries) + adjacent-message normalization + same-turn multi-task parallelism
+├── agent.rs              ( 5453)  # core loop + usage accounting + cancel + context compression (preflight/overflow dual trigger + rolling chunked summaries) + adjacent-message normalization + same-turn multi-task parallelism
 ├── agent_tests.rs        (15042)  # core-loop regression tests (scripted provider::mock, no network)
 ├── usage_probe.rs        (   97)  # thread-local usage side channel for parallel workers: recovers billed usage after a panic unwind at the join point (keeps result.json and the shared counter from diverging)
 ├── compress.rs           ( 1480)  # compression engine (find_safe_cut / chunked summaries / saturating usage merge + block-level billing primitives)
@@ -1879,7 +1879,7 @@ crates/core/src/  # kernel crate (package tiny-agent-core, lib name tiny_agent):
 └── m0_probes.rs          (  338)  # M0 mechanism probes (cfg(test), #[path]-declared in lib.rs): reserve/settle ledger, shared Provider cell, per-request model routing in-process prototype (A-L2b/2c/9 — reused directly by the M3 llm primitive)
 
 src/  # CLI crate (package tiny-agent, bin tiny-agent): process shell + headless rendering + batch + TUI
-├── main.rs               ( 1174)  # CLI entry + assembly (build_agent) + --session none
+├── main.rs               ( 1277)  # CLI entry + assembly (build_agent) + --session none
 ├── signal.rs             (  123)  # headless SIGINT → cancel (first press graceful / second hard-exit 130)
 ├── batch.rs              ( 4117)  # batch tasks + --retries/--failed + report merging
 ├── harness.rs            ( 2697)  # headless mode + result.json + NDJSON + exit codes

@@ -75,7 +75,10 @@
   `preserved_reasoning` 只有显式 `false` 才进哈希（非默认那一侧反转为关）；`reasoning-carry` 配方的两臂都写显式值，
   不受影响。**寿命 = 当前轮**，失效点与保留点如下，规则是「整段剥、
   永不剥一半」——只剥一部分会留下「早期 assistant 带 reasoning、后期不带」的混合形状，正是严格 API 拒收的那种
-  （`compress::strip_reasoning` 的文档就是这条规则）：剥的三处 = `push_user` 开新 user 轮、`set_model`、
+  （`compress::strip_reasoning` 的文档就是这条规则）：剥的三处 = `push_user` 开新 user 轮（实体是 `agent::append_user_turn` 的开新轮分支——**user 轮进历史的
+  唯一入口**，2026-11 起 `pub`：Agent 存在之前就要拼历史的宿主（CLI 的 `--resume --task`）也必须走它；
+  CLI 曾手抄这两个分支、漏了剥除，上一轮的思考块被带进新一轮的每个请求，由
+  `scripts/e2e_anthropic_wire.py` 抓到）、`set_model`、
   `normalize_adjacent` 合并相邻同角色消息（合并后的消息 `reasoning = None`——两轮的状态拼不成一份：位置相对旧块、签名只覆盖
   一轮）；**不清**的两处 = 工具结果并入尾部 user 消息（合并分支的另一半，当前工具循环的状态因此存活）、压缩折叠与工具结果
   裁剪（幸存消息保留自己的：块的签名自包含，fold 整体移走、prune 只改 tool-result 文本）。会话归档（`archive_messages`）

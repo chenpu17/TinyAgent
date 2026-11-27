@@ -4246,7 +4246,18 @@ fn normalize_tool_use_ids(blocks: &mut [Block], history: &[Message]) {
 /// must merge into the prior user turn — notably after a turn cancelled before
 /// any assistant text (the assistant message is dropped, leaving history ending
 /// in the prior user message this follow-up must merge into).
-fn append_user_turn(messages: &mut Vec<Message>, blocks: Vec<Block>) {
+///
+/// The one way a user turn enters a history outside the loop, and where the
+/// reasoning lifetime ends ([`Message::reasoning`]). [`Agent::push_user`]
+/// calls it for a follow-up; a host that assembles a history BEFORE the agent
+/// exists — a CLI resuming a session with a new task — must call it too rather
+/// than push a `Message::user` of its own. The CLI did exactly that until
+/// 2026-11: its hand-written new-turn branch skipped the strip, and the
+/// finished turn's thinking blocks rode along into every request of the new
+/// turn (caught on the wire by `scripts/e2e_anthropic_wire.py`). A pushed
+/// message arrives without an id — the agent's ingest assigns one, or the
+/// caller pre-mints it (the CLI does, to stay above its archive).
+pub fn append_user_turn(messages: &mut Vec<Message>, blocks: Vec<Block>) {
     if messages.last().is_some_and(|m| m.role == Role::User) {
         if let Some(last) = messages.last_mut() {
             last.content.extend(blocks);

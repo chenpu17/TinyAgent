@@ -356,6 +356,12 @@
 
 ### Fixed
 
+- **headless `--resume --task` 没有结束上一轮的推理寿命**：CLI 把 `--task` 直接推上从 session 文件读回
+  的历史，手写的「开新 user 轮」分支漏了剥除上一轮的 `Message.reasoning`——`preserved_reasoning` 开着
+  （默认）时，上一轮的思考块被原样带进新一轮的**每一个**请求，token 白花。现在任务经
+  `agent::append_user_turn` 入历史（与 `push_user` 同一入口，该函数改为公开），新一轮不再携带上一轮的
+  思考块；末尾已是 user 消息时照旧折进去。由新增的 `scripts/e2e_anthropic_wire.py` 多轮场景抓到并钉住。
+
 - **MCP legacy SSE：落在流轮转间隙里的请求被打到已退役的会话（全量并发测试里偶发「tools/list timed out」
   的根因）**：读线程到期轮转时丢掉旧 GET 再开新连接，而 POST 目标只在新连接的 `endpoint` 到达时刷新——
   这期间发出的请求被 POST 到旧会话。会话绑定的 server 靠定时器回收会话（python-sdk 每 100 ms 轮询一次，
