@@ -1,0 +1,10 @@
+Weekly sync — 2026-11-10
+Attendees: Ming, Petra, Tomas
+
+- [x] Ming: send the updated quote to Harbor Works
+- [ ] Petra: file the expense report for the Harbor Road trip
+The migration plan was reviewed; two open points remain.
+- [ ] Tomas: split the migration plan into two phases
+- [ ] Ming: confirm the downtime window with Northline Co
+
+Next sync: 2026-11-17

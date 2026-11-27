@@ -1,0 +1,4 @@
+{
+  "task": "The directory `data/` holds 16 log files (`part_01.txt` to `part_16.txt`), about 5 KB each. A line counts when it contains `SIGNAL` as a whole word — case-sensitive, so `signal`, `SIGNALLED`, `RESIGNAL` and `SIGNAL_COUNT` do not count. Count the SIGNAL lines of every file and write `out/counts.tsv`: one line per file with the file name, a tab character and the count, sorted by file name, then a last line `total`, a tab and the sum of all counts. Read the files with `read_file` (there is no shell). Save your results into `out/counts.tsv` as you go and make sure the file is complete when you finish: the conversation is long, so the file — not your memory of it — has to hold the counts.",
+  "limits": { "compress_threshold_chars": 24000, "max_turns": 60 }
+}

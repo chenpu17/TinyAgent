@@ -1,0 +1,37 @@
+{
+  "category": "loop suppression",
+  "summary": "A poll that never completes: the run must stop early (stuck-loop guard or a honest give-up) instead of burning the turn budget.",
+  "config": {
+    "tools": ["read_file", "write_file", "list_dir"],
+    "mcp_servers": [
+      { "name": "regress", "command": "${PYTHON}", "args": ["${REGRESS_DIR}/mcp_server.py"] }
+    ]
+  },
+  "script": {
+    "turns": [
+      {
+        "reasoning": "Start the job first.",
+        "tools": [{ "name": "mcp_regress_job_start", "arguments": { "job": "nightly-export" } }]
+      },
+      {
+        "reasoning": "Not done yet; poll again.",
+        "tools": [{ "name": "mcp_regress_job_status", "arguments": { "job": "nightly-export" } }]
+      }
+    ]
+  },
+  "mock": {
+    "bad_script": {
+      "turns": [
+        {
+          "tools": [
+            {
+              "name": "write_file",
+              "arguments": { "path": "out/job.txt", "content": "nightly-export: running" }
+            }
+          ]
+        },
+        { "text": "Done." }
+      ]
+    }
+  }
+}

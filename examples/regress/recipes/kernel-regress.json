@@ -1,0 +1,9 @@
+{
+  "name": "kernel-regress",
+  "description": "内核版本间的回归基线：六个任务、单臂、每任务重复 3 次。改内核前后各 prepare + run 一批（同一天、同一份底配置），再 compare --a/--b：成功率不许掉（--max-pass-drop），轮数 / token / 压缩次数 / 耗时看趋势。",
+  "base_config": "~/.config/tinyagent/config.json",
+  "repeats": 3,
+  "arms": [
+    { "name": "baseline", "label": "the kernel under test", "config": {} }
+  ]
+}

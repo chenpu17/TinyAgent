@@ -1,0 +1,11 @@
+{
+  "name": "summary-preview",
+  "description": "docs/kernel_improvement_plan.md §2.2 实验 3：摘要窗口里工具调用的摘录宽度（limits.summary_preview_chars）。臂 preview1000 把它从默认的 200 放宽到 1000，对照臂就是默认值。看多步任务上压缩后的成功率是否变、摘要调用的 token 与截断怎么变。五个任务都跑压缩可能发生的多步任务；loop-suppression 与摘要摘录宽度无关，不含。底配置里的模型就是被测模型。",
+  "base_config": "~/.config/tinyagent/config.json",
+  "tasks": ["long-output", "multi-file-edit", "recover-after-failure", "mcp-many-tools", "cjk-docs"],
+  "repeats": 3,
+  "arms": [
+    { "name": "preview200", "label": "summary_preview_chars = 200 (default)", "config": {} },
+    { "name": "preview1000", "label": "summary_preview_chars = 1000", "config": { "limits": { "summary_preview_chars": 1000 } } }
+  ]
+}

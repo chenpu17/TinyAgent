@@ -1,0 +1,4 @@
+{
+  "task": "The `regress` MCP server keeps the stock of four warehouses (north, east, south, west). In the east warehouse three items hold fewer than 20 units. For each of them, find which of the other three warehouses holds the most of that item, and how many units must move so that east ends up with exactly 20 units. Write `out/restock.json` with this shape: `{\"items\": {\"<item>\": {\"units\": <units to move>, \"from\": \"<source warehouse>\"}}, \"cost_cents\": <sum over the items of units times the item price>}`. Take every number from the server's tools; do not guess.",
+  "limits": { "max_turns": 40 }
+}

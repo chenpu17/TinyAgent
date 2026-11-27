@@ -1,0 +1,4 @@
+{
+  "task": "Run `python3 tools/summarize.py notes`. It should print one `<file>: <n> action items` line per notes file plus a final `total: <n>` line (see README.md), but it currently fails. Find the cause and fix it. Do not modify anything under `notes/`. Then run the command again and save its exact standard output to `out/summary.txt`.",
+  "limits": { "max_turns": 30 }
+}

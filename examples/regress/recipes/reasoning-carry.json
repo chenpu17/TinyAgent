@@ -1,0 +1,11 @@
+{
+  "name": "reasoning-carry",
+  "description": "docs/kernel_improvement_plan.md §1.2 实验一：思考跨轮保留（preserved_reasoning）值不值得默认开。2026-11-26 已在 deepseek-flash 上跑完并据此把默认值改成开（计划 §0.0.3 D1、§0.0.5）；配方留作复现——两臂都显式写值，不受默认值变动影响。同一模型、同一天、重复轮次间 AB/BA 交替，每臂每任务至少 3 次。不含 loop-suppression——那一项考的是打转护栏，与思考保留无关。底配置里的模型就是被测模型。",
+  "base_config": "~/.config/tinyagent/config.json",
+  "tasks": ["multi-file-edit", "long-output", "mcp-many-tools", "recover-after-failure", "cjk-docs"],
+  "repeats": 3,
+  "arms": [
+    { "name": "off", "label": "preserved_reasoning = false", "config": { "preserved_reasoning": false } },
+    { "name": "on", "label": "preserved_reasoning = true", "config": { "preserved_reasoning": true } }
+  ]
+}

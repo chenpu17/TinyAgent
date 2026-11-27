@@ -1,0 +1,4 @@
+{
+  "task": "Two unit tests in this repository fail. Run `python3 run_tests.py` to see which ones, read `README.md` for the intended behavior, then fix the library code under `calc/` so that every test passes. Do not modify anything under `tests/`, and do not modify `run_tests.py`. Run `python3 run_tests.py` again to confirm before you finish.",
+  "limits": { "max_turns": 30 }
+}

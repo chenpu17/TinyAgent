@@ -1,0 +1,32 @@
+{
+  "category": "CJK docs / instruction following",
+  "summary": "Rewrite two Chinese documents under three mechanical rules (terms, punctuation, heading levels) and touch nothing else.",
+  "config": { "tools": ["read_file", "write_file", "list_dir"] },
+  "script": {
+    "turns": [
+      {
+        "tools": [
+          { "name": "read_file", "arguments": { "path": "docs/user-guide.md" } },
+          { "name": "read_file", "arguments": { "path": "docs/install-guide.md" } },
+          { "name": "read_file", "arguments": { "path": "docs/glossary.md" } }
+        ]
+      },
+      {
+        "reasoning": "Apply the three rules to the user guide: terms per the glossary, punctuation next to Chinese, one H1.",
+        "tools": [{
+          "name": "write_file",
+          "arguments": { "path": "out/user-guide.md", "content": {"$file": "expected/user-guide.md"} }
+        }]
+      },
+      {
+        "tools": [{
+          "name": "write_file",
+          "arguments": { "path": "out/install-guide.md", "content": {"$file": "expected/install-guide.md"} }
+        }]
+      },
+      {
+        "text": "整理完成，结果在 `out/user-guide.md` 和 `out/install-guide.md`：用词按术语表统一，紧邻中文的半角标点改成了全角，每个文件只保留一个一级标题。行内代码和 `docs/` 下的原文件都没有改动。"
+      }
+    ]
+  }
+}

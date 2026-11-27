@@ -1,0 +1,10 @@
+Weekly sync — 2026-11-03
+Attendees: Ming, Petra, Tomas
+
+- [ ] Ming: send the updated quote to Harbor Works
+- [x] Petra: book the review room for Thursday
+- [ ] Tomas: draft the migration plan for the records table
+Discussed the spring order; no decision yet.
+- [ ] Ming: ask the warehouse for the current stock report
+
+Next sync: 2026-11-10

@@ -1,0 +1,11 @@
+{
+  "name": "compression-handoff",
+  "description": "docs/kernel_improvement_plan.md §2.2 实验 2：压缩交接。臂 keep0 把 keep_recent_messages 压到 0（压缩后不留最近的原文消息，只剩摘要 + 旁注），对照默认的 8。看长对话任务上成功率是否掉、压缩次数与 token 怎么变。五个任务都跑压缩可能发生的多步任务；loop-suppression 与压缩无关，不含。",
+  "base_config": "~/.config/tinyagent/config.json",
+  "tasks": ["long-output", "multi-file-edit", "recover-after-failure", "mcp-many-tools", "cjk-docs"],
+  "repeats": 3,
+  "arms": [
+    { "name": "keep8", "label": "keep_recent_messages = 8 (default)", "config": {} },
+    { "name": "keep0", "label": "keep_recent_messages = 0", "config": { "limits": { "keep_recent_messages": 0 } } }
+  ]
+}

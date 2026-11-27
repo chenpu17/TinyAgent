@@ -1,0 +1,4 @@
+{
+  "task": "Start the background job `nightly-export` and wait until it reports `done`. Only then write the line `<job>: <status>` to `out/job.txt`. If the job cannot reach `done`, do not create the file.",
+  "limits": { "max_turns": 40 }
+}

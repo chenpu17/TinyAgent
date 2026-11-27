@@ -1,0 +1,194 @@
+{
+  "category": "long output / compression handoff",
+  "summary": "About 75 KB of tool output across ten read turns: the history is compressed several times, so the result can only come out right if it is written to a file as the run goes.",
+  "config": {
+    "tools": [
+      "read_file",
+      "write_file",
+      "edit_file",
+      "list_dir"
+    ],
+    "limits": {
+      "max_context_tokens": 0
+    }
+  },
+  "mock": {
+    "config": {
+      "limits": {
+        "compress_threshold_chars": 6000,
+        "keep_recent_messages": 4
+      }
+    }
+  },
+  "script": {
+    "turns": [
+      {
+        "tools": [
+          {
+            "name": "read_file",
+            "arguments": {
+              "path": "data/part_01.txt"
+            }
+          },
+          {
+            "name": "read_file",
+            "arguments": {
+              "path": "data/part_02.txt"
+            }
+          }
+        ]
+      },
+      {
+        "tools": [
+          {
+            "name": "read_file",
+            "arguments": {
+              "path": "data/part_03.txt"
+            }
+          },
+          {
+            "name": "read_file",
+            "arguments": {
+              "path": "data/part_04.txt"
+            }
+          }
+        ]
+      },
+      {
+        "tools": [
+          {
+            "name": "read_file",
+            "arguments": {
+              "path": "data/part_05.txt"
+            }
+          },
+          {
+            "name": "read_file",
+            "arguments": {
+              "path": "data/part_06.txt"
+            }
+          }
+        ]
+      },
+      {
+        "reasoning": "Six files counted. Save what I have so far: the early part of the conversation will be summarized.",
+        "tools": [
+          {
+            "name": "write_file",
+            "arguments": {
+              "path": "out/counts.tsv",
+              "content": "part_01.txt\t3\npart_02.txt\t5\npart_03.txt\t0\npart_04.txt\t2\npart_05.txt\t7\npart_06.txt\t1\ntotal\t18\n"
+            }
+          }
+        ]
+      },
+      {
+        "tools": [
+          {
+            "name": "read_file",
+            "arguments": {
+              "path": "data/part_07.txt"
+            }
+          },
+          {
+            "name": "read_file",
+            "arguments": {
+              "path": "data/part_08.txt"
+            }
+          }
+        ]
+      },
+      {
+        "tools": [
+          {
+            "name": "read_file",
+            "arguments": {
+              "path": "data/part_09.txt"
+            }
+          },
+          {
+            "name": "read_file",
+            "arguments": {
+              "path": "data/part_10.txt"
+            }
+          }
+        ]
+      },
+      {
+        "tools": [
+          {
+            "name": "read_file",
+            "arguments": {
+              "path": "data/part_11.txt"
+            }
+          },
+          {
+            "name": "read_file",
+            "arguments": {
+              "path": "data/part_12.txt"
+            }
+          }
+        ]
+      },
+      {
+        "reasoning": "Halfway. Update the file with the counts of the first twelve files.",
+        "tools": [
+          {
+            "name": "write_file",
+            "arguments": {
+              "path": "out/counts.tsv",
+              "content": "part_01.txt\t3\npart_02.txt\t5\npart_03.txt\t0\npart_04.txt\t2\npart_05.txt\t7\npart_06.txt\t1\npart_07.txt\t4\npart_08.txt\t6\npart_09.txt\t2\npart_10.txt\t5\npart_11.txt\t3\npart_12.txt\t0\ntotal\t38\n"
+            }
+          }
+        ]
+      },
+      {
+        "tools": [
+          {
+            "name": "read_file",
+            "arguments": {
+              "path": "data/part_13.txt"
+            }
+          },
+          {
+            "name": "read_file",
+            "arguments": {
+              "path": "data/part_14.txt"
+            }
+          }
+        ]
+      },
+      {
+        "tools": [
+          {
+            "name": "read_file",
+            "arguments": {
+              "path": "data/part_15.txt"
+            }
+          },
+          {
+            "name": "read_file",
+            "arguments": {
+              "path": "data/part_16.txt"
+            }
+          }
+        ]
+      },
+      {
+        "tools": [
+          {
+            "name": "write_file",
+            "arguments": {
+              "path": "out/counts.tsv",
+              "content": "part_01.txt\t3\npart_02.txt\t5\npart_03.txt\t0\npart_04.txt\t2\npart_05.txt\t7\npart_06.txt\t1\npart_07.txt\t4\npart_08.txt\t6\npart_09.txt\t2\npart_10.txt\t5\npart_11.txt\t3\npart_12.txt\t0\npart_13.txt\t8\npart_14.txt\t1\npart_15.txt\t4\npart_16.txt\t3\ntotal\t54\n"
+            }
+          }
+        ]
+      },
+      {
+        "reasoning": "All sixteen files are counted and the file holds the complete table.",
+        "text": "Counted the SIGNAL lines of all 16 files (54 in total). The complete table is in `out/counts.tsv`; I kept it up to date while reading, because the early part of the conversation was summarized along the way."
+      }
+    ]
+  }
+}

@@ -1,0 +1,11 @@
+Weekly sync — 2026-11-17
+Attendees: Ming, Petra
+
+- [x] Petra: file the expense report for the Harbor Road trip
+- [ ] Ming: order spare seals for the south warehouse
+- [ ] Ming: reply to Cedar Yard about the open invoice
+- [x] Tomas: split the migration plan into two phases (sent by mail)
+Stock report arrived; three items are low in the east warehouse.
+- [ ] Petra: schedule the downtime window
+
+No further notes.

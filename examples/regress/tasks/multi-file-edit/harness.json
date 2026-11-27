@@ -1,0 +1,48 @@
+{
+  "category": "multi-file edit",
+  "summary": "Two failing unit tests: read the contract, fix the library (not the tests), re-run the suite.",
+  "config": { "tools": ["shell", "read_file", "write_file", "edit_file", "list_dir"] },
+  "script": {
+    "turns": [
+      {
+        "reasoning": "Run the suite first to see which tests fail.",
+        "tools": [{ "name": "shell", "arguments": { "command": "python3 run_tests.py" } }]
+      },
+      {
+        "tools": [
+          { "name": "read_file", "arguments": { "path": "README.md" } },
+          { "name": "read_file", "arguments": { "path": "calc/core.py" } },
+          { "name": "read_file", "arguments": { "path": "calc/stats.py" } },
+          { "name": "read_file", "arguments": { "path": "tests/test_calc.py" } }
+        ]
+      },
+      {
+        "reasoning": "Both failures come from the same root: dividing by a zero divisor. div must raise ValueError; mean of an empty list must too.",
+        "tools": [
+          {
+            "name": "edit_file",
+            "arguments": {
+              "path": "calc/core.py",
+              "old_string": "def div(a, b):\n    return a / b\n",
+              "new_string": "def div(a, b):\n    if b == 0:\n        raise ValueError(\"division by zero\")\n    return a / b\n"
+            }
+          },
+          {
+            "name": "edit_file",
+            "arguments": {
+              "path": "calc/stats.py",
+              "old_string": "def mean(values):\n    return sum(values) / len(values)\n",
+              "new_string": "def mean(values):\n    if not values:\n        raise ValueError(\"mean of empty list\")\n    return sum(values) / len(values)\n"
+            }
+          }
+        ]
+      },
+      {
+        "tools": [{ "name": "shell", "arguments": { "command": "python3 run_tests.py" } }]
+      },
+      {
+        "text": "Fixed both failures in the library: `div` now raises `ValueError(\"division by zero\")` for a zero divisor, and `mean` raises `ValueError(\"mean of empty list\")` for an empty sequence. `python3 run_tests.py` reports `tests: 10, failures: 0, errors: 0`."
+      }
+    ]
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "category": "recover after failure",
+  "summary": "The first command fails on an ImportError; diagnose it, fix the cause without touching the notes, save the output.",
+  "config": { "tools": ["shell", "read_file", "write_file", "edit_file", "list_dir"] },
+  "script": {
+    "turns": [
+      {
+        "reasoning": "Start with the command the task names.",
+        "tools": [{ "name": "shell", "arguments": { "command": "python3 tools/summarize.py notes" } }]
+      },
+      {
+        "tools": [
+          { "name": "read_file", "arguments": { "path": "tools/summarize.py" } },
+          { "name": "list_dir", "arguments": { "path": "tools" } }
+        ]
+      },
+      {
+        "reasoning": "The ImportError names `notelib`, but the directory holds `notes_lib.py`. Fix the import.",
+        "tools": [{
+          "name": "edit_file",
+          "arguments": {
+            "path": "tools/summarize.py",
+            "old_string": "from notelib import count_actions, load_notes",
+            "new_string": "from notes_lib import count_actions, load_notes"
+          }
+        }]
+      },
+      {
+        "tools": [{ "name": "shell", "arguments": { "command": "mkdir -p out && python3 tools/summarize.py notes > out/summary.txt" } }]
+      },
+      {
+        "text": "The command failed with `ModuleNotFoundError: No module named 'notelib'`: the helper module is `tools/notes_lib.py`. I corrected the import in `tools/summarize.py` (nothing under `notes/` was changed), re-ran the command, and saved its output to `out/summary.txt`."
+      }
+    ]
+  }
+}

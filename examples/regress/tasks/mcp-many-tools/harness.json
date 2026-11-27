@@ -1,0 +1,63 @@
+{
+  "category": "many tools / MCP",
+  "summary": "A twelve-tool MCP server: the agent needs three of the tools and a join across them, and must leave the other nine alone.",
+  "config": {
+    "tools": ["read_file", "write_file", "list_dir"],
+    "mcp_servers": [
+      { "name": "regress", "command": "${PYTHON}", "args": ["${REGRESS_DIR}/mcp_server.py"] }
+    ]
+  },
+  "script": {
+    "turns": [
+      {
+        "reasoning": "List the warehouses and read the stock of the east warehouse to find the low items.",
+        "tools": [
+          { "name": "mcp_regress_list_warehouses", "arguments": {} },
+          { "name": "mcp_regress_warehouse_info", "arguments": { "warehouse": "east" } }
+        ]
+      },
+      {
+        "reasoning": "nut, clip and valve are below 20 units. Compare the other three warehouses for each of them.",
+        "tools": [
+          { "name": "mcp_regress_item_stock", "arguments": { "item": "nut", "warehouse": "north" } },
+          { "name": "mcp_regress_item_stock", "arguments": { "item": "nut", "warehouse": "south" } },
+          { "name": "mcp_regress_item_stock", "arguments": { "item": "nut", "warehouse": "west" } }
+        ]
+      },
+      {
+        "tools": [
+          { "name": "mcp_regress_item_stock", "arguments": { "item": "clip", "warehouse": "north" } },
+          { "name": "mcp_regress_item_stock", "arguments": { "item": "clip", "warehouse": "south" } },
+          { "name": "mcp_regress_item_stock", "arguments": { "item": "clip", "warehouse": "west" } }
+        ]
+      },
+      {
+        "tools": [
+          { "name": "mcp_regress_item_stock", "arguments": { "item": "valve", "warehouse": "north" } },
+          { "name": "mcp_regress_item_stock", "arguments": { "item": "valve", "warehouse": "south" } },
+          { "name": "mcp_regress_item_stock", "arguments": { "item": "valve", "warehouse": "west" } }
+        ]
+      },
+      {
+        "reasoning": "Now the prices, for the cost of the moved units.",
+        "tools": [
+          { "name": "mcp_regress_item_price", "arguments": { "item": "nut" } },
+          { "name": "mcp_regress_item_price", "arguments": { "item": "clip" } },
+          { "name": "mcp_regress_item_price", "arguments": { "item": "valve" } }
+        ]
+      },
+      {
+        "tools": [{
+          "name": "write_file",
+          "arguments": {
+            "path": "out/restock.json",
+            "content": "{\n  \"items\": {\n    \"clip\": {\"units\": 8, \"from\": \"south\"},\n    \"nut\": {\"units\": 12, \"from\": \"north\"},\n    \"valve\": {\"units\": 15, \"from\": \"south\"}\n  },\n  \"cost_cents\": 5206\n}\n"
+          }
+        }]
+      },
+      {
+        "text": "Three items are low in the east warehouse. Wrote `out/restock.json`: nut 12 units from north, clip 8 units from south, valve 15 units from south; total 5206 cents."
+      }
+    ]
+  }
+}

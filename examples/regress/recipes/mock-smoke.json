@@ -1,0 +1,11 @@
+{
+  "name": "mock-smoke",
+  "description": "零成本冒烟：把付费通道的同款代码路径（prepare → run → summarize → compare）走一遍，不花钱。臂 b 把 max_turns 压到 1，必须被判卷判失败——证明评测流水线抓得住回归。scripts/regress_eval.py check 的最后一组就是它。",
+  "mock": "openai",
+  "tasks": ["multi-file-edit"],
+  "arms": [
+    { "name": "a", "label": "scripted good path", "config": {} },
+    { "name": "b", "label": "max_turns = 1 (must fail)", "config": { "limits": { "max_turns": 1 } } }
+  ],
+  "repeats": 1
+}
