@@ -134,8 +134,9 @@ tiny-agent --config examples/chat.json --tui
 任务片段**只能覆盖** `task` / `system_prompt` / `model` / `max_tokens` / `reasoning_effort` /
 `inject_environment` / `salvage_on_max_tokens` / `limits`（逐字段钳制）/ `code`（逐字段钳制；
 `code.enabled` 与 `code.llm.enabled` / `code.llm.default_model` 仍拒绝）。安全相关字段
-（`provider` / `base_url` / `api_key_env` / `workdir` / `tools` / `restrict_to_workdir` /
-`mcp_servers`）禁止覆盖——覆盖即标记 `bad_task` 失败，不执行。
+（`provider` / `base_url` / `api_key_env` / `env_passthrough` / `extra_body` / `extra_headers` /
+`workdir` / `tools` / `restrict_to_workdir` / `mcp_servers` / `preserved_reasoning`）
+禁止覆盖——覆盖即标记 `bad_task` 失败，不执行。
 
 ### `--retries N`：transient 失败重试
 
@@ -151,7 +152,7 @@ tiny-agent --config examples/chat.json --tui
 | `bad_task` | 任务片段非法（禁用字段 / 缺 task / JSON 错） | ❌ |
 | `max_turns_reached` / `max_tokens` | 模型跑满上限 | ❌ |
 | `budget_exceeded` | 累计 token 触顶 `limits.max_total_tokens` | ❌ |
-| `stuck_loop` | 打转护栏：同参同果的相同调用连续 6 次（第 3 次先在下发的 tool_result 里附纠偏提示，给一次自愈机会；结果有进展或参数不同即重置） | ❌ |
+| `stuck_loop` | 打转护栏：同参同果的相同调用连续 6 次（第 3 次先在下发的 tool_result 里附纠偏提示，给一次自愈机会；结果有进展或参数不同即重置）。同参同果、但**中间隔着别的调用**的重复不会停 run：第 4、6… 次时在那条 tool_result 里附一条只提示、不停 run 的提醒 | ❌ |
 | `arbitration_capped` | 轮末仲裁（`Hooks::on_turn_stopping`）在单 run 续跑帽（6，与打转护栏同款纪律）内持续否决模型的 `end_turn`；run 在模型最后一轮干净收尾——exit 0、标签留在 result.json 供审计。CLI 二进制整体不可达（单跑与 `--batch` 都不装钩子，只有库宿主可触发）；result.json 的 `success` 键仍严格只认 `end_turn` | ❌ |
 | `stream_truncated` / `stream_idle` | 流式响应被网关截断（无 finish_reason）或静默超过 `stream_idle_secs`——honest-cost 部分结果：已到的文本/调用保留并照实入账，exit 1，不重试。（读流中途**死亡**不同：以 transient `error` 形态保留部分文本并进入重试梯） | ❌ |
 | `panic` | 任务在 worker 里 panic，被兜成失败条目（见下） | ❌ |
@@ -205,7 +206,7 @@ tiny-agent --config examples/harness.json --task "跑测试" --retries 3 --outpu
 - `--session none` 关闭持久化——不读不写，一次性 headless 运行不在 cwd 留文件（与 `--resume` 互斥）
 - `--resume` 加载历史继续；此时 config 里的 `task` 视为已消费，用 `--task` 追加新指令。会话保存时的 `model` 与当前 config 不同时，以**新模型**继续（stderr 出现 `[warn] session model '…' differs from config model '…'` 提示一行——允许中途换模型，不是错误）
 - 崩溃也不丢已完成的轮次；TUI 模式同样生效
-- TUI `--resume` 会把历史**转录进原生 scrollback**（用户/助手消息、工具调用与结果按 id 配对重建单行视图，`· ` 系统行标注"resumed"），图片不转录；停在 tool_result 中途的会话恢复后自动续跑，末条任务文本直接可见
+- TUI `--resume` 会把历史**转录进原生 scrollback**（用户/助手消息、工具调用与结果按 id 配对重建单行视图，`· ` 系统行标注"resumed"）；图片与 PDF 块保留为 `[image attached]` / `[PDF document attached]` 轻量占位，不再静默消失；停在 tool_result 中途的会话恢复后自动续跑，末条任务文本直接可见
 
 ## TUI 对话模式
 
@@ -214,23 +215,27 @@ tiny-agent --config examples/harness.json --task "跑测试" --retries 3 --outpu
 | 键 | 动作 |
 |---|---|
 | `Enter` | 发送（运行中则为排队，当前轮结束后自动发出；补全弹窗打开时为补全选中命令，不发送）；行尾为 `\` 时改为换行（行续接，bash 语义） |
-| `Alt+Enter` / `Shift+Enter` | 输入换行（多行） |
+| `Shift+Enter` / `Alt+Enter` / `Ctrl-J` | 输入换行（多行） |
 | `Backspace` | 删前字符（跨行合并上一行） |
-| `Ctrl-D` | 删光标后字符（跨行合并下一行）；空输入且空闲 → 退出 |
-| `←`/`→`/`Home`/`End` | 行内移动 |
-| `Alt+←`/`Alt+→` | 按词移动（空白分词；CJK 整段非空白算一词） |
-| `Ctrl-W` | 删前一词（行首退化为合并上一行） |
+| `Ctrl-Backspace` / `Ctrl-W` | 删前一词（行首退化为合并上一行） |
+| `Delete` / `Ctrl-D` | 删光标后字符（跨行合并下一行）；空闲空输入时 `Ctrl-D` 退出 |
+| `←`/`→`/`Home`/`End` | 逻辑行内移动 |
+| `Ctrl+←`/`Ctrl+→` 或 `Alt+←`/`Alt+→` | 按词移动（空白分词；CJK 整段非空白算一词） |
 | `Ctrl-U` / `Ctrl-K` | 删到行首 / 删到行尾 |
 | `Ctrl-A` / `Ctrl-E` | 移到行首 / 行尾 |
 | `↑`/`↓` | 单行输入（含空输入）或正在浏览历史时召回上/下一条历史；多行输入时跨行移动（补全弹窗打开时为移动弹窗选中） |
 | `Alt+↑`/`Alt+↓` | 输入历史翻页（任何输入状态下可用） |
+| `Ctrl-O` | 把最近一项工具调用、工具结果或思考块（取三者中最新）全文追加重印 |
 | `Ctrl-C` | 忙 → 取消当前轮（同时丢弃排队消息）；空闲 → 连按两次退出（2 秒内再按一次，首按只提示） |
 | `Esc` | 忙 → 取消当前轮；空闲 → 清空输入框（补全弹窗打开时只关弹窗）。退出用 `/quit`、`/exit`，或空闲连按两次 `Ctrl-C` |
 
-运行中（running）输入框保持可编辑：可以继续打字，`Enter` 会把消息排队——live 区显示暗色的
-`❯ … · queued` 占位行，输入框标题同步显示队列长度；当前轮结束后最老的
-占位行换成真实消息并自动发送；`Ctrl-C` 取消当前轮会**连同排队消息一起丢弃**；`/clear` 与 `/context` 在运行中禁用
-（`/context` 要向持有 agent 的 worker 线程查询），其余斜杠命令（`/export`、`/out`、`/model`、`/limits`、`/tools`、`/system`、`/help`，以及退出用的 `/quit` / `/exit`）照常可用。
+运行中（running）输入框保持可编辑：可以继续打字，`Enter` 按 FIFO 排队。独立 live 预览显示最老的
+待发送消息与队列长度——待发送文本**不会**作为 ghost 行进入 transcript，也不会阻塞已完成工具结果
+提交；真正开始投递时才追加对应的 `❯` 用户行。`/queue` 查看待发全文，`/unqueue` 取回最新一条待发
+消息到编辑框，`Ctrl-C`/`Esc` 取消当前轮并**丢弃它的队列**。运行失败会暂停保留的队列，避免连续
+故障自动触发一串请求：`/resume` 显式释放下一条；另发一条新 prompt 不会隐式释放被保留的 FIFO。
+`/clear`、`/context`、`/resume`、`/compact` 在运行中从补全弹窗隐藏（`/context` 要向持有 agent 的 worker 线程
+查询，`/resume` 只在轮次间有意义，`/compact` 不能折叠一轮还在追加的历史），其余斜杠命令照常可用。
 
 **原生选择 / 滚动 / 搜索**：已定稿的对话（你的消息、助手回复、工具调用与结果、系统行）都在终端
 scrollback 里，是真正的终端文本——鼠标拖选即选中原文，复制走终端自身机制（macOS 上选中即复制）；
@@ -239,22 +244,36 @@ scrollback 里，是真正的终端文本——鼠标拖选即选中原文，复
 在途助手回复暂留在底部 live 区（带 `▌` 光标）。**长回复增量定稿**：在途内容超出 live 区高度后，
 已完结的段落会**提前提交进 scrollback**；没有段落边界可切的超长单段（LLM 常见的"一整段一行"散文）
 按**显示行**切分，内容以行为单位连续向上滚出（与 Claude Code 同款观感），live 区只保留正在生成的
-尾部两三行（思考区块同理；已提前定稿的行不再随后续重排）。
-空对话（或 `/clear` 之后）live 区显示暗色按键速览（`/help`、补全、原生滚动 / 选择 / 复制）。
-对话正文在宽屏下限制为 120 列并左对齐，角色用行内图标区分——你的消息以青色 `❯ ` 开头、助手的
-以绿色 `● ` 开头（无独立标题行，每条消息省一行）；工具调用和结果缩进归属于助手，各占一行单行预览
-（工具调用显示紧凑参数摘要、工具结果显示输出预览）；失败且输出不超过 20 行的结果自动展开方便直接
-看到报错，超长输出保持折叠，成功结果要展开时用 `/out` 重印全文。输入框与状态行使用近全宽布局；
-running 时输入框标题显示 spinner、当前活动（thinking / writing / → 工具名）、本轮耗时、取消提示和
-队列长度（终端过窄放不下时优先省略活动名，保留耗时与取消提示），整个输入框边框随运行状态变色；
-空闲时标题为 ` Ask TinyAgent `。
-一轮开始还没有可见输出时，live 区显示瞬时的 `● …` 占位（渲染期合成，不进对话历史），首个文本或
-工具调用出现即消失。推理模型的思考过程单独渲染为暗色斜体的 `✻` 区块——不走 markdown、和答复正文
+尾部两三行（已提前定稿的行不再随后续重排；未闭合的行内代码会等反引号配对后再切，避免独立 Markdown
+片段显出多余反引号）。**思考刻意走另一条路径**：live 区只渲染有界尾部，最终整块一次提交，长思考因此
+仍可折叠。空对话（或 `/clear` 之后）live 区显示三行 render-only 报头：宽屏下带版本号的
+`T I N Y A G E N T` 间隔字标（版本号与输入框右缘对齐）、横跨整个工作区的双色规则线，以及一句简洁标语；
+键帽只出现在两行之下的输入框底边框上，报头不重复。窄屏先省略版本号。空态只在渲染期合成，不进
+transcript 或 `/export`。
+对话正文在宽屏下限制为 120 列并左对齐，角色用行内图标区分——你的消息以青色 `❯ ` 和粗体正文显示、助手
+以绿色 `◆ ` 开头（无独立标题行，每条消息省一行）；长行软换行并保留悬挂缩进，代码块与展开的工具输出
+在续行继续显示 `▎` / `│` guide；行内代码与键帽共用随明暗主题切换的凸起表面。工具调用和结果以连续 `▎`
+执行导轨缩进归属于助手：调用显示紧凑参数摘要，
+结果显示状态、耗时和输出预览；失败结果只有同时满足不超过 20 行且不超过 2000 字符时才自动展开，避免一个超长单行
+报错冲满屏幕。`/out` 重印完整结果，`/call` 重印完整输入 JSON；两者都追加一份展开副本，不改写不可变
+scrollback。工具参数流式生成时显示 render-only 的 `receiving arguments` 活动，JSON 增量不进 transcript。
+正文、composer、队列预览与状态行在宽屏共用同一处最多 120 列的工作区；composer 使用圆角边框与略凸起、
+随主题切换的表面色，对长 prompt 软换行，并在固定八行 inline viewport 内纵向滚动
+保持光标可见，不再有输入水平滚动。running 时输入框标题显示 spinner、当前活动（thinking / writing /
+→ 工具名）、本轮耗时、取消提示和队列长度，窄终端分级省略细节但始终保留取消提示；idle / running /
+cancelling / failed 有各自标题与边框/状态颜色，空闲时标题为 ` ◆ MESSAGE `，底边框在空间足够时
+显示同款 `Enter` / `/` / `Ctrl-J` / `/help` 键帽（窄框先省 `/` 与 Ctrl-J）。
+一轮开始还没有可见输出时，live 区显示瞬时的 `◆ …` 占位（渲染期合成，不进对话历史），首个文本或
+工具调用出现即消失。推理模型的思考过程单独渲染为品红斜体的 `✻` 区块——不走 markdown、和答复正文
 视觉分离，流式期间带 `▌` 光标、输入框标题显示 thinking；答复开始后 ✻ 区块定稿进 scrollback，答复以
-正常样式另起一块（子 agent 的思考带 `[名字]` 标注）。`/export` 导出时思考以 `✻ Thinking` 段落收录。
-状态行左侧只保留模型、整体运行状态（running / idle，无计时）、上下文占用和累计 token（如
-`1.2k in · 0.8k out`）；右侧右对齐显示当前目录的完整路径
-（并行开多个窗口时一眼区分，过长时左侧截断加 `…` 前缀，剩余不足 12 列则整段隐藏——窄屏时它最先消失）。
+正常样式另起一块（子 agent 的思考带 `[名字]` 标注）。定稿后超过 8 个显示行的思考折叠为紧凑头部加
+末尾 3 行预览；`/thinking [n]` 追加重印第 n 新的完整思考（默认最新），`/export` 始终收录完整原文为
+`✻ Thinking` 段落。
+状态行使用随明暗主题切换的低对比底色，模型以青色文字标识而非厚重的实心徽章；左侧只保留模型、
+整体运行状态（ready / running / cancelling / failed，空闲不计时）、上下文占用和累计 token
+（如 `1.2k in / 0.8k out`；尚未产生计费的新会话不显示 token 段，而不是显示 0）；右侧右对齐显示当前目录
+（并行开多个窗口时一眼区分）。路径超过 48 列显示预算时，
+保留能放下的最长完整尾部目录段并加 `…` 前缀，不把目录名从中间截断；剩余不足 12 列则整段隐藏——窄屏时它最先消失。
 上下文占用显示为 `ctx 54.7k`；在配置的
 `limits.max_context_tokens` 里设了模型上下文窗口后变为 `ctx 21% (54.7k/256k)`，占用 ≥60% 转黄、
 ≥80% 转红。agent 用过 `todo` 后，状态条另显一段 `plan done/total`（如 `plan 2/5`，全部完成转绿、
@@ -262,26 +281,37 @@ running 时输入框标题显示 spinner、当前活动（thinking / writing / �
 终端变窄时状态条先省略 token、再省略 plan，上下文段保留到最后，只保留模型和运行状态为止。退出
 （`/quit`、`/exit`，或空闲 `Ctrl-C` 连按两次）时若仍有排队消息，终端还原后会在 stderr 提示被丢弃的条数。
 一轮正常结束（end_turn / stop 等）不再打印 `[done: …]` 行，只有异常停止（max_tokens /
-length / error 等）才显示警告。工具输出里的 ANSI 颜色序列（如 git diff 的红绿）会按
-原样着色显示，其余控制序列一律剥除；`/export` 导出的则是去掉转义码的纯文本。
+length / error 等）才显示警告。工具输出里的 ANSI SGR 颜色序列（如 git diff 的红绿）会按
+原样着色显示，包含 256 色索引与 RGB truecolor 形式；其余控制序列一律剥除；`/export` 导出的则是
+去掉转义码的纯文本。
 `/` 开头走斜杠命令（不发给模型）。输入以 `/` 开头且还在敲命令名（未输入空格）时，输入框上方会浮出
-补全弹窗：按前缀过滤（大小写敏感），`↑`/`↓` 移动选中（循环），`Tab`/`Enter` 把选中命令补全进输入框
+补全弹窗：按前缀过滤（大小写敏感），`↑`/`↓` 移动选中（循环），`Shift+Tab` 反向选择，
+`Tab`/`Enter` 把选中命令补全进输入框
 （`/export` 自动带尾空格方便输路径；补全只是填入，再按一次 `Enter` 才执行，防止误触发 `/clear`），
-`Esc` 只关弹窗。输入空格进入参数阶段、删掉 `/` 或无匹配时弹窗自动关闭；暂不支持鼠标点选；运行中
-同样可用（命令照常即时执行，消息照旧排队）：
+`Esc` 只关弹窗。选中行带 `❯` 侧栏标记与凸起表面，底部键帽明确标出补全、执行和关闭。输入空格进入参数阶段；
+删掉 `/` 或无匹配时弹窗自动关闭；暂不支持鼠标点选；运行中同样可用（命令照常即时执行，消息照旧排队）：
 
 | 命令 | 作用 |
 |---|---|
-| `/clear` | 清空对话历史（不进输入历史） |
+| `/clear` | 清空对话历史（不进输入历史；仅空闲时） |
 | `/export [path]` | 导出对话到文件（无路径时复制到剪贴板） |
 | `/out [n]` | 重印第 n 新的工具结果全文（默认最新一条；错误结果同样可展开） |
-| `/model` `/limits` `/tools` `/system` | 只读查看当前配置 |
-| `/context` | 上下文构成报表（估算 token：system 三段 / 工具四类 / 消息分型 + 校准状态与窗口余量） |
-| `/help` | 命令列表 |
+| `/call [n]` | 重印第 n 新的工具调用及完整输入 JSON（默认最新一条） |
+| `/thinking [n]` | 重印第 n 新的思考块全文（默认最新一块） |
+| `/queue` | 列出等待当前轮次完成的待发消息 |
+| `/unqueue` | 取回最新一条待发消息到编辑框 |
+| `/resume` | 显式继续失败后暂停的队列（仅空闲时） |
+| `/model` `/limits` `/tools` `/system` | 只读查看当前配置；`/system` 显示配置的 base prompt |
+| `/context` | 上下文构成报表（估算 token：system 三段 / 工具四类 / 消息分型 + 校准状态与窗口余量；工具表越过 1 万估算 token 或 30 个工具时附一段提示，见[上下文压缩](#上下文压缩)；仅空闲时） |
+| `/compact [focus]` | 立即把历史折叠成摘要，可带给摘要器的侧重指令（仅空闲时；摘要请求计费；`Esc` 取消） |
+| `/help` | 分组的命令与键盘帮助 |
+| `/quit`（别名 `/exit`） | 退出 TUI；若有在途轮次会先取消 |
 
 取消机制：`Ctrl-C` 在流式 chunk 间（≤200ms）生效，取消后可继续发下一条——内核 `run()` 不清停止标志（电平契约，嵌入方在受理点负责清），TUI 在提交每条新输入时自动清掉上一轮的残留停止。
 
-多行粘贴：终端开启 bracketed paste，一次粘贴含换行的多行会被当作**单条**消息，不会因换行被提前发送——直接粘贴即可，无需手动改 Alt+Enter。手动输入多行除了 `Alt+Enter` / `Shift+Enter`，也可在行尾打 `\` 再按 `Enter` 换行（行续接）——终端不上报修饰键时（如 macOS Terminal.app）这是唯一的手动多行入口。
+手动压缩：`/compact` 不等阈值，立即执行与自动压缩相同的折叠（内核 `compact_with`）；`/compact 重点保留 API 变更` 会把这段文字作为宿主指令附在摘要 prompt 后。仅空闲时可用——运行中输入会被拒绝并提示 `[busy — /compact is disabled while running]`，命令保留在编辑框。折叠是一个忙任务：状态栏显示 `compacting… · Ctrl-C cancel`，`Esc` 取消摘要请求（打印 `[cancelled]`，历史不动），其间输入的消息排在折叠之后、基于折叠后的历史运行。折叠完成提交一行 `[context compressed (manual): dropped N messages, M kept]`，摘要请求的用量计入状态栏合计并去掉过期的 `ctx` 估算；历史太短时直接回答 `[compact] nothing to fold`、不发请求；摘要请求失败则打印 `[compact] failed: …`、历史保持原样（不影响后续轮次的自动压缩）。
+
+多行粘贴：终端开启 bracketed paste，一次粘贴含换行的多行会被当作**单条**消息，不会因换行被提前发送——直接粘贴即可，无需手动改 Alt+Enter。手动输入多行可用 `Shift+Enter` / `Alt+Enter` / `Ctrl+J`，也可在行尾打 `\` 再按 `Enter` 换行（行续接）——终端不上报修饰键时（如 macOS Terminal.app）这是唯一的手动多行入口。
 
 浅色终端适配：`TINYAGENT_TUI_THEME=light` 启动 TUI，系统行 / 预览 / 状态段等暗色文字换用更深的中灰（深浅底都可读），行内代码从白色改染青色（浅色底上白字几乎隐形）。未设置或其它值保持深色主题不变；不做自动探测（终端背景色上报不可靠），需要浅色就显式设这个环境变量。
 
@@ -298,7 +328,7 @@ length / error 等）才显示警告。工具输出里的 ANSI 颜色序列（�
 ]
 ```
 
-stdio server 可注入环境变量（`env`，叠加在宿主环境之上、同名以配置为准）——GUI 应用从 Finder/Dock 启动没有 shell 环境，靠 env 传凭据的 server（GitHub MCP 的 `GITHUB_PERSONAL_ACCESS_TOKEN`、数据库连接串、各类 `XXX_API_KEY`）必须走这条。`env` 仅对 stdio 生效，HTTP 传输忽略它。社区主流 MCP 配置（Claude Desktop / Code、VS Code）都含此字段，复制过来即可用。
+stdio server 可注入环境变量（`env`，叠加在宿主环境之上、同名以配置为准）——GUI 应用从 Finder/Dock 启动没有 shell 环境，靠 env 传凭据的 server（GitHub MCP 的 `GITHUB_PERSONAL_ACCESS_TOKEN`、数据库连接串、各类 `XXX_API_KEY`）必须走这条。`env` 仅对 stdio 生效，HTTP 传输忽略它。社区主流 MCP 配置（Claude Desktop / Code、VS Code）都含此字段，复制过来即可用。server 继承的宿主环境里不含 `api_key_env` 指向的那一个变量（见下文「⚠️ 安全说明」）；在 `env` 里显式写出的同名变量照常下发。
 
 支持三种传输（`command` 与 `url` 二选一）：
 
@@ -315,6 +345,34 @@ stdio server 可注入环境变量（`env`，叠加在宿主环境之上、同�
 | **auto**（默认） | 先按 Streamable HTTP 探测，失败自动回落旧版 SSE |
 
 不支持的边角：server-initiated request（sampling、roots/list 等，带 `method` 的请求）会被丢弃——本客户端只消费响应帧。`examples/mcp_echo.py`（stdio）与 `examples/mcp_http_echo.py`（/mcp + /sse 双端点）是零依赖测试服务器，也是协议参考实现。内置工具白名单（`tools`）与 MCP 工具互不影响。
+
+### 超时、工具过滤、取消
+
+每个 server 四个可选键：
+
+| 键 | 默认值 | 含义 |
+|---|---|---|
+| `call_timeout_secs` | `120` | 单个 JSON-RPC 请求端到端的时限（含 `tools/call`）。工具本就该跑很久的（慢构建、大查询）调大；不稳定的 sidecar 调小 |
+| `connect_timeout_secs` | HTTP/SSE 为 `15`；stdio 为 call 超时 | TCP/TLS 连接（旧版 SSE 还含等 `endpoint` 事件——首个，以及每次流轮转后的那个；落在这段间隙里的请求会等新 `endpoint` 再发，不会打到已退役的会话上）。在 stdio 上它约束的是 `initialize` 握手，即 `npx`/`uvx` server 允许启动多久——想单独约束慢启动、又不抬高之后每次调用，就设它 |
+| `allow_tools` | 全部工具 | 非空时只暴露列出的 **wire** 名——server 自己 `tools/list` 里的名字，不是 `mcp_<server>_` 展示名。列了 server 没有的名字则启动失败（`allow_tools names tool(s) the server does not expose: …`），而不是静默什么都不暴露 |
+| `deny_tools` | 无 | 永不暴露的 wire 名，无论 server 列了什么。deny 优先于 allow |
+
+两个超时键都不接受 `0`（报错信息点名 server、键和默认值），上限 7 天——超过基本是配置里单位写错了。超时报错点名设定该时限的键，如 `MCP call 'tools/call' timed out after 2s (limit: call_timeout_secs) or server died`。
+
+**协议版本。** 客户端在 `initialize` 里提供 `2025-03-26`，之后每个 HTTP 请求都带 `MCP-Protocol-Version: <协商结果>`。`2025-03-26` / `2025-06-18` / `2025-11-25` 静默接受；server 答的其它版本原样回带、只打一行警告（`… which this client has not verified`）——协商永不把 server 判死。
+
+**取消。** `tools/call` 进行中按 Ctrl-C（或库里 `set_cancel`）会先给 server 发 `notifications/cancelled`（`requestId` + reason）再收尾，长耗时工具可以就此停手，不必对着已经离开的调用方跑完。调用还没发出就被取消的，根本不发。
+
+**空闲的 HTTP 连接。** HTTP 连接空闲满 60 s 后要发 `tools/call` 前，客户端先发 `ping`（5 s 上限）。有应答——哪怕是错误应答——调用照发；server 一声不吭则调用失败且**不发出**：`MCP 'srv': unreachable after 62s idle — 'tools/call' was not sent (ping failed: …)`。stdio 连接从不探测。
+
+**会话丢失（Streamable HTTP）。** 带 session id 的请求得到 404 说明 server 忘了会话：客户端起新会话（重新 `initialize`，一行警告）并把该请求重发一次。新会话起不来，或重发的请求再次被拒，调用就以该错误失败。恢复后**不**重新拉取工具表——会话里的工具就是启动时列出的那些，重启后工具集变了的 server 会在调用时报 `unknown tool`。旧版 SSE 没有会话可恢复。
+
+**工具结果与注解。** `tools/call` 的结果可以在文本帧之外带 `structuredContent`。对**声明了 `outputSchema`** 的工具，
+结构化载荷才是权威版本：模型拿到它的 JSON 文本，给人看的文本镜像被丢弃（结果里的图片照样保留）。对其它工具则是文本帧优先，
+只有 server 一个文本帧都没给时才用 `structuredContent`——纯结构化的 server 不再显示成 `[empty tool result]`。
+server 为每个工具声明的注解（`readOnlyHint` / `destructiveHint` / `idempotentHint` / `openWorldHint`）另存为一张旁表：
+库宿主在 `before_tool` 钩子里读它（`ctx.annotations(tool)`）来定策略，不必重新拉取工具表；每次调用把当时的快照记进
+result.json（`tool_calls[].annotations`）。它是 **server 的声称**——内核不据此强制任何行为（见「[库 API](docs/lib_api.md)」节）。
 
 ### 运行时热增删（库 API）
 
@@ -431,12 +489,17 @@ tiny-agent --config examples/web-search.json --task "搜一下 Anthropic 最近�
   "reasoning_effort": "可选，思考程度字符串原样透传（none/low/medium/high/xhigh/max），不校验",
   "strip_think_tags": true,
   "gateway_fixes_preset": null,
+  "preserved_reasoning": true,
+  "extra_body": null,
+  "extra_headers": null,
+  "env_passthrough": [],
   "limits": {
     "max_turns": 30,
     "timeout_secs": 600,
     "max_output_chars": 30000,
     "compress_threshold_chars": 400000,
     "keep_recent_messages": 8,
+    "summary_preview_chars": 200,
     "max_context_tokens": 0,
     "max_total_tokens": 0,
     "stream_idle_secs": 30,
@@ -451,8 +514,15 @@ API key 从 `api_key_env` 指定的环境变量读取，不写进配置文件。
 两个较新的键（宿主集成需求单批次）：`strip_think_tags`（默认 `true`）——把 openai 回复流里内联的
 `<think>…</think>` 块剥进 `thinking` 事件（正文保证无标签残留）；设 `false` 即逐字节透传。
 `gateway_fixes_preset`（可选对象）——预置 openai 兼容网关的请求体修复位（`max_completion_tokens` /
-`no_stream_options` / `no_reasoning_effort`，默认全 `false`），让**首个请求**就带上学到的形状、
+`no_stream_options` / `no_reasoning_effort` / `no_reasoning_echo`，默认全 `false`），让**首个请求**就带上学到的形状、
 教学 400 往返整个消失；把此前导出的 `gateway_fixes` 喂回这里即可。
+
+四个请求整形与卫生相关的键（四者都在上文的 batch HARD 清单里；后三个默认全关 / 为空，既有配置的行为逐位不变）：
+
+- `preserved_reasoning`（2026-11-26 起默认 `true`）：保留每一轮 assistant 的推理，在**同一轮**的后续请求里随工具结果一并回传。DeepSeek（`reasoning_content`）、GLM、Anthropic 扩展思考模型这几家的 API 都要求跨工具调用把推理带回来，模型才能延续思路。是否划算量过 A/B（2026-11-26，每格 3 次重复），在同一个网关的两个端点上各量了一次。OpenAI 兼容端点（`deepseek-flash`）上，打开后回归任务集的成功率不降，总 token 更省——压缩修复之前少约四成、修后少 31%；Anthropic 协议端点（`hw-vol-deepseek`）上反而多花 26%。两次的差别都全部来自会触发压缩的长任务；不压缩的四个短任务逐任务在 −55% 到 +51% 之间来回跳，是每格 3 次的噪声（见 `docs/kernel_improvement_plan.md` §0.0.5）。默认打开，是因为省 token 的那一次恰好落在长任务最疼的地方——但只量过这一个网关、两个模型名，而且两个端点之间方向就变了，自己的任务请自己量。不想要回显时设 `false`：网关拒绝这个额外的请求字段（内置 OpenAI provider 会从第一个 400 学到、之后丢掉回显，仅记在内存里），或者部署上需要历史与 session 文件与这个字段出现之前逐字节一致。代价：该轮每个后续请求都要重发保留的推理（多花输入 token，计入压缩触发估算），会话文件里会包含思考文本。生命周期只有当前轮——新的 user 轮、切换模型、相邻同角色消息合并都会把整段历史里的推理丢掉；会话归档永不携带。
+- `extra_body`（可选对象）：合并进每个 chat 请求的额外顶层字段——配置没有专门键的厂商开关，例如 GLM 的 `{"thinking": {"type": "enabled"}}` 或中转站的路由标签。必须是对象；内核自己拥有的键（`model` / `messages` / `system` / `tools` / `stream` / `stream_options` / `max_tokens` / `max_completion_tokens`，以及设置了 `reasoning_effort` 时的 `reasoning_effort` / `thinking` / `output_config`）在加载时即拒绝。
+- `extra_headers`（可选对象）：每个 chat 请求附带的额外 HTTP 头（中转站的租户头、`anthropic-beta` 开关）。不能覆盖内核管理的头（认证、content type、协议版本）——加载时即拒绝。值按凭据对待：debug 输出打码，配置指纹只哈希头名。
+- `env_passthrough`（变量名列表）：工具子进程（`shell`、stdio MCP server）本会被隐藏、但允许看到的变量。默认情况下它们继承的环境里恰好被移除 `api_key_env` 指向的那一个变量（见「⚠️ 安全说明」）；确实需要密钥的子进程——比如对同一网关发 `curl`——用 `"env_passthrough": ["THE_KEY"]` 放行。库从不修改进程环境：移除发生在每次 spawn 时，agent 自己的请求照常读到密钥。
 
 `inject_environment`（默认 `true`）：构造 agent 时在 system prompt **最前面**插入一段运行环境事实：
 
@@ -478,9 +548,13 @@ API key 从 `api_key_env` 指定的环境变量读取，不写进配置文件。
 
 `limits.subagent_max_turns`（默认 25）：`task` 子 agent 的轮次天花板，生效值是 `min(父 max_turns, 本值)`——子 agent 是**有界的支线**，没有天花板时一个卡住的子 agent 会一直烧父的循环预算，直到父自己的 `max_turns` 用尽；父的 run 仍是真正的墙钟护栏（共享取消标志）。设 `0` = **不另设天花板**（子 agent 原样继承父的 `max_turns`）——这是最松取值，故批量任务片段只能**收紧**（更小值），片段设 0 会被忽略、放宽会被 `min` 拒绝。子 agent 的轮次**永不高于父**（本值只降不升）。GUI/长工作流宿主把父 `max_turns` 放宽到千级时，记得同步调大本值，否则子 agent 会被默认的 25 掐回去。
 
+`max_tokens`（默认 `8192`）与 `limits.max_context_tokens`（默认 `0`）是两个需要填模型自身数字的旋钮。`max_tokens` 限的是**单次请求的输出**，而思考模型的思考 token 也从这份额度里出——想得久了会把额度吃光、答复被截断（`stop_reason: "max_tokens"`）。某一轮在模型还在思考时被截断，内核会给一行提示 `[context] … hit max_tokens (…) while reasoning — thinking counts against the same output budget …`，每个 run 只提示一次：调大 `max_tokens`（或调低 `reasoning_effort`）。`limits.max_context_tokens` 是模型的**上下文窗口**：设了之后 preflight 闸门按 token 估算、在窗口的 ~85% 处压缩（见[上下文压缩](#上下文压缩)）；留 `0` 则没有按 token 的压缩，全靠 `compress_threshold_chars` 字符启发式（≈4 字符/token——CJK 文本接近 1 字符 1 token，中文占比高的 run 会冲过阈值），再往后只剩溢出恢复兜底。窗口未设时内核在启动时打印一行 `[warn] [context] limits.max_context_tokens is not set: …`（headless 与 batch 写 stderr；TUI 显示为一条 diag 行）。两个默认值都不改：默认配置依旧合法。
+
 `reasoning_effort`（可选字符串，默认不设）：思考程度，**按字符串原样透传给 provider，不做枚举校验**——各家档位碎片化且随模型代际变动，TinyAgent 不维护映射表，由 provider/server 拒绝未知值。取值参考：OpenAI `none`/`low`/`medium`/`high`/`xhigh`/`max`（随模型代际扩张）、Anthropic `low`/`medium`/`high`/`max`（Claude 4.6+ adaptive thinking；Opus 4.7 起旧 `budget_tokens` 已移除）、DeepSeek `low`/`high`/`xhigh`/`max`、GLM 仅开关（`enabled`/`disabled`）。映射：OpenAI 系直接发 `reasoning_effort` 字段（老网关不认会 400，`body_fix_for_400` 自动 drop 重试，与 `max_tokens`/`stream_options` 同款）；Anthropic 发 `thinking: {"type": "adaptive"}` + `output_config: {"effort": "..."}`（effort 在**独立顶层 `output_config` 对象**里，不在 thinking 内、也不是裸顶层字段——裸顶层会被静默忽略，这是该 API 最常见的坑），`"none"` 发 `{"type": "disabled"}`。
 
-**思考内容透出**：推理模型的思考过程作为 `ThinkingDelta` 事件流式透出（OpenAI 系 `delta.reasoning_content`、Anthropic `thinking` content block），`--json` 下为 `{"type":"thinking","delta":...}`；**不进对话历史正文与上下文回传**（各家 API 也不要求回传，故只作事件透出给 UI）。GUI（如 TinyWorker）据此渲染可折叠"思考过程"区块；headless 终端把思考写到 **stderr**（不污染 stdout 的最终回复 / `summary`）；TUI 渲染为**独立的暗色斜体 `✻` 区块**（不走 markdown、与答复正文视觉分离，流式期间输入框标题显示 thinking，结束后随答复一起定稿进 scrollback）。批量任务片段可覆盖此项（软字段，与 `model`/`max_tokens` 同类，不在 `forbidden_batch_override`）。
+**思考内容透出**：推理模型的思考过程作为 `ThinkingDelta` 事件流式透出（OpenAI 系 `delta.reasoning_content`、Anthropic `thinking` content block），`--json` 下为 `{"type":"thinking","delta":...}`；默认**不进对话历史正文与上下文回传**（只作事件透出给 UI）。
+唯一的例外是 `preserved_reasoning`（默认开；见上文）：此时 provider 的推理块保留在 assistant 消息的旁字段里，
+在**当前轮**的后续请求中回传给同一模型——同样不进答复正文。GUI（如 TinyWorker）据此渲染可折叠"思考过程"区块；headless 终端把思考写到 **stderr**（不污染 stdout 的最终回复 / `summary`）；TUI 渲染为**独立的品红斜体 `✻` 区块**（不走 markdown、与答复正文视觉分离，流式期间输入框标题显示 thinking，结束后随答复一起定稿进 scrollback）。批量任务片段可覆盖此项（软字段，与 `model`/`max_tokens` 同类，不在 `forbidden_batch_override`）。
 
 ### 上下文压缩
 
@@ -503,6 +577,14 @@ API key 从 `api_key_env` 指定的环境变量读取，不写进配置文件。
      回退全历史估算。这是「按模型真实窗口压」，推荐。锚点同款校准也驱动 `context_breakdown()`
      的 `calibration`（见[库 API 文档](docs/lib_api.md)），可用它观察压缩前后的构成变化。
    - 未设（`0`，默认）：回退 `compress_threshold_chars`（默认 400k 字符 ≈100k tokens，`0` = 关闭）的字符启发式。
+
+   前馈折叠最多保留 `keep_recent_messages` 条原文——**若这个窗口本身就超过阈值下空间的一半，则保留更少**
+   （按闸门自己的单位量：设了 `max_context_tokens` 用 token，否则用字符）。此时保留「尾部装得下半个空间」的
+   最宽窗口，把另一半留给头部与接下来几轮的增长。不这样做的话，尾部很重的 run 每次折叠后立刻又越过阈值，
+   每轮付一次摘要、却只换来一两轮的空间（deepseek-flash 上实测：56 轮里折叠 32 次，其中 27 次只丢 2 条消息；
+   这 32 轮的中位耗时 16.1 秒，其余 24 轮 2.5 秒）。
+   窗口只会变小——最小到最后一轮完整回合为止——`keep_recent_messages: 0`（「全部折叠」）原样保留。手动压缩与
+   溢出恢复仍按配置的窗口来。
 2. **溢出（overflow）兜底**——**永远开启，与上面配置无关**。当 provider 返回「上下文过长」类错误
    （`context_length_exceeded` / `prompt is too long` / `maximum context length` 等，子串匹配错误体）
    时，先剪枝重试，仍溢出则强制摘要压缩一次并**重试该回合一次**；小窗口场景下折叠后仍溢出
@@ -514,7 +596,9 @@ API key 从 `api_key_env` 指定的环境变量读取，不写进配置文件。
 3. **宿主主动（manual）**——库用户在轮次间调 `Agent::compact()` / `compact_with(events, Some("focus …"))`
    （见「[库 API](docs/lib_api.md)」节，Python/Node 绑定同款 `compact(instructions?, on_event?)`）：GUI 的上下文
    占用指示到 80%+ 时点一下即压，不等阈值也不赌溢出；焦点指令引导摘要侧重（如"重点保留 API 变更"）。
-   摘要 usage 返回给宿主记账，不进下一次 run 的账单。
+   摘要 usage 返回给宿主记账，不进下一次 run 的账单。TUI 里 `/compact [focus]` 就是同一调用换了键盘入口。
+   想在折叠前存下自己笔记的库宿主实现 `Hooks::on_before_compact`——在历史真的被折叠之前同步调用一次，
+   带触发原因、消息计数、当前 todo 清单与即将离开的历史消息（见「[库 API](docs/lib_api.md)」节）。
 
 摘要质量上：模型把中段历史写成**结构化滚动摘要**（目标/进展/决策/改动文件/报错与解法/下一步；关键
 路径/标识符/错误文本要求**逐字引用**，抑制多次压缩的累积漂移），折叠进首条任务消息，只保留任务 +
@@ -522,6 +606,28 @@ API key 从 `api_key_env` 指定的环境变量读取，不写进配置文件。
 边界**分块**摘要再合并，把单次压缩比控制在 ~6:1，保住路径/报错等细节。切割点选在 assistant 消息边界，
 保证 tool_use/tool_result 配对不被切断；压缩失败时告警一次并禁用本次运行的后续压缩（不中断任务，
 也不每轮重试刷屏）。
+
+摘要器读到的折叠前缀是一份**摘录转写**：每个工具调用、工具结果都裁到 `limits.summary_preview_chars` 个字符
+（默认 200；`0` 只留名字 / 标签），所以几 MB 的输出转储不会变成几 MB 的摘要 prompt。裁的是摘要器看到的东西——
+主模型读的活历史从不受影响。摘要自身的输出预算与转写长度成比例（≈16 字符/token，夹在 1024–4096 之间，再受
+本轮 `max_tokens` 封顶）。**推理模型需要更多**：思考与正文共用同一份额度，被 `max_tokens` 截断的摘要曾是常态
+（deepseek-flash 的三个付费批次里 240 次摘要调用有 204 次在 1024 token 的预算下限处截断，其中 199 次带思考）。所以**被截断且带思考**的摘要会以两倍预算
+（至多 8192）重试一次；一个字都没回来的同样重试一次。重试只会更好，不会更坏——它正常结束 → 用它的正文；
+它又被截断 → 两段正文里取长的；它被拒绝（严格网关对翻倍后的值回 400）、失败或中途断流 → 用第一次的正文。
+每次尝试都计费、都上报；用户取消时照旧什么都不折叠。拒绝过翻倍预算的网关，这个 agent 之后不再向它要这个预算；
+重试被正常服务后，这个 agent 之后摘要的预算下限随之抬高（这两条学习跨 run 保留，换了模型重新开始）。**不带思考**
+的截断摘要保持一贯的单次尝试。摘录更宽不一定更好：同日实测（3 次重复），1000 对默认的 200 在
+`long-output` 上贵 3.4 倍，模型还整批重读文件去核对更详细的摘要。调大之前先在自己的模型上量。
+
+**保护窗的实测取舍**（2026-11-26，deepseek-flash，3 次重复）：`keep_recent_messages: 0`（整段压成一条摘要、
+一条原文都不留）明显更差。五个回归任务里只有 `long-output` 会触发压缩：默认 8 通过 2/3，0 通过 0/3——三次都
+撞满轮数上限，每次折叠后模型都从头重读已经数过的文件（摘要被截断，进展没带过去）。所以默认值保持 8，调小之前
+先在自己的模型上量；实验数据见 `docs/kernel_improvement_plan.md` §0.0.5。
+
+**自适应保留窗与摘要重试的实测**（2026-11-26，deepseek-flash，同一配方跑修复前后的两个二进制，6 任务 × 3 次
+重复）：只有 `long-output` 会压缩，它的通过从 1/3 到 3/3，折叠 82 → 21 次（只丢 2 条消息的 79 → 1 次），没有
+一份最终摘要再被截断（修前 82 份里 71 份），主请求的输入 token 降到约四分之一；整套任务 14/18 → 17/18。带折叠
+的轮次更慢了（中位 13.1 → 16.6 秒：摘要更长，首次被截断时还要多发一次请求），run 的总耗时反而下降。
 
 **折叠后的保真**（对齐 Claude Code / Codex 的压缩后恢复）：随摘要一起折回头部的还有两样结构化内容——
 (a) **todo 清单**：`todo` 工具没有读取模式，模型对计划的唯一视图是最近一次 todo 结果的渲染清单，折叠
@@ -542,6 +648,24 @@ id 语义：折叠消息的 id 随原件迁入归档（离开活历史）；剪�
 压缩摘要请求自身的 token 用量也计入运行累计（`input_tokens` / `output_tokens`），
 成本数字与实际调用一致，不因压缩而漏报。
 
+**工具表规模（固定成本）**：每次请求都携带完整工具表，任何压缩都折叠不了它。当工具表估算规模
+**超过 1 万 token 或超过 30 个工具定义**时（阈值取自 Anthropic 的 Tool search 文档，属经验值而非
+provider 限制），TinyAgent 在构造 agent 时经内核 diag 通道**每进程提示一次**（headless / batch 模式写
+stderr；TUI 启动时把提示打印在视口上方）：
+
+```
+[context] tool definitions ≈ 11416 tokens across 42 tools.
+  Over both advisory lines (10000 tokens, 30 tools).
+  Fixed cost on every request; compaction cannot fold it.
+  Trim tools / MCP servers, or move rarely used tools into skills.
+  Rules of thumb from Anthropic's Tool search docs, on estimates.
+```
+
+`/context` 在工具四类下方给出同一段提示，数字取报表当时的口径（有存活校准时 token 数按校准缩放，
+工具数不缩放）；库宿主从 `ContextBreakdown.tools.advisory()` / `tool_count()` 读判定（见
+[库 API](docs/lib_api.md)）。**只提示不处置**：不会自动裁剪、重排或延迟加载——可精简 `tools` /
+`mcp_servers`，或把少用的工具挪进 skill。
+
 ### Prompt caching
 
 Anthropic 原生 provider 默认开启 prompt caching：每个请求自动在 **system prompt / tools / 末条消息**
@@ -561,7 +685,7 @@ Anthropic 原生 provider 默认开启 prompt caching：每个请求自动在 **
 
 - `shell` 工具原样执行模型生成的命令（`sh -c` / `cmd /C`），无任何命令过滤。
   模型可以 `rm -rf`、`curl ... | sh`、访问网络——与其赋予进程的权限一致。
-- **每个子进程继承完整宿主环境变量**（shell 工具、MCP stdio server、代码沙箱经 `shell`）。其中包括 `api_key_env` 指向的凭据值——它按设计就驻留在进程 env 里，所以每个被 spawn 的子进程都读得到（round-3 探针：种入的环境变量经「直调 shell」与「guest→shell」双路可达）。config 从不落盘凭据值本身，但把凭据挡在子进程之外只有进程级隔离（容器 / 受限用户）这一条路。
+- **子进程继承宿主环境变量，但不含 API key 变量**（shell 工具、MCP stdio server、代码沙箱经 `shell`）：`api_key_env` 指向的变量会从工具拉起的每个进程里移除——模型顺手执行 `echo $THE_KEY` 什么也打不出来，密钥不再进入 transcript、session 文件与 `--json` 事件流。**这是防顺手，不是隔离**：其余变量仍完整继承（不想让模型读到的其他密钥，就不要放在这次运行的环境里）；同用户进程仍可经操作系统读到父进程的环境（Linux `/proc/<pid>/environ`、macOS `ps eww`）。确实需要密钥的子进程用 `"env_passthrough": ["THE_KEY"]` 放行；单个 MCP server 也可以在自己的 `env` 条目里拿到它（显式配置的条目始终优先）。配置里有 `shell` 工具或 stdio MCP server 时，启动会打印一行提示，说明隐藏了哪个变量。
 - 文件工具默认不限制路径：`read_file ../../etc/passwd`、
   `write_file /etc/cron.d/x` 都会被执行。
 - **在 CI / 评测 pipeline 中批量运行不可信的第三方 task 时**，务必：
@@ -628,9 +752,12 @@ TinyAgent 的定位是**可审计、可无人值守的 agent 执行单元**—�
   "output_tokens": 567,
   "cache_creation_input_tokens": 300,
   "cache_read_input_tokens": 1500,
+  "reasoning_tokens": 88,
   "summary": "agent 的最终文本回复",
   "tool_calls": [
-    { "name": "write_file", "input": {...}, "output": "wrote 42 bytes", "is_error": false, "duration_ms": 3 }
+    { "name": "write_file", "input": {...}, "output": "wrote 42 bytes", "is_error": false, "duration_ms": 3 },
+    { "name": "mcp_fs_read_file", "input": {...}, "output": "…", "is_error": false, "duration_ms": 12,
+      "annotations": { "read_only_hint": true, "destructive_hint": false, "idempotent_hint": true, "open_world_hint": false } }
   ],
   "turn_timings": [
     { "turn": 1, "duration_ms": 2100, "tool_calls": 1 },
@@ -640,7 +767,7 @@ TinyAgent 的定位是**可审计、可无人值守的 agent 执行单元**—�
     { "trigger": "preflight", "dropped": 8, "folded_ids": ["m3","m4","m5","m6","m7","m8","m9","m10"], "kept": 6, "estimated_tokens_before": 152000, "estimated_tokens_after": 41000, "measured_tokens_before": 148220 }
   ],
   "config_fingerprint": "3f9a1c2e4b5d6071",
-  "gateway_fixes": { "max_completion_tokens": true, "no_stream_options": false, "no_reasoning_effort": false },
+  "gateway_fixes": { "max_completion_tokens": true, "no_stream_options": false, "no_reasoning_effort": false, "no_reasoning_echo": false },
   "plan": [
     { "subject": "跑测试", "status": "completed" },
     { "subject": "修失败用例", "status": "in_progress" },
@@ -664,8 +791,10 @@ TinyAgent 的定位是**可审计、可无人值守的 agent 执行单元**—�
   Agent 的热更新换挡（`set_model` 等）改变生效形状但不改已出账指纹，换挡后对比台账请重建
   Agent（或每 run 一建）。凡真正构建出 agent 的终态都写 `config_fingerprint`——失败 run 也在内
   （重试梯耗尽 / `request_error` / 退避中取消），「模型 + harness」配对台账同样覆盖它们；只有
-  空归属终态（`bad_task` / 未启动 / `panic`）缺席。`gateway_fixes`——openai 兼容网关迄今为止学到的请求体修复（三布尔位，
-  凭据无关），仅当至少学到一位才出现；喂回下个进程配置的 `gateway_fixes_preset` 可跳过教学 400。
+  空归属终态（`bad_task` / 未启动 / `panic`）缺席。`gateway_fixes`——openai 兼容网关迄今为止学到的请求体修复（四布尔位，
+  凭据无关），仅当至少学到一位才出现；喂回下个进程配置的 `gateway_fixes_preset` 可跳过教学 400。第四位
+  `no_reasoning_echo` 只在 `preserved_reasoning` 开启时才可能出现：网关对回显上一轮 `reasoning_content` 的请求回 400，
+  provider 由此学会在后续请求里把它剥掉。（带这一位的预置文件，早于它的二进制读不了——预置解析拒绝未知键。）
   这是 provider 的进程内累计集（预置 + 此后学到的，OR 合并），**不是**单 run 增量——同一 Agent
   多次 run 导出同值；要逐 run 增量请自行 diff 相邻 outcome。第三个台账键
   `arbitrations_used`（可选，**稀疏**——没有仲裁即缺席而非写 `0`，启用前的结果文件逐字节不变）：
@@ -681,7 +810,15 @@ TinyAgent 的定位是**可审计、可无人值守的 agent 执行单元**—�
 - `attempts` 是实际执行的 agent 运行次数（`>1` 表示发生了瞬态重试，见下文「单跑瞬态重试」）。批量侧：终态先于 agent 构建时记 `0`（任务片段非法、隔离 setup 失败、从未启动即取消）；重试轮构建失败保留已进入的 attempt 计数
 - `input_tokens` / `output_tokens` 是本次运行累计的 token 用量；`cache_creation_input_tokens` /
   `cache_read_input_tokens` 是 prompt 缓存写/读累计（Anthropic 两者都报，OpenAI 只报读）。`input_tokens`
-  只含未缓存部分，真实计费输入需加上缓存写 1.25× / 读 0.1×（见上文 Prompt caching）
+  只含未缓存部分，真实计费输入需加上缓存写 1.25× / 读 0.1×（见上文 Prompt caching）。
+  `reasoning_tokens`（可选）是 provider 上报的 `output_tokens` 中的推理份额（OpenAI 兼容端的
+  `completion_tokens_details.reasoning_tokens`）——**子集拆分、不是第五根轴**：绝不叠加在 `output_tokens` 之上，
+  也没有任何预算闸门读它。跨 run 的每次请求求和（含 `task` 子 agent 与失败的 attempt）；没有任何上报时该键缺席，
+  非推理模型的结果文件不变。批量 `report.json` 按任务以及在 `totals` / `averages` 里同款镜像，同样只在有上报时才写
+- **MCP 工具**的 `tool_calls[]` 条目带一个可选的 `annotations` 对象——调用当时 server 对该工具的自述
+  （`read_only_hint` / `destructive_hint` / `idempotent_hint` / `open_world_hint`；server 没声明的按规范默认值补齐，
+  故只有 `idempotent_hint` 可能缺席）。它记录的是 server **声称**的内容，供运行后审计与宿主策略钩子使用
+  （见「[库 API](docs/lib_api.md)」节）；内核不据此强制任何行为。内置工具没有这一项
 - agent.run 返回 `Err`（如 provider 503）时仍会写结果文件：`{"success": false, "stop_reason": "error", "error": "..."}`；
   不可救的上下文溢出（强制压缩未能救回）记 `stop_reason: "context_overflow"`，确定性请求拒绝
   （401/403/404/400 等）记 `"request_error"`（两者都不进瞬态重试，exit code 仍为 1），与 batch report 同口径
@@ -718,7 +855,8 @@ GUI 可渲染"正在构造调用…"（headless 终端不重复打印——完�
 实测用量（当前上下文占用的真值——ctx 占用指示应只认它）；`true` = 某个工具调用的账单折进
 运行累计（`task` 子 agent 的多轮累计、run_code 内层 llm、宿主工具自行上报的用量——在该工具的
 `tool_call` 与 `tool_result` 之间发出，**不是**对当前历史上下文的测量）。两种风味都计入运行
-累计总额；两者对你含义不同时按该标记分支。
+累计总额；两者对你含义不同时按该标记分支。事件另带一个增量键 `reasoning_tokens`（恒出现）：该次上报的
+`output_tokens` 中的推理份额——与 result.json 里同一个「子集」数字——provider 不报拆分时为 `0`。
 `turn_arbitration` 仅在宿主的轮末仲裁钩子否决了模型完成时出现（FR-1）：
 `{"type":"turn_arbitration","turn","continued","note"}`——`continued:true` 表示后面还有一轮
 （note 走监督者旁注管线，投递点落 `note_injected` 事件）；`continued:false` 表示续跑帽已满，
@@ -1027,8 +1165,19 @@ metadata:
 2. 字段格式参考 references/REFERENCE.md ...
 ```
 
-> 单行标量字段只支持单行值（多行 YAML 折叠不支持）；`metadata` 是唯一支持缩进 `key: value` 块的字段。
-> 未知字段忽略（标准允许）。
+> 四个标量字段（`name` / `description` / `license` / `compatibility`）与 `metadata` 的每个值，既可以写单行值，
+> 也可以写 **YAML 块标量**——`|`（literal，换行保留）或 `>`（folded，同缩进两行之间的换行折成一个空格），
+> 可带 `-` / `+` chomping 与缩进指示符——标准允许、真实技能文件也常这样写长描述：
+>
+> ```yaml
+> description: >
+>   从 PDF 表单里抽取字段并输出 JSON。
+>   用于表单类文档（AcroForm、XFA）；纯文本 PDF 不适用。
+> ```
+>
+> 块内容按缩进收集：第一条缩进不深于键所在行的行就是下一个键，所以 `metadata:` 块可以紧跟其后。
+> 值会被 trim，因此 chomping 指示符不改变结果。刻意仍不支持（不引 YAML 依赖）：多行*裸*标量、块序列
+> （`- item`）与嵌套映射——`metadata` 仍是唯一支持缩进 `key: value` 块的字段。未知字段忽略（标准允许）。
 
 ### 三级渐进式加载
 
@@ -1114,6 +1263,66 @@ cargo bench -p tiny-agent-core --features mock --bench loop_bench -- --quick
 `crates/core/src/agent.rs` 的 `#[cfg(test)]` 模块覆盖 cancel 契约（run 永不清、预置即取消、受理点 `clear_cancel`）、tool_use/tool_result N:N 配对（含中途取消的
 合成 `[cancelled by user]`）、上下文压缩、usage 累计等不变量。**改 `agent.rs` 核心路径请配套补 loop 测试。**
 
+另有两套真进程套件用本地 mock 驱动真实 CLI 二进制，零密钥零成本：`scripts/e2e_scenarios.py`
+（CI 的 `e2e` job：打转护栏、并行子 agent fan-out、SIGINT exit 130）与 `scripts/e2e_mcp.py`
+（`python3 scripts/e2e_mcp.py`，不是 CI 门禁：MCP stdio 与 Streamable HTTP 的线上行为——
+协商、超时、取消通知、会话恢复、凭据卫生）。
+
+### 回归任务集（`examples/regress`）
+
+六个端到端任务，每个都带脚本化的零成本路径和基于文件的判卷脚本——进程内 loop 测试给不了的
+「内核有没有变差」这张网：
+
+| 任务 | 守的是什么 |
+|---|---|
+| `multi-file-edit` | 两个单测失败：读契约、修库代码（不改测试）、重跑测试 |
+| `long-output` | 十个读轮次共约 75 KB 工具输出，中途被压缩多次——结果必须边跑边落到文件 |
+| `mcp-many-tools` | 十二个工具的 MCP server：只用到其中三个并做一次联结，其余九个不碰 |
+| `recover-after-failure` | 第一条命令就失败：定位原因、修掉、保存输出 |
+| `cjk-docs` | 中文文档按三条机械规则整理（术语、标点、标题层级），其余一律不动 |
+| `loop-suppression` | 永远等不到完成的轮询必须提前收手，而不是烧完轮次预算 |
+
+一个任务就是一个目录 `examples/regress/tasks/<id>/`：
+
+```
+<id>.json      任务片段（task + limits）——与 --batch 目录里的任务文件同格式
+harness.json   评测侧数据，永不进模型可见的配置：类别、底配置覆盖、零成本通道的
+               脚本化模型（examples/mock_script.py 的格式）
+check.py       通过条件：`python3 check.py <result.json>`（cwd = 本次 run 的 workdir），
+               退出 0 = 通过。结论只来自这里
+fixture/       运行前拷进 workdir 的初始文件（可选）
+setup.py       生成数据：`python3 setup.py <workdir>`（可选）
+expected/      脚本经 {"$file": "expected/…"} 引用的参考文件（可选）
+```
+
+```sh
+python3 scripts/regress_eval.py check      # CI 门禁（e2e job；./scripts/check.sh e2e 也跑）
+```
+
+`check` 对每个任务 × 两种线协议（OpenAI 兼容与 Anthropic）证明三件事：脚本化正路径通过；
+「什么都不做」的模型过不了判卷；同一任务跑两次汇总逐项相等。随后用一份指向 `127.0.0.1:9`
+的假付费配置把付费通道的闸门逐条走一遍——`check` 在任何环境下都发不出一次付费请求。
+评测脚本自己的离线单测在 `scripts/tests/test_regress_eval.py`（本地 pytest，不进 CI）。
+
+门禁之外，评测脚本把一份配方冻结成批次、在内核版本之间做对比：
+
+```sh
+python3 scripts/regress_eval.py prepare examples/regress/recipes/kernel-regress.json \
+    --price-table prices.json --cost-stop 5     # 冻结二进制 + 任务哈希与逐 run 配置
+python3 scripts/regress_eval.py run artifacts/regress/<批次>            # dry-run：只打印计划
+python3 scripts/regress_eval.py run artifacts/regress/<批次> --execute  # 付费
+python3 scripts/regress_eval.py compare --a <旧 summary.json> --b <新 summary.json>
+```
+
+- **付费通道。** `run` 不带 `--execute` 只是 dry-run；冻结时没同时给价表**和**费用停止值的批次
+  会被以 `blocked_paid` 拒绝。密钥只由 CLI 经配置里的 `api_key_env` 读取；评测脚本从不读、也
+  不落盘密钥值。费用停止值的比较对象是「已花 + 下一个 run 的最坏预留」——用量报不全的 run
+  按预留记进已花，绝不当 0。
+- **配方**（`examples/regress/recipes/`）：`kernel-regress`（改内核前后的基线；成功率下降时
+  `compare` 失败）、`reasoning-carry`、`compression-handoff` 与 `summary-preview`（A/B 实验，重复轮次间
+  两臂交替）、`mock-smoke`（整条流水线的零成本走查）。`prepare <付费配方> --mock openai` 让同一批任务走
+  脚本化通道，零成本；`--base-config <文件>` 覆盖配方里的底配置。
+
 ## 发布流程
 
 版本号同步在 **6 处**（改一处漏一处会造成绑定包与核心版本漂移）：根 `Cargo.toml`、
@@ -1156,67 +1365,67 @@ cargo bench -p tiny-agent-core --features mock --bench loop_bench -- --quick
 <!-- BEGIN CODE STRUCTURE (generated by scripts/gen_structure.py) -->
 ```text
 crates/core/src/  # kernel crate (package tiny-agent-core, lib name tiny_agent): agent loop / tools / providers / config / assembly
-├── lib.rs                (  618)  # lib root: build_agent* / assemble (tool table, ToolCtx, code install, skill injection)
+├── lib.rs                (  803)  # lib root: build_agent* / assemble (tool table, ToolCtx, code install, skill injection)
 ├── fsutil.rs             (  477)  # atomic-write primitives (O_EXCL temp + fsync + dir fsync; shared by session/result/report)
 ├── diag.rs               (  179)  # diagnostics channel: global sink installable by GUI hosts (falls back to stderr, byte-identical) — soft-failure warnings of skills/MCP/session/run_code go through it
-├── config.rs             ( 3443)  # config parsing + task-fragment merge + batch override whitelist
+├── config.rs             ( 4313)  # config parsing + task-fragment merge + batch override whitelist
 ├── provider/  # LLM backends
-│   ├── mod.rs                ( 1191)  # shared Message/Block, SSE reader, CancellableSse
-│   ├── openai.rs             ( 2388)  # OpenAI-compatible (include_usage; 400 fallbacks: max_tokens→max_completion_tokens / drop stream_options)
+│   ├── mod.rs                ( 1654)  # shared Message/Block, SSE reader, CancellableSse
+│   ├── openai.rs             ( 3088)  # OpenAI-compatible (include_usage; 400 fallbacks: max_tokens→max_completion_tokens / drop stream_options)
 │   ├── openai_review_pins.rs ( 1003)  # openai review pins (loopback HTTP: status matrix/credential discipline/retry body; ThinkStripper differential + idle timeout)
 │   ├── sse_review_pins.rs    (  245)  # SSE parser review pins (chunk-boundary invariance across 17 stream shapes, sync vs worker path)
-│   ├── anthropic.rs          ( 1246)  # Anthropic native (message_start/message_delta usage)
-│   └── mock.rs               (  361)  # scripted Provider for tests (cfg(any(test, feature="mock")))
-├── agent.rs              ( 4768)  # core loop + usage accounting + cancel + context compression (preflight/overflow dual trigger + rolling chunked summaries) + adjacent-message normalization + same-turn multi-task parallelism
-├── agent_tests.rs        (11903)  # core-loop regression tests (scripted provider::mock, no network)
-├── usage_probe.rs        (   94)  # thread-local usage side channel for parallel workers: recovers billed usage after a panic unwind at the join point (keeps result.json and the shared counter from diverging)
-├── compress.rs           ( 1079)  # compression engine (find_safe_cut / chunked summaries / saturating usage merge + block-level billing primitives)
-├── context_report.rs     (  901)  # context composition breakdown (ContextBreakdown estimate: 3 system parts / 4 tool classes / message typing + anchor calibration)
+│   ├── anthropic.rs          ( 1937)  # Anthropic native (message_start/message_delta usage)
+│   └── mock.rs               (  437)  # scripted Provider for tests (cfg(any(test, feature="mock")))
+├── agent.rs              ( 5429)  # core loop + usage accounting + cancel + context compression (preflight/overflow dual trigger + rolling chunked summaries) + adjacent-message normalization + same-turn multi-task parallelism
+├── agent_tests.rs        (15042)  # core-loop regression tests (scripted provider::mock, no network)
+├── usage_probe.rs        (   97)  # thread-local usage side channel for parallel workers: recovers billed usage after a panic unwind at the join point (keeps result.json and the shared counter from diverging)
+├── compress.rs           ( 1480)  # compression engine (find_safe_cut / chunked summaries / saturating usage merge + block-level billing primitives)
+├── context_report.rs     ( 1356)  # context composition breakdown (ContextBreakdown estimate: 3 system parts / 4 tool classes / message typing + anchor calibration)
 ├── retry.rs              (  158)  # exponential backoff shared by batch --retries and single-run transient retry (±25% jitter against lockstep)
-├── session.rs            (  533)  # session persistence (atomic writes + fold archive)
-├── skills.rs             ( 1491)  # three-tier skill loading (built-in / user dir / project)
-├── hooks.rs              (  335)  # hooks gate (Deny / Modify / audit)
+├── session.rs            (  608)  # session persistence (atomic writes + fold archive)
+├── skills.rs             ( 1768)  # three-tier skill loading (built-in / user dir / project)
+├── hooks.rs              (  412)  # hooks gate (Deny / Modify / audit)
 ├── tools/  # toolset: built-in tools + MCP wrappers + task sub-agent + run_code (feature code)
-│   ├── mod.rs                ( 1573)  # Tool trait + ToolCtx + CallbackTool/SharedTool + whitelist assembly
-│   ├── shell.rs              ( 1305)  # shell tool (unix: sh -c; Windows: cmd /C + raw_arg verbatim command passing, defeating std quoting)
-│   ├── file.rs               ( 1672)  # read_file / write_file / edit_file / list_dir
+│   ├── mod.rs                ( 1795)  # Tool trait + ToolCtx + CallbackTool/SharedTool + whitelist assembly
+│   ├── shell.rs              ( 1381)  # shell tool (unix: sh -c; Windows: cmd /C + raw_arg verbatim command passing, defeating std quoting)
+│   ├── file.rs               ( 1676)  # read_file / write_file / edit_file / list_dir
 │   ├── image.rs              (   87)  # load_image tool
 │   ├── document.rs           (  100)  # PDF → Block::Document loading (lib API load_document_block)
-│   ├── skill.rs              (  991)  # read_skill / list_skill (outside the whitelist; injected by assembly)
-│   ├── mcp.rs                (  674)  # MCP tool wrapper (sanitize_name + wire_name dispatch)
-│   ├── subagent.rs           ( 1105)  # task sub-agent tool (own context + turn cap; non-recursive)
-│   ├── todo.rs               (  311)  # todo tool (task plan, full replacement; plan lands in result.json)
+│   ├── skill.rs              (  993)  # read_skill / list_skill (outside the whitelist; injected by assembly)
+│   ├── mcp.rs                ( 1049)  # MCP tool wrapper (sanitize_name + wire_name dispatch)
+│   ├── subagent.rs           ( 1285)  # task sub-agent tool (own context + turn cap; non-recursive)
+│   ├── todo.rs               (  313)  # todo tool (task plan, full replacement; plan lands in result.json)
 │   ├── run_code.rs           (  103)  # run_code facade (feature code): mod declarations + symbol re-exports; implementation in run_code/ submodules
-│   ├── llm.rs                (  740)  # llm judgment primitive (feature code + code.llm gate): single-shot stateless inner model call — LD-17 reserve/settle, LD-18 label normalization, shared Provider cell
+│   ├── llm.rs                (  743)  # llm judgment primitive (feature code + code.llm gate): single-shot stateless inner model call — LD-17 reserve/settle, LD-18 label normalization, shared Provider cell
 │   └── run_code/  # run_code submodules (same code gate): split from the original 11.9k single file by concern
 │       ├── contract.rs           (  936)  # guest-facing contract text: reserved names/CODE marker/byte caps, PRELUDE three sources, skill md loading, strip_once
 │       ├── sandbox.rs            (  806)  # wasmtime sandbox: QuickJS module load & cache, epoch/fuel/MemLimiter, CallTrace, HostCtx, wall clock, guest memory read caps
-│       ├── guest_api.rs          ( 3587)  # host function surface: unpack/read/write, host_call_tool dispatch, inner-result envelope, llm marker parse folding, audit meta
+│       ├── guest_api.rs          ( 3603)  # host function surface: unpack/read/write, host_call_tool dispatch, inner-result envelope, llm marker parse folding, audit meta
 │       ├── fs_policy.rs          ( 2444)  # fs/glob policy: path interception & lexical normalization, write-dir constraints, symlink checks, glob matching (** folding + segment caps)
 │       ├── lib_index.rs          ( 2051)  # lib family: session library index/read-write caps, sha256, reserved names, include delivery
 │       ├── batch.rs              ( 2289)  # callBatch: wave scheduling, output admission (total-cap degradation), entry envelopes
 │       ├── precheck.rs           (  858)  # FR-2 precheck: lexer + keyword-hit rendering
-│       ├── tool.rs               ( 1096)  # the tool itself: RunCodeTool state machine + Tool impl (hash-pinned description/schema)
-│       └── test_util.rs          (  123)  # shared test helpers (cfg(test): scratch/ctx/llm assembly)
-├── mcp.rs                ( 5995)  # MCP client (stdio / Streamable HTTP incl. 202→GET stream / legacy SSE)
+│       ├── tool.rs               ( 1115)  # the tool itself: RunCodeTool state machine + Tool impl (hash-pinned description/schema)
+│       └── test_util.rs          (  125)  # shared test helpers (cfg(test): scratch/ctx/llm assembly)
+├── mcp.rs                (10045)  # MCP client (stdio / Streamable HTTP incl. 202→GET stream / legacy SSE)
 ├── winjob.rs             (  481)  # Windows Job Object process-tree kill (shared by shell timeout/cancel + MCP child reaping; two drop strategies)
-└── m0_probes.rs          (  337)  # M0 mechanism probes (cfg(test), #[path]-declared in lib.rs): reserve/settle ledger, shared Provider cell, per-request model routing in-process prototype (A-L2b/2c/9 — reused directly by the M3 llm primitive)
+└── m0_probes.rs          (  338)  # M0 mechanism probes (cfg(test), #[path]-declared in lib.rs): reserve/settle ledger, shared Provider cell, per-request model routing in-process prototype (A-L2b/2c/9 — reused directly by the M3 llm primitive)
 
 src/  # CLI crate (package tiny-agent, bin tiny-agent): process shell + headless rendering + batch + TUI
-├── main.rs               ( 1075)  # CLI entry + assembly (build_agent) + --session none
+├── main.rs               ( 1174)  # CLI entry + assembly (build_agent) + --session none
 ├── signal.rs             (  123)  # headless SIGINT → cancel (first press graceful / second hard-exit 130)
-├── batch.rs              ( 4046)  # batch tasks + --retries/--failed + report merging
-├── harness.rs            ( 2578)  # headless mode + result.json + NDJSON + exit codes
-├── harness_tests.rs      ( 1212)  # harness behavior tests (retry ladder / result.json / NDJSON; moved here with harness from the kernel's agent_tests.rs)
+├── batch.rs              ( 4117)  # batch tasks + --retries/--failed + report merging
+├── harness.rs            ( 2695)  # headless mode + result.json + NDJSON + exit codes
+├── harness_tests.rs      ( 1216)  # harness behavior tests (retry ladder / result.json / NDJSON; moved here with harness from the kernel's agent_tests.rs)
 ├── tui.rs                (   20)  # TUI module root (feature tui): mod declarations + public exports (run / transcript_rows)
 └── tui/  # TUI submodules (same tui gate): split from the original 8.7k-line single file by concern
-    ├── app.rs                ( 1839)  # session assembly: run entry / worker thread / event & input channels / ui_loop event body / Ctrl-C double-press window
-    ├── input.rs              (  361)  # multi-line InputBuffer editor / input history recall / horizontal input scrolling
-    ├── slash.rs              (  549)  # slash commands: classify grammar / read-only replies / completion popup state machine / /context report
-    ├── theme.rs              (  147)  # theme: single source for history-row & chrome colors / light-dark switch TINYAGENT_TUI_THEME / number formatting helpers
-    ├── markdown.rs           (  632)  # markdown & ANSI rendering: render_markdown / escape parsing / fence scanning (shared with streaming splits) / MdCache single-slot cache
-    ├── transcript.rs         ( 1198)  # conversation Row model and all build/mutation logic: history rendering / streaming increments & incremental splits / /export dump / resume rebuild
-    ├── render.rs             (  490)  # terminal drawing: scrollback commit_rows / live-region render / input & status bar chrome / width & control-char utilities
-    └── tests.rs              ( 4164)  # TUI regression tests (TestBackend cell-grid assertions + input / completion / streaming-split logic)
+    ├── app.rs                ( 2362)  # session assembly: run entry / worker thread / event & input channels / ui_loop event body / Ctrl-C double-press window
+    ├── input.rs              (  333)  # multi-line InputBuffer editor / input history recall / word & line editing
+    ├── slash.rs              (  864)  # slash commands: classify grammar / read-only replies / completion popup state machine / /context report
+    ├── theme.rs              (  191)  # theme: single source for history-row & chrome colors / light-dark switch TINYAGENT_TUI_THEME / number formatting helpers
+    ├── markdown.rs           (  722)  # markdown & ANSI rendering: render_markdown / escape parsing / fence scanning (shared with streaming splits) / MdCache single-slot cache
+    ├── transcript.rs         ( 1266)  # conversation Row model and all build/mutation logic: history rendering / streaming increments & incremental splits / /export dump / resume rebuild
+    ├── render.rs             ( 1036)  # terminal drawing: scrollback commit_rows / live-region render / input & status bar chrome / width & control-char utilities
+    └── tests.rs              ( 5106)  # TUI regression tests (TestBackend cell-grid assertions + input / completion / streaming-split logic)
 ```
 <!-- END CODE STRUCTURE -->

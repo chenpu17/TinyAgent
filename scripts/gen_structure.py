@@ -94,7 +94,7 @@ ENTRIES = [
     ("src", "harness_tests.rs", "harness behavior tests (retry ladder / result.json / NDJSON; moved here with harness from the kernel's agent_tests.rs)"),
     ("src", "tui.rs", "TUI module root (feature tui): mod declarations + public exports (run / transcript_rows)"),
     ("src", "tui/app.rs", "session assembly: run entry / worker thread / event & input channels / ui_loop event body / Ctrl-C double-press window"),
-    ("src", "tui/input.rs", "multi-line InputBuffer editor / input history recall / horizontal input scrolling"),
+    ("src", "tui/input.rs", "multi-line InputBuffer editor / input history recall / word & line editing"),
     ("src", "tui/slash.rs", "slash commands: classify grammar / read-only replies / completion popup state machine / /context report"),
     ("src", "tui/theme.rs", "theme: single source for history-row & chrome colors / light-dark switch TINYAGENT_TUI_THEME / number formatting helpers"),
     ("src", "tui/markdown.rs", "markdown & ANSI rendering: render_markdown / escape parsing / fence scanning (shared with streaming splits) / MdCache single-slot cache"),

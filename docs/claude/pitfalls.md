@@ -96,6 +96,13 @@
 - **`panic = "abort"`（`[profile.release]`）**：release 下 panic **不触发 `Drop`**。TUI 的终端还原
   (`TerminalGuard`)、MCP 子进程清理（`StdioTransport::drop`）都依赖 Drop——调试这些行为用
   **debug 构建**。`std::process::exit` 也跳过 Drop，headless 模式退出前显式 `drop(agent)`。
+  **唯一有意的 TUI 例外是终端断开监控**：crossterm 0.29 Unix event source 遇到 tty EOF 会在自己的
+  read loop 内打转（零字节 read 不 break、非 WouldBlock 错误被吞），主线程甚至无法从 `event::poll`
+  返回处理错误，pty 关闭后即 100% CPU。独立 `tui-tty-watch` 线程用 `libc::poll` 探测 HUP/ERR/NVAL，
+  不消费输入；断开后置 cancel + shutdown + 发送 `None`，有界等 worker 退出、显式恢复终端，再
+  `process::exit(0)`。这不是可随手推广的退出方式：只有主线程无法正常返回时才使用，探测未知错误
+  不得杀健康会话。pty 测试的 finally 要清理**整个进程组**，且允许进程已自行退出（killpg 可能
+  报 ProcessLookup/Permission）；失败清理只杀 demo 父进程会留下 tiny-agent 孤儿并复现此问题。
 
   **MCP stdio 有 shutdown-aware teardown（cancel 与 shutdown 是两个独立标志）**：
   `Agent::set_shutdown` 把一个**独立于 cancel** 的 shutdown Arc 经 `Tool::set_shutdown`→
@@ -117,7 +124,10 @@
   **轮内取消（2026-09 审核 #9）**：`McpTool::run` 把 `ctx.cancel` **随单次调用**传入传输层（不是 set_cancel
   传播），stdio/SSE 的响应等待按 ≤50ms 薄片轮询（`recv_cancelable`）——Ctrl-C 在卡死 server 上不再等满
   120s `CALL_TIMEOUT`；取消后 pending 槽由既有错误路径回收、迟到响应被 `pending_dispatch` 丢弃。HTTP 传输
-  仍是整段阻塞 POST（自带 CALL_TIMEOUT 总超时），无切片。`run`/`set_shutdown` 共享 client 锁的顺序依赖
+  2026-11 起同款可取消：直接在 POST 响应体上应答的那次交换（`run_direct`）搬到 worker 线程
+  `mcp-http-exchange` 上跑、调用方薄片轮询，202 应答走 pending 表的通道等待——例外只剩 reader 线程起不来时
+  的一次性 GET 兜底（不可取消）。被取消的在飞请求另发 `notifications/cancelled`（尽力而为、1 s 上限；超时
+  不发——超时的调用 server 可能已经做完）。`run`/`set_shutdown` 共享 client 锁的顺序依赖
   （set_shutdown 可能短暂排在一个在飞调用后面，由切片轮询兜底）注释钉在 `tools/mcp.rs`。
 - **`serde_json::json!` 宏按所有权取值**：`From<&Value>` / `From<Option<_>>` 不存在。给宏传
   `&String`/`&Value` 要 `.clone()`；`Option<&str>` 要显式转成 `Value::Null` 或 `json!(s)`。
@@ -172,7 +182,8 @@
   `Clamp` 并补一行 `merge`。**`let PartialLimits { ... } = l;` 是穷尽解构、没有 `..`**——
   新字段不分类就是编译错误，这是刻意设计（旧版手写 if-chain 曾把 0-哨兵逻辑化石复制四份、
   悄悄丢过覆盖），禁止为"省事"加回 `..`。同理 `Config::apply` 顶层的 `PartialConfig`
-  解构也是穷尽的。
+  解构也是穷尽的。内核之外还有三处要跟着改（评测装置的 clamp 镜像、两份 README、指纹），见下面
+  「给 `limits` 加键的四处同步」。
 - **批量 `--retries` 只重试 transient**（`stop_reason == "error"`），指数退避 1..32s 封顶；
   `bad_task`/`max_turns` 等确定性失败不重试。transient 判定是 `RunError` 上的小型分类
   （`is_transient`，单跑梯与 batch 共用）：provider HTTP 拒绝带结构化状态码（`ApiStatusError`，
@@ -269,11 +280,90 @@
   （`GITHUB_PERSONAL_ACCESS_TOKEN` / 连接串 / `XXX_API_KEY`）。`#[serde(default)]` 向后兼容；`validate()` 不拦
   （HTTP 传输忽略 env，不报错——env 只对 stdio 生效）。两条 Command 链（unix `process_group(0)` + `#[cfg(not(unix))]`）
   都要加 `.envs`，别只改一条。
+- **MCP 改动的测试与验证（2026-11，2.4 的教训；行为不变量见 architecture「MCP 客户端契约」）**：
+  ① **改完一项就跑全量 clippy 组**（`./scripts/check.sh clippy`）：只跑内核 crate 会漏掉 CLI crate 里的新
+  lint（测试里的 `useless_format`、TUI 臂里的 `clone_on_copy` 各漏过一次，到四配置门禁才红）。
+  ② **装 diag sink 的测试先拿 `TEST_LOCK` 再装**：进程级 sink 是全局单例，`DiagCapture` 构造时先锁后装，
+  断言只看含针的行（并发跑时别的测试的 diag 行会混进来）。
+  ③ **往大文件测试块尾部 splice 用 `rfind` +「锚在文件尾」断言**：`    }\n}\n` 在 `mcp.rs` 里出现几十次，
+  首匹配会插到文件中段。
+  ④ **真实进程 mock 的坑**（`scripts/e2e_mcp.py`）：每个场景用新日志文件（追加写会把上一场景的行带进断言
+  ——SIGINT 早于 handler 安装、握手序列翻倍都是这么出的假红/假绿）；只答 202 的 mock 必须等 standing GET
+  连上再推送（否则回复落空、调用方坐满超时——顺带暴露了客户端 POST 前布防的竞态窗口，architecture ⑤）；
+  OpenAI 格式的 user `content` 可能是块数组不是字符串；「调用已到达 server」要认**到达时**写的日志行
+  （慢调用只在完成时记一行的话，Ctrl-C 会早于 server 真正开工）。
+  ⑤ **轮转间隙里的请求**（2026-11 修掉；此前记为「已知偶发」）：`legacy_sse_post_follows_the_fresh_endpoint_after_rotation`
+  全量并发跑时偶发「tools/list timed out」或 404、单跑稳定。根因在产品代码而不在测试：读线程到期轮转时
+  丢掉旧 GET 再开新连接，`post_url` 只在新连接的 `endpoint` 到达时才刷新——这段间隙里发出的请求被 POST 到
+  旧会话；会话绑定的 server 靠**定时器**回收会话（python-sdk 每 100ms 轮询，不是断开瞬间），这种 POST 照样
+  被应 202、应答写进已关闭的连接，调用方等满 CALL_TIMEOUT。测试只是碰巧把请求落进了间隙（持 `TEST_LOCK`
+  等多久不受自己控制）。修法在传输层：轮转**先退役** POST 目标（置 `None`）再丢连接，`post_target` 等新
+  `endpoint`（界 = connect 键，看得见 cancel 与死亡 latch；取消通知不等）；mock 加了「重连的 `endpoint`
+  延迟 / 会话在 GET 关闭后存活多久」两个旋钮（`mock_legacy_session_bound_endpoint_with`），间隙可以被测试
+  走进去。**教训**：时序型偶发先当产品缺陷查根因，别只给测试加重试或余量；「server 在连接断开瞬间回收
+  资源」是没验证过的假设。仍然存在的相邻限制：**已经出门**的请求跨过轮转边界时，应答依赖 server 在新
+  连接上重发——不重发即丢失、调用方坐满 CALL_TIMEOUT（模块顶部 `STREAM_ROUND` 注释明示的取舍；要关掉得
+  「排空在途请求再轮转」，未做）。配套新测试踩过的坑：会制造 diag 告警的测试若不持 `TEST_LOCK`，告警会漏进
+  当时正持锁装汇的测试（`http_standing_stream_rotations_stay_silent` 断言零告警且不过滤）——扣住**响应头**的 mock
+  让每次重连在连接阶段超时，走的是「重连失败」告警路径；mock 现在立刻发响应头、只扣 `endpoint` 事件（读阶段超时
+  = 静默轮转）。新测试单独跑一遍、数一数 stderr 上的 `[warn]` 行再加进套件。
+- **`#[cfg(windows)]` 后的代码本地编译不到——加字段/改签名后做一次 Windows 目标交叉检查（2026-11，内核改进计划
+  2.4 的教训）**：给 `McpServerConfig` 加四个字段后，本机 fmt、四套 clippy、全部测试全绿；到 Windows 目标上
+  做交叉检查才发现 `mcp.rs` 三个 `#[cfg(windows)]` 测试（`stdio_drop_on_windows_…` / `windows_reaper_kills_…` /
+  `windows_set_shutdown_twice_…`）的 `McpServerConfig { … }` 字面量没补字段——CI 的三平台矩阵 job 第一步就是
+  `cargo clippy --all-targets`，推上去 Windows 格当场红（同批 2.5 给 `StdioTransport::spawn` 加参数时这三处
+  **调用点**改了、字面量漏了）。它与 feature 盲区同构，只是本地没有对应的「第五个配置」。**规则**：加字段/改签名后，
+  `cfg(windows)` / `cfg(not(unix))` 块里的字面量与调用点单独过一遍（`grep -rn 'cfg(windows)' crates src bindings`
+  定位块，再看块内构造点），并跑一遍下面的交叉检查。
+  **配方**（不装任何工具链；只做类型检查 + lint，**不是实跑**——Windows 测试仍只在 CI 上执行）：本机只有 zig 时
+  `ring` 的 build script 会先倒——cc-rs 把 Rust 三元组原样传给 zig（`--target=x86_64-pc-windows-gnu`），zig 只认
+  `-target x86_64-windows-gnu`。临时目录放一个包装脚本，只改写这一个参数后转给 zig：
+  `args=()`；`for a in "$@"; do case "$a" in --target=x86_64-pc-windows-gnu) args+=(-target x86_64-windows-gnu);;`
+  `*) args+=("$a");; esac; done`；`exec zig cc "${args[@]}"`。然后
+  `export CARGO_TARGET_DIR=<临时> ZIG_GLOBAL_CACHE_DIR=<临时> ZIG_LOCAL_CACHE_DIR=<临时>`（别污染日常构建目录
+  与 zig 缓存，收尾一并删）、`export CC_x86_64_pc_windows_gnu=<包装脚本> AR_x86_64_pc_windows_gnu="zig ar"`，再把
+  CI 四套 clippy 原样加上 `--locked --target x86_64-pc-windows-gnu` 跑一遍，外加
+  `--features tui,code,mock --all-targets` 一套把 mock 门后的测试也编到。CI 的 Windows 格是 msvc 目标；第一方
+  代码没有 `target_env` 分支，gnu 目标对 `cfg(windows)` 代码等价（阳性对照：往 Windows 专属测试里放一个未用变量，
+  这套 clippy 会以 `unused_variables` 失败——说明它真的在 lint 这部分代码）。绑定 crate：Python 另设
+  `PYO3_CROSS_PYTHON_VERSION`（如 `3.12`）；Node 的 napi-build 在 Windows 目标上无条件找 `libnode.dll`（找不到就
+  panic、没有跳过开关），本机没有 win32 的 node 库时把 `LIBNODE_PATH` 指向一个放了同名空占位文件的临时目录即可
+  （`cargo clippy` 不链接，只过它的存在性检查）。
 - **思考内容展示策略**：`ThinkingDelta` 在 `harness` 的 `--json` NDJSON 发 `{"type":"thinking","delta":...}`；
-  headless 终端打印写 **stderr**（不进 stdout 的 `summary`，可 `2>/dev/null` 屏蔽）；TUI 用 or 模式
-  TUI 渲染为独立暗色斜体 `✻` 区块（`Row::Thinking`，不走 markdown/MdCache，与答复视觉分离；可折叠区块仍是 TinyWorker 的事）。
+  headless 终端打印写 **stderr**（不进 stdout 的 `summary`，可 `2>/dev/null` 屏蔽）；TUI 渲染为独立
+  独立色斜体 `✻` 区块（`Row::Thinking`，不走 markdown/MdCache，与答复视觉分离）。**Thinking 不走
+  Assistant 的提前分块定稿**：live 只画有界尾部，关闭后整块提交；超过 8 个显示行折叠为头部 + 末尾
+  3 行，`/thinking [n]` 用 `Row::ThinkingFull` 追加重印完整原文，`/export` 始终拿完整原文。别为了
+  复用 Assistant 切分把前文提前塞进不可变 scrollback——那样最终无法再折叠。
   子 agent 的思考经 `AgentEvent::SubAgent` 整体包装转发（`subagent.rs` 不逐变体 match），harness 的 SubAgent 内嵌
   match 单独把它写 stderr 带 `[name]` 前缀。
+- **TUI 显示宽度必须按 grapheme，不是按 `char`**：composer、最终 wrap、display-row 测量与截断共用
+  `LayoutCell`（`unicode-segmentation` + `unicode-width`）；`👩‍💻`、`❤️` 等 ZWJ/variation-selector
+  序列逐 char 拆会分字、错光标甚至切出残字。`InputBuffer.col` 仍是 UTF-8 byte offset，只有
+  `layout_composer` 的 source→cell 映射能决定视觉 caret；exact-full-width、drop-space 两侧与窄屏
+  continuation 要跑真实 TestBackend cell-grid/cursor 测试，别用字符串宽度目测。**角色/工具标识变更
+  必须同步 `render.rs::continuation_prefix`**：`◆` 替换 `●` 时若漏掉这里，长回答的续行会丢掉两列
+  悬挂缩进；用真实 `wrap_line` 钉子覆盖新符号，不能只改首行快照。
+- **TUI 滚动区画面疑似重叠要用真实终端模拟器交叉核对**：`insert_before` + DECSTBM scrolling-region
+  操作可能让 pyte 重放出 composer、工具行与状态行互相覆盖的假画面；这不足以证明产品回归。真实 Kitty
+  重放同一流程可对 pyte 结果证伪。视觉验收应同时保存真实终端的 screen/scrollback 文本与样式捕获，
+  再检查 cell grid；不要只凭一次 pyte 整屏文本或“看起来对”下结论。 Kitty ANSI 的 colon-form indexed
+  SGR（如 `48:5:234`）若交给 pyte 二次渲染，需先规范化成 `48;5;234`，并按 CR/LF 喂入视觉行，避免
+  截图渲染器自己制造颜色或折行伪影。**根因（2026-11 定位）**：pyte 0.8.2 根本没实现 `CSI S`（SU）/
+  `CSI T`（SD）——`csi['S']` / `csi['T']` 是 `None`，落进 debug no-op；而 TUI 提交 scrollback 靠的正是
+  DECSTBM + SU（ratatui `scrolling-regions`），所以 pyte 里视口上方的行永远不上移、每个已提交块都盖在
+  顶部几行上——假重叠是模拟器的缺口，不是产品的回归。补法见文末「pyte 重放 TUI 的三个假象」。
+- **Assistant soft-cut 的放弃路径不得改原文**：先验证 EOF 空尾、全空前缀，再一次性 `split_off` /
+  `truncate`；先 pop 换行再 return 会让 `"\n\n"`、空 fence 等流式内容静默丢字节。fence 状态只看
+  切点前的完整逻辑行（半个 `"```ab"` 不是 closing fence），未闭合 inline code 内不切，closing fence
+  滑到 EOF 不切。Markdown 已按正文宽度预折行，**不要再把裸 `◆ `/continuation 宽度重复计入 soft-cut**；
+  正确性用真实 `build_history_lines → wrap_history` 的切分前后逐行等价测试钉住。
+- **TUI 队列不能做成 transcript ghost**：`VecDeque<String>` 是唯一真值，queue preview 仅 render-only；
+  真正发送才追加 `Row::User`，否则未发生的输入会阻塞 commit watermark。失败置 Failed + queue_paused，
+  只有 `/resume` 释放旧 FIFO；另发新 prompt 不得隐式放行，重复 cancel 不得重复刷状态行。
+  **`queue_paused` 必须蕴含队列非空**：失败时队列为空不置位、`/unqueue` 取走最后一条要解除（两处都经
+  `pause_for_held` 派生），取消清队直接置 false——残留标志会把后续正常运行中排入的消息误标 paused
+  并在轮末扣住。
 - **TUI 子 agent 文本气泡不切分是既定决策，但它是平方级成本**：live 区对 SubAgent 气泡的每个
   流式 `TextDelta` 都全量重解析整块 markdown（切分/增量渲染留后续）——单气泡渲染成本
   O(气泡字节数²)。实测（bench profile，24KB 文本 / 300 个 delta）：子气泡路径 ≈371ms（≈单次
@@ -353,3 +443,171 @@
   `deepseek-flash` / `glm-5.3` / `glm-5.3-flash` / `k3`。`vol-` 前缀只对
   Claude Code 接入端有效；评测/绑定测试一律用网关名（`v0b_eval.py` 默认值
   即正确）。新会话第一次真模型烟雾门撞 400 时先查这里，别急着改装置。
+- **内核改进计划落地时踩到的坑（2026-11；行为契约见 architecture 各「内核改进计划 x.y」条）**：
+  - **工具表估算的两个重算点必须同量纲（0.2）**：`refresh_tool_defs` 曾按字节数累加，构造路径用的是 CJK
+    感知的 `compress::tool_schema_units`——热增一个带中文描述的 MCP 工具之后，同一个 agent 的两条路径估算
+    口径就不一致（中文描述在热增路径上被低估三倍）。现在「重算工具表」只有 `tool_schema_units_sum` 一个函数；
+    新增重算入口别再手写 `.map(|t| …len()).sum()`，回归钉子比对的是「热增后 == 一次性构造」。
+  - **块标量 ≠ 多行裸标量（0.3）**：`description: >` / `|` 是认的多行形式；`description:` 换行后直接缩进续行
+    （YAML plain scalar 续行）**仍不支持**——必填字段读成空 → `Missing` → `[skill]` 告警跳过，不会解析出
+    半截值。块头必须**整段**是 `|` / `>` 加至多一个 chomping 指示（`-` / `+`）与一个 1–9 的缩进指示
+    （`parse_block_header`）：`description: | # 说明` 这类带尾随内容的行**不是块头**（真 YAML 会当成块头 +
+    注释），这里被当成单行标量、值就是那串字面文本——静默降级不报错。归属只看缩进（第一条缩进 ≤ 键缩进的
+    非空行就是下一个键），所以 `metadata:` 可以紧跟在折行的 description 后面；chomping 校验后忽略（值恒
+    trim）；`description` ≤1024 的上限作用在拼接并 trim 之后的值上。
+  - **`tools/list` 翻页：任一页失败 = 握手失败（0.1）**：翻到一半的残缺工具表比没有更糟（模型看得到、
+    调用却失败）；单页 server 的请求序列与翻页之前逐字节相同（无 `nextCursor` 即停），重复出现已跟过的
+    游标即停并告警，上限 64 页 / 256 工具。改翻页逻辑先看
+    `handshake_follows_tools_list_cursor_pagination` / `handshake_stops_on_a_repeated_cursor` 两根钉子。
+  - **回归评测装置（0.4）的九条**：① **臂压过 mock 调参**——`build_config` 的叠加顺序是底配置 ← 任务覆盖 ←
+    （mock 专用覆盖）← 臂覆盖 ← 任务片段。臂是实验变量、必须说了算；把臂放在 mock 调参之前，「把
+    `keep_recent_messages` 压到 0」的臂会被任务的 mock 调参悄悄改回去（先写 pytest 才抓出来的）。
+    ② **清单脱敏要进嵌套**：`extra_headers` 在顶层，MCP 的 `headers` / `env` 嵌在 `mcp_servers` 里——只脱
+    顶层会漏；`base_url` 与 MCP `url` 要去掉 query / fragment（有的网关把密钥放在那里）。
+    ③ **任务片段的 `limits` 按 `Clamp` 语义合并**（只能收紧），`LIMIT_CLAMPS` 是 `config.rs` 里 `Clamp` 的
+    镜像——内核那边改了某个键的变体，这边要同步。
+    ④ **改写过的 mock 必须真执行一遍**：`mock_anthropic.py` 的一份重写有语法错误，只有 `check`（每个任务 ×
+    两种线协议各真跑一遍）抓出来——静态核对替代不了真跑。
+    ⑤ **两条通道都要隔离环境，而且不止 `XDG_CONFIG_HOME`**：`[skill]` 的全局查找跟着它走，否则开发者本机
+    的真实技能目录会漏进轨迹（CI 与开发机跑出不同的请求；付费通道起初沿用开发者环境，第一次真机批次就
+    漏了）。批次目录又在仓库里——workdir 自己不是仓库时 git 会向上找到外层仓库，模型跑一句
+    `git status --short; git diff` 就把开发者未提交的改动发给了模型，换成 `git stash` 就是改坏工作区。
+    现在 `run_env` 对两条通道一并设 `XDG_CONFIG_HOME`（run 目录内的空目录）与 `GIT_CEILING_DIRECTORIES`
+    （run 目录 + 全部祖先；workdir 自己是仓库时照常被发现），三根钉子：配置目录隔离、真实 `git init` 仓库里
+    从 workdir / run 目录 / 祖先都找不到仓库而 workdir 是仓库时仍找得到、mock 批次里脚本化的
+    `git rev-parse --show-toplevel` 得到 `rc=128`。挡不住的只剩「先 `cd` 到批次的祖先目录再 git」。子进程不继承
+    父进程的 `sys.dont_write_bytecode`——mock / setup / check 的子进程要带 `PYTHONDONTWRITEBYTECODE=1`，否则
+    仓库里落 `__pycache__`。
+    ⑥ **费用停止按「已花 + 下一个 run 的最坏预留 ≥ 停止值」判**：用量报不全的 run 按预留记进已花、绝不当 0；
+    `--cost-stop` 只收正的有限数（bool / `inf` / `0` / 负数都当配置错误）；`result.json` 缺失时 `turns`
+    记 0，汇总不崩。**停止值还要大于单个 run 的最坏预留**（现价表与 `reasoning-carry` 的 limits 下约 3.9 USD）：
+    预留比停止值大时第一个 run 就被挡下——批次目录里 0 个 run、花费 0、exit 0（2026-11-26 给 3.0 被挡、改 7.0 才发车），
+    很容易看成「跑完了」。判卷脚本对 `shell` 工具结果数行要记得**首行是 `$ <命令>` 回显**（`shell.rs`）。
+    harness 自身的单测（`scripts/tests/test_regress_eval.py`）不进 CI——**动 harness 先写测试再改**。
+    ⑦ **文档里写的命令行形状也要排练**：`run <批次目录>`、`prepare --base-config` 按相对路径给出是文档里的
+    写法，而零成本 `check` 走的是绝对临时目录，从没走过这条路。2026-11-26 第一次真机批次六个 run 全部在
+    启动阶段 `cannot read config file`（子进程的 cwd 是 run 目录，相对的配置文件路径在那里解析不到；没发出
+    请求、花费为零）。现在 `run` / `summarize` 把批次目录、`prepare` 把 `--base-config` 都解析成绝对路径
+    （清单里记的也是绝对路径），两条用例钉住。一条通道第一次真跑之前，先用**与文档逐字相同的命令行**对
+    mock 配方排练一遍。
+    ⑧ **mock MCP server 的每个工具都要有一条「合法调用」探针**：脚本化模型只走任务需要的那几个工具，没被
+    脚本调过的工具等于没测过——`transfer_stock` 的参数校验要求每个参数都是非空字符串，整数 `units` 被判成
+    `missing argument 'units'`，零成本通道一直是绿的，真实模型白撞 25 次（一次 run 的全部工具错误）。
+    `test_every_mock_mcp_tool_accepts_a_well_formed_call` 以 `TOOLS` 为真值源，新增工具不补样例即失败；
+    整数参数改在工具处校验。
+  - **推理回传是旁字段，别把它做成 Block（1.1）**：进了 `blocks` 就会触发「新增 Block 变体四层清单」，
+    并让空回复判定 / 零块仲裁 / salvage 探测 / TUI 转录全都看见它。失效规则是「整段剥、永不剥一半」：
+    剥 = `push_user` 开新 user 轮 / `set_model` / 相邻同角色合并；不清 = 工具结果并入尾 user 消息 /
+    压缩折叠与裁剪。**给 `GatewayFixes` 加位是单向门**：它带 `deny_unknown_fields`，带新位的 preset 旧
+    二进制读不了。**「provider 产出」≠「落历史」**：内置 provider 无条件填 `ChatResponse.reasoning`，
+    是否落历史只看 `Config.preserved_reasoning`——断言历史里没有 reasoning，不代表 provider 没产出。
+  - **`Usage.reasoning_tokens` 为 0 不出键（1.4）**：`Usage` 结构体与 result.json / report.json 侧
+    `skip_serializing_if`，NDJSON `usage` 事件却恒出现（harness 手写映射）。任何「这些键恒在」式的断言
+    循环都会在它上面翻车；要测它就给 mock 一帧带 `completion_tokens_details.reasoning_tokens` 的 usage。
+    它是 `output_tokens` 的子集拆分，永远不要加进总量。
+  - **`extra_body` / `extra_headers` 的校验在加载期（1.3）**：`extra_body` 里写内核自有键（`model` /
+    `messages` / `tools` / `max_tokens` …；设了 `reasoning_effort` 时还有 `thinking` / `output_config` /
+    `reasoning_effort`）是配置错误而不是静默覆盖；报错不回显值（header 值是凭据），`ExtraHeaders` 别派生
+    会打值的 `Debug`、别把它打进日志；`Config::fingerprint` 对 `extra_headers` 只哈希头名。
+  - **模型窗口提示测纯函数那一半（1.5）**：`Limits::context_window_hint()` / `context_window_line(cfg)` 是
+    纯函数；打印半边（`harness::note` → stderr）在 `cargo test` 并发下抓不住也不必抓。**每进程 / 每 run
+    一次的 diag 提示别数调用次数**（窗口提示是 CLI 启动时打一次，思考烧穿提示按 run 去重）——测判定与
+    文案，不测「发了没」。
+  - **MCP 注解是旁表，加字段要扫全部字面量构造点（1.6）**：`McpToolInfo` 多了三个注解与 `output_schema`，
+    `ToolCallRecord` 多了 `annotations`，`ToolCtx` 多了 `tool_annotations`——Rust 测试与两个绑定里按字面量
+    构造的地方都要补（编译器点名 Rust 侧；绑定侧的 JS / Python 字典不会）。旁表的唯一构造点是
+    `annotation_table`（`Agent::try_new` + `refresh_tool_defs` 调），新增改工具表的入口必须过后者，否则
+    旁表与实际分发表不一致。`ToolAnnotations::MISSING` 是「server 什么都没声明」的规范默认值，
+    `idempotent_hint` 规范没有默认、恒 `None`。**它是 server 的自述**：别让调度或审批把它当成保证。
+  - **`on_before_compact` 的三个「不触发」（2.2）**：摘要失败 / 空摘要 / 仅 prune 都没有折叠可通知——把
+    钩子挪到摘要之前（「先通知再决定」）或在这些路径上也调一次，都会破坏「观察点 = 每次折叠恰一次」。
+    它是唯一 panic 被兜住的钩子（裸 `catch_unwind`——发布构建 `panic = "abort"` 兜不住，实现仍不该
+    panic）。TUI 侧两个细节：`{e:#}` 打印 anyhow 包装的 `CompressError` 会把 cause 链打两遍（它既 Display
+    成 source、又暴露 `source()`），要对内部的 `c.source` 直接格式化；`/compact` 是 idle-only，忙时的
+    命令要留在 composer 而不是被吞掉。
+  - **工具表规模提示与 `/context` 必须同数（2.3）**：装配期没有 `ToolsBreakdown`，提示用
+    `tool_table_tokens(system, tool_schema_chars)` 现算（system 段之后的 running-floor 份额）——别用
+    `tool_schema_chars / 4`（差一个 floor 舍入就会和 `/context` 差 1）。判定是严格大于。提示经 diag 通道、
+    每进程按文本去重，所以**同一测试进程里只能观察到一次**：文案断言用 `tool_defs_advisory_lines` 纯函数。
+    另（既有瑕疵，未改）：`main.rs` 在 `tui::run` **之前** `build_agent`，装配期的 diag 行（`[skill]` /
+    `[config]` / `mcp: server ready` / 本提示）此时 TUI 的 diag bridge 还没装，走 stderr fallback 打进
+    未进 raw 的终端，长行被终端按右缘硬折（断词）——所以提示文案每行都远小于 80 列。
+  - **新增 spawn 点的凭据卫生清单（2.5）**：凡是工具 / MCP 传输 / 宿主自定义工具拉起子进程，必须
+    ① 读 `ctx.hidden_env`（agent 装配时算好的集，默认恰是 `api_key_env` 指向的那一个变量）② 对每个名字
+    `Command::env_remove`（两条平台链都做）③ MCP 条目自己 `env` 里显式写出的同名变量保留——
+    `.envs(&cfg.env)` 先于 `strip_inherited_env` ④ 补一个「变量在子进程里不可见」的探针测试（真 spawn）。
+    **库从不改进程环境**（定位是防顺手不防对抗）：别图省事在装配时 `env::remove_var`——会波及同进程的
+    其他 agent 与宿主自己。探针测试同样不改进程环境（测试并行跑）：拿每个测试进程都有的现成变量名
+    （unix `HOME` / windows `USERNAME`）当「要藏的名字」传进 hidden 集，先做对照组（不藏 ⇒ 子进程读得到）
+    再断言藏了读不到；缺 python 解释器或变量不存在时自跳过。`tools/llm.rs` 里的
+    `hidden_env: Vec::new()` 是测试专用代码，不是 spawn 点。
+  - **真模型验证的三个内核发现（2026-11-26，§0.0.5；行为契约见 architecture 对应三段）**：
+    ① **推理模型的摘要截断**：推理 token 与正文共用 `max_tokens`，三个付费批次的 240 次摘要里 204 次（85%）
+    在下限 1024 处截断（199 次带思考）——「截断仍连贯」对带思考的截断不成立（会话文件里的终版摘要在半行
+    断掉）。**数摘要调用别用启发式**：以 `compressed` 事件后面紧跟着的那条 `usage` 为准；「不带缓存且
+    输出 ≥ 1024 的 usage 就是摘要」会把主对话的长回复算进去（第一次这样数出 252 / 231，其中 7 次是主对话、
+    17 次是预算高于下限的调用——复查 artifacts 才纠正，文档里差点留下错数）。重试阶梯见
+    architecture，这里记三个易错点：**「带推理」有两个信号**（`resp.reasoning` 有块，或
+    `usage.reasoning_tokens > 0`——只看前者会漏掉「只报计数、不流 `reasoning_content`」的网关），而且必须在
+    `merge_usage` 合并之前读；**重试的 `Err` 不能直接透传**（手里已有第一段正文时折它——落 `compress_failed`
+    会连带关掉之后的溢出恢复），取消是例外；**预算学习挂在 agent 上、跨 run 保留**（`set_model` 才清），
+    别写成「每 run 重置」——TUI 的同一个 agent 跑几十个 run，每 run 重学等于每 run 先付一次截断的摘要。
+    ② **折叠抖动与自适应保留窗**：只改 Preflight 一条路径（`compress()` 里 `CompressTrigger::Preflight =>
+    self.adaptive_keep()`），Manual / Overflow 保持配置窗——溢出恢复要的是最大折叠量，不是「刚好过线」。
+    两个闸门的量纲不同：`window_usage` 对字符闸门用 `total_chars`、对 token 闸门用 `estimate_tokens` ×
+    锚点 scale；`gate_room()` 与 `over_compaction_threshold` 必须是同一个判定（改阈值判定时两处一起改）。
+    **写压缩用例先数消息条数**：`find_safe_cut` 要求 `n > keep + 2`，7 条消息的夹具测不了 keep = 6
+    （合法地返回 `None`，不是 bug）；切点只落在 assistant 上，名义起点是 tool_result 时会前滑到下一条。
+    ③ **隔次重复窗口的差一**：`RepeatWindow::observe` 的返回值原样进模型可见文案（「已返回同样结果 n 次」），
+    首次必须是 1、提示在该键第 4 次出现时发——实现时写成 `map_or(0, …)`，四个新用例全红（`[8, 9]` 对
+    `[6, 7]`）。教训：**计数器的值进文案时，边界值（恰好等于阈值那一次）要有用例钉住**，并且先怀疑实现
+    再怀疑断言（同批另外三处红是断言 / 夹具错：token 闸门用例把历史下标数错、两处字符宽度各差一）。提示与
+    连续 nudge 用 `if / else if` 互斥，同一次调用不叠两条；硬停只认连续计数，别为了「更灵敏」把窗口计数
+    接进硬停。
+  - **给 `limits` 加键的四处同步（2.2 的 `summary_preview_chars`）**：① 内核侧按上面「新增 `Limits` 字段的
+    接入流程」；② 评测装置的 `LIMIT_CLAMPS` / `LIMIT_DEFAULTS`（`scripts/regress_eval.py`）是 `Clamp` 的
+    镜像，`scripts/tests/test_regress_eval.py` 按正则数 `config.rs` 里被 clamp 的字段数——加字段不更新即红，
+    先跑 pytest 再跑 `regress_eval.py check`；③ 两份 README 的配置样例与 `limits` 说明；④
+    **`Config::fingerprint` 把整个 `limits` 序列化进哈希**——加键让所有配置的指纹偏移一次（钉指纹字面值、
+    跨版本比对的台账要留意），冻结过的 `prepare` 清单（harness 脚本与基配置的 sha256）也要重做。
+  - **默认值翻转会把「非默认才进哈希」的那一侧翻过去（D1）**：`preserved_reasoning` 改默认开之后，进哈希的
+    是显式 `false`。文档别再写「`preserved_reasoning` 非默认时进哈希、旧配置指纹不变」这种绑着旧默认值的话，
+    说成「显式 `false` 才进」。A/B 配方的两臂都写显式值才不受默认值变化影响（`reasoning-carry` 就是）。
+    测试里凡断言「历史不含 reasoning」的，要么显式关掉开关，要么说明当前轮没有回传——默认已经是开。
+- **宽松网关的 200 证明不了回传正确（2026-11-26，Anthropic 线补测）**：`/frank` 这类翻译网关**不校验 thinking 签名**
+  （去掉、改掉照样 200），所以「真端点跑通了」只说明没被拒，不说明回传的内容对。要证明回传忠实，得抓包做三方核对：
+  网关发来的块（把 `content_block_*` 事件按 index 拼回）↔ 会话里的 `Message.reasoning`（`before` 是它在响应 content
+  里的下标；`opaque` 是对象 `{"signature": …}`，不是字符串）↔ 下一次请求里回传的块；核对脚本先做变异自测（改签名 /
+  正文 / 位置、丢块、改工具入参都要抓得出来）。做法是让被测二进制指向一个只听 127.0.0.1 的转发器（去掉认证头再落盘；
+  落盘后按 `x-api-key` / `authorization` 两个头名扫一遍，确认是 0 条），每批跑完对主循环请求逐条查：角色交替、
+  tool_use / tool_result N:N、thinking 只在带 tool_use 的消息里、签名非空、块逐字节一致；用量另算一笔——result.json
+  的输入 / 输出含摘要请求，线上的主循环与摘要请求得**加在一起**才对得上（只加主循环时，折叠过的 run 会「对不上」）。
+  真实线上两个容易写错的点：① 工具调用轮里 thinking 块多半是**空正文 + 一个 `signature_delta`**（`content_block_start`
+  的 `thinking` 与 `signature` 都是空串，没有任何 `thinking_delta`）——空正文不等于未签名，`into_reasoning_block` 只看
+  签名非空，这种块必须保留并原位回传（单测
+  `empty_signed_thinking_between_text_and_tool_use_is_echoed_in_place`）；块序不止「thinking 在最前」，还见过
+  `[text, thinking, tool_use]` 与 `[thinking, text, tool_use]`。② `signature_delta` 是 `content_block_delta` 里
+  `delta.type` 的一个取值，不是顶层事件类型（按顶层类型数它永远是 0）。批次的 `summary.json` 不记摘要调用的次数：
+  重试率只能从抓包里数（连续两个请求体相同即重试）。
+- **pyte 重放 TUI 的三个假象（2026-11 定位，`/compact` 的 pty 验证）**：① **SU / SD 没实现**（见上面
+  「滚动区画面疑似重叠」条的根因）。要忠实模拟就子类化 `pyte.Stream`，在 `__init__` 里
+  `self.csi = dict(self.csi); self.csi.update({"S": "scroll_up", "T": "scroll_down"})`——dispatcher 在解析器
+  FSM 首次推进时才创建，所以必须在首次 feed 之前改；Screen 侧按当前 margins 实现两个滚动（SU 不动光标、
+  区域顶部的行移出，SD 在区域顶部补空行）。② **窗口尺寸要在 fork 之前设好**：`pty.fork()` 之后在父进程里
+  `TIOCSWINSZ`，与子进程第一次 `terminal::size()` 是竞态（新 pty 的 winsize 是 0×0）——
+  `os.openpty()` → 设尺寸 → fork → `setsid` + `TIOCSCTTY` → dup2 → exec。③ **光标查询要按真实位置应答**：
+  裸驱动固定回 `\x1b[<底行>;1R` 会把 inline 视口钉在屏幕底行；真实终端里视口紧跟在启动打印的几行
+  下面、随提交上移。让模拟器自己回（`screen.write_process_input = lambda s: os.write(fd, s.encode())`，
+  pyte 的 `report_device_status` 会回真实行列）才贴近用户看到的布局。另：边读边剥 ANSI 时，缓冲区尾部
+  的半个转义序列会在补全后改变剥离结果——「发键之后的输出」这类标记要打在解码后的缓冲上，别打在
+  剥离后的长度上。
+- **本机 `strip = "debuginfo"` + macOS 27 的 dyld 拒载绑定的 cdylib（2026-11，环境问题，非仓库缺陷）**：
+  症状：`maturin develop` / `npm run build:debug` 都成功，`import tiny_agent` / `require(…)` 当场失败，
+  报 `mis-aligned LINKEDIT string pool`。根因：用户级 `~/.cargo/config.toml` 的 `[profile.dev] debug = false`
+  让 cargo 给 dev profile 默认 `strip = "debuginfo"`，rustc 链接后剥 debuginfo 产出的 cdylib（绑定的
+  `.so` / `.node`）LINKEDIT string pool 起点只按 4 字节对齐（`stroff ≡ 4 mod 8`），macOS 27.2 的 dyld
+  校验 8 字节对齐、直接拒载。可执行文件与 proc-macro 的布局恰好对齐，所以只有绑定暴露；HEAD 的干净
+  导出同样复现（既有）。绕过（只动环境变量，不改仓库与用户配置）：`CARGO_PROFILE_DEV_STRIP=none` +
+  独立的 `CARGO_TARGET_DIR`（免得和日常构建来回切换 profile 互相重编）。要根治可在自己的
+  `[profile.dev]` 里写 `strip = "none"`（本批未代改用户配置）。CI 没有这份全局配置、release profile
+  不受影响——**本地绑定测试挂在这个报错上时先查它，别去改绑定代码**。

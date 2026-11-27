@@ -28,7 +28,9 @@ cargo fmt --all                            # 格式化（CI 有 --check 门禁�
 每次改完**四个 clippy 配置都要跑**（headless / tui / code / tui,code 交叉）：`#[cfg(feature)]` 后的代码，
 不带该 feature 的构建与 clippy 都看不到——单跑一两个会漏。TUI 代码在 `tui` 后；
 `run_code.rs` 与 `agent.rs` 的 `set_code_*` 在 `code` 后；tui 与 code 的**交叉面**
-（TUI 的 CodeLog 渲染、`/code` 命令）只在第四配置可见。CI 里四个 clippy 都带 `-D warnings`，
+（TUI 的 CodeLog 渲染、`/code` 命令）只在第四配置可见。`#[cfg(windows)]` 后的代码是同款盲区——本地
+任何配置都不编译它，只在 CI 的 Windows 格见分晓；动了它或给内核结构体加字段后，按 pitfalls 的
+zig 包装配方做一次 Windows 目标交叉 clippy。CI 里四个 clippy 都带 `-D warnings`，
 本地跑出任何黄字即等于红灯。**`cargo fmt --all` 同理**（CI 的 fmt job 对全 workspace
 `--check`，含双绑定 crate；存量 305 处漂移已在一个纯格式 commit 清零，该 commit 记在
 `.git-blame-ignore-revs`，`git blame` 配 ignoreRevsFile 后可跳过）。CI fmt job 还带两个
@@ -96,7 +98,11 @@ cargo clippy -p tiny-agent-node
   观察到 cancel 是 **EXIT_CANCELLED 终态**（不重试、也不清——清了即复活用户已否决的 run）。
   别给任何 run 入口加回清残留。
 - **新增"消息进历史"入口必须补 id 分配点**（漏了宿主锚点拿到 `None`）。
-- **`ToolOutput`/`ToolCallRecord`/`ToolCtx` 加字段要同步全部字面量构造点**（含两个绑定）。
+- **`ToolOutput`/`ToolCallRecord`/`ToolCtx` 加字段要同步全部字面量构造点**（含两个绑定，也含
+  `#[cfg(windows)]` 后的字面量——后者本地编译不到，见 pitfalls 对应条）。
+- **新增会拉起子进程的代码路径（内置工具 / MCP 传输 / 宿主自定义工具）必须照同款读 `ctx.hidden_env`、
+  逐变量 `env_remove`**——库从不改进程环境，漏一个 spawn 点就是凭据卫生的旁路；配套探针测试
+  （断言变量不可见）并跑 `scripts/e2e_mcp.py` 的 K 组。
 - **错误路径也是账单面**：绑定侧失败要透出结构化成本——run 的 `RunError` 与 compact 的
   `CompressError::burned`（2026-09 起两绑定都以 JSON 错误信封透出，py `json.loads(e.args[0])` /
   node `JSON.parse(err.message)`）；`Hooks::after_tool` 带 `ctx: &ToolCtx`（破坏性改动，趁绑定
@@ -116,20 +122,26 @@ cargo clippy -p tiny-agent-node
 - **思考/工具参数增量透出**：只发事件、永不进 `text`/`blocks`；新增流式透出项照同款纪律抄。
 - **`reasoning_effort` 按字符串原样透传**，不做枚举校验；anthropic 走独立顶层 `output_config`，别用裸顶层字段。
 - **PDF 文档块**：新 Block 变体照四层接入点清单（anthropic / openai 显式报错 / compress 三处 / tui）；token 预估按页×3000。
-- **压缩**：`find_safe_cut` 空尾是合法切点；`summary_call` 空正文（思考烧穿）预算加倍重试一次，effort 恒 `None`。
+- **压缩**：`find_safe_cut` 空尾是合法切点；`summary_call` 至多两次——空正文无条件、**截断且带推理**（reasoning 块或 `usage.reasoning_tokens > 0`）才以翻倍预算（≤8192）重试一次，取较长正文、重试失败折第一段、取消恒 `Err`；预算学习 `SummaryBudget { floor, ceiling }` 挂 agent、跨 run 保留、`set_model` 清；effort 恒 `None`。Preflight 折叠的保留窗只降不升（配置窗自身超 `gate_room()/2` 即缩到能装进一半的最宽尾部，Manual / Overflow 不缩）；摘要摘录宽度 `limits.summary_preview_chars`（默认 200，只能收紧）。
 - **`salvage_on_max_tokens`**：max_tokens 截断且无 tool_use 时一次性 wrap-up nudge；带 tool_use 不 salvage。
-- **打转护栏**：键 =（工具名， canon 生效参数， 结果指纹），同参不同果即进展、不计数；canon 数值统一经 f64 归一（1 与 1.0 同键）；第 3 次 nudge 进历史块、第 6 次 `stuck_loop` 收尾；无闩锁（轮尾直读当前连续计数），轮尾 cancel 优先于 stuck_loop。
+- **打转护栏**：键 =（工具名， canon 生效参数， 结果指纹），同参不同果即进展、不计数；canon 数值统一经 f64 归一（1 与 1.0 同键）；第 3 次 nudge 进历史块、第 6 次 `stuck_loop` 收尾；无闩锁（轮尾直读当前连续计数），轮尾 cancel 优先于 stuck_loop。另有 `RepeatWindow`（最近 8 次调用）对**隔次**同键在第 4、6、8… 次只提示不停（与连续 nudge 互斥，硬停只认连续计数）。
 - **token 预算闸门**：run 级共享计数器父子同读；turn 边界比较的 cap 以 `BudgetGate::cap` 为单源（自身 limits 快照只能收紧）；工具账单按 `ToolOutput::usage_in_shared_budget` 分流——子 agent（已自计）只折 totals，其余工具的 usage 由 fold 代入计数器；并行 worker panic 时已计费 usage 由线程本地 `usage_probe` 回收进合成错误输出。
 - **宿主热更新面**：`set_model` 等不传播给已构造的子 agent 快照（既定决策）；`compact()` 成本绝不进 `self.usage`；run_code 注册表首次执行即冻结 `code.llm`，之后热更改到它发 diag 警告（需重建 agent），普通 limits/路径热更不打扰。
-- **上下文构成分解**：`context_breakdown()` 是拉取式估算查询（system 三段/工具四类 `Tool::origin()`/消息分型），与 Usage 实测口径刻意不混流；等和不变量靠单趟 running-floor；锚点 scale 校准、失效即回 None。
-- **MCP 热增删**：撞名 = Err + 回滚；热增路径不打印；子 agent 与 run_code registry 都不感知（快照语义）；HTTP/SSE 流读取带 30s 轮次上限、teardown 有界 join（≤2s）——热删残留线程/连接至多一轮自回收（改读循环先看 `shutdown_stream_reader` 契约）；legacy SSE 轮转后跟随新连接的 endpoint 刷新 POST 目标、reader 死亡置 latch 快败（stdio 同款）。
+- **上下文构成分解**：`context_breakdown()` 是拉取式估算查询（system 三段/工具四类 `Tool::origin()`/消息分型），与 Usage 实测口径刻意不混流；等和不变量靠单趟 running-floor；锚点 scale 校准、失效即回 None。**工具表规模提示（2.3）**：`ToolsBreakdown::advisory()` 严格大于 10000 估算 token 或 30 个工具才提示（恰好等于不算越过）；token 数与 `/context` 同口径（校准缩放后的 `tokens`），工具数不缩放；顶层 agent 构造期经 diag 通道每进程按文本去重提示一次（子 agent / 热增删不提示），文案单一来源 `tool_defs_advisory_lines`；**只提示不处置**。
+- **MCP 热增删**：撞名 = Err + 回滚；热增路径不打印；子 agent 与 run_code registry 都不感知（快照语义）；HTTP/SSE 流读取带 30s 轮次上限、teardown 有界 join（≤2s）——热删残留线程/连接至多一轮自回收（改读循环先看 `shutdown_stream_reader` 契约）；legacy SSE 轮转后跟随新连接的 endpoint 刷新 POST 目标、reader 死亡置 latch 快败（stdio 同款）；`refresh_tool_defs` 是工具表的唯一重算点——schema 占用与构造路径同一个 `tool_schema_units` 量纲（CJK 感知，别退回字节数）、注解旁表同步重建。
 - **MCP SSE 同源闸门**：endpoint 解析与 POST 发送共用 `reqwest::Url`（真解析器）——别写字符串版 origin 切分，反斜杠混淆可绕过。
+- **MCP 客户端契约（0.1/2.4）**：`tools/list` 翻页（64 页 / 256 工具，任一页失败即握手失败）；`call_timeout_secs` / `connect_timeout_secs`（界与超时文案里的键成对，`0` 与超 7 天即配置错误）；`allow_tools`/`deny_tools` 写 wire 名、在 `start_server` 过滤（allow 的未知名字硬错、deny 的放行）；`initialize` 提供 `2025-03-26`、后续请求带协商版本（未知修订只告警）；取消通知只发给已出门的请求（超时不发）；HTTP 空闲 ≥60 s 先 `ping`（静默 = 调用不发出）；Streamable HTTP 404 → 新会话 + 只重发一次（不重拉工具表）。legacy SSE 轮转时**先退役** POST 目标、间隙里的请求/通知等新 `endpoint` 再发（界 = `connect_timeout_secs`，看得见 cancel 与 reader 死亡；取消通知不等、无当前目标即丢帧）。standing stream 的 POST 前布防是尽力而为的竞态保险（只答 202 的 server 有丢回复窗口，已知未修）。
+- **MCP 注解旁表（1.6）**：`ToolCtx::tool_annotations`（Arc，按**暴露名**索引）是 server 自述的唯一落点——刻意做成旁表而非 `Tool` trait 方法（内置工具 / `CallbackTool` 不必作答，第三方想声明就覆盖 `Tool::annotations`）；唯一构造点 = `Agent::try_new` + `refresh_tool_defs`，所以永远与实际分发的工具表一致；子 agent / run_code guest 持构造时快照；每次调用把快照落 `ToolCallRecord.annotations`。**是 server 的声称、不是内核保证**，没有任何强制。工具声明了 `outputSchema` 时结果的 `structuredContent` 压过文本镜像，否则只做「纯结构化 server」的兜底。
+- **凭据卫生（2.5）**：`ToolCtx.hidden_env` 默认恰是 `api_key_env` 指向的那**一个**变量（`env_passthrough` 列了则为空）；移除发生在每个 spawn 点（`Command::env_remove`：shell 两条链、MCP stdio 两条链 + 热增），**库从不改进程环境**；MCP 条目 `env` 里显式写出的同名变量照常下发（用户有意交给某个 server）；`task` 子 agent 与 run_code guest 的 ctx 克隆原样继承；定位是防顺手不防对抗。启动提示每进程一次、且只在配置里真有 `shell` 或 stdio MCP 时发；`restrict_to_workdir` 未开的无人值守提示只在 headless + batch（TUI 有人在看）。
 - **子 agent（task）**：按 `Tool::concurrency()`/`available_to_subagent()` 能力标记路由，无名字黑名单；共享父 MCP、预算与 cancel；轮次天花板 `limits.subagent_max_turns`（默认 25，`0`=不另设，恒 `min` 父预算——宿主放宽父 `max_turns` 时须同步调大）。
 - **轮末仲裁（FR-1）**：`on_turn_stopping` 仅 top_level×`end_turn`×发 `Done` 前；`Continue` 复用旁注队列（轮首投递），帽 6 对齐 STUCK_STOP_AT，超限 `arbitration_capped`（exit 0，标签在 result.json）；默认 Stop **零漂移**——非默认决策才发 `turn_arbitration` 事件。
-- **推理通道**：`reasoning_content`/`reasoning` 字段 → ThinkingDelta 是协议路径（恒开）；内联 `<think>` 剥离是内容约定（FR-2，`strip_think_tags` 默认开、跨 chunk 边界、正文 fail-closed 无残留）。两者都永不进历史/正文。
-- **Hooks**：Deny 落 `Slot::Ran(error)` 不占 Cancelled，Deny 文案过 `tools::truncate`（ctx 预算）；`after_tool` 带 `ctx: &ToolCtx`（与 before 对称，审计归因 `ctx.subagent`）；Modify 只换执行输入、审计留原始输入；`--resume` 不带走 hooks。审批等待期落下的 cancel 在 **gate→执行检查点**（`ctx_cancelled`，execute_tool_call / 并行 spawn 前 / run_code 内层共用）拒绝执行；并行批另有**每波开波前 + worker 进工具体前**两道复查，已 announce 未运行的调用装配段补发取消 ToolResult（事件配平）；已过 gate 但因 pre-spawn/波间检查点未启动的调用统一转 `Slot::Ran` 占位（进 records + `after_tool(executed=false)`，过的 gate 不留未配对 before——gate 循环被打断、从未过闸的才保持 Cancelled）；并行批的 `sync_channel` 必须在 scope 闭包**内**创建（回调 panic 时 `rx` 随 unwind 销毁才不死锁）。
+- **推理通道**：`reasoning_content`/`reasoning` 字段 → ThinkingDelta 是协议路径（恒开）；内联 `<think>` 剥离是内容约定（FR-2，`strip_think_tags` 默认开、跨 chunk 边界、正文 fail-closed 无残留）。两者都永不进正文；思考增量本身永不进历史，能进历史的只有显式回传的 `Message.reasoning`（下一行）。
+- **推理回传（1.1）**：内置 provider **无条件**产出 `ChatResponse.reasoning`（`Reasoning{provider, blocks}`，旁字段而非 Block 变体——`content` 形状与所有「块形状」规则不变）；`preserved_reasoning` 默认 `true`（2026-11-26 起，D1；显式关时 `try_new` 剥掉 initial 历史里的、之后每个回复的在落盘前丢弃——历史逐字节同开关出现之前；指纹只在显式 `false` 时进）；开了寿命也只有**当前轮**（`push_user` 开新 user 轮 / `set_model` / 相邻同角色合并一律整段剥；工具结果并入尾 user 消息走合并分支**不剥**；压缩折叠与工具结果裁剪保留幸存消息自己的；会话归档永不携带）；子 agent 继承开关；provider 只回显自己家族的块，OpenRouter `delta.reasoning` 仅展示不落；OpenAI 家族回显被 400 拒即学到 `BodyFix::DropReasoningEcho`（`GatewayFixes` 第四位）。两个分支都上过真端点（2026-11-26；Anthropic 分支逐请求抓包核对、回传逐字节一致；修后复测里省不省 token 随端点变：OpenAI 协议 −31%、Anthropic 协议 +26%，默认值未改）；宽松网关不校验签名，200 证明不了回传正确——工具调用轮里「空正文 + 签名」的 thinking 块必须保留并原位回传，要抓包三方核对（见 pitfalls）。`Usage.reasoning_tokens` 是 `output_tokens` 的**子集拆分**——不进 `total()`、无闸门读它、序列化只在非 0 时出键（非推理模型的 result.json / report.json 逐字节不变；NDJSON `usage` 事件则是恒出现的增量键）。
+- **请求整形（1.3）**：`extra_body` / `extra_headers` 由 provider 构造器承接（`with_extra_body` / `with_extra_headers`，`build_agent*` 按配置自动调）；加载期 `Config::validate_extra` 拒内核自有键（`EXTRA_BODY_RESERVED[_WITH_EFFORT]` / `EXTRA_HEADERS_RESERVED`），报错不回显值；`ExtraHeaders` 的 `Debug` 打码、`fingerprint` 只哈希 header 名；四个新键（含 `preserved_reasoning` / `env_passthrough`）都是 batch HARD。
+- **模型窗口提示（1.5）**：`Limits::context_window_hint()` 纯函数（窗口未设才出一行），CLI 在装配前打印一次（headless/batch 走 stderr、TUI 走 diag 行）；思考中被 `max_tokens` 截断的提示走 diag 通道、每 run 一次——都是建议不是校验，两个默认值不改。
+- **Hooks**：Deny 落 `Slot::Ran(error)` 不占 Cancelled，Deny 文案过 `tools::truncate`（ctx 预算）；`after_tool` 带 `ctx: &ToolCtx`（与 before 对称，审计归因 `ctx.subagent`）；Modify 只换执行输入、审计留原始输入；`--resume` 不带走 hooks。审批等待期落下的 cancel 在 **gate→执行检查点**（`ctx_cancelled`，execute_tool_call / 并行 spawn 前 / run_code 内层共用）拒绝执行；并行批另有**每波开波前 + worker 进工具体前**两道复查，已 announce 未运行的调用装配段补发取消 ToolResult（事件配平）；已过 gate 但因 pre-spawn/波间检查点未启动的调用统一转 `Slot::Ran` 占位（进 records + `after_tool(executed=false)`，过的 gate 不留未配对 before——gate 循环被打断、从未过闸的才保持 Cancelled）；并行批的 `sync_channel` 必须在 scope 闭包**内**创建（回调 panic 时 `rx` 随 unwind 销毁才不死锁）。`on_before_compact`（2.2）只在折叠**真的发生**之前同步调一次（摘要已成功之后；摘要失败 / 空摘要 / 仅 prune 都不触发），只读不能否决，是唯一 panic 会被兜住的钩子（裸 `catch_unwind`——发布构建 `panic = "abort"` 兜不住，实现仍不该 panic）；绑定层未转发。
 - **todo + meta**：plan 从 records 派生不经压缩；`meta` 审计侧信道不进模型可见 content。
-- **Skill**：三级加载；name 必须等于父目录名；`read_skill`/`list_skill` 不在白名单、由 assemble 配套注入；子 agent 不继承。
+- **Skill**：三级加载；name 必须等于父目录名；`read_skill`/`list_skill` 不在白名单、由 assemble 配套注入；子 agent 不继承。frontmatter 的四个标量字段与 `metadata` 值支持 YAML 块标量（`|` / `>` + chomping / 缩进指示符，手工解析不引 YAML 依赖；按缩进判归属、值恒 trim），多行裸标量 / 块序列 / 嵌套映射仍刻意不支持。
 - **run_code**：两层开关默认全关；wasmtime 中断四点纪律（入口门/epoch 回调/host_call 入口/收尾裁决）；`max_wasm_stack` 384 KiB；测试必须先 warm 模块。
 - **run_code 触发文案**：规则明确 AND 剩余规模；`agentic-code.md` 为独立评测变体，原提示词不变；契约同步用 `python3 scripts/sync_run_code_contract.py --check`，交接见 `docs/run_code_routing_report.md`。
 - **run_code 微调支持**：`skill_injection` 三态（声明序=披露序，batch 收紧=min）装配期消费、热更不重注；`precheck` 调用期经 snapshot；检出集合只有 `{run_code, task, todo}`；拒答/墓碑文案即规格在 `docs/finetune_support_design.md` 附录 A，改文案先走其修订记录。
@@ -141,7 +153,7 @@ cargo clippy -p tiny-agent-node
 - **run_code 路径拦截**：符号链接走查按**原始拼写**逐组件进行（先折叠 `..` 会把 `link` 抹掉、`link/../x` 逃逸）；绝对拼写**从根锚定**走查（字面前缀非 workdir 的折叠拼写不再跳过）；不存在目标经**最深已存在祖先 canonicalize** 判定（不再纯词法回退）。cancel/deadline 入口拒绝都同时 latch `interrupt`+`halted`（可捕获异常被 guest 捕获重试时，停机检查拒纳）。
 - **headless Ctrl-C**：首次翻 cancel 优雅收尾（exit 130），二次硬退；批量模式 worker gate 同款。
 - **消息稳定 id**：ingest 点分配（非构造时）；`next_msg_id` 不随 `clear_messages` 重置。
-- **TUI**：inline viewport + scrollback 提交模型；新增"在飞行"必须同步 holdback/inflight/LiveRow 三件套；新暗色元素用 `dim_fg()`；源码按关注点拆在 `src/tui/`（app/transcript/markdown/slash/render/input/theme + tests，`tui.rs` 只是模块根）。
+- **TUI**：inline viewport + scrollback 提交模型；新增"在飞行"必须同步 holdback/inflight/LiveRow 三件套；Assistant 才增量切分，Thinking live 有界尾部、最终整块提交（>8 显示行折叠，全文 `/thinking` 重印）；队列唯一真值是 `VecDeque`、不得回潮 transcript ghost，失败暂停只能 `/resume` 释放；composer/折行/切点统一 grapheme 显示宽度，放弃 soft-cut 必须原子；正文与底部 chrome 共享左锚定 120 列工作区，角色/工具标识变更同步 `continuation_prefix`，空态/popup 共用 `truncate_line`；新暗色元素用 `dim_fg()`，键帽/选中行/行内代码共用 `keycap_bg()`；Unix tty 断开由独立监控线程收尾（crossterm EOF 内循环会满核），禁止回退成只靠主事件循环；源码按关注点拆在 `src/tui/`（app/transcript/markdown/slash/render/input/theme + tests，`tui.rs` 只是模块根）。
 - **文件工具 workdir 沙盒（`tools::confined_to`）**：尾段**逐组件解析走查、着陆即复检**——`缺失目录/../<外向 symlink>` 类拼写一律 Err（词法折叠会 Ok 逃逸，性质 fuzz 抓过）；**present-but-unresolvable 一律 fail-closed**（悬空 symlink/不可穿过的前缀只放行 ENOENT 真缺失——悬空外向链曾词法放行、写穿真逃逸，审计抓过），Ok 永不背 `..`/`.`、再入不动点，内向 symlink 返回真身；文件工具与 skill 沙盒共用，改它两边的语义测试都要过。
 
 ## 容易踩的坑索引（详录：`docs/claude/pitfalls.md`）
@@ -162,11 +174,16 @@ cargo clippy -p tiny-agent-node
 - **`--session none` 是字面量哨兵**，与 `--resume` 互斥。
 - **MCP 工具名**：只消毒展示名，wire 名不动；`validate_tool_names` 在 assemble 末尾、之后别再 push 工具。
 - **MCP stdio `env` 注入**：两条 Command 链（unix / 非 unix）都要加 `.envs`。
+- **MCP 改动的测试与验证**：改完跑全量 clippy 组（内核单跑会漏 CLI crate 的 lint）；装 diag sink 的测试先拿 `TEST_LOCK`；大文件测试块尾部 splice 用 `rfind` 锚文件尾；真实进程 mock 每场景新日志、只答 202 的 mock 等 GET 连上再推。
 - **`ToolConcurrency::Parallel` 是承诺**：可重入 + 轮询 cancel，核心不校验，谎报只在生产数据竞争。
 - **`#[non_exhaustive]` 只给消费侧枚举**；`Role`/`CompressTrigger`/生产侧枚举不加。
-- **思考展示**：headless 写 stderr 不进 stdout；TUI 独立 ✻ 区块不走 markdown。
+- **思考展示**：headless 写 stderr 不进 stdout；TUI 独立 ✻ 区块不走 markdown，长思考不提前切分、最终折叠并可 `/thinking` 全文重印。
+- **TUI 布局/切分/队列**：显示宽度按 grapheme 不按 char，caret 与极窄屏用真实 cell-grid/cursor 钉；soft-cut 放弃路径原子、完整行推 fence、未闭合 inline code 不切；队列只存 `VecDeque`，不得做成阻塞 watermark 的 ghost；空态/弹窗/正文/输入区一律用 `content_width()` 的 120 列上限（`zone_rect` 是终端全宽，直接用它会让宽屏右缘错位）。
 - **TUI 子 agent 气泡不切分**：live 区逐 delta 全量重解析是 O(气泡²)，触发条件是不守「简短总结」契约的子 agent（`TextDelta` 不受 `max_output_chars` 约束）。
-- **context_breakdown 等和靠单趟 running-floor**（各段独立 /4 会差 1-2 丢不变量）；无 thinking 桶（思考永不进 history）；锚点失效即校准回 None。
+- **context_breakdown 等和靠单趟 running-floor**（各段独立 /4 会差 1-2 丢不变量）；无 thinking 桶（思考增量永不进 history），`preserved_reasoning` 开时旁字段 `Message.reasoning` 另计 `reasoning` 桶；锚点失效即校准回 None。
+- **`Usage.reasoning_tokens` 为 0 不序列化**（结构体与 result.json / report.json 侧）：绑定测试别把它塞进「四轴恒在」的断言循环——非推理模型下这个键根本不出现，要测它就给 mock 一帧带 `completion_tokens_details.reasoning_tokens` 的 usage。
+- **本机 `strip = "debuginfo"` + macOS 27 的 dyld**：用户级 `~/.cargo/config.toml` 的 `[profile.dev] debug = false` 会让 cargo 给 dev profile 默认 `strip = "debuginfo"`，rustc 链接后剥 debuginfo 产出的 cdylib（绑定的 `.so` / `.node`）LINKEDIT string pool 8 字节错位，macOS 27.2 的 dyld 直接拒载（`mis-aligned LINKEDIT string pool`）——`maturin develop` / `npm run build:debug` 成功但 `import` / `require` 失败。可执行文件与 proc-macro 的布局恰好对齐，所以只有绑定暴露。绕过：`CARGO_PROFILE_DEV_STRIP=none`（环境变量，不改仓库与用户配置）；CI 无此全局配置、release profile 不受影响。
+- **回归评测装置（`scripts/regress_eval.py`）**：臂配置压过任务的 mock 专用调参（arm-over-mock）；清单落盘前脱敏（含 MCP 嵌套 `headers` / `env` 与 URL query）；`[skill]` 按 `XDG_CONFIG_HOME` / `HOME` 查找——**两条通道**都经 `run_env` 隔离 `XDG_CONFIG_HOME`（否则开发者本机的真实技能目录会漏进轨迹）并设 `GIT_CEILING_DIRECTORIES`（批次目录在仓库里，模型在 workdir 发的 `git` 不得解析到外层仓库——第一次真机批次把开发者未提交的 diff 发给了模型）；mock MCP server 的每个工具都要有一条合法调用探针（脚本化模型不调的工具等于没测过，`transfer_stock` 拒收整数参数零成本通道一直是绿的）；改写过的 mock 必须真执行一遍（`check` 抓出过一份只有运行时才炸的 `mock_anthropic.py` 语法错误）；动 harness 先写/跑 `scripts/tests/test_regress_eval.py`（本地 pytest，不进 CI）——七个缺陷都是先写测试才在跑之前抓出来的；批次目录 / `--base-config` 一律解析成绝对路径（run 的子进程 cwd 是 run 目录，第一次真机批次因相对路径六个 run 启动即败），一条通道第一次真跑前先用**与文档逐字相同的命令行**对 mock 排练；给 `limits` 加键要四处同步（内核 clamp / harness 的 clamp 镜像与 pytest 计数 / 两份 README / 所有配置指纹一次性偏移）。
 
 ## 离线 / 视觉验证
 
@@ -184,6 +201,18 @@ cargo clippy -p tiny-agent-node
   CLI/HTTP 栈守四个 loop 级行为：打转护栏（stuck_loop 硬停 / 同参不同果不误停 / nudge 只进历史不进
   事件流）、单轮 10 路并行 task fan-out（8/波 + N:N + 请求数精确核算）、SIGINT exit 130。CI 有
   同名 job（ubuntu）。改了 loop/取消/打转行为后必跑。
+- **MCP 端到端**：`python3 scripts/e2e_mcp.py`——真实 headless 二进制 × 文件内自带的零依赖 mock MCP
+  （stdio / Streamable HTTP）+ 脚本化 LLM，十组线上行为（工具名单、配置报错、Ctrl-C 取消通知、调用/握手
+  超时键、协商版本、404 会话恢复、202 standing stream、凭据卫生、空闲探测）约 15 s；`--idle` 才跑空闲
+  探测组（I，约 65 s），`A K` 这类参数只跑指定组。**不是 CI 门禁**：改了 `mcp.rs` 或任何 spawn 链后手动跑
+  （Ctrl-C 组在 Windows 跳过；`TA_BIN` 指定二进制）。
+- **回归任务集**：`examples/regress/tasks/<id>/`（任务片段 + 同级 `harness.json` 评测侧数据 + `check.py`
+  判卷 + fixture）× `scripts/regress_eval.py`。`check` 是 CI 门禁（`check.sh e2e` 组第三步）：逐任务 × 两种
+  线协议走脚本化 mock 的零成本全链路，并在任何环境下都发不出付费请求；`prepare` / `run` / `compare` 是本地
+  付费 A/B 通道——`run` 默认 dry-run、`--execute` 才付费，没同时给 `--price-table` 与 `--cost-stop` 的 batch
+  一律 `blocked_paid`，费用停止按「已花 + 下一个 run 的最坏预留 ≥ 停止值即停」、未上报用量按预留记——所以 `--cost-stop` 要大于单个 run 的预留（现价表下约 3.9 USD），给小了一个 run 都不发。
+  改了内核之后跑的就是它；harness 自身的离线单测在 `scripts/tests/test_regress_eval.py`（本地 pytest，
+  不进 CI）。
 - **mock server**：`examples/mock_openai.py`、`examples/mock_anthropic.py` 是零依赖 SSE mock，
   用于无 API key 跑通整个 loop（tool_use 配对、usage 解析、取消）。改动 provider/agent 后用它回归。
 - **进程内回归**：`agent.rs` 的 loop 不变量用 `provider/mock.rs`（脚本化 Provider，不连网）单测覆盖
@@ -194,6 +223,22 @@ cargo clippy -p tiny-agent-node
   改了并行批次的分支（新增 Slot 赋值点、改占位/合成逻辑）先看这张表再动。
 - **TUI 视觉验证**：用 ratatui `TestBackend` 抓 cell grid 做断言（见 `tui::tests`）；端到端交互用
   pty 脚本驱动（项目里惯用 `/tmp/ta-verify/` 放临时 mock + pty 脚本，跑完即删）。**不要只靠
-  "看起来对"**——改了渲染/光标/markdown 要真抓屏或单测断言验证。pty 驱动两个坑：裸 pty 必须
+  "看起来对"**——改了渲染/光标/markdown 要真抓屏或单测断言验证。pty 驱动六个坑：裸 pty 必须
   应答 crossterm 的 `\x1b[6n` 光标查询（回 `\x1b[<行>;<列>R`，否则启动即 "cursor position
-  could not be read" 退出）；带补全弹窗的斜杠命令要**双回车**（第一个 Enter 被弹窗吃掉当选择）。
+  could not be read" 退出；固定回底行会把视口钉在屏幕底部，要贴近真实布局就按真实光标位置应答）；
+  带补全弹窗的斜杠命令要**双回车**（第一个 Enter 被弹窗吃掉当选择）；
+  增量重绘只回写变化的 cell，剥掉 ANSI 后的可见文本是乱序拼接的——**断言用稳定子串，别断言整行
+  或整句标题**（「不再出现 X」类断言取 X 的稳定片段最后一次出现之后的尾部再判）；滚动区画面疑似
+  重叠须用真实终端模拟器交叉核对（根因：pyte 0.8.2 根本没实现 SU/SD——`CSI S` / `CSI T` 落 no-op，
+  而 scrollback 提交靠的就是它们，补 handler 的做法见 pitfalls），截图渲染器与终端事实要分开验证；
+  pty 尺寸要在 fork **之前**设好（`pty.fork()` 后父进程再 `TIOCSWINSZ` 与子进程首次取尺寸竞态，
+  新 pty 初始 0×0）；
+  断言「空闲双击
+  Ctrl-C 退出」要先等状态栏回到 `idle`——忙时第一下是取消当前轮、第二下只是空闲态的首次按下
+  （只打印提示不退出），且 `idle` 这类标记要在**发键之后**收到的输出里找（起始屏幕上本来就有）。
+- **TUI 快速体验**：`./scripts/tui_demo.py`——进程内起零密钥 SSE mock（127.0.0.1 随机端口），用
+  隔离的演示目录启动真实 TUI；消息以 `tool` / `think` / `slow` / `fail` 开头分别演示工具调用、
+  长思考折叠、慢速流式（队列 / 取消）、失败态与队列暂停，其余消息回使用指引。`--light` 浅色、
+  `--release`、`--no-build`、`--real -- <参数>` 用自己的配置（此时不起 mock）。**不是 CI 门禁**
+  （门禁是 `scripts/e2e_scenarios.py`）：人工看渲染效果用；`--no-build` 复用的
+  `target/debug/tiny-agent` 若被 `check.sh` 的 `build: code` 组换成无 `tui` 的构建，二进制会明确报错。

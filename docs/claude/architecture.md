@@ -35,7 +35,8 @@
   `message_start`/`message_delta`）。`provider/mock.rs` 是 `cfg(test)` 的脚本化 Provider，
   供 `agent.rs` 的进程内 loop 回归测试用（不连网）。
 - **思考（reasoning/thinking）透出 + 程度配置**：`ChatEvent`/`AgentEvent` 各有 `ThinkingDelta(String)` 变体
-  （`AgentEvent` serde 外部 tag → `{"ThinkingDelta":"..."}`，TinyWorker 后端零改动接到）。**只透出不入历史**——
+  （`AgentEvent` serde 外部 tag → `{"ThinkingDelta":"..."}`，TinyWorker 后端零改动接到）。**思考增量只透出不入历史**
+（能进历史的只有下一条「推理回传」的旁字段，且默认不进）——
   openai 解析 `delta.reasoning_content`（DeepSeek/GLM 官方）或 `delta.reasoning`（OpenRouter 归一化各厂商思考，`reasoning_details` 数组忽略——`reasoning` 是其纯文本投影）、anthropic 解析 `thinking` content block（`content_block_start` 的 type=
   `thinking`/`redacted_thinking` → `Pending::Thinking`；`thinking_delta` 增量在 `delta.thinking`，`signature_delta`
   忽略），都只发事件、**不**进 `text`/`blocks`（`finalize_pending_lenient` 对 `Thinking` 返 `None`）。`reasoning_effort`
@@ -49,9 +50,73 @@
   `text`/`blocks`——openai 在 `arguments` 分片落地即发（空串过滤）、anthropic 在 `input_json_delta` 复用
   pending 块的 id/name，权威装配输入在 `ToolCall` 事件 / `Block::ToolUse`。**键是 tool_use id 不是 name**
   （同 turn 并行同名调用 name 必撞；两侧 id 都在流早期可得）。harness `--json` 吐 `{"type":"tool_input",...}`，
-  plain headless 刻意安静（完整 ToolCall 行随后来）；TUI 走 `_ => {}` 兜底。mock 的 `OkToolStream` 变体
+  plain headless 刻意安静（完整 ToolCall 行随后来）；TUI 把它作为 render-only 的 `receiving arguments`
+  活动提示，并关闭旧 Assistant/Thinking live 流让提示可见，JSON 增量本身不进 transcript。mock 的 `OkToolStream` 变体
   驱动 loop 级测试（分片→事件→拼装）。新增流式透出项照这套纪律抄。
-- **PDF 文档块（`Block::Document { media_type, data }`，Anthropic-only）**：对齐 Anthropic `document` content block（base64 source；url/Files-API `file_id` 两种 source 不做——宿主自己下载后推字节）。**四层接入点清单（新增 Block 变体照抄）**：① anthropic `message_json`（`{"type":"document","source":{"type":"base64",…}}`）；② openai `chat()` 入口 `reject_documents` **显式报错**（chat-completions 无 document 内容类型，静默丢弃比报错更糟；`message_jsons` 里的 omission placeholder 文本臂是防御纵深——正常路径不可达）；③ compress 三处（`total_chars` 给 base64-len/100 地板走 legacy char 阈值；`estimate_tokens` 按**页数×`PDF_TOKENS_PER_PAGE`=3000** token-side 加法；`window_lines` 出 `<document>` 占位行）；④ tui `transcript_rows` 显示跳过（与 Image 同款）。mock 的 capture 是 `_ => {}` 兜底、agent loop 不穷尽 match Block——新变体不强制点名这些点。**token 预估按页不按字节**：官方口径 1,500–3,000/页（逐页转图+抽文本，官方自己 3 页全视觉样例 ≈2,333/页），社区实测偏低估 → 取上沿 3000（preflight 宁早压，真实 usage 仍是记账权威）。`pdf_page_estimate`（compress.rs）免解析启发式：裸扫 `/Type /Page`/`/Type/Page`（尾字节非字母数字，排掉 `/Pages` 父节点与 `/PageMode` 类长名）与 `/Pages` 节点 ±窗口内 `/Count` 取 max（救 ObjStm 压缩流藏 page 对象的 PDF 1.5+；窗口限定在页树节点附近是防 outline 书签的 `/Count` 混入），双零按 ~100 KiB/页兜底、地板 1——每次 preflight 重解码重扫（10 MiB 封顶 ~ms 级，不值得给 Block 加缓存状态）。**实测对真实产商 PDF 精确**（CUPS 文本管线 3/46 页、Quartz 图像管线 1 页，PDFKit 真值逐一匹配；`tests/fixtures/cups_3p.pdf` 真件 fixture 永久钉住；ObjStm 藏 page 对象的 Word/Acrobat 类输出离线无产商、仅合成用例覆盖——`/Count` 恢复路径在案）。读取 helper `tools/document.rs::load_document_block`（`.pdf` 后缀 + `%PDF-` 头 + 10 MiB take 有界读，镜像 `load_block`；lib.rs 门面 re-export）。**刻意不做 `load_document` 工具**（模型驱动加载是后续可选项；本期 host-push only，经 `push_user`）。
+- **推理回传 + 推理 token 账单（内核改进计划 1.1 / 1.4；`Config.preserved_reasoning`，2026-11-26 起默认开）**：上一条「只透出不入历史」
+  现在要补半句——**增量**永远不进历史，能进历史的只有 provider 显式回传的推理状态（默认落历史，显式
+  `false` 才不落）。形状刻意是**旁字段不是
+  Block 变体**：`ChatResponse.reasoning: Option<Reasoning>`（`Reasoning { provider, blocks: Vec<ReasoningBlock> }`，块
+  `{ before, text, opaque }`——`before` 是它原先在 `content` 里的位置下标，Anthropic interleaved thinking 要求原位回显；
+  `opaque` 是厂商私有伴生数据，Anthropic 的 `signature` / redacted `data`，OpenAI 兼容端与手工裁剪过的旧记录恒为 `{}`、永不
+  `null`），`Message.reasoning` 同形。**为什么不进 `blocks`**：所有「块形状」规则（空回复不落盘、仲裁的零块判定、salvage
+  探测、子代理 `final_text`、TUI 转录）原样成立，渲染层永远看不到它。**两层决定**：① provider **无条件**产出（内置两家
+  `ChatResponse.reasoning` 恒填；自定义 provider `from_simple` 合成的恒 `None`）；② Agent 按 `self.preserved_reasoning`
+  决定是否落历史——唯一落点在 push assistant 之前那一处 `if self.preserved_reasoning { assistant.reasoning =
+  resp.reasoning.take() }`，关着时就在这里丢弃，历史与没有这个字段时逐字节相同；`try_new` 另把 initial 历史里的剥掉
+  （旧 session 文件带了 reasoning 而配置已关，也不会漏出去）。**默认值（D1，2026-11-26 用户拍板「默认开」）**：先按
+  opt-in 落地；`reasoning-carry` 配方在 deepseek-flash 上的 A/B 达标（成功率不降，on 15/15 对 off 14/15；总 token
+  −39%，收益全部来自会压缩的 `long-output` −48%，不压缩的四个短任务多花约 21%——保留的推理在同轮每个后续请求里
+  重发）之后改成默认开。只此一家模型、每格 3 次。**修后复测（同日晚）**：方向随端点变——OpenAI 协议 −31%，Anthropic 协议
+  端点（`hw-vol-deepseek`）+26%，差别全在 `long-output`，短任务 ±50% 是噪声；默认值未改，见计划文档 §0.0.3 的 D1。
+  Anthropic 分支已在那个端点上逐请求抓包核对（30 run / 328 请求）：回传的 thinking 块与网关发来的逐字节一致，含
+  工具调用轮里最常见的「空正文 + 签名」块（`empty_signed_thinking_between_text_and_tool_use_is_echoed_in_place`
+  钉住）；该网关不校验签名，官方 API 的严格校验仍未验证（抓包核对的做法见 pitfalls）。改默认的连带：`Config::fingerprint` 里
+  `preserved_reasoning` 只有显式 `false` 才进哈希（非默认那一侧反转为关）；`reasoning-carry` 配方的两臂都写显式值，
+  不受影响。**寿命 = 当前轮**，失效点与保留点如下，规则是「整段剥、
+  永不剥一半」——只剥一部分会留下「早期 assistant 带 reasoning、后期不带」的混合形状，正是严格 API 拒收的那种
+  （`compress::strip_reasoning` 的文档就是这条规则）：剥的三处 = `push_user` 开新 user 轮、`set_model`、
+  `normalize_adjacent` 合并相邻同角色消息（合并后的消息 `reasoning = None`——两轮的状态拼不成一份：位置相对旧块、签名只覆盖
+  一轮）；**不清**的两处 = 工具结果并入尾部 user 消息（合并分支的另一半，当前工具循环的状态因此存活）、压缩折叠与工具结果
+  裁剪（幸存消息保留自己的：块的签名自包含，fold 整体移走、prune 只改 tool-result 文本）。会话归档（`archive_messages`）
+  永不携带：离开活历史即轮次已尽，且思考文本是没有审计价值的草稿纸。provider 只回显**自己家族**的块
+  （`Message::reasoning_for(REASONING_ANTHROPIC | REASONING_OPENAI)`，跨厂商旧状态跳过不发）；Anthropic 未签名的 thinking 块
+  不回显；OpenAI 兼容侧按 `reasoning_content` 回显，对端 400 拒收即学 `BodyFix::DropReasoningEcho` →
+  `GatewayFixes.no_reasoning_echo`（第四位；`GatewayFixes` 带 `deny_unknown_fields`，所以带它的 preset 旧二进制读不了），
+  之后 `message_jsons` 在序列化时剥。请求没带 reasoning 而对端的 400 文本点出了这件事（OpenAI：提到
+  `reasoning_content`；Anthropic：同时提到 thinking 与 tool_use/redacted_thinking），错误文本追加
+  `REASONING_CARRY_HINT`——只在请求确实没带 reasoning 时才提（回传开着时请求本来就带了，这类 400 另有原因，
+  提开关就是误导），它修的那类失败必须点名开关（宿主可见的诊断，不是模型可见文案）。OpenRouter 的
+  `delta.reasoning` 仍只是展示投影、不落。子 agent 经 `child_cfg = self.cfg.clone()` 继承开关（`tools/subagent.rs` 钉住）。
+  **计量**：`compress::reasoning_units` / `reasoning_chars` 把旁字段计入 `estimate_tokens` 与 `total_chars`（文本与 opaque
+  都按 CJK 感知的 `text_units` 算——密文唯一诚实的度量是长度），`context_report` 给它独立的 `reasoning` 桶（等和不变量照旧）。
+  **`Usage.reasoning_tokens`**：provider 单独上报的推理份额（OpenAI 兼容 `completion_tokens_details.reasoning_tokens`；
+  Anthropic 不单列，恒 0）——是 `output_tokens` 的**子集拆分、不是第五根轴**：`Usage::total()` 刻意不加（同一批 token 记两次
+  账），没有任何闸门读它。`RunOutcome.reasoning_tokens` 跨请求求和（`task` 子 agent 花的、重试梯里失败 attempt 花的都在内，
+  写端 `saturating_add`）。**出键规则两侧不同**：`Usage` 结构体与 result.json / report.json 都是「0 不出键」（非推理模型的
+  输出逐字节不变），NDJSON 的 `usage` 事件则是恒出现的增量键（harness `event_json` 是手写映射）。外部按字面量构造
+  `Usage` 的代码会编译失败（破坏性，CHANGELOG 有迁移说明）；绑定侧 `Usage` / `RunOutcome` 自动序列化，所以 1.4 没改绑定
+  源码——但两绑定的测试各钉了「一次性结果 + getter 跨轮求和 + 未上报不出键」，因为把 `reasoning_tokens` 塞进「四轴恒在」
+  的断言循环会当场失败（它默认不在）。
+- **请求整形 `extra_body` / `extra_headers`（内核改进计划 1.3）**：由内置 provider 的构造器承接
+  （`Anthropic::with_extra_body(Value)` / `with_extra_headers(ExtraHeaders)`，`OpenAi` 同名同参），`provider::build` /
+  `build_agent*` 按配置自动调用——直接构造 provider 的宿主自己调。**校验在加载期**：`Config::validate_extra` 要求
+  `extra_body` 是对象且不含内核自有键（`config::EXTRA_BODY_RESERVED`；设了 `reasoning_effort` 时还有
+  `EXTRA_BODY_RESERVED_WITH_EFFORT`——`thinking` / `output_config` / `reasoning_effort` 这时归内核管）、`extra_headers`
+  不得覆盖内核管理的头（`EXTRA_HEADERS_RESERVED`：鉴权 / content type / 协议版本等），报错**不回显值**（header 值是
+  凭据）。provider 内部还有一道静默过滤，兜住手工构造绕过加载校验的情况。**凭据纪律**：`ExtraHeaders` 的 `Debug` 对值
+  打码；`Config::fingerprint` 对 `extra_headers` 只哈希头名（`extra_body` 全量进哈希），两个新键都是「非默认才进」——默认
+  配置的指纹不变。批量覆盖：HARD（`Config::apply` 拒绝任务片段设置）；`apply_trusted` 照常应用，且**先在副本上**跑 extras
+  校验（它要读同一 overlay 可能设置的 `reasoning_effort`），被拒的 overlay 不留半套修改。用途是厂商开关（GLM 的
+  `{"thinking": {"type": "enabled"}}`、中转站的路由标签、`anthropic-beta`）——内核不为每家加专门键。
+- **模型窗口提示（内核改进计划 1.5）**：`Limits::context_window_hint()` 是纯函数——`max_context_tokens == 0`（默认）时
+  返回一行说明（`compress_threshold_chars` 也为 0 时换成更重的一句：没有任何东西在请求前压缩历史），设了窗口则 `None`。
+  CLI 在装配**之前**打印一次（headless / batch 走 `harness::note` → stderr，前缀 `[warn]`；TUI 在 `tui::run` 里排成第一条
+  diag 行，因为 TUI 看不到 stderr）——纯半边拆成 `context_window_line(cfg)`，测试不必抓 stderr。另一半是**思考烧穿输出
+  额度**的提示：某轮 `stop_reason == "max_tokens"` 且本轮有思考增量 → 经 diag 通道发一次（每 run 一次，子 agent 带名字），
+  走 diag 而不是事件流——它是给操作者的建议，不是 run 事实。**两个默认值都不改、不是校验**：默认配置合法，溢出恢复仍是兜底
+  （改默认值要等 0.4 的评测数据）。
+- **PDF 文档块（`Block::Document { media_type, data }`，Anthropic-only）**：对齐 Anthropic `document` content block（base64 source；url/Files-API `file_id` 两种 source 不做——宿主自己下载后推字节）。**四层接入点清单（新增 Block 变体照抄）**：① anthropic `message_json`（`{"type":"document","source":{"type":"base64",…}}`）；② openai `chat()` 入口 `reject_documents` **显式报错**（chat-completions 无 document 内容类型，静默丢弃比报错更糟；`message_jsons` 里的 omission placeholder 文本臂是防御纵深——正常路径不可达）；③ compress 三处（`total_chars` 给 base64-len/100 地板走 legacy char 阈值；`estimate_tokens` 按**页数×`PDF_TOKENS_PER_PAGE`=3000** token-side 加法；`window_lines` 出 `<document>` 占位行）；④ tui `transcript_rows` 显示轻量 `[PDF document attached]` 占位（Image 同理为 `[image attached]`，不再静默跳过）。mock 的 capture 是 `_ => {}` 兜底、agent loop 不穷尽 match Block——新变体不强制点名这些点。**token 预估按页不按字节**：官方口径 1,500–3,000/页（逐页转图+抽文本，官方自己 3 页全视觉样例 ≈2,333/页），社区实测偏低估 → 取上沿 3000（preflight 宁早压，真实 usage 仍是记账权威）。`pdf_page_estimate`（compress.rs）免解析启发式：裸扫 `/Type /Page`/`/Type/Page`（尾字节非字母数字，排掉 `/Pages` 父节点与 `/PageMode` 类长名）与 `/Pages` 节点 ±窗口内 `/Count` 取 max（救 ObjStm 压缩流藏 page 对象的 PDF 1.5+；窗口限定在页树节点附近是防 outline 书签的 `/Count` 混入），双零按 ~100 KiB/页兜底、地板 1——每次 preflight 重解码重扫（10 MiB 封顶 ~ms 级，不值得给 Block 加缓存状态）。**实测对真实产商 PDF 精确**（CUPS 文本管线 3/46 页、Quartz 图像管线 1 页，PDFKit 真值逐一匹配；`tests/fixtures/cups_3p.pdf` 真件 fixture 永久钉住；ObjStm 藏 page 对象的 Word/Acrobat 类输出离线无产商、仅合成用例覆盖——`/Count` 恢复路径在案）。读取 helper `tools/document.rs::load_document_block`（`.pdf` 后缀 + `%PDF-` 头 + 10 MiB take 有界读，镜像 `load_block`；lib.rs 门面 re-export）。**刻意不做 `load_document` 工具**（模型驱动加载是后续可选项；本期 host-push only，经 `push_user`）。
 - **核心 loop 在 `agent.rs`**：累计 usage、cancel 轮询、上下文压缩的有状态编排（`compress`/
   `summarize_prefix`/`summary_call`，读写 Agent 字段 + 驱动 provider）在这里。压缩的**纯函数与常量**
   （`estimate_tokens`/`find_safe_cut`/`fold_summary`/`prune_tool_results`/`window_lines`/`chunk_lines`/
@@ -74,14 +139,57 @@
   历史必 user 结尾，若钳到 n-1 扫边界必落空、该配置下压缩被静默禁用（A2 修复）；`fold_summary` 对空尾
   产出单条 user 头。守卫是 `saturating_add(2)`（usize::MAX 级 keep_recent 不 panic/回绕）。
 
-  **`summary_call` 空正文重试（思考网关自愈，TinyWorker 反馈 #7）**：混合思考网关（deepseek/glm）把
-  reasoning_content 计入 max_tokens，UPDATE 分支（带旧摘要）诱导的长推敲可整块烧光 1024 起步预算 →
-  `finish=length` 映射成 stop_reason `"max_tokens"` 且**正文零字**——「截断仍连贯」的接受假设在零正文时
-  为假，空文本随后落退化分支（dropped=0 + Warning）。修法是 provider 无关的两段尝试：`attempt==0 &&
-  stop_reason=="max_tokens" && text.trim().is_empty()` → 预算 `saturating_mul(2).min(8192)` 重试一次；
-  加倍值**刻意不钳回调用方的轮次上限**（首轮已证明 cap 级预算必死于思考，钳回等于重放已知必死的请求），
-  认死理的网关对加倍值报 400 则该次压缩失败（≈旧退化、多一次廉价请求）。非空正文的真截断首轮即接受、
-  重试仍截断也接受。两轮 usage 经 `merge_usage` 合并返回（诚实成本——烧掉的首轮照计费）。**配套纪律**：
+  **预检折叠的自适应保留窗（内核改进计划 §0.0.5 发现 2，2026-11-26）**：`Agent::adaptive_keep()` 只被 `compress()`
+  的 Preflight 路径调用。配置的 `keep_recent_messages` 窗口自身的占用（`window_usage`：字符闸门用 `total_chars`，
+  token 闸门用切片的 `estimate_tokens` × 存活锚点的 scale）超过 `gate_room() / 2` 时，换成 `compress::shrink_keep`
+  给出的**能装进一半的最宽尾部**；没有这么宽的就取最窄的可行窗；一个可行窗都没有返回 `None` → 保持配置值。
+  `gate_room()` 是 `over_compaction_threshold` 那个判定的预算写法：token 闸门 = `max_context_tokens ×
+  COMPACT_UTILIZATION_PCT / 100 −（system + 工具 schema 的估算）− max_tokens`，字符闸门 = `compress_threshold_chars`，
+  两个都没设 → `None` → 不缩。**只降不升**：显式 `keep_recent_messages: 0` 不动；配置窗下没有安全切点
+  （`find_safe_cut` 为 `None`）时原样返回，调用方照旧报「无可压缩」。Manual 与 Overflow 两条路径不调它，照配置窗口
+  走。为什么：保留窗自己压在阈值上时，折完仍在阈值之上，下一轮再折、每次只折掉一两轮，每次一张摘要账单——实测
+  一个 56 轮的 run 折了 32 次、27 次只折掉 2 条（三个批次 240 次折叠里 213 次如此），带折叠的轮次中位 16.1 s、
+  其余 2.5 s；尾部压到一半空间，另一半留给摘要头与
+  之后几轮的增长。缩窗时一行 diag_info，每 run 一次（`adaptive_window_noted`，`run_loop` 入口复位）。
+  测试：`agent_tests.rs` 的 `adaptive_keep_only_lowers_the_configured_window` / `heavy_tail_preflight_*` /
+  `light_tail_preflight_*` / `manual_compact_and_overflow_recovery_*` / `token_gate_preflight_fold_*` /
+  `explicit_keep_recent_zero_*`，`compress.rs` 的 `shrink_keep_*` 五个。
+
+  **`summary_call` 的两段尝试阶梯**（空正文重试来自思考网关自愈、TinyWorker 反馈 #7；截断重试来自内核改进计划
+  §0.0.5 发现 1，2026-11-26）：混合思考网关（deepseek/glm）把 reasoning_content 计入 max_tokens，UPDATE 分支（带旧
+  摘要）诱导的长推敲可整块烧光 1024 起步预算 → `finish=length` 映射成 stop_reason `"max_tokens"` 且**正文零字**
+  ——「截断仍连贯」的接受假设在零正文时为假，空文本随后落退化分支（dropped=0 + Warning）。至多两次请求
+  （`for attempt in 0..2`），第二次为两种形状而存在：
+
+  - **空正文**（`max_tokens`、无文本——思考吃光了额度）→ 无条件以翻倍预算重试一次：没有正文就无从折叠，一次请求
+    换回一次折叠是便宜的。
+  - **截断的非空正文**（`max_tokens`、有文本）→ 仅当这一尝试**带推理**才重试一次：`resp.reasoning` 有块，或
+    `usage.reasoning_tokens > 0`（网关只报计数、不流 `reasoning_content` 也算）。正文是被思考挤短的，不是摘要本身
+    长。不带推理的截断是真·长摘要，首次尝试已是预算内的最好答案——保持「首次即接受」的旧行为。
+
+  翻倍值 `saturating_mul(2).min(SUMMARY_MAX_BUDGET = 8192)`，**刻意不钳回调用方的轮次上限**（首次已证明 cap 级
+  预算必死于思考，钳回等于重放已知必死的请求）。重试只能更好：正常结束 → 用它的正文（并
+  `summary_budget.learned(翻倍值)`）；又截断 → 两段正文取长；回来是空的 / 被拒（严格网关对翻倍值的 400）/ 失败 /
+  中途断流（非 `end_turn`/`max_tokens` 的 stop_reason）→ 折第一次的正文（`first_truncated`），免得落
+  `compress_failed`（它还会关掉之后的溢出恢复）。**取消始终是 `Err`**：重试 `Err` 且 `self.cancelled()`，或
+  stop_reason 为 `"cancelled"`——折叠不得落在用户已否决的历史上。重试被拒分两种：确定性错误（非
+  `is_transient_error`）→ `summary_budget.ceiling = Some(翻倍值)` + 一行 diag_warn，之后不再要 ≥ 它的额度；瞬时
+  错误（5xx、超时）不对预算下结论、不记。零正文的重试失败且手里没有正文 → `Err`（≈旧退化、多一次廉价请求）。
+  所有尝试的 usage 经 `merge_usage` 合并返回（诚实成本——烧掉的那次照计费），`CompressError.burned` 同款。
+
+  **`SummaryBudget { floor, ceiling }`**（agent 级、跨 run 保留，`set_model` 清）：`floor` 只在翻倍重试被服务时
+  抬高（`learned` 一行 diag_info——首次预算变大会改变摘要的账单），不截断的模型永远不动它；之后每次摘要的预算 =
+  `max(比例值, floor).min(本轮 max_tokens)`（`summary_budget_for`，`summarize_prefix` 的单点 / 分块 / 合并三处都过
+  它）。**摘录宽度**：`window_lines(messages, cut, preview_chars)` 的第三个参数来自
+  `limits.summary_preview_chars`（默认 200 = 原硬编码值；`0` 只留工具名 / 标签；`Clamp::Tighten`——batch 与回归
+  任务片段只能调小），裁的是摘要器看到的折叠前缀，主模型读的活历史不受影响。`limits` 多了这个键，而
+  `Config::fingerprint` 把整个 `limits` 序列化进哈希，所以所有配置的指纹偏移一次。
+
+  测试：`agent_tests.rs` 的 `summary_cut_short_by_reasoning_*` / `summary_retry_*` / `summary_reasoning_known_only_*` /
+  `summary_truncation_without_reasoning_*` / `failed_summary_retry_*` / `refused_summary_retry_*` /
+  `a_cancelled_summary_retry_*` / `a_served_retry_*` / `refused_empty_summary_retry_*` / `summary_budget_*` /
+  `summary_transcript_excerpts_*`，`compress.rs` 的 `window_lines_excerpts_tool_io_at_the_configured_width`。
+  **配套纪律**：
   summary_call 的 `reasoning_effort` 恒 `None` 且**不**改成低档值——Anthropic 上任何 Some(非 "none")
   effort 是**开启** adaptive thinking（与意图相反），OpenAI 兼容网关对 "low" 的解释是掷硬币；默认开思考
   的网关交给上面的空正文重试兜住。
@@ -124,6 +232,21 @@
   计数跨轮持久、随 run 重置；`Cancelled` 槽不计数（未执行）。测试组 8 个：
   nudge→停 / 换参重置 / 键序不敏感 / 进展结果不误停 / Modify 生效参数 / 同轮换法解停 /
   取消优先 / 数值拼写归一。
+
+  **隔次重复窗口（内核改进计划 §0.0.5 发现 3，2026-11-26；只提示、不停）**：上面的连续计数有个实测到的空隙——
+  `loop-suppression` 里模型发了 9 次一模一样的 `job_status` 轮询（中间夹着别的调用）、最长连续只有 3：第 3 次的 `stuck_nudge` 文案是
+  「换一个工具」，模型照办，连续计数被清掉，硬停永远够不着。护栏只数连续是刻意的（不误伤正常轮询），所以另开
+  `RepeatWindow`（`run_loop` 持有、随 run 丢弃）：记住最近 `REPEAT_WINDOW`=8 次调用的键与累计次数；
+  `observe(key)` 在弹出队首**之前**查最近一次同键——那一次还在窗口里就接着数，已滑出就从 1 重数。**首次返回 1
+  而不是 0**：这个数原样写进文案，从 0 数起会让提示晚一次才发、报出的次数少一（新写的用例在落地前抓到的差一，
+  改的是产品代码不是断言）。装配段每个 `Slot::Ran` 调用两处都记：连续计数照旧；连续计数 < `STUCK_NUDGE_AT` 且
+  `seen >= REPEAT_NUDGE_AT`=4 且偶数 → `repeat_nudge(seen)` 追加到该次 tool_result 的历史块。与连续 nudge
+  互斥（`if / else if`）：同一次调用已到连续 3 就只发 `stuck_nudge`，不叠两条。文案只陈述观察到的事实、两条读法
+  都点到（在等外部状态 → 多等一会儿或如实告诉用户；以为自己的改动会改变结果 → 回头查为什么），刻意不写
+  「最近 N 次里」——计数是跨窗口的累计链。硬停仍然只认连续计数：隔次重复分不清「原地打转」与「改一步验一步」
+  （改完再跑测试，没修好就是同参同果），误停比漏停贵。同参不同果即进展、不计数（结果指纹在键里）。
+  测试 6 个：`repeat_window_counts_*` / `alternating_identical_calls_*` / `three_occurrences_of_a_key_*` /
+  `progressing_polls_*` / `repeat_notice_neither_stacks_*` / `repeat_notice_reaches_every_block_*`。
 
   **溢出确定性**：溢出逃逸失败后的溢出错误经 `RunError::is_context_overflow()` 判定为确定性——单跑
   `run_with_retries` 与 batch（stop_reason `context_overflow`，run_one 只重试 `"error"`）都不再进退避。
@@ -184,8 +307,15 @@
   CALL_TIMEOUT（最坏是丢到超时，不是延迟一轮）；健康流每 30s 轮转重连对服务器是新增的周期性
   GET/日志负载（旧实现单连接挂到死）。reqwest blocking 无逐读 read_timeout，请求级 `.timeout`
   是 body 总时限。**legacy SSE 的 POST 目标跟随轮转**：`endpoint` 是每连接资源（会话绑定的
-  server 在 GET 断开瞬间回收旧 endpoint），所以每条连接的 endpoint 事件都重新过同源闸门并
-  刷新共享 `post_url`——冻结在第一条连接上的目标会在首次轮转后 404 掉每个调用。
+  server 在 GET 断开后回收旧 endpoint——python-sdk 是 100ms 定时器轮询，不是断开瞬间），所以每条连接的
+  endpoint 事件都重新过同源闸门并刷新共享 `post_url`——冻结在第一条连接上的目标会在首次轮转后 404 掉
+  每个调用。**轮转时先退役 POST 目标**（2026-11）：读线程在到期轮转、丢弃旧连接**之前**把 `post_url`
+  置 `None`，到新连接的 `endpoint` 才恢复；这期间 `post()`（`post_target`）等新目标而不是打向旧会话——
+  否则落在间隙里的 POST 被应 202、应答写进已死连接，调用方坐满整个 CALL_TIMEOUT。等待的界是 connect 键
+  （与等首个 endpoint 同一个界），不超过调用方自己的界（更短时按调用方的键措辞）；等的过程中看得见
+  cancel（≤`POST_TARGET_POLL`）与 reader 死亡 latch；取消通知不等（不等回执，没有当前目标就丢帧）。
+  残留：退役前一刻已取走旧目标的 POST 仍可能打到刚被回收的会话（server 应 404 或应答丢失，以调用自己
+  的界收尾）——彻底关掉要「排空在途请求再轮转」的重设计，未做。
   **reader 死亡即 latch 快败**（stdio stdout / legacy SSE 两种传输对称）：reader 的死亡退出
   （首连失败、EOF、真读错、超限行、endpoint 刷新被闸门拒）先写停止原因再 fail-all，之后的
   request/notify 按原因立刻快败——否则服务器仍活时每次后续调用各坐满 CALL_TIMEOUT 变僵尸；
@@ -211,6 +341,93 @@
   路径 `/@trusted:3000/x`——任何手写 origin 切分（`find('/')`、rsplit('@')、默认端口剥除……）都可能
   与真解析器分歧（IDNA、百分号编码 host、userinfo 边角），别再写字符串版；回归测试钉住反斜杠混淆
   与网络路径变体（`endpoint_resolution_rejects_parser_confusion_bypasses`）。
+- **MCP 客户端契约（内核改进计划 0.1 翻页 + 2.4 版本/超时/名单/取消/探测/恢复）**：线上行为与默认值在
+  双语 README「超时、工具过滤、取消」小节，库侧七条清单在 `docs/lib_api.md`「MCP 客户端契约」。改 `mcp.rs`
+  前要记的不变量（都是代码注释里「为什么」的索引，不是复述）：
+  ① **界与名成对**：`Timeouts { call, connect, boot: (Duration, &'static str) }`——`boot` 是 `initialize`
+  用的界：stdio 默认借调用超时（设了 `connect_timeout_secs` 才换成它），HTTP 两种传输用连接超时。超时文案的
+  `(limit: <键>)` 取自界旁边的标签（`timed_out` / `name_the_bound`），不靠事后推断；连接超时能不能被贴上
+  `connect_timeout_secs` 标签，取决于 reqwest 是否把该错误标成 `is_connect() && is_timeout()`。配置侧 `0`
+  与超 7 天（`MCP_MAX_TIMEOUT_SECS`）在 `McpServerConfig::validate()` 报错；`timeout_secs` 仍对合法值做
+  `min`（防御性钳制，不是策略）。
+  ② **取消通知只发给「已出门」的请求**：`McpClient::call` 入口与 `probe_if_idle` 之后各查一次预置 cancel
+  （已置位 → `MCP call '<m>' cancelled`，不发请求、不通知）；请求发出后 Err 且 cancel 置位 →
+  `notify_cancelled(id, "cancelled by the client")`，每种传输都受 `CANCEL_NOTIFY_TIMEOUT`（1 s）约束、失败
+  只吞。**超时不发通知**（没有 cancel 就没有通知——超时的调用 server 可能已经做完并回了话）。
+  ③ **会话恢复只认一种信号**：`Failure::SessionLost` 仅由 `http_error` 在「404 且请求带了 session」时给出
+  （404 到达在 server 执行任何东西之前，所以重发不会重复副作用）；`attempt == 0` 才 `recover_session`
+  （diag 一行 → `reset_session()` → `initialize()`）并重发一次，再丢即原样报错。`reset_session()` 顺手重置
+  `standalone_rejected`——恢复后 server 若仍拒绝 standing GET 会再告警一次 405（已知、无害）。恢复**不重拉
+  工具表**（server 重启后换了工具集 → 调用拿到它自己的 unknown tool 错误，显式）。legacy SSE 没有 session，
+  探测/取消有、恢复无。
+  ④ **空闲探测三态**：`probe_if_idle`——`idle_for() < MCP_IDLE_PING`（60 s）直接过；否则
+  `request_within(id, "ping", {}, MCP_PING_TIMEOUT)`（5 s，且不超过该 server 的调用超时）：有结果或
+  `Failure::Answered`（server 应答了但拒绝，如没有 `ping` 的 `-32601`）→ 照常调用；`SessionLost` → 走恢复；
+  `Other`（静默/连不上）→ 调用**不发出**，`unreachable after Ns idle — '<m>' was not sent (ping failed: …)`。
+  `last_ok` 是 `idle_for` 的唯一数据源，只在「往返完成或 server 应答拒绝」时更新。stdio 恒 `None`（reader
+  死亡已锁存，下一次调用本就即时失败）。
+  ⑤ **standing stream 的 POST 前布防是尽力而为的竞态保险（已知缺口，未修）**：`request_bounded` 在 POST 前
+  `ensure_standalone_stream(false)`——GET 在线程里异步起，POST 立刻出门。只答 202 的 server 若在客户端 GET
+  连上之前就推送回复，这条回复无处可去，调用方坐满调用超时；standing GET 每 30 s 轮转（`STREAM_ROUND`）
+  都会重开这个窗口。官方 SDK 的 server 在 POST 响应体上直接以 SSE 应答，不受影响；自测 mock 撞到过
+  （120 s 挂起）。修法（待做）：reader 发布「已连接/被拒」，POST 前有界等它。202 分支收到应答后还会
+  `ensure_standalone_stream(true)` 再等一次；仅在线程起不来（资源耗尽）时才落到**不可取消**的一次性 GET
+  兜底（`get_event_stream` + `sse_response_for_id`）。
+  ⑥ **协议版本是两个常量 + 一个共享 cell**：`PROTOCOL_VERSION`（`initialize` 提供 `2025-03-26`）与
+  `KNOWN_PROTOCOL_VERSIONS`（静默集合：`2025-03-26` / `2025-06-18` / `2025-11-25`；其它原样采用并告警一次，
+  缺省按 `2025-03-26`，永不因版本拒绝 server）。协商值存 `McpClient::protocol_version`，经
+  `Arc<Mutex<String>>` 共享给 standing-stream reader——轮转重连的 GET 也要带对 `MCP-Protocol-Version`；
+  `initialize` 请求本身带 cell 的默认值。支持新修订 = 往 `KNOWN_PROTOCOL_VERSIONS` 加一项，不动
+  `PROTOCOL_VERSION`（2026-07-28 规范仍是跟踪项）。
+  ⑦ **工具名单在 `start_server` 里过滤**（`filter_tools`），启动装配 / `build_agent_with_lenient` / 热增
+  `build_one` 三条路径天然同款；`allow_tools` 的未知名字是硬错误（防拼写错与上游改名），`deny_tools` 的
+  未知名字放行（上游删工具不该拖垮装配）；名单写 wire 名。`tools/list` 翻页在 `McpClient::list_tools`
+  （64 页 / 256 工具 / 游标循环即停 / 任一页失败即握手失败），单页 server 的请求序列与翻页之前逐字节相同。
+  验证：`mcp.rs` 测试块（脚本化 `Transport` + 真 socket / python 子进程）+ `scripts/e2e_mcp.py`（真实
+  headless 二进制 × 文件内自带的零依赖 mock MCP + 脚本化 LLM，A–K 约 15 s，`--idle` 才跑 65 s 的空闲探测组 I）。
+- **MCP 注解旁表 + `structuredContent` 取舍（内核改进计划 1.6）**：`McpToolInfo` 多三个 `Option<bool>` 注解
+  （`destructive_hint` / `idempotent_hint` / `open_world_hint`，与原有 `read_only_hint` 并列）与 `output_schema`；
+  归一后的 `ToolAnnotations` 四字段是 `bool` / `bool` / `Option<bool>` / `bool`——**「未声明」与「声明为假」的区别**靠
+  规范默认值落位（`readOnlyHint`/`destructiveHint`/`openWorldHint` 有默认，`idempotentHint` 规范没有默认、省略即
+  `None`），实现不依赖任何缺省值假设。**旁表而不是 `Tool` trait 方法**：声明属于 server，内置工具 / 绑定
+  `CallbackTool` / run_code 注册都不必为它作答（第三方工具想声明就覆盖 `Tool::annotations`）；`ToolCtx::tool_annotations:
+  Arc<BTreeMap<String, ToolAnnotations>>` 按**暴露名**（模型调用的 `mcp_<server>_<tool>`）索引，`ctx.annotations(tool)`
+  是便捷读法（内置工具 `None`，MCP 工具恒有条目，什么都没声明时是 `ToolAnnotations::MISSING`）。**唯一构造点 =
+  `Agent::try_new` + `Agent::refresh_tool_defs`**（每个改工具表的入口都过这两个：热增删、开关 run_code 都走后者），
+  所以旁表永远不会与 agent 实际分发的工具表不一致；`task` 子代理与 run_code guest 持构造时快照（Arc 克隆——父侧之后
+  的增删只换父的 Arc）。每次调用把该工具的注解快照进 `ToolCallRecord.annotations`（落 result.json 的
+  `tool_calls[].annotations`，`skip_serializing_if = Option::is_none`——内置工具不出键）。**是 server 的自述、不是内核
+  保证**：没有任何强制，调度上 `read_only_hint` 也只是并行提示；审批留在宿主一侧（`before_tool` 读旁表决策）。
+  `structuredContent`（MCP 2025-06-18）：声明了 `outputSchema` 的工具以结构化载荷为权威——`shape_result_with` 的
+  `prefer_structured` 分支用它的 JSON 文本**替换**文本镜像（镜像是给人看的有损渲染）；没声明的工具 `content` 优先、
+  `structuredContent` 只做「纯结构化 server」的兜底（否则渲染成 `[empty tool result]`）。两种情况下结果里的图片都照样
+  胜出（结构化半边带不了图），文本已被预算截断时也不再切换。
+- **凭据卫生（内核改进计划 2.5；`ToolCtx.hidden_env` + `Config.env_passthrough`）**：此前子进程完整继承环境，模型一句
+  `env` 就把密钥写进上下文、session 文件与 `--json` 事件流。现在 `tools::hidden_env_vars(cfg)` 在装配时算出要移除的变量集
+  ——默认恰好是 `api_key_env` 指向的**那一个**变量（`env_passthrough` 列了它则为空；`api_key_env` 为空也为空），落进
+  `ToolCtx.hidden_env`。**库从不修改进程环境**：移除发生在每个 spawn 点的 `Command::env_remove`——`shell` 工具两条链
+  （unix `sh -c` / windows `cmd /C`，`hide_env`）、MCP stdio server 两条链（`McpClient::start_with_env(cfg,
+  &hidden_env)`；无参 `start(cfg)` 等价于空集，自己持有 MCP 客户端的宿主按需选）、热增的 `Agent::add_mcp_server`
+  （读 agent 自己的 ctx 集）。MCP 条目 `env` 里**显式写出**的同名变量照常下发——用户有意把密钥交给某个 server 时它保留
+  （`.envs(&cfg.env)` 在 `env_remove` 之后）。`task` 子代理（`child_ctx`）与 run_code guest 的 ctx 是克隆，原样继承。
+  **定位是防顺手不防对抗**：其余变量完整继承，同用户进程仍可经操作系统读到父进程环境——真正的隔离靠容器或受限用户。
+  两条启动提示都走 diag 通道、每进程一次、只在对应条件成立时出现：卫生提示（`[config] API key variable(s) … hidden
+  from tool subprocesses …`）只在配置里真有 `shell` 工具或 stdio MCP server 时发；无人值守提示（`restrict_to_workdir`
+  未开）只在 headless（带 task）与 batch 发、TUI 不发（有人在看）——同样「纯半边」拆出来供测试，不必抓 stderr。
+  验证：`tools::shell::tests::hidden_env_is_removed_from_the_spawned_shell`（真 spawn 探针）、
+  `tools::tests::hidden_env_vars_is_the_key_variable_unless_passed_through`（集合的纯函数）、
+  `mcp::tests::strip_inherited_env_removes_hidden_names_unless_configured`（配置的 `env` 优先）与
+  `mcp::tests::stdio_server_is_spawned_without_the_hidden_env`（python 子进程回显环境）、
+  `agent_tests::add_mcp_server_spawns_with_the_agent_hidden_env`（热增）、`subagent::tests::
+  child_ctx_inherits_hooks_and_tags_subagent_name`（子代理）与 `run_code::tool::tests::
+  guest_ctx_inherits_the_hidden_env_set`（guest）、`scripts/e2e_mcp.py` 组 K（真实二进制 × shell + stdio MCP：
+  默认不可见、`env_passthrough` 放行、MCP `env` 显式下发，共 8 项）。Windows 侧（`cmd /C` 链、热增链）没有实跑，
+  只做了 Windows 目标的交叉类型检查与 clippy（配方见 pitfalls「`#[cfg(windows)]`」条）。
+- **`refresh_tool_defs` 与构造路径同一量纲（内核改进计划 0.2）**：热增删 MCP server、开关 run_code 之后重算
+  `tool_schema_chars` 的那段曾经用字节数累加，而构造路径用的是 CJK 感知的 `compress::tool_schema_units`——同一个 agent
+  热增一个带中文描述的工具之后，两条路径的估算口径就不一致。现在两边都过 `tool_schema_units_sum`（构造路径与
+  `refresh_tool_defs` 共用），回归钉子：热增后与一次性构造的值相等。新增「重算工具表」的入口时照同款走这个函数，
+  别再手写 `.map(|t| …len()).sum()`。
 - **子 agent（`task` 工具，`tools/subagent.rs`）**：主 agent 把聚焦子任务交给一个全新子 agent
   （独立历史 + 独立 turn 预算，`limits.subagent_max_turns` 封顶——默认 25，`0` = 不另设天花板），
   只把最终摘要作 tool 结果返回。
@@ -242,13 +459,14 @@
   闸门」条）；`timeout_secs` 经 `clamp_child_timeout` 收紧为父的**剩余时间**（`ToolCtx::deadline`，
   只紧不松、地板 1s——0 会意外松成"不限"），不再克隆完整第二份超时。粒度仍是轮次边界：同轮已并行
   启动的兄弟互不见对方本轮后续花费，严格控成本仍留余量或去掉 `task`（README limits 节同款表述）。
-- **Hooks 拦截层（`hooks.rs`，P1，第三方扩展面）**：`trait Hooks: Send + Sync` 四默认方法
+- **Hooks 拦截层（`hooks.rs`，P1，第三方扩展面）**：`trait Hooks: Send + Sync` 五默认方法
   （`before_tool` → `ToolDecision::{Allow, Deny(String), Modify(Value)}`；`after_tool` 事后审计；
   `on_chat_request` 只读观察主 turn 请求；`on_turn_stopping` 轮末仲裁——FR-1：仅 top_level、仅
   `end_turn`、仅即将发 `Done` 前调用，`Continue{note}` 复用 R1 旁注管线（入队 → 下轮轮首
   `deliver_notes` 投递），续跑帽 `TURN_ARBITRATION_CAP = STUCK_STOP_AT`（6），超限降级
   `stop_reason="arbitration_capped"`、note 只留在 `TurnArbitration` 事件里；**默认 `Stop` 零漂移**
-  ——非默认决策才发事件，既有钉子表不漂移；子 agent run（`top_level=false`）从不仲裁），
+  ——非默认决策才发事件，既有钉子表不漂移；子 agent run（`top_level=false`）从不仲裁；
+  `on_before_compact` 压缩前观察——见本条末尾的 2.2 段），
   `Agent::set_hooks` 后置安装（仿 `set_cancel` 模式）。
   装配（`lib.rs::assemble`）留 `ToolCtx::hooks = None`——二进制与绑定**零行为变化**，只有库用户
   显式安装才生效。**子 agent 经 `child_ctx()` Arc-clone 继承同一层**（顶层拒绝 = 子 agent 内也拒绝，
@@ -283,6 +501,25 @@
   分散在六组测试里各写各的，任一条路径悄悄偏离没人拦。不变量用变异测试验证过——分别去掉 Cancelled
   的 ToolResult 合成、去掉占位循环的 `after_tool`，对应用例立即转红。新增 Slot 赋值点或改占位/合成
   逻辑时先对照这张表。
+  **压缩前观察 `on_before_compact(&CompactionInfo)`（内核改进计划 2.2）**：唯一调用点
+  `Agent::notify_before_compact`，坐在**摘要已成功**与**改写历史**之间——每次「真的折叠」同步调一次，
+  触发路径三类全覆盖（run 内 preflight / overflow 恢复、宿主的 `Agent::compact*`、`task` 子代理自己的
+  压缩——后者带 `info.subagent`、跑在那条 worker 线程上）。摘要失败 / 空摘要 / 仅 prune 都**不触发**
+  （没有折叠可通知）。`CompactionInfo` 全是借用（`trigger`、`subagent`、`dropped`、`dropped_chars`、
+  `todo` = 最新 todo 调用的渲染清单、`folding` = 即将离场的那些原始消息，仍可读）——**只读、不能否决**
+  （摘要已计费，调用返回即折叠；要留档就在这一次调用里克隆）。调用点不持锁。它是**唯一 panic 会被
+  兜住**的钩子：`catch_unwind(AssertUnwindSafe)` 包住，panic 经 diag 通道报一行
+  `[compress] on_before_compact hook panicked (…) — folding anyway` 后照常折叠——此刻摘要已计费、
+  未折叠的历史离 overflow 只差一个请求，坏掉的观察者不该让这次折叠作废（发布构建 `panic = "abort"`
+  兜不住 panic=abort 的进程，所以实现仍不该 panic）。慢钩子只观测不设限：超过
+  `COMPACT_HOOK_SLOW_WARN`（= 仲裁钩子同款 5 s）`diag_warn` 一次（run 内路径下它睡多久就吃掉多少
+  剩余预算）。**两个绑定都没转发它**（鸭子类型只认 `before_tool` / `after_tool` / `on_chat_request`）。
+  TUI 的 `/compact [focus]`（idle-only）是同一个内核调用的键盘入口：worker 上的忙任务，状态栏
+  `compacting…`、Esc 取消、期间输入照常排队；成功时照常渲染折叠自己的 `Compressed` 事件，历史太短是一行
+  `[compact] nothing to fold …`，失败一行 `[compact] failed: …`（cause 链只打印一次），Esc 取消只留 UI
+  自己的 `[cancelled]`；成本在每条路径上都诚实（见 `compact_report`）。
+  新增折叠路径时必须过 `notify_before_compact`——它的三个「不触发」条件是 `agent_tests.rs` 的钉子，
+  漏调或多调都会让「观察点 = 每次折叠恰一次」失真。
 - **任务计划（`todo` 工具，`tools/todo.rs`）+ 审计 `meta` 通道**：`todo` 是无状态工具（`&self`，与 shell 同），
   **全量替换语义**（每次发完整计划，TodoWrite 式）。两条关键设计：① **`plan` 从 tool-call 日志派生，不经压缩**——
   `agent::extract_plan` 取 `records`（`Vec<ToolCallRecord>`，独立于 `self.messages`）里最后一条非 error 的 `todo` 调用的
@@ -313,9 +550,16 @@
   镜像 `main.rs` 的手写 XDG 定位，无 dirs crate）+ 项目 `<workdir>/.tinyagent/skills/`，项目覆盖全局同名
   （`scan` 按 name 排序去重）。每个 skill 是子目录含 `SKILL.md`（YAML frontmatter + 正文）。
 
-  **手写 6 字段 frontmatter 解析（无 YAML 依赖）**：必填 `name`/`description`；可选 `license`/`compatibility`（单行标量）、
-  `allowed-tools`（空白拆成 `Vec`）、`metadata`（缩进 `key: value` 块 → `HashMap`，`in_metadata` 状态机）。多行 YAML 折叠
-  不支持；`metadata` 是唯一支持块的字段。**`SkillEntry` 带全 6 字段**，但 level-1 简介只透出 name+description（license/
+  **手写 6 字段 frontmatter 解析（无 YAML 依赖）**：必填 `name`/`description`；可选 `license`/`compatibility`（标量）、
+  `allowed-tools`（空白拆成 `Vec`）、`metadata`（缩进 `key: value` 块 → `HashMap`，`in_metadata` 状态机）。
+  **块标量（内核改进计划 0.3）**：四个标量字段（`name`/`description`/`license`/`compatibility`）与 `metadata` 的每个值都接受
+  单行值或 YAML 块标量——`|`（字面：保留换行）或 `>`（折叠：同缩进的相邻行并成一个空格，紧邻空行或更深缩进处不并），
+  可带 chomping 指示（`-` / `+`：校验后忽略——值恒 trim，所以它不改变结果）与缩进指示（1–9）。块体按缩进收集：比 `key:`
+  行更深缩进的行都属于块，第一个非空行定基准缩进（更深的行保留多出的缩进），**第一条缩进 ≤ 键缩进的非空行就是下一个键**
+  ——所以折行的 description 后面可以直接跟 `metadata:`（是兄弟键，不是描述文本）。`description` ≤1024 的校验作用在
+  **拼接并 trim 之后**的值上。**仍刻意不支持**（不引 YAML 依赖）：多行**裸**标量（plain scalar 续行）、块序列（`- item`）、
+  嵌套映射——这些键保持原有行为（必填字段读成空 → `Missing` → 告警跳过；`allowed-tools` 读成空；未知键按规范忽略），
+  不做猜测式解析；`metadata` 仍是唯一接受缩进 `key: value` 块的字段。**`SkillEntry` 带全 6 字段**，但 level-1 简介只透出 name+description（license/
   compatibility/metadata 仅存储不进 system——简介须短）。**name 严格校验**：1-64 字符、仅 `[a-z0-9-]`、首尾非 `-`、无 `--`、
   **必须等于父目录名**（`valid_skill_name` + scan 内 `name == dir.file_name()` 校验）；`description` ≤1024；任一不过 →
   warning+skip。三级加载：①简介拼进 **system_prompt**（常驻——压缩只动 messages 不动 system，故简介安全；但计入
@@ -411,6 +655,10 @@
   ——主 loop 展示预算拉不走数据规模块，guest 2M 预算吃满窗）+ write_file `content_b64`（字节保真写，
   开放问题 1 的解）。② **prelude**（`PRELUDE_SRC` → `prelude_line()` 展平成**单物理行**注入 guest 代码前——
   quickjs 行号相对 eval 源，多行 prelude 会把用户栈帧行号整体偏移；展平后恒 +1，不变式测试钉住）：
+  **栈帧位置是「出错前最近一个带位置信息的语句」，不保证是出错的那一行**——quickjs 只给部分指令挂源位置
+  （调用、throw 等），`const r = nope(x);` 里未定义标识符的读取没有自己的位置，报出来的是更早的那条语句，
+  可以早好几行，极端情况落在 prelude 行上（实测报成 `<run_code>:1:2248`——prelude 那一行的某一列）。标识符名在消息里，模型照样能自纠
+  （2026-11-26 真机批次 deepseek-flash 写了 `await0(n)`，一次报错下一轮改对）；别拿行号去反推源码行。
   `readAll`/`readLines`/`writeVerified` 三件、清单**封闭**（每个新助手都是「模型以为有其实没有」的新幻觉面），
   描述（设计附录 A 即规格）点名三者，改 prelude 必须同步附录 A 与描述。`eval_code` 每次调用新建 JS
   runtime——prelude 不能分两次 eval、只能拼进同段（函数体内 var/function 声明，用户代码可遮蔽）。
@@ -552,8 +800,11 @@
   请求的上下文按来源拆出 token **估算**量——system 三段（env 头/用户 base/skill 简介）、工具 schema
   四类（`Tool::origin()` 能力标记：Builtin/Mcp/Skill/Custom，默认 Custom、SharedTool 委托 inner，类内
   逐工具 name+desc+schema JSON）、消息历史按 block 分型（user_text/assistant_text/tool_use/tool_result/
-  image/document/skill_content/other；**没有 thinking 桶**——思考是纯事件流永不进 history，恒 0 字段是
-  撒谎式 API；skill_content 按 tool 名 == `read_skill` 归因，ToolResult 只有 tool_use_id，先扫 ToolUse 建
+  image/document/skill_content/reasoning/other；**没有 thinking 桶**——`ThinkingDelta` 是纯事件流、永不进
+  history，恒 0 字段是撒谎式 API；`reasoning` 桶计的是另一条通道——`preserved_reasoning`（2026-11-26 起默认开）打开时随
+  assistant 消息落在**旁字段** `Message.reasoning` 里的回传块（`compress::reasoning_units`，与
+  `estimate_tokens` / `total_chars` 用同一份），开关没开或当前轮没有回传时恒 0；skill_content 按 tool 名 ==
+  `read_skill` 归因，ToolResult 只有 tool_use_id，先扫 ToolUse 建
   id→name 映射（同 compress `todo_use_ids` 模式），eager 注入对与运行期真实调用一并归入）。**口径纪律**：
   一切数字是启发式估算（`compress::estimate_tokens` 同一套 yardstick：units/4——ASCII 字符计 1、
   CJK 计 9、其他非 ASCII 计 4——+ 图片 len/100 + PDF 页
@@ -579,7 +830,18 @@
   绑定照 `usage()` 模式透出（Python `context_breakdown()` pythonize dict / Node native `contextBreakdown()`
   serde Value + wrapper.d.ts 同步两件套纪律）；TUI `/context` 是第一个消费端（worker channel 模式，
   busy 拒绝与 /clear 同款——worker 在 run 里不泵 in_rx）。
-- **TUI 是可选 feature**（`ratatui` + `crossterm` + `tui-markdown` + `unicode-width`），
+  **工具表规模提示（内核改进计划 2.3）**：`ToolsBreakdown::advisory()` 在工具 schema 估算**严格大于**
+  `TOOL_DEFS_ADVISORY_TOKENS = 10_000` 或工具数（四类之和，`tool_count()`）**严格大于**
+  `TOOL_DEFS_ADVISORY_COUNT = 30` 时出提示（恰好等于不算越过；token 数取报表**当前**口径——校准缩放后的
+  `tokens`，工具数不缩放；`ToolDefsAdvisory::{Tokens, Count, Both}`）。同一判定在装配期也走一遍：
+  `Agent::try_new` 末尾（仅顶层 agent）用 `tool_table_tokens(system, tool_schema_chars)` 算出与报表**同数**的
+  值（system 段之后的 running-floor 份额 `floor((sys+U)/4) - floor(sys/4)`，
+  `tool_table_tokens_is_the_breakdowns_number` 钉住两者永远相等），越过即经 diag 通道（`[context] …`，
+  `note_tool_defs_advisory`）**每进程按文本去重提示一次**；子 agent 与热增删（`refresh_tool_defs`）不提示
+  （子 agent 的工具表是父的有界子集、会按 child 重复；热增路径按契约不打印——`/context` 报实时表）。
+  文案单一来源 `tool_defs_advisory_lines`（五短句、每行远小于 80 列——启动期 diag 经 stderr fallback 进
+  未进 raw 的终端，长行会被终端按右缘硬折、断词）。**只提示不处置**：裁不裁工具表由宿主决定。
+- **TUI 是可选 feature**（`ratatui` + `crossterm` + `tui-markdown` + `unicode-segmentation` + `unicode-width`），
   `src/tui/`（模块根 `tui.rs` + app/transcript/markdown/slash/render/input/theme/tests）在
   `#[cfg(feature = "tui")]` 后——2026-10 由 8.7k 行单文件按关注点拆分（纯搬移零行为变更，
   148 个测试随迁；`crate::tui::run` 入口不变）。默认 headless 版不含它，保持体积。
@@ -594,48 +856,155 @@
   默认回退路径每次 `insert_before` 都 `Terminal::clear()`（发一个 DSR 光标查询 `\x1b[6n`），开了
   scrolling-regions 走 CSR(DECSTBM) 滚动区路径、无此查询且渲染更平滑（CSR 现代终端普遍支持）。
 
+  **终端断开监控（Unix）**：crossterm 0.29 的 Unix event source 在 tty EOF 时不会从内部 read loop
+  返回（`read == 0` 不退出、非 WouldBlock 错误被忽略），pty master 关闭后主线程会卡在 `event::poll()`
+  内满核空转，外层事件循环收不到错误。`spawn_terminal_disconnect_monitor` 因此用独立线程对同一 tty
+  （stdin 是 tty 则复用其 fd，否则自行打开 `/dev/tty`）做 100ms `libc::poll`，只探测、不读走输入；
+  HUP/ERR/NVAL 时置 cancel + shutdown、发 `None` 让 worker 收尾，最多等 3s，再恢复终端并
+  `process::exit(0)`。**这是有意的进程级逃生口**：主线程可能永远困在 crossterm 内，不能指望正常
+  return/Drop；正常退出只置 shutdown，监控线程最迟下一轮自行退出。未知探测错误 fail-open（不杀健康
+  TUI），EINTR 重试。非 Unix 为 no-op。真实 openpty 单测钉住关闭前后探测结果，pty 进程级验收须覆盖
+  自动退出与 CPU，不只断言普通 idle。
+
   **TUI 定位（原"冻结只修 bug"政策已按产品决定放宽）**：交互体验对齐主流终端 AI 工具的基础项
   已落地一批（见下），红线仍是**架构与渲染模型**——不做全屏 / 鼠标托管 / 主题系统这类结构性扩张。
   已落地的扩展面速记：
+  - **视觉语言与底部 chrome**：空态是三行 render-only 报头——宽屏为与 120 列工作区同宽、版本号右对齐到
+    输入框右缘的 `T I N Y A G E N T` 间隔字标，加双色规则线与简洁标语；窄屏先舍版本号。键帽只在
+    composer 底边框上出现一次，空态不重复。正文、composer、队列预览、状态行与空态/弹窗共享左锚定、
+    最多 120 列的工作区（空态/弹窗的宽度参数必须传 `content_w`，不能传 zone 的全宽）。正文用粗体青色
+    `❯` 用户行与绿色 `◆` 助手行分层，工具头以 `TOOL_HEAD_MARK="    ▎ "` 串联调用/结果，展开正文延续
+    `│` guide；Thinking 用独立色斜体，系统信息/警告/错误分别用 `·`/`!`/`✗`。行内代码与键帽、slash
+    选中行共用 `keycap_bg()` 的主题感知凸起表面（选中行另有 `❯` gutter，不再整行反色）；普通白字不被
+    重染。composer 使用圆角边框与 `composer_bg()`，空闲标题为 ` ◆ MESSAGE `，底边框在空间足够时放
+    Enter / / / Ctrl-J / /help 键帽（窄框先省 `/` 与 Ctrl-J），忙时撤下。状态栏以 `surface_bg()` 铺
+    低对比底色，模型是青色粗体文字而非实心徽章，状态文案为 ready/running/cancelling/failed；累计 token
+    段只在该会话已产生计费（含仅缓存流量）时出现，新会话不显示 0；路径有 48 列显示预算，超长时保留
+    最长完整尾部目录段并加 `…`，不足 12 列则隐藏。空态与 slash popup 共用 grapheme-aware
+    `truncate_line`，角色/工具符号变更必须同步最终折行的 `continuation_prefix`。
   - **流式增量定稿（`split_streaming_row(&mut rows, width)` + `Row::AssistantCont{text,tight}`）**：
-    在途 Assistant/Thinking 行的**显示行数**（`est_display_rows`：逐字符 unicode-width 累加折行——
-    是渲染实际行数的**上界**，markdown 段内软连接只会更少行，宁早切勿漏切）超过阈值即切分：前缀
-    定稿进 scrollback、尾段继续 live 流式。**切分点两级**：优先最新安全段落边界（`last_safe_boundary`，
-    空行分隔、前缀围栏闭合）——整段 markdown 块完整定稿，续块 loose（块间补空行恢复段落间距）；
-    段落本身超过阈值（**含 LLM 常见"一整段一行"散文——逻辑行数是 1，任何基于 `lines().count()` 的
-    阈值对它永不触发，必须按显示行**）退化为**显示行切分**（`soft_cut_offset`：切点总在折行边界，
-    尾段保留最后 `LIVE_TAIL_ROWS=2` 行），续块 tight——渲染紧贴前行（无空行，段落不被撕成两半）、
-    不重复 ✻ 标记、`/export` 以 `\n` 拼接。围栏内切分给尾段补合成 ```` ``` ```` 开栏（未闭合前缀照样
-    渲染成代码块；转录 strip 回去）。**阈值两档**：首切 `INLINE_HEIGHT`，切过一次后（尾行是
-    Cont/tight Thinking）降为 `LIVE_TAIL_ROWS`——之后每写一行即提交；年轻段落（≤2 行）仍走段落
-    切分保住空行结构。**`trailing_spacer` 陷阱（`build_history_lines` 第 6 参）**：commit 渲染的是
-    `rows` 切片，切片末行若按"历史末尾"无条件补空行，每批增量提交都往 scrollback 塞一个多余空行、
-    tight 段落被撕开——只有 `pending_end == rows.len()` 才传 true。续块无 ● 图标（一条回复不读成
-    N 条消息）；子 agent 气泡不切。改 `split_streaming_row` 签名（带 width）或 Cont/Thinking 形状的
-    人：测试里 ~10 处构造/匹配要跟着改。
-  - **思考区块（`Row::Thinking`）**：ThinkingDelta 不再与答复折进同一 Assistant 行（混排不可读），
-    走 `append_thinking_delta` 进独立暗色斜体 `✻` 行——`thinking_stream: Option<String>` 是当前在飞
+    **只切在途 Assistant，Thinking 与子 agent 都不切**。显示行测量与最终折行共用 grapheme-aware
+    `LayoutCell`/`unicode-width` 口径（CJK、ZWJ emoji、variation selector 都按完整 grapheme 处理），
+    超过阈值即把安全前缀定稿进 scrollback、尾段继续 live 流式。**切分点两级**：优先最新安全段落
+    边界（`last_safe_boundary`，空行分隔、前缀围栏闭合），续块 loose（块间补空行）；段落本身超过
+    阈值时退化为**显示行切分**（`soft_cut_offset` 保留最后 `LIVE_TAIL_ROWS=2` 行），续块 tight
+    （无空行，`/export` 以 `\n` 拼接）。围栏内切分给尾段补同字符同长度的合成开栏；切点落在未闭合
+    inline code 内则等待闭合，fence 状态只由切点前的**完整逻辑行**推导，closing fence 滑到 EOF
+    时拒绝空尾切分。**放弃切分必须原子**：先在不可变切片上验证 EOF/全空前缀，再一次性
+    `split_off`/`truncate`，不能先删换行再 return。阈值首切 `INLINE_HEIGHT`，切过一次后降为
+    `LIVE_TAIL_ROWS`；年轻段落（≤2 行）仍走段落切分。**`trailing_spacer` 陷阱**：commit 渲染的
+    切片末行只有 `pending_end == rows.len()` 才按历史末尾补空行，否则每批提交多一条空行、tight
+    段落被撕开。续块无 ◆ 图标；子 agent 气泡不切。改 `split_streaming_row` 或 Cont 形状时同步
+    更新对应构造/匹配与真实 `build_history_lines → wrap_history` 最终渲染等价测试。
+  - **思考区块（`Row::Thinking` / `Row::ThinkingFull`）**：ThinkingDelta 走
+    `append_thinking_delta` 进独立色斜体 `✻` 行——`thinking_stream: Option<String>` 是当前在飞
     trace 的 tag（"" 父 / 子 agent 名，merge 判据同 `sub_streaming_name`），答复/工具/任何其它行插入
-    即关闭、再次 trace 开新行；**不走 markdown/MdCache**（视觉上必须区别于答复）；`commit_pending_end`
-    与 `inflight_row_index` 都把 Thinking 与 Assistant 同等对待（在飞 hold back / live 区渲染 + `▌` 光标，
-    `build_history_lines` 的 `LiveRow::{Text,Think}` 决定光标归属）；空 trace 渲染为空、`/export` 以
-    `✻ Thinking` 段落收录。改这三处的人：新增任何"在飞行"必须同步 holdback/inflight/LiveRow 三件套。
-  - **render-only 瞬态模式**（`thinking`、`tool_running` 同款）：渲染期合成、不进 rows / MdCache /
-    转录——live 区渲染优先链 popup > thinking > inflight 流式行 > tool_running 占位
-    （`→ 工具名 · 1.2s…`，并行 fan-out 聚合 `(+N)`，busy 时 120ms tick 走字）。新增瞬态展示照此模式。
-  - **`/out [n]`**：从 rows 尾部找第 n 新的 `ToolResult` 克隆置 `expanded: true` 重印
-    （`nth_last_tool_result`）——展开渲染与提交通道全复用，无新渲染路径；`SLASH_COMMANDS` 一张表
-    同时驱动 /help 与补全弹窗（新增命令只改表 + classify + Enter match 三处）。
+    即关闭、再次 trace 开新行；**不走 markdown/MdCache**。`commit_pending_end` 与
+    `inflight_row_index` 仍把 Thinking 与 Assistant 同等 hold back（`LiveRow::{Text,Think}` 决定光标
+    归属），但 Thinking **不走 Assistant 的增量切分**：live 只渲染按显示宽度截取的有界尾部，避免
+    每个 delta 重排整段；关闭后整块一次提交，超过 `THINKING_FOLD_ROWS=8` 个显示行折叠为头部 +
+    末尾 `THINKING_PREVIEW_ROWS=3` 行。**定稿态的行数、折叠判定与预览切片都按 `trim_end()` 后的
+    原文算**——真实 trace 以 `\n`（常是 `\n\n`）结尾，尾部空行不是内容：否则头部行数虚高、三行
+    预览有一行空白，八行整的 trace 还会被空行推过阈值。`Row` 内始终保留完整原文供
+    `/export`；`/thinking [n]`
+    克隆成显式 `ThinkingFull` 追加重印，绝不原地改已提交 scrollback。新增任何"在飞行"仍必须
+    同步 holdback/inflight/LiveRow 三件套。
+  - **共享显示布局与 composer**：`render.rs::layout_cells` 以 `unicode-segmentation` 的 grapheme
+    cluster 为最小单元，同时保留 composer char offset、源 byte offset、显示宽度与样式；最终
+    `wrap_line`、`est_display_rows`/`display_row_starts`、显示截断都复用这套口径，禁止按 `char`
+    拆 ZWJ emoji。`layout_composer` 负责软折行与 source offset→cell 光标映射，`composer_scroll`
+    是纵向滚动唯一计算点；`InputBuffer.col` 仍是 UTF-8 byte offset。已删除 `input_hscroll`，长
+    prompt 在固定 inline viewport 内纵向审阅。drop-space 两侧、exact-full-width、grapheme 内 caret
+    与 1–4 列极窄 continuation 都有 TestBackend cell-grid/cursor 钉子。
+  - **render-only 瞬态模式**（`thinking`、`tool_building`、`tool_running` 同款）：渲染期合成、不进
+    rows / MdCache / 转录——live 区渲染优先链 popup > 空态 > thinking 占位 > inflight 流式行 >
+    `tool_building`（`→ 工具名 · receiving arguments`）> tool_running 占位（`→ 工具名 · 1.2s…`，
+    并行 fan-out 聚合 `(+N)`，busy 时 120ms tick 走字）。ToolInputDelta 只驱动 tool_building，
+    不累计 JSON 到 UI 状态。新增瞬态展示照此模式。
+  - **队列与运行相位**：`queued: VecDeque<String>` 是唯一真值，**没有 `Row::Queued`/transcript
+    ghost**；独立 queue preview 显示最老待发消息与长度，真正受理投递时才追加 `Row::User`，因此
+    待发送文本不会卡住 commit watermark。正常完成自动 flush FIFO；取消清空队列；错误进入
+    `RunPhase::Failed` 并置 `queue_paused`，必须 `/resume` 显式释放，另发新 prompt 不隐式释放旧
+    FIFO。`/queue` 列表、`/unqueue` 取回最新一条到 composer。**不变量：`queue_paused` ⇒ 队列非空**
+    ——暂停是「被扣住的消息」的属性：失败时队列为空不置位（`pause_for_held`），取消清队、
+    `/unqueue` 取走最后一条都解除（后者同经 `pause_for_held`）；残留标志会把下一次正常运行期间排入
+    的消息标成 paused 并在轮末扣住，而用户从未见过暂停提示。failed 态标题由
+    `failed_title(held, width)` 按有无扣住消息给出 `/resume` 或重试提示（空队列时 `/resume` 只会答
+    `[no paused queue]`）。
+    `RunPhase::{Idle,Running,Cancelling,Failed}` 驱动标题/边框/状态与 busy popup，重复取消不重复刷
+    `[cancelling…]`。
+  - **详情追加重印**：`/out [n]`、`/call [n]`、`/thinking [n]` 分别克隆第 n 新的工具结果、工具
+    调用（完整输入 JSON）、思考块；`Ctrl+O` 取三者中最新一项。复用展开渲染与提交通道，不修改
+    已提交历史，也不虚构同名并行调用的精确配对。失败工具结果自动展开同时受 **20 行 + 2000 字符**
+    限制。`SLASH_COMMANDS` 一张表驱动 grammar、/help、补全与 busy 隐藏（新增命令仍需接 classify
+    与 Enter 执行臂）；`/clear`、`/context`、`/resume`、`/compact` 是 idle-only。
   - **resume 转录**（`tui::transcript_rows(&[Message]) -> Vec<Row>`）：main.rs 在 build_agent
     **消费 `initial` 之前**快照；先一遍扫全部 ToolUse 建 id→name map，ToolResult 按 id 反查配名
-    （查不到用 `(unknown)`），`elapsed: None`（字段本就为 resume 设计）；Image 跳过（转录是显示层）。
-    resume 时**跳过 initial_task 镜像**（末条 user 已在转录里，再镜像重复）；`Row` 因此 `pub(crate)`。
+    （查不到用 `(unknown)`），`elapsed: None`（字段本就为 resume 设计）；Image/Document 分别显示
+    `[image attached]` / `[PDF document attached]` 轻量占位，不静默抹掉轮次。resume 时**跳过
+    initial_task 镜像**（末条 user 已在转录里，再镜像重复）；`Row` 因此 `pub(crate)`。
   - **浅色主题**（`TINYAGENT_TUI_THEME=light`）：`THEME_LIGHT: OnceLock<bool>` 进程级一次设定
     （`run()` 入口读 env，OnceLock 无法复位——**测试不得 set 它**，light/dark 两态逻辑抽纯函数
-    `theme_light_from` / `redye_inline_code` 测）；dim 文字走 `dim_fg()`（dark=Gray 现状 / light=DarkGray）、
-    行内代码走 `code_fg()`（dark=White / light=青）——新增暗色 UI 元素用 `dim_fg()` 别再引常量。
+    `theme_light_from` / `dim_fg_for` / `code_fg_for` 测）；dim 文字走 `dim_fg()`（dark=Gray 现状 /
+    light=DarkGray），行内代码走 `code_fg()`（dark=White / light=青）并统一铺 `keycap_bg()`——
+    `redye_inline_code` 只重写 tui-markdown 原生的 white-on-black span，别误染普通白字。新增暗色
+    UI 元素用 `dim_fg()` 别再引常量。
   - **键位语义**：单行输入（含空）或浏览中 ↑/↓ 走历史召回（判定 `up_is_history`），多行恢复跨行
-    移动；`Ctrl-D` 删后字符（`InputBuffer::delete_forward`，backspace 镜像）/ 空输入空闲退出；
-    行尾 `\`+Enter 换行（行续接）；空闲 `Ctrl-C` 双击 2s 窗口确认退出（判定 `ctrl_c_should_quit`），
-    忙时单击取消不变。`is_normal_stop` 名单含 `cancelled`（Esc 已提示，Done 行是噪声）。
+    移动；`Ctrl-D`/Delete 删后字符（空输入空闲时 Ctrl-D 退出），Ctrl/Alt+←/→ 按词移动，
+    Ctrl+Backspace 删词；Shift+Enter / Alt+Enter / Ctrl+J 或行尾 `\`+Enter 换行；补全弹窗
+    Shift+Tab（兼容 `BackTab` 与 `Tab+SHIFT`）反向选择；`Ctrl+O` 追加重印最新详情；空闲
+    `Ctrl-C` 双击 2s 窗口确认退出（判定 `ctrl_c_should_quit`），忙时单击取消不变。
+    `is_normal_stop` 名单含 `cancelled`（Esc 已提示，Done 行是噪声）。
+- **回归任务集与评测装置（内核改进计划 0.4；`examples/regress/` + `scripts/regress_eval.py`）**：改内核之后
+  跑的就是它——六个任务（`multi-file-edit` / `long-output` / `mcp-many-tools` / `recover-after-failure` /
+  `cjk-docs` / `loop-suppression`）× 五个配方（`kernel-regress` / `reasoning-carry` / `compression-handoff` / `summary-preview` /
+  `mock-smoke`）。**任务目录** `examples/regress/tasks/<id>/`：`<id>.json` 是任务片段（`task` + `limits`）——与
+  `--batch` 任务文件**同格式、可直接用**；评测侧数据放同级 `harness.json`（类别、底配置覆盖、零成本通道的脚本化
+  模型），不进模型可见的配置；`check.py <result.json>`（cwd = 本次 run 的 workdir，退出 0 = 通过）是**唯一的
+  判卷点**——结论只来自它，不来自 CLI 退出码；`fixture/`（拷进 workdir）、`setup.py`（生成数据）、`expected/`
+  （参考文件，脚本经 `{"$file": "expected/…"}` 引用）可选。**每次 run 是一次单进程调用**（`--config … --json
+  --output result.json --session none`），不走 batch 模式——评测测的是内核在一份任务上的行为，batch 的重试梯
+  属于被测对象之外；任务片段里的 `limits` 仍按 batch 同款 `Clamp` 语义合并（**只能收紧**，`LIMIT_CLAMPS` 与
+  `config.rs` 的 `Clamp` 逐条镜像）。**配置叠加顺序**（`build_config`）：底配置 ← 任务覆盖 ←（mock 专用覆盖）
+  ← **臂覆盖** ← 任务片段——**臂压过 mock 调参**：臂是实验变量、必须说了算，否则「把 `keep_recent_messages`
+  压到 0」这样的臂会被任务的 mock 调参悄悄改回去（先写 pytest 抓出来的）。**两条通道**：`mock`（零成本——
+  每次 run 起一个 `mock_openai.py` / `mock_anthropic.py`，端口由系统分配、从 stderr 首行读回；底配置由脚本
+  生成，不读用户配置、不碰密钥）与 `paid`（底配置来自配方指向的配置文件；`run` 默认 dry-run，显式 `--execute`
+  才真跑；`prepare` 时没同时冻结 `--price-table` 与 `--cost-stop` 的批次标 `blocked_paid`，`run --execute`
+  一律拒绝；密钥只经 `api_key_env` 由 CLI 自己读，harness 只看变量在不在、从不读值）。**封存校验**
+  （`verify_frozen` + `run_config`）：`prepare` 把二进制、评测脚本、任务文件、底配置的 sha256、逐 run 配置与
+  执行顺序（重复轮次间 AB/BA 交替，抵消顺序偏差）冻结进 `manifest.json`；`run` 前逐项比对，任何一项变了
+  就要求重新 prepare，重建的配置还要与冻结副本逐字节相等（「清单说的就是跑的」）；半途的 run 目录挪开、
+  绝不覆盖，已有 `verdict.json` 的 run 跳过（可续跑）。**路径一律绝对化**：`run` / `summarize` 的批次目录、
+  `prepare --base-config` 的路径都先解析成绝对路径（清单里记的也是绝对路径）——run 的子进程 cwd 是 run 目录，
+  文档里的相对写法在那里解析不到（2026-11-26 第一次真机批次六个 run 全部启动即败；零成本通道走的是绝对
+  临时目录，从没踩到）。**清单脱敏**（`redact`）：逐 run 的真实配置只落
+  run 目录（0600），进清单的副本对 `extra_headers` 与每个 MCP 条目的 `headers` / `env` 只留键名（与内核
+  `Config::fingerprint` 同口径——MCP 的是**嵌套**在 `mcp_servers` 里的，只脱顶层会漏），
+  `base_url` / MCP `url` 去掉 query 与 fragment（有的网关把密钥放在那里）。**费用停止**：
+  `已花 + 下一个 run 的最坏预留 ≥ 停止值` 即不再起新 run；最坏预留 = `max_turns × (max_tokens + 窗口)`
+  （窗口取 `max_context_tokens`，没配按 `compress_threshold_chars / 4`，封顶 `max_total_tokens`）按四个单价
+  里**最贵的**折算（宁可高估）；用量报不全的 run 按预留记进「已花」、绝不当 0（与 `code_value_eval`
+  同口径）；`--cost-stop` 只收正的有限数（bool / `inf` / `0` / 负数即配置错误，`is_cost_stop`）。
+  **hermetic（两条通道一视同仁，`run_env`）**：每次 run 把 `XDG_CONFIG_HOME` 指到 run 目录内的空目录——`[skill]`
+  的全局查找跟着它走，否则开发者本机的真实技能目录会漏进轨迹（付费通道起初沿用开发者环境，2026-11-26 第一次
+  真机批次的 run 日志里就出现了开发者本机技能目录的 symlink 提示）；并给被测二进制（连同它拉起的工具 / MCP
+  子进程）设 `GIT_CEILING_DIRECTORIES` = run 目录与它的全部祖先——批次目录默认在仓库里，workdir 自己不是仓库时
+  git 会向上找到外层仓库，模型跑 `git status` / `git diff` 就把开发者未提交的 diff 发给了模型（同一批次的
+  `multi-file-edit` 抓出，约 30 KB），换成 `git stash` 就是改坏开发者的工作区；workdir 自己是仓库时照常被发现，
+  挡不住的只剩「先 `cd` 到祖先目录再 git」。mock / setup / check
+  子进程带 `PYTHONDONTWRITEBYTECODE=1`（否则仓库里落 `__pycache__`）。**`check` 是 CI 门禁**（`check.sh e2e`
+  组第三步、ci.yml 同款命令）：任务集校验 → 每个任务 × openai / anthropic 两种线协议的脚本化正路径全过 →
+  「什么都不做」的模型必须过不了判卷 → 同一任务跑两次汇总逐项相等 → 付费闸门逐条拒绝 → `mock-smoke`
+  配方把 prepare → run → summarize → compare 走一遍；用的假付费配置指向 `127.0.0.1:9`、密钥变量名从未
+  设置——**任何环境下都发不出一次付费请求**（环境里有真密钥也一样：`check` 不构造付费 run）。harness 自身
+  的离线单测在 `scripts/tests/test_regress_eval.py`（本地 pytest，不进 CI）——**动 harness 先写/跑它**，
+  七个缺陷都是先写测试才在跑之前抓出来的。判卷/汇总里两个易漏点：`result.json` 缺失时 `turns` 记 0
+  （不让汇总 KeyError）、工具错误数 `tool_errors` 作为独立指标进汇总与对比表的 `errs` 列——只看通过率
+  会把「模型反复撞错误才通过」掩盖掉。**读真机批次的三个要点**（2026-11-26 三个批次的经验）：① 判卷只看
+  产物——`PASS (exit 124, timeout)` 是「超时前产物已经正确、模型没来得及收尾」，按通过计，所以通过率要连同
+  `stop_reason` 一起读；② `compressed` 事件之后的第一条 `usage` 事件是那次摘要调用的用量（折叠经
+  `bill_chat` 入账），`output_tokens` 等于预算上限即摘要被截断——推理模型的思考 token 计入同一份预算；
+  ③ 只在会压缩的任务上两臂才有差别，其余任务的臂间波动是噪声（每格 3 次时尤其如此），结论按任务分行说，
+  别只报合计。付费通道保持串行：网关在 3 路并发流时回过 502（`upstream timed out`）。
 

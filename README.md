@@ -128,7 +128,8 @@ Under `--batch <dir>`, every `*.json` is a task fragment (all fields optional, o
 Task fragments may **only override** `task` / `system_prompt` / `model` / `max_tokens` / `reasoning_effort` /
 `inject_environment` / `salvage_on_max_tokens` / `limits` (clamped field by field) / `code` (clamped field by
 field; `code.enabled` and `code.llm.enabled` / `code.llm.default_model` are still refused). Security-relevant fields
-(`provider` / `base_url` / `api_key_env` / `workdir` / `tools` / `restrict_to_workdir` / `mcp_servers`) may not be
+(`provider` / `base_url` / `api_key_env` / `env_passthrough` / `extra_body` / `extra_headers` / `workdir` / `tools` /
+`restrict_to_workdir` / `mcp_servers` / `preserved_reasoning`) may not be
 overridden — any attempt marks the task `bad_task` and it is not executed.
 
 ### `--retries N`: retrying transient failures
@@ -146,7 +147,7 @@ cannot change them:
 | `bad_task` | invalid task fragment (forbidden field / missing task / JSON error) | ❌ |
 | `max_turns_reached` / `max_tokens` | a model limit was reached | ❌ |
 | `budget_exceeded` | cumulative tokens hit `limits.max_total_tokens` | ❌ |
-| `stuck_loop` | spinning guardrail: the same call with identical arguments and identical results 6 times in a row (the 3rd occurrence attaches a course-correction hint to the tool_result first, granting one self-healing chance; progress or changed args reset the counter) | ❌ |
+| `stuck_loop` | spinning guardrail: the same call with identical arguments and identical results 6 times in a row (the 3rd occurrence attaches a course-correction hint to the tool_result first, granting one self-healing chance; progress or changed args reset the counter). The same call returning the same result **with other calls in between** never stops the run: it gets a notice-only hint in that tool_result at its 4th, 6th… occurrence | ❌ |
 | `arbitration_capped` | turn-stopping arbitration (`Hooks::on_turn_stopping`) kept rejecting the model's `end_turn` past its per-run continuation cap (6, aligned with the stuck-loop discipline); the run then ends cleanly on the model's final turn — exit 0, the label lives in result.json for hosts that audit it (unreachable from the CLI binary — neither single runs nor `--batch` install hooks; only library hosts can trigger it; result.json `success` stays strict `end_turn`) | ❌ |
 | `stream_truncated` / `stream_idle` | the streaming response was cut short by the gateway (no finish_reason) or went silent past `stream_idle_secs` — honest-cost partial result: whatever text/calls arrived is kept and billed, exit 1, not retried. (A mid-read stream DEATH is different: it surfaces as a transient `error` with the partial text kept, and IS retried) | ❌ |
 | `panic` | the task panicked in a worker and was caught into a failure entry (below) | ❌ |
@@ -204,7 +205,7 @@ tiny-agent --config examples/harness.json --task "run the tests" --retries 3 --o
 - `--session none` disables persistence — nothing read, nothing written; a one-shot headless run leaves no file in cwd (mutually exclusive with `--resume`)
 - `--resume` loads the history and continues; the config's `task` counts as consumed, append new instructions via `--task`. A session saved under a different `model` than the current config resumes with the **new** model (a `[warn] session model '…' differs from config model '…'` line says so on stderr — model switch mid-session is allowed, not an error)
 - Completed turns survive crashes; applies to TUI mode as well
-- TUI `--resume` **transcribes the history into the native scrollback** (user/assistant messages, tool calls and results rebuilt as single-line views paired by id, `· ` system lines marked "resumed"); images are not transcribed; a session that stopped mid-tool_result resumes and auto-continues, with the last task text immediately visible
+- TUI `--resume` **transcribes the history into the native scrollback** (user/assistant messages, tool calls and results rebuilt as single-line views paired by id, `· ` system lines marked "resumed"); image and PDF blocks remain visible as lightweight `[image attached]` / `[PDF document attached]` placeholders; a session that stopped mid-tool_result resumes and auto-continues, with the last task text immediately visible
 
 ## TUI chat mode
 
@@ -218,25 +219,30 @@ content scrolls, the selection drifts" is gone. **Input mode** is the default:
 | key | action |
 |---|---|
 | `Enter` | send (queued while a turn is running; sent automatically when it ends; picks the completion-popup selection when open — does not send); with a trailing `\` it becomes a newline (line continuation, bash semantics) |
-| `Alt+Enter` / `Shift+Enter` | insert a newline (multi-line) |
+| `Shift+Enter` / `Alt+Enter` / `Ctrl-J` | insert a newline (multi-line) |
 | `Backspace` | delete the previous char (merging the previous line across lines) |
-| `Ctrl-D` | delete the next char (merging the next line); empty input while idle → quit |
-| `←`/`→`/`Home`/`End` | move within the line |
-| `Alt+←`/`Alt+→` | move by word (whitespace-split; a CJK run counts as one word) |
-| `Ctrl-W` | delete the previous word (degrades to merging the previous line at line start) |
+| `Ctrl-Backspace` / `Ctrl-W` | delete the previous word (degrades to merging the previous line at line start) |
+| `Delete` / `Ctrl-D` | delete the next char (merging the next line); `Ctrl-D` on empty input while idle quits |
+| `←`/`→`/`Home`/`End` | move within the logical line |
+| `Ctrl+←`/`Ctrl+→` or `Alt+←`/`Alt+→` | move by word (whitespace-split; a CJK run counts as one word) |
 | `Ctrl-U` / `Ctrl-K` | delete to line start / line end |
 | `Ctrl-A` / `Ctrl-E` | go to line start / line end |
 | `↑`/`↓` | recall previous/next history entry in single-line input (including empty) or while browsing history; move across lines in multi-line input (moves the popup selection when the completion popup is open) |
 | `Alt+↑`/`Alt+↓` | page through input history (available in any input state) |
+| `Ctrl-O` | append a full reprint of the latest tool call, tool result, or thinking block, whichever is newest |
 | `Ctrl-C` | busy → cancel the current turn (queued messages are discarded too); idle → double-press to quit (second press within 2s; the first only prints a hint) |
 | `Esc` | busy → cancel the current turn; idle → clear the input box (only closes the popup when it is open). Quit via `/quit`, `/exit`, or idle double `Ctrl-C` |
 
-While running, the input box stays editable: keep typing; `Enter` queues the message — the live region shows
-a dim `❯ … · queued` placeholder row and the input title shows the queue length; when the current turn ends,
-the oldest placeholder becomes the real message and is sent automatically; `Ctrl-C` cancels the turn **and
-discards the queued messages with it**; `/clear` and `/context` are disabled while running (`/context`
-needs to query the worker thread that owns the agent), the other slash commands (`/export`, `/out`,
-`/model`, `/limits`, `/tools`, `/system`, `/help`, plus `/quit` / `/exit`) work as usual.
+While running, the input box stays editable: keep typing; `Enter` queues the message in FIFO order. A
+separate live preview shows the oldest pending message and queue length — pending text is **not** inserted
+into the transcript as a ghost row and never blocks completed tool output from committing. A message gets
+its real `❯` user row only when delivery starts. `/queue` lists pending text, `/unqueue` withdraws the
+newest pending message into the editor, and `Ctrl-C`/`Esc` cancels the turn **and discards its queue**.
+A failed run pauses any held queue instead of firing a cascade of requests: `/resume` explicitly releases
+the next message; sending a separate new prompt does not implicitly release the held FIFO. `/clear`,
+`/context`, `/resume`, and `/compact` are hidden from completion while running (`/context` needs the worker
+thread that owns the agent; `/resume` only makes sense between runs; `/compact` must not fold a history a
+run is still appending to); the other slash commands work as usual.
 
 **Native select / scroll / search**: the finalized conversation (your messages, assistant replies, tool
 calls and results, system lines) lives in the terminal scrollback as real terminal text — mouse-drag
@@ -249,67 +255,107 @@ replies**: once in-flight content outgrows the live region's height, completed p
 to the scrollback early**; an extremely long single paragraph with no paragraph boundary to cut (the LLM
 staple "one paragraph, one line" prose) is split by **display lines**, content scrolls up continuously line
 by line (same look as Claude Code), and the live region keeps only the last two or three generating lines
-(thinking blocks behave the same; early-committed lines are never re-laid-out). An empty conversation (or
-after `/clear`) shows a dim key cheat-sheet (`/help`, completion, native scroll / select / copy).
+(early-committed lines are never re-laid-out; unmatched inline-code spans wait for their closing backticks
+rather than being split into visibly corrupted Markdown). **Thinking is deliberately different**: its live
+view is a bounded tail, and the final block commits atomically so a long trace can still fold. An empty
+conversation (or after `/clear`) shows a three-row render-only masthead: a spaced `T I N Y A G E N T`
+wordmark with the version pinned to the same right edge as the composer on wide screens, a two-tone rule
+across the full work area, and a concise tagline. The composer's bottom border carries the key legend
+just below; the sheet does not repeat it. Narrow terminals shed the version first. It is render-only and
+never enters the transcript or `/export`.
 Conversation text is capped at 120 columns and left-aligned on wide screens; roles are distinguished by
-inline icons — your messages start with a cyan `❯ `, the assistant's with a green `● ` (no separate title
-line; one line saved per message); tool calls and results are indented under the assistant, each a single
-one-line preview (tool calls show a compact argument summary, tool results an output preview); failed
-results with ≤20 lines of output auto-expand so errors are immediately visible, longer output stays
-collapsed; to expand a successful result use `/out` to reprint it in full. The input box and status line
-use a near-full-width layout; while running, the input title shows a spinner, the current activity
-(thinking / writing / → tool name), turn elapsed time, the cancel hint, and the queue length (on too-narrow
-terminals the activity name drops first, keeping time and cancel hint), and the whole input border changes
-color with run state; idle the title is ` Ask TinyAgent `.
-At the start of a turn with nothing visible yet, the live region shows a transient `● …` placeholder
+inline icons — your messages use a cyan `❯ ` and bold body text, the assistant's a green `◆ ` (no separate title
+line; one line saved per message). Long lines soft-wrap with a hanging indent; code blocks and expanded
+tool output keep their `▎` / `│` guides on continuation rows. Inline code uses the same theme-aware raised
+surface as the keycaps. Tool calls and results share a continuous `▎`
+execution rail under the assistant: calls show a compact argument summary and results show status, elapsed time,
+and an output preview. Failed results auto-expand only when they fit both limits (≤20 lines and ≤2000 chars), so one huge
+single-line error cannot flood the screen. Use `/out` for full output and `/call` for full input JSON;
+both append a fresh expanded copy instead of trying to mutate immutable scrollback. While tool arguments
+are streaming, a render-only `receiving arguments` activity appears; JSON fragments never enter the
+transcript. Conversation, composer, queue preview, and status share the same 120-column maximum work area
+on wide screens. The composer uses a rounded frame and a slightly raised theme-aware surface; it soft-wraps
+long prompts and scrolls vertically to keep the caret visible inside the fixed eight-row inline viewport —
+there is no horizontal input scrolling. While running, the input title shows a spinner, current activity
+(thinking / writing / → tool name), turn elapsed time, cancel hint, and queue length; narrow terminals
+shed detail in stages while preserving the cancel hint. Idle, running, cancelling, and failed have distinct
+titles and border/status colors; the idle title is ` ◆ MESSAGE `, and the bottom border carries matching
+`Enter` / `/` / `Ctrl-J` / `/help` keycaps when they fit (narrow frames drop `/` and Ctrl-J first).
+At the start of a turn with nothing visible yet, the live region shows a transient `◆ …` placeholder
 (synthesized during render, never enters conversation history); it disappears at the first text or tool
-call. A reasoning model's thinking renders as its own dim italic `✻` block — no markdown, visually
+call. A reasoning model's thinking renders as its own italic magenta `✻` block — no markdown, visually
 separate from the reply body, with a `▌` cursor while streaming and the input title showing thinking; once
 the reply starts, the ✻ block finalizes into the scrollback and the reply begins as a normal block (a
-sub-agent's thinking carries a `[name]` tag). `/export` includes thinking as `✻ Thinking` sections.
-The status line's left side keeps only the model, overall run state (running / idle, no timer), context
-occupancy, and cumulative tokens (e.g. `1.2k in · 0.8k out`); the right side right-aligns the current
-directory's full path (instantly tells apart multiple parallel windows; truncated on the left with an `…`
-prefix when too long, hidden entirely if fewer than 12 columns would remain — it is the first to go on
-narrow screens). Context occupancy renders as `ctx 54.7k`; once the model's context window is set in
-`limits.max_context_tokens` it becomes `ctx 21% (54.7k/256k)`, turning yellow at ≥60% and red at ≥80%.
-After the agent has used `todo`, the status bar adds a `plan done/total` segment (e.g. `plan 2/5`, green
-when all complete, yellow in progress), reflecting task-plan progress live — the full checklist stays in
-the most recent `todo` tool-result line. When the terminal narrows, the status bar drops tokens first,
+sub-agent's thinking carries a `[name]` tag). A finalized trace longer than eight display rows folds to a
+compact header plus its last three rows; `/thinking [n]` appends the complete n-th newest trace (latest by
+default), and `/export` always includes the full original as `✻ Thinking` sections.
+The status line sits on a subtle theme-aware surface with a cyan text model label rather than a heavy solid
+badge. Its left side keeps only the model, overall run state (`ready` / `running` / `cancelling` / `failed`,
+no idle timer), context occupancy, and cumulative tokens once something has been billed (e.g.
+`1.2k in / 0.8k out`; a fresh session omits the segment instead of showing zeros); the right side
+right-aligns the current directory (instantly tells apart multiple parallel windows). A path longer than its
+48-column display budget keeps the longest complete trailing directory components with an `…` prefix; it is
+hidden entirely if fewer than 12 columns would remain — the first thing narrow screens lose.
+Context occupancy renders as `ctx 54.7k`; once the model's context window
+is set in `limits.max_context_tokens` it becomes `ctx 21% (54.7k/256k)`, turning yellow at ≥60% and red at
+≥80%. After the agent has used `todo`, the status bar adds a `plan done/total` segment (e.g. `plan 2/5`,
+green when all complete, yellow in progress), reflecting task-plan progress live — the full checklist stays
+in the most recent `todo` tool-result line. When the terminal narrows, the status bar drops tokens first,
 then plan; the context segment lasts longest, down to just model and run state. On exit (`/quit`,
 `/exit`, or idle double `Ctrl-C`) with messages still queued, the count dropped is reported on stderr
 after the terminal is restored. A turn that ends normally (end_turn / stop) no longer prints a
-`[done: …]` line; only abnormal stops (max_tokens / length / error …) show a warning. ANSI color
-sequences in tool output (e.g. the red/green of git diff) render colored as-is; other control sequences
-are stripped; `/export` writes plain text without escapes.
+`[done: …]` line; only abnormal stops (max_tokens / length / error …) show a warning. ANSI SGR color
+sequences in tool output (e.g. the red/green of git diff) render colored as-is, including indexed 256-color
+and RGB truecolor forms; other control sequences are stripped; `/export` writes plain text without escapes.
 Anything starting with `/` is a slash command (not sent to the model). While you are still typing the
 command name (no space yet), a completion popup floats above the input: filtered by prefix
-(case-sensitive), `↑`/`↓` move the selection (wrapping), `Tab`/`Enter` complete the selected command into
+(case-sensitive), `↑`/`↓` move the selection (wrapping), `Shift+Tab` moves it backward, and
+`Tab`/`Enter` complete the selected command into
 the input box (`/export` appends a trailing space for the path; completion only fills in — one more
-`Enter` executes, guarding against accidental `/clear`), `Esc` closes just the popup. Typing a space
+`Enter` executes, guarding against accidental `/clear`), `Esc` closes just the popup. The selected row has a `❯`
+gutter and a raised surface; footer keycaps make completion, execution, and dismissal discoverable. Typing a space
 enters the argument phase; deleting the `/` or emptying the matches closes the popup automatically; mouse
 clicking is not supported yet; available while running too (commands execute immediately, messages still
 queue):
 
 | command | effect |
 |---|---|
-| `/clear` | clear conversation history (not added to input history) |
+| `/clear` | clear conversation history (not added to input history; idle only) |
 | `/export [path]` | export the conversation to a file (no path → copy to clipboard) |
 | `/out [n]` | reprint the n-th newest tool result in full (default the latest; error results expand too) |
-| `/model` `/limits` `/tools` `/system` | read-only views of the current config |
-| `/context` | context composition report (estimated tokens: 3 system parts / 4 tool classes / message typing + calibration state and window headroom) |
-| `/help` | command list |
+| `/call [n]` | reprint the n-th newest tool call with its complete input JSON (default the latest) |
+| `/thinking [n]` | reprint the n-th newest thinking block in full (default the latest) |
+| `/queue` | list messages waiting behind the in-flight run |
+| `/unqueue` | withdraw the newest queued message into the editor |
+| `/resume` | explicitly continue a queue paused after a failed run (idle only) |
+| `/model` `/limits` `/tools` `/system` | read-only views of the current config; `/system` shows the configured base prompt |
+| `/context` | context composition report (estimated tokens: 3 system parts / 4 tool classes / message typing + calibration state and window headroom; plus a short advisory when the tool table is over 10k estimated tokens or 30 tools — see [Tool table size](#context-compression); idle only) |
+| `/compact [focus]` | fold the history into a summary now, with optional focus instructions for the summarizer (idle only; the summary request is billed; `Esc` cancels) |
+| `/help` | grouped command and keyboard help |
+| `/quit` (alias `/exit`) | exit the TUI, cancelling any in-flight turn |
 
 Cancellation: `Ctrl-C` takes effect between streaming chunks (≤200ms); after cancelling you can send the
 next message — the kernel `run()` never clears the stop flag (level-triggered contract; the embedder
 clears at the acceptance point), and the TUI clears the previous round's residual stop automatically each
 time it submits new input.
 
+Manual compaction: `/compact` runs the same fold as the automatic compaction right now (kernel
+`compact_with`) instead of waiting for the threshold; `/compact focus on the API changes` appends the text
+as host instructions to the summarizer prompt. It is idle-only — typed while a run is in flight it is
+refused with `[busy — /compact is disabled while running]` and stays in the editor. The fold is a busy
+task: the status bar shows `compacting… · Ctrl-C cancel`, `Esc` cancels the summary request
+(`[cancelled]`, history untouched), and messages typed meanwhile queue behind the fold and run on the
+folded history. A finished fold commits `[context compressed (manual): dropped N messages, M kept]`,
+bills the summary request to the status-bar totals and drops the stale `ctx` estimate; a history too
+short to fold answers `[compact] nothing to fold` without a request; a failed summary request is
+reported as `[compact] failed: …` and leaves the history as it was (it does not disable the automatic
+compaction of later runs).
+
 Multi-line paste: with bracketed paste enabled in the terminal, pasting a multi-line block is treated as
 **one** message — newlines never trigger an early send; just paste, no Alt+Enter needed. For manual
-multi-line input, besides `Alt+Enter` / `Shift+Enter`, you can end the line with `\` then press `Enter`
-(line continuation) — when the terminal reports no modifier keys (e.g. macOS Terminal.app) this is the
-only manual multi-line entry.
+multi-line input, use `Shift+Enter`, `Alt+Enter`, or `Ctrl+J`; you can also end the line with `\` then
+press `Enter` (line continuation) — when the terminal reports no modifier keys (e.g. macOS Terminal.app)
+this is the only manual multi-line entry.
 
 Light-terminal support: `TINYAGENT_TUI_THEME=light` starts the TUI with dim text (system lines /
 previews / status segments) switched to a darker mid-gray (readable on both light and dark backgrounds),
@@ -335,7 +381,8 @@ config wins on collision) — GUI apps launched from Finder/Dock have no shell e
 that rely on env-passed credentials (GitHub MCP's `GITHUB_PERSONAL_ACCESS_TOKEN`, database connection
 strings, every kind of `XXX_API_KEY`) must go through this. `env` applies to stdio only; HTTP transports
 ignore it. Mainstream community MCP configs (Claude Desktop / Code, VS Code) carry this field — copy
-them over and they work.
+them over and they work. The host environment a server inherits lacks the one variable `api_key_env`
+names (see the **⚠️ Security notes** section); a name this `env` sets is handed over regardless.
 
 Three transports (`command` or `url`, pick one):
 
@@ -358,6 +405,54 @@ dropped — this client only consumes response frames. `examples/mcp_echo.py` (s
 `examples/mcp_http_echo.py` (both /mcp and /sse endpoints) are zero-dependency test servers and also
 reference protocol implementations. The built-in tool whitelist (`tools`) and MCP tools don't interfere
 with each other.
+
+### Timeouts, tool filters, cancellation
+
+Four optional keys per server:
+
+| key | default | meaning |
+|---|---|---|
+| `call_timeout_secs` | `120` | one JSON-RPC request end to end, `tools/call` included. Raise it for a tool that legitimately runs long (a slow build, a big query); lower it for a flaky sidecar |
+| `connect_timeout_secs` | `15` on HTTP/SSE; the call timeout on stdio | the TCP/TLS connect (legacy SSE: also the wait for its `endpoint` event — the first one, and the one after every stream rotation; a request issued in that gap is held until the fresh endpoint instead of being posted to the retired session). On stdio it bounds the `initialize` handshake, i.e. how long an `npx`/`uvx` server may take to come up — set it to bound a slow boot without raising every later call |
+| `allow_tools` | every tool | when non-empty, only these **wire** names are exposed — the server's own names from its `tools/list`, not the `mcp_<server>_` display names. A listed name the server does not expose fails startup (`allow_tools names tool(s) the server does not expose: …`) instead of exposing nothing |
+| `deny_tools` | none | wire names never exposed, whatever the server lists. Deny wins over allow |
+
+`0` is rejected for both timeouts (the message names the server, the key and the default) and the ceiling
+is 7 days — a value past it is a unit mix-up in the config. A timeout message names the key that set the
+bound, e.g. `MCP call 'tools/call' timed out after 2s (limit: call_timeout_secs) or server died`.
+
+**Protocol version.** The client offers `2025-03-26` and sends the negotiated revision in
+`MCP-Protocol-Version` on every later HTTP request. `2025-03-26` / `2025-06-18` / `2025-11-25` are accepted
+silently; any other revision the server answers is echoed back as-is with one warning line
+(`… which this client has not verified`) — negotiation never fails a server.
+
+**Cancellation.** Ctrl-C (or a library `set_cancel`) during a `tools/call` sends the server
+`notifications/cancelled` (`requestId` + reason) before the run unwinds, so a long tool can stop working
+instead of running to completion for a caller that has left. A call cancelled before it leaves is not
+sent at all.
+
+**Idle HTTP connections.** Before a `tools/call` on an HTTP connection that has been idle for 60 s or
+more, the client sends `ping` (5 s bound). Answered — even with an error — the call goes through; a
+server that stays silent fails the call *without sending it*: `MCP 'srv': unreachable after 62s idle —
+'tools/call' was not sent (ping failed: …)`. stdio connections are never probed.
+
+**Lost session (Streamable HTTP).** A 404 on a request that carries a session id means the server forgot
+the session: the client starts a new one (`initialize` again, one warning line) and re-sends the request
+once. A session that cannot be started, or a re-sent request that is refused again, fails the call with
+that error. The tool table is **not** re-listed after a recovery — the session's tools are the ones listed
+at startup, so a server that restarted with a different set reports `unknown tool` on the call. Legacy
+SSE has no session to recover.
+
+**Tool results and annotations.** A `tools/call` result may carry `structuredContent` next to its text
+frames. For a tool that **declared an `outputSchema`** the structured payload is the authoritative one:
+the model gets its JSON text and the human-readable text mirror is dropped (an image in the result is
+still kept). For any other tool the text frames win, and `structuredContent` is used only when the
+server sent no text at all — a structured-only server no longer renders as `[empty tool result]`.
+The annotations a server declares per tool (`readOnlyHint` / `destructiveHint` / `idempotentHint` /
+`openWorldHint`) are kept as a side table: library hosts read them in a `before_tool` hook
+(`ctx.annotations(tool)`) to decide policy without re-listing the tools, and every call records a
+snapshot in result.json (`tool_calls[].annotations`). They are the **server's claims** — nothing is
+enforced on their behalf (see the [library API doc](docs/lib_api.md)).
 
 ### Runtime hot add/remove (library API)
 
@@ -487,12 +582,17 @@ tiny-agent --config examples/web-search.json --task "search for Anthropic's rece
   "reasoning_effort": "optional; reasoning-effort string passed through verbatim (none/low/medium/high/xhigh/max), not validated",
   "strip_think_tags": true,
   "gateway_fixes_preset": null,
+  "preserved_reasoning": true,
+  "extra_body": null,
+  "extra_headers": null,
+  "env_passthrough": [],
   "limits": {
     "max_turns": 30,
     "timeout_secs": 600,
     "max_output_chars": 30000,
     "compress_threshold_chars": 400000,
     "keep_recent_messages": 8,
+    "summary_preview_chars": 200,
     "max_context_tokens": 0,
     "max_total_tokens": 0,
     "stream_idle_secs": 30,
@@ -509,8 +609,45 @@ Two newer keys (host-integration batch): `strip_think_tags` (default `true`) str
 `<think>…</think>` blocks out of openai reply streams into `thinking` events (the reply text is
 guaranteed tag-free); set `false` for byte-exact passthrough. `gateway_fixes_preset` (optional
 object) pre-seeds the openai gateway body fixes (`max_completion_tokens` / `no_stream_options` /
-`no_reasoning_effort`, all default `false`) so the FIRST request already carries the learned shape
+`no_reasoning_effort` / `no_reasoning_echo`, all default `false`) so the FIRST request already carries the learned shape
 and the teaching-400 round-trip disappears — feed a previously exported `gateway_fixes` back here.
+
+Four request-shaping and hygiene keys (all four are on the batch HARD list above; the last three
+default to off / empty, so an existing config behaves exactly as before):
+
+- `preserved_reasoning` (default `true` since 2026-11-26): keep each assistant turn's reasoning and send
+  it back with the later requests of the **same turn**. Several current APIs expect it next to the tool
+  results to continue the chain of thought across a tool-use loop — DeepSeek (`reasoning_content`),
+  GLM, and Anthropic's extended-thinking models. A/B runs (2026-11-26, 3 repeats per cell) measured it
+  on two endpoints of one gateway. On the OpenAI-compatible one (`deepseek-flash`) the regression set's
+  success rate did not drop with it on, and total tokens fell — by about 40% before the compression
+  fixes, 31% after them. On the Anthropic-protocol one (`hw-vol-deepseek`) it cost 26% *more* tokens
+  instead. Both times the difference comes entirely from the long task that compresses; on the four
+  short tasks that never compress it ranges from −55% to +51% per task, which is run-to-run noise (see
+  `docs/kernel_improvement_plan.md` §0.0.5). The default is on because the saving was measured where
+  long runs hurt — but that is one gateway and two model names, and the sign changed between them, so
+  measure on your own. Set it to `false` where the echo is unwanted: a gateway that
+  rejects the extra request field (the built-in OpenAI provider learns that from the first 400 and
+  drops the echo afterwards, in memory only), or a deployment that needs history and session files
+  byte-identical to before the field existed. Cost: every later
+  request of the turn re-sends the kept reasoning (more input tokens, estimated into the compression
+  trigger), and session files then contain the thinking text. Lifetime: the current turn only — a new user
+  turn, a model switch, and the merge of two adjacent same-role messages drop it from the whole history;
+  the session archive never carries it.
+- `extra_body` (optional object): extra top-level fields merged into every chat request — vendor knobs the
+  config has no dedicated key for, e.g. GLM `{"thinking": {"type": "enabled"}}` or a relay's routing tag.
+  Must be an object; the kernel-owned keys (`model` / `messages` / `system` / `tools` / `stream` /
+  `stream_options` / `max_tokens` / `max_completion_tokens`, plus `reasoning_effort` / `thinking` /
+  `output_config` while `reasoning_effort` is set) are rejected at load.
+- `extra_headers` (optional object): extra HTTP headers on every chat request (a relay's tenant header,
+  `anthropic-beta` flags). Cannot override the headers the kernel manages (authentication, content type,
+  protocol version) — rejected at load. Values are treated as credentials: masked in debug output, and the
+  config fingerprint hashes only the header names.
+- `env_passthrough` (list of variable names): variables the tool subprocesses (`shell`, stdio MCP servers)
+  may see although they would be hidden. By default exactly the `api_key_env` variable is removed from what
+  they inherit (see **⚠️ Security notes**); a subprocess that really needs the key — a `curl` against the
+  same gateway — gets it back with `"env_passthrough": ["THE_KEY"]`. The library never edits the process
+  environment: the removal happens per spawn, and the agent's own requests still read the key normally.
 
 `inject_environment` (default `true`): when the agent is constructed, a block of runtime environment
 facts is prepended to the **very front** of the system prompt:
@@ -597,6 +734,20 @@ sub-agent's turns are **never higher** than the parent's (this value only lowers
 hosts that raise the parent's `max_turns` into the thousands should raise this too, or sub-agents get
 pinched back to the default 25.
 
+`max_tokens` (default `8192`) and `limits.max_context_tokens` (default `0`) are the two knobs that want
+the model's own numbers. `max_tokens` caps the **output of one request**, and on a thinking model the
+thinking tokens come out of that same allowance — a long think can eat it and leave the reply truncated
+(`stop_reason: "max_tokens"`). When a turn is cut off while the model was still reasoning, a one-line
+`[context] … hit max_tokens (…) while reasoning — thinking counts against the same output budget …`
+hint says so, once per run: raise `max_tokens` (or lower `reasoning_effort`).
+`limits.max_context_tokens` is the model's **context window**. Set it and the preflight gate compacts on
+a token estimate at ~85% of the window (see [Context compression](#context-compression)). Left at `0`,
+nothing compacts on tokens: the run relies on the `compress_threshold_chars` character heuristic
+(≈4 chars per token — CJK text costs closer to one token per character, so a CJK-heavy run overruns it)
+and, past that, on the overflow recovery. Whenever the window is unset the kernel prints a one-line
+`[warn] [context] limits.max_context_tokens is not set: …` note at startup (headless and batch: stderr;
+TUI: a diag row). Neither default changes: the default configuration stays valid.
+
 `reasoning_effort` (optional string, unset by default): the reasoning-effort level, **passed through to
 the provider verbatim as a string, with no enum validation** — every vendor's tiers are fragmented and
 shift between model generations; TinyAgent keeps no mapping table, and unknown values are the
@@ -612,10 +763,14 @@ single most common trap in that API), and `"none"` sends `{"type": "disabled"}`.
 
 **Thinking exposure**: a reasoning model's thinking streams out as `ThinkingDelta` events (OpenAI family
 `delta.reasoning_content`, Anthropic `thinking` content blocks); under `--json` that's
-`{"type":"thinking","delta":...}`; it **never enters the conversation history or context replay** (no
-API requires replaying it either — it exists purely as an event for UIs). A GUI (e.g. TinyWorker)
+`{"type":"thinking","delta":...}`; by default it **never enters the conversation history or context
+replay** (it exists purely as an event for UIs). The one exception is `preserved_reasoning` (on by
+default; see above): then the provider's reasoning blocks are kept in a side field of the assistant
+message and replayed to the same model for the rest of the current turn — still never in the reply
+text. A GUI
+(e.g. TinyWorker)
 renders collapsible "thinking" sections from it; headless terminals write thinking to **stderr** (not
-polluting stdout's final reply / `summary`); the TUI renders it as the **separate dim italic `✻`
+polluting stdout's final reply / `summary`); the TUI renders it as the **separate italic magenta `✻`
 block** (no markdown, visually separate from the reply body; the input title shows thinking while it
 streams, then it finalizes into the scrollback with the reply). Batch fragments may override it (a soft
 field, same class as `model`/`max_tokens`; not in `forbidden_batch_override`).
@@ -651,6 +806,17 @@ the last two layers:
      watch composition change across a compression.
    - unset (`0`, default): fall back to the `compress_threshold_chars` character heuristic (default
      400k chars ≈100k tokens; `0` = off).
+
+   A preflight fold keeps at most `keep_recent_messages` originals — and **fewer when that window
+   alone would hold more than half the room** under the threshold (measured in the gate's own unit:
+   tokens with `max_context_tokens` set, chars otherwise). It then keeps the widest window whose tail
+   fits half the room, leaving the other half for the head and the next turns. Without this a run
+   with a heavy tail re-crosses the threshold right after every fold and pays one summary per turn
+   for a round or two of relief (measured on `deepseek-flash`: 32 folds in 56 turns, 27 of them
+   dropping exactly 2 messages; those 32 turns took a median 16.1 s against 2.5 s for the other
+   24). The window only ever shrinks — never below the last complete round —
+   and `keep_recent_messages: 0` ("fold everything") is left as is. Manual compaction and overflow
+   recovery keep the configured window.
 2. **Overflow backstop** — **always on, independent of the config above**. When the provider returns a
    "context too long" class error (`context_length_exceeded` / `prompt is too long` / `maximum context
    length` …, substring-matched against the error body): prune and retry first; still overflowing,
@@ -667,7 +833,11 @@ the last two layers:
    have `compact(instructions?, on_event?)`): a GUI whose context gauge reads 80%+ compresses on
    click, waiting for neither threshold nor overflow; a focus instruction steers the summary (e.g.
    "keep API changes front and center"). The summary's usage returns to the host for bookkeeping and
-   does not enter the next run's bill.
+   does not enter the next run's bill. In the TUI, `/compact [focus]` is the same call from the
+   keyboard. Library hosts that want to save their own notes before a fold implement
+   `Hooks::on_before_compact` — called once, right before the history is really folded, with the
+   trigger, the counts, the current todo list and the messages about to leave (see the
+   [library API doc](docs/lib_api.md)).
 
 Summary quality: the model writes mid-history as a **structured rolling summary** (goal / progress /
 decisions / changed files / errors & fixes / next steps; key paths / identifiers / error texts are
@@ -678,6 +848,39 @@ summarized in **chunks** along message boundaries and merged, holding the per-ca
 near ~6:1 and preserving details like paths/errors. Cut points land on assistant-message boundaries so
 tool_use/tool_result pairing is never severed; a compression failure warns once and disables further
 compression for this run (the task continues; no per-turn retry spam).
+
+The summarizer reads the folded prefix as a **transcript of excerpts**: every tool call and tool result
+is clipped to `limits.summary_preview_chars` characters (default 200; `0` keeps only the name / tag),
+so a multi-megabyte dump never becomes a multi-megabyte summary prompt. This clips what the summarizer
+sees — never the live history the main model reads. The summary's own output budget is proportional
+to the transcript (≈16 chars per token, clamped to 1024–4096, capped by the turn's `max_tokens`).
+**Reasoning models need more of it**: thinking is billed against the same allowance, and a summary cut
+off by `max_tokens` was the rule rather than the exception (204 of 240 summary calls in the
+`deepseek-flash` batches, 199 of them with thinking). So a summary that was cut short **and** reasoned is
+retried once at twice the budget (at most 8192); so is one that came back with no text at all. The
+retry can only improve on the first attempt — it completes → its text; it is cut off again → the
+longer of the two bodies; it is refused (a strict gateway's 400 on the doubled value), fails or dies
+mid-stream → the first attempt's body. Every attempt is billed and reported; a cancelled run still
+folds nothing. A gateway that refuses the doubled budget is not asked for it again by this agent; a
+served retry raises the floor for its later summaries (the lesson survives across runs; switching
+the model starts over). A summary that was cut short **without** reasoning keeps the single attempt
+it always had. A wider excerpt is not automatically better: measured the same day (3 repeats), 1000 against the
+default 200 cost 3.4× on `long-output` and had the model re-reading whole batches of files to verify the richer
+summaries. Raise it only after measuring on your own model.
+
+**Protection window, measured** (2026-11-26, `deepseek-flash`, 3 repeats): `keep_recent_messages: 0` (fold
+everything into one summary, keep no originals) was clearly worse. Of the five regression tasks only `long-output`
+compresses at all: the default 8 passed 2/3, 0 passed 0/3 — every run hit the turn cap, and after each fold the
+model re-read files it had already counted (the summary was truncated and the progress did not carry over). The
+default therefore stays at 8; measure on your own model before lowering it. Data: `docs/kernel_improvement_plan.md`
+§0.0.5.
+
+**Adaptive window and summary retry, measured** (2026-11-26, `deepseek-flash`, same recipe on the binary built
+before the two fixes and on the one built after, 6 tasks × 3 repeats): on `long-output` — the only task that
+compresses — passes went 1/3 → 3/3, folds 82 → 21 (79 → 1 of them dropping exactly 2 messages), no final summary
+was left truncated (71 of 82 before), and the main requests' input tokens fell to about a quarter; the whole set
+went 14/18 → 17/18. A fold-bearing turn got slower (median 13.1 → 16.6 s: longer summaries, and one more request
+when the first is cut off) while the runs got faster overall.
 
 **Post-fold fidelity** (aligned with Claude Code / Codex post-compression recovery): two structured
 items ride back into the head along with the summary — (a) the **todo list**: the `todo` tool has no
@@ -709,6 +912,26 @@ The compression summary requests' own token usage also counts into the run total
 (`input_tokens` / `output_tokens`) — the cost figures match the actual calls; compression never
 under-reports.
 
+**Tool table size** (a standing cost): every request carries the whole tool table, and no compression
+folds it. When the table is estimated at **more than 10k tokens or more than 30 tool definitions** (rules
+of thumb taken from Anthropic's Tool search documentation — empirical figures, not a provider limit),
+TinyAgent says so **once per process**, when the agent is constructed, on the kernel's diag channel
+(stderr in headless and batch mode; in the TUI the notice is printed above the viewport at startup):
+
+```
+[context] tool definitions ≈ 11416 tokens across 42 tools.
+  Over both advisory lines (10000 tokens, 30 tools).
+  Fixed cost on every request; compaction cannot fold it.
+  Trim tools / MCP servers, or move rarely used tools into skills.
+  Rules of thumb from Anthropic's Tool search docs, on estimates.
+```
+
+`/context` shows the same block under the tool classes, on the numbers the report is showing at that
+moment (a live calibration scales the token figure, the count never scales). Library hosts read the
+verdict off `ContextBreakdown.tools.advisory()` / `tool_count()` (see the
+[library API doc](docs/lib_api.md)). **Advise only**: nothing is trimmed, reordered or deferred
+automatically — trim the `tools` list or `mcp_servers`, or move rarely used tools into skills.
+
 ### Prompt caching
 
 The Anthropic native provider enables prompt caching by default: every request automatically places
@@ -731,12 +954,16 @@ one-shot calls and carry no cache breakpoints.
 
 - The `shell` tool executes model-generated commands verbatim (`sh -c` / `cmd /C`) with no command
   filtering. The model can `rm -rf`, `curl ... | sh`, reach the network — everything the process can.
-- **Every child process inherits the full host environment** (shell tools, MCP stdio servers, and the
-  code sandbox via `shell`). That includes the credential value `api_key_env` points at — it lives in
-  the process env by design, so every spawned child can read it (round-3 probe: a seeded env var was
-  reachable from both a direct shell call and a guest→shell call). The config never stores the value
-  itself, but process-level isolation (container / restricted user) is the only thing that keeps it
-  from the children.
+- **Child processes inherit the host environment minus the API key variable** (shell tool, MCP stdio
+  servers, and the code sandbox via `shell`): the variable `api_key_env` names is removed from every
+  process the tools spawn, so a model-written `echo $THE_KEY` prints nothing and the key no longer
+  lands in transcripts, session files or `--json` events. **This is accident-proofing, not isolation**:
+  every *other* variable is still inherited in full (do not keep other secrets in a run's environment
+  unless the model may read them), and a same-user process can still read the parent's environment
+  through the OS (Linux `/proc/<pid>/environ`, macOS `ps eww`). A child that genuinely needs the key
+  gets it back with `"env_passthrough": ["THE_KEY"]`; a single MCP server can also be handed it in its
+  own `env` entry (configured entries always win). A config that has the `shell` tool or a stdio MCP
+  server prints one startup line naming what was hidden.
 - File tools do not restrict paths by default: `read_file ../../etc/passwd` and
   `write_file /etc/cron.d/x` will be executed.
 - **When batch-running untrusted third-party tasks in CI / eval pipelines**, always:
@@ -821,9 +1048,12 @@ temptations.
   "output_tokens": 567,
   "cache_creation_input_tokens": 300,
   "cache_read_input_tokens": 1500,
+  "reasoning_tokens": 88,
   "summary": "the agent's final text reply",
   "tool_calls": [
-    { "name": "write_file", "input": {...}, "output": "wrote 42 bytes", "is_error": false, "duration_ms": 3 }
+    { "name": "write_file", "input": {...}, "output": "wrote 42 bytes", "is_error": false, "duration_ms": 3 },
+    { "name": "mcp_fs_read_file", "input": {...}, "output": "…", "is_error": false, "duration_ms": 12,
+      "annotations": { "read_only_hint": true, "destructive_hint": false, "idempotent_hint": true, "open_world_hint": false } }
   ],
   "turn_timings": [
     { "turn": 1, "duration_ms": 2100, "tool_calls": 1 },
@@ -833,7 +1063,7 @@ temptations.
     { "trigger": "preflight", "dropped": 8, "folded_ids": ["m3","m4","m5","m6","m7","m8","m9","m10"], "kept": 6, "estimated_tokens_before": 152000, "estimated_tokens_after": 41000, "measured_tokens_before": 148220 }
   ],
   "config_fingerprint": "3f9a1c2e4b5d6071",
-  "gateway_fixes": { "max_completion_tokens": true, "no_stream_options": false, "no_reasoning_effort": false },
+  "gateway_fixes": { "max_completion_tokens": true, "no_stream_options": false, "no_reasoning_effort": false, "no_reasoning_echo": false },
   "plan": [
     { "subject": "run the tests", "status": "completed" },
     { "subject": "fix failing cases", "status": "in_progress" },
@@ -857,9 +1087,13 @@ temptations.
   (clamp/overlay-merged) config, computed over harness-shaping fields + kernel version, excluding
   `task`/`workdir` (per-run inputs) and credential VALUES (MCP header/env key names only, URLs
   userinfo-redacted); same config → same fingerprint, any model/limits/tools/MCP/sandbox change →
-  different. `gateway_fixes` — the openai-compat gateway body fixes learned so far (three boolean
+  different. `gateway_fixes` — the openai-compat gateway body fixes learned so far (four boolean
   bits, credential-free), present only when at least one has been learned; feed it back via the
-  config's `gateway_fixes_preset` in the next process to skip the teaching 400. This is the
+  config's `gateway_fixes_preset` in the next process to skip the teaching 400. The fourth bit,
+  `no_reasoning_echo`, only comes up while `preserved_reasoning` is on: a gateway that rejects the
+  echo of a previous turn's `reasoning_content` with a 400 teaches the provider to strip it from
+  later requests. (A preset carrying it cannot be read by binaries older than this bit — the preset
+  parser rejects unknown keys.) This is the
   provider's running cumulative set (process preset + everything learned since, OR-ed), NOT a
   per-run delta — repeated runs of one agent export the same value; diff consecutive outcomes
   yourself if you need run-over-run increments. The fingerprint is a construction-time snapshot:
@@ -906,7 +1140,19 @@ temptations.
 - `input_tokens` / `output_tokens` are the run's cumulative token usage;
   `cache_creation_input_tokens` / `cache_read_input_tokens` are the cumulative prompt-cache
   writes/reads (Anthropic reports both; OpenAI reports reads only). `input_tokens` excludes cached
-  tokens; true billed input adds cache write 1.25× / read 0.1× (see Prompt caching)
+  tokens; true billed input adds cache write 1.25× / read 0.1× (see Prompt caching).
+  `reasoning_tokens` (optional) is the reasoning share of `output_tokens` as reported by the provider
+  (OpenAI-compat `completion_tokens_details.reasoning_tokens`) — a **subset split, not a fifth axis**:
+  it is never added on top of `output_tokens`, and no budget gate reads it. Sums every request of the
+  run (`task` sub-agents and failed attempts included); the key is absent when nothing reported a
+  split, so results from non-reasoning models are unchanged. The batch `report.json` mirrors it per
+  task and in its `totals` / `averages`, under the same only-when-reported rule
+- `tool_calls[]` entries for **MCP tools** carry an optional `annotations` object — the server's
+  self-declarations about the tool at call time (`read_only_hint` / `destructive_hint` /
+  `idempotent_hint` / `open_world_hint`; spec defaults filled in where the server said nothing, so
+  `idempotent_hint` is the only key that can be missing). It is what the server **claimed**, kept for
+  post-run audit and for host policy hooks (see the [library API doc](docs/lib_api.md)); nothing
+  enforces it. Built-in tools have no entry
 - When agent.run returns `Err` (e.g. provider 503) the result file is still written:
   `{"success": false, "stop_reason": "error", "error": "..."}`; an unsurmountable context overflow
   (forced compression failed to rescue) records `stop_reason: "context_overflow"`, deterministic
@@ -950,7 +1196,9 @@ this run (the truth for current context occupancy — what a ctx meter should se
 call's bill folded into the run totals (a `task` sub-agent's multi-turn aggregate, the run_code inner
 llm, a host tool's own report — emitted between that tool's `tool_call` and `tool_result`, and NOT a
 measurement of the current history). Both flavors count toward the cumulative totals; branch on the
-flag when the two mean different things to you. `turn_arbitration` appears only when a host's
+flag when the two mean different things to you. The event also carries an additive `reasoning_tokens`
+key (always present): the reasoning share of that report's `output_tokens` — the same subset figure
+as in result.json — `0` when the provider reports no split. `turn_arbitration` appears only when a host's
 turn-stopping hook rejected the model's completion (FR-1): `{"type":"turn_arbitration","turn","continued","note"}`
 — `continued:true` means one more turn follows (the note rides the supervisor-note pipeline, a
 `note_injected` event lands at the delivery point); `continued:false` means the continuation cap was
@@ -1355,8 +1603,21 @@ metadata:
 2. Field formats: see references/REFERENCE.md ...
 ```
 
-> Single-line scalar fields take single-line values only (multi-line YAML folding is unsupported);
-> `metadata` is the only field accepting an indented `key: value` block.
+> The four scalar fields (`name` / `description` / `license` / `compatibility`) and each `metadata` value
+> take a single-line value **or a YAML block scalar** — `|` (literal: line breaks kept) or `>` (folded: the
+> break between two equally indented lines becomes one space), with the usual `-` / `+` chomping and
+> indentation indicators — a form the standard allows and real skill files use for long descriptions:
+>
+> ```yaml
+> description: >
+>   Extract fields from PDF forms and output JSON.
+>   Use for form-type documents (AcroForm, XFA); not for plain-text PDFs.
+> ```
+>
+> The body is collected by indentation: the first line at or above the key's indentation is the next key,
+> so a `metadata:` block may follow directly. The value is trimmed, which makes chomping a no-op.
+> Still unsupported, deliberately (no YAML dependency): multi-line *plain* scalars, block sequences
+> (`- item`) and nested mappings — `metadata` is the only field accepting an indented `key: value` block.
 > Unknown fields are ignored (as the standard allows).
 
 ### Three-tier progressive loading
@@ -1460,6 +1721,70 @@ tool_use/tool_result N:N pairing (including the synthetic `[cancelled by user]` 
 context compression, usage accumulation invariants. **Touching core `agent.rs` paths comes with
 matching loop tests.**
 
+Two real-process suites drive the actual CLI binary against local mocks, with no key and no cost:
+`scripts/e2e_scenarios.py` (the CI `e2e` job: stuck-loop guard, parallel sub-agent fan-out, SIGINT
+exit 130) and `scripts/e2e_mcp.py` (`python3 scripts/e2e_mcp.py`, not a CI gate: MCP stdio and
+Streamable HTTP behaviour — negotiation, timeouts, cancellation notifications, session recovery,
+credential hygiene).
+
+### Regression task set (`examples/regress`)
+
+Six end-to-end tasks, each with a scripted zero-cost path and a file-based checker — the net for
+"did the kernel get worse" that the in-process loop tests cannot provide:
+
+| task | what it guards |
+|---|---|
+| `multi-file-edit` | two failing unit tests: read the contract, fix the library (not the tests), re-run the suite |
+| `long-output` | ~75 KB of tool output over ten read turns, compressed several times — the result must be written to a file as the run goes |
+| `mcp-many-tools` | a twelve-tool MCP server: three of the tools and a join across them, the other nine left alone |
+| `recover-after-failure` | the first command fails: diagnose it, fix the cause, save the output |
+| `cjk-docs` | Chinese documents under three mechanical rules (terms, punctuation, heading levels); nothing else may change |
+| `loop-suppression` | a poll that never completes must stop early instead of burning the turn budget |
+
+A task is a directory `examples/regress/tasks/<id>/`:
+
+```
+<id>.json      task fragment (task + limits) — the same format as a --batch task file
+harness.json   evaluation-side data that never reaches the model: category, base-config
+               overlay, the scripted model (examples/mock_script.py format)
+check.py       pass condition: `python3 check.py <result.json>` with cwd = the run's
+               workdir; exit 0 = pass. The verdict comes from here and nowhere else
+fixture/       initial files copied into the workdir (optional)
+setup.py       generates data: `python3 setup.py <workdir>` (optional)
+expected/      reference files the script cites through {"$file": "expected/…"} (optional)
+```
+
+```sh
+python3 scripts/regress_eval.py check      # CI gate (e2e job; also in ./scripts/check.sh e2e)
+```
+
+Per task and wire protocol (OpenAI-compatible and Anthropic) `check` proves that the scripted good
+path passes, that a model which does nothing useful cannot pass the checker, and that two runs of the
+same task summarize identically. It then walks the paid lane's gates with a fake paid config that
+points at `127.0.0.1:9` — `check` cannot send a paid request in any environment. The harness's own
+offline unit tests live in `scripts/tests/test_regress_eval.py` (local pytest, not in CI).
+
+Beyond the gate the harness freezes a recipe into a batch and compares kernels:
+
+```sh
+python3 scripts/regress_eval.py prepare examples/regress/recipes/kernel-regress.json \
+    --price-table prices.json --cost-stop 5     # freeze binary + task hashes and per-run configs
+python3 scripts/regress_eval.py run artifacts/regress/<batch>            # dry-run: prints the plan
+python3 scripts/regress_eval.py run artifacts/regress/<batch> --execute  # paid
+python3 scripts/regress_eval.py compare --a <old summary.json> --b <new summary.json>
+```
+
+- **Paid lane.** `run` is a dry-run unless `--execute` is given, and a batch frozen without a price
+  table **and** a cost stop is refused as `blocked_paid`. Keys are read by the CLI through the
+  config's `api_key_env`; the harness never reads or stores a key value. The cost stop compares
+  known spend plus the worst-case reserve of the next run against the stop — a run whose usage was
+  never reported counts as its reserve, never as 0.
+- **Recipes** (`examples/regress/recipes/`): `kernel-regress` (baseline before / after a kernel
+  change; `compare` fails when the pass rate drops), `reasoning-carry`, `compression-handoff` and
+  `summary-preview` (A/B experiments, arms alternate between repeats), `mock-smoke` (zero-cost walk
+  of the whole pipeline). `prepare <paid recipe> --mock openai` runs the same tasks through the
+  scripted lane at no cost; `--base-config <file>` overrides the recipe's base config.
+
 ## Release process
 
 Version numbers sync in **6 places** (miss one and the bindings drift from the core): root
@@ -1507,67 +1832,67 @@ one-line responsibility is maintained in that script's ENTRIES.
 <!-- BEGIN CODE STRUCTURE (generated by scripts/gen_structure.py) -->
 ```text
 crates/core/src/  # kernel crate (package tiny-agent-core, lib name tiny_agent): agent loop / tools / providers / config / assembly
-├── lib.rs                (  618)  # lib root: build_agent* / assemble (tool table, ToolCtx, code install, skill injection)
+├── lib.rs                (  803)  # lib root: build_agent* / assemble (tool table, ToolCtx, code install, skill injection)
 ├── fsutil.rs             (  477)  # atomic-write primitives (O_EXCL temp + fsync + dir fsync; shared by session/result/report)
 ├── diag.rs               (  179)  # diagnostics channel: global sink installable by GUI hosts (falls back to stderr, byte-identical) — soft-failure warnings of skills/MCP/session/run_code go through it
-├── config.rs             ( 3443)  # config parsing + task-fragment merge + batch override whitelist
+├── config.rs             ( 4313)  # config parsing + task-fragment merge + batch override whitelist
 ├── provider/  # LLM backends
-│   ├── mod.rs                ( 1191)  # shared Message/Block, SSE reader, CancellableSse
-│   ├── openai.rs             ( 2388)  # OpenAI-compatible (include_usage; 400 fallbacks: max_tokens→max_completion_tokens / drop stream_options)
+│   ├── mod.rs                ( 1654)  # shared Message/Block, SSE reader, CancellableSse
+│   ├── openai.rs             ( 3088)  # OpenAI-compatible (include_usage; 400 fallbacks: max_tokens→max_completion_tokens / drop stream_options)
 │   ├── openai_review_pins.rs ( 1003)  # openai review pins (loopback HTTP: status matrix/credential discipline/retry body; ThinkStripper differential + idle timeout)
 │   ├── sse_review_pins.rs    (  245)  # SSE parser review pins (chunk-boundary invariance across 17 stream shapes, sync vs worker path)
-│   ├── anthropic.rs          ( 1246)  # Anthropic native (message_start/message_delta usage)
-│   └── mock.rs               (  361)  # scripted Provider for tests (cfg(any(test, feature="mock")))
-├── agent.rs              ( 4768)  # core loop + usage accounting + cancel + context compression (preflight/overflow dual trigger + rolling chunked summaries) + adjacent-message normalization + same-turn multi-task parallelism
-├── agent_tests.rs        (11903)  # core-loop regression tests (scripted provider::mock, no network)
-├── usage_probe.rs        (   94)  # thread-local usage side channel for parallel workers: recovers billed usage after a panic unwind at the join point (keeps result.json and the shared counter from diverging)
-├── compress.rs           ( 1079)  # compression engine (find_safe_cut / chunked summaries / saturating usage merge + block-level billing primitives)
-├── context_report.rs     (  901)  # context composition breakdown (ContextBreakdown estimate: 3 system parts / 4 tool classes / message typing + anchor calibration)
+│   ├── anthropic.rs          ( 1937)  # Anthropic native (message_start/message_delta usage)
+│   └── mock.rs               (  437)  # scripted Provider for tests (cfg(any(test, feature="mock")))
+├── agent.rs              ( 5429)  # core loop + usage accounting + cancel + context compression (preflight/overflow dual trigger + rolling chunked summaries) + adjacent-message normalization + same-turn multi-task parallelism
+├── agent_tests.rs        (15042)  # core-loop regression tests (scripted provider::mock, no network)
+├── usage_probe.rs        (   97)  # thread-local usage side channel for parallel workers: recovers billed usage after a panic unwind at the join point (keeps result.json and the shared counter from diverging)
+├── compress.rs           ( 1480)  # compression engine (find_safe_cut / chunked summaries / saturating usage merge + block-level billing primitives)
+├── context_report.rs     ( 1356)  # context composition breakdown (ContextBreakdown estimate: 3 system parts / 4 tool classes / message typing + anchor calibration)
 ├── retry.rs              (  158)  # exponential backoff shared by batch --retries and single-run transient retry (±25% jitter against lockstep)
-├── session.rs            (  533)  # session persistence (atomic writes + fold archive)
-├── skills.rs             ( 1491)  # three-tier skill loading (built-in / user dir / project)
-├── hooks.rs              (  335)  # hooks gate (Deny / Modify / audit)
+├── session.rs            (  608)  # session persistence (atomic writes + fold archive)
+├── skills.rs             ( 1768)  # three-tier skill loading (built-in / user dir / project)
+├── hooks.rs              (  412)  # hooks gate (Deny / Modify / audit)
 ├── tools/  # toolset: built-in tools + MCP wrappers + task sub-agent + run_code (feature code)
-│   ├── mod.rs                ( 1573)  # Tool trait + ToolCtx + CallbackTool/SharedTool + whitelist assembly
-│   ├── shell.rs              ( 1305)  # shell tool (unix: sh -c; Windows: cmd /C + raw_arg verbatim command passing, defeating std quoting)
-│   ├── file.rs               ( 1672)  # read_file / write_file / edit_file / list_dir
+│   ├── mod.rs                ( 1795)  # Tool trait + ToolCtx + CallbackTool/SharedTool + whitelist assembly
+│   ├── shell.rs              ( 1381)  # shell tool (unix: sh -c; Windows: cmd /C + raw_arg verbatim command passing, defeating std quoting)
+│   ├── file.rs               ( 1676)  # read_file / write_file / edit_file / list_dir
 │   ├── image.rs              (   87)  # load_image tool
 │   ├── document.rs           (  100)  # PDF → Block::Document loading (lib API load_document_block)
-│   ├── skill.rs              (  991)  # read_skill / list_skill (outside the whitelist; injected by assembly)
-│   ├── mcp.rs                (  674)  # MCP tool wrapper (sanitize_name + wire_name dispatch)
-│   ├── subagent.rs           ( 1105)  # task sub-agent tool (own context + turn cap; non-recursive)
-│   ├── todo.rs               (  311)  # todo tool (task plan, full replacement; plan lands in result.json)
+│   ├── skill.rs              (  993)  # read_skill / list_skill (outside the whitelist; injected by assembly)
+│   ├── mcp.rs                ( 1049)  # MCP tool wrapper (sanitize_name + wire_name dispatch)
+│   ├── subagent.rs           ( 1285)  # task sub-agent tool (own context + turn cap; non-recursive)
+│   ├── todo.rs               (  313)  # todo tool (task plan, full replacement; plan lands in result.json)
 │   ├── run_code.rs           (  103)  # run_code facade (feature code): mod declarations + symbol re-exports; implementation in run_code/ submodules
-│   ├── llm.rs                (  740)  # llm judgment primitive (feature code + code.llm gate): single-shot stateless inner model call — LD-17 reserve/settle, LD-18 label normalization, shared Provider cell
+│   ├── llm.rs                (  743)  # llm judgment primitive (feature code + code.llm gate): single-shot stateless inner model call — LD-17 reserve/settle, LD-18 label normalization, shared Provider cell
 │   └── run_code/  # run_code submodules (same code gate): split from the original 11.9k single file by concern
 │       ├── contract.rs           (  936)  # guest-facing contract text: reserved names/CODE marker/byte caps, PRELUDE three sources, skill md loading, strip_once
 │       ├── sandbox.rs            (  806)  # wasmtime sandbox: QuickJS module load & cache, epoch/fuel/MemLimiter, CallTrace, HostCtx, wall clock, guest memory read caps
-│       ├── guest_api.rs          ( 3587)  # host function surface: unpack/read/write, host_call_tool dispatch, inner-result envelope, llm marker parse folding, audit meta
+│       ├── guest_api.rs          ( 3603)  # host function surface: unpack/read/write, host_call_tool dispatch, inner-result envelope, llm marker parse folding, audit meta
 │       ├── fs_policy.rs          ( 2444)  # fs/glob policy: path interception & lexical normalization, write-dir constraints, symlink checks, glob matching (** folding + segment caps)
 │       ├── lib_index.rs          ( 2051)  # lib family: session library index/read-write caps, sha256, reserved names, include delivery
 │       ├── batch.rs              ( 2289)  # callBatch: wave scheduling, output admission (total-cap degradation), entry envelopes
 │       ├── precheck.rs           (  858)  # FR-2 precheck: lexer + keyword-hit rendering
-│       ├── tool.rs               ( 1096)  # the tool itself: RunCodeTool state machine + Tool impl (hash-pinned description/schema)
-│       └── test_util.rs          (  123)  # shared test helpers (cfg(test): scratch/ctx/llm assembly)
-├── mcp.rs                ( 5995)  # MCP client (stdio / Streamable HTTP incl. 202→GET stream / legacy SSE)
+│       ├── tool.rs               ( 1115)  # the tool itself: RunCodeTool state machine + Tool impl (hash-pinned description/schema)
+│       └── test_util.rs          (  125)  # shared test helpers (cfg(test): scratch/ctx/llm assembly)
+├── mcp.rs                (10045)  # MCP client (stdio / Streamable HTTP incl. 202→GET stream / legacy SSE)
 ├── winjob.rs             (  481)  # Windows Job Object process-tree kill (shared by shell timeout/cancel + MCP child reaping; two drop strategies)
-└── m0_probes.rs          (  337)  # M0 mechanism probes (cfg(test), #[path]-declared in lib.rs): reserve/settle ledger, shared Provider cell, per-request model routing in-process prototype (A-L2b/2c/9 — reused directly by the M3 llm primitive)
+└── m0_probes.rs          (  338)  # M0 mechanism probes (cfg(test), #[path]-declared in lib.rs): reserve/settle ledger, shared Provider cell, per-request model routing in-process prototype (A-L2b/2c/9 — reused directly by the M3 llm primitive)
 
 src/  # CLI crate (package tiny-agent, bin tiny-agent): process shell + headless rendering + batch + TUI
-├── main.rs               ( 1075)  # CLI entry + assembly (build_agent) + --session none
+├── main.rs               ( 1174)  # CLI entry + assembly (build_agent) + --session none
 ├── signal.rs             (  123)  # headless SIGINT → cancel (first press graceful / second hard-exit 130)
-├── batch.rs              ( 4046)  # batch tasks + --retries/--failed + report merging
-├── harness.rs            ( 2578)  # headless mode + result.json + NDJSON + exit codes
-├── harness_tests.rs      ( 1212)  # harness behavior tests (retry ladder / result.json / NDJSON; moved here with harness from the kernel's agent_tests.rs)
+├── batch.rs              ( 4117)  # batch tasks + --retries/--failed + report merging
+├── harness.rs            ( 2695)  # headless mode + result.json + NDJSON + exit codes
+├── harness_tests.rs      ( 1216)  # harness behavior tests (retry ladder / result.json / NDJSON; moved here with harness from the kernel's agent_tests.rs)
 ├── tui.rs                (   20)  # TUI module root (feature tui): mod declarations + public exports (run / transcript_rows)
 └── tui/  # TUI submodules (same tui gate): split from the original 8.7k-line single file by concern
-    ├── app.rs                ( 1839)  # session assembly: run entry / worker thread / event & input channels / ui_loop event body / Ctrl-C double-press window
-    ├── input.rs              (  361)  # multi-line InputBuffer editor / input history recall / horizontal input scrolling
-    ├── slash.rs              (  549)  # slash commands: classify grammar / read-only replies / completion popup state machine / /context report
-    ├── theme.rs              (  147)  # theme: single source for history-row & chrome colors / light-dark switch TINYAGENT_TUI_THEME / number formatting helpers
-    ├── markdown.rs           (  632)  # markdown & ANSI rendering: render_markdown / escape parsing / fence scanning (shared with streaming splits) / MdCache single-slot cache
-    ├── transcript.rs         ( 1198)  # conversation Row model and all build/mutation logic: history rendering / streaming increments & incremental splits / /export dump / resume rebuild
-    ├── render.rs             (  490)  # terminal drawing: scrollback commit_rows / live-region render / input & status bar chrome / width & control-char utilities
-    └── tests.rs              ( 4164)  # TUI regression tests (TestBackend cell-grid assertions + input / completion / streaming-split logic)
+    ├── app.rs                ( 2362)  # session assembly: run entry / worker thread / event & input channels / ui_loop event body / Ctrl-C double-press window
+    ├── input.rs              (  333)  # multi-line InputBuffer editor / input history recall / word & line editing
+    ├── slash.rs              (  864)  # slash commands: classify grammar / read-only replies / completion popup state machine / /context report
+    ├── theme.rs              (  191)  # theme: single source for history-row & chrome colors / light-dark switch TINYAGENT_TUI_THEME / number formatting helpers
+    ├── markdown.rs           (  722)  # markdown & ANSI rendering: render_markdown / escape parsing / fence scanning (shared with streaming splits) / MdCache single-slot cache
+    ├── transcript.rs         ( 1266)  # conversation Row model and all build/mutation logic: history rendering / streaming increments & incremental splits / /export dump / resume rebuild
+    ├── render.rs             ( 1036)  # terminal drawing: scrollback commit_rows / live-region render / input & status bar chrome / width & control-char utilities
+    └── tests.rs              ( 5106)  # TUI regression tests (TestBackend cell-grid assertions + input / completion / streaming-split logic)
 ```
 <!-- END CODE STRUCTURE -->

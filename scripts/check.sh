@@ -8,7 +8,7 @@
 # 用法：
 #   ./scripts/check.sh              # 跑默认全集（fmt clippy test e2e docs）
 #   ./scripts/check.sh fmt docs     # 只跑指定分组，可给多个
-#   ./scripts/check.sh e2e          # 只跑场景 e2e（内置 SSE mock，零密钥）
+#   ./scripts/check.sh e2e          # 只跑 e2e（场景 e2e + 回归任务集零成本自检，零密钥）
 #   ./scripts/check.sh all          # 等价默认（仍不含 bindings / bench）
 #   ./scripts/check.sh bindings     # 双绑定 clippy（默认不跑，见下）
 #   ./scripts/check.sh bench        # 性能基准（快跑一轮，默认不跑，见下）
@@ -76,9 +76,10 @@ group_test() {
 }
 
 group_e2e() {
-    # 逐字对齐 ci.yml 的 e2e job 两步：先 build 出 code 版真实二进制再跑场景。
-    # e2e_scenarios.py 自己只在二进制不存在时才 build——这里显式 build 一次，
-    # 保证它测的是当前源码而不是上次遗留的 target 产物。
+    # 逐字对齐 ci.yml 的 e2e job 三步：先 build 出 code 版真实二进制，再跑场景，
+    # 最后跑回归任务集的零成本自检。e2e_scenarios.py 自己只在二进制不存在时才
+    # build——这里显式 build 一次，保证两个脚本测的都是当前源码而不是上次遗留的
+    # target 产物。
     run_check "build: code" \
         cargo build --locked --features code
     # 内置 SSE 场景 mock（线程化、零密钥），走真实 CLI/HTTP 栈守四个 loop 级
@@ -86,6 +87,13 @@ group_e2e() {
     # 改了 loop / 取消 / 打转行为后必跑（CLAUDE.md「离线 / 视觉验证」）。
     run_check "e2e: scenarios" \
         python3 scripts/e2e_scenarios.py
+    # 回归任务集零成本自检（examples/regress/tasks，脚本化 mock，零密钥）：6 个
+    # 任务 × 两种线协议的正路径、坏模型必被判卷拦下、可复现、付费闸门、
+    # mock-smoke 流水线。check 在任何环境下都发不出付费请求（付费通道只在本地
+    # 手动触发）。改了内核之后看的就是它；纯函数与判卷脚本的离线单测在
+    # scripts/tests/test_regress_eval.py（本地 pytest，不进 CI）。
+    run_check "regress: zero-cost check" \
+        python3 scripts/regress_eval.py check
 }
 
 group_docs() {

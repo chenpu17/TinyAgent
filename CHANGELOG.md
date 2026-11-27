@@ -76,6 +76,224 @@
   冲（正文纯净 fail-closed）、未成形的部分标签按正文冲、关标签无开标签是普通正文。`Config::
   strip_think_tags`（默认 true；指纹纳入）；关 = 逐字节透传（FR-2 之前行为）。`reasoning_content`/
   `reasoning` 协议字段路径不受开关影响（此前已支持，需求单该半前提已过时）。
+- **工具表规模提示（内核改进计划 2.3，只提示不处置）**：工具定义是每次请求的固定成本，压缩
+  折叠不了它。估算规模越过经验阈值（> 1 万估算 token 或 > 30 个工具定义，取自 Anthropic Tool
+  search 文档，非 provider 限制）时：(a) 构造顶层 `Agent` 时经 diag 通道发一次 warn
+  （`[context] tool definitions ≈ N tokens across M tools.` + 四条短句，每行一句；未装 sink 时写
+  stderr；**每进程按文本去重**——batch 逐任务重建 agent 只提示一次；`task` 子代理不重复提示）；
+  (b) TUI `/context` 在工具四类下方附同一段提示块（与构造期提示同一份文本、同一个 token 数）。
+  库 API：`ToolsBreakdown::tool_count()` / `advisory()`、常量 `TOOL_DEFS_ADVISORY_TOKENS` /
+  `TOOL_DEFS_ADVISORY_COUNT`、`ToolDefsAdvisory`（non_exhaustive）、纯函数
+  `tool_defs_advisory()` / `tool_defs_advisory_lines()`。判定取报表当前口径（有存活校准时 token 数
+  按校准缩放，工具数不缩放）；MCP 热增删后不再提示，宿主读 `advisory()`。默认工具表
+  （9 个工具 ≈ 1.5k token）在线内，默认静默。顺带修正：TUI 启动行 `session ready · 模型 · N tools`
+  的 N 改为**模型实际可见的工具数**（此前取配置 `tools` 白名单的长度：`tools: []` + MCP 时显示
+  `0 tools`，默认配置显示 7 而模型实际看到 9）。
+- **MCP `tools/list` 翻页（内核改进计划 0.1）**：此前只读第一页——server 的工具表带 `nextCursor`
+  时第二页起被静默丢弃，模型看不到那些工具，也没有任何提示。`McpClient::list_tools` 现在跟随游标到
+  收尾（上限 64 页 / 256 工具；游标重复即停并告警，防 server 把同一页循环喂回来），任一页失败即握手
+  失败——不带着半张工具表起跑。单页 server 的请求序列与翻页之前逐字节相同。
+- **SKILL.md frontmatter 块标量（内核改进计划 0.3）**：`name` / `description` / `license` /
+  `compatibility` 四个标量字段与 `metadata` 的每个值，除单行值外接受 YAML 块标量——`|`（字面量：
+  保留换行）或 `>`（折叠：同缩进的相邻两行并成一行），可带 chomping（`-` / `+`）与缩进指示
+  （1–9）。标准允许、真实技能文件里常见的长 `description` 写法（`description: >` 下面接缩进段落）
+  此前装不上：`name` / `description` 用块标量写的技能被整份跳过（`[skill]` 告警「uses a YAML block
+  scalar … skipped」），其余字段读成字面量 `>` / `|`、整段块体丢失。块体按缩进收集（第一条缩进 ≤
+  键缩进的非空行就是下一个键，
+  所以 `metadata:` 块可以紧跟着出现），值恒 trim（chomping 校验后即忽略）；`description` ≤1024 的
+  校验作用在拼接后的值上。仍刻意不支持（不引 YAML 依赖）：多行**裸**标量、块序列、嵌套映射——这些
+  形态保持原有行为。
+- **回归任务集与评测装置（内核改进计划 0.4；`examples/regress/` + `scripts/regress_eval.py`）**：
+  进程内 loop 测试钉不住的「内核有没有变差」由六个端到端任务来兜——`multi-file-edit`（读契约、
+  修库不修测试、重跑套件）/ `long-output`（十轮读取约 75 KB 工具输出、多次压缩，边跑边把结果写
+  进文件）/ `mcp-many-tools`（十二个工具的 MCP server，三个加一次联查）/ `recover-after-failure`
+  （首条命令失败后的诊断与修复）/ `cjk-docs`（中文文档的三条机械规则）/ `loop-suppression`（永不
+  完成的轮询要早停）。任务目录 = 任务片段（与 `--batch` 任务文件同格式）+ 同级 `harness.json`
+  （评测侧数据，永不进模型）+ `check.py` 判卷（`python3 check.py <result.json>`，cwd = 本次 run 的
+  workdir，exit 0 = 通过；结论只由它定）+ 可选 `fixture/` / `setup.py` / `expected/`。配方五个：
+  `kernel-regress`（内核改动前后的基线，`compare` 在通过率下降时报红）、`reasoning-carry` /
+  `compression-handoff` / `summary-preview`（A/B 实验，臂在重复间交替；三个都已于 2026-11-26 在
+  deepseek-flash 上跑完，结论见对应条目）、`mock-smoke`（零成本走通全流程）。
+  `python3 scripts/regress_eval.py check` 是 CI 门禁（`check.sh e2e` 组第三步）：逐任务 × 两种线协议
+  （OpenAI 兼容 / Anthropic）走脚本化 mock 全链路，证明「脚本化的好路径能过、什么都不做的模型过不了、
+  同一任务两次运行的摘要一致」，再拿一份指向 `127.0.0.1:9` 的假付费配置把付费通道的闸门各走一遍——
+  **`check` 在任何环境下都发不出付费请求**（哪怕机器上有密钥）。付费通道 `prepare` / `run` /
+  `compare`：`run` 默认 dry-run，`--execute` 才付费；没同时给 `--price-table` 与 `--cost-stop` 的
+  批次一律 `blocked_paid`；`prepare` 把二进制 / 任务文件 / 基配置的 sha256 与逐 run 配置冻进清单，
+  `run` 执行前复核（漂移即拒跑）；清单落盘前脱敏（`extra_headers`、MCP 嵌套的 `headers` / `env`、
+  URL 的 query 与 fragment）；费用停止按「已花 + 下一个 run 的最坏预留 ≥ 停止值即停」，用量从未
+  上报的 run 按预留记、绝不记 0。任务片段的 `limits` 按 batch 的 Clamp 语义合并（只能收紧）。
+  harness 自己的离线单测在 `scripts/tests/test_regress_eval.py`（本地 pytest，不进 CI）。顺带：
+  `check` 实跑时抓出 `examples/mock_anthropic.py` 一处只有运行时才炸的语法错误，已修。2026-11-26 付费
+  通道第一次真跑（deepseek-flash，三个批次 66 个 run）抓出评测装置自己的三个缺陷，均已修（见 Fixed）；
+  两份 README 的「上下文压缩」节写入了 `keep_recent_messages` 的 A/B 结论（0 明显差于默认的 8）。
+  同日第二批付费通道（三个内核修复的修前 / 修后 A/B 与 `summary-preview`，又是 66 个 run）暴露了 `long-output` 的
+  一条判卷线偏严：`check.py` 要求至少 2 次压缩，内核修复之后 8–9 轮就正确完成的 run 只折叠 1 次、会被判失败。
+  2026-11-27 降到 1 次（仍是「至少真的压缩过一次」）。已跑的批次不回改；按新线对着留存的 workdir 重判，24 个真模型
+  run 里 2 个由失败变为通过，唯一一个 0 次折叠的（产物全对、5 轮结束）仍然不过（计划文档 §0.0.5 末尾）。
+- **推理状态回传 `Config.preserved_reasoning`（内核改进计划 1.1；默认值 2026-11-26 起为开，见 Changed）**：
+  打开后 assistant 消息
+  的推理块留在消息的**旁字段** `Message.reasoning`（`Reasoning { provider, blocks }`，块保留相对
+  正文的位置：`ReasoningBlock { before, text, opaque }`），在同一 user 轮内的后续请求里回传——
+  DeepSeek（`reasoning_content`）/ GLM / Anthropic 扩展思考这类 API 要求工具循环里把思考块带回。
+  内置 provider **无条件**产出 `ChatResponse.reasoning`，落不落历史由 agent 按开关决定（关着时
+  `try_new` 剥掉 initial 历史里的、之后每个回复的在落盘前丢弃——历史逐字节同开关出现之前）；寿命只有
+  **当前轮**（`push_user` 开新 user 轮 / `set_model` / 相邻同角色合并一律整段剥；工具结果并入尾
+  user 消息的合并分支不剥；压缩折叠与工具结果裁剪保留幸存消息自己的；会话归档永不携带）；`task`
+  子 agent 继承开关。provider 只回显自己家族的块，OpenRouter 的 `delta.reasoning` 仅展示不落；
+  OpenAI 家族回显被 400 拒即学到 `GatewayFixes.no_reasoning_echo`（第四位，见破坏性）；缺
+  reasoning 的 400 附一句提示（开关关着时才提）。成本：同轮后续请求重发保留的推理（计入 token 估算
+  与压缩触发，`/context` 多一个 `reasoning` 桶），session 文件因此含思考文本。
+- **`extra_body` / `extra_headers` 请求整形（内核改进计划 1.3）**：两个可选配置键（默认空），把配置
+  没有专键的厂商开关并进每个聊天请求——`extra_body`（顶层字段对象，如 GLM 的
+  `{"thinking": {"type": "enabled"}}`、中转站的路由标签）、`extra_headers`（如中转站的租户头、
+  `anthropic-beta`）。加载期 `Config::validate_extra` 拒绝内核自有键（`model` / `messages` / `system` /
+  `tools` / `stream` / `stream_options` / `max_tokens` / `max_completion_tokens`，设了
+  `reasoning_effort` 时再加 `reasoning_effort` / `thinking` / `output_config`；header 侧是认证、
+  content-type、协议版本等内核管理的头），报错不回显值；`extra_headers` 的值按凭据对待（`Debug`
+  打码、`Config::fingerprint` 只哈希 header 名）。库侧 `OpenAi::with_extra_body` /
+  `with_extra_headers`（`build_agent*` 按配置自动调）。指纹字段清单相应扩展：`preserved_reasoning` /
+  `extra_body` / `env_passthrough` 仅在非默认时进哈希，旧配置的指纹不变（`preserved_reasoning` 的
+  默认值后来改成开，非默认那一侧随之反转为显式 `false`——不写与显式 `true` 同形）。两个键与
+  `preserved_reasoning` / `env_passthrough` 一样都是 batch HARD（任务片段不可覆盖）。
+- **推理 token 进账单面 `reasoning_tokens`（内核改进计划 1.4）**：`Usage.reasoning_tokens` /
+  `RunOutcome.reasoning_tokens`——provider 上报的 `output_tokens` 里的推理份额（OpenAI 兼容的
+  `completion_tokens_details.reasoning_tokens`；Anthropic 不单报），是**子集拆分、不是第五个轴**：
+  不进 `total()`、没有预算闸门读它。汇总整个 run 的每次请求（`task` 子 agent 与失败 attempt
+  都算）。result.json / batch `report.json` 只在上报非 0 时出键（非推理模型的产物逐字节不变）；
+  `--json` 的 `usage` 事件则恒带该键（未上报为 0）。
+- **模型窗口提示（内核改进计划 1.5）**：`limits.max_context_tokens` 未设时，装配前打印一行
+  `[warn] [context] limits.max_context_tokens is not set: …`（headless / batch 走 stderr，TUI 走
+  diag 行）；思考中被 `max_tokens` 截断时另有一行提示（每 run 一次）。都是建议不是校验，两个默认值
+  不改。库侧 `Limits::context_window_hint()`（纯函数，窗口已设返回 `None`）。
+- **`limits.summary_preview_chars`——压缩摘要读到的工具摘录宽度（内核改进计划 2.2，实验三的旋钮；
+  默认 200）**：压缩时被折叠的前缀交给摘要器的不是原文，而是一份**摘录转写**——每个工具调用与
+  工具结果只留头一段（此前这个宽度写死 200 字符）。现在它是 `limits` 的键：`0` 只留工具名 / 标签，
+  调大让摘要器多看到一些被折叠的工具输出。默认值就是原先的硬编码值，默认行为不变；只能收紧
+  （batch 与回归任务片段里只能调小）。付费 A/B 已跑（2026-11-26，`summary-preview` 配方：200 对 1000，五个任务 ×
+  3 次重复，deepseek-flash）：只有 `long-output` 会折叠，1000 没有更好——折叠 7 → 21 次、轮数均值
+  12.7 → 29.3、成本 0.14 → 0.48 USD，模型折叠后整批重读文件核对；默认 200 保持。**`limits` 多了一个键，所有配置的 `config_fingerprint` 因此偏移一次**
+  （指纹把整个 `limits` 结构序列化进哈希）——跨版本比较指纹时留意。
+- **三个内核发现的 loop 回归测试（内核改进计划 §0.0.5；`agent_tests.rs` 与 `compress.rs` 共 27 个
+  用例）**：摘要预算阶梯 13 个（推理模型上摘要被思考烧穿）、前馈折叠的自适应保留窗 6 个（折叠
+  抖动）、隔次重复窗口 6 个（打转护栏的空隙），外加 `summary_preview_chars` 的 2 个；`compress.rs`
+  另有 `shrink_keep_*` 单元测试 5 个。重复窗口的用例在实现落地前就抓出一处差一：提示晚一次才发、
+  报出的次数少一。
+- **MCP 注解旁表（内核改进计划 1.6）**：`tools/list` 返回的逐工具注解此前只读 `readOnlyHint`，
+  `destructiveHint` / `idempotentHint` / `openWorldHint` 与 `outputSchema` 被丢弃。现在四个注解归一成
+  `ToolAnnotations` 落进旁表 `ToolCtx.tool_annotations`（按暴露名索引；唯一构造点 = `Agent::try_new`
+  + `refresh_tool_defs`，所以永远与实际分发的工具表一致），`before_tool` / `after_tool` 钩子里
+  `ctx.annotations(tool)` 读取（宿主据此做策略，不必自己再列一遍工具），result.json 的
+  `tool_calls[].annotations` 留每次调用的快照；子 agent / run_code guest 持构造时快照。**是 server
+  的声称、不是内核保证**，没有任何强制。第三方工具想声明就覆盖新增的 `Tool::annotations()`
+  （默认 `None`）；内置工具 / `CallbackTool` 不必作答。同批改了 `structuredContent` 的取舍——见
+  Changed。
+- **压缩前观察钩子 `Hooks::on_before_compact` 与 TUI `/compact [focus]`（内核改进计划 2.2）**：
+  钩子在「真的折叠」之前同步调一次——摘要已成功、改写历史之前；三条触发路径（阈值 / 溢出恢复 /
+  手动）全覆盖，摘要失败 / 空摘要 / 仅 prune 不触发。入参 `CompactionInfo` 全是借用（触发原因、
+  子 agent 标记、被折叠条数与字符数、当前 todo 清单、即将离开历史的消息）——只读、不能否决；宿主
+  据此在折叠前保存自己的笔记。它是唯一 panic 会被兜住的钩子（`catch_unwind`，照常折叠），慢钩子
+  （≥5 s）有一行告警。绑定未转发。TUI 新增 `/compact [focus]`（idle-only）：立即执行与自动压缩
+  同一个折叠（`compact_with`），focus 文本引导摘要；折叠是 worker 上的忙任务（状态栏
+  `compacting…`、Esc 取消、期间输入照常排队），失败一行 `[compact] failed: …`；成本在成功与失败
+  路径上都诚实回账、不进下一个 run 的账单。
+- **MCP 客户端契约补齐（内核改进计划 2.4）**：
+  - **超时**：`McpServerConfig.call_timeout_secs`（单个 JSON-RPC 请求端到端，含 `tools/call`；默认
+    120）与 `connect_timeout_secs`（HTTP/SSE：TCP/TLS 连接，legacy SSE 还含等 `endpoint` 事件，
+    默认 15；stdio：`initialize` 握手即 server 的启动时间，默认沿用调用超时）。`0` 与超 7 天都是
+    配置错误，报错点名 server、键与默认值；超时文案点名定界的是哪个键。
+  - **工具名单**：`allow_tools` / `deny_tools` 写 **wire 名**，在 `start_server` 过滤——`allow` 里的
+    未知名字硬错（防拼写错与上游改名），`deny` 的未知名字放行；三条装配路径（启动 / 宽松装配 /
+    热增）同款。
+  - **协议版本**：`initialize` 提供 `2025-03-26`，之后每个 HTTP 请求带协商到的
+    `MCP-Protocol-Version`；`2025-03-26` / `2025-06-18` / `2025-11-25` 静默接受，其它修订原样采用
+    并告警一次——永不因版本拒绝 server。
+  - **取消通知**：`tools/call` 进行中取消（Ctrl-C 或库 `set_cancel`）时向 server 发
+    `notifications/cancelled`（`requestId` + reason），长工具可以停手；只发给已出门的请求（超时
+    不发）。
+  - **空闲探测**：HTTP 连接空闲 ≥60 s 后的 `tools/call` 先发 `ping`（5 s 上限）——应答了（哪怕是
+    错误）照常发调用，静默则调用失败且**不发出**（`unreachable after Ns idle — 'tools/call' was
+    not sent`）。stdio 不探测。
+  - **会话恢复**：Streamable HTTP 上带会话 id 的请求吃到 404 = server 忘了会话——重新
+    `initialize`（一行告警）并只重发一次；起不来或重发仍被拒即按该错误失败。恢复后**不**重拉
+    工具表。
+  真机矩阵 `scripts/e2e_mcp.py`（不是 CI 门禁）十组 A–K 覆盖以上全部行为。
+
+### Changed
+
+- **TUI 视觉、布局与输入全面重整（克制现代，保留 inline viewport + 原生 scrollback）**：
+  统一角色/工具/思考/状态的语义样式、软折行悬挂缩进、代码与展开输出 guide、窄屏分级降级；
+  空态改为三行 render-only 报头（与 120 列工作区同宽的间隔字标 + 右对齐版本号、双色规则线、标语），
+  键帽只在 composer 底边框出现一次；助手使用 `◆` 标识，工具调用与结果由连续 `▎` 导轨串联，思考使用
+  独立色；正文、composer、队列预览与状态栏共享最多 120 列的工作区。
+  composer 使用圆角边框与略凸起的主题表面，空闲标题为 ` ◆ MESSAGE `，底部键位提示与 slash 弹窗选中行、
+  行内代码共用一套键帽/凸起表面语言；状态栏以轻量青色文字显示模型，运行状态明确为
+  `ready` / `running` / `cancelling` / `failed`，累计 token 段在产生计费后才出现，长路径按完整目录段
+  省略而非任意截断。
+  composer 从水平滚动改为软换行 + 纵向审阅，光标按 grapheme display cell 定位，CJK、普通 emoji、
+  ZWJ 序列与 variation selector 不再被逐 `char` 拆字（新增可选轻量依赖 `unicode-segmentation`）。
+  工具默认显示关键参数、状态、耗时与有限预览，失败自动展开同时受 20 行 / 2000 字符限制；
+  ANSI SGR 保留 256 色索引与 RGB truecolor；resume 的图片 / PDF 以轻量占位保留轮次上下文。
+- **TUI 队列与运行状态改为显式状态机**：待发消息从 transcript ghost 解耦，只在独立 live preview
+  显示，真正发送才追加用户行；正常完成自动 flush FIFO，取消清空队列，失败进入 `failed` 并暂停
+  保留队列，`/resume` 显式继续（另发新 prompt 不隐式释放旧 FIFO）。新增 `/queue`、`/unqueue`，
+  并用 `idle` / `running` / `cancelling` / `failed` 区分标题、边框与状态，重复取消不再刷屏。
+- **TUI 长思考与详情查看**：Thinking 不再走 Assistant 的提前分块定稿，live 仅显示有界尾部；
+  定稿后超过 8 个显示行折叠为头部 + 末尾 3 行，完整原文仍进 `/export`，`/thinking [n]` 追加
+  重印全文。新增 `/call [n]` 查看完整工具输入，`Ctrl+O` 重印最新工具调用 / 结果 / 思考详情；
+  所有展开均为追加重印，不改写已提交 scrollback。补全支持 Shift+Tab 反向选择，编辑新增
+  Ctrl+J 换行、Ctrl/Alt+词移动、Ctrl+Backspace 与 Delete；`/help`、空态速览和双 README 同步。
+- **Assistant 流式切分可靠性**：共享 grapheme-aware 显示行测量；未闭合 inline code 等待闭合、
+  fence 状态只读取完整逻辑行、EOF 空尾拒绝切分，放弃切分不再修改原文；增加真实
+  `build_history_lines → wrap_history` 最终渲染等价与极窄屏 / 光标 cell-grid 回归。
+- **MCP 工具声明 `outputSchema` 时 `structuredContent` 压过文本镜像（内核改进计划 1.6）**：此前文本
+  帧恒优先、`structuredContent` 只在没有任何文本帧时兜底（「纯结构化 server 渲染成
+  `[empty tool result]`」的修复）。现在声明了 `outputSchema` 的工具以结构化载荷为准——模型拿到它
+  的 JSON 文本，可读文本镜像丢弃（结果里的图片仍保留）；其余工具不变（文本帧优先 + 无文本时兜底）。
+  声明了 `outputSchema` 却把真结果放在文本里的 server 会看到变化。
+- **工具子进程默认不再继承 API 密钥变量（内核改进计划 2.5，新默认）**：`shell` 工具与 stdio MCP
+  server 拉起的进程里，`api_key_env` 指向的那一个变量被移除；`env_passthrough` 放行。详见下方
+  Security。
+- **`preserved_reasoning` 默认改为开（内核改进计划 2.1 / D1，2026-11-26）**：实验一在 deepseek-flash
+  上的结论是成功率不降（on 15/15 对 off 14/15）、总 token −39%，收益全部来自会压缩的长任务
+  （`long-output` −48%）；不压缩的四个短任务多花约 21%（保留的推理在同一轮的每个后续请求里重发）。
+  默认开：收益落在长任务最疼的地方。**只在一个端点上量过**——自己的任务形态如果几乎不压缩，值得先量一量；
+  不想要的部署显式写 `"preserved_reasoning": false`，关掉后历史与 session 文件逐字节同开关出现之前。
+  同日晚间用内核修复之后的二进制把实验一原样复测，**省不省 token 随端点而变**：OpenAI 协议上 −31%
+  （每 run 58.5k → 40.3k token），换成同一网关的 Anthropic 协议端点（`hw-vol-deepseek`）是 +26%（67.7k → 85.1k），
+  差别全在 `long-output`；短任务多花 21% 没有复现，逐任务在 −55% 到 +51% 之间乱跳，是每格 3 次的噪声。默认值没有
+  因此改动；用户 2026-11-27 确认保持默认开（计划文档 §0.0.3 的 D1）。Anthropic 分支已在那个端点上用真模型逐请求核对过线上形状：30 个
+  run、328 个请求，回传的 thinking 块（含工具调用轮里最常见的「空正文加签名」块）与网关发来的逐字节一致，压缩
+  之后同样成立。该网关不校验签名——Anthropic 官方 API 的严格校验仍未验证，也没见过 `redacted_thinking`。拒收回显
+  的网关会先吃一次 400，内置 OpenAI provider 据此学会不再回显（仅内存）。`reasoning-carry` 配方的两臂都写显式值，
+  不受默认值变化影响。数据见 `docs/kernel_improvement_plan.md` §0.0.5。
+- **摘要预算自适应重试（内核改进计划 §0.0.5 发现 1）**：推理 token 与正文共用摘要的输出额度。
+  deepseek-flash 的三个付费批次里 240 次摘要调用有 204 次（85%）在 1024 token 的预算下限处被截断（其中
+  199 次带思考），
+  而内核对「截断但非空」首次就接受，终版摘要在半行处断掉。现在摘要**截断且带推理**（或空正文）时
+  只重试一次、预算翻倍（上限 8192），取较长的一份正文——重试只能让结果变好，最坏等于旧行为。
+  网关拒给翻倍预算即这个 agent 不再要（记上限、一行告警）；重试被正常服务则抬高它之后摘要的
+  地板（两条学习跨 run 保留，`set_model` 清掉）。不带推理的截断保持单次尝试。修后 A/B（同日，回归集
+  6 任务 × 3 次，修前 / 修后两个二进制同配方）：`long-output` 修后 21 份最终摘要没有一份再被截断（修前
+  82 份里 70 份卡在 1024），每个 run 的地板都被抬了两次（1024 → 2048 → 4096）。同日晚在 Anthropic 协议端点（`hw-vol-deepseek`）抓包数到
+  24 次折叠里 11 次首发就被思考挤截断：9 次重试收尾；2 次重试的输出又用满预算（网关仍标 `end_turn`），
+  取较长的一份（其中一份是首发那一份）；截断的首发
+  白花了摘要输出 token 的 26%（计划文档 §0.0.5「Anthropic 线补测」，那里还记了一条没做的候选项：给摘要请求
+  显式禁思考，用户 2026-11-27 同意暂不做）；数据见 `docs/kernel_improvement_plan.md` §0.0.5。
+- **前馈压缩的自适应保留窗（内核改进计划 §0.0.5 发现 2）**：保留窗自身就占满空间时，预检每轮再折
+  一次、每次只折得掉 2 条消息——实测一个 56 轮的 run 折了 32 次，其中 27 次只折掉 2 条（三个批次的
+  `long-output` 里 240 次折叠有 213 次如此），带折叠的轮次中位 16.1 秒、其余 2.5 秒。现在 Preflight 折叠
+  保留「自身占用不超过剩余空间一半」的最宽尾部（上限仍是 `keep_recent_messages`）：折得少，但每次
+  都折得掉。手动压缩与溢出恢复保持配置的窗口。修后 A/B：同一个任务折叠 82 → 21 次、只折掉 2 条的
+  79 → 1 次，通过 1/3 → 3/3，主请求输入 token 少约四分之三；带折叠的轮次更慢（中位 13.1 → 16.6 秒），
+  三个 run 的总耗时仍从 1268 秒降到 657 秒。
+- **隔次重复提示（内核改进计划 §0.0.5 发现 3）**：打转护栏只数**连续**的同参同果调用，轮询之间
+  夹着别的调用时连续计数就被清掉——实测 9 次一模一样的轮询（中间夹着别的调用）、最长连续 3 次，第 3 次的提示
+  （「换一个工具」）模型照办，硬停永远够不着。现在另有一个最近 8 次调用的重复窗口：同一个键
+  （工具名 + 生效参数 + 结果指纹）在窗口里第 4、6、8… 次出现时，该次的 tool_result 里附一条针对
+  轮询的提示。**只提示、不停**——硬停线（连续 6 次）不动，同参不同果照旧算进展。修后 A/B 上看不出
+  效果：`loop-suppression` 每侧 3 个 run，通过 1/3 对 2/3、工具调用 46 次对 37 次——方向一致但落在
+  噪声里，也只有这一个任务会触发它。
 
 ### Changed（破坏性）
 
@@ -106,9 +324,43 @@
   累计，可超 100%，持续到父 agent 下一次请求完成）。harness `--json` 的 `usage` 记录只加
   `tool_folded` 键；human 模式折叠行带 ` (tool-billed)` 后缀；两个绑定经 serde 透传自动带上新键。
   **Rust 库消费方若对 `AgentEvent::Usage` 穷尽解构，需补该字段或 `..`**。
+- **内核改进计划一批结构字段（2026-11-25）**——全部带默认值，读取方按键 / 字段消费不受影响，
+  **字面构造方需补字段**：
+  - `Usage` / `RunOutcome` 新增 `reasoning_tokens: u64`（1.4；自定义 provider 字面构造 `Usage` 需补
+    字段，不上报就给 `0`）；`AgentEvent::Usage` 变体同名字段（恒出现，未上报为 0）——穷尽解构需补
+    字段或 `..`；
+  - `Message` 新增 `reasoning: Option<Reasoning>`、`ChatResponse` 新增 `reasoning: Option<Reasoning>`
+    （1.1）——自定义 `Provider` 实现若字面构造 `ChatResponse` 需补字段（`from_simple` 给 `None`）；
+  - `GatewayFixes` 新增第四位 `no_reasoning_echo`（`deny_unknown_fields`：旧二进制读不了带新位的
+    预置）；
+  - `McpToolInfo` 新增 `destructive_hint` / `idempotent_hint` / `open_world_hint` / `output_schema`，
+    `ToolCallRecord` 新增 `annotations`（1.6）；
+  - `ToolCtx`（只派生 `Clone`，宿主字面构造）新增 `hidden_env: Vec<String>`（2.5）与
+    `tool_annotations: Arc<BTreeMap<String, ToolAnnotations>>`（1.6）——自定义工具 / 测试里构造
+    `ToolCtx` 的代码各补一项；
+  - `Config` 与 `PartialConfig` 新增 `preserved_reasoning` / `extra_body` / `extra_headers` /
+    `env_passthrough`（四个都是 batch HARD，任务片段不可覆盖）；`McpServerConfig` 新增
+    `call_timeout_secs` / `connect_timeout_secs` / `allow_tools` / `deny_tools`（均可选，缺省行为不变）；
+  - `Limits` / `PartialLimits` 新增 `summary_preview_chars`（2026-11-26）——JSON 配置缺省即 200，
+    **Rust 侧字面构造 `Limits { .. }` 的库消费方需补字段**。
+  带默认实现的新增方法（不破坏，仅供同批查阅）：`Hooks::on_before_compact`、`Tool::annotations`。
+  对外产物只加可选键（result.json / NDJSON / 配置文件；`RESULT_SCHEMA_VERSION` 不变）。两个绑定的
+  `Usage` / `RunOutcome` 字典多出可选键 `reasoning_tokens`（未上报不出键），`wrapper.d.ts` 同步。
 
 ### Fixed
 
+- **MCP legacy SSE：落在流轮转间隙里的请求被打到已退役的会话（全量并发测试里偶发「tools/list timed out」
+  的根因）**：读线程到期轮转时丢掉旧 GET 再开新连接，而 POST 目标只在新连接的 `endpoint` 到达时刷新——
+  这期间发出的请求被 POST 到旧会话。会话绑定的 server 靠定时器回收会话（python-sdk 每 100 ms 轮询一次，
+  不是断开瞬间），这种 POST 照样被应 202、应答写进已关闭的连接，调用方于是等满整个 `call_timeout_secs`。
+  现在轮转**先退役** POST 目标，请求与通知等新 `endpoint` 再发：等待的界是 `connect_timeout_secs`（与等
+  首个 `endpoint` 同一个界，且不超过请求自己的界），期间看得见 cancel 与读线程死亡；取消通知不等（不等
+  回执，没有当前目标就丢帧）。相邻限制不变（明示的取舍）：**已出门**的请求跨过轮转边界时，应答依赖
+  server 在新连接上重发，不重发即丢失。
+- **TUI 终端断开后单核 100% CPU**：crossterm 0.29 的 Unix 输入源在 tty EOF 时困于内部读循环，
+  pty/控制终端消失后主线程无法返回处理错误。新增独立 tty 断开监控，触发后按正常会话收尾链路
+  取消 worker、唤醒 MCP teardown、有界等待并恢复终端，再退出进程；正常空闲与可恢复的轮取消不变。
+  新增真实 openpty 断开探测回归测试，并经进程级 pty 验证断开后自动退出。
 - **2026-11-03 外部对抗评审 round-2（4 位新评审分片：持久化/批处理、TUI/CLI/config、bindings FFI、钉子质量变异测试+CI 复核）**：
   - **SSE 零数据流 cancel 残余竞态（评审 R4-P2-1，变异测试顺带实锤钉子 flake）**：`CancellableSse::
     next_payload` 的 `Disconnected` 臂不回采样 cancel flag——TTFB 窗口内 cancel 翻转与流 EOF 落进同一
@@ -254,6 +506,25 @@
     （共 6 处）；`./scripts/check.sh e2e` 单跑先构建（此前用遗留二进制可假绿）；workflow 最小权限、
     第三方 action 钉 commit SHA（`dtolnay/rust-toolchain@stable` 刻意豁免）、cargo-audit 钉 0.22.2、
     release 并发组与 npm publish 幂等、`NPM_TOKEN` 提为 job 级 env。
+- **`refresh_tool_defs` 与构造路径的估算量纲不一致（内核改进计划 0.2）**：热增删 MCP server、开关
+  run_code 之后重算 `tool_schema_chars` 的那段用字节数累加，而构造路径用的是 CJK 感知的
+  `compress::tool_schema_units`——热增一个带中文描述的工具之后，同一个 agent 两条路径的估算口径
+  就分叉。现在两边都过 `tool_schema_units_sum`，回归钉子：热增后与一次性构造的值相等。
+- **`scripts/regress_eval.py`：批次目录或 `--base-config` 按相对路径给出时，付费通道的 run 全部在启动
+  阶段失败**（`cannot read config file`；2026-11-26 第一次真机批次抓出，没发出请求、花费为零）。每个
+  run 的子进程工作目录是 run 目录，相对路径在那里解析不到；零成本 `check` 走的是绝对临时目录，所以
+  从没踩到。现在 `run` / `summarize` 把批次目录、`prepare` 把基配置路径都解析成绝对路径（清单里记的
+  也是绝对路径，换一个工作目录再 `run` 仍指向同一份文件），两条离线用例钉住。
+- **回归评测的 run 环境不密闭（2026-11-26 第一次真机批次抓出）**：付费通道沿用开发者环境——开发者本机
+  技能目录的 symlink 提示进了 run 日志；批次目录又在仓库里，模型在 workdir 里跑
+  `git status --short; git diff` 解析到外层仓库，开发者未提交的 diff（约 30 KB）被发给了模型，换成
+  `git stash` 就是改坏工作区。现在两条通道都经 `run_env` 隔离：`XDG_CONFIG_HOME` 指到 run 目录内的空
+  目录，`GIT_CEILING_DIRECTORIES`（run 目录 + 全部祖先）挡住向上发现——workdir 自己是仓库时照常可用；
+  三条离线用例钉住（含 mock 批次里的端到端）。
+- **`examples/regress/mcp_server.py` 的 `transfer_stock` 拒收整数 `units`**：参数校验要求每个参数都是非空
+  字符串，整数被判成 `missing argument 'units'`——脚本化模型不调这个工具，零成本通道一直是绿的；真实模型
+  一次 run 里撞了 25 次。整数参数改在工具处校验（正整数），十二个工具各加一条合法调用探针（以 `TOOLS`
+  为真值源，新增工具不补样例即失败）。
 
 ### Security
 
@@ -273,6 +544,21 @@
   wasmtime-internal-cache 整个 36.x 线钉 `zstd ^0.13`、修复版在 0.14，逐条可达性分析后写入
   `.cargo/audit.toml` 白名单（一次性 encode/decode、不用 seekable、未编入 legacy 帧、非 wasm 目标），
   随 wasmtime 大版本升级移除。
+- **工具子进程不再继承 API 密钥变量（内核改进计划 2.5，新默认）**：此前 `shell` 工具与 stdio MCP
+  server 起子进程时**完整继承**宿主环境——`api_key_env` 指向的密钥对模型写的命令和第三方 MCP
+  server 可见：一句 `echo $THE_KEY` 就把密钥打进转录、session 文件与 `--json` 事件流。现在装配时
+  算出要移除的变量集（默认恰好是 `api_key_env` 指向的**那一个**变量），在每个 spawn 点
+  `Command::env_remove`——`shell` 两条链（unix `sh -c` / windows `cmd /C`）、MCP stdio 两条链 +
+  热增 `add_mcp_server`；`task` 子 agent 与 run_code guest 的 ctx 是克隆，原样继承。**库从不修改
+  进程环境**，agent 自己的请求照常读密钥。放行方式：`"env_passthrough": ["THE_KEY"]`（全局）；
+  MCP 条目自己的 `env` 里显式写出同名变量照常下发（用户有意把密钥交给某个 server，配置值优先）。
+  提示：配置里真有 `shell` 工具或 stdio MCP server 时，启动打一行点名藏了什么（每进程一次）；
+  `restrict_to_workdir` 未开的无人值守提示同样每进程一次，只在 headless 与 batch 打印（TUI 有人在
+  看）。**定位是防顺手不防对抗**：其余变量完整继承（不要把别的密钥放在 run 的环境里，除非模型
+  可以读），同用户进程仍可经操作系统读到父进程环境——真正的隔离靠容器或受限用户。迁移：确实
+  需要密钥的子进程（如对同一网关 `curl`）把变量名加进 `env_passthrough`。配套探针测试断言变量
+  不可见（真 spawn 的 shell / python 子进程、热增路径、子 agent 与 guest 的继承），
+  `scripts/e2e_mcp.py` 组 K 用真实二进制再走一遍。
 
 ## [0.4.3] - 2026-10-24
 
