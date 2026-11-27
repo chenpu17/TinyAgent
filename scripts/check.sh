@@ -8,7 +8,7 @@
 # 用法：
 #   ./scripts/check.sh              # 跑默认全集（fmt clippy test e2e docs）
 #   ./scripts/check.sh fmt docs     # 只跑指定分组，可给多个
-#   ./scripts/check.sh e2e          # 只跑 e2e（场景 e2e + 回归任务集零成本自检，零密钥）
+#   ./scripts/check.sh e2e          # 只跑 e2e（场景 e2e + Anthropic 线回传自检 + 回归任务集零成本自检，零密钥）
 #   ./scripts/check.sh all          # 等价默认（仍不含 bindings / bench）
 #   ./scripts/check.sh bindings     # 双绑定 clippy（默认不跑，见下）
 #   ./scripts/check.sh bench        # 性能基准（快跑一轮，默认不跑，见下）
@@ -76,10 +76,10 @@ group_test() {
 }
 
 group_e2e() {
-    # 逐字对齐 ci.yml 的 e2e job 三步：先 build 出 code 版真实二进制，再跑场景，
-    # 最后跑回归任务集的零成本自检。e2e_scenarios.py 自己只在二进制不存在时才
-    # build——这里显式 build 一次，保证两个脚本测的都是当前源码而不是上次遗留的
-    # target 产物。
+    # 逐字对齐 ci.yml 的 e2e job 四步：先 build 出 code 版真实二进制，再跑场景，
+    # 然后是 Anthropic 线回传的线上自检，最后跑回归任务集的零成本自检。
+    # e2e_scenarios.py 自己只在二进制不存在时才 build——这里显式 build 一次，
+    # 保证后面三个脚本测的都是当前源码而不是上次遗留的 target 产物。
     run_check "build: code" \
         cargo build --locked --features code
     # 内置 SSE 场景 mock（线程化、零密钥），走真实 CLI/HTTP 栈守四个 loop 级
@@ -87,6 +87,15 @@ group_e2e() {
     # 改了 loop / 取消 / 打转行为后必跑（CLAUDE.md「离线 / 视觉验证」）。
     run_check "e2e: scenarios" \
         python3 scripts/e2e_scenarios.py
+    # Anthropic 协议「推理回传」的线上契约自检：进程内脚本化 Messages API mock +
+    # 真实二进制，离线、零密钥，约 2 秒。逐请求核对回传的 thinking 块与端点签发的
+    # 逐字节一致（正文、签名、位置）、只活当前一轮、压缩折叠后保留的尾巴不动、
+    # 会话文件三向对账、usage 对得上 result.json；检查器自带五种篡改自测。已登记
+    # 的内核缺口以 [GAP] 报告、不计失败（TA_WIRE_STRICT=1 让它致命）。capture /
+    # audit 两个子命令是真实端点的手动通道，不在这里跑；离线单测在
+    # scripts/tests/test_e2e_anthropic_wire.py（本地 pytest，不进 CI）。
+    run_check "e2e: anthropic wire" \
+        python3 scripts/e2e_anthropic_wire.py
     # 回归任务集零成本自检（examples/regress/tasks，脚本化 mock，零密钥）：6 个
     # 任务 × 两种线协议的正路径、坏模型必被判卷拦下、可复现、付费闸门、
     # mock-smoke 流水线。check 在任何环境下都发不出付费请求（付费通道只在本地

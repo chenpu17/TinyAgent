@@ -1268,6 +1268,38 @@ cargo bench -p tiny-agent-core --features mock --bench loop_bench -- --quick
 （`python3 scripts/e2e_mcp.py`，不是 CI 门禁：MCP stdio 与 Streamable HTTP 的线上行为——
 协商、超时、取消通知、会话恢复、凭据卫生）。
 
+### Anthropic 线回传自检（`scripts/e2e_anthropic_wire.py`）
+
+第三套真进程套件钉的是 Anthropic 协议上真正离开进程的东西：「推理回传」——运行中那一轮由端点签名的
+`thinking` 块，在那一轮之后的每个请求里原样带回——逐字节一致。一个只依赖标准库的脚本（Python 3.9+，
+无第三方模块），三个子命令共用同一套检查函数：
+
+```sh
+python3 scripts/e2e_anthropic_wire.py check      # CI 门禁（e2e job；./scripts/check.sh e2e 也跑）
+python3 scripts/e2e_anthropic_wire.py capture --upstream https://HOST --out /tmp/ta-wire-capture
+python3 scripts/e2e_anthropic_wire.py audit /tmp/ta-wire-capture --session <session.json> --result <result.json>
+```
+
+- **`check`**（默认；离线、确定性、约两秒）：进程内脚本化的 Messages API mock 驱动真实 headless 二进制
+  （`TA_BIN` 可换二进制；临时配置、workdir 与会话文件都在一个跑完即删的临时目录里——`--keep` 保留）。
+  十个场景：真实流量上见过的块形状、边缘块（未签名的 thinking 丢弃、`redacted_thinking` 保留）、回传关闭、
+  `reasoning_effort` `none` / `low`、多轮对话、跨进程 `--resume`、`max_tokens` 补写轮（半截正文被截断之后、
+  空回复之后两种）、一次压缩折叠。每个请求都按这些规则核对：角色交替、tool_use ↔ tool_result N:N、thinking
+  只出现在运行中那一轮的 assistant 消息里、签名非空、回传的块与端点发来的逐字节一致（正文、签名、位置）——
+  会话文件、result.json 与 NDJSON 流通道再对着同一份流量对账。变异自测（改签名、改正文、挪位置、丢整块、
+  改工具入参）必须抓住每一份篡改副本。
+- **`capture`**（手动；从不进 CI）：回环转发代理（`--listen`，默认 `127.0.0.1:<空闲端口>`），打印临时配置
+  要用的 `base_url`，把每个请求体与每条流式响应记进 `--out`（`requests.jsonl` / `responses.jsonl` /
+  `meta.json`；须是新目录或空目录——已有的 capture 永不覆盖）。**凭据卫生**：上游主机名从不落盘，像凭据的
+  header 只留名字，写下的每一行都先过密钥模式扫描——命中即脱敏后再写，并以非零退出码收场。
+- **`audit`**（离线）：对 capture 目录跑同一套检查，`--session` / `--result` 是可选的第二、第三见证；
+  `--carry-off` 声明这次运行关着 `preserved_reasoning`。
+
+输出是每条检查一行 `[PASS] <检查> — <钉住了什么>` 或 `[FAIL] …`，外加一行总结；退出码 0 当且仅当没有失败。
+只因已登记的内核缺口而失败的检查打 `[GAP]`——如实报告、不计失败——除非 `--strict`（或 `TA_WIRE_STRICT=1`）
+让它致命。`--verbose` 给出逐请求明细，`--only <子串>` 只跑名字对得上的检查。脚本自己的离线单测在
+`scripts/tests/test_e2e_anthropic_wire.py`（本地 pytest，不进 CI）。
+
 ### 回归任务集（`examples/regress`）
 
 六个端到端任务，每个都带脚本化的零成本路径和基于文件的判卷脚本——进程内 loop 测试给不了的

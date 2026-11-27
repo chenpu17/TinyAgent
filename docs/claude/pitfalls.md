@@ -597,6 +597,12 @@
   `[text, thinking, tool_use]` 与 `[thinking, text, tool_use]`。② `signature_delta` 是 `content_block_delta` 里
   `delta.type` 的一个取值，不是顶层事件类型（按顶层类型数它永远是 0）。批次的 `summary.json` 不记摘要调用的次数：
   重试率只能从抓包里数（连续两个请求体相同即重试）。
+  这套三方核对已落成仓库脚本（2026-11-27）：离线门禁 `python3 scripts/e2e_anthropic_wire.py`（CI 的 e2e job），
+  抓真实端点用它的 `capture` / `audit` 两个子命令（只听回环的转发代理；上游地址与凭据值不落盘、落盘前再扫一遍），
+  别再手搓转发器。它上线第一天抓到的就是「`--resume --task` 不结束上一轮推理寿命」（见上面 Anthropic 相邻 user
+  条）。另一个教训在它自己的测试文件里：**依赖「真缺口还在」的测试，在缺口被修掉的那一刻就空转**——缺口机制的
+  测试（`[GAP]` 不计失败 / `--verbose` 逐条 / `--strict` 致命）要用合成的缺口（`file_synthetic_gap`），并且断言
+  「确实出现了缺口行」，不许 `if not gaps: return`。
 - **pyte 重放 TUI 的三个假象（2026-11 定位，`/compact` 的 pty 验证）**：① **SU / SD 没实现**（见上面
   「滚动区画面疑似重叠」条的根因）。要忠实模拟就子类化 `pyte.Stream`，在 `__init__` 里
   `self.csi = dict(self.csi); self.csi.update({"S": "scroll_up", "T": "scroll_down"})`——dispatcher 在解析器

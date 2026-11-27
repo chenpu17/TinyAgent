@@ -7,6 +7,15 @@
 
 ### Added
 
+- **Anthropic 线回传自检 `scripts/e2e_anthropic_wire.py`（进 CI 的 e2e job 与 `./scripts/check.sh e2e`）**：
+  进程内脚本化 Messages API mock 驱动真实 headless 二进制，离线、零密钥、约 2 秒。十个场景（真实流量上见过的
+  块形状、边界块、关回传、`reasoning_effort` `none` / `low`、多轮对话、跨进程 `--resume`、截断后与空回复后的
+  `max_tokens` 收尾轮、压缩折叠）逐请求核对：回传的 thinking 块与端点签发的逐字节一致（正文、签名、位置）、
+  只活当前一轮、压缩折叠后保留的尾巴不动，会话文件 / result.json / NDJSON 事件流三向对账；另带五种篡改自测。
+  `capture` / `audit` 两个子命令是真实端点的手动通道（只听回环的转发代理；上游地址与凭据值不落盘），不进
+  CI。离线单测在 `scripts/tests/test_e2e_anthropic_wire.py`（本地 pytest）。上线第一天就抓到下面 Fixed 里
+  `--resume --task` 那一条。
+
 - **MCP 宽松装配 `build_agent_with_lenient`（宿主降级需求，TinyWorker）**：与
   `build_agent_with` 同参数签名，返回值多带失败清单（`Result<(Agent, Vec<McpFailure>)>`），
   差别只在 MCP 起不来的处理——逐个 server 尝试，失败的跳过并

@@ -109,7 +109,11 @@ jobs:
     # 请求数精确核算）、SIGINT 优雅取消（exit 130）。脚本化 MockProvider
     # 单测覆盖进程内 loop 不变量，这个 job 守它们到不了的「真栈」层
     # （CLI 解析、SSE 解码、进程信号）。单平台：场景无平台差异。
-    # 第三步是回归任务集的零成本自检（scripts/regress_eval.py check）：
+    # 第三步是 Anthropic 线回传的线上自检（scripts/e2e_anthropic_wire.py，
+    # 不带参数即 check）：进程内脚本化 Messages API mock + 同一个二进制，
+    # 逐请求核对回传的 thinking 块与端点签发的逐字节一致、只活当前一轮、
+    # 压缩折叠后保留的尾巴不动；已登记的内核缺口报 [GAP]、不计失败。
+    # 第四步是回归任务集的零成本自检（scripts/regress_eval.py check）：
     # examples/regress/tasks 的 6 个任务 × openai/anthropic 两种线协议的
     # 脚本化正路径全部通过、「什么都不做」的模型必被判卷拦下、同一任务两次
     # 运行汇总逐项相等、付费闸门逐条拒绝、mock-smoke 配方走完整条流水线。
@@ -125,6 +129,10 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo build --locked --features code
       - run: python3 scripts/e2e_scenarios.py
+      # Anthropic 协议「推理回传」的线上契约自检（离线、零密钥，约 2 秒）：
+      # 与 scripts/check.sh 的 e2e 组逐字对齐；capture / audit 两个手动子命令
+      # 不在这里跑。
+      - run: python3 scripts/e2e_anthropic_wire.py
       - run: python3 scripts/regress_eval.py check
 
   python-binding:

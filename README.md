@@ -1727,6 +1727,46 @@ exit 130) and `scripts/e2e_mcp.py` (`python3 scripts/e2e_mcp.py`, not a CI gate:
 Streamable HTTP behaviour — negotiation, timeouts, cancellation notifications, session recovery,
 credential hygiene).
 
+### Anthropic wire check (`scripts/e2e_anthropic_wire.py`)
+
+A third real-process suite pins what actually leaves the process on the Anthropic protocol: the
+"reasoning carry" — the provider-signed `thinking` blocks of the running turn, echoed back in every
+later request of that turn — byte for byte. One stdlib-only script (Python 3.9+, no third-party
+module) with three subcommands that share every checking function between them:
+
+```sh
+python3 scripts/e2e_anthropic_wire.py check      # CI gate (e2e job; also in ./scripts/check.sh e2e)
+python3 scripts/e2e_anthropic_wire.py capture --upstream https://HOST --out /tmp/ta-wire-capture
+python3 scripts/e2e_anthropic_wire.py audit /tmp/ta-wire-capture --session <session.json> --result <result.json>
+```
+
+- **`check`** (the default; offline, deterministic, about two seconds): an in-process scripted Messages
+  API mock drives the real headless binary (`TA_BIN` overrides the binary; the scratch config, workdir
+  and session live in a temp directory that is removed afterwards — `--keep` retains it). Ten scenarios:
+  the block shapes seen on real traffic, edge blocks (unsigned thinking dropped, `redacted_thinking`
+  kept), carry off, `reasoning_effort` `none` / `low`, a multi-turn conversation, a cross-process
+  `--resume`, the `max_tokens` wrap-up turn after a cut and after an empty reply, and a compression
+  fold. Every request is held to: alternating roles, tool_use ↔ tool_result N:N, thinking only in the
+  running turn's assistant messages, non-empty signatures, echoed blocks byte-identical to what the
+  endpoint sent (text, signature, position) — and the session file, result.json and the NDJSON stream
+  channel are reconciled against the same traffic. A mutation self-test (signature altered, text
+  altered, position moved, block dropped, tool input changed) must catch every tampered copy.
+- **`capture`** (manual; never in CI): a loopback forwarding proxy (`--listen`, default
+  `127.0.0.1:<free port>`) that prints the `base_url` for a scratch config and records every request
+  body and every streamed response into `--out` (`requests.jsonl` / `responses.jsonl` / `meta.json`;
+  a new or empty directory — an existing capture is never overwritten). **Credential hygiene**: the
+  upstream host is never recorded, credential-looking headers are kept by name only, and everything
+  written is scanned for key patterns — a hit is redacted before writing and the exit is non-zero.
+- **`audit`** (offline): the same checks over a capture directory, with `--session` / `--result` as
+  optional second and third witnesses; `--carry-off` declares a run made with `preserved_reasoning`
+  off.
+
+Output is one `[PASS] <check> — <what was pinned>` or `[FAIL] …` line per check plus a summary line;
+exit code 0 iff nothing failed. A check that fails only for a reason already filed as a kernel gap
+prints `[GAP]` — reported, not counted — unless `--strict` (or `TA_WIRE_STRICT=1`) makes it fatal.
+`--verbose` prints per-request detail, `--only <substr>` narrows a run. The script's own offline unit
+tests live in `scripts/tests/test_e2e_anthropic_wire.py` (local pytest, not in CI).
+
 ### Regression task set (`examples/regress`)
 
 Six end-to-end tasks, each with a scripted zero-cost path and a file-based checker — the net for

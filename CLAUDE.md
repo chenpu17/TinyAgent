@@ -204,6 +204,13 @@ cargo clippy -p tiny-agent-node
   CLI/HTTP 栈守四个 loop 级行为：打转护栏（stuck_loop 硬停 / 同参不同果不误停 / nudge 只进历史不进
   事件流）、单轮 10 路并行 task fan-out（8/波 + N:N + 请求数精确核算）、SIGINT exit 130。CI 有
   同名 job（ubuntu）。改了 loop/取消/打转行为后必跑。
+- **Anthropic 线回传自检**：`python3 scripts/e2e_anthropic_wire.py`——CI 门禁（e2e job，也是 `check.sh e2e`
+  组第三步）：进程内脚本化 Messages API mock × 真实 headless 二进制，离线零密钥约 2 秒，十个场景逐请求核对回传的
+  thinking 块与端点签发的逐字节一致、只活当前一轮、会话文件 / result.json / NDJSON 三向对账，自带五种篡改自测。
+  `[GAP]` = 已登记的内核缺口（`KNOWN_GAPS` 表：修掉即撤、与修复落在同一个提交；登记了却不再复现会让 check 红），
+  `TA_WIRE_STRICT=1` 让它致命；`capture` / `audit` 是真实端点的手动通道（回环转发代理，上游地址与凭据值不落盘），
+  不进 CI；离线单测 `scripts/tests/test_e2e_anthropic_wire.py`（本地 pytest）。改了 `provider/anthropic.rs`、
+  推理回传或压缩折叠后必跑。
 - **MCP 端到端**：`python3 scripts/e2e_mcp.py`——真实 headless 二进制 × 文件内自带的零依赖 mock MCP
   （stdio / Streamable HTTP）+ 脚本化 LLM，十组线上行为（工具名单、配置报错、Ctrl-C 取消通知、调用/握手
   超时键、协商版本、404 会话恢复、202 standing stream、凭据卫生、空闲探测）约 15 s；`--idle` 才跑空闲
