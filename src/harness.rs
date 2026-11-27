@@ -1934,7 +1934,8 @@ mod tests {
         // branch carried that field with zero test coverage (its fix landed
         // after the last pin batch; a revert of the branch compiled clean,
         // proving no pin would have caught its removal). Both sides here:
-        let dir = std::env::temp_dir().join(format!("ta-res-fp-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("ta-res-fp-{}-{}", line!(), std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
         // Failed run WITH an attribution meta (agent built): key present.
@@ -2315,7 +2316,8 @@ mod tests {
         // （恒在，台账钉「模型 + harness 配对」）与 gateway_fixes（仅学到修复
         // 时在——sparse 约定，无修复的产出与既有字节一致）。此前文档声称两键
         // 在而 write_result 手工键清单漏了它们，实现与文档各说各话。
-        let dir = std::env::temp_dir().join(format!("ta-res-fp-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("ta-res-fp-{}-{}", line!(), std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mk = |fp: &str, fixes: tiny_agent::GatewayFixes| RunOutcome {
             reasoning_tokens: 0,

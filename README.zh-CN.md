@@ -1415,7 +1415,7 @@ src/  # CLI crate (package tiny-agent, bin tiny-agent): process shell + headless
 ├── main.rs               ( 1174)  # CLI entry + assembly (build_agent) + --session none
 ├── signal.rs             (  123)  # headless SIGINT → cancel (first press graceful / second hard-exit 130)
 ├── batch.rs              ( 4117)  # batch tasks + --retries/--failed + report merging
-├── harness.rs            ( 2695)  # headless mode + result.json + NDJSON + exit codes
+├── harness.rs            ( 2697)  # headless mode + result.json + NDJSON + exit codes
 ├── harness_tests.rs      ( 1216)  # harness behavior tests (retry ladder / result.json / NDJSON; moved here with harness from the kernel's agent_tests.rs)
 ├── tui.rs                (   20)  # TUI module root (feature tui): mod declarations + public exports (run / transcript_rows)
 └── tui/  # TUI submodules (same tui gate): split from the original 8.7k-line single file by concern

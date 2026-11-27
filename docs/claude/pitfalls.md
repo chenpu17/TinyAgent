@@ -216,7 +216,11 @@
   （如 leftover 清理检查）都会被同进程并发跑的另一个 batch 测试的在飞沙箱干扰（外审第四轮
   实遇：并行首跑挂、串行复跑绿）——任务名带测试专属前缀（如 `isocleana`）再断言；**scratch 根
   目录同理**——两个 cancel 测试曾共用 `ta-batch-cancel-<pid>` 根互相清/写对方 results 而双双
-  假红（2026-09 外审期间实遇），每个测试用独立根名。
+  假红（2026-09 外审期间实遇），每个测试用独立根名。**harness 的 `write_result` 测试 2026-11
+  中了同一招**：两个测试共用 `ta-res-fp-<pid>`，一方收尾 `remove_dir_all` 恰好撞上另一方
+  `atomic_write` 里的 `create_dir_all`（mkdir 报已存在、复核 `is_dir` 时目录已被删）→ 偶发
+  `File exists (os error 17)` 假红。**只按 pid 键的临时目录名一律再带 `line!()`**（同文件
+  `ta-attrib-…` 的写法）；并行测试偶发红先查共享目录名，别只重跑一遍变绿就算了。
 - **批量 Ctrl-C 是 worker gate，不中断在跑任务**：`batch::run` 的 worker 在**起任务前**检查共享
   cancel 标志，命中则标 `cancelled` 跳过（首个命中的 worker 打一次性契约警告）；在跑的任务照常跑完
   （"收敛"）。**例外（A5，既定取舍）**：每个 agent 都用 `set_shutdown` 挂了同一个 flag 的 reaper——首次
