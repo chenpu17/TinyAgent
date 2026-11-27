@@ -346,6 +346,13 @@
   带默认实现的新增方法（不破坏，仅供同批查阅）：`Hooks::on_before_compact`、`Tool::annotations`。
   对外产物只加可选键（result.json / NDJSON / 配置文件；`RESULT_SCHEMA_VERSION` 不变）。两个绑定的
   `Usage` / `RunOutcome` 字典多出可选键 `reasoning_tokens`（未上报不出键），`wrapper.d.ts` 同步。
+- **`RunError.usage` 的类型改为 `Box<Usage>`（2026-11-27，CI 修复伴生）**：`Usage` 加 `reasoning_tokens`
+  之后 `RunError` 恰好 128 字节，正卡在 clippy `result_large_err` 的红线上——CI 的 clippy 1.100 对每个返回
+  `Result<_, RunError>` 的签名**和**转发它的闭包（测试里的 `thread::scope` / `catch_unwind`、Python 绑定的
+  `allow_threads`）都报错。把用量字段装箱降到 96 字节，并加编译期断言钉住（回到 128 即编译失败，任何工具链
+  都拦得住），原先的逐函数 allow 全部删除。**读侧源码兼容**：`e.usage.input_tokens` 照常写（经 `Deref`）；
+  只有**字面构造 `RunError { usage, … }`** 的库消费方（罕见——它由 run 返回）要把值包成 `Box::new`，按值
+  搬走 `usage` 的地方写 `*e.usage`。JSON / 绑定面不变。
 
 ### Fixed
 

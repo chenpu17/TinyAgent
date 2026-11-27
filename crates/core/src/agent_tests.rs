@@ -2632,7 +2632,7 @@ impl Tool for NestedTaskTool {
                 // chats into the inherited counter).
                 let mut out = ToolOutput::error(format!("nested {label} failed: {re:#}"));
                 if re.usage.total() > 0 {
-                    out.usage = Some(re.usage);
+                    out.usage = Some(*re.usage);
                     out.usage_in_shared_budget = true;
                 }
                 Ok(out)
@@ -4820,7 +4820,7 @@ fn api_status_error_retry_taxonomy() {
                 format!("X API error {status}: nope"),
             )
             .into(),
-            usage: Usage::default(),
+            usage: Box::new(Usage::default()),
             tool_calls: vec![],
             compressions: vec![],
             turns: 1,
@@ -4843,7 +4843,7 @@ fn api_status_error_retry_taxonomy() {
     let wrapped = RunError {
         // anyhow::Error's inherent .context — no trait import needed.
         source: api_err.context("request to API failed"),
-        usage: Usage::default(),
+        usage: Box::new(Usage::default()),
         tool_calls: vec![],
         compressions: vec![],
         turns: 1,
@@ -4856,7 +4856,7 @@ fn api_status_error_retry_taxonomy() {
     // the pre-taxonomy retryable default.
     let plain = RunError {
         source: anyhow::anyhow!("connection reset by peer"),
-        usage: Usage::default(),
+        usage: Box::new(Usage::default()),
         tool_calls: vec![],
         compressions: vec![],
         turns: 1,
@@ -4882,7 +4882,7 @@ fn is_transient_treats_408_request_timeout_and_425_too_early_as_retryable() {
                 format!("X API error {status}: retry me"),
             )
             .into(),
-            usage: Usage::default(),
+            usage: Box::new(Usage::default()),
             tool_calls: vec![],
             compressions: vec![],
             turns: 1,
@@ -12049,7 +12049,7 @@ fn run_cost_folds_failed_attempt_arbitrations_and_gateway_fixes() {
     let mut acc = RunCost::default();
     let e1 = RunError {
         source: anyhow::anyhow!("boom"),
-        usage: Usage::default(),
+        usage: Box::new(Usage::default()),
         tool_calls: vec![],
         compressions: vec![],
         turns: 1,
@@ -12070,7 +12070,7 @@ fn run_cost_folds_failed_attempt_arbitrations_and_gateway_fixes() {
     assert_eq!(v["gateway_fixes"]["no_stream_options"], true);
     let clean = RunError {
         source: anyhow::anyhow!("boom"),
-        usage: Usage::default(),
+        usage: Box::new(Usage::default()),
         tool_calls: vec![],
         compressions: vec![],
         turns: 1,
@@ -13045,10 +13045,10 @@ fn reasoning_tokens_reach_the_bill_through_every_fold() {
     // … and saturating, like every other fold.
     let full = RunError {
         source: anyhow::anyhow!("boom"),
-        usage: Usage {
+        usage: Box::new(Usage {
             reasoning_tokens: u64::MAX,
             ..Usage::default()
-        },
+        }),
         tool_calls: vec![],
         compressions: vec![],
         turns: 1,

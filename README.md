@@ -1843,7 +1843,7 @@ crates/core/src/  # kernel crate (package tiny-agent-core, lib name tiny_agent):
 │   ├── sse_review_pins.rs    (  245)  # SSE parser review pins (chunk-boundary invariance across 17 stream shapes, sync vs worker path)
 │   ├── anthropic.rs          ( 1937)  # Anthropic native (message_start/message_delta usage)
 │   └── mock.rs               (  437)  # scripted Provider for tests (cfg(any(test, feature="mock")))
-├── agent.rs              ( 5429)  # core loop + usage accounting + cancel + context compression (preflight/overflow dual trigger + rolling chunked summaries) + adjacent-message normalization + same-turn multi-task parallelism
+├── agent.rs              ( 5442)  # core loop + usage accounting + cancel + context compression (preflight/overflow dual trigger + rolling chunked summaries) + adjacent-message normalization + same-turn multi-task parallelism
 ├── agent_tests.rs        (15042)  # core-loop regression tests (scripted provider::mock, no network)
 ├── usage_probe.rs        (   97)  # thread-local usage side channel for parallel workers: recovers billed usage after a panic unwind at the join point (keeps result.json and the shared counter from diverging)
 ├── compress.rs           ( 1480)  # compression engine (find_safe_cut / chunked summaries / saturating usage merge + block-level billing primitives)

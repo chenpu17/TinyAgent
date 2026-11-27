@@ -374,7 +374,7 @@ fn run_subagent(
             // covers cache read/creation too — a child whose only cost was a
             // prompt-cache hit (input/output zero) must still be billed.
             if re.usage.total() > 0 {
-                out.usage = Some(re.usage);
+                out.usage = Some(*re.usage);
                 // Same as the success path: the child billed its own chats
                 // into the inherited counter before erroring.
                 out.usage_in_shared_budget = true;
@@ -956,7 +956,7 @@ mod tests {
         let mut acc = crate::agent::RunCost::default();
         acc.add_failed(&crate::agent::RunError {
             source: anyhow::anyhow!("unused"),
-            usage: u,
+            usage: Box::new(u),
             tool_calls: vec![],
             compressions: vec![],
             turns: 0,

@@ -843,20 +843,26 @@ pub struct RunOutcome {
 /// `Display`/`Debug` delegate to `source`, so existing `{e}` / `{e:#}`
 /// formatting at call sites is unchanged.
 ///
-/// SIZE: 128 bytes — exactly at clippy's `result_large_err` threshold since
-/// [`Usage`] gained `reasoning_tokens`. It is returned by value ONCE per
-/// failed run, on the coldest path there is, so the four functions returning
-/// it carry an explicit `allow` instead of trading a public field's type for
-/// a few bytes (every field here is read by the retry ladders and both
-/// bindings; boxing one would move a deref into each of them for nothing
-/// measurable).
+/// SIZE: 96 bytes, held under clippy's 128-byte `result_large_err` line by
+/// the `const` assertion right below (it is 128 unboxed: exactly on the line
+/// since [`Usage`] gained `reasoning_tokens`). Staying under it is deliberate.
+/// The lint fires on every signature that returns `Result<_, RunError>` (the
+/// four functions here) AND on every closure that forwards one of their
+/// results: `thread::scope` spawns and `catch_unwind` in the tests, the
+/// Python binding's `allow_threads`. Suppressing per site is a list that only
+/// ever grows, and its closure half is invisible on toolchains older than
+/// CI's (1.93 linted the functions alone, 1.100 added the closures), so it
+/// could only ever be discovered by a red CI. [`Self::usage`] is the boxed
+/// field: reads deref through it (`e.usage.input_tokens` is unchanged), only
+/// the struct literals that build one wrap the value in `Box::new`.
 pub struct RunError {
     /// The underlying failure. `Display`/`Debug` delegate here, so existing
     /// formatting is unchanged; the cost fields below are the extra payload a
     /// retry loop needs.
     pub source: anyhow::Error,
-    /// Tokens burned by chat requests in this run before it errored.
-    pub usage: Usage,
+    /// Tokens burned by chat requests in this run before it errored. Boxed for
+    /// the size note on the struct only: one allocation on a failed run.
+    pub usage: Box<Usage>,
     /// Tool calls executed in this run before it errored.
     pub tool_calls: Vec<ToolCallRecord>,
     /// Compressions completed in this run before it errored — same honest
@@ -884,6 +890,15 @@ pub struct RunError {
     /// Compute time elapsed before the error.
     pub elapsed: Duration,
 }
+
+// See the size note on `RunError`: at >= 128 bytes `result_large_err` turns
+// red on every signature AND closure forwarding a `Result<_, RunError>`. The
+// local gate must catch that on any toolchain, not only on CI's newer one —
+// so a field that pushes the struct back onto the line fails to compile here.
+const _: () = assert!(
+    std::mem::size_of::<RunError>() < 128,
+    "RunError reached clippy's 128-byte result_large_err line: box a field"
+);
 
 /// `serde` `skip_serializing_if` predicate for the sparse numeric fields of
 /// [`RunOutcome`] (`arbitrations_used`, `reasoning_tokens`): a zero field
@@ -2267,7 +2282,7 @@ impl Agent {
     ) -> RunError {
         RunError {
             source,
-            usage: self.usage,
+            usage: Box::new(self.usage),
             tool_calls: records.to_vec(),
             compressions: compressions.to_vec(),
             turns,
@@ -2389,7 +2404,6 @@ impl Agent {
     /// is TERMINAL for the ladder (`EXIT_CANCELLED`, see
     /// the CLI crate's `harness::run_with_retries`) — clearing it there would revive a run
     /// the user already vetoed.
-    #[allow(clippy::result_large_err)] // see the size note on `RunError`
     pub fn run(&mut self, events: &mut dyn FnMut(AgentEvent)) -> Result<RunOutcome, RunError> {
         self.run_impl(events, /* top_level */ true)
     }
@@ -2408,7 +2422,6 @@ impl Agent {
     /// would race every sibling. The child is freshly built per call, so it
     /// has no stale cancel of its own; any `true` it observes on the shared
     /// flag is a real cancel it must honour.
-    #[allow(clippy::result_large_err)] // see the size note on `RunError`
     pub(crate) fn run_as_subagent(
         &mut self,
         events: &mut dyn FnMut(AgentEvent),
@@ -2517,7 +2530,6 @@ impl Agent {
     /// the one shape the R1 contract forbids). Moving the emission out of the
     /// loop body preserves its exact historical semantics: only on Ok (error
     /// paths emit no `Done`), last event of a successful run.
-    #[allow(clippy::result_large_err)] // see the size note on `RunError`
     fn run_impl(
         &mut self,
         events: &mut dyn FnMut(AgentEvent),
@@ -2533,7 +2545,6 @@ impl Agent {
         result
     }
 
-    #[allow(clippy::result_large_err)] // see the size note on `RunError`
     fn run_loop(
         &mut self,
         events: &mut dyn FnMut(AgentEvent),
@@ -5192,8 +5203,10 @@ impl Agent {
                     // carrying that run's usage; for everyone else it
                     // reads None and `spent` (this call's own
                     // accumulation) stands alone.
-                    let burned =
-                        compress::merge_usage(spent, e.downcast_ref::<RunError>().map(|r| r.usage));
+                    let burned = compress::merge_usage(
+                        spent,
+                        e.downcast_ref::<RunError>().map(|r| *r.usage),
+                    );
                     return Err(CompressError { source: e, burned });
                 }
             }

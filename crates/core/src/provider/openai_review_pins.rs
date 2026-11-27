@@ -94,7 +94,7 @@ fn client() -> reqwest::blocking::Client {
 fn run_error_of(e: anyhow::Error) -> RunError {
     RunError {
         source: e,
-        usage: Usage::default(),
+        usage: Box::new(Usage::default()),
         tool_calls: vec![],
         compressions: vec![],
         turns: 0,
