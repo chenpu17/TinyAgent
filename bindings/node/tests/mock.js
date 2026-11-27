@@ -12,9 +12,11 @@ function sseBytes(chunks, done = true) {
   return Buffer.from(out);
 }
 
-/** A streaming tool_call: name first, then arguments, then finish=tool_calls. */
-function toolCallSse(id, name, args) {
-  return sseBytes([
+/** A streaming tool_call: name first, then arguments, then finish=tool_calls.
+ *  An optional `usage` frame rides the finish chunk (OpenAI-compatible style,
+ *  same as textSse), so tool-call turns can bill honestly. */
+function toolCallSse(id, name, args, usage = null) {
+  const chunks = [
     { choices: [{ index: 0, finish_reason: null, delta: {
       role: 'assistant',
       tool_calls: [{ index: 0, id, type: 'function', function: { name, arguments: '' } }],
@@ -23,7 +25,9 @@ function toolCallSse(id, name, args) {
       tool_calls: [{ index: 0, function: { arguments: JSON.stringify(args) } }],
     } }] },
     { choices: [{ index: 0, finish_reason: 'tool_calls', delta: {} }] },
-  ]);
+  ];
+  if (usage) chunks[2].usage = usage;
+  return sseBytes(chunks);
 }
 
 /** A final text answer, optionally carrying a usage frame on the finish chunk. */

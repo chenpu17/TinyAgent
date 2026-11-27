@@ -22,6 +22,10 @@ use super::*;
 /// the guest value is `GUEST_OUTPUT_CHARS` (contract.rs).
 pub(super) fn guest_ctx(ctx: &ToolCtx) -> ToolCtx {
     ToolCtx {
+        tool_annotations: std::sync::Arc::new(std::collections::BTreeMap::new()),
+        // Inherited verbatim: a guest's `tools.call("shell", …)` spawns
+        // through the same shell tool, so it must strip the same variables.
+        hidden_env: ctx.hidden_env.clone(),
         tool_absent_notes: ctx.tool_absent_notes.clone(),
         workdir: ctx.workdir.clone(),
         max_output_chars: GUEST_OUTPUT_CHARS,
@@ -1092,5 +1096,20 @@ mod tests {
             out2.content
         );
         assert_eq!(out2.meta.as_ref().unwrap()["call_count"], 1);
+    }
+
+    /// Credential hygiene (kernel plan 2.5): the guest ctx carries the outer
+    /// call's hidden-env set verbatim — a guest's `tools.call("shell", …)`
+    /// spawns through the same shell tool and must strip the same variables.
+    #[test]
+    fn guest_ctx_inherits_the_hidden_env_set() {
+        let mut outer = ctx(&scratch());
+        outer.hidden_env = vec!["TA_GUEST_KEY".into()];
+        let guest = guest_ctx(&outer);
+        assert_eq!(
+            guest.hidden_env,
+            vec!["TA_GUEST_KEY".to_string()],
+            "the guest must hide what the outer call hides"
+        );
     }
 }

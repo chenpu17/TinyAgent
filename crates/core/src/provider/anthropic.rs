@@ -15,6 +15,9 @@ pub struct Anthropic {
     base_url: String,
     api_key: String,
     idle: std::time::Duration,
+    /// `Config.extra_body` / `Config.extra_headers`, applied to every
+    /// request (see the `with_extra_*` builders).
+    extras: super::RequestExtras,
 }
 
 impl Anthropic {
@@ -32,10 +35,47 @@ impl Anthropic {
             base_url,
             api_key: api_key.to_string(),
             idle,
+            extras: super::RequestExtras::default(),
         }
     }
 
-    fn message_json(m: &Message) -> Value {
+    /// Extra top-level request-body fields for every request
+    /// (`Config.extra_body`, wired by `provider::build`). Replaces any set
+    /// earlier. Ignored unless it is a JSON object; a field the kernel
+    /// already writes (`model`, `messages`, …) is never overridden.
+    pub fn with_extra_body(mut self, extra_body: Value) -> Self {
+        {
+            self.extras.set_body(extra_body);
+            self
+        }
+    }
+
+    /// Extra request headers for every request (`Config.extra_headers`,
+    /// wired by `provider::build`). Replaces any set earlier. Dropped here:
+    /// a header the kernel manages (authentication, content type, protocol
+    /// version) and anything that is not a valid header — the config
+    /// validation already rejects both with the entry blamed, this is the
+    /// guard for a provider built by hand.
+    pub fn with_extra_headers(mut self, extra_headers: crate::config::ExtraHeaders) -> Self {
+        {
+            self.extras.set_headers(&extra_headers);
+            self
+        }
+    }
+
+    /// Both extras as parsed from a config — `provider::build`'s entry.
+    pub(crate) fn with_request_extras(mut self, extras: super::RequestExtras) -> Self {
+        {
+            self.extras = extras;
+            self
+        }
+    }
+
+    /// Map one message to the wire shape. `echo_reasoning` false (thinking
+    /// disabled for this request, or the default when called directly) sends
+    /// the blocks alone; true splices the message's carried reasoning blocks
+    /// back where they appeared — see [`Anthropic::content_with_reasoning`].
+    fn message_json(m: &Message, echo_reasoning: bool) -> Value {
         let role = match m.role {
             Role::User => "user",
             Role::Assistant => "assistant",
@@ -98,7 +138,76 @@ impl Anthropic {
                 }
             })
             .collect();
+        let content = if echo_reasoning && m.role == Role::Assistant {
+            Self::content_with_reasoning(m, content)
+        } else {
+            content
+        };
         json!({"role": role, "content": content})
+    }
+
+    /// Splice a message's carried reasoning (`Message::reasoning`) into its
+    /// wire content, each block at the position it had when the model emitted
+    /// it (`ReasoningBlock::before`). Reasoning carry, Anthropic side
+    /// (`Config.preserved_reasoning`): the Messages API wants a thinking
+    /// block sent back verbatim, signature included, for the model to keep
+    /// its reasoning across a tool-use loop.
+    ///
+    /// - Only this family's state (`Message::reasoning_for`): a session
+    ///   written by the other provider carries nothing we know how to send.
+    /// - A block the state can't rebuild faithfully is skipped, not guessed:
+    ///   a thinking block needs its `signature` (the API rejects an unsigned
+    ///   one — an unsigned capture was already dropped at parse time, this
+    ///   guards hand-edited state), a redacted block its `data`.
+    /// - `before` is clamped to the current content: the agent may have
+    ///   removed blocks from the message after capture (a truncated
+    ///   tool_use), and positions then shift down with them.
+    /// - Order is preserved: reasoning blocks that shared a position keep
+    ///   emission order and precede the content block that came after.
+    fn content_with_reasoning(m: &Message, content: Vec<Value>) -> Vec<Value> {
+        let Some(r) = m.reasoning_for(super::REASONING_ANTHROPIC) else {
+            return content;
+        };
+        let blocks: Vec<(usize, Value)> = r
+            .blocks
+            .iter()
+            .filter_map(|b| {
+                let v = match b.opaque.get("signature") {
+                    Some(sig) if sig.is_string() => json!({
+                        "type": "thinking", "thinking": b.text, "signature": sig
+                    }),
+                    _ => match b.opaque.get("data") {
+                        Some(data) if data.is_string() => json!({
+                            "type": "redacted_thinking", "data": data
+                        }),
+                        _ => return None,
+                    },
+                };
+                Some((b.before.min(content.len()), v))
+            })
+            .collect();
+        if blocks.is_empty() {
+            return content;
+        }
+        let mut merged = Vec::with_capacity(content.len().saturating_add(blocks.len()));
+        let mut rest = blocks.into_iter().peekable();
+        for (i, c) in content.into_iter().enumerate() {
+            while rest.peek().is_some_and(|(at, _)| *at <= i) {
+                merged.push(rest.next().map(|(_, v)| v).unwrap_or(Value::Null));
+            }
+            merged.push(c);
+        }
+        merged.extend(rest.map(|(_, v)| v));
+        merged
+    }
+
+    /// Whether this request wants reasoning echoed: anything but an explicit
+    /// "disable thinking" (`reasoning_effort: "none"` → `thinking: {type:
+    /// disabled}`). Thinking blocks belong to requests that have thinking
+    /// on — a session that switched effort mid-conversation sends the blocks
+    /// alone from then on.
+    fn echo_reasoning(req: &ChatRequest) -> bool {
+        req.reasoning_effort != Some("none")
     }
 
     fn tools_json(tools: &[ToolDef]) -> Value {
@@ -124,9 +233,64 @@ enum Pending {
         name: String,
         json: String,
     },
-    /// A `thinking` content block. Buffered only to coalesce its deltas into
-    /// ThinkingDelta events; finalize drops it (thinking never enters history).
-    Thinking(String),
+    /// A `thinking` / `redacted_thinking` content block. Its text still goes
+    /// out only as ThinkingDelta events — it never becomes a history block —
+    /// but the buffer is no longer discard-only: reasoning carry
+    /// (`Config.preserved_reasoning`) needs the block's replayable parts
+    /// (see [`ThinkingBuf`]), which finalize files into the response's
+    /// `reasoning` side field instead of `blocks`.
+    Thinking(ThinkingBuf),
+}
+
+/// The replayable state of one streaming thinking block. What the Messages
+/// API wants back verbatim is exactly this: the text plus its signature
+/// (`thinking`), or the opaque payload (`redacted_thinking`, which carries
+/// no readable text at all).
+struct ThinkingBuf {
+    /// `thinking_delta` text. Empty for a redacted block.
+    text: String,
+    /// `signature_delta` fragments, concatenated. The signature attests to
+    /// the text; the API checks it on the way back in, and an unsigned block
+    /// cannot be replayed — one that never got a signature (stream cut
+    /// inside the block, a gateway that drops the deltas) is dropped.
+    signature: String,
+    /// `redacted_thinking`'s `data`, handed over whole at content_block_start.
+    redacted: Option<String>,
+}
+
+impl ThinkingBuf {
+    fn thinking() -> Self {
+        Self {
+            text: String::new(),
+            signature: String::new(),
+            redacted: None,
+        }
+    }
+
+    fn redacted(data: &Value) -> Self {
+        Self {
+            text: String::new(),
+            signature: String::new(),
+            redacted: data.as_str().map(str::to_string),
+        }
+    }
+
+    /// The replayable form of this block, or `None` when there is none (an
+    /// unsigned thinking block; a redacted block without data).
+    fn into_reasoning_block(self, before: usize) -> Option<super::ReasoningBlock> {
+        if let Some(data) = self.redacted {
+            return Some(super::ReasoningBlock {
+                before,
+                text: String::new(),
+                opaque: json!({ "data": data }),
+            });
+        }
+        (!self.signature.is_empty()).then(|| super::ReasoningBlock {
+            before,
+            text: self.text,
+            opaque: json!({ "signature": self.signature }),
+        })
+    }
 }
 
 /// Finalize a pending block into a concrete Block, tolerant of incomplete
@@ -136,7 +300,16 @@ enum Pending {
 /// surfaces as a stream_truncated stop_reason, and a model's malformed JSON
 /// on a COMPLETE stream reaches the tool layer (which reports the bad input
 /// back to the model) instead of killing the whole run.
-fn finalize_pending_lenient(p: Pending) -> Option<Block> {
+///
+/// A thinking block yields no Block — its deltas already went out as
+/// ThinkingDelta and it never enters history — but its replayable state, if
+/// any, is filed into `reasoning` at `before`, the number of blocks finalized
+/// ahead of it (the caller's `blocks.len()`), so an echo can put it back.
+fn finalize_pending_lenient(
+    p: Pending,
+    before: usize,
+    reasoning: &mut Vec<super::ReasoningBlock>,
+) -> Option<Block> {
     match p {
         // Skip an empty text block: a content_block_start with no later delta
         // (stream cut right after the block opened) would otherwise solidify a
@@ -153,10 +326,12 @@ fn finalize_pending_lenient(p: Pending) -> Option<Block> {
             };
             Some(Block::ToolUse { id, name, input })
         }
-        // Thinking is event-only: its deltas already went out as ThinkingDelta.
-        // It never solidifies into a history block (no major API asks thinking
-        // to be echoed back on the next turn).
-        Pending::Thinking(_) => None,
+        // Thinking stays out of `blocks` for good (display-only channel);
+        // only its opaque replay state is kept, on the side.
+        Pending::Thinking(buf) => {
+            reasoning.extend(buf.into_reasoning_block(before));
+            None
+        }
     }
 }
 
@@ -172,13 +347,16 @@ impl Provider for Anthropic {
         if req.cancel.load(std::sync::atomic::Ordering::Relaxed) {
             anyhow::bail!("request cancelled before sending to the Anthropic API");
         }
-        let body = Self::build_body(req);
-        let mut rb = self
+        let mut body = Self::build_body(req);
+        // Config extras last, and never over a kernel-written field.
+        self.extras.merge_body(&mut body);
+        let rb = self
             .client
             .post(format!("{}/v1/messages", self.base_url))
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json");
+        let mut rb = self.extras.apply_headers(rb);
         if let Some(t) = req.per_request_timeout {
             rb = rb.timeout(t);
         }
@@ -194,11 +372,11 @@ impl Provider for Anthropic {
             // buffered whole.
             let text = super::capped_err_body(&mut resp);
             // Structured status + historical display text (see ApiStatusError).
-            return Err(super::ApiStatusError::new(
-                status.as_u16(),
-                format!("Anthropic API error {status}: {text}"),
-            )
-            .into());
+            let mut msg = format!("Anthropic API error {status}: {text}");
+            if status == reqwest::StatusCode::BAD_REQUEST {
+                msg.push_str(Self::missing_reasoning_hint(req, &text));
+            }
+            return Err(super::ApiStatusError::new(status.as_u16(), msg).into());
         }
 
         let mut sse = CancellableSse::new(resp, req.cancel.clone(), self.idle)?;
@@ -207,6 +385,31 @@ impl Provider for Anthropic {
 }
 
 impl Anthropic {
+    /// The hint for the one 400 about reasoning no request edit can repair
+    /// here: with thinking enabled, the Messages API requires the last
+    /// assistant message of a tool loop to start with its (signed) thinking
+    /// block. Fires only when the 400 reads like that requirement AND this
+    /// request carried no thinking block at all — i.e. the carry switch was
+    /// off. A request that did echo its blocks and still got the 400 has a
+    /// different problem (the blocks are all the API gave), so it gets the
+    /// plain text instead of a misleading pointer.
+    fn missing_reasoning_hint(req: &ChatRequest, text: &str) -> &'static str {
+        let names_block = text.contains("thinking")
+            && (text.contains("tool_use") || text.contains("redacted_thinking"));
+        if !names_block {
+            return "";
+        }
+        let echoed = Self::echo_reasoning(req)
+            && req
+                .messages
+                .iter()
+                .any(|m| m.reasoning_for(super::REASONING_ANTHROPIC).is_some());
+        if echoed {
+            ""
+        } else {
+            super::REASONING_CARRY_HINT
+        }
+    }
     /// Assemble the `/v1/messages` request body. Pure (no `&self`, no I/O) so
     /// the prompt-cache gating is directly unit-testable (see
     /// `tests::build_body_*`). Prompt caching marks up to three ephemeral
@@ -223,7 +426,11 @@ impl Anthropic {
             "model": req.model,
             "max_tokens": req.max_tokens,
             "stream": true,
-            "messages": req.messages.iter().map(Self::message_json).collect::<Vec<_>>(),
+            "messages": req
+                .messages
+                .iter()
+                .map(|m| Self::message_json(m, Self::echo_reasoning(req)))
+                .collect::<Vec<_>>(),
         });
         // Adaptive thinking (Claude 4.6+). The effort string is forwarded
         // verbatim — NOT mapped to an enum, since Anthropic's own ladder
@@ -323,6 +530,10 @@ impl Anthropic {
         // usage=None, not Some(all-zeros) — downstream accounting keys on
         // Some/None to tell "0 tokens" from "usage unknown".
         let mut saw_usage = false;
+        // Reasoning carry: the replayable state of every thinking block
+        // finalized in this response, in emission order. The agent decides
+        // whether to keep it (`Config.preserved_reasoning`).
+        let mut reasoning: Vec<super::ReasoningBlock> = Vec::new();
 
         loop {
             let data = match src.next_payload() {
@@ -349,6 +560,7 @@ impl Anthropic {
                         "[stream error] Anthropic stream read error: {msg}"
                     )));
                     return Ok(ChatResponse {
+                        reasoning: super::into_reasoning(super::REASONING_ANTHROPIC, reasoning),
                         blocks,
                         stop_reason: "stream_error".into(),
                         usage: saw_usage.then_some(usage),
@@ -380,7 +592,7 @@ impl Anthropic {
                     // (truncated stream) would be overwritten here — flush it
                     // leniently (its tool JSON may be half-delivered).
                     if let Some(p) = pending.take() {
-                        if let Some(b) = finalize_pending_lenient(p) {
+                        if let Some(b) = finalize_pending_lenient(p, blocks.len(), &mut reasoning) {
                             blocks.push(b);
                         }
                     }
@@ -404,11 +616,16 @@ impl Anthropic {
                         },
                         // Extended-thinking blocks. `thinking` streams its text
                         // via later thinking_delta events (surfaced as
-                        // ThinkingDelta); `redacted_thinking` carries no readable
-                        // text (only a signature), so it stays a silent
-                        // placeholder. Neither enters history — finalize drops
-                        // Pending::Thinking.
-                        "thinking" | "redacted_thinking" => Pending::Thinking(String::new()),
+                        // ThinkingDelta) and its integrity tag via
+                        // signature_delta; `redacted_thinking` carries no
+                        // readable text, only an opaque `data` payload given
+                        // whole here. Neither ever enters `blocks` — but both
+                        // are kept, in [`ThinkingBuf`], as the replayable
+                        // state the agent may echo back.
+                        "thinking" => Pending::Thinking(ThinkingBuf::thinking()),
+                        "redacted_thinking" => {
+                            Pending::Thinking(ThinkingBuf::redacted(&cb["data"]))
+                        }
                         _ => Pending::Text(String::new()),
                     });
                 }
@@ -446,17 +663,24 @@ impl Anthropic {
                         }
                         // Anthropic extended-thinking streaming: each delta
                         // carries a `thinking` text fragment. Surface it as
-                        // ThinkingDelta (event-only); the buffer is kept solely
-                        // so a later non-thinking delta can't misattach to it.
-                        // `signature_delta` (the thinking block's integrity tag)
-                        // falls through to `_` — we never echo thinking back, so
-                        // the signature is irrelevant to us.
+                        // ThinkingDelta (event-only); the buffer also keeps the
+                        // text for the replayable state.
+                        // `signature_delta` carries the block's integrity tag
+                        // — display-silent, but the one thing an echoed
+                        // thinking block cannot travel without.
                         "thinking_delta" => {
                             if let Some(Pending::Thinking(buf)) = &mut pending {
                                 let t = delta["thinking"].as_str().unwrap_or_default();
                                 if !t.is_empty() {
-                                    buf.push_str(t);
+                                    buf.text.push_str(t);
                                     on_event(ChatEvent::ThinkingDelta(t.to_string()));
+                                }
+                            }
+                        }
+                        "signature_delta" => {
+                            if let Some(Pending::Thinking(buf)) = &mut pending {
+                                if let Some(sig) = delta["signature"].as_str() {
+                                    buf.signature.push_str(sig);
                                 }
                             }
                         }
@@ -471,7 +695,7 @@ impl Anthropic {
                     // matching the OpenAI provider — hard-failing the whole run
                     // on a single model-level JSON slip was needlessly fatal.
                     if let Some(p) = pending.take() {
-                        if let Some(b) = finalize_pending_lenient(p) {
+                        if let Some(b) = finalize_pending_lenient(p, blocks.len(), &mut reasoning) {
                             blocks.push(b);
                         }
                     }
@@ -528,6 +752,7 @@ impl Anthropic {
                         "[stream error] Anthropic stream error: {msg}"
                     )));
                     return Ok(ChatResponse {
+                        reasoning: super::into_reasoning(super::REASONING_ANTHROPIC, reasoning),
                         blocks,
                         stop_reason: "stream_error".into(),
                         usage: saw_usage.then_some(usage),
@@ -554,7 +779,7 @@ impl Anthropic {
         // tool JSON becomes _raw) rather than dropping the block or
         // hard-failing on a parse error.
         if let Some(p) = pending.take() {
-            if let Some(b) = finalize_pending_lenient(p) {
+            if let Some(b) = finalize_pending_lenient(p, blocks.len(), &mut reasoning) {
                 blocks.push(b);
             }
         }
@@ -569,6 +794,7 @@ impl Anthropic {
             "stream_truncated".into()
         };
         Ok(ChatResponse {
+            reasoning: super::into_reasoning(super::REASONING_ANTHROPIC, reasoning),
             blocks,
             stop_reason,
             usage: saw_usage.then_some(usage),
@@ -680,7 +906,9 @@ mod tests {
     fn thinking_block_surfaces_event_and_stays_out_of_history() {
         // Extended thinking: a `thinking` content block streams its text via
         // thinking_delta. The trace surfaces as ThinkingDelta events AND never
-        // enters the assembled blocks (no major API asks thinking echoed back).
+        // enters the assembled `blocks` (it travels in the `reasoning` side
+        // field instead, and only when it is replayable — see the
+        // `signed_thinking_*` / `redacted_thinking_*` tests below).
         let raw = concat!(
             "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5}}}\n\n",
             "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\"}}\n\n",
@@ -702,6 +930,415 @@ mod tests {
         // Only the text block survives into history; thinking is event-only.
         assert_eq!(resp.blocks.len(), 1);
         assert!(matches!(&resp.blocks[0], Block::Text(t) if t == "ok"));
+        // No signature_delta in this stream → nothing replayable to keep
+        // (an unsigned thinking block cannot be echoed).
+        assert!(resp.reasoning.is_none());
+    }
+
+    /// Build a thinking-block SSE stream from (delta-text, delta-signature)
+    /// fragments, followed by one text block. `redacted` swaps the block for
+    /// a `redacted_thinking` one carrying `data`.
+    fn thinking_stream(parts: &[(&str, &str)], redacted: Option<&str>) -> String {
+        let mut raw = String::from(
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5}}}\n\n",
+        );
+        if let Some(data) = redacted {
+            raw.push_str(&format!(
+                "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"redacted_thinking\",\"data\":\"{data}\"}}}}\n\n"
+            ));
+        } else {
+            raw.push_str(
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\"}}\n\n",
+            );
+        }
+        for (text, sig) in parts {
+            if !text.is_empty() {
+                raw.push_str(&format!(
+                    "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"thinking_delta\",\"thinking\":\"{text}\"}}}}\n\n"
+                ));
+            }
+            if !sig.is_empty() {
+                raw.push_str(&format!(
+                    "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"signature_delta\",\"signature\":\"{sig}\"}}}}\n\n"
+                ));
+            }
+        }
+        raw.push_str("data: {\"type\":\"content_block_stop\",\"index\":0}\n\n");
+        raw.push_str(
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        );
+        raw.push_str(
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+        );
+        raw.push_str("data: {\"type\":\"content_block_stop\",\"index\":1}\n\n");
+        raw.push_str(
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n",
+        );
+        raw
+    }
+
+    #[test]
+    fn signed_thinking_is_kept_as_replayable_state() {
+        // thinking → thinking_delta×2 → signature_delta: the text still
+        // streams as ThinkingDelta and stays out of `blocks`, but now the
+        // block is also captured — text + joined signature — in the
+        // response's `reasoning` side field, positioned ahead of the text
+        // block it preceded (`before: 0`).
+        let raw = thinking_stream(&[("let me ", "sig-A=="), ("think", "sig-B==")], None);
+        let mut thinking = String::new();
+        let resp = Anthropic::parse_stream(raw.as_bytes(), &mut |e| {
+            if let crate::provider::ChatEvent::ThinkingDelta(t) = e {
+                thinking.push_str(&t);
+            }
+        })
+        .unwrap();
+        assert_eq!(thinking, "let me think");
+        assert_eq!(resp.blocks.len(), 1);
+        let r = resp.reasoning.expect("signed thinking must be captured");
+        assert_eq!(r.provider, super::super::REASONING_ANTHROPIC);
+        assert_eq!(r.blocks.len(), 1);
+        assert_eq!(r.blocks[0].before, 0);
+        assert_eq!(r.blocks[0].text, "let me think");
+        assert_eq!(r.blocks[0].opaque, json!({"signature": "sig-A==sig-B=="}));
+    }
+
+    #[test]
+    fn unsigned_thinking_is_not_kept() {
+        // Text but no signature (a gateway that drops signature_delta, or a
+        // stream cut inside the block): nothing an echo could send — the API
+        // checks the signature — so the block is not captured at all, while
+        // the display feed and the text block are exactly as before.
+        let raw = thinking_stream(&[("bare thought", "")], None);
+        let mut thinking = String::new();
+        let resp = Anthropic::parse_stream(raw.as_bytes(), &mut |e| {
+            if let crate::provider::ChatEvent::ThinkingDelta(t) = e {
+                thinking.push_str(&t);
+            }
+        })
+        .unwrap();
+        assert_eq!(thinking, "bare thought");
+        assert!(resp.reasoning.is_none());
+        assert_eq!(resp.blocks.len(), 1);
+    }
+
+    #[test]
+    fn redacted_thinking_is_kept_with_its_payload() {
+        // `redacted_thinking` has no readable text — only the opaque `data`
+        // given whole at content_block_start. Nothing to display, but the
+        // payload is exactly what must travel back.
+        let raw = thinking_stream(&[], Some("opaque-blob=="));
+        let mut events = 0;
+        let resp = Anthropic::parse_stream(raw.as_bytes(), &mut |_| events += 1).unwrap();
+        assert_eq!(events, 1, "only the text delta fires an event");
+        let r = resp.reasoning.expect("redacted thinking must be captured");
+        assert_eq!(r.blocks.len(), 1);
+        assert_eq!(r.blocks[0].before, 0);
+        assert!(r.blocks[0].text.is_empty());
+        assert_eq!(r.blocks[0].opaque, json!({"data": "opaque-blob=="}));
+        assert_eq!(resp.blocks.len(), 1);
+    }
+
+    #[test]
+    fn interleaved_thinking_keeps_its_positions() {
+        // thinking, text, thinking: the second thinking block trails one
+        // block, so its `before` is 1 — an echo replays each block where it
+        // appeared (interleaved thinking), not "all thinking first".
+        let raw = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"plan\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"s1\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"thinking\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"more\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"s2\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":2}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+        );
+        let resp = parse(raw.as_bytes());
+        assert_eq!(resp.blocks.len(), 1);
+        let r = resp.reasoning.unwrap();
+        let positions: Vec<(usize, &str)> = r
+            .blocks
+            .iter()
+            .map(|b| (b.before, b.text.as_str()))
+            .collect();
+        assert_eq!(positions, vec![(0, "plan"), (1, "more")]);
+    }
+
+    #[test]
+    fn empty_signed_thinking_between_text_and_tool_use_is_echoed_in_place() {
+        // A shape a real Messages-API endpoint sent in nearly every tool-call
+        // turn (2026-11-26, captured on the wire): a thinking block with no
+        // `thinking_delta` at all — empty text and one `signature_delta` —
+        // sitting after the text block and ahead of the `tool_use`. Empty text
+        // is not "unsigned": the block is kept, and the echo puts it back at
+        // index 1 with the signature byte for byte.
+        let raw = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5}}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Writing it now.\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-empty==\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"shell\",\"input\":{}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"ls\\\"}\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":2}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":12}}\n\n",
+        );
+        let mut thinking = String::new();
+        let resp = Anthropic::parse_stream(raw.as_bytes(), &mut |e| {
+            if let crate::provider::ChatEvent::ThinkingDelta(t) = e {
+                thinking.push_str(&t);
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            thinking, "",
+            "no thinking_delta: nothing on the display feed"
+        );
+        assert_eq!(
+            resp.blocks.len(),
+            2,
+            "text + tool_use; thinking never becomes a block"
+        );
+        let reasoning = resp
+            .reasoning
+            .expect("an empty thinking block with a signature is replayable state");
+        let positions: Vec<(usize, &str)> = reasoning
+            .blocks
+            .iter()
+            .map(|b| (b.before, b.text.as_str()))
+            .collect();
+        assert_eq!(positions, vec![(1, "")]);
+
+        // Echoed exactly where it sat: text, thinking, tool_use.
+        let mut assistant = Message::assistant(resp.blocks);
+        assistant.reasoning = Some(reasoning);
+        let content = Anthropic::message_json(&assistant, true)["content"]
+            .as_array()
+            .cloned()
+            .expect("content is a list");
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(
+            content[1],
+            json!({"type": "thinking", "thinking": "", "signature": "sig-empty=="})
+        );
+        assert_eq!(content[2]["type"], "tool_use");
+        assert_eq!(content[2]["input"], json!({"command": "ls"}));
+    }
+
+    #[test]
+    fn stream_cut_inside_thinking_keeps_only_completed_blocks() {
+        // First thinking block signed and complete; second cut off by a
+        // stream error before any signature. The complete one survives in
+        // the honest-cost partial, the cut one does not.
+        let raw = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"done\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"s1\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"thinking\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"half\"}}\n\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}\n\n",
+        );
+        let resp = parse(raw.as_bytes());
+        assert_eq!(resp.stop_reason, "stream_error");
+        let r = resp.reasoning.unwrap();
+        assert_eq!(r.blocks.len(), 1);
+        assert_eq!(r.blocks[0].text, "done");
+    }
+
+    /// A request whose assistant message carries reasoning state.
+    fn carry_req(effort: Option<&'static str>, provider: &'static str) -> ChatRequest<'static> {
+        let tools: &'static [ToolDef] = Box::leak(
+            vec![ToolDef {
+                name: "shell".into(),
+                description: "run a shell command".into(),
+                schema: json!({"type": "object"}),
+            }]
+            .into_boxed_slice(),
+        );
+        let mut assistant = Message::assistant(vec![Block::Text("working on it".into())]);
+        assistant.reasoning = Some(super::super::Reasoning {
+            provider: provider.into(),
+            blocks: vec![super::super::ReasoningBlock {
+                before: 0,
+                text: "first thought".into(),
+                opaque: json!({"signature": "sig=="}),
+            }],
+        });
+        let msgs: &'static [Message] = Box::leak(
+            vec![Message::user(vec![Block::Text("hello".into())]), assistant].into_boxed_slice(),
+        );
+        ChatRequest {
+            system: Some("you are a helpful agent"),
+            messages: msgs,
+            tools,
+            model: "claude-opus-5-5",
+            max_tokens: 1024,
+            per_request_timeout: None,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cache: false,
+            reasoning_effort: effort,
+            temperature: None,
+        }
+    }
+
+    #[test]
+    fn build_body_echoes_thinking_ahead_of_the_blocks() {
+        // Thinking on: the carried block travels back first in the assistant
+        // content, text and signature verbatim.
+        let body = Anthropic::build_body(&carry_req(Some("low"), "anthropic"));
+        let content = &body["messages"][1]["content"];
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "first thought");
+        assert_eq!(content[0]["signature"], "sig==");
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "working on it");
+        assert_eq!(content.as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn build_body_echoes_redacted_blocks_too() {
+        let req = carry_req(None, "anthropic");
+        let redacted = Message {
+            reasoning: Some(super::super::Reasoning {
+                provider: "anthropic".into(),
+                blocks: vec![super::super::ReasoningBlock {
+                    before: 0,
+                    text: String::new(),
+                    opaque: json!({"data": "blob=="}),
+                }],
+            }),
+            ..req.messages[1].clone()
+        };
+        let v = Anthropic::message_json(&redacted, true);
+        assert_eq!(
+            v["content"][0],
+            json!({"type": "redacted_thinking", "data": "blob=="})
+        );
+        assert_eq!(v["content"][1]["type"], "text");
+    }
+
+    #[test]
+    fn build_body_skips_unreplayable_and_foreign_state() {
+        // No signature, no data → skipped rather than sent malformed; a
+        // foreign provider tag → skipped as well; nothing replayable at all
+        // → the wire shape is exactly the pre-carry one.
+        let req = carry_req(None, "openai");
+        let v = Anthropic::message_json(&req.messages[1], true);
+        assert_eq!(v["content"].as_array().unwrap().len(), 1);
+        assert_eq!(v["content"][0]["type"], "text");
+
+        let unsigned = Message {
+            reasoning: Some(super::super::Reasoning {
+                provider: "anthropic".into(),
+                blocks: vec![super::super::ReasoningBlock {
+                    before: 0,
+                    text: "edited".into(),
+                    opaque: json!({}),
+                }],
+            }),
+            ..req.messages[1].clone()
+        };
+        let v = Anthropic::message_json(&unsigned, true);
+        assert_eq!(v["content"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn build_body_omits_reasoning_when_thinking_is_disabled() {
+        // `reasoning_effort: "none"` → thinking disabled for this request:
+        // the blocks alone travel (a session that switched effort off).
+        let off = Anthropic::build_body(&carry_req(Some("none"), "anthropic"));
+        assert_eq!(off["thinking"]["type"], "disabled");
+        let content = &off["messages"][1]["content"];
+        assert_eq!(content.as_array().unwrap().len(), 1);
+        assert_eq!(content[0]["type"], "text");
+        // Server default (None) is "unknown, probably on" → echoed.
+        let dflt = Anthropic::build_body(&carry_req(None, "anthropic"));
+        assert_eq!(dflt["messages"][1]["content"][0]["type"], "thinking");
+    }
+
+    #[test]
+    fn echo_positions_clamp_after_blocks_were_removed() {
+        // `before` is relative to the blocks at capture time; the agent may
+        // drop a block afterwards (a truncated tool_use), so a now-too-large
+        // position clamps to the end instead of panicking or reordering.
+        let req = carry_req(None, "anthropic");
+        let shifted = Message {
+            reasoning: Some(super::super::Reasoning {
+                provider: "anthropic".into(),
+                blocks: vec![
+                    super::super::ReasoningBlock {
+                        before: 0,
+                        text: "first".into(),
+                        opaque: json!({"signature": "a"}),
+                    },
+                    super::super::ReasoningBlock {
+                        before: 7,
+                        text: "last".into(),
+                        opaque: json!({"signature": "b"}),
+                    },
+                ],
+            }),
+            ..req.messages[1].clone()
+        };
+        let v = Anthropic::message_json(&shifted, true);
+        let content = v["content"].as_array().unwrap();
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0]["thinking"], "first");
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[2]["thinking"], "last");
+    }
+
+    #[test]
+    fn missing_thinking_400_names_the_carry_switch() {
+        // The Messages API's tool-loop rule: with thinking enabled the last
+        // assistant message must start with its thinking block. Carry off →
+        // the request carries none → the 400's text gets the switch named.
+        let text = "messages.1.content.0.type: Expected `thinking` or `redacted_thinking`, but found `tool_use`";
+        let carried = carry_req(Some("high"), "anthropic");
+        let bare: &'static [Message] = Box::leak(
+            vec![
+                carried.messages[0].clone(),
+                Message {
+                    reasoning: None,
+                    ..carried.messages[1].clone()
+                },
+            ]
+            .into_boxed_slice(),
+        );
+        let off = ChatRequest {
+            messages: bare,
+            ..carry_req(Some("high"), "anthropic")
+        };
+        let hint = Anthropic::missing_reasoning_hint(&off, text);
+        assert!(hint.contains("`preserved_reasoning: true`"), "{hint}");
+
+        // The request DID echo its blocks and still drew this 400 → a
+        // different problem (the blocks are all the API gave): no pointer.
+        assert_eq!(Anthropic::missing_reasoning_hint(&carried, text), "");
+
+        // Blocks exist but thinking is disabled for this request, so they are
+        // not echoed — from the API's side the trace is missing all the same.
+        let disabled = carry_req(Some("none"), "anthropic");
+        assert!(Anthropic::missing_reasoning_hint(&disabled, text).contains("preserved_reasoning"));
+
+        // Anything that is not the tool-loop rule keeps its plain text.
+        assert_eq!(
+            Anthropic::missing_reasoning_hint(&off, "max_tokens: must be greater than 0"),
+            ""
+        );
+        assert_eq!(
+            Anthropic::missing_reasoning_hint(&off, "thinking.budget_tokens: invalid"),
+            ""
+        );
+        assert_eq!(Anthropic::missing_reasoning_hint(&off, "overloaded"), "");
     }
 
     #[test]
@@ -1023,13 +1660,13 @@ mod tests {
         };
 
         // image + empty text → [image] only
-        let v = Anthropic::message_json(&mk("", Some(img())));
+        let v = Anthropic::message_json(&mk("", Some(img())), false);
         let blocks = v["content"][0]["content"].as_array().unwrap();
         assert_eq!(blocks.len(), 1, "got: {blocks:?}");
         assert_eq!(blocks[0]["type"], "image");
 
         // no image + empty text → content key omitted entirely
-        let v = Anthropic::message_json(&mk("", None));
+        let v = Anthropic::message_json(&mk("", None), false);
         assert!(
             v["content"][0].get("content").is_none(),
             "content must be omitted, got: {}",
@@ -1037,14 +1674,14 @@ mod tests {
         );
 
         // image + text → [image, text] (unchanged shape)
-        let v = Anthropic::message_json(&mk("ok", Some(img())));
+        let v = Anthropic::message_json(&mk("ok", Some(img())), false);
         let blocks = v["content"][0]["content"].as_array().unwrap();
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[1]["type"], "text");
         assert_eq!(blocks[1]["text"], "ok");
 
         // text only → bare string (unchanged shape)
-        let v = Anthropic::message_json(&mk("plain", None));
+        let v = Anthropic::message_json(&mk("plain", None), false);
         assert_eq!(v["content"][0]["content"], "plain");
     }
 
@@ -1059,7 +1696,7 @@ mod tests {
             },
             Block::Text("summarize this".into()),
         ]);
-        let v = Anthropic::message_json(&m);
+        let v = Anthropic::message_json(&m, false);
         assert_eq!(v["content"][0]["type"], "document");
         assert_eq!(v["content"][0]["source"]["type"], "base64");
         assert_eq!(v["content"][0]["source"]["media_type"], "application/pdf");
@@ -1241,6 +1878,60 @@ mod tests {
         assert!(
             !msg.contains("request to Anthropic API failed"),
             "the guard must fire before any connection attempt: {msg}"
+        );
+    }
+
+    /// `Config.extra_body` / `extra_headers` reach the wire through the one
+    /// production wiring point (`provider::build`): new fields and headers
+    /// ride along on every request, while a kernel-written body field or
+    /// header keeps its value — here from a config that skipped the
+    /// load-time check (built straight from JSON, reserved entries and all).
+    #[test]
+    fn chat_sends_the_config_extras_on_the_wire() {
+        use crate::provider::testhttp;
+        let gw = testhttp::gateway_inspected(|_| testhttp::sse_anthropic("ok"));
+        let cfg: crate::config::Config = serde_json::from_str(&format!(
+            r#"{{"provider":"anthropic","api_key_env":"K","model":"m","base_url":{:?},
+                "extra_body":{{"top_k":5,"model":"smuggled","max_tokens":1,"stream":false}},
+                "extra_headers":{{"anthropic-beta":"flag-1","Authorization":"Bearer evil",
+                                  "X-Tenant":"tenant-7"}}}}"#,
+            gw.url
+        ))
+        .unwrap();
+        let prov = super::super::build(&cfg, "k", reqwest::blocking::Client::new());
+        let req = sample_req(false, None);
+        let resp = prov.chat(&req, &mut |_| {}).unwrap();
+        assert!(
+            matches!(resp.blocks.as_slice(), [Block::Text(t)] if t == "ok"),
+            "{:?}",
+            resp.blocks
+        );
+        let bodies = gw.bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0]["top_k"], 5);
+        assert_eq!(bodies[0]["model"], req.model);
+        assert_eq!(bodies[0]["max_tokens"], req.max_tokens);
+        assert_eq!(
+            bodies[0]["stream"], true,
+            "streaming is the kernel's decision"
+        );
+        let heads = gw.heads.lock().unwrap();
+        let head = &heads[0];
+        for wanted in [
+            "x-api-key: k",
+            "anthropic-version: 2023-06-01",
+            "content-type: application/json",
+            "anthropic-beta: flag-1",
+            "x-tenant: tenant-7",
+        ] {
+            assert!(
+                head.iter().any(|l| l == wanted),
+                "{wanted} missing from {head:?}"
+            );
+        }
+        assert!(
+            !head.iter().any(|l| l.starts_with("authorization:")),
+            "the key header cannot be swapped from the extras: {head:?}"
         );
     }
 }

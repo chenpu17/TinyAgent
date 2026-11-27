@@ -31,8 +31,8 @@
 //! scaling the components may differ from their totals by rounding.
 
 use crate::compress::{
-    block_chars, block_pdf_tokens, char_units, estimate_tokens, image_payload_len, text_units,
-    CHARS_PER_TOKEN,
+    block_chars, block_pdf_tokens, char_units, estimate_tokens, image_payload_len, reasoning_units,
+    text_units, CHARS_PER_TOKEN,
 };
 use crate::provider::{Block, Message, Role, ToolDef};
 use crate::tools::{Tool, ToolOrigin};
@@ -117,6 +117,131 @@ pub struct ToolsBreakdown {
     pub tokens: u64,
 }
 
+/// Advisory line for the ESTIMATED size of the tool table: more than this
+/// many tokens of tool definitions. Every request carries the whole table, so
+/// it is a standing cost no compaction can fold. A rule of thumb taken from
+/// Anthropic's Tool search documentation — an empirical figure, not a
+/// provider limit: crossing it advises, never acts.
+pub const TOOL_DEFS_ADVISORY_TOKENS: u64 = 10_000;
+
+/// Advisory line for the NUMBER of tool definitions (see
+/// [`TOOL_DEFS_ADVISORY_TOKENS`]): more than this many tools. The two lines
+/// are independent — either one alone is worth a notice.
+pub const TOOL_DEFS_ADVISORY_COUNT: usize = 30;
+
+/// Which advisory line(s) a tool table is over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ToolDefsAdvisory {
+    /// Over [`TOOL_DEFS_ADVISORY_TOKENS`] only.
+    Tokens,
+    /// Over [`TOOL_DEFS_ADVISORY_COUNT`] only.
+    Count,
+    /// Over both.
+    Both,
+}
+
+impl ToolsBreakdown {
+    /// Tool definitions across the four origin buckets.
+    pub fn tool_count(&self) -> usize {
+        self.builtin
+            .tools
+            .len()
+            .saturating_add(self.mcp.tools.len())
+            .saturating_add(self.skill.tools.len())
+            .saturating_add(self.custom.tools.len())
+    }
+
+    /// The advisory line(s) this table is over — judged on `tokens` as
+    /// reported (scaled when a calibration is live) and [`Self::tool_count`];
+    /// `None` under both.
+    pub fn advisory(&self) -> Option<ToolDefsAdvisory> {
+        tool_defs_advisory(self.tokens, self.tool_count())
+    }
+}
+
+/// Which advisory line(s) a tool table of `tokens` estimated tokens across
+/// `count` definitions is over. Strictly "more than": a table exactly ON a
+/// line is not over it.
+pub fn tool_defs_advisory(tokens: u64, count: usize) -> Option<ToolDefsAdvisory> {
+    match (
+        tokens > TOOL_DEFS_ADVISORY_TOKENS,
+        count > TOOL_DEFS_ADVISORY_COUNT,
+    ) {
+        (false, false) => None,
+        (true, false) => Some(ToolDefsAdvisory::Tokens),
+        (false, true) => Some(ToolDefsAdvisory::Count),
+        (true, true) => Some(ToolDefsAdvisory::Both),
+    }
+}
+
+/// The advisory as display lines — no tag and no indent, each surface adds
+/// its own. `None` under both lines. ONE text for every surface (the
+/// construction-time diag notice, the TUI's `/context`) so they cannot drift
+/// apart. One statement per line, every line well under 80 columns: the
+/// notice reaches a terminal through the stderr fallback, where a long line
+/// is hard-wrapped by the terminal itself — mid-word, at whatever the width
+/// happens to be.
+pub fn tool_defs_advisory_lines(tokens: u64, count: usize) -> Option<Vec<String>> {
+    let crossed = match tool_defs_advisory(tokens, count)? {
+        ToolDefsAdvisory::Tokens => format!("the advisory line of {TOOL_DEFS_ADVISORY_TOKENS} tokens"),
+        ToolDefsAdvisory::Count => format!("the advisory line of {TOOL_DEFS_ADVISORY_COUNT} tools"),
+        ToolDefsAdvisory::Both => format!(
+            "both advisory lines ({TOOL_DEFS_ADVISORY_TOKENS} tokens, {TOOL_DEFS_ADVISORY_COUNT} tools)"
+        ),
+    };
+    let count_s = if count == 1 {
+        "1 tool".to_owned()
+    } else {
+        format!("{count} tools")
+    };
+    Some(vec![
+        format!("tool definitions ≈ {tokens} tokens across {count_s}."),
+        format!("Over {crossed}."),
+        "Fixed cost on every request; compaction cannot fold it.".to_owned(),
+        "Trim tools / MCP servers, or move rarely used tools into skills.".to_owned(),
+        "Rules of thumb from Anthropic's Tool search docs, on estimates.".to_owned(),
+    ])
+}
+
+/// [`ToolsBreakdown::tokens`] for a table of `tool_units` units behind a
+/// system prompt — exactly the number an uncalibrated `build` reports, at the
+/// cost of one pass over the system prompt instead of another over the table.
+/// The allocator books the system prompt's three segments first (together
+/// exactly `floor(sys / CHARS_PER_TOKEN)`) and then one segment per tool, so
+/// the running floor over the tools telescopes to the difference of two
+/// quotients. Pinned against `build` in the tests.
+pub(crate) fn tool_table_tokens(system: Option<&str>, tool_units: usize) -> u64 {
+    let sys = system.map_or(0, text_units);
+    let after = sys.saturating_add(tool_units) / CHARS_PER_TOKEN;
+    (after - sys / CHARS_PER_TOKEN) as u64
+}
+
+/// The construction-time notice through the diag channel (`[context] …`,
+/// warn level) — once per process per distinct text. A batch run builds one
+/// agent per task from the same table and a long-lived host rebuilds
+/// sessions: the first crossing is the news, the repeats are noise. The
+/// notice is a snapshot of one table; [`ToolsBreakdown::advisory`] stays the
+/// live answer for hosts that need the current one. One statement per line,
+/// continuation lines indented two spaces (a sink that renders messages as
+/// rows receives the same text and adds its own continuation pad).
+pub(crate) fn note_tool_defs_advisory(tokens: u64, count: usize) {
+    let Some(lines) = tool_defs_advisory_lines(tokens, count) else {
+        return;
+    };
+    let text = format!("[context] {}", lines.join("\n  "));
+    static SAID: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<String>>> =
+        std::sync::OnceLock::new();
+    let said = SAID.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()));
+    let fresh = said
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(text.clone());
+    if fresh {
+        crate::diag::diag_warn!("{text}");
+    }
+}
+
 /// Message history aggregated by block kind.
 #[derive(Debug, Clone, Serialize)]
 pub struct MessagesBreakdown {
@@ -127,13 +252,15 @@ pub struct MessagesBreakdown {
     pub by_kind: MessageKinds,
 }
 
-/// Message-history kinds. There is deliberately NO `thinking` bucket:
-/// TinyAgent's thinking is a pure event stream (`ThinkingDelta`) that never
-/// enters history (the `Block` enum has no variant for it), so there is
-/// structurally nothing to count — a permanently-zero field would be a
-/// lying API. If a `Block::Thinking` variant ever lands, the classifier's
-/// exhaustive match fails at compile time and its author places it in
-/// `other` first, promoting it to a named field when warranted.
+/// Message-history kinds. There is no `Block`-level `thinking` bucket:
+/// thinking streams as a pure event feed (`ThinkingDelta`) and the `Block`
+/// enum has no variant for it. What DOES enter history is the provider's
+/// carried reasoning state (`Message::reasoning`, kept only while
+/// `Config.preserved_reasoning` is on) — that has its own `reasoning` bucket
+/// below, and is 0 (like every bucket here) whenever nothing carries it. If a
+/// `Block::Thinking` variant ever lands, the classifier's exhaustive match
+/// fails at compile time and its author places it in `other` first, promoting
+/// it to a named field when warranted.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct MessageKinds {
     /// `Text` blocks inside user messages.
@@ -158,6 +285,10 @@ pub struct MessageKinds {
     /// bodies. `list_skill` does NOT count (a small listing is ordinary
     /// tool traffic).
     pub skill_content: u64,
+    /// Carried provider reasoning state (`Message.reasoning` — thinking text
+    /// plus its opaque signature/redaction payload). It rides on every
+    /// request until its turn ends, so it is context the model pays for.
+    pub reasoning: u64,
     /// Fallback for `Block` variants that don't map to a named bucket. The
     /// classifier matches exhaustively (in-crate `#[non_exhaustive]` doesn't
     /// apply), so a new variant fails that match at compile time and its
@@ -398,6 +529,14 @@ pub(crate) fn build(
                   // destination, not an implicit wildcard.
             }
         }
+        // Carried reasoning rides beside the blocks (a side field, not a
+        // Block) — one segment per message, after its blocks, same running
+        // floor so the sum invariant below still closes.
+        let carried = reasoning_units(m);
+        if carried > 0 {
+            let tok = alloc(carried, &mut acc, &mut prev_q);
+            add(&mut kinds.reasoning, tok, &mut messages_tokens);
+        }
     }
 
     // Invariant: by-kind attribution is a PARTITION of messages.tokens — the
@@ -412,6 +551,7 @@ pub(crate) fn build(
             + kinds.image
             + kinds.document
             + kinds.skill_content
+            + kinds.reasoning
             + kinds.other,
         messages_tokens,
         "by-kind buckets must sum exactly to messages.tokens"
@@ -509,6 +649,7 @@ fn scale_breakdown(bd: &mut ContextBreakdown, scale: f64) {
         &mut k.image,
         &mut k.document,
         &mut k.skill_content,
+        &mut k.reasoning,
         &mut k.other,
     ] {
         *field = scale_u64(*field, scale);
@@ -562,21 +703,32 @@ mod tests {
     }
 
     fn mixed_history() -> Vec<Message> {
+        // The assistant turn also carries reasoning state (text + opaque
+        // signature), so the sum invariant below covers that channel too.
+        let mut assistant = Message::assistant(vec![
+            Block::Text("assistant reply".into()),
+            Block::ToolUse {
+                id: "t1".into(),
+                name: "read_skill".into(),
+                input: json!({"name": "run-code"}),
+            },
+            Block::ToolUse {
+                id: "t2".into(),
+                name: "list_skill".into(),
+                input: json!({}),
+            },
+        ]);
+        assistant.reasoning = Some(crate::provider::Reasoning {
+            provider: "anthropic".into(),
+            blocks: vec![crate::provider::ReasoningBlock {
+                before: 0,
+                text: "thinking it over 想一想".into(),
+                opaque: json!({"signature": "sig=="}),
+            }],
+        });
         vec![
             Message::user(vec![Block::Text("hello world 你好世界".into())]),
-            Message::assistant(vec![
-                Block::Text("assistant reply".into()),
-                Block::ToolUse {
-                    id: "t1".into(),
-                    name: "read_skill".into(),
-                    input: json!({"name": "run-code"}),
-                },
-                Block::ToolUse {
-                    id: "t2".into(),
-                    name: "list_skill".into(),
-                    input: json!({}),
-                },
-            ]),
+            assistant,
             Message::user(vec![
                 Block::ToolResult {
                     tool_use_id: "t1".into(),
@@ -871,6 +1023,82 @@ mod tests {
         assert_eq!(bd.messages.by_kind.tool_result, (400 / 4) as u64);
     }
 
+    /// An assistant message carrying reasoning state — text + opaque vendor
+    /// payload — beside one text block.
+    fn history_with_reasoning() -> Vec<Message> {
+        let mut assistant = Message::assistant(vec![Block::Text("a".repeat(400))]);
+        assistant.reasoning = Some(crate::provider::Reasoning {
+            provider: "anthropic".into(),
+            blocks: vec![
+                crate::provider::ReasoningBlock {
+                    before: 0,
+                    text: "t".repeat(800),
+                    opaque: json!({"signature": "s".repeat(40)}),
+                },
+                crate::provider::ReasoningBlock {
+                    before: 1,
+                    text: String::new(),
+                    opaque: json!({"data": "d".repeat(20)}),
+                },
+            ],
+        });
+        vec![Message::user(vec![Block::Text("q".into())]), assistant]
+    }
+
+    /// Carried reasoning (`Message::reasoning`) is its own bucket — readable
+    /// text and opaque payload both, summed over the blocks — apart from the
+    /// assistant text it rode with, and still inside the partition + sum
+    /// invariants (it rides on every request of its turn, so it is context
+    /// the model pays for).
+    #[test]
+    fn carried_reasoning_gets_its_own_bucket() {
+        let (tools, defs) = mixed_tools();
+        let messages = history_with_reasoning();
+        let bd = build(None, 0, 0, &tools, &defs, &messages, None);
+        // The opaque payloads count as their JSON form (what rides on the
+        // wire): `{"signature":"s"*40}` is 56 chars, `{"data":"d"*20}` is
+        // 31 → 800 + 56 + 31 = 887 units for reasoning, 400 for the
+        // assistant text; the user's "q" is sub-token and lands in the
+        // running floor.
+        let reasoning_units = 800 + 56 + 31;
+        assert_eq!(bd.messages.by_kind.reasoning, (reasoning_units / 4) as u64);
+        assert_eq!(bd.messages.by_kind.assistant_text, (400 / 4) as u64);
+        let k = &bd.messages.by_kind;
+        assert_eq!(
+            k.user_text
+                + k.assistant_text
+                + k.tool_use
+                + k.tool_result
+                + k.image
+                + k.document
+                + k.skill_content
+                + k.reasoning
+                + k.other,
+            bd.messages.tokens,
+            "the bucket is part of the partition, never an extra"
+        );
+        let tool_schema_chars: usize = defs
+            .iter()
+            .map(|t| {
+                crate::compress::tool_schema_units(&t.name, &t.description, &t.schema.to_string())
+            })
+            .sum();
+        assert_eq!(
+            bd.total_tokens,
+            estimate_tokens(&messages, None, tool_schema_chars) as u64
+        );
+        // Strip it and the bucket closes at zero, the rest unchanged — the
+        // shape every history has while the carry switch is off.
+        let mut bare = history_with_reasoning();
+        crate::compress::strip_reasoning(&mut bare);
+        let stripped = build(None, 0, 0, &tools, &defs, &bare, None);
+        assert_eq!(stripped.messages.by_kind.reasoning, 0);
+        assert_eq!(
+            bd.messages.tokens.saturating_sub(stripped.messages.tokens),
+            (reasoning_units / 4) as u64
+        );
+    }
+
     /// A multi-page PDF's page add-on lands in the document bucket on top
     /// of its chars share.
     #[test]
@@ -897,5 +1125,232 @@ mod tests {
         assert_eq!(bd.system.tokens, 0);
         assert_eq!(bd.tools.tokens, 0);
         assert_eq!(bd.messages.tokens, 0);
+        assert_eq!(bd.tools.tool_count(), 0);
+        assert_eq!(bd.tools.advisory(), None);
+    }
+
+    /// `tool_count` sums the four origin buckets; the advisory follows the
+    /// numbers of the breakdown as reported — tokens and count, each line on
+    /// its own, a table exactly ON a line is not over it.
+    #[test]
+    fn tools_breakdown_advisory_follows_the_table() {
+        fn table(n: usize, desc_len: usize, calibration: Option<Calibration>) -> ToolsBreakdown {
+            let tools: Vec<FakeTool> = (0..n)
+                .map(|i| FakeTool {
+                    def: ToolDef {
+                        name: format!("t{i}"),
+                        description: "d".repeat(desc_len),
+                        schema: json!({"type": "object"}),
+                    },
+                    origin: ToolOrigin::Mcp,
+                })
+                .collect();
+            let defs: Vec<ToolDef> = tools.iter().map(|t| t.def()).collect();
+            build(None, 0, 0, &boxed(tools), &defs, &[], calibration).tools
+        }
+        let wide = 4 * TOOL_DEFS_ADVISORY_TOKENS as usize + 64;
+        // Two small tools: under both lines.
+        let small = table(2, 10, None);
+        assert_eq!(small.tool_count(), 2);
+        assert_eq!(small.advisory(), None);
+        // 31 tools under the token line: the count line alone.
+        let many = table(31, 1_200, None);
+        assert_eq!(many.tool_count(), 31);
+        assert!(
+            many.tokens <= TOOL_DEFS_ADVISORY_TOKENS,
+            "fixture drifted: {}",
+            many.tokens
+        );
+        assert_eq!(many.advisory(), Some(ToolDefsAdvisory::Count));
+        // One tool whose description alone crosses the token line.
+        let one = table(1, wide, None);
+        assert_eq!(one.tool_count(), 1);
+        assert!(one.tokens > TOOL_DEFS_ADVISORY_TOKENS);
+        assert_eq!(one.advisory(), Some(ToolDefsAdvisory::Tokens));
+        assert_eq!(
+            table(31, wide, None).advisory(),
+            Some(ToolDefsAdvisory::Both)
+        );
+        // Judged on the numbers AS REPORTED: a live calibration scales the
+        // table's tokens, so a table under the line uncalibrated can cross
+        // it once the anchor says the estimate ran low.
+        let scaled = table(
+            2,
+            1_200,
+            Some(Calibration {
+                measured_prompt_tokens: 90_000,
+                scale: 32.0,
+            }),
+        );
+        assert!(scaled.tokens > TOOL_DEFS_ADVISORY_TOKENS);
+        assert_eq!(scaled.advisory(), Some(ToolDefsAdvisory::Tokens));
+        assert_eq!(scaled.tool_count(), 2, "the count never scales");
+    }
+
+    /// The construction-time notice prints [`tool_table_tokens`]; `/context`
+    /// prints `ToolsBreakdown::tokens`. One number for both — whatever the
+    /// system prompt's and the table's units do to the running floor (the
+    /// table is booked after the system prompt and before the history, so
+    /// neither the split inside the table nor the history can move it).
+    #[test]
+    fn tool_table_tokens_is_the_breakdowns_number() {
+        fn table() -> Vec<FakeTool> {
+            (0..9)
+                .map(|i| FakeTool {
+                    def: ToolDef {
+                        name: format!("t{i}"),
+                        description: "d".repeat(37 * i + 5),
+                        schema: json!({"type": "object", "properties": {"q": {"type": "string"}}}),
+                    },
+                    origin: ToolOrigin::Mcp,
+                })
+                .collect()
+        }
+        let defs: Vec<ToolDef> = table().iter().map(|t| t.def()).collect();
+        let units: usize = defs
+            .iter()
+            .map(|d| {
+                crate::compress::tool_schema_units(&d.name, &d.description, &d.schema.to_string())
+            })
+            .sum();
+        // (system prompt, env header bytes, base bytes)
+        let prompts: [(Option<&str>, usize, usize); 9] = [
+            (None, 0, 0),
+            (Some(""), 0, 0),
+            (Some("abc"), 0, 0),        // remainder 3
+            (Some("abcd"), 0, 0),       // aligned
+            (Some("a"), 0, 0),          // remainder 1
+            (Some("ab"), 0, 0),         // remainder 2
+            (Some("中文"), 0, 0),       // CJK: 18 units
+            (Some("env\n\nbas"), 3, 5), // env / base / intro split
+            (Some(&"x".repeat(1_001)), 0, 0),
+        ];
+        let own = (units / CHARS_PER_TOKEN) as u64;
+        let mut seen = std::collections::BTreeSet::new();
+        for (system, env, base) in prompts {
+            let label = format!(
+                "env {env} base {base} ({} units)",
+                system.map_or(0, text_units)
+            );
+            let empty = build(system, env, base, &boxed(table()), &defs, &[], None);
+            assert_eq!(
+                empty.tools.tokens,
+                tool_table_tokens(system, units),
+                "{label}"
+            );
+            // The history is booked after the table: it cannot move the number.
+            let full = build(
+                system,
+                env,
+                base,
+                &boxed(table()),
+                &defs,
+                &mixed_history(),
+                None,
+            );
+            assert!(full.messages.tokens > 0, "fixture: a non-empty history");
+            assert_eq!(
+                full.tools.tokens, empty.tools.tokens,
+                "{label}: history moved the table's number"
+            );
+            assert_eq!(full.tools.tool_count(), empty.tools.tool_count(), "{label}");
+            seen.insert(tool_table_tokens(system, units));
+        }
+        // The whole point of the helper: the table's own floor is NOT always
+        // the breakdown's number — the system prompt's remainder can hand
+        // the table one more token.
+        assert_eq!(
+            seen.into_iter().collect::<Vec<_>>(),
+            vec![own, own + 1],
+            "fixture drifted: want both the table's own floor and one more"
+        );
+    }
+
+    /// The advisory predicate is strictly "more than", per line: exactly on a
+    /// line is not over it.
+    #[test]
+    fn tool_defs_advisory_is_strict_per_line() {
+        assert_eq!(
+            tool_defs_advisory(TOOL_DEFS_ADVISORY_TOKENS, TOOL_DEFS_ADVISORY_COUNT),
+            None
+        );
+        assert_eq!(tool_defs_advisory(0, 0), None);
+        assert_eq!(
+            tool_defs_advisory(TOOL_DEFS_ADVISORY_TOKENS + 1, TOOL_DEFS_ADVISORY_COUNT),
+            Some(ToolDefsAdvisory::Tokens)
+        );
+        assert_eq!(
+            tool_defs_advisory(TOOL_DEFS_ADVISORY_TOKENS, TOOL_DEFS_ADVISORY_COUNT + 1),
+            Some(ToolDefsAdvisory::Count)
+        );
+        assert_eq!(
+            tool_defs_advisory(u64::MAX, usize::MAX),
+            Some(ToolDefsAdvisory::Both)
+        );
+    }
+
+    /// The display text names the line(s) actually crossed (never the one
+    /// the table is under), says what to do, and labels the thresholds as
+    /// rules of thumb on estimates. Nothing under both lines.
+    #[test]
+    fn tool_defs_advisory_lines_name_the_crossed_lines() {
+        assert_eq!(tool_defs_advisory_lines(1, 1), None);
+        assert_eq!(
+            tool_defs_advisory_lines(TOOL_DEFS_ADVISORY_TOKENS, TOOL_DEFS_ADVISORY_COUNT),
+            None
+        );
+        let count = tool_defs_advisory_lines(40, 31).unwrap();
+        assert_eq!(
+            count[0], "tool definitions ≈ 40 tokens across 31 tools.",
+            "{count:?}"
+        );
+        assert_eq!(count[1], "Over the advisory line of 30 tools.", "{count:?}");
+        assert!(
+            !count[1].contains("tokens,"),
+            "count-only text must not cite the token line: {:?}",
+            count[1]
+        );
+        let tokens = tool_defs_advisory_lines(10_001, 3).unwrap();
+        assert_eq!(tokens[0], "tool definitions ≈ 10001 tokens across 3 tools.");
+        assert_eq!(tokens[1], "Over the advisory line of 10000 tokens.");
+        let both = tool_defs_advisory_lines(10_001, 31).unwrap();
+        assert_eq!(both[0], "tool definitions ≈ 10001 tokens across 31 tools.");
+        assert_eq!(
+            both[1],
+            "Over both advisory lines (10000 tokens, 30 tools)."
+        );
+        // Singular.
+        assert_eq!(
+            tool_defs_advisory_lines(10_001, 1).unwrap()[0],
+            "tool definitions ≈ 10001 tokens across 1 tool."
+        );
+        // Same guidance after the first two lines on every path.
+        assert_eq!(both[2..], count[2..]);
+        assert_eq!(both[2..], tokens[2..]);
+        assert_eq!(
+            both[2..].iter().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "Fixed cost on every request; compaction cannot fold it.",
+                "Trim tools / MCP servers, or move rarely used tools into skills.",
+                "Rules of thumb from Anthropic's Tool search docs, on estimates.",
+            ]
+        );
+        assert_eq!(both.len(), 5);
+        // Each line fits an 80-column terminal under the notice's own
+        // prefix ("[context] " on the first, two spaces on the rest) with a
+        // margin for wider numbers — the stderr fallback is hard-wrapped by
+        // the terminal itself, mid-word, at whatever the width happens to be.
+        for (i, line) in both.iter().enumerate() {
+            let prefix = if i == 0 { "[context] " } else { "  " };
+            assert!(
+                prefix.len() + line.chars().count() <= 78,
+                "{} cols: {prefix}{line}",
+                prefix.len() + line.chars().count()
+            );
+            assert!(
+                !line.ends_with(' '),
+                "no trailing space for a terminal to wrap on: {line:?}"
+            );
+        }
     }
 }

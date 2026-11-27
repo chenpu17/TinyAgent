@@ -3,11 +3,12 @@
 //! can be asserted in-process — no HTTP server, no Python mock.
 //!
 //! Known coverage boundary (review IMP, documented): `MockTurn::Ok` streams
-//! text deltas but never emits `ThinkingDelta` and never passes through the
-//! SSE layer / `ThinkStripper` — so the agent loop's ThinkingDelta mapping is
-//! exercised end-to-end only by the binding/e2e suites (the FR-2 acceptance
-//! pins live at the parse level). Mock tests assert history/ledger invariants,
-//! which are channel-shape-agnostic.
+//! text deltas but has no SSE layer / `ThinkStripper` — `<think>`-tag
+//! splitting and the real providers' reasoning field parsing are exercised
+//! only at the provider parse level and by the binding/e2e suites. It DOES
+//! emit `ThinkingDelta` for a scripted reply's reasoning text (reasoning
+//! carry), so the loop's event mapping runs for that channel too. Mock tests
+//! assert history/ledger invariants, which are channel-shape-agnostic.
 //!
 //! Second boundary (round-3 review R2-07, documented): `ErrAfter`/`OkAfter`
 //! sleep the FULL delay without reading the cancel flag, and there is no
@@ -114,6 +115,24 @@ pub struct Captured {
     /// never sent with `None`, which would let the sse-reader worker thread
     /// linger forever on a half-open connection). See `agent::STREAM_BACKSTOP`.
     pub per_request_timeout: Option<std::time::Duration>,
+    /// Carried reasoning in the request (`Message::reasoning`), in message
+    /// order — what a real provider would echo back. Empty while
+    /// `Config.preserved_reasoning` is off, which is the byte-identical
+    /// guarantee the carry tests pin; with it on, `(msg, provider, blocks)`
+    /// says WHICH assistant turns still carry state, so a test can assert the
+    /// turn boundary (older turns drop it, the live tool loop keeps it).
+    pub reasoning: Vec<CapturedReasoning>,
+}
+
+/// One request message's carried reasoning as the mock saw it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapturedReasoning {
+    /// Index of the carrying message in the request.
+    pub msg: usize,
+    /// `Reasoning::provider` tag ("anthropic" / "openai").
+    pub provider: String,
+    /// `(before, text)` per block.
+    pub blocks: Vec<(usize, String)>,
 }
 
 /// Shared, interior-mutable state — cloned by the test so it survives the
@@ -206,7 +225,19 @@ impl Provider for MockProvider {
         let mut tool_use_ids = Vec::new();
         let mut tool_result_ids = Vec::new();
         let mut user_texts = Vec::new();
-        for m in req.messages {
+        let mut reasoning = Vec::new();
+        for (i, m) in req.messages.iter().enumerate() {
+            if let Some(r) = &m.reasoning {
+                reasoning.push(CapturedReasoning {
+                    msg: i,
+                    provider: r.provider.clone(),
+                    blocks: r
+                        .blocks
+                        .iter()
+                        .map(|b| (b.before, b.text.clone()))
+                        .collect(),
+                });
+            }
             for b in &m.content {
                 match b {
                     Block::ToolUse { id, .. } => tool_use_ids.push(id.clone()),
@@ -237,6 +268,7 @@ impl Provider for MockProvider {
             temperature: req.temperature,
             tool_names: req.tools.iter().map(|t| t.name.clone()).collect(),
             per_request_timeout: req.per_request_timeout,
+            reasoning,
         });
 
         // Pop the next scripted turn; running off the end is a test bug.
@@ -275,6 +307,15 @@ impl Provider for MockProvider {
                         on_event(ChatEvent::TextDelta(t.clone()));
                     }
                 }
+                // Same for the reply's reasoning text — one ThinkingDelta per
+                // readable block, ahead of the text like the real streams.
+                if let Some(r) = &resp.reasoning {
+                    for b in &r.blocks {
+                        if !b.text.is_empty() {
+                            on_event(ChatEvent::ThinkingDelta(b.text.clone()));
+                        }
+                    }
+                }
                 Ok(resp)
             }
             MockTurn::OkToolStream { id, name, frags } => {
@@ -291,6 +332,7 @@ impl Provider for MockProvider {
                 let input = serde_json::from_str(&joined)
                     .unwrap_or_else(|_| serde_json::json!({"_raw": joined}));
                 Ok(ChatResponse {
+                    reasoning: None,
                     blocks: vec![Block::ToolUse { id, name, input }],
                     stop_reason: "tool_use".into(),
                     usage: None,
@@ -315,6 +357,7 @@ impl Provider for MockProvider {
 /// A normal turn that ends the run with some text.
 pub fn resp_text(text: &str, usage: Option<Usage>) -> MockTurn {
     MockTurn::Ok(ChatResponse {
+        reasoning: None,
         blocks: vec![Block::Text(text.into())],
         stop_reason: "end_turn".into(),
         usage,
@@ -325,6 +368,7 @@ pub fn resp_text(text: &str, usage: Option<Usage>) -> MockTurn {
 /// continues into tool execution.
 pub fn resp_tool(id: &str, name: &str, input: Value, usage: Option<Usage>) -> MockTurn {
     MockTurn::Ok(ChatResponse {
+        reasoning: None,
         blocks: vec![Block::ToolUse {
             id: id.into(),
             name: name.into(),
@@ -337,11 +381,42 @@ pub fn resp_tool(id: &str, name: &str, input: Value, usage: Option<Usage>) -> Mo
 
 pub fn mk_usage(input_tokens: u64, output_tokens: u64) -> Option<Usage> {
     Some(Usage {
+        reasoning_tokens: 0,
         input_tokens,
         output_tokens,
         cache_creation_input_tokens: 0,
         cache_read_input_tokens: 0,
     })
+}
+
+/// Carried reasoning for a scripted reply: one block `thinking` long, ahead
+/// of every content block (`before: 0`), tagged for `provider` ("anthropic" /
+/// "openai" — see `REASONING_ANTHROPIC` / `REASONING_OPENAI`).
+pub fn mk_reasoning(provider: &str, thinking: &str) -> Option<Reasoning> {
+    Some(Reasoning {
+        provider: provider.into(),
+        blocks: vec![ReasoningBlock {
+            before: 0,
+            text: thinking.into(),
+            opaque: serde_json::json!({}),
+        }],
+    })
+}
+
+/// A tool-call turn that also carries reasoning (a thinking model inside a
+/// tool loop) — `resp_tool` with `ChatResponse::reasoning` attached.
+pub fn resp_tool_reasoning(
+    id: &str,
+    name: &str,
+    input: Value,
+    thinking: &str,
+    usage: Option<Usage>,
+) -> MockTurn {
+    let MockTurn::Ok(mut resp) = resp_tool(id, name, input, usage) else {
+        unreachable!("resp_tool always builds a MockTurn::Ok");
+    };
+    resp.reasoning = mk_reasoning(REASONING_OPENAI, thinking);
+    MockTurn::Ok(resp)
 }
 
 /// Like `mk_usage` but also sets the prompt-cache fields — for tests asserting
@@ -353,6 +428,7 @@ pub fn mk_usage_cache(
     cache_read_input_tokens: u64,
 ) -> Option<Usage> {
     Some(Usage {
+        reasoning_tokens: 0,
         input_tokens,
         output_tokens,
         cache_creation_input_tokens,

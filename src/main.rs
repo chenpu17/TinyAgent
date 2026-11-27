@@ -293,6 +293,8 @@ fn main() -> Result<()> {
             .isolate
             .parse()
             .map_err(|e: String| anyhow::anyhow!("{e}"))?;
+        note_context_window(&cfg);
+        note_unattended(&cfg);
         let code = batch::run(
             &cfg,
             dir,
@@ -485,6 +487,14 @@ fn main() -> Result<()> {
             bail!("--retries only applies to headless (non-TUI) mode");
         }
     }
+    // The unset-model-window note (`Limits::context_window_hint`) and the
+    // unattended-run hint: once per process, before any assembly output.
+    // Headless and batch print them here; for the window the TUI shows a diag
+    // row instead (`tui::run`), for the hint it prints nothing at all.
+    if !tui_mode {
+        note_context_window(&cfg);
+        note_unattended(&cfg);
+    }
     let client = provider::new_client(cfg.limits.timeout_secs);
     // Headless 专用：SIGINT 处理器在装配**之前**装好（round-3 评审 R2-04）。
     // build_agent 可能在 MCP 握手上花秒级时间——此前的注册点在装配之后，
@@ -554,6 +564,46 @@ fn main() -> Result<()> {
         drop(agent);
         std::process::exit(code);
     }
+}
+
+/// The startup stderr line for an unset model window
+/// ([`tiny_agent::config::Limits::context_window_hint`]); nothing once
+/// `limits.max_context_tokens` is set. Best-effort write like every other
+/// startup note ([`harness::note`]).
+fn note_context_window(cfg: &Config) {
+    if let Some(line) = context_window_line(cfg) {
+        harness::note(format_args!("{line}"));
+    }
+}
+
+/// The line [`note_context_window`] prints, without printing it — the pure
+/// half, so the test below needs no stderr capture.
+fn context_window_line(cfg: &Config) -> Option<String> {
+    cfg.limits
+        .context_window_hint()
+        .map(|hint| format!("[warn] {hint}"))
+}
+
+/// The startup stderr line for an unattended run (batch, or headless with a
+/// task) whose config leaves `restrict_to_workdir` off; nothing once it is
+/// on. A hint, not a default change: with it off the file tools read and
+/// write anywhere this user can, so one wrong path in a model-written call
+/// lands outside the workdir — with nobody at the keyboard to catch it. The
+/// TUI never prints it: there, someone is watching.
+fn note_unattended(cfg: &Config) {
+    if let Some(line) = unattended_line(cfg) {
+        harness::note(format_args!("{line}"));
+    }
+}
+
+/// The line [`note_unattended`] prints, without printing it — the pure
+/// half, so the test below needs no stderr capture.
+fn unattended_line(cfg: &Config) -> Option<String> {
+    (!cfg.restrict_to_workdir).then(|| {
+        "[warn] [config] restrict_to_workdir is off: the file tools may read and write outside \
+         the workdir — set \"restrict_to_workdir\": true for unattended runs"
+            .to_string()
+    })
 }
 
 /// True when the `--report` value is the DEFAULT "report.json" — possibly via
@@ -759,8 +809,9 @@ fn missing_config_error(default: Option<&Path>) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        choose_config_path, default_config_path_in, default_tui_mode, is_default_report,
-        is_default_session, next_resumed_id, session_target, Block, Message, TuiDefault,
+        choose_config_path, context_window_line, default_config_path_in, default_tui_mode,
+        is_default_report, is_default_session, next_resumed_id, session_target, unattended_line,
+        Block, Message, TuiDefault,
     };
     use std::path::{Path, PathBuf};
     use tiny_agent::config::pick_home;
@@ -771,6 +822,54 @@ mod tests {
         let mut m = Message::assistant(vec![Block::Text("x".into())]);
         m.id = Some(id.to_string());
         m
+    }
+
+    /// The unset model window is announced once at startup, and never once
+    /// it is set — a configured run's stderr is unchanged.
+    #[test]
+    fn context_window_line_only_while_the_window_is_unset() {
+        let base = r#"{"provider":"openai","api_key_env":"K","model":"m"}"#;
+        let cfg: tiny_agent::Config = serde_json::from_str(base).unwrap();
+        let line = context_window_line(&cfg).expect("default config: the window is unset");
+        assert!(
+            line.starts_with("[warn] [context] limits.max_context_tokens is not set"),
+            "{line}"
+        );
+        assert!(line.contains("Set max_context_tokens"), "{line}");
+
+        let cfg: tiny_agent::Config = serde_json::from_value(serde_json::json!({
+            "provider": "openai", "api_key_env": "K", "model": "m",
+            "limits": {"max_context_tokens": 200_000}
+        }))
+        .unwrap();
+        assert_eq!(cfg.limits.max_context_tokens, 200_000);
+        assert!(
+            context_window_line(&cfg).is_none(),
+            "a configured window prints nothing"
+        );
+    }
+
+    /// The unattended-run hint is printed only while `restrict_to_workdir`
+    /// is off — a restricted config's stderr is unchanged.
+    #[test]
+    fn unattended_line_only_while_unrestricted() {
+        let cfg: tiny_agent::Config =
+            serde_json::from_str(r#"{"provider":"openai","api_key_env":"K","model":"m"}"#).unwrap();
+        let line = unattended_line(&cfg).expect("default config: unrestricted");
+        assert!(
+            line.starts_with("[warn] [config] restrict_to_workdir is off"),
+            "{line}"
+        );
+        assert!(line.contains("\"restrict_to_workdir\": true"), "{line}");
+
+        let cfg: tiny_agent::Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"K","model":"m","restrict_to_workdir":true}"#,
+        )
+        .unwrap();
+        assert!(
+            unattended_line(&cfg).is_none(),
+            "a restricted config prints nothing"
+        );
     }
 
     #[test]

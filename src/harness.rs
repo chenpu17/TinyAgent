@@ -472,6 +472,7 @@ fn event_json(ev: &AgentEvent) -> Value {
             cache_creation_input_tokens,
             cache_read_input_tokens,
             tool_folded,
+            reasoning_tokens,
         } => {
             // Additive key: `tool_folded` distinguishes the two flavors —
             // `false` = one direct provider request's own usage (the truth
@@ -487,6 +488,9 @@ fn event_json(ev: &AgentEvent) -> Value {
                 "cache_creation_input_tokens": *cache_creation_input_tokens,
                 "cache_read_input_tokens": *cache_read_input_tokens,
                 "tool_folded": *tool_folded,
+                // Additive key (always present): the reasoning share OF
+                // `output_tokens` when the provider reports the split, else 0.
+                "reasoning_tokens": *reasoning_tokens,
             })
         }
         AgentEvent::Compressed {
@@ -859,6 +863,18 @@ pub fn write_result(
             result
         }
     };
+    // Reasoning tokens (a split OF output_tokens — `Usage::reasoning_tokens`):
+    // sparse like `arbitrations_used`. A run whose provider reported no split
+    // (or a non-reasoning model) leaves the key out, so its result.json stays
+    // byte-identical. Both branches land here, failure included: the failed
+    // attempts' thinking was paid for too (错误路径也是账单面).
+    let reasoning_tokens = match outcome {
+        Some(o) => o.reasoning_tokens,
+        None => none_acc.map(|acc| acc.usage.reasoning_tokens).unwrap_or(0),
+    };
+    if reasoning_tokens > 0 {
+        result["reasoning_tokens"] = json!(reasoning_tokens);
+    }
     // run_code audit anchor (NFR-3): additive key, only when the sandbox was
     // enabled at assembly — default-config output stays byte-identical. Both
     // branches above land here before serialization, so a single insertion
@@ -1079,6 +1095,7 @@ impl<Out: Write, Err: Write> HumanRenderer<Out, Err> {
                 cache_creation_input_tokens,
                 cache_read_input_tokens,
                 tool_folded,
+                reasoning_tokens,
             } => {
                 let cache = if *cache_creation_input_tokens > 0 || *cache_read_input_tokens > 0 {
                     format!(
@@ -1088,13 +1105,20 @@ impl<Out: Write, Err: Write> HumanRenderer<Out, Err> {
                 } else {
                     String::new()
                 };
+                // How much of the output was thinking (a split of ↓, not an
+                // extra axis) — only when the provider reports one.
+                let think = if *reasoning_tokens > 0 {
+                    format!(" · think {reasoning_tokens}")
+                } else {
+                    String::new()
+                };
                 // Tag the tool-folded flavor so a human tailing the run can
                 // tell a tool's bill (a task child's multi-turn sum — NOT the
                 // current history's occupancy) from the turn's own request.
                 let folded = if *tool_folded { " (tool-billed)" } else { "" };
                 let _ = writeln!(
                     self.err,
-                    "[tokens: {input_tokens}↑ {output_tokens}↓{cache}{folded}]"
+                    "[tokens: {input_tokens}↑ {output_tokens}↓{cache}{think}{folded}]"
                 );
             }
             AgentEvent::TodoUpdate { todos } => {
@@ -1214,11 +1238,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ta-res-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let o = RunOutcome {
+            reasoning_tokens: 0,
             final_text: "done".into(),
             turns: 2,
             stop_reason: "end_turn".into(),
             arbitrations_used: 0,
             tool_calls: vec![ToolCallRecord {
+                annotations: None,
                 name: "read_file".into(),
                 input: json!({"path": "a.txt"}),
                 output: "hello world".into(),
@@ -1288,6 +1314,8 @@ mod tests {
             vec![],
             vec![Message::user(vec![Block::Text("go".into())])],
             crate::tools::ToolCtx {
+                tool_annotations: std::sync::Arc::new(std::collections::BTreeMap::new()),
+                hidden_env: Vec::new(),
                 tool_absent_notes: Vec::new(),
                 workdir: std::env::current_dir().unwrap(),
                 max_output_chars: 1000,
@@ -1404,6 +1432,7 @@ mod tests {
         };
 
         let o = RunOutcome {
+            reasoning_tokens: 0,
             final_text: "done".into(),
             turns: 1,
             stop_reason: "end_turn".into(),
@@ -1459,12 +1488,14 @@ mod tests {
 
         // Outcome WITH a todo call → `plan` present.
         let with_plan = RunOutcome {
+            reasoning_tokens: 0,
             final_text: "done".into(),
             turns: 1,
             stop_reason: "end_turn".into(),
             arbitrations_used: 0,
             tool_calls: vec![
                 ToolCallRecord {
+                    annotations: None,
                     name: "todo".into(),
                     input: json!({"todos":[
                         {"subject":"a","status":"completed"},
@@ -1476,6 +1507,7 @@ mod tests {
                     duration_ms: None,
                 },
                 ToolCallRecord {
+                    annotations: None,
                     name: "shell".into(),
                     input: json!({"command":"ls"}),
                     output: "x".into(),
@@ -1504,11 +1536,13 @@ mod tests {
 
         // Outcome with NO todo call → `plan` key absent (not null).
         let without_plan = RunOutcome {
+            reasoning_tokens: 0,
             final_text: "done".into(),
             turns: 1,
             stop_reason: "end_turn".into(),
             arbitrations_used: 0,
             tool_calls: vec![ToolCallRecord {
+                annotations: None,
                 name: "shell".into(),
                 input: json!({"command":"ls"}),
                 output: "x".into(),
@@ -1559,6 +1593,7 @@ mod tests {
             config_fingerprint: None,
         };
         let o = RunOutcome {
+            reasoning_tokens: 0,
             final_text: "done".into(),
             turns: 1,
             stop_reason: "end_turn".into(),
@@ -1607,12 +1642,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ta-meta-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let o = RunOutcome {
+            reasoning_tokens: 0,
             final_text: "done".into(),
             turns: 1,
             stop_reason: "end_turn".into(),
             arbitrations_used: 0,
             tool_calls: vec![
                 ToolCallRecord {
+                    annotations: None,
                     name: "task".into(),
                     input: json!({"name":"scout","prompt":"x"}),
                     output: "summary".into(),
@@ -1623,6 +1660,7 @@ mod tests {
                     duration_ms: None,
                 },
                 ToolCallRecord {
+                    annotations: None,
                     name: "shell".into(),
                     input: json!({"command":"ls"}),
                     output: "x".into(),
@@ -1672,12 +1710,14 @@ mod tests {
         // hold after two add_failed() calls.
         let acc = RunCost {
             usage: crate::provider::Usage {
+                reasoning_tokens: 0,
                 input_tokens: 300,
                 output_tokens: 40,
                 cache_creation_input_tokens: 100,
                 cache_read_input_tokens: 50,
             },
             tool_calls: vec![ToolCallRecord {
+                annotations: None,
                 name: "shell".into(),
                 input: json!({"command": "ls"}),
                 output: "a.txt".into(),
@@ -1754,6 +1794,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ta-res-arb-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut o = RunOutcome {
+            reasoning_tokens: 0,
             final_text: "done".into(),
             turns: 3,
             stop_reason: "end_turn".into(),
@@ -1814,6 +1855,71 @@ mod tests {
         let zparsed: Value =
             serde_json::from_str(&std::fs::read_to_string(&zpath).unwrap()).unwrap();
         assert!(zparsed.get("arbitrations_used").is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `reasoning_tokens` (a split OF `output_tokens`) is on the ledger on
+    /// both branches — the success outcome, and the failed attempts'
+    /// accumulated cost — and absent, not null, when nothing reported it (a
+    /// non-reasoning model's result.json stays byte-identical).
+    #[test]
+    fn write_result_reports_reasoning_tokens_only_when_reported() {
+        let dir = std::env::temp_dir().join(format!("ta-res-think-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut o = RunOutcome {
+            reasoning_tokens: 12,
+            final_text: "done".into(),
+            turns: 3,
+            stop_reason: "end_turn".into(),
+            arbitrations_used: 0,
+            tool_calls: vec![],
+            compressions: vec![],
+            turn_timings: vec![],
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            elapsed: std::time::Duration::from_secs(1),
+            config_fingerprint: "fp".into(),
+            gateway_fixes: Default::default(),
+        };
+        let path = dir.join("ok.json");
+        write_result(&path, Some(&o), None, 1, "error", None, &meta()).unwrap();
+        let parsed: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed["reasoning_tokens"], 12);
+        assert_eq!(parsed["output_tokens"], 20);
+
+        // Zero on the outcome: the key is left out.
+        o.reasoning_tokens = 0;
+        write_result(&path, Some(&o), None, 1, "error", None, &meta()).unwrap();
+        let zparsed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(zparsed.get("reasoning_tokens").is_none(), "{zparsed}");
+
+        // Failure branch: the failed attempts' thinking was paid for too.
+        let mut acc = RunCost::default();
+        acc.usage.reasoning_tokens = 7;
+        let fpath = dir.join("fail-think.json");
+        write_result(
+            &fpath,
+            None,
+            Some("provider 503"),
+            2,
+            "error",
+            Some(&acc),
+            &meta(),
+        )
+        .unwrap();
+        let fparsed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&fpath).unwrap()).unwrap();
+        assert_eq!(fparsed["reasoning_tokens"], 7);
+
+        // No accumulated cost at all (never started): absent.
+        write_result(&fpath, None, Some("boom"), 1, "error", None, &meta()).unwrap();
+        let nparsed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&fpath).unwrap()).unwrap();
+        assert!(nparsed.get("reasoning_tokens").is_none(), "{nparsed}");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1950,6 +2056,7 @@ mod tests {
         // cost from any downstream token accounting); `tool_folded` rides
         // along for both flavors (additive key, schema stays add-only).
         let v = event_json(&AgentEvent::Usage {
+            reasoning_tokens: 0,
             input_tokens: 100,
             output_tokens: 5,
             cache_creation_input_tokens: 200,
@@ -1966,6 +2073,7 @@ mod tests {
             "a direct provider request reports the request flavor"
         );
         let v = event_json(&AgentEvent::Usage {
+            reasoning_tokens: 0,
             input_tokens: 111,
             output_tokens: 22,
             cache_creation_input_tokens: 0,
@@ -2173,6 +2281,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ta-res-cache-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let o = RunOutcome {
+            reasoning_tokens: 0,
             final_text: "done".into(),
             turns: 1,
             stop_reason: "end_turn".into(),
@@ -2209,6 +2318,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ta-res-fp-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mk = |fp: &str, fixes: tiny_agent::GatewayFixes| RunOutcome {
+            reasoning_tokens: 0,
             final_text: "done".into(),
             turns: 1,
             stop_reason: "end_turn".into(),
@@ -2264,6 +2374,7 @@ mod tests {
 
         // Zero-turn cancelled outcome → both keys absent (not null, not []).
         let plain = RunOutcome {
+            reasoning_tokens: 0,
             final_text: String::new(),
             turns: 0,
             stop_reason: "cancelled".into(),
@@ -2297,11 +2408,13 @@ mod tests {
         // run DOES carry its turn row — but the unmeasured call stays free of
         // the sparse duration_ms key.
         let partial = RunOutcome {
+            reasoning_tokens: 0,
             final_text: String::new(),
             turns: 1,
             stop_reason: "cancelled".into(),
             arbitrations_used: 0,
             tool_calls: vec![ToolCallRecord {
+                annotations: None,
                 name: "shell".into(),
                 input: json!({"command":"ls"}),
                 output: "x".into(),
@@ -2335,11 +2448,13 @@ mod tests {
 
         // One fold + two turn rows + a timed call → keys present, shaped right.
         let audited = RunOutcome {
+            reasoning_tokens: 0,
             final_text: "done".into(),
             turns: 2,
             stop_reason: "end_turn".into(),
             arbitrations_used: 0,
             tool_calls: vec![ToolCallRecord {
+                annotations: None,
                 name: "shell".into(),
                 input: json!({"command":"ls"}),
                 output: "x".into(),
@@ -2412,6 +2527,7 @@ mod tests {
         r.render(&AgentEvent::TurnStart(1));
         r.render(&AgentEvent::Warning("careful".into()));
         r.render(&AgentEvent::Usage {
+            reasoning_tokens: 0,
             input_tokens: 10,
             output_tokens: 2,
             cache_creation_input_tokens: 5,
@@ -2421,6 +2537,7 @@ mod tests {
         // The tool-folded flavor carries a visible marker so a human can
         // tell a tool's bill from the turn's own request.
         r.render(&AgentEvent::Usage {
+            reasoning_tokens: 0,
             input_tokens: 111,
             output_tokens: 22,
             cache_creation_input_tokens: 0,

@@ -83,6 +83,9 @@ pub(crate) fn record(u: &Usage) {
             acc.cache_read_input_tokens = acc
                 .cache_read_input_tokens
                 .saturating_add(u.cache_read_input_tokens);
+            // A split of output_tokens — folded for the bill, like everywhere
+            // else usage is summed; `total()` never reads it.
+            acc.reasoning_tokens = acc.reasoning_tokens.saturating_add(u.reasoning_tokens);
         }
     });
 }

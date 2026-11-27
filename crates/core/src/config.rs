@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::borrow::Cow;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -22,6 +23,9 @@ fn default_compress_threshold() -> usize {
 fn default_keep_recent() -> usize {
     8
 }
+fn default_summary_preview_chars() -> usize {
+    200
+}
 fn default_stream_idle() -> u64 {
     30
 }
@@ -38,6 +42,16 @@ fn default_inject_environment() -> bool {
     true
 }
 fn default_salvage_on_max_tokens() -> bool {
+    true
+}
+/// `preserved_reasoning` defaults to ON (2026-11-26). The A/B on a reasoning
+/// model through an OpenAI-compatible gateway (`docs/kernel_improvement_plan.md`
+/// §0.0.5, 实验一) came out 15/15 vs 14/15 with 39% fewer billed tokens — the
+/// gain sits where history is compressed mid-run; on runs that never compress
+/// the carried reasoning costs extra input tokens. The reasons it started as
+/// opt-in (history byte-compat, the echo being new request surface) are a
+/// deployment concern now, expressed by setting it to `false`.
+fn default_preserved_reasoning() -> bool {
     true
 }
 fn default_tools() -> Vec<String> {
@@ -91,9 +105,25 @@ pub struct Limits {
     /// over and this char threshold is ignored.
     #[serde(default = "default_compress_threshold")]
     pub compress_threshold_chars: usize,
-    /// Messages kept verbatim at the tail when compressing.
+    /// Messages kept verbatim at the tail when compressing — an UPPER bound.
+    /// A preflight fold (the threshold trigger) lowers it when the configured
+    /// window alone would hold more than half the compaction threshold, which
+    /// would otherwise re-trigger a fold every turn and drop only a round or
+    /// two each time; overflow recovery and the manual compact keep the
+    /// configured window.
     #[serde(default = "default_keep_recent")]
     pub keep_recent_messages: usize,
+    /// Longest excerpt of each tool call / tool result in the transcript the
+    /// compression summary is written from (default 200 chars; `0` = the call
+    /// name / result tag only). The summary model never sees the folded
+    /// messages themselves, only this transcript — a longer preview keeps more
+    /// detail (paths, identifiers, error text) at the price of a bigger summary
+    /// request, and once the transcript crosses ~24k chars a fold costs one
+    /// summary call per chunk plus a combine call. Batch tightening only: a
+    /// task fragment may lower it, never raise it. It clips what the summarizer
+    /// sees — never the live history the main model reads.
+    #[serde(default = "default_summary_preview_chars")]
+    pub summary_preview_chars: usize,
     /// Model context-window ceiling in tokens. `> 0` switches preflight
     /// compression to a token estimate (≈4 chars/token, reserving room for one
     /// turn's output) that compacts before the provider would reject an
@@ -151,12 +181,45 @@ impl Default for Limits {
             max_output_chars: default_max_output(),
             compress_threshold_chars: default_compress_threshold(),
             keep_recent_messages: default_keep_recent(),
+            summary_preview_chars: default_summary_preview_chars(),
             max_context_tokens: 0,
             max_total_tokens: 0,
             stream_idle_secs: default_stream_idle(),
             shell_timeout_secs: default_shell_timeout(),
             subagent_max_turns: default_subagent_max_turns(),
         }
+    }
+}
+
+impl Limits {
+    /// The one-time startup note for an unset model window
+    /// (`max_context_tokens == 0`, the default): what the run falls back to
+    /// and how to change it. `None` once the window is set — the token-based
+    /// preflight gate is then active and there is nothing to say. Pure: the
+    /// caller picks the channel (the CLI prints it once at startup; a library
+    /// host shows it wherever it keeps notes). Not a validation — the default
+    /// config is valid, the overflow recovery remains the backstop.
+    pub fn context_window_hint(&self) -> Option<String> {
+        if self.max_context_tokens > 0 {
+            return None;
+        }
+        Some(if self.compress_threshold_chars == 0 {
+            "[context] limits.max_context_tokens is not set and compress_threshold_chars is 0: \
+             nothing compacts the history before a request, so a long run ends on the \
+             provider's context-window error (the overflow recovery then compresses and \
+             retries once). Set max_context_tokens to the model's context window."
+                .to_owned()
+        } else {
+            format!(
+                "[context] limits.max_context_tokens is not set: history is compacted on the \
+                 character threshold alone (compress_threshold_chars = {} ≈ {} tokens at 4 \
+                 chars/token; CJK text costs closer to one token per character, so a \
+                 CJK-heavy run overruns it). Set max_context_tokens to the model's context \
+                 window to compact on a token estimate instead.",
+                self.compress_threshold_chars,
+                self.compress_threshold_chars / 4
+            )
+        })
     }
 }
 
@@ -172,7 +235,8 @@ enum Clamp {
     /// Smaller is tighter and 0 is either the tightest value or nonsensical
     /// (clamped at the use site, e.g. stream idle ≥1s in the provider): plain
     /// `min`. A fragment can only lower the base value.
-    /// (max_turns / max_output_chars / keep_recent_messages / stream_idle_secs)
+    /// (max_turns / max_output_chars / keep_recent_messages /
+    /// stream_idle_secs / summary_preview_chars)
     Tighten,
     /// 0 means "no limit" — the LOOSEST value, opposite of [`Self::Tighten`]
     /// fields. Canonical explanation, written ONCE here (it previously
@@ -306,6 +370,44 @@ pub struct McpServerConfig {
     /// stdio MCP servers — matching the Claude Desktop / VS Code config shape.
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
+    /// Seconds one JSON-RPC request to this server may take (`tools/call`
+    /// included) before it fails with a timeout. `None` (the default) = 120.
+    /// A server whose tools legitimately run long (a slow build, a big
+    /// query) raises it; a flaky sidecar lowers it so a wedge costs seconds,
+    /// not minutes. `0` is rejected by [`Self::validate`] — it would fail
+    /// every call instantly.
+    #[serde(default)]
+    pub call_timeout_secs: Option<u64>,
+    /// Seconds the initial connection may take. What "initial connection"
+    /// covers depends on the transport, and so does the default:
+    ///
+    /// - **HTTP/SSE**: the TCP/TLS connect (for legacy SSE also the wait for
+    ///   its `endpoint` event — the first one, and the one after every stream
+    ///   rotation). Unset = 15.
+    /// - **stdio**: the `initialize` handshake, i.e. how long the server may
+    ///   take to come up. Unset = the call timeout (120 by default) — NOT
+    ///   15, because a first run of an `npx`/`uvx` server on a cold cache
+    ///   regularly takes longer than that. Set the key to bound a slow boot
+    ///   without raising the per-call timeout for every later call.
+    ///
+    /// `0` is rejected by [`Self::validate`]. Both this and
+    /// [`Self::call_timeout_secs`] are capped at [`MCP_MAX_TIMEOUT_SECS`].
+    #[serde(default)]
+    pub connect_timeout_secs: Option<u64>,
+    /// If non-empty, only the WIRE tool names listed here are exposed from
+    /// this server (the server's own names, before the `mcp_<server>_`
+    /// display prefix — as they appear in its `tools/list`). A name in the
+    /// list that the server does NOT expose is an assembly error (a renamed
+    /// or removed tool must not fail open as "silently not allowed").
+    /// Empty (the default) = every tool the server lists.
+    #[serde(default)]
+    pub allow_tools: Vec<String>,
+    /// WIRE tool names never exposed, whatever the server lists (evaluated
+    /// after `allow_tools`; takes precedence on overlap). Empty = nothing
+    /// denied. Unlike `allow_tools`, a name the server does not expose is
+    /// fine — deny entries are also forward-looking.
+    #[serde(default)]
+    pub deny_tools: Vec<String>,
 }
 
 /// Manual Debug (see the struct comment): every field prints normally except
@@ -332,6 +434,10 @@ impl fmt::Debug for McpServerConfig {
             .field("transport", &self.transport)
             .field("headers", &redact(&self.headers))
             .field("env", &redact(&self.env))
+            .field("call_timeout_secs", &self.call_timeout_secs)
+            .field("connect_timeout_secs", &self.connect_timeout_secs)
+            .field("allow_tools", &self.allow_tools)
+            .field("deny_tools", &self.deny_tools)
             .finish()
     }
 }
@@ -394,6 +500,15 @@ pub fn redact_url_credentials(url: &str) -> Cow<'_, str> {
     ))
 }
 
+/// Ceiling (seconds) of one configured MCP timeout,
+/// [`McpServerConfig::call_timeout_secs`] or
+/// [`McpServerConfig::connect_timeout_secs`]. Not a policy number but an
+/// overflow guard with a round shape: the kernel adds such a value to a
+/// monotonic clock, and that addition overflows (a panic) far below `u64`
+/// seconds. Anything honestly above a week means "no timeout", which these
+/// keys do not express.
+pub const MCP_MAX_TIMEOUT_SECS: u64 = 7 * 86_400;
+
 impl McpServerConfig {
     /// Reject structurally-unusable server entries at config time: exactly one
     /// of `command` / `url`, and no HTTP-only fields on a stdio server. Called
@@ -421,6 +536,39 @@ impl McpServerConfig {
                 "mcp server '{}': \"transport\"/\"headers\" only apply to url servers",
                 self.name
             );
+        }
+        for (field, value, default) in [
+            ("call_timeout_secs", self.call_timeout_secs, "120s"),
+            (
+                "connect_timeout_secs",
+                self.connect_timeout_secs,
+                "15s on HTTP, the call timeout on stdio",
+            ),
+        ] {
+            if value == Some(0) {
+                bail!(
+                    "mcp server '{}': \"{field}\" must be at least 1 (omit it for the default, {default})",
+                    self.name
+                );
+            }
+            if value.is_some_and(|v| v > MCP_MAX_TIMEOUT_SECS) {
+                bail!(
+                    "mcp server '{}': \"{field}\" is {}s, above the {MCP_MAX_TIMEOUT_SECS}s ceiling (a unit mix-up in the config?)",
+                    self.name,
+                    value.unwrap_or_default()
+                );
+            }
+        }
+        for (field, names) in [
+            ("allow_tools", &self.allow_tools),
+            ("deny_tools", &self.deny_tools),
+        ] {
+            if names.iter().any(|n| n.trim().is_empty()) {
+                bail!(
+                    "mcp server '{}': \"{field}\" contains an empty tool name",
+                    self.name
+                );
+            }
         }
         Ok(())
     }
@@ -787,10 +935,130 @@ pub struct Config {
     /// deployment whose models legitimately emit those literal tags. The
     /// `reasoning_content`/`reasoning` delta fields are ALWAYS routed to
     /// `ThinkingDelta` regardless of this knob (protocol variants, not a
-    /// content convention). Thinking never enters history or the reply — the
-    /// standing anthropic-side rule.
+    /// content convention). Thinking never enters the reply text or the
+    /// visible history content — the standing anthropic-side rule; with
+    /// `preserved_reasoning` on it rides along in a side field instead.
     #[serde(default = "default_strip_think_tags")]
     pub strip_think_tags: bool,
+    /// Keep each assistant turn's reasoning state in the history and echo it
+    /// back to the provider on later requests (`provider::Reasoning`): several
+    /// current APIs want the earlier reasoning to come back with the tool
+    /// results for the model to keep its chain of thought across a tool-use
+    /// loop. **On by default** since 2026-11-26, on the strength of the A/B in
+    /// `docs/kernel_improvement_plan.md` §0.0.5 (实验一): a reasoning model
+    /// finished 15/15 task runs with the carry against 14/15 without, at 39%
+    /// fewer billed tokens — the whole difference sat in the runs that
+    /// compress mid-run, while runs that never compress pay the carried
+    /// reasoning as extra input tokens. Set it to `false` where the echo is
+    /// unwanted: a gateway that rejects the extra request field (the built-in
+    /// OpenAI provider learns that from the first 400 and drops the echo
+    /// afterwards, in memory only), or a deployment that needs history and
+    /// session files byte-identical to before the field existed. What it
+    /// costs: every later request re-sends the kept reasoning (more input
+    /// tokens — estimated into the compression trigger), and session files
+    /// then contain the thinking text. What it never changes: the reply text,
+    /// the event stream, and the TUI (reasoning is a side field, not a
+    /// content block). Lifetime — the current turn only: a new user turn, a
+    /// model switch, and the merge of two adjacent same-role messages drop it
+    /// from the whole history, and the session archive never carries it. A
+    /// compression fold and tool-result pruning leave the kept messages'
+    /// reasoning alone (see `compress::strip_reasoning`).
+    #[serde(default = "default_preserved_reasoning")]
+    pub preserved_reasoning: bool,
+    /// Extra top-level request-body fields, merged into every chat request
+    /// for gateways and models with vendor-specific knobs the config has no
+    /// dedicated key for (GLM `{"thinking": {"type": "enabled"}}`, a relay's
+    /// routing tag, a self-hosted server's sampler flags). Must be a JSON
+    /// object. The kernel-owned keys are reserved and rejected at load —
+    /// `model` / `messages` / `system` / `tools` / `stream` / `stream_options`
+    /// / `max_tokens` / `max_completion_tokens`, plus `reasoning_effort` /
+    /// `thinking` / `output_config` while `reasoning_effort` is set (they
+    /// derive from it): two sources for one field is a silent drift. Nothing
+    /// here changes what the model may DO on the host (tools and the sandbox
+    /// are not body fields), but a body field can change what the gateway
+    /// does — so the field is HARD for batch fragments.
+    #[serde(default)]
+    pub extra_body: Option<Value>,
+    /// Extra HTTP request headers, merged into every chat request (a relay's
+    /// tenant or routing header, `anthropic-beta` feature flags). Cannot
+    /// override the headers the kernel manages (auth, content type, protocol
+    /// version) — rejected at load. Values are credentials by default: the
+    /// type's `Debug` masks them and [`Config::fingerprint`] hashes only the
+    /// key names. HARD for batch fragments.
+    #[serde(default)]
+    pub extra_headers: Option<ExtraHeaders>,
+    /// Environment variable names that stay visible to the processes the
+    /// tools spawn (the `shell` tool, stdio MCP servers) even though they
+    /// would otherwise be hidden. By default the hidden set is exactly the
+    /// provider's `api_key_env` variable: a model-written shell command has
+    /// no business reading the API key, and a prompt-injected `echo
+    /// $THE_KEY` used to hand it to the model (and into every transcript).
+    /// List the variable here to opt back in for a deployment that really
+    /// runs key-using CLIs (a `curl` against the same gateway). A library
+    /// never edits the process environment — the removal happens per spawn,
+    /// and the agent's own requests still read the key normally. HARD for
+    /// batch fragments (it re-exposes a credential).
+    #[serde(default)]
+    pub env_passthrough: Vec<String>,
+}
+
+/// Extra request headers from `Config.extra_headers` — a map with the
+/// credential discipline of [`McpServerConfig`] built in: `Config` derives
+/// `Debug`, so a plain `HashMap` here would print header VALUES (a relay's
+/// token, a tenant key) in any `{:?}`. The hand-written `Debug` below masks
+/// every value and keeps the key names.
+#[derive(Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(transparent)]
+pub struct ExtraHeaders(pub std::collections::BTreeMap<String, String>);
+
+impl fmt::Debug for ExtraHeaders {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let masked: std::collections::BTreeMap<&str, &str> =
+            self.0.keys().map(|k| (k.as_str(), "***")).collect();
+        f.debug_map().entries(masked.iter()).finish()
+    }
+}
+
+/// Body keys the kernel always writes itself (or derives from a dedicated
+/// config key): an `extra_body` entry under one of these is a config error,
+/// never a silent winner.
+pub(crate) const EXTRA_BODY_RESERVED: &[&str] = &[
+    "model",
+    "messages",
+    "system",
+    "tools",
+    "stream",
+    "stream_options",
+    "max_tokens",
+    "max_completion_tokens",
+];
+
+/// Body keys the kernel derives from `reasoning_effort`: reserved only while
+/// that is set (with it unset they are exactly what `extra_body` is for —
+/// GLM's `thinking` object, a relay's effort spelling).
+pub(crate) const EXTRA_BODY_RESERVED_WITH_EFFORT: &[&str] =
+    &["reasoning_effort", "thinking", "output_config"];
+
+/// Header names (lowercase) the kernel manages on every chat request. Also
+/// enforced at request time, whatever skipped the load-time check.
+pub(crate) const EXTRA_HEADERS_RESERVED: &[&str] = &[
+    "authorization",
+    "x-api-key",
+    "anthropic-version",
+    "content-type",
+    "accept",
+    "host",
+    "content-length",
+    "connection",
+    "transfer-encoding",
+];
+
+/// Whether a header name is kernel-managed (case-insensitive, as HTTP names
+/// are). The single source for both the load-time rejection and the
+/// request-time filter.
+pub(crate) fn header_is_reserved(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    EXTRA_HEADERS_RESERVED.contains(&lower.as_str())
 }
 
 fn default_strip_think_tags() -> bool {
@@ -950,6 +1218,15 @@ impl Config {
     /// 序进——顺序本身是拓扑语义。新增 harness 字段时必须同步加进这里
     /// （漏加 = 该字段变动不换指纹 = 台账静默失真）。
     ///
+    /// 后加的字段按「非默认才进」接入（`preserved_reasoning` /
+    /// `extra_body` / `extra_headers` / `env_passthrough`；MCP 条目的
+    /// `call_timeout_secs` / `connect_timeout_secs` / `allow_tools` /
+    /// `deny_tools`）：默认配置的指纹与加字段之前逐位相同，历史台账不打断；
+    /// 一旦启用，键才出现、指纹才变。`extra_headers` 只进键名——值是凭据
+    /// 载体（见 `ExtraHeaders`）。`preserved_reasoning` 的默认值 2026-11-26
+    /// 由关改开，「非默认」那侧随之反转：默认（开）不进键，显式写 `false`
+    /// 才进——默认配置的指纹不因这次改默认值而变，显式 `true` 与不写同形。
+    ///
     /// 时点语义（外审 P2 定版）：指纹是**构造时快照**——`Agent::new` 时对
     /// 定格的 [`Config`] 算一次，此后出账恒复制该值。常驻 `Agent` 的热更新
     /// （`set_model` / `set_reasoning_effort` / `set_max_tokens` /
@@ -982,7 +1259,7 @@ impl Config {
                 header_keys.sort();
                 let mut env_keys: Vec<&String> = s.env.keys().collect();
                 env_keys.sort();
-                serde_json::json!({
+                let mut entry = serde_json::json!({
                     "name": s.name,
                     "command": s.command,
                     "args": s.args,
@@ -993,10 +1270,28 @@ impl Config {
                     "transport": s.transport,
                     "header_keys": header_keys,
                     "env_keys": env_keys,
-                })
+                });
+                // Non-default-only (see the doc comment): an all-default
+                // entry serializes exactly as before these fields existed.
+                if s.call_timeout_secs.is_some()
+                    || s.connect_timeout_secs.is_some()
+                    || !s.allow_tools.is_empty()
+                    || !s.deny_tools.is_empty()
+                {
+                    entry["extra"] = serde_json::json!({
+                        "call_timeout_secs": s.call_timeout_secs,
+                        "connect_timeout_secs": s.connect_timeout_secs,
+                        "allow_tools": s.allow_tools,
+                        "deny_tools": s.deny_tools,
+                    });
+                }
+                entry
             })
             .collect();
-        let canonical = serde_json::json!({
+        let mut extra_header_keys: Vec<&String> =
+            self.extra_headers.iter().flat_map(|h| h.0.keys()).collect();
+        extra_header_keys.sort();
+        let mut canonical = serde_json::json!({
             "schema": 1,
             "core": env!("CARGO_PKG_VERSION"),
             "provider": self.provider.as_str(),
@@ -1023,6 +1318,20 @@ impl Config {
             "gateway_fixes_preset": self.gateway_fixes_preset,
             "strip_think_tags": self.strip_think_tags,
         });
+        // Non-default-only keys (see the doc comment). Since the default
+        // flipped to on, the non-default side is `false`.
+        if !self.preserved_reasoning {
+            canonical["preserved_reasoning"] = serde_json::json!(false);
+        }
+        if let Some(eb) = &self.extra_body {
+            canonical["extra_body"] = eb.clone();
+        }
+        if !extra_header_keys.is_empty() {
+            canonical["extra_header_keys"] = serde_json::json!(extra_header_keys);
+        }
+        if !self.env_passthrough.is_empty() {
+            canonical["env_passthrough"] = serde_json::json!(self.env_passthrough);
+        }
         let digest = Sha256::digest(canonical.to_string().as_bytes());
         let mut out = String::with_capacity(16);
         for b in &digest[..8] {
@@ -1056,6 +1365,7 @@ impl Config {
         for s in &self.mcp_servers {
             s.validate()?;
         }
+        self.validate_extra()?;
         self.workdir = self.workdir.take().map(resolve_workdir).transpose()?;
         // `code.llm` enablement invariants (code_llm_design §5, LD-5): fail
         // at config time with the config blamed, not at the first sandbox
@@ -1069,6 +1379,64 @@ impl Config {
         // went through. Needs the normalized workdir → hence after the
         // resolve above.
         self.warn_alias_path_rules();
+        Ok(())
+    }
+
+    /// Validate the three request-shaping extras (`extra_body` /
+    /// `extra_headers` / `env_passthrough`), so a bad entry fails at config
+    /// time with the config blamed rather than as a provider 400 on the first
+    /// request or — worse — as a silently ignored knob. Called from
+    /// [`Self::validate_and_normalize`] (every config entry point) and from
+    /// the trusted overlay when one of the three is set. Never echoes a
+    /// header VALUE.
+    fn validate_extra(&self) -> Result<()> {
+        if let Some(body) = &self.extra_body {
+            let Some(obj) = body.as_object() else {
+                bail!("extra_body must be a JSON object of top-level request-body fields");
+            };
+            for key in obj.keys() {
+                if EXTRA_BODY_RESERVED.contains(&key.as_str()) {
+                    bail!(
+                        "extra_body must not set '{key}': the kernel owns that field (use the \
+                         matching config key — model / max_tokens / … — or drop the entry)"
+                    );
+                }
+                if self.reasoning_effort.is_some()
+                    && EXTRA_BODY_RESERVED_WITH_EFFORT.contains(&key.as_str())
+                {
+                    bail!(
+                        "extra_body must not set '{key}' while reasoning_effort is set — both \
+                         derive the same request field; keep one"
+                    );
+                }
+            }
+        }
+        if let Some(headers) = &self.extra_headers {
+            for (name, value) in &headers.0 {
+                if header_is_reserved(name) {
+                    bail!(
+                        "extra_headers must not set '{name}': the kernel manages that header \
+                         (authentication, content type, protocol version)"
+                    );
+                }
+                if let Err(e) = reqwest::header::HeaderName::from_bytes(name.as_bytes()) {
+                    bail!("extra_headers: invalid header name ({e})");
+                }
+                // The value is not echoed: a rejected one is often a secret
+                // with a stray newline.
+                if reqwest::header::HeaderValue::from_str(value).is_err() {
+                    bail!(
+                        "extra_headers: '{name}' has an invalid value (control characters? a \
+                         trailing newline from the environment?) — the value is never echoed"
+                    );
+                }
+            }
+        }
+        for name in &self.env_passthrough {
+            if name.is_empty() || name.contains(['=', '\0']) {
+                bail!("env_passthrough entries must be environment variable names (got an empty name or one containing '=' )");
+            }
+        }
         Ok(())
     }
 
@@ -1140,7 +1508,8 @@ impl Config {
     /// max_tokens / reasoning_effort / inject_environment /
     /// salvage_on_max_tokens / limits / `code` under its clamps); any hard
     /// field (provider / base_url / api_key_env / workdir / tools /
-    /// restrict_to_workdir / mcp_servers) is REJECTED here with an error
+    /// restrict_to_workdir / mcp_servers / preserved_reasoning / extra_body /
+    /// extra_headers / env_passthrough) is REJECTED here with an error
     /// pointing at [`Self::apply_trusted`].
     ///
     /// Since the bin/lib split this method is a published library API. The
@@ -1157,10 +1526,10 @@ impl Config {
         if let Some(field) = p.forbidden_batch_override() {
             bail!(
                 "config fragment must not set '{field}' (hard field: endpoints, \
-                 credentials, workdir, tool whitelist and MCP servers come from \
-                 the trusted base config); if this overlay is host-constructed \
-                 and already screened, use apply_trusted — see \
-                 PartialConfig::forbidden_batch_override"
+                 credentials, workdir, tool whitelist, MCP servers and the \
+                 request-shape extras come from the trusted base config); if \
+                 this overlay is host-constructed and already screened, use \
+                 apply_trusted — see PartialConfig::forbidden_batch_override"
             );
         }
         self.apply_trusted(p)
@@ -1205,7 +1574,41 @@ impl Config {
             inject_environment,
             salvage_on_max_tokens,
             code,
+            preserved_reasoning,
+            extra_body,
+            extra_headers,
+            env_passthrough,
         } = p;
+        // The request-shape extras carry the load-time validation (see
+        // `validate_extra`), and that check reads `reasoning_effort` — which
+        // this overlay may set too. So it runs FIRST, on a copy of the result
+        // the overlay would produce: a rejected overlay leaves the config
+        // exactly as it was, like every other rejection below (the per-field
+        // checks validate before they assign; this one depends on a later
+        // field, so it cannot sit beside its assignment).
+        let reshapes_requests = preserved_reasoning.is_some()
+            || extra_body.is_some()
+            || extra_headers.is_some()
+            || env_passthrough.is_some();
+        if reshapes_requests {
+            let mut next = self.clone();
+            if let Some(v) = &reasoning_effort {
+                next.reasoning_effort = Some(v.clone());
+            }
+            if let Some(v) = preserved_reasoning {
+                next.preserved_reasoning = v;
+            }
+            if extra_body.is_some() {
+                next.extra_body = extra_body.clone();
+            }
+            if extra_headers.is_some() {
+                next.extra_headers = extra_headers.clone();
+            }
+            if let Some(v) = &env_passthrough {
+                next.env_passthrough = v.clone();
+            }
+            next.validate_extra()?;
+        }
         if let Some(v) = provider {
             self.provider = v;
         }
@@ -1261,6 +1664,7 @@ impl Config {
                 max_output_chars,
                 compress_threshold_chars,
                 keep_recent_messages,
+                summary_preview_chars,
                 max_context_tokens,
                 max_total_tokens,
                 stream_idle_secs,
@@ -1275,6 +1679,9 @@ impl Config {
                 Clamp::TightenOrInit.merge(li.compress_threshold_chars, compress_threshold_chars);
             li.keep_recent_messages =
                 Clamp::Tighten.merge(li.keep_recent_messages, keep_recent_messages);
+            // A longer summary preview is a bigger billed request: lower only.
+            li.summary_preview_chars =
+                Clamp::Tighten.merge(li.summary_preview_chars, summary_preview_chars);
             li.max_context_tokens =
                 Clamp::TightenOrInit.merge(li.max_context_tokens, max_context_tokens);
             li.max_total_tokens = Clamp::TightenOrInit.merge(li.max_total_tokens, max_total_tokens);
@@ -1319,6 +1726,18 @@ impl Config {
                 }
             }
             self.code.merge_partial(pc)?;
+        }
+        if let Some(v) = preserved_reasoning {
+            self.preserved_reasoning = v;
+        }
+        if extra_body.is_some() {
+            self.extra_body = extra_body;
+        }
+        if extra_headers.is_some() {
+            self.extra_headers = extra_headers;
+        }
+        if let Some(v) = env_passthrough {
+            self.env_passthrough = v;
         }
         Ok(())
     }
@@ -1366,6 +1785,15 @@ pub struct PartialConfig {
     /// Soft, per-field: see [`PartialCodeConfig`]. `code.enabled` is still
     /// rejected — an untrusted fragment may not switch the sandbox.
     pub code: Option<PartialCodeConfig>,
+    /// HARD: changes what every later request carries (and its cost) for the
+    /// whole conversation, in the direction that spends more.
+    pub preserved_reasoning: Option<bool>,
+    /// HARD: arbitrary request-body fields steer what the gateway does.
+    pub extra_body: Option<Value>,
+    /// HARD: a header can redirect or authenticate a request.
+    pub extra_headers: Option<ExtraHeaders>,
+    /// HARD: re-exposes the API key to tool subprocesses.
+    pub env_passthrough: Option<Vec<String>>,
 }
 
 impl PartialConfig {
@@ -1408,6 +1836,10 @@ impl PartialConfig {
             // in CodeConfig::merge_partial (§9), and the one that isn't
             // (enabled) is rejected by Config::apply → bad_task.
             code: _,
+            preserved_reasoning,
+            extra_body,
+            extra_headers,
+            env_passthrough,
         } = self;
         if provider.is_some() {
             return Some("provider");
@@ -1429,6 +1861,18 @@ impl PartialConfig {
         }
         if mcp_servers.is_some() {
             return Some("mcp_servers");
+        }
+        if preserved_reasoning.is_some() {
+            return Some("preserved_reasoning");
+        }
+        if extra_body.is_some() {
+            return Some("extra_body");
+        }
+        if extra_headers.is_some() {
+            return Some("extra_headers");
+        }
+        if env_passthrough.is_some() {
+            return Some("env_passthrough");
         }
         None
     }
@@ -1652,6 +2096,8 @@ pub struct PartialLimits {
     pub compress_threshold_chars: Option<usize>,
     /// `Tighten`.
     pub keep_recent_messages: Option<usize>,
+    /// `Tighten` — a longer summary preview is a bigger billed request.
+    pub summary_preview_chars: Option<usize>,
     /// `TightenOrInit`.
     pub max_context_tokens: Option<u64>,
     /// `TightenOrInit` — the run-wide token budget.
@@ -1942,6 +2388,61 @@ mod tests {
         .unwrap();
         assert!(http.validate().is_ok());
         assert_eq!(http.transport, Some(McpTransport::Http));
+    }
+
+    /// The MCP timeout / tool-list validation names the server, the JSON key
+    /// (as written in the config), and what to do about it — the three things
+    /// an operator needs to fix an entry without reading the source.
+    #[test]
+    fn mcp_server_timeout_and_tool_list_validation_names_the_field_and_the_fix() {
+        let server = |extra: &str| -> McpServerConfig {
+            serde_json::from_str(&format!(r#"{{"name":"t","command":"npx"{}}}"#, extra))
+                .expect("server config")
+        };
+        for field in ["call_timeout_secs", "connect_timeout_secs"] {
+            let zero = server(&format!(r#","{field}":0"#));
+            let msg = format!("{:#}", zero.validate().expect_err("zero is not a timeout"));
+            assert!(
+                msg.contains("mcp server 't'")
+                    && msg.contains(&format!("\"{field}\""))
+                    && msg.contains("must be at least 1"),
+                "{msg}"
+            );
+            // … and the default omitting the key would give, per transport.
+            let default = if field == "call_timeout_secs" {
+                "default, 120s"
+            } else {
+                "the call timeout on stdio"
+            };
+            assert!(msg.contains(default), "{msg}");
+            let past = server(&format!(r#","{field}":{}"#, MCP_MAX_TIMEOUT_SECS + 1));
+            let msg = format!("{:#}", past.validate().expect_err("past the ceiling"));
+            assert!(
+                msg.contains(&format!("\"{field}\""))
+                    && msg.contains(&format!("{}s ceiling", MCP_MAX_TIMEOUT_SECS)),
+                "{msg}"
+            );
+            // The ceiling itself is a legal value.
+            let at_cap = server(&format!(r#","{field}":{}"#, MCP_MAX_TIMEOUT_SECS));
+            assert!(at_cap.validate().is_ok());
+        }
+        for field in ["allow_tools", "deny_tools"] {
+            let blank = server(&format!(r#","{field}":["a", ""]"#));
+            let msg = format!(
+                "{:#}",
+                blank
+                    .validate()
+                    .expect_err("an empty name is a typo waiting to happen")
+            );
+            assert!(
+                msg.contains("mcp server 't'")
+                    && msg.contains(&format!("\"{field}\""))
+                    && msg.contains("empty tool name"),
+                "{msg}"
+            );
+            let fine = server(&format!(r#","{field}":["a", "b"]"#));
+            assert!(fine.validate().is_ok());
+        }
     }
 
     #[test]
@@ -2304,6 +2805,7 @@ mod tests {
             r#"{"provider":"anthropic","api_key_env":"K","model":"m","limits":{
                 "max_turns":100,"timeout_secs":1000,"max_output_chars":100000,
                 "compress_threshold_chars":1000000,"keep_recent_messages":100,
+                "summary_preview_chars":100000,
                 "max_context_tokens":1000000,"max_total_tokens":1000000,
                 "stream_idle_secs":1000,"shell_timeout_secs":10000,
                 "subagent_max_turns":1000}}"#,
@@ -2312,6 +2814,7 @@ mod tests {
         let partial: PartialConfig = serde_json::from_str(
             r#"{"limits":{"max_turns":2,"timeout_secs":3,"max_output_chars":4,
                 "compress_threshold_chars":5,"keep_recent_messages":6,
+                "summary_preview_chars":60,
                 "max_context_tokens":7,"max_total_tokens":8,
                 "stream_idle_secs":9,"shell_timeout_secs":10,
                 "subagent_max_turns":11}}"#,
@@ -2327,6 +2830,10 @@ mod tests {
         );
         assert_eq!(
             cfg.limits.keep_recent_messages, 6,
+            "Tighten field must land"
+        );
+        assert_eq!(
+            cfg.limits.summary_preview_chars, 60,
             "Tighten field must land"
         );
         assert_eq!(
@@ -2388,6 +2895,79 @@ mod tests {
         let mut c = base(5);
         c.apply(fragment(25)).unwrap();
         assert_eq!(c.limits.subagent_max_turns, 5, "放宽被拒（只允许收紧）");
+    }
+
+    #[test]
+    fn summary_preview_chars_defaults_and_only_tightens() {
+        // The summary transcript's per-item excerpt cap: default 200, and a
+        // longer excerpt is a bigger billed summary request — so an untrusted
+        // fragment may only LOWER it (Clamp::Tighten, plain min). 0 is legal
+        // (names only) and is therefore the tightest value, unlike the
+        // 0-means-unlimited limits.
+        let base = |chars: usize| {
+            let json = format!(
+                r#"{{"provider":"openai","api_key_env":"K","model":"m",
+                     "limits":{{"summary_preview_chars":{chars}}}}}"#
+            );
+            serde_json::from_str::<Config>(&json).unwrap()
+        };
+        let fragment = |chars: usize| {
+            let json = format!(r#"{{"limits":{{"summary_preview_chars":{chars}}}}}"#);
+            serde_json::from_str::<PartialConfig>(&json).unwrap()
+        };
+
+        assert_eq!(Limits::default().summary_preview_chars, 200);
+        // Absent from the JSON → the serde default (the parsed-empty sentinel
+        // in `limits_serde_defaults_match_default_impl` covers `{}`).
+        let bare: Config =
+            serde_json::from_str(r#"{"provider":"openai","api_key_env":"K","model":"m"}"#).unwrap();
+        assert_eq!(bare.limits.summary_preview_chars, 200);
+
+        let mut c = base(1000);
+        c.apply(fragment(300)).unwrap();
+        assert_eq!(c.limits.summary_preview_chars, 300, "收紧生效");
+
+        let mut c = base(1000);
+        c.apply(fragment(0)).unwrap();
+        assert_eq!(
+            c.limits.summary_preview_chars, 0,
+            "0 = 只留名字，合法的最紧值"
+        );
+
+        let mut c = base(200);
+        c.apply(fragment(1000)).unwrap();
+        assert_eq!(
+            c.limits.summary_preview_chars, 200,
+            "放宽被拒（只允许收紧）"
+        );
+    }
+
+    #[test]
+    fn preserved_reasoning_defaults_on_and_opt_out_is_explicit() {
+        // D1 (2026-11-26): the reasoning carry is on unless the config says
+        // otherwise. Pinned in all three shapes the kernel reads a config
+        // from: JSON without the key, JSON with an explicit false, and the
+        // struct default. The fingerprint follows the non-default-only rule,
+        // so the default (on) adds no key and only an explicit false moves it.
+        let on: Config =
+            serde_json::from_str(r#"{"provider":"openai","api_key_env":"K","model":"m"}"#).unwrap();
+        assert!(on.preserved_reasoning, "缺省即开");
+        let explicit_on: Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"K","model":"m","preserved_reasoning":true}"#,
+        )
+        .unwrap();
+        assert!(explicit_on.preserved_reasoning);
+        assert_eq!(
+            explicit_on.fingerprint(),
+            on.fingerprint(),
+            "显式 true 与缺省同形（指纹不因写法而变）"
+        );
+        let off: Config = serde_json::from_str(
+            r#"{"provider":"openai","api_key_env":"K","model":"m","preserved_reasoning":false}"#,
+        )
+        .unwrap();
+        assert!(!off.preserved_reasoning, "显式 false 才关");
+        assert_ne!(off.fingerprint(), on.fingerprint(), "显式 false 移动指纹");
     }
 
     /// §9 per-field merge strategies for `code` fragments — the §13-18-style
@@ -3073,6 +3653,7 @@ mod tests {
         assert_eq!(
             c.gateway_fixes_preset,
             Some(crate::provider::GatewayFixes {
+                no_reasoning_echo: false,
                 max_completion_tokens: true,
                 no_stream_options: false,
                 no_reasoning_effort: false,
@@ -3231,6 +3812,23 @@ mod tests {
         let mut c = mk();
         c.strip_think_tags = false;
         assert_ne!(c.fingerprint(), base, "strip_think_tags must move fp");
+        let mut c = mk();
+        c.preserved_reasoning = false;
+        assert_ne!(
+            c.fingerprint(),
+            base,
+            "preserved_reasoning off must move fp (on is the default)"
+        );
+        let mut c = mk();
+        c.extra_body = Some(serde_json::json!({"top_k": 5}));
+        assert_ne!(c.fingerprint(), base, "extra_body must move fp");
+        let mut c = mk();
+        c.extra_headers =
+            Some(serde_json::from_value(serde_json::json!({"X-Tenant": "a"})).unwrap());
+        assert_ne!(c.fingerprint(), base, "extra_headers must move fp");
+        let mut c = mk();
+        c.env_passthrough = vec!["OTHER_TOKEN".into()];
+        assert_ne!(c.fingerprint(), base, "env_passthrough must move fp");
         // provider / code.skill_injection 经解析面变异（枚举不在根部）。
         let c: Config =
             serde_json::from_str(r#"{"provider":"anthropic","api_key_env":"K","model":"m"}"#)
@@ -3251,7 +3849,32 @@ mod tests {
         c.workdir = Some(std::path::PathBuf::from("."));
         assert_eq!(c.fingerprint(), base, "workdir must NOT move fp");
 
-        // ── Limits 全部 10 个字段 ──
+        // ── McpServerConfig 的后加字段（非默认才进） ──
+        let with_server = || -> Config {
+            serde_json::from_str(
+                r#"{"provider":"openai","api_key_env":"K","model":"m",
+                    "mcp_servers":[{"name":"s","command":"x"}]}"#,
+            )
+            .unwrap()
+        };
+        let server_base = with_server().fingerprint();
+        macro_rules! srv {
+            ($field:ident, $val:expr) => {{
+                let mut c = with_server();
+                c.mcp_servers[0].$field = $val;
+                assert_ne!(
+                    c.fingerprint(),
+                    server_base,
+                    concat!("mcp_servers.", stringify!($field), " must move fp")
+                );
+            }};
+        }
+        srv!(call_timeout_secs, Some(7));
+        srv!(connect_timeout_secs, Some(3));
+        srv!(allow_tools, vec!["a".into()]);
+        srv!(deny_tools, vec!["b".into()]);
+
+        // ── Limits 全部 11 个字段 ──
         macro_rules! lim {
             ($field:ident, $val:expr) => {{
                 let mut c = mk();
@@ -3268,6 +3891,7 @@ mod tests {
         lim!(max_output_chars, 99);
         lim!(compress_threshold_chars, 123456);
         lim!(keep_recent_messages, 4);
+        lim!(summary_preview_chars, 999);
         lim!(max_context_tokens, 1000);
         lim!(max_total_tokens, 1000);
         lim!(stream_idle_secs, 77);
@@ -3318,6 +3942,252 @@ mod tests {
             mk_pair(false).fingerprint(),
             "mcp_servers declared order IS harness topology (documented)"
         );
+    }
+
+    /// The model-window note is for the unset window only, and says what the
+    /// run falls back to in both default shapes (char threshold on / off).
+    #[test]
+    fn context_window_hint_only_while_the_window_is_unset() {
+        let mut lim = Limits::default();
+        assert_eq!(lim.max_context_tokens, 0, "the default is unset");
+        let hint = lim.context_window_hint().expect("unset window → a hint");
+        assert!(
+            hint.contains("limits.max_context_tokens")
+                && hint.contains("compress_threshold_chars")
+                && hint.contains("CJK"),
+            "{hint}"
+        );
+        assert!(
+            hint.contains(&format!("≈ {} tokens", lim.compress_threshold_chars / 4)),
+            "the note quotes the effective fallback: {hint}"
+        );
+        // The char threshold is off too: preflight compression is entirely off.
+        lim.compress_threshold_chars = 0;
+        let off = lim.context_window_hint().unwrap();
+        assert!(off.contains("compress_threshold_chars is 0"), "{off}");
+        // Set: nothing to say.
+        lim.max_context_tokens = 200_000;
+        assert!(lim.context_window_hint().is_none());
+    }
+
+    // ── Request-shaping extras: extra_body / extra_headers / env_passthrough ──
+    //
+    // All three change what leaves the process (a body field, a header, a
+    // variable), so a bad one fails at CONFIG time with the entry blamed —
+    // never as a provider 400 on the first request or as a silently ignored
+    // knob — and never by echoing a value.
+
+    /// Parse + validate a config exactly as `Config::load` does, minus the file.
+    fn validated(json: &str) -> Result<Config> {
+        let mut cfg: Config = serde_json::from_str(json)?;
+        cfg.validate_and_normalize()?;
+        Ok(cfg)
+    }
+
+    #[test]
+    fn extra_body_takes_vendor_knobs_and_rejects_kernel_owned_keys() {
+        let ok = validated(
+            r#"{"provider":"openai","api_key_env":"K","model":"m",
+                "extra_body":{"thinking":{"type":"enabled"},"top_k":5}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            ok.extra_body,
+            Some(serde_json::json!({"thinking": {"type": "enabled"}, "top_k": 5}))
+        );
+
+        // Two sources for one kernel-owned field is a silent drift.
+        for key in [
+            "model",
+            "max_tokens",
+            "max_completion_tokens",
+            "messages",
+            "stream",
+        ] {
+            let json = format!(
+                r#"{{"provider":"openai","api_key_env":"K","model":"m","extra_body":{{"{key}":"x"}}}}"#
+            );
+            let err = validated(&json).unwrap_err().to_string();
+            assert!(err.contains(&format!("'{key}'")), "{key}: {err}");
+        }
+
+        let err = validated(
+            r#"{"provider":"openai","api_key_env":"K","model":"m","extra_body":["top_k"]}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("JSON object"), "{err}");
+
+        // Effort-derived keys are reserved only while `reasoning_effort` is
+        // set: with it unset they are exactly what the field is for.
+        let free = validated(
+            r#"{"provider":"openai","api_key_env":"K","model":"m",
+                "extra_body":{"reasoning_effort":"high","thinking":{"type":"enabled"}}}"#,
+        )
+        .unwrap();
+        assert!(free.reasoning_effort.is_none());
+        let err = validated(
+            r#"{"provider":"openai","api_key_env":"K","model":"m","reasoning_effort":"low",
+                "extra_body":{"thinking":{"type":"enabled"}}}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("'thinking'") && err.contains("reasoning_effort"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn extra_headers_reject_kernel_managed_names_and_bad_entries_without_echoing_values() {
+        let ok = validated(
+            r#"{"provider":"anthropic","api_key_env":"K","model":"m",
+                "extra_headers":{"anthropic-beta":"secret-beta-9f3a","X-Tenant":"tenant-secret-77"}}"#,
+        )
+        .unwrap();
+        let headers = ok.extra_headers.as_ref().unwrap();
+        assert_eq!(headers.0["X-Tenant"], "tenant-secret-77");
+        // `Config` derives Debug — the hand-written one on ExtraHeaders keeps
+        // the key names (useful in a log) and masks every value.
+        let printed = format!("{ok:?}");
+        assert!(
+            printed.contains("anthropic-beta") && printed.contains("X-Tenant"),
+            "{printed}"
+        );
+        assert!(
+            !printed.contains("secret-beta-9f3a") && !printed.contains("tenant-secret-77"),
+            "a header value reached Debug output: {printed}"
+        );
+
+        // Authentication, protocol version, content type: the kernel's.
+        for name in [
+            "Authorization",
+            "x-api-key",
+            "Anthropic-Version",
+            "Content-Type",
+            "HOST",
+        ] {
+            let json = format!(
+                r#"{{"provider":"openai","api_key_env":"K","model":"m",
+                    "extra_headers":{{"{name}":"x"}}}}"#
+            );
+            let err = validated(&json).unwrap_err().to_string();
+            assert!(err.contains(&format!("'{name}'")), "{name}: {err}");
+        }
+
+        // An invalid value is often a secret with a stray newline: rejected,
+        // the header named, the value never echoed.
+        let err = validated(
+            r#"{"provider":"openai","api_key_env":"K","model":"m",
+                "extra_headers":{"X-Tenant":"secret-value-9f3a\n"}}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("'X-Tenant'") && err.contains("invalid value"),
+            "{err}"
+        );
+        assert!(!err.contains("secret-value-9f3a"), "{err}");
+
+        let err = validated(
+            r#"{"provider":"openai","api_key_env":"K","model":"m",
+                "extra_headers":{"bad name":"v"}}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("invalid header name"), "{err}");
+    }
+
+    #[test]
+    fn env_passthrough_takes_names_and_rejects_anything_else() {
+        let ok = validated(
+            r#"{"provider":"openai","api_key_env":"K","model":"m","env_passthrough":["OTHER_TOKEN"]}"#,
+        )
+        .unwrap();
+        assert_eq!(ok.env_passthrough, vec!["OTHER_TOKEN"]);
+        for name in ["", "A=B", "A\u{0}B"] {
+            let json = format!(
+                r#"{{"provider":"openai","api_key_env":"K","model":"m","env_passthrough":[{}]}}"#,
+                serde_json::json!(name)
+            );
+            assert!(
+                validated(&json).is_err(),
+                "{name:?} must not pass as a variable name"
+            );
+        }
+    }
+
+    /// Each of the four changes what every later request carries or what a
+    /// tool subprocess can see — none may come from an untrusted batch
+    /// fragment, whichever entry point it uses (`forbidden_batch_override`
+    /// for the CLI's copy, `Config::apply` for library hosts).
+    #[test]
+    fn request_shaping_fields_are_hard_for_untrusted_overlays() {
+        let base: Config =
+            serde_json::from_str(r#"{"provider":"openai","api_key_env":"K","model":"m"}"#).unwrap();
+        for (json, field) in [
+            (r#"{"preserved_reasoning":false}"#, "preserved_reasoning"),
+            (r#"{"extra_body":{"top_k":5}}"#, "extra_body"),
+            (r#"{"extra_headers":{"X-Tenant":"t"}}"#, "extra_headers"),
+            (r#"{"env_passthrough":["OTHER_TOKEN"]}"#, "env_passthrough"),
+        ] {
+            let p: PartialConfig = serde_json::from_str(json).unwrap();
+            assert_eq!(p.forbidden_batch_override(), Some(field), "{field}");
+            let mut cfg = base.clone();
+            let err = cfg.apply(p).unwrap_err().to_string();
+            assert!(err.contains(field), "{field}: {err}");
+            assert_eq!(
+                cfg.fingerprint(),
+                base.fingerprint(),
+                "{field}: rejected whole, nothing applied"
+            );
+        }
+        // A vetted overlay (a host's own config layering) may set them, and
+        // goes through the same validation as a file.
+        let mut cfg = base.clone();
+        let p: PartialConfig = serde_json::from_str(
+            r#"{"preserved_reasoning":false,"extra_body":{"top_k":5},"extra_headers":{"X-Tenant":"t"},
+                "env_passthrough":["OTHER_TOKEN"]}"#,
+        )
+        .unwrap();
+        cfg.apply_trusted(p).unwrap();
+        // The default is on (since 2026-11-26): the overlay turned it off.
+        assert!(!cfg.preserved_reasoning);
+        assert_eq!(cfg.extra_body, Some(serde_json::json!({"top_k": 5})));
+        assert!(cfg.extra_headers.is_some() && cfg.env_passthrough == vec!["OTHER_TOKEN"]);
+        // … and never a reserved entry, whichever door it comes through.
+        let mut cfg = base.clone();
+        let p: PartialConfig =
+            serde_json::from_str(r#"{"extra_body":{"model":"smuggled"}}"#).unwrap();
+        assert!(cfg.apply_trusted(p).is_err());
+        assert!(cfg.extra_body.is_none(), "rejected whole");
+    }
+
+    /// `extra_headers` values are credentials: the fingerprint (which lands
+    /// in every result.json) hashes the key names only.
+    #[test]
+    fn extra_header_values_never_reach_the_fingerprint() {
+        let mk = |value: &str| -> Config {
+            let mut c: Config =
+                serde_json::from_str(r#"{"provider":"openai","api_key_env":"K","model":"m"}"#)
+                    .unwrap();
+            c.extra_headers = Some(
+                serde_json::from_value(
+                    serde_json::json!({"X-Tenant": value, "anthropic-beta": "f"}),
+                )
+                .unwrap(),
+            );
+            c
+        };
+        assert_eq!(mk("tenant-a").fingerprint(), mk("tenant-b").fingerprint());
+        let mut other_keys = mk("tenant-a");
+        other_keys.extra_headers = Some(
+            serde_json::from_value(
+                serde_json::json!({"x-other": "tenant-a", "anthropic-beta": "f"}),
+            )
+            .unwrap(),
+        );
+        assert_ne!(other_keys.fingerprint(), mk("tenant-a").fingerprint());
     }
 }
 

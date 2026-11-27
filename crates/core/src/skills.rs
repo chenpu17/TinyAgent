@@ -302,14 +302,6 @@ pub fn scan(dirs: &[PathBuf]) -> (SkillIndex, Vec<String>) {
                     ));
                     continue;
                 }
-                FrontmatterParse::BlockScalar => {
-                    warnings.push(format!(
-                        "skill dir {} SKILL.md uses a YAML block scalar (| or >) for name/description, \
-                         unsupported by the line parser, skipped (write it as a single-line scalar)",
-                        sub.display()
-                    ));
-                    continue;
-                }
             };
             if !valid_skill_name(&fm.name) {
                 warnings.push(format!(
@@ -431,34 +423,40 @@ struct ParsedFrontmatter {
     metadata: HashMap<String, String>,
 }
 
-/// Outcome of parsing a SKILL.md frontmatter block. `BlockScalar` is
-/// distinguished from plain `Missing` because the failure MODES differ
-/// (round-4 R4B-F4): a `|`/`>` header on a required field used to be loaded
-/// as a literal garbage description — silently violating the "broken skill
-/// skipped + warned" contract — while a missing field always skipped loudly.
+/// Outcome of parsing a SKILL.md frontmatter block.
 #[derive(Debug)]
 enum FrontmatterParse {
     Parsed(ParsedFrontmatter),
     /// No frontmatter block at all, or a required field missing/empty.
     Missing,
-    /// name/description are a YAML block scalar (`|`/`>` header): the line
-    /// parser doesn't support multi-line scalars, so the header text would
-    /// otherwise become the literal system-prompt intro.
-    BlockScalar,
 }
+
 /// Parse the agentskills.io YAML frontmatter block delimited by `---` lines.
 ///
 /// All six standard fields are recognized: `name`/`description` (required),
 /// `license`/`compatibility` (optional single-line), `allowed-tools` (optional,
 /// whitespace-split into a list), and `metadata` (optional indented `key:
-/// value` block → map). Only single-line scalar values are supported for the
-/// scalar fields; `metadata` is the one block form and is collected by a small
-/// indent-driven state machine (no nested YAML). Unknown keys are ignored —
-/// the open spec permits them (only Claude Code's upload path rejects unknown
-/// keys). Returns [`FrontmatterParse::Missing`] if there is no frontmatter or
-/// either required field is missing/empty, and [`FrontmatterParse::BlockScalar`]
-/// if a required field is written as a YAML block scalar (a `|`/`>` header the
-/// single-line parser cannot serve). Expects the conventional `key: value`
+/// value` block → map). The four scalar fields (`name` / `description` /
+/// `license` / `compatibility`) and each `metadata` value may be written
+/// either as a single-line scalar or as a YAML BLOCK scalar (`|` literal or
+/// `>` folded, with optional chomping / indentation indicators) — a form
+/// the Agent Skills spec allows and real skill files use for long
+/// descriptions. Block bodies are collected by indentation: every line
+/// indented deeper than the `key:` line belongs to the block, the first
+/// non-blank such line sets the block's base indentation, deeper lines keep
+/// their extra indentation, and the first line at or above the key's
+/// indentation ends it (so `metadata:` right after a folded description is
+/// a sibling key, not description text). The value is always trimmed, so
+/// the chomping indicator (`-`/`+`) is accepted but never changes the
+/// result. `metadata` is otherwise the one block form and is collected by a
+/// small indent-driven state machine. NOT supported, deliberately (no YAML
+/// dependency): multi-line PLAIN scalars, block sequences (`- item`) and
+/// nested mappings — such keys keep their pre-existing behavior (`allowed-
+/// tools` reads empty, unknown keys are ignored, a required field comes out
+/// empty → `Missing`). The open spec permits unknown keys, so they are
+/// ignored (only Claude Code's upload path rejects them). Returns
+/// [`FrontmatterParse::Missing`] if there is no frontmatter or either
+/// required field is missing/empty. Expects the conventional `key: value`
 /// shape (no space before the colon).
 fn parse_frontmatter(content: &str) -> FrontmatterParse {
     // Strip a UTF-8 BOM if present: Windows editors (VS Code default, PowerShell
@@ -468,8 +466,11 @@ fn parse_frontmatter(content: &str) -> FrontmatterParse {
     // check, silently skipping the whole skill with a misleading "missing
     // frontmatter" warning.
     let content = content.strip_prefix('\u{feff}').unwrap_or(content);
-    let mut lines = content.lines();
-    let Some(first) = lines.next() else {
+    // `lines()` already normalizes CRLF (and a lone trailing CR) away, so a
+    // block scalar collected from a Windows-checked-out skill carries no
+    // stray `\r`.
+    let lines: Vec<&str> = content.lines().collect();
+    let Some(first) = lines.first() else {
         return FrontmatterParse::Missing;
     };
     if first.trim() != "---" {
@@ -482,8 +483,13 @@ fn parse_frontmatter(content: &str) -> FrontmatterParse {
     let mut allowed_tools: Vec<String> = Vec::new();
     let mut metadata: HashMap<String, String> = HashMap::new();
     let mut in_metadata = false;
-    let mut block_scalar = false;
-    for line in lines {
+    // `i` is the NEXT line to look at; a block scalar advances it past the
+    // lines it consumed (the line that ENDED the block is looked at again,
+    // as a key line).
+    let mut i = 1;
+    while i < lines.len() {
+        let line = lines[i];
+        i += 1;
         let t = line.trim();
         if t == "---" {
             break; // end of frontmatter
@@ -497,29 +503,21 @@ fn parse_frontmatter(content: &str) -> FrontmatterParse {
         if in_metadata {
             if indented {
                 if let Some((k, v)) = split_kv(t) {
-                    metadata.insert(k.to_string(), unquote(v));
+                    let text = scalar_value(v, &lines, &mut i, indent_of(line));
+                    metadata.insert(k.to_string(), text);
                 }
                 continue;
             }
             in_metadata = false;
         }
-        if let Some(v) = strip_key(t, "name") {
-            // Header check on the RAW text (pre-unquote): a quoted "|-" is a
-            // plain scalar by definition — unquoting first would misdetect
-            // it as a block scalar.
-            if is_block_scalar_header(raw_scalar_value(t, "name")) {
-                block_scalar = true;
-            }
-            name = Some(v);
-        } else if let Some(v) = strip_key(t, "description") {
-            if is_block_scalar_header(raw_scalar_value(t, "description")) {
-                block_scalar = true;
-            }
-            description = Some(v);
-        } else if let Some(v) = strip_key(t, "license") {
-            license = Some(v);
-        } else if let Some(v) = strip_key(t, "compatibility") {
-            compatibility = Some(v);
+        if let Some(rest) = t.strip_prefix("name:") {
+            name = Some(scalar_value(rest, &lines, &mut i, indent_of(line)));
+        } else if let Some(rest) = t.strip_prefix("description:") {
+            description = Some(scalar_value(rest, &lines, &mut i, indent_of(line)));
+        } else if let Some(rest) = t.strip_prefix("license:") {
+            license = Some(scalar_value(rest, &lines, &mut i, indent_of(line)));
+        } else if let Some(rest) = t.strip_prefix("compatibility:") {
+            compatibility = Some(scalar_value(rest, &lines, &mut i, indent_of(line)));
         } else if let Some(v) = strip_key(t, "allowed-tools") {
             allowed_tools = v.split_whitespace().map(String::from).collect();
         } else if strip_key(t, "metadata").is_some() {
@@ -528,9 +526,6 @@ fn parse_frontmatter(content: &str) -> FrontmatterParse {
             in_metadata = true;
         }
         // other keys ignored
-    }
-    if block_scalar {
-        return FrontmatterParse::BlockScalar;
     }
     let Some(name) = name.filter(|n| !n.is_empty()) else {
         return FrontmatterParse::Missing;
@@ -548,20 +543,159 @@ fn parse_frontmatter(content: &str) -> FrontmatterParse {
     })
 }
 
-/// Is this single-line value a YAML block scalar HEADER (`|` or `>`, with
-/// optional chomping `+`/`-` and indentation digits in any order) and nothing
-/// else? Strict match on purpose: `>-`/`|2-` are unsupported block scalars,
-/// while `>2x faster` (trailing text) stays a plain string — real-world
-/// descriptions may legitimately start with `>` (e.g. prompts), and YAML
-/// itself would reject a header with trailing garbage. Quoted values
-/// (`"|-"`) are plain scalars by definition and never reach here.
-fn is_block_scalar_header(v: &str) -> bool {
-    let mut chars = v.chars();
-    match chars.next() {
-        Some('|' | '>') => {}
-        _ => return false,
+/// The value of a scalar field whose text after `key:` is `rest`: a block
+/// scalar body when `rest` is a block header (`|` / `>`), else the
+/// single-line scalar (quotes stripped). `lines`/`i` are the frontmatter
+/// line cursor (see `parse_frontmatter`); only the block form moves it.
+/// `key_indent` is the key line's indentation — a block body must be
+/// indented deeper than it.
+fn scalar_value(rest: &str, lines: &[&str], i: &mut usize, key_indent: usize) -> String {
+    match parse_block_header(rest.trim()) {
+        Some(header) => collect_block_scalar(lines, i, key_indent, header),
+        None => unquote(rest.trim()),
     }
-    chars.all(|c| matches!(c, '+' | '-' | '0'..='9'))
+}
+
+/// A parsed YAML block scalar header: `|` (literal) or `>` (folded), each
+/// optionally followed by a chomping indicator (`-` / `+`) and an explicit
+/// indentation indicator (`1`–`9`), in either order.
+struct BlockHeader {
+    /// `>`: line breaks between equally-indented lines fold to spaces.
+    /// `|`: every line break is kept.
+    folded: bool,
+    /// Explicit indentation indicator: the body is indented this many columns
+    /// deeper than the key (instead of auto-detected from the first line).
+    explicit_indent: Option<usize>,
+}
+
+/// Is the text after `key:` a YAML block scalar HEADER (`|` or `>`, with
+/// optional chomping `+`/`-` and indentation digits in any order) and nothing
+/// else? Strict match on purpose: `>2x faster` (trailing text) stays a plain
+/// string — real-world descriptions may legitimately start with `>` (e.g.
+/// prompts) — and YAML itself would reject a header with trailing garbage
+/// (or a repeated indicator). Quoted values (`"|-"`) are plain scalars by
+/// definition and never reach here. The chomping indicator is validated and
+/// then ignored: block values are trimmed, so strip/clip/keep coincide.
+fn parse_block_header(v: &str) -> Option<BlockHeader> {
+    let mut chars = v.chars();
+    let folded = match chars.next()? {
+        '|' => false,
+        '>' => true,
+        _ => return None,
+    };
+    let (mut chomp, mut indent) = (false, None);
+    for c in chars {
+        match c {
+            '-' | '+' if !chomp => chomp = true,
+            '1'..='9' if indent.is_none() => indent = Some(c as usize - '0' as usize),
+            _ => return None,
+        }
+    }
+    Some(BlockHeader {
+        folded,
+        explicit_indent: indent,
+    })
+}
+
+/// Number of leading space/tab columns of `line`.
+fn indent_of(line: &str) -> usize {
+    line.chars().take_while(|c| *c == ' ' || *c == '\t').count()
+}
+
+/// Collect a block scalar body starting at `lines[*i]`, for a header whose
+/// key line is indented `key_indent` columns. Returns the trimmed scalar
+/// value and the index of the first line NOT consumed by the block (the line
+/// that ended it is re-examined as a key line by the caller).
+///
+/// Membership is by indentation only: a non-blank line belongs to the block
+/// while it is indented deeper than the key line AND at least as deep as the
+/// block's base indentation (the first non-blank body line's indentation, or
+/// the explicit indicator). Blank lines inside are content (a paragraph
+/// break); blank lines after the last body line are skipped. More-indented
+/// lines keep their extra indentation relative to the base.
+///
+/// - literal (`|`): line breaks and blank lines are kept as-is.
+/// - folded (`>`): the break between two equally-indented body lines becomes
+///   one space; breaks next to a blank line or to a more-indented line stay
+///   newlines (YAML's "more-indented lines are not folded" rule).
+fn collect_block_scalar(
+    lines: &[&str],
+    i: &mut usize,
+    key_indent: usize,
+    header: BlockHeader,
+) -> String {
+    // `None` = blank line; `Some((indent, text))` = body line, whitespace at
+    // both ends already removed (trailing whitespace is invisible in the
+    // system prompt and would only make two equal descriptions compare
+    // unequal; the leading indentation is re-added relative to `base`).
+    let mut items: Vec<Option<(usize, &str)>> = Vec::new();
+    let mut base = header.explicit_indent.map(|n| key_indent.saturating_add(n));
+    while *i < lines.len() {
+        let line = lines[*i];
+        if line.trim().is_empty() {
+            items.push(None);
+            *i += 1;
+            continue;
+        }
+        let indent = indent_of(line);
+        if indent <= key_indent {
+            break;
+        }
+        match base {
+            None => base = Some(indent),
+            Some(b) if indent < b => break,
+            Some(_) => {}
+        }
+        // Text with BOTH ends' whitespace removed; the indentation is carried
+        // separately (relative to `base`) so a body line never drags its
+        // leading spaces into the value.
+        items.push(Some((indent, line.trim())));
+        *i += 1;
+    }
+    let base = base.unwrap_or(0);
+    let body = |indent: usize, text: &str| -> String {
+        let mut s = String::with_capacity(text.len() + 4);
+        for _ in base..indent {
+            s.push(' ');
+        }
+        s.push_str(text);
+        s
+    };
+    let mut out = String::new();
+    if header.folded {
+        // `prev`: None before the first body line and after a blank line;
+        // Some(more_indented) otherwise. A blank line after at least one body
+        // line is a paragraph break (kept as a newline, and it suppresses the
+        // fold on the following line).
+        let mut prev: Option<bool> = None;
+        for item in items {
+            let Some((indent, text)) = item else {
+                if prev.take().is_some() || !out.is_empty() {
+                    out.push('\n');
+                }
+                continue;
+            };
+            let more_indented = indent > base;
+            match prev {
+                None => {}
+                Some(false) if !more_indented => out.push(' '),
+                Some(_) => out.push('\n'),
+            }
+            out.push_str(&body(indent, text));
+            prev = Some(more_indented);
+        }
+    } else {
+        for item in &items {
+            match item {
+                None => out.push('\n'),
+                Some((indent, text)) => {
+                    out.push_str(&body(*indent, text));
+                    out.push('\n');
+                }
+            }
+        }
+    }
+    out.trim().to_string()
 }
 
 /// Match `key: value` (after trim), returning the value trimmed and with a
@@ -569,15 +703,6 @@ fn is_block_scalar_header(v: &str) -> bool {
 fn strip_key(line: &str, key: &str) -> Option<String> {
     let rest = line.strip_prefix(&format!("{key}:"))?;
     Some(unquote(rest.trim()))
-}
-
-/// The raw (pre-unquote) scalar text after `key:` on a trimmed line, or `""`
-/// when the line doesn't have that shape. Used only by the block-scalar
-/// check, which must see quoting as the user wrote it.
-fn raw_scalar_value<'a>(line: &'a str, key: &str) -> &'a str {
-    line.strip_prefix(key)
-        .and_then(|r| r.strip_prefix(':'))
-        .map_or("", str::trim)
 }
 
 /// Split a `key: value` line at the first colon (used for `metadata` entries,
@@ -787,36 +912,168 @@ mod tests {
     }
 
     #[test]
-    fn frontmatter_block_scalar_on_required_field_is_unsupported() {
-        // R4B-F4: YAML block scalars (`|`/`>` headers) are legal YAML but the
-        // line parser can't serve them — the header text must not become a
-        // literal garbage description (that silently broke the "broken skill
-        // skipped + warned" contract). Strict header match: trailing text
-        // (`>2x faster`) stays a plain string.
-        assert!(matches!(
-            parse_frontmatter("---\nname: x\ndescription: >-\n  folded\n---\nbody"),
-            FrontmatterParse::BlockScalar
-        ));
-        assert!(matches!(
-            parse_frontmatter("---\nname: x\ndescription: |\n  literal\n---\nbody"),
-            FrontmatterParse::BlockScalar
-        ));
-        assert!(matches!(
-            parse_frontmatter("---\nname: |\n  x\ndescription: d\n---\nbody"),
-            FrontmatterParse::BlockScalar
-        ));
-        // Header with indentation + chomping indicators in any order.
-        assert!(matches!(
-            parse_frontmatter("---\nname: x\ndescription: |2-\n  literal\n---\nbody"),
-            FrontmatterParse::BlockScalar
-        ));
+    fn frontmatter_block_scalar_header_match_is_strict() {
         // Trailing text after the indicator is NOT a header (real prompts may
         // start with '>'): still parses as a plain single-line scalar.
         let f = fm("---\nname: x\ndescription: >2x faster than before\n---\nbody");
         assert_eq!(f.description, ">2x faster than before");
+        let f = fm("---\nname: x\ndescription: > see the guide\n---\nbody");
+        assert_eq!(f.description, "> see the guide");
         // Quoted block-scalar-looking value is a plain scalar by definition.
         let f = fm("---\nname: x\ndescription: \"|-\"\n---\nbody");
         assert_eq!(f.description, "|-");
+        // Indicators: chomping + indentation in either order are headers; a
+        // repeated indicator, indentation digit 0, or any other trailer is
+        // not (YAML would reject those too).
+        for h in [
+            "|", ">", "|-", ">-", "|+", ">+", "|2", ">9", "|2-", ">-2", "|-2", ">2+",
+        ] {
+            assert!(parse_block_header(h).is_some(), "{h:?} must be a header");
+        }
+        for h in [
+            "|--", ">-+", "|22", ">0", "|-x", "| #c", "|2x", "", " -", "a|", "||",
+        ] {
+            assert!(
+                parse_block_header(h).is_none(),
+                "{h:?} must not be a header"
+            );
+        }
+    }
+
+    #[test]
+    fn frontmatter_block_scalars_fold_and_keep_lines() {
+        // Real skill files write long descriptions as YAML block scalars
+        // (the Agent Skills spec allows it). The line parser used to skip
+        // such skills outright. Table-driven over the forms that matter:
+        // folded vs literal, indentation, blank lines, indicators, CRLF.
+        let cases: Vec<(&str, String, &str)> = vec![
+            ("folded joins lines with a space", ">".into(), "a b"),
+            ("folded strip indicator", ">-".into(), "a b"),
+            (
+                "folded keep indicator (values are trimmed)",
+                ">+".into(),
+                "a b",
+            ),
+            ("literal keeps line breaks", "|".into(), "a\nb"),
+            ("literal strip indicator", "|-".into(), "a"),
+            ("literal keeps blank lines", "|".into(), "a\n\nb"),
+            ("folded folds across ONE blank line", ">".into(), "a\nb"),
+            ("folded keeps N-1 of N blank lines", ">".into(), "a\n\nb"),
+            (
+                "folded keeps breaks around a deeper line (extra indent kept)",
+                ">".into(),
+                "a\n  code\nb",
+            ),
+            (
+                "literal keeps a deeper line's EXTRA indentation",
+                "|".into(),
+                "a\n  code\nb",
+            ),
+            ("a less-indented line ends the block", ">".into(), "a"),
+        ];
+        let bodies = [
+            "  a\n  b\n",
+            "  a\n  b\n",
+            "  a\n  b\n",
+            "  a\n  b\n",
+            "  a\n",
+            "  a\n\n  b\n",
+            "  a\n\n  b\n",
+            "  a\n\n\n  b\n",
+            "  a\n    code\n  b\n",
+            "  a\n    code\n  b\n",
+            "    a\n  b: 1\n",
+        ];
+        for ((label, header, want), body) in cases.into_iter().zip(bodies) {
+            let c = format!("---\nname: x\ndescription: {header}\n{body}---\nbody");
+            let f = fm(&c);
+            assert_eq!(f.description, want, "{label}: {c:?}");
+        }
+    }
+
+    #[test]
+    fn frontmatter_block_scalar_edge_shapes() {
+        // Trailing whitespace on a body line is stripped (invisible in the
+        // system prompt, and it would make equal descriptions differ).
+        let f = fm("---\nname: x\ndescription: >\n  a   \n  b\t\n---\n");
+        assert_eq!(f.description, "a b");
+        // Deeper base indentation is auto-detected from the first body line.
+        let f = fm("---\nname: x\ndescription: >\n    a\n    b\n---\n");
+        assert_eq!(f.description, "a b");
+        // A tab counts as one indentation column.
+        let f = fm("---\nname: x\ndescription: |\n\ta\n---\n");
+        assert_eq!(f.description, "a");
+        // Leading blank lines are not content.
+        let f = fm("---\nname: x\ndescription: >\n\n\n  a\n---\n");
+        assert_eq!(f.description, "a");
+        // Explicit indentation indicator (1 column deeper than the key).
+        let f = fm("---\nname: x\ndescription: |2\n  a\n  b\n---\n");
+        assert_eq!(f.description, "a\nb");
+        // CRLF line endings: no stray carriage return in the value.
+        let f = fm("---\r\nname: x\r\ndescription: >\r\n  a\r\n  b\r\n---\r\n");
+        assert_eq!(f.description, "a b");
+        let f = fm("---\r\nname: x\r\ndescription: |\r\n  a\r\n\r\n  b\r\n---\r\n");
+        assert_eq!(f.description, "a\n\nb");
+        // A multi-line name is still a name the standard rejects (the scan
+        // layer reports it as invalid) — but a one-line block name is fine.
+        let f = fm("---\nname: |-\n  x\ndescription: d\n---\n");
+        assert_eq!(f.name, "x");
+        let f = fm("---\nname: |\n  x\n  y\ndescription: d\n---\n");
+        assert_eq!(f.name, "x\ny");
+        assert!(!valid_skill_name(&f.name));
+    }
+
+    #[test]
+    fn frontmatter_block_scalar_ends_at_sibling_keys_and_coexists_with_metadata() {
+        // Membership is by indentation: the first line at or above the key's
+        // indentation ends the block and is parsed as a key again.
+        let f = fm("---\nname: x\ndescription: >\n  Use it\n  well\nlicense: MIT\n---\n");
+        assert_eq!(f.description, "Use it well");
+        assert_eq!(f.license.as_deref(), Some("MIT"));
+        // `metadata:` right after a folded description is a sibling key, not
+        // description text.
+        let f =
+            fm("---\nname: x\ndescription: >\n  Use it\n  well\nmetadata:\n  author: alice\n---\n");
+        assert_eq!(f.description, "Use it well");
+        assert_eq!(f.metadata.get("author").map(String::as_str), Some("alice"));
+        // Optional scalar fields accept block scalars too.
+        let f = fm("---\nname: x\ndescription: d\nlicense: >\n  Apache\n  2.0\n---\n");
+        assert_eq!(f.license.as_deref(), Some("Apache 2.0"));
+        // …and so does a metadata value; a sibling metadata key at the map's
+        // own indentation ends it.
+        let f = fm(
+            "---\nname: x\ndescription: d\nmetadata:\n  notes: |\n    line1\n    line2\n  author: bob\n---\n",
+        );
+        assert_eq!(
+            f.metadata.get("notes").map(String::as_str),
+            Some("line1\nline2")
+        );
+        assert_eq!(f.metadata.get("author").map(String::as_str), Some("bob"));
+        let f = fm(
+            "---\nname: x\ndescription: d\nmetadata:\n  notes: >\n    line1\n    line2\n  author: bob\n---\n",
+        );
+        assert_eq!(
+            f.metadata.get("notes").map(String::as_str),
+            Some("line1 line2")
+        );
+    }
+
+    #[test]
+    fn frontmatter_empty_block_scalar_on_a_required_field_is_missing() {
+        // A header with no body is an empty value: for a required field that
+        // is the same loud `Missing` as an absent key (never an empty
+        // description in the system prompt); for an optional field it is
+        // Some(""), same as `license:` with nothing after the colon.
+        assert!(matches!(
+            parse_frontmatter("---\nname: x\ndescription: >\n---\n"),
+            FrontmatterParse::Missing
+        ));
+        assert!(matches!(
+            parse_frontmatter("---\nname: x\ndescription: |\nlicense: MIT\n---\n"),
+            FrontmatterParse::Missing
+        ));
+        let f = fm("---\nname: x\ndescription: d\nlicense: |\n---\n");
+        assert_eq!(f.license.as_deref(), Some(""));
     }
 
     #[test]
@@ -1469,22 +1726,42 @@ description: o
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// R4B-F4: a `|`/`>` block scalar on description is legal YAML the line
-    /// parser can't serve — the header text must be SKIPPED with a specific
-    /// warning, not loaded as a literal garbage intro.
+    /// A `|`/`>` block scalar on description is legal YAML the Agent Skills
+    /// spec allows; such a skill LOADS (it used to be skipped with a warning
+    /// because the line parser couldn't serve the form), with the folded
+    /// value as the one-line intro — and the header text never leaks into
+    /// the system prompt.
     #[test]
-    fn scan_warns_on_block_scalar_description() {
+    fn scan_loads_block_scalar_descriptions() {
         let dir = tmpd("blockscalar");
         write_skill(
             &dir,
             "folded",
             "---\nname: folded\ndescription: >-\n  a folded\n  multi-line intro\n---\nbody\n",
         );
+        write_skill(
+            &dir,
+            "literal",
+            "---\nname: literal\ndescription: |\n  first line\n\n  second paragraph\n---\nbody\n",
+        );
         let (idx, warns) = scan(std::slice::from_ref(&dir));
-        assert!(idx.is_empty(), "block-scalar skill must be skipped");
         assert!(
-            warns.len() == 1 && warns[0].contains("block scalar"),
-            "{warns:?}"
+            warns.is_empty(),
+            "block-scalar skills are no longer a defect: {warns:?}"
+        );
+        let by_name: HashMap<&str, &SkillEntry> =
+            idx.entries.iter().map(|e| (e.name.as_str(), e)).collect();
+        assert_eq!(
+            by_name.get("folded").map(|e| e.description.as_str()),
+            Some("a folded multi-line intro")
+        );
+        assert_eq!(
+            by_name.get("literal").map(|e| e.description.as_str()),
+            Some("first line\n\nsecond paragraph")
+        );
+        assert_eq!(
+            render_intro(None, &idx).matches("description: >").count(),
+            0
         );
         std::fs::remove_dir_all(&dir).ok();
     }

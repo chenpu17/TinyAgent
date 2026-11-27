@@ -1,8 +1,9 @@
 //! Minimal MCP client: stdio, Streamable HTTP (2025-03-26) and
 //! legacy HTTP+SSE (2024-11-05) transports. Implements just enough
-//! of the protocol: initialize, tools/list, tools/call.
+//! of the protocol: initialize, tools/list, tools/call, ping,
+//! notifications/cancelled.
 
-use crate::config::{redact_url_credentials, McpServerConfig, McpTransport};
+use crate::config::{redact_url_credentials, McpServerConfig, McpTransport, MCP_MAX_TIMEOUT_SECS};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -12,8 +13,30 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// The protocol revision this client REQUESTS in `initialize` — the oldest
+/// revision that defines Streamable HTTP. The server answers with the revision
+/// it will actually speak (`negotiatedProtocolVersion`); that value is what
+/// later HTTP requests carry in `MCP-Protocol-Version`, so a server on a
+/// newer revision keeps working instead of 400ing every request
+/// (see [`negotiate_protocol_version`]). A server that does not know this
+/// revision answers with its own latest, or nothing.
 const PROTOCOL_VERSION: &str = "2025-03-26";
+/// Revisions this client can interoperate with. `initialize` asks for
+/// [`PROTOCOL_VERSION`] only, so a server answers with one of these solely
+/// when it does not implement the requested revision; everything this client
+/// puts on the wire (initialize / tools/list / tools/call / ping / SSE / 202 /
+/// cancellation) reads the same across them. Anything else is worth one
+/// warning, never a failed handshake: the alternative is refusing a server
+/// that would have worked. Tracking item, not a claim: revisions after the
+/// last entry are new to this client too.
+const KNOWN_PROTOCOL_VERSIONS: &[&str] = &[PROTOCOL_VERSION, "2025-06-18", "2025-11-25"];
+/// Default bound of one JSON-RPC request (`tools/call` included), used when
+/// the server entry leaves `call_timeout_secs` unset — see [`Timeouts`].
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
+/// Default first-contact bound of the HTTP transports (the TCP/TLS connect;
+/// for legacy SSE also the wait for the `endpoint` event — at first contact
+/// and again after every stream rotation), used when the server entry leaves
+/// `connect_timeout_secs` unset — see [`Timeouts`].
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Per-round read deadline for the long-lived SSE GET streams (the standing
 /// standalone stream and the legacy SSE reader share it). A blocked
@@ -39,13 +62,20 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// whatever arrives on the live connection and never re-delivers anything
 /// itself; a response the server does not re-send is lost, and the caller
 /// waits out the full [`CALL_TIMEOUT`]. Rotation shrinks the delivery gap,
-/// it does not provide redelivery.
+/// it does not provide redelivery. The complementary case is closed
+/// (2026-11): a request ISSUED inside a gap is never posted to the retired
+/// connection's session — the legacy SSE reader retires the POST target
+/// before it drops the connection, and `post` waits for the fresh
+/// `endpoint` (`SseTransport::post_target`).
 const STREAM_ROUND: Duration = Duration::from_secs(30);
 /// Reconnect backoff after a stream ended EARLY (server closed it / real
 /// read error / failed reconnect connect). Deadline rotations skip it: the
 /// stream was healthy, and the rotation must re-open the delivery path
 /// immediately.
 const STREAM_BACKOFF: Duration = Duration::from_millis(500);
+/// Poll granularity while a legacy-SSE POST waits for the next connection's
+/// `endpoint` (the rotation gap — see `SseTransport::post_target`).
+const POST_TARGET_POLL: Duration = Duration::from_millis(5);
 /// How long a Drop waits (50ms polls) for its stream reader thread to exit
 /// before detaching. The reader wakes at its current round's deadline at the
 /// latest, so the detached case self-reclaims within ~one round + backoff.
@@ -60,6 +90,26 @@ const READER_JOIN_WAIT: Duration = Duration::from_secs(2);
 /// stdin handle, so the caller kills the child to break the pipe (which also
 /// ends the stuck thread — see [`write_frame_cancelable`]).
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound on the best-effort `notifications/cancelled` that follows a
+/// cancelled request. It is sent AFTER the caller's call has already been
+/// given up, so it must never become the thing the user waits on: a server
+/// too wedged to take one small frame inside this bound is simply not told.
+const CANCEL_NOTIFY_TIMEOUT: Duration = Duration::from_secs(1);
+/// `reason` of that notification. Server-facing only — the model never sees
+/// it (the cancelled call has no result to show).
+const CANCEL_REASON: &str = "cancelled by the client";
+/// How long an HTTP transport may sit without a completed request before a
+/// `tools/call` is preceded by a `ping`. Long enough that an ordinary pause
+/// between turns costs nothing; past it a connection can have been dropped
+/// without either side noticing (idle timeout on a proxy or NAT, a server
+/// restart that forgot the session) — and a request sent into that fails
+/// late and cryptically, or worse runs before anyone can tell. A ping is
+/// side-effect free, so it is the thing to spend on finding out.
+const MCP_IDLE_PING: Duration = Duration::from_secs(60);
+/// Overall bound of that probe (never above the server entry's
+/// `call_timeout_secs`): it runs in front of a call the user is waiting on,
+/// against a connection already suspected dead.
+const MCP_PING_TIMEOUT: Duration = Duration::from_secs(5);
 /// Hard cap on a single line read from an MCP server (stdio line or one SSE
 /// `data:`/`event:` line). Bounds memory against a runaway or malicious server
 /// that emits an unbounded line with no newline — `read_line` would otherwise
@@ -80,6 +130,11 @@ const MCP_EVENT_MAX: usize = 4 * MCP_LINE_MAX;
 /// choice — a hostile/compromised server listing 10k tools used to bloat
 /// every request for the whole session.
 const MCP_MAX_TOOLS: usize = 256;
+/// Cap on `tools/list` pages followed during the handshake (cursor
+/// pagination). 64 pages × any sane page size is far beyond the
+/// [`MCP_MAX_TOOLS`] a server may expose; the bound exists for a server that
+/// keeps returning a fresh `nextCursor` forever.
+const MCP_LIST_MAX_PAGES: usize = 64;
 /// Per-tool description cap (chars) — same 1024 the skill standard uses.
 const MCP_TOOL_DESC_MAX: usize = 1024;
 /// Per-tool inputSchema cap (serialized bytes).
@@ -147,6 +202,193 @@ pub struct McpToolInfo {
     /// SERVER-declared scheduling hint feeding `Tool::batchable` — not a
     /// side-effect-freedom proof (LD-19: 有注解也只视为调度提示).
     pub read_only_hint: bool,
+    /// `annotations.destructiveHint` (absent = `true`, the spec default).
+    /// Recorded for audit and host policy only — never consulted by the
+    /// kernel's own scheduling.
+    pub destructive_hint: bool,
+    /// `annotations.idempotentHint`. The spec gives it NO default, so an
+    /// omitted hint stays `None` ("unknown") rather than guessing.
+    pub idempotent_hint: Option<bool>,
+    /// `annotations.openWorldHint` (absent = `true`, the spec default):
+    /// the tool may talk to outside entities (web, other processes).
+    pub open_world_hint: bool,
+    /// `outputSchema` the server declared for this tool's `structuredContent`
+    /// (absent, non-object, or over the size cap = `None`). Its only use is
+    /// to license the `structuredContent` preference on results — see
+    /// `crate::tools::mcp`.
+    pub output_schema: Option<Value>,
+}
+
+impl McpToolInfo {
+    /// The server's declarations as one auditable value (same field set the
+    /// listing carries; defaults already applied).
+    pub fn annotations(&self) -> crate::tools::ToolAnnotations {
+        crate::tools::ToolAnnotations {
+            read_only_hint: self.read_only_hint,
+            destructive_hint: self.destructive_hint,
+            idempotent_hint: self.idempotent_hint,
+            open_world_hint: self.open_world_hint,
+        }
+    }
+}
+
+/// One server's timeouts, resolved from [`McpServerConfig`] when its transport
+/// is built and carried by the transport (never read from the config again —
+/// a config edit mid-session does not reach a live server).
+///
+/// Two config keys, two bounds — plus one derived:
+/// - `call` (`call_timeout_secs`, default [`CALL_TIMEOUT`]): one JSON-RPC
+///   request end to end, `tools/call` included. The bound a slow tool raises
+///   and a flaky sidecar lowers.
+/// - `connect` (`connect_timeout_secs`, default [`CONNECT_TIMEOUT`] — HTTP
+///   transports only): the TCP/TLS connect, and legacy SSE's wait for the
+///   `endpoint` event — the first one and the one after every stream
+///   rotation. There is no network connect on stdio, so the key is
+///   not spent there.
+/// - `boot`: the handshake's `initialize`, i.e. how long a stdio server may
+///   take to come up (an npx download, a container). It is the one thing the
+///   connect key means on stdio: set → `connect`; unset → `call`, which is
+///   exactly the bound such a server had before the key existed. Deliberately
+///   NOT the 15s default: first runs of `npx`/`uvx` servers on a cold cache
+///   (a fresh CI or batch machine) regularly take longer than that, and they
+///   would start failing at 15s where they used to work. For HTTP transports
+///   `boot` is `call` — a connected server that never answers `initialize`
+///   is a hung call, not a slow boot.
+///
+/// `boot` also carries the config key its value came from, so a timeout
+/// message can name the one to raise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Timeouts {
+    call: Duration,
+    connect: Duration,
+    boot: (Duration, &'static str),
+}
+
+impl Timeouts {
+    fn for_stdio(cfg: &McpServerConfig) -> Self {
+        let call = timeout_secs(cfg.call_timeout_secs, CALL_TIMEOUT);
+        Self {
+            call,
+            connect: timeout_secs(cfg.connect_timeout_secs, CONNECT_TIMEOUT),
+            boot: match cfg.connect_timeout_secs {
+                Some(_) => (
+                    timeout_secs(cfg.connect_timeout_secs, CONNECT_TIMEOUT),
+                    "connect_timeout_secs",
+                ),
+                None => (call, "call_timeout_secs"),
+            },
+        }
+    }
+
+    fn for_http(cfg: &McpServerConfig) -> Self {
+        let call = timeout_secs(cfg.call_timeout_secs, CALL_TIMEOUT);
+        Self {
+            call,
+            connect: timeout_secs(cfg.connect_timeout_secs, CONNECT_TIMEOUT),
+            boot: (call, "call_timeout_secs"),
+        }
+    }
+}
+
+/// `Option<u64>` seconds → [`Duration`], falling back to `default` when unset.
+/// [`McpServerConfig::validate`] already rejects values past
+/// [`MCP_MAX_TIMEOUT_SECS`]; the clamp here keeps `Instant::now() + timeout`
+/// from panicking on overflow even for a struct a host built by hand and never
+/// validated.
+fn timeout_secs(v: Option<u64>, default: Duration) -> Duration {
+    Duration::from_secs(v.unwrap_or(default.as_secs()).min(MCP_MAX_TIMEOUT_SECS))
+}
+
+/// The config key behind the `call` bound, for timeout messages.
+const CALL_LABEL: &str = "call_timeout_secs";
+/// … and behind the TCP/TLS connect bound.
+const CONNECT_LABEL: &str = "connect_timeout_secs";
+
+/// Which config key set a bound, for a timeout message ([`timed_out`]). `None`
+/// = a bound no key set (the idle probe's own), so there is no key to name.
+type BoundLabel = Option<&'static str>;
+
+/// Marker for the error chain: HTTP 404 on a request that carried our
+/// `Mcp-Session-Id` — the Streamable HTTP server's "I do not know this
+/// session" (it restarted, or expired the session while the connection sat
+/// idle). The spec's client obligation on this answer is a new `initialize`,
+/// which is what [`McpClient::call`] does with it.
+#[derive(Debug)]
+struct SessionExpired;
+/// In an error chain only to be FOUND by type (see [`has_marker`]); no
+/// source of its own.
+impl std::error::Error for SessionExpired {}
+impl std::fmt::Display for SessionExpired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "the server no longer knows this session (it restarted, or the session expired while idle)",
+        )
+    }
+}
+
+/// Is `marker` anywhere in `e`'s chain? The marker sits at the ROOT of the
+/// errors that carry one (the human message is layered on top as context), so
+/// the whole chain is walked, not just the top.
+fn has_marker<T: std::error::Error + 'static>(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| cause.downcast_ref::<T>().is_some())
+}
+
+/// What a transport can say about a request that failed. The default says
+/// nothing; only the transport with the concept fills it in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Failure {
+    /// Nothing special: the failure stands as written.
+    Other,
+    /// The server forgot our session (see [`SessionExpired`]). The request
+    /// was refused before it ran, so it is safe to send again on a new one.
+    SessionLost,
+    /// The server ANSWERED the request — with something that is not a
+    /// result: a JSON-RPC `error` object (a server without `ping` says
+    /// `-32601 Method not found`), or an HTTP error status. It is up and
+    /// listening, which is all an idle probe needs to know.
+    Answered,
+}
+
+/// The revision to speak after `initialize`: whatever non-empty string the
+/// server answered — it is the server's call (spec: "the client MUST use that
+/// protocol version for subsequent communication"), ours only to echo it. A
+/// revision off [`KNOWN_PROTOCOL_VERSIONS`] gets one warning and is echoed
+/// all the same; a missing or empty one falls back to the requested revision,
+/// also with a warning. Neither fails the handshake: a server that just
+/// answered `initialize` is working, and a client that quits over the label
+/// would turn a working server off.
+fn negotiate_protocol_version(server: &str, negotiated: Option<&str>) -> String {
+    match negotiated {
+        Some(v) if KNOWN_PROTOCOL_VERSIONS.contains(&v) => v.to_owned(),
+        Some(v) if !v.is_empty() => {
+            crate::diag::diag_warn!(
+                "[warn] MCP '{server}': server speaks protocol revision '{v}', which this client has not verified (known: {}); \
+                 echoing it on every request — nothing this client sends depends on the newer revision",
+                KNOWN_PROTOCOL_VERSIONS.join(", ")
+            );
+            v.to_owned()
+        }
+        _ => {
+            crate::diag::diag_warn!(
+                "[warn] MCP '{server}': initialize result names no protocol version; assuming {PROTOCOL_VERSION}"
+            );
+            PROTOCOL_VERSION.to_owned()
+        }
+    }
+}
+
+/// The non-2xx answer of an HTTP request, `text` being its (capped) body. A
+/// 404 to a request that CARRIED a session id is the Streamable HTTP server's
+/// "session not found" — that one is built on the [`SessionExpired`] marker
+/// so [`McpClient::call`] can start a new session instead of failing the
+/// call. A 404 to a request without one (wrong URL) stays a plain error.
+fn http_error(status: reqwest::StatusCode, text: &str, had_session: bool) -> anyhow::Error {
+    let msg = format!("MCP HTTP error {status}: {text}");
+    if status == reqwest::StatusCode::NOT_FOUND && had_session {
+        anyhow::Error::new(SessionExpired).context(msg)
+    } else {
+        anyhow!(msg)
+    }
 }
 
 /// One JSON-RPC message channel. Requests carry a client-generated id
@@ -157,6 +399,7 @@ trait Transport: Send {
     /// lands within ~50ms instead of after the full CALL_TIMEOUT — a wedged
     /// server used to hold the turn hostage for 120s with no way to stop.
     /// `None` = the startup handshake (no run in flight, nothing to cancel).
+    /// Bounded by the transport's call timeout ([`Timeouts::call`]).
     fn request(
         &mut self,
         id: u64,
@@ -169,6 +412,52 @@ trait Transport: Send {
     /// to spawn a reaper that kills the child process group on shutdown, so a
     /// stuck call unblocks (see `StdioTransport::set_shutdown`).
     fn set_shutdown(&mut self, _shutdown: &Arc<AtomicBool>) {}
+    /// The handshake's `initialize`: an ordinary request bounded by the
+    /// transport's BOOT timeout instead of its call timeout (see
+    /// [`Timeouts::boot`] — only stdio's differs). Also used to start a
+    /// replacement session on a server that forgot the previous one.
+    fn request_connect(&mut self, id: u64, method: &str, params: Value) -> Result<Value> {
+        self.request(id, method, params, /* cancel: */ None)
+    }
+    /// An ordinary request under an explicit overall bound, used by the idle
+    /// probe's `ping` (short: it is asking whether a suspected-dead connection
+    /// is alive, and must not sit out a full call timeout to be told no).
+    /// Transports that cannot bound a single request use their own call
+    /// timeout instead — `bound` is then known to be the shorter one.
+    fn request_within(
+        &mut self,
+        id: u64,
+        method: &str,
+        params: Value,
+        bound: Duration,
+    ) -> Result<Value> {
+        let _ = bound;
+        self.request(id, method, params, /* cancel: */ None)
+    }
+    /// The revision negotiated at `initialize`. Streamable HTTP echoes it in
+    /// the `MCP-Protocol-Version` header of every later request; the other
+    /// transports have nowhere to put it.
+    fn set_protocol_version(&mut self, _version: &str) {}
+    /// Time since this transport last completed a request round trip, or
+    /// `None` where idle means nothing: stdio has a reader thread whose death
+    /// is latched and fails the next call on the spot, so a probe there would
+    /// only delay that failure by one round trip.
+    fn idle_for(&self) -> Option<Duration> {
+        None
+    }
+    /// Tell the server request `id` was cancelled (`notifications/cancelled`,
+    /// `reason`). Best effort by contract: implementations swallow every
+    /// failure and bound the attempt to [`CANCEL_NOTIFY_TIMEOUT`], because
+    /// the caller has already given the call up and is on its way out.
+    fn notify_cancelled(&mut self, _request_id: u64, _reason: &str) {}
+    /// What this transport knows about a request that failed (see
+    /// [`Failure`]). Asked right after the failure, about THAT failure.
+    fn failure(&self, _err: &anyhow::Error) -> Failure {
+        Failure::Other
+    }
+    /// Drop the session so the next `initialize` starts a fresh one. Only
+    /// meaningful where [`Failure::SessionLost`] can come back.
+    fn reset_session(&mut self) {}
 }
 
 /// One connected MCP server: a JSON-RPC transport plus the initialize
@@ -177,15 +466,44 @@ trait Transport: Send {
 pub struct McpClient {
     transport: Box<dyn Transport>,
     next_id: u64,
+    /// The server's config name — every diagnostic this client emits names
+    /// it, since several servers can sit side by side and "the server" is
+    /// not enough to act on.
+    name: String,
+    /// The revision the server chose at `initialize` (see
+    /// [`negotiate_protocol_version`]).
+    protocol_version: String,
+    /// How long an HTTP transport may sit idle before a `tools/call` is
+    /// preceded by a `ping` ([`MCP_IDLE_PING`]; a field so tests can force
+    /// the probe without waiting a minute).
+    idle_ping: Duration,
 }
 
 impl McpClient {
     /// Connect and run the initialize handshake, then fetch the tool list.
+    /// A stdio server gets the agent's own environment plus its configured
+    /// `env` — nothing hidden ([`Self::start_with_env`] is the form that
+    /// strips credentials).
     pub fn start(cfg: &McpServerConfig) -> Result<(Self, Vec<McpToolInfo>)> {
+        Self::start_with_env(cfg, &[])
+    }
+
+    /// [`Self::start`], additionally removing `hidden_env` from a **stdio**
+    /// server's environment (the credential-hygiene set — see
+    /// `tools::hidden_env_vars`). The agent assembles every server through
+    /// this form, so a server the model can drive through tool calls never
+    /// sees the provider's key variable; a name the server entry configures
+    /// in its own `env` is kept (handed over on purpose — see
+    /// [`strip_inherited_env`]). HTTP transports ignore the list: nothing is
+    /// spawned.
+    pub fn start_with_env(
+        cfg: &McpServerConfig,
+        hidden_env: &[String],
+    ) -> Result<(Self, Vec<McpToolInfo>)> {
         cfg.validate()?;
         let mode = cfg.transport.unwrap_or(McpTransport::Auto);
         match (&cfg.command, &cfg.url) {
-            (Some(_), _) => Self::handshake(StdioTransport::spawn(cfg)?, &cfg.name),
+            (Some(_), _) => Self::handshake(StdioTransport::spawn(cfg, hidden_env)?, &cfg.name),
             (None, Some(url)) => match mode {
                 McpTransport::Http => Self::handshake(HttpTransport::new(url, cfg)?, &cfg.name),
                 McpTransport::Sse => Self::handshake(SseTransport::connect(url, cfg)?, &cfg.name),
@@ -220,20 +538,125 @@ impl McpClient {
         let mut client = Self {
             transport: Box::new(transport),
             next_id: 1,
+            name: name.to_owned(),
+            protocol_version: PROTOCOL_VERSION.to_owned(),
+            idle_ping: MCP_IDLE_PING,
         };
-        client.call(
+        client.initialize()?;
+        let tools = client.list_tools(name)?;
+        Ok((client, bound_tools(tools, name)))
+    }
+
+    /// The protocol revision the server chose at `initialize` — what every
+    /// later HTTP request carries in `MCP-Protocol-Version`. Starts as the
+    /// requested revision and is replaced by the server's answer.
+    pub fn protocol_version(&self) -> &str {
+        &self.protocol_version
+    }
+
+    /// `initialize` + `notifications/initialized`. Runs once at
+    /// [`Self::start`], and again on a Streamable HTTP server that answered
+    /// 404 to a request carrying our session id (see [`Self::call`]).
+    /// `initialize` goes through [`Transport::request_connect`] — the boot
+    /// bound — and its result decides the protocol revision every later HTTP
+    /// request names.
+    fn initialize(&mut self) -> Result<()> {
+        let id = self.alloc_id();
+        let init = self.transport.request_connect(
+            id,
             "initialize",
             json!({
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {},
                 "clientInfo": {"name": "tiny-agent", "version": env!("CARGO_PKG_VERSION")}
             }),
-            /* cancel: */ None,
         )?;
-        client.notify("notifications/initialized", json!({}))?;
+        self.protocol_version = negotiate_protocol_version(
+            &self.name,
+            init.get("protocolVersion").and_then(Value::as_str),
+        );
+        self.transport.set_protocol_version(&self.protocol_version);
+        self.notify("notifications/initialized", json!({}))?;
+        Ok(())
+    }
 
-        let tools = client.call("tools/list", json!({}), /* cancel: */ None)?;
-        Ok((client, bound_tools(tools, name)))
+    fn alloc_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    /// Fetch the server's whole tool list, following `tools/list` cursor
+    /// pagination (MCP spec: a result may carry `nextCursor`; a client that
+    /// stops after the first page silently never sees the rest — on a paging
+    /// server every tool from page 2 on was dropped). Returns ONE merged
+    /// `{"tools": [...]}` result for [`bound_tools`], which still enforces
+    /// the per-server caps on it. `server` is the config name, woven into
+    /// every warning (several servers can be configured side by side).
+    ///
+    /// Bounds, all server-chosen inputs:
+    /// - at most [`MCP_LIST_MAX_PAGES`] requests — a server that keeps
+    ///   handing out a fresh cursor (buggy or hostile) cannot keep the
+    ///   handshake spinning;
+    /// - a `nextCursor` already followed is refused (a cursor loop ends the
+    ///   listing instead of burning every page on the same data);
+    /// - once [`MCP_MAX_TOOLS`] tools are in hand, no further page is
+    ///   requested;
+    /// - a tool whose name already appeared on an EARLIER page is ignored
+    ///   with a warning (the first listing wins). Names repeated inside one
+    ///   page are left alone: they still reach the assembly-time collision
+    ///   gate, which fails the server loudly — so a single-page server sees
+    ///   exactly the pre-pagination request sequence and outcome.
+    ///
+    /// A failed page request fails the listing: the handshake must not
+    /// succeed on a partial tool table the operator has no way to notice.
+    fn list_tools(&mut self, server: &str) -> Result<Value> {
+        let mut merged: Vec<Value> = Vec::new();
+        let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen_cursors: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut cursor: Option<String> = None;
+        for page in 1..=MCP_LIST_MAX_PAGES {
+            let params = match &cursor {
+                Some(c) => json!({ "cursor": c }),
+                None => json!({}),
+            };
+            let result = self.call("tools/list", params, /* cancel: */ None)?;
+            for t in result["tools"].as_array().cloned().unwrap_or_default() {
+                let name = t["name"].as_str().unwrap_or_default().to_string();
+                if page > 1 && !name.is_empty() && !seen_names.insert(name.clone()) {
+                    crate::diag::diag_warn!(
+                        "[warn] MCP '{server}': tool '{name}' is listed on more than one page; keeping the first listing"
+                    );
+                    continue;
+                }
+                seen_names.insert(name);
+                merged.push(t);
+            }
+            let next = result["nextCursor"].as_str().unwrap_or_default();
+            if next.is_empty() {
+                break; // last page
+            }
+            if merged.len() >= MCP_MAX_TOOLS {
+                crate::diag::diag_warn!(
+                    "[warn] MCP '{server}': exposes more than {MCP_MAX_TOOLS} tools; ignoring the rest of its pages"
+                );
+                break;
+            }
+            if page == MCP_LIST_MAX_PAGES {
+                crate::diag::diag_warn!(
+                    "[warn] MCP '{server}': tool list exceeds {MCP_LIST_MAX_PAGES} pages; ignoring the rest"
+                );
+                break;
+            }
+            if !seen_cursors.insert(next.to_string()) {
+                crate::diag::diag_warn!(
+                    "[warn] MCP '{server}': repeated a tools/list cursor; stopping after the pages fetched so far"
+                );
+                break;
+            }
+            cursor = Some(next.to_string());
+        }
+        Ok(json!({ "tools": merged }))
     }
 
     /// Arm teardown on the underlying transport (stdio servers spawn a reaper
@@ -248,17 +671,137 @@ impl McpClient {
         self.transport.notify(method, params)
     }
 
-    /// `cancel` (the run's per-turn flag) is forwarded to the transport; see
-    /// [`Transport::request`] for the slice-poll contract.
+    /// Send one JSON-RPC request and return its `result`.
+    ///
+    /// `cancel` (the run's per-turn flag) shapes the call four ways, in the
+    /// order they apply:
+    /// - **Already set on entry → nothing is sent.** A run the user just
+    ///   interrupted must not start one more tool call — it may have side
+    ///   effects, and nobody is waiting for its result. (The kernel's
+    ///   "cancel is checked again right before execution" discipline.)
+    /// - **`tools/call` on an HTTP transport idle for [`MCP_IDLE_PING`] is
+    ///   preceded by a `ping`** — see [`Self::probe_if_idle`].
+    /// - **Cancelled while in flight → the server is told**
+    ///   (`notifications/cancelled`, best effort) so it can stop the work it
+    ///   would otherwise finish for a client that walked away.
+    /// - Not about `cancel`, but it lives in the same place: a Streamable
+    ///   HTTP server that forgot the session answers 404 *before* running the
+    ///   request; the call then starts a new session and is sent once more.
+    ///
+    /// A request that leaves here was handed to the transport exactly once
+    /// per attempt, with a fresh id each time.
     pub fn call(
         &mut self,
         method: &str,
         params: Value,
         cancel: Option<&AtomicBool>,
     ) -> Result<Value> {
-        let id = self.next_id;
-        self.next_id += 1;
-        self.transport.request(id, method, params, cancel)
+        let cancelled = || cancel.is_some_and(|c| c.load(Ordering::Relaxed));
+        if cancelled() {
+            bail!("MCP call '{method}' cancelled");
+        }
+        if method == "tools/call" {
+            self.probe_if_idle(method)?;
+            // The probe can take seconds (a dead connection sits out its
+            // bound); a cancel landing in there must stop the call exactly
+            // like one landing before it.
+            if cancelled() {
+                bail!("MCP call '{method}' cancelled");
+            }
+        }
+        let mut attempt = 0;
+        loop {
+            let id = self.alloc_id();
+            let res = self.transport.request(id, method, params.clone(), cancel);
+            match res {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    if cancelled() {
+                        self.transport.notify_cancelled(id, CANCEL_REASON);
+                        return Err(e);
+                    }
+                    // One retry, and only for this failure: the 404 arrived
+                    // before the server ran anything, so re-sending cannot
+                    // repeat a side effect. A session that dies again during
+                    // the retry is reported, not chased.
+                    if attempt == 0 && self.transport.failure(&e) == Failure::SessionLost {
+                        attempt += 1;
+                        self.recover_session(&e, method)?;
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    /// `ping` before a `tools/call` on an HTTP transport that has sat idle
+    /// since its last completed round trip. Past [`MCP_IDLE_PING`] the
+    /// connection may have been dropped without either side noticing (an
+    /// idle timeout on a proxy or NAT, a server restart that forgot the
+    /// session) — and a `tools/call` sent into that is the worst request to
+    /// lose: the server may run it and have the answer go nowhere, the client
+    /// times out, the model retries, and a side effect happens twice. A ping
+    /// is side-effect free, so it is the request to spend on finding out
+    /// whether the path still works.
+    ///
+    /// Verdicts, and what `what` (the call this guards) does about them:
+    /// - ping answered (a result, or a JSON-RPC error — a server without
+    ///   `ping` says `-32601`, which still proves it is listening) → the
+    ///   call goes ahead.
+    /// - the server forgot the session → new session (see
+    ///   [`Self::recover_session`]), then the call goes ahead.
+    /// - nothing came back inside [`MCP_PING_TIMEOUT`] → the call is NOT
+    ///   sent and this returns an error naming the ping failure. Deliberately
+    ///   not "send it anyway": the call is what the probe was protecting.
+    ///
+    /// stdio is never probed: its reader thread's death is latched and fails
+    /// the next call on the spot, so a ping would only add a round trip in
+    /// front of a failure that is already immediate.
+    fn probe_if_idle(&mut self, what: &str) -> Result<()> {
+        let Some(idle) = self.transport.idle_for() else {
+            return Ok(());
+        };
+        if idle < self.idle_ping {
+            return Ok(());
+        }
+        // The transport caps this at its own call timeout (request_within).
+        let id = self.alloc_id();
+        let outcome = self
+            .transport
+            .request_within(id, "ping", json!({}), MCP_PING_TIMEOUT);
+        match outcome {
+            Ok(_) => Ok(()),
+            Err(e) => match self.transport.failure(&e) {
+                Failure::SessionLost => self.recover_session(&e, what),
+                Failure::Answered => Ok(()),
+                Failure::Other => bail!(
+                    "MCP '{}': unreachable after {}s idle — '{what}' was not sent (ping failed: {e:#})",
+                    self.name,
+                    idle.as_secs()
+                ),
+            },
+        }
+    }
+
+    /// Start a new session on a Streamable HTTP server that answered 404 to
+    /// a request carrying the old one. `cause` is that 404, `what` the
+    /// request it refused. The tool table is NOT re-fetched afterwards (see
+    /// [`Self::initialize`]): a server that restarted with a different set
+    /// of tools reports "unknown tool" on the call, which is explicit.
+    fn recover_session(&mut self, cause: &anyhow::Error, what: &str) -> Result<()> {
+        crate::diag::diag_warn!(
+            "[warn] MCP '{}': {} while sending '{what}'; starting a new session",
+            self.name,
+            cause
+        );
+        self.transport.reset_session();
+        self.initialize().with_context(|| {
+            format!(
+                "MCP '{}': the server dropped its session and a new one could not be started",
+                self.name
+            )
+        })
     }
 }
 
@@ -345,11 +888,45 @@ fn bound_tools(tools: Value, server: &str) -> Vec<McpToolInfo> {
             );
             continue;
         }
+        // The four annotation hints: server-chosen, so a non-boolean value
+        // reads as "absent" and takes the spec default (`idempotentHint` has
+        // none and stays None). bool-typed fields on the struct keep the
+        // consumer side free of tri-state handling.
+        let ann = &t["annotations"];
+        // outputSchema is never model-visible, but it is still server-chosen
+        // memory held for the session: same object-only + size-cap rules as
+        // inputSchema, except an offender costs only the output schema (the
+        // tool stays, results fall back to the text content) — unlike a bad
+        // inputSchema, this one cannot break a request.
+        let output_schema = match &t["outputSchema"] {
+            v if v.is_null() => None,
+            v if !v.is_object() => {
+                crate::diag::diag_warn!(
+                    "[warn] MCP '{server}': tool '{name}' outputSchema is not an object; ignoring the output schema"
+                );
+                None
+            }
+            v if serde_json::to_string(v)
+                .map(|s| s.len())
+                .unwrap_or(usize::MAX)
+                > MCP_SCHEMA_MAX =>
+            {
+                crate::diag::diag_warn!(
+                    "[warn] MCP '{server}': tool '{name}' outputSchema exceeds {MCP_SCHEMA_MAX} bytes; ignoring the output schema"
+                );
+                None
+            }
+            v => Some(v.clone()),
+        };
         infos.push(McpToolInfo {
             name,
             description,
             input_schema,
-            read_only_hint: t["annotations"]["readOnlyHint"].as_bool().unwrap_or(false),
+            read_only_hint: ann["readOnlyHint"].as_bool().unwrap_or(false),
+            destructive_hint: ann["destructiveHint"].as_bool().unwrap_or(true),
+            idempotent_hint: ann["idempotentHint"].as_bool(),
+            open_world_hint: ann["openWorldHint"].as_bool().unwrap_or(true),
+            output_schema,
         });
     }
     infos
@@ -382,12 +959,14 @@ fn redacted_chain(e: &anyhow::Error) -> String {
     redact_url_credentials(&format!("{e:#}")).into_owned()
 }
 
-/// HTTP client with explicit timeouts for request/response calls.
-/// (The long-lived SSE GETs use their own connect-only clients and add a
-/// per-request [`STREAM_ROUND`] round timeout — see the two stream readers.)
-fn http_client(total: Duration) -> reqwest::blocking::Client {
+/// HTTP client with explicit timeouts for request/response calls: `connect`
+/// bounds the TCP/TLS connect, `total` the whole request (headers AND every
+/// read of the body — a direct `tools/call` answer streams no longer than
+/// this). (The long-lived SSE GETs use their own connect-only clients and add
+/// a per-request [`STREAM_ROUND`] round timeout — see the two stream readers.)
+fn http_client(total: Duration, connect: Duration) -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
-        .connect_timeout(CONNECT_TIMEOUT)
+        .connect_timeout(connect)
         .timeout(total)
         // Never follow redirects: a malicious/compromised MCP server could
         // 302 our authenticated POST (custom headers aren't auto-stripped
@@ -451,26 +1030,78 @@ fn pending_fail_all(pending: &Pending, detail: &str) {
 
 // ─── stdio ──────────────────────────────────────────────────────────
 
-/// Wait for a response on `rx`, slicing the CALL_TIMEOUT into ≤50ms polls of
-/// the run's cancel flag (the shared wait core of the stdio / SSE transports).
-/// A Ctrl-C mid-wait bails within one slice instead of after the full 120s —
-/// the blocked `McpTool::run` was the run loop's only tool wait with no
-/// intra-turn cancel path. On bail the CALLER's error path reclaims the
-/// pending slot; the server's late response (if it ever arrives) finds no
+/// "The bound ran out" — one wording for every transport, naming the config
+/// key that set the bound (the message says what to raise). A `None` label is
+/// a bound no key set, so none is named.
+fn timed_out(method: &str, bound: Duration, label: BoundLabel) -> anyhow::Error {
+    match label {
+        Some(key) => {
+            anyhow!("MCP call '{method}' timed out after {bound:?} (limit: {key}) or server died")
+        }
+        None => anyhow!("MCP call '{method}' timed out after {bound:?} or server died"),
+    }
+}
+
+/// `e`, reworded as a timeout if it is one. A request that ran INLINE (no
+/// cancel flag: the handshake, a library host's own call, the idle probe)
+/// comes back with reqwest's bare "operation timed out" — true, but it says
+/// neither how long the client waited nor which config key set that. The
+/// sliced waits word their own timeouts (`recv_cancelable`); this is the
+/// other half, applied where the request's bound and label are known. A
+/// connect-phase timeout is bounded by the connect key, not by the request's
+/// bound, and is named as such; anything that is not a timeout passes as is.
+fn name_the_bound(
+    e: anyhow::Error,
+    method: &str,
+    timeouts: &Timeouts,
+    bound: Duration,
+    label: BoundLabel,
+) -> anyhow::Error {
+    let Some(reqwest_error) = e
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<reqwest::Error>())
+    else {
+        return e;
+    };
+    if !reqwest_error.is_timeout() {
+        return e;
+    }
+    if reqwest_error.is_connect() {
+        anyhow!(
+            "MCP call '{method}' timed out after {:?} connecting (limit: {CONNECT_LABEL})",
+            timeouts.connect
+        )
+    } else {
+        timed_out(method, bound, label)
+    }
+}
+
+/// Wait for a response on `rx`, slicing `bound` into ≤50ms polls of the run's
+/// cancel flag (the shared wait core of the stdio / SSE / HTTP-stream
+/// transports). A Ctrl-C mid-wait bails within one slice instead of after the
+/// whole bound — the blocked `McpTool::run` was the run loop's only tool wait
+/// with no intra-turn cancel path. On bail the CALLER's error path reclaims
+/// the pending slot; the server's late response (if it ever arrives) finds no
 /// entry and is dropped by `pending_dispatch`, so an abandoned id can't
 /// corrupt the next call.
-fn recv_cancelable(
-    rx: &mpsc::Receiver<Value>,
+///
+/// `label` names the config key behind `bound`, for the timeout message.
+/// Generic over the payload: transports hand back a JSON-RPC message here,
+/// [`HttpTransport::run_direct`] the outcome of a direct exchange.
+fn recv_cancelable<T>(
+    rx: &mpsc::Receiver<T>,
     method: &str,
     cancel: Option<&AtomicBool>,
-) -> Result<Value> {
-    let deadline = Instant::now() + CALL_TIMEOUT;
+    bound: Duration,
+    label: BoundLabel,
+) -> Result<T> {
+    let deadline = Instant::now() + bound;
     loop {
         let slice = deadline
             .saturating_duration_since(Instant::now())
             .min(Duration::from_millis(50));
         if slice.is_zero() {
-            bail!("MCP call '{method}' timed out or server died");
+            return Err(timed_out(method, bound, label));
         }
         match rx.recv_timeout(slice) {
             Ok(msg) => return Ok(msg),
@@ -711,6 +1342,28 @@ struct StdioTransport {
     /// killing the MCP child is irreversible, so it must never fire on a
     /// recoverable turn-interrupt.
     reaper: Option<std::thread::JoinHandle<()>>,
+    /// Resolved from the server entry at spawn; `boot` is the one that
+    /// differs from the HTTP transports' (see [`Timeouts`]).
+    timeouts: Timeouts,
+}
+
+/// Remove `hidden` from a stdio server's environment — every name EXCEPT
+/// one the server entry configures on purpose: `.envs(&cfg.env)` has already
+/// been applied, so a server the user handed the key to keeps it (only what
+/// was INHERITED from the agent is stripped). Called by BOTH spawn chains
+/// (unix `process_group(0)` and the Windows `cmd /C` shim) — same
+/// two-chain rule as the `.envs` call itself.
+#[cfg(any(unix, windows))]
+fn strip_inherited_env(
+    command: &mut std::process::Command,
+    configured: &HashMap<String, String>,
+    hidden: &[String],
+) {
+    for name in hidden {
+        if !configured.contains_key(name) {
+            command.env_remove(name);
+        }
+    }
 }
 
 impl StdioTransport {
@@ -718,7 +1371,7 @@ impl StdioTransport {
     /// 块）；第三平台（wasm 等）由紧随其后的 cfg 兜底版本返回明确错误——
     /// 参照 signal.rs 的 install_sigint_cancel 拆分法。
     #[cfg(any(unix, windows))]
-    fn spawn(cfg: &McpServerConfig) -> Result<Self> {
+    fn spawn(cfg: &McpServerConfig, hidden_env: &[String]) -> Result<Self> {
         use std::process::{Command, Stdio};
         let cmd = cfg.command.as_ref().expect("validated");
         // Spawn the server in its own process group (unix) so Drop can kill
@@ -728,14 +1381,16 @@ impl StdioTransport {
         #[cfg(unix)]
         let child = {
             use std::os::unix::process::CommandExt;
-            Command::new(cmd)
+            let mut command = Command::new(cmd);
+            command
                 .args(&cfg.args)
                 .envs(&cfg.env)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
-                .process_group(0)
-                .spawn()
+                .process_group(0);
+            strip_inherited_env(&mut command, &cfg.env, hidden_env);
+            command.spawn()
         };
         #[cfg(windows)]
         let child = {
@@ -750,15 +1405,17 @@ impl StdioTransport {
             // 默认闪 conhost 黑框；压掉窗口，stdio 管道不受影响，node 孙进程
             // 继承隐藏控制台不会二次弹窗。
             use std::os::windows::process::CommandExt;
-            Command::new("cmd")
+            let mut command = Command::new("cmd");
+            command
                 .arg("/C")
                 .raw_arg(windows_cmd_tail(cmd, &cfg.args))
                 .envs(&cfg.env)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
-                .creation_flags(0x0800_0000)
-                .spawn()
+                .creation_flags(0x0800_0000);
+            strip_inherited_env(&mut command, &cfg.env, hidden_env);
+            command.spawn()
         };
         let child =
             child.with_context(|| format!("cannot start MCP server '{}': {}", cfg.name, cmd))?;
@@ -781,6 +1438,7 @@ impl StdioTransport {
             dead: Arc::new(std::sync::Mutex::new(None)),
             alive: Arc::new(AtomicBool::new(true)),
             reaper: None,
+            timeouts: Timeouts::for_stdio(cfg),
         };
         if let Err(e) = this.wire_readers(&cfg.name) {
             // A half-built transport has no Drop coming — nothing was
@@ -803,7 +1461,7 @@ impl StdioTransport {
     /// Job Object，其余目标没有可用的子进程机制，明确报错而不是让 cfg
     /// 谓词失配在编译期炸开（同 signal.rs::install_sigint_cancel 的拆法）。
     #[cfg(not(any(unix, windows)))]
-    fn spawn(_cfg: &McpServerConfig) -> Result<Self> {
+    fn spawn(_cfg: &McpServerConfig, _hidden_env: &[String]) -> Result<Self> {
         bail!("MCP stdio transport requires unix or windows");
     }
 
@@ -1019,13 +1677,17 @@ fn spawn_reaper_job(
         .context("cannot spawn mcp-reaper thread")
 }
 
-impl Transport for StdioTransport {
-    fn request(
+impl StdioTransport {
+    /// One request under an explicit overall bound (the call timeout, or the
+    /// boot one for `initialize`) — the body of [`Transport::request`].
+    fn request_bounded(
         &mut self,
         id: u64,
         method: &str,
         params: Value,
         cancel: Option<&AtomicBool>,
+        bound: Duration,
+        label: &'static str,
     ) -> Result<Value> {
         // Fast-fail once the write path is gone: a previous write that timed
         // out or was cancelled left its writer thread stuck holding the only
@@ -1046,7 +1708,7 @@ impl Transport for StdioTransport {
         // Dead-reader latch: checked AFTER the slot is registered so a reader
         // exiting right under us cannot slip past both this check and its
         // final pending_fail_all (one of the two always sees us). Without it
-        // every later call sat out the full CALL_TIMEOUT against a child that
+        // every later call sat out the full call timeout against a child that
         // can never answer — the zombie transport.
         if let Some(reason) = self.dead.lock().unwrap_or_else(|e| e.into_inner()).clone() {
             self.pending
@@ -1068,7 +1730,8 @@ impl Transport for StdioTransport {
         let res = match write_frame_cancelable(stdin, &frame_bytes, WRITE_TIMEOUT, cancel) {
             Ok(w) => {
                 self.stdin = Some(w);
-                recv_cancelable(&rx, method, cancel).and_then(|msg| extract_result(msg, method))
+                recv_cancelable(&rx, method, cancel, bound, Some(label))
+                    .and_then(|msg| extract_result(msg, method))
             }
             Err(e) => {
                 // The writer thread is stuck inside write() holding stdin (or
@@ -1094,7 +1757,71 @@ impl Transport for StdioTransport {
         }
         res
     }
+}
 
+impl Transport for StdioTransport {
+    fn request(
+        &mut self,
+        id: u64,
+        method: &str,
+        params: Value,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Value> {
+        self.request_bounded(id, method, params, cancel, self.timeouts.call, CALL_LABEL)
+    }
+
+    /// stdio is the transport the boot bound exists for: a server that has
+    /// to download itself before it can answer `initialize` is slow to
+    /// START, which is a different budget from every later call (see
+    /// [`Timeouts::boot`]).
+    fn request_connect(&mut self, id: u64, method: &str, params: Value) -> Result<Value> {
+        let (boot, label) = self.timeouts.boot;
+        self.request_bounded(id, method, params, /* cancel: */ None, boot, label)
+    }
+
+    /// The server is told on its stdin, like every other frame. Nothing to
+    /// tell once the write path is gone (a cancelled/timed-out WRITE already
+    /// killed the child — the request never left, or the pipe is broken) or
+    /// the reader is dead (the server cannot be assumed alive).
+    fn notify_cancelled(&mut self, request_id: u64, reason: &str) {
+        let Some(stdin) = self.stdin.take() else {
+            return;
+        };
+        if self
+            .dead
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
+            self.stdin = Some(stdin);
+            return;
+        }
+        let mut bytes = notify_frame(
+            "notifications/cancelled",
+            json!({"requestId": request_id, "reason": reason}),
+        )
+        .to_string()
+        .into_bytes();
+        bytes.push(b'\n');
+        match write_frame_cancelable(
+            stdin,
+            &bytes,
+            CANCEL_NOTIFY_TIMEOUT,
+            /* cancel: */ None,
+        ) {
+            Ok(w) => self.stdin = Some(w),
+            Err(_) => {
+                // Same dead-pipe rule as request()/notify(): a write that did
+                // not finish leaves its thread owning stdin, which only the
+                // child's death releases. This frame is ~100 bytes and the
+                // cancelled request was fully written before it, so the pipe
+                // can only be full if the server has stopped reading
+                // altogether — it was not going to answer the next call
+                // either. The failure itself is swallowed (best effort).
+                self.kill_child();
+            }
+        }
+    }
     fn notify(&mut self, method: &str, params: Value) -> Result<()> {
         // Same wedged-write protection as request(): notify frames are tiny
         // today (the handshake's notifications/initialized), but the
@@ -1260,6 +1987,21 @@ fn shutdown_stream_reader(shutdown: &AtomicBool, reader: &mut Option<std::thread
     }
 }
 
+/// The signal half of [`shutdown_stream_reader`], without the wait — for a
+/// reader retired MID-SESSION (its session was dropped; see
+/// `HttpTransport::reset_session`), where nothing is being torn down and the
+/// join attempt would be 2s of nothing: that reader sits in a healthy read,
+/// which only its round deadline ends. Same bounded residue as the detached
+/// case above — the thread and its connection are gone within ~one round +
+/// [`STREAM_BACKOFF`], on their own.
+fn retire_stream_reader(
+    shutdown: &Arc<AtomicBool>,
+    reader: &mut Option<std::thread::JoinHandle<()>>,
+) {
+    shutdown.store(true, Ordering::Relaxed);
+    *reader = None;
+}
+
 struct HttpTransport {
     client: reqwest::blocking::Client,
     url: String,
@@ -1271,6 +2013,8 @@ struct HttpTransport {
     /// response is deliverable the moment the server pushes it — SSE does not
     /// queue for a client that hasn't connected, which is exactly the race
     /// the standing stream exists to close (see [`HttpTransport::request`]).
+    /// Replaced wholesale when the session is dropped (see
+    /// [`Transport::reset_session`]).
     pending: Pending,
     /// Stop flag for the standing-stream reader thread; set in Drop.
     stream_shutdown: Arc<AtomicBool>,
@@ -1289,6 +2033,146 @@ struct HttpTransport {
     /// so tests can inject a small round and observe rotations/teardown in
     /// milliseconds.
     stream_round: Duration,
+    /// Resolved from the server entry at construction (see [`Timeouts`]).
+    timeouts: Timeouts,
+    /// The negotiated protocol revision, shared with the standing-stream
+    /// thread: an `initialize` the server answers with 202 opens that stream
+    /// BEFORE the answer (and with it the revision) is known, so the thread
+    /// cannot be handed a `String` at spawn — it reads the cell at the top of
+    /// every round.
+    protocol_version: Arc<std::sync::Mutex<String>>,
+    /// When the last exchange with this server completed (see
+    /// [`Transport::idle_for`]). `None` until the first one does.
+    last_ok: Option<Instant>,
+    /// Whether the last POST came back with a FINAL status — anything but
+    /// 202, which only says "accepted" and leaves the answer to a stream.
+    /// Reset by every request and read by [`Transport::failure`] right after
+    /// it failed: it is what tells a probe the server REFUSED (`Answered`)
+    /// from a connection that never answered (`Other`).
+    post_answered: std::cell::Cell<bool>,
+}
+
+/// Everything one direct POST needs, copied out of an [`HttpTransport`] so
+/// the whole exchange — the POST included — can run on a worker thread (see
+/// [`HttpTransport::run_direct`]). No borrow of the transport survives the
+/// copy: the thread outlives the caller's wait whenever that wait is given
+/// up (cancel, timeout), and must not hold the transport hostage.
+struct PostJob {
+    client: reqwest::blocking::Client,
+    url: String,
+    headers: HashMap<String, String>,
+    session_id: Option<String>,
+    protocol_version: String,
+}
+
+/// How a direct POST answer is delivered (picked from `content-type`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyKind {
+    /// `text/event-stream`: events until the one carrying our response.
+    Sse,
+    /// Anything else: one JSON document.
+    Json,
+}
+
+/// The outcome of one direct POST exchange.
+struct Direct {
+    /// A final HTTP status arrived (anything but 202) — see
+    /// `HttpTransport::post_answered`.
+    answered: bool,
+    /// The session id the answer announced, if any (`initialize`'s does).
+    session_id: Option<String>,
+    /// `Some(result)` = the answer was read (or failed to be);
+    /// `None` = the server only ACCEPTED the POST (202) and the answer is
+    /// coming on a stream.
+    body: Option<Result<Value>>,
+}
+
+/// POST one frame and, unless the server merely accepted it, read its whole
+/// answer. One function for both callers — inline on the handshake path (no
+/// run in flight, nothing to cancel) and on the worker thread of
+/// [`HttpTransport::run_direct`] — so the two cannot drift. Never fails as a
+/// whole: transport-level failures are reported through `body` together with
+/// what was learned before them (`answered`, the session id).
+fn direct_exchange(job: PostJob, body: Value, bound: Duration, id: u64, method: &str) -> Direct {
+    let mut out = Direct {
+        answered: false,
+        session_id: None,
+        body: None,
+    };
+    let read = (|| -> Result<Option<Value>> {
+        let mut resp = job.post(&body, bound)?;
+        let status = resp.status();
+        out.answered = status != 202;
+        out.session_id = resp
+            .headers()
+            .get("Mcp-Session-Id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        if status == 202 {
+            // Spec (2025-03-26 Streamable HTTP): the server MAY answer a
+            // POSTed request with `202 Accepted` and no body — the actual
+            // JSON-RPC response then arrives on the server-initiated SSE
+            // stream. Dropping the response releases the bodyless
+            // connection; the caller picks the stream (see request_bounded).
+            return Ok(None);
+        }
+        if !status.is_success() {
+            // P2-3: the error body's size is the server's choice and only
+            // feeds a diagnostic string — cap it.
+            let text = capped_text(&mut resp, MCP_ERR_BODY_MAX);
+            return Err(http_error(status, &text, job.session_id.is_some()));
+        }
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let kind = if ct.contains("text/event-stream") {
+            BodyKind::Sse
+        } else {
+            BodyKind::Json
+        };
+        read_direct(kind, resp, id, method).map(Some)
+    })();
+    out.body = match read {
+        Ok(None) => None,
+        Ok(Some(v)) => Some(Ok(v)),
+        Err(e) => Some(Err(e)),
+    };
+    out
+}
+
+/// Read one direct answer's body to the JSON-RPC message it carries. Bounded
+/// twice over: every read by the request timeout (`bound` was handed to the
+/// request), and the bytes by the caps below.
+fn read_direct(
+    kind: BodyKind,
+    mut resp: reqwest::blocking::Response,
+    id: u64,
+    method: &str,
+) -> Result<Value> {
+    match kind {
+        BodyKind::Sse => {
+            // Read SSE events until the response with our id arrives. Use
+            // the multi-line-aware event reader: provider::SseReader
+            // takes only the first `data:` line of a multi-line event and
+            // would drop the rest, losing large JSON-RPC results. The
+            // id+method response match lives in sse_response_for_id (see
+            // its doc for the guard).
+            let mut reader = std::io::BufReader::new(resp);
+            sse_response_for_id(&mut reader, id, method)
+        }
+        BodyKind::Json => {
+            // P2-3: read capped, then parse — resp.json() buffers the entire
+            // body before parsing, and the body's size is the server's choice
+            // (MCP_EVENT_MAX already bounds the SSE variant of the same
+            // result; a body cut at the cap fails the parse, which is the
+            // right outcome for a >64MiB result).
+            let text = capped_text(&mut resp, MCP_EVENT_MAX as u64);
+            serde_json::from_str(&text).context("MCP HTTP: invalid JSON response")
+        }
+    }
 }
 
 /// Read at most `cap` bytes of a response body as lossy text. The SSE paths
@@ -1302,10 +2186,57 @@ fn capped_text(resp: &mut reqwest::blocking::Response, cap: u64) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
+impl PostJob {
+    /// POST `body`, the whole request bounded by `bound`. Returns ANY status:
+    /// whether an answer is an error is the caller's call to make — a 404 on
+    /// a request that carried a session id means something a notification
+    /// does not care about (see [`http_error`]). No-redirect and the other
+    /// client-level guards come with `client` (see [`http_client`]).
+    fn post(&self, body: &Value, bound: Duration) -> Result<reqwest::blocking::Response> {
+        let mut req = self
+            .client
+            .post(&self.url)
+            .timeout(bound)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            // Spec: "the client MUST include the MCP-Protocol-Version:
+            // <protocol-version> HTTP header on all subsequent requests to
+            // the MCP server" — the NEGOTIATED revision, not the one asked
+            // for (a server that negotiated a newer revision is entitled to
+            // 400 a request stamped with an older one).
+            .header("MCP-Protocol-Version", self.protocol_version.as_str());
+        for (k, v) in &self.headers {
+            req = req.header(k, v);
+        }
+        if let Some(sid) = &self.session_id {
+            req = req.header("Mcp-Session-Id", sid);
+        }
+        req.json(body)
+            .send()
+            .map_err(strip_reqwest_url)
+            .context("MCP HTTP POST failed")
+    }
+
+    /// The non-success half of [`Self::post`]'s contract, for callers that
+    /// only need the POST acknowledged (notifications).
+    fn acknowledged(&self, resp: reqwest::blocking::Response) -> Result<()> {
+        let status = resp.status();
+        if status.is_success() || status == 202 {
+            return Ok(());
+        }
+        // P2-3: the error body's size is the server's choice and only
+        // feeds a diagnostic string — cap it.
+        let mut resp = resp;
+        let text = capped_text(&mut resp, MCP_ERR_BODY_MAX);
+        Err(http_error(status, &text, self.session_id.is_some()))
+    }
+}
+
 impl HttpTransport {
     fn new(url: &str, cfg: &McpServerConfig) -> Result<Self> {
+        let timeouts = Timeouts::for_http(cfg);
         Ok(Self {
-            client: http_client(CALL_TIMEOUT),
+            client: http_client(timeouts.call, timeouts.connect),
             url: url.to_string(),
             headers: cfg.headers.clone(),
             session_id: None,
@@ -1314,7 +2245,26 @@ impl HttpTransport {
             stream_reader: None,
             standalone_rejected: Arc::new(AtomicBool::new(false)),
             stream_round: STREAM_ROUND,
+            timeouts,
+            protocol_version: Arc::new(std::sync::Mutex::new(PROTOCOL_VERSION.to_owned())),
+            last_ok: None,
+            post_answered: std::cell::Cell::new(false),
         })
+    }
+
+    /// Copy what one direct POST needs (see [`PostJob`]).
+    fn post_job(&self) -> PostJob {
+        PostJob {
+            client: self.client.clone(),
+            url: self.url.clone(),
+            headers: self.headers.clone(),
+            session_id: self.session_id.clone(),
+            protocol_version: self
+                .protocol_version
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+        }
     }
 
     /// Make sure exactly one standing standalone-stream reader is running,
@@ -1347,54 +2297,74 @@ impl HttpTransport {
             self.stream_shutdown.clone(),
             self.standalone_rejected.clone(),
             self.stream_round,
+            self.timeouts.connect,
+            self.protocol_version.clone(),
         )?;
         self.stream_reader = Some(reader);
         Ok(())
     }
 
-    fn post(&self, body: &Value) -> Result<reqwest::blocking::Response> {
-        let mut req = self
-            .client
-            .post(&self.url)
-            .header("content-type", "application/json")
-            .header("accept", "application/json, text/event-stream")
-            .header("MCP-Protocol-Version", PROTOCOL_VERSION);
-        for (k, v) in &self.headers {
-            req = req.header(k, v);
-        }
-        if let Some(sid) = &self.session_id {
-            req = req.header("Mcp-Session-Id", sid);
-        }
-        let mut resp = req
-            .json(body)
-            .send()
-            .map_err(strip_reqwest_url)
-            .context("MCP HTTP POST failed")?;
-        if !resp.status().is_success() && resp.status() != 202 {
-            let status = resp.status();
-            // P2-3: the error body's size is the server's choice and only
-            // feeds a diagnostic string — cap it.
-            let text = capped_text(&mut resp, MCP_ERR_BODY_MAX);
-            bail!("MCP HTTP error {status}: {text}");
-        }
-        Ok(resp)
+    /// One direct exchange (POST + answer), cancel-aware when there is a
+    /// cancel flag to honor. With none — the handshake — it runs inline. With
+    /// one it runs on a worker thread and the caller waits on a channel, so
+    /// a Ctrl-C lands within ~50ms at any point of it. That is the whole
+    /// reason this exists: for a Streamable HTTP server that answers
+    /// `tools/call` with plain JSON, the tool's entire run time is spent
+    /// INSIDE the POST (the answer's headers arrive when the tool is done),
+    /// so a body-only thread would have left the common case uncancelled —
+    /// the call sat out its full timeout no matter when the user pressed Esc.
+    ///
+    /// Abandoning the thread (cancel, timeout) leaks nothing unbounded: the
+    /// request carries `bound`, so the worker ends no later than the caller's
+    /// own deadline would have been — the response is dropped there, which
+    /// returns or closes the connection.
+    fn run_direct(
+        &self,
+        body: Value,
+        bound: Duration,
+        id: u64,
+        method: &str,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Direct> {
+        let job = self.post_job();
+        let Some(cancel) = cancel else {
+            return Ok(direct_exchange(job, body, bound, id, method));
+        };
+        let (tx, rx) = mpsc::channel::<Direct>();
+        let name = method.to_owned();
+        std::thread::Builder::new()
+            .name("mcp-http-exchange".into())
+            .spawn(move || {
+                let _ = tx.send(direct_exchange(job, body, bound, id, &name));
+            })
+            // Same policy as every other thread here: resource exhaustion is
+            // a per-call failure the caller already knows how to surface,
+            // never a panic — and never a silent fallback to the inline
+            // read, which is exactly the uncancelable wait this avoids.
+            .context("cannot spawn MCP HTTP exchange thread")?;
+        recv_cancelable(&rx, method, Some(cancel), bound, Some(CALL_LABEL))
     }
 
-    /// Open the standalone server→client SSE stream on the endpoint (spec
+    /// Open a one-shot server→client SSE stream on the endpoint (spec
     /// 2025-03-26 Streamable HTTP, "Listening for messages from the server"):
     /// a GET with `Accept: text/event-stream`, carrying `Mcp-Session-Id`
     /// when a session was established ("clients ... MUST include it in the
     /// Mcp-Session-Id header on all of their subsequent HTTP requests").
-    /// Uses the SAME timeout-bounded client as the POST, so the read can't
-    /// outlive CALL_TIMEOUT — the consumer (sse_response_for_id) returns the
-    /// moment the matching response arrives, and a server that never sends
-    /// one fails at the timeout instead of hanging the caller forever.
-    fn get_event_stream(&self) -> Result<reqwest::blocking::Response> {
+    /// Only the fallback for a 202 whose standing stream could not be armed
+    /// (thread spawn failure) — see [`Self::ensure_standalone_stream`].
+    fn get_event_stream(&self, bound: Duration) -> Result<reqwest::blocking::Response> {
         let mut req = self
             .client
             .get(&self.url)
+            .timeout(bound)
             .header("accept", "text/event-stream")
-            .header("MCP-Protocol-Version", PROTOCOL_VERSION);
+            .header(
+                "MCP-Protocol-Version",
+                self.protocol_version
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_str(),
+            );
         for (k, v) in &self.headers {
             req = req.header(k, v);
         }
@@ -1405,31 +2375,28 @@ impl HttpTransport {
             .send()
             .map_err(strip_reqwest_url)
             .context("MCP HTTP GET (SSE stream) failed")?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            // Same error-body cap and rationale as post().
+        let status = resp.status();
+        if !status.is_success() {
+            // Same error-body cap and rationale as PostJob::acknowledged.
             let text = capped_text(&mut resp, MCP_ERR_BODY_MAX);
-            bail!("MCP HTTP GET error {status}: {text}");
+            return Err(http_error(status, &text, self.session_id.is_some()));
         }
         Ok(resp)
     }
-}
 
-impl Transport for HttpTransport {
-    fn request(
+    /// One request under an explicit overall bound (the call timeout, or the
+    /// idle probe's shorter one — `label` names the key behind it, see
+    /// [`BoundLabel`]) — the body of [`Transport::request`].
+    fn request_bounded(
         &mut self,
         id: u64,
         method: &str,
         params: Value,
-        // Cancel is honored on the 202 wait via recv_cancelable's 50ms slices
-        // (same contract as stdio / SSE). The direct POST/GET round-trips are
-        // blocking reqwest calls already bounded by the client's
-        // CALL_TIMEOUT total timeout — there is no channel wait to slice on
-        // those. The standing-stream reader is likewise unblockable mid-read,
-        // but every read is round-bounded (STREAM_ROUND), so teardown joins
-        // it within ~one round (see shutdown_stream_reader).
         cancel: Option<&AtomicBool>,
+        bound: Duration,
+        label: BoundLabel,
     ) -> Result<Value> {
+        let started = Instant::now();
         // Register the pending slot BEFORE the POST: a server that answers
         // with 202 delivers the response on the standing stream whenever it
         // pleases — including between our POST and the wait below — so the
@@ -1444,7 +2411,7 @@ impl Transport for HttpTransport {
         // 202 response the server pushes the instant it processes the POST
         // is only deliverable if the GET is already open. The old flow
         // (POST → drop(resp) → only THEN open a fresh GET per 202) lost any
-        // such response permanently and burned the full CALL_TIMEOUT; in
+        // such response permanently and burned the full call timeout; in
         // Auto mode an initialize hitting that path mis-probed Streamable as
         // broken and fell back to legacy SSE. Failure to arm the stream is
         // NOT fatal here — the 202 branch below still has the inline
@@ -1452,71 +2419,49 @@ impl Transport for HttpTransport {
         if self.session_id.is_some() {
             let _ = self.ensure_standalone_stream(/* force: */ false);
         }
+        self.post_answered.set(false);
         let res = (|| -> Result<Value> {
-            let resp = self.post(&frame(id, method, params))?;
-            if let Some(sid) = resp
-                .headers()
-                .get("Mcp-Session-Id")
-                .and_then(|v| v.to_str().ok())
-            {
-                self.session_id = Some(sid.to_string());
+            // A run without a cancel flag waits INLINE (see run_direct), so
+            // its timeouts arrive as reqwest's own — worded here, once, for
+            // both halves of the exchange.
+            let direct = self
+                .run_direct(frame(id, method, params), bound, id, method, cancel)
+                .map_err(|e| name_the_bound(e, method, &self.timeouts, bound, label))?;
+            self.post_answered.set(direct.answered);
+            if let Some(sid) = direct.session_id {
+                self.session_id = Some(sid);
             }
-
-            if resp.status() == 202 {
-                // Spec (2025-03-26 Streamable HTTP): the server MAY answer a
-                // POSTed request with `202 Accepted` and no body — the actual
-                // JSON-RPC response then arrives on the server-initiated SSE
-                // stream. That stream is the STANDING standalone GET (see
-                // spawn_standalone_stream): one long-lived connection per
-                // session, opened before the POST that might need it and
-                // shared by every 202, with responses dispatched through the
-                // shared pending table. The wait is therefore cancel-aware.
-                // If arming the stream failed (thread spawn — resource
-                // exhaustion), fall back to the old one-shot GET +
-                // sse_response_for_id, byte-identical to the previous
-                // behavior.
-                drop(resp); // release the bodyless 202 connection
-                if self.ensure_standalone_stream(/* force: */ true).is_ok() {
-                    let msg = recv_cancelable(&rx, method, cancel)?;
-                    return extract_result(msg, method);
+            match direct.body {
+                // The answer is in hand (or failed to be read) — done.
+                Some(body) => body
+                    .map_err(|e| name_the_bound(e, method, &self.timeouts, bound, label))
+                    .and_then(|msg| extract_result(msg, method)),
+                None => {
+                    // 202 Accepted: the answer is on a stream. The STANDING
+                    // standalone GET (see spawn_standalone_stream): one
+                    // long-lived connection per session, shared by every 202,
+                    // with responses dispatched through the shared pending
+                    // table — so this wait is cancel-aware.
+                    let left = bound.saturating_sub(started.elapsed());
+                    if self.ensure_standalone_stream(/* force: */ true).is_ok() {
+                        let msg = recv_cancelable(&rx, method, cancel, left, label)?;
+                        return extract_result(msg, method);
+                    }
+                    // Arming failed (thread spawn — resource exhaustion):
+                    // the old one-shot GET + sse_response_for_id, which is
+                    // NOT cancel-aware — a blocking read bounded by `left`.
+                    let stream = self.get_event_stream(left)?;
+                    let mut reader = std::io::BufReader::new(stream);
+                    let msg = sse_response_for_id(&mut reader, id, method)?;
+                    extract_result(msg, method)
                 }
-                let stream = self.get_event_stream()?;
-                let mut reader = std::io::BufReader::new(stream);
-                let msg = sse_response_for_id(&mut reader, id, method)?;
-                return extract_result(msg, method);
-            }
-
-            let ct = resp
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_string();
-
-            if ct.contains("text/event-stream") {
-                // Read SSE events until the response with our id arrives. Use
-                // the multi-line-aware event reader: provider::SseReader
-                // takes only the first `data:` line of a multi-line event and
-                // would drop the rest, losing large JSON-RPC results. The
-                // id+method response match lives in sse_response_for_id (see
-                // its doc for the guard).
-                let mut reader = std::io::BufReader::new(resp);
-                let msg = sse_response_for_id(&mut reader, id, method)?;
-                extract_result(msg, method)
-            } else {
-                // Plain-JSON response. P2-3: read capped, then parse —
-                // resp.json() buffers the entire body before parsing, and
-                // the body's size is the server's choice (MCP_EVENT_MAX
-                // already bounds the SSE variant of the same result; a body
-                // cut at the cap fails the parse, which is the right outcome
-                // for a >64MiB result).
-                let mut resp = resp;
-                let text = capped_text(&mut resp, MCP_EVENT_MAX as u64);
-                let msg: Value =
-                    serde_json::from_str(&text).context("MCP HTTP: invalid JSON response")?;
-                extract_result(msg, method)
             }
         })();
+        // Either the round trip completed or the server answered and refused:
+        // both prove the path to it was alive just now (see idle_for).
+        if res.is_ok() || self.post_answered.get() {
+            self.last_ok = Some(Instant::now());
+        }
         // Reclaim the slot on every exit (success included): a late duplicate
         // delivery on the standing stream must find no entry (and be dropped
         // by pending_dispatch) instead of leaking one map entry per call.
@@ -1526,11 +2471,110 @@ impl Transport for HttpTransport {
             .remove(&id);
         res
     }
+}
+
+impl Transport for HttpTransport {
+    fn request(
+        &mut self,
+        id: u64,
+        method: &str,
+        params: Value,
+        // Honored at every wait: the direct exchange runs on a worker thread
+        // (run_direct) and the 202 wait is a channel wait — both sliced into
+        // ≤50ms polls (see recv_cancelable). The standing-stream reader is
+        // unblockable mid-read, but every read is round-bounded
+        // (STREAM_ROUND), so teardown joins it within ~one round (see
+        // shutdown_stream_reader).
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Value> {
+        self.request_bounded(
+            id,
+            method,
+            params,
+            cancel,
+            self.timeouts.call,
+            Some(CALL_LABEL),
+        )
+    }
+
+    fn request_within(
+        &mut self,
+        id: u64,
+        method: &str,
+        params: Value,
+        bound: Duration,
+    ) -> Result<Value> {
+        // The caller's bound, but never looser than the server entry's own —
+        // and the label names whichever of the two is shorter.
+        let bound = bound.min(self.timeouts.call);
+        let label = (bound < MCP_PING_TIMEOUT).then_some(CALL_LABEL);
+        self.request_bounded(id, method, params, /* cancel: */ None, bound, label)
+    }
 
     fn notify(&mut self, method: &str, params: Value) -> Result<()> {
         // Spec: server answers 202 Accepted (no body) for notifications.
-        self.post(&notify_frame(method, params))?;
-        Ok(())
+        let job = self.post_job();
+        job.post(&notify_frame(method, params), self.timeouts.call)
+            .and_then(|resp| job.acknowledged(resp))
+            .map_err(|e| {
+                name_the_bound(
+                    e,
+                    method,
+                    &self.timeouts,
+                    self.timeouts.call,
+                    Some(CALL_LABEL),
+                )
+            })
+    }
+
+    fn set_protocol_version(&mut self, version: &str) {
+        *self
+            .protocol_version
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = version.to_owned();
+    }
+
+    fn idle_for(&self) -> Option<Duration> {
+        self.last_ok.map(|t| t.elapsed())
+    }
+
+    /// One small POST under its own short bound, outcome ignored: the server
+    /// may never have seen the request (the POST was still in flight), in
+    /// which case it discards the notification as referring to an unknown
+    /// id — the spec's own rule for `notifications/cancelled`.
+    fn notify_cancelled(&mut self, request_id: u64, reason: &str) {
+        let job = self.post_job();
+        let frame = notify_frame(
+            "notifications/cancelled",
+            json!({"requestId": request_id, "reason": reason}),
+        );
+        let _ = job
+            .post(&frame, CANCEL_NOTIFY_TIMEOUT)
+            .and_then(|resp| job.acknowledged(resp));
+    }
+
+    fn failure(&self, err: &anyhow::Error) -> Failure {
+        if has_marker::<SessionExpired>(err) {
+            Failure::SessionLost
+        } else if self.post_answered.get() {
+            Failure::Answered
+        } else {
+            Failure::Other
+        }
+    }
+
+    /// Drop the session. Everything tied to it is replaced, not reused, so
+    /// that the retired standing-stream reader — which keeps the OLD stop
+    /// flag, rejection latch and pending table — can do nothing to the next
+    /// session whatever it does from here on: a late 4xx and the whole-table
+    /// drain that goes with it land in a table no new request is registered
+    /// in.
+    fn reset_session(&mut self) {
+        retire_stream_reader(&self.stream_shutdown, &mut self.stream_reader);
+        self.stream_shutdown = Arc::new(AtomicBool::new(false));
+        self.standalone_rejected = Arc::new(AtomicBool::new(false));
+        self.pending = pending_new();
+        self.session_id = None;
     }
 }
 
@@ -1595,6 +2639,15 @@ enum StandaloneRound {
 /// on this stream errors at once — the old inline path failed fast on the
 /// same 4xx and must not regress into a timeout) and exits permanently; the
 /// next ensure_standalone_stream() gives it one fresh attempt.
+///
+/// `protocol_version` is the cell the transport keeps the negotiated revision
+/// in: the thread reads it at the top of every round (an `initialize` answered
+/// with 202 opens the stream before the revision is known). `connect` is the
+/// server entry's connect timeout.
+// The parameter list IS the thread's wiring — every value is either moved
+// into the thread or bound to its client. A bundling struct would only move
+// the nine names one level down (same call as `tools/file.rs` and `batch.rs`).
+#[allow(clippy::too_many_arguments)]
 fn spawn_standalone_stream(
     url: String,
     headers: HashMap<String, String>,
@@ -1603,13 +2656,15 @@ fn spawn_standalone_stream(
     shutdown: Arc<AtomicBool>,
     rejected: Arc<AtomicBool>,
     round: Duration,
+    connect: Duration,
+    protocol_version: Arc<std::sync::Mutex<String>>,
 ) -> Result<std::thread::JoinHandle<()>> {
     // Same builder shape and no-redirect rationale as SseTransport::connect:
     // connect timeout ONLY (a total timeout would kill a healthy idle
-    // stream at CALL_TIMEOUT), and a redirect-following client would carry
-    // the configured headers (possibly Authorization) off-origin.
+    // stream at the call timeout), and a redirect-following client would
+    // carry the configured headers (possibly Authorization) off-origin.
     let client = reqwest::blocking::Client::builder()
-        .connect_timeout(CONNECT_TIMEOUT)
+        .connect_timeout(connect)
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap_or_else(|_| {
@@ -1622,6 +2677,10 @@ fn spawn_standalone_stream(
         .name("mcp-http-stream".into())
         .spawn(move || {
             while !shutdown.load(Ordering::Relaxed) {
+                let version = protocol_version
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
                 match standalone_stream_round(
                     &client,
                     &url,
@@ -1630,8 +2689,20 @@ fn spawn_standalone_stream(
                     &pending,
                     &shutdown,
                     round,
+                    &version,
                 ) {
                     StandaloneRound::Rejected(detail) => {
+                        // A RETIRED reader reports to nobody. Its stop flag
+                        // was set because the session was dropped
+                        // (HttpTransport::reset_session), and a 404 on a GET
+                        // that still names that session is the expected
+                        // answer to it — not a rejection worth a warning, and
+                        // the drain below would hit whatever the NEXT session
+                        // has in flight if this reader still shared its
+                        // table (it does not, for exactly this reason).
+                        if shutdown.load(Ordering::Relaxed) {
+                            return;
+                        }
                         // Latch the rejection: the transport's best-effort
                         // pre-POST arming stops re-spawning this thread (one
                         // wasted GET + warning per request would be pure
@@ -1712,6 +2783,8 @@ fn spawn_standalone_stream(
 /// so a healthy stream yields [`StandaloneRound::Expired`] at least once per
 /// [`STREAM_ROUND`] (rotation cadence) and a wedged read cannot outlive it —
 /// the bound that keeps teardown bounded.
+// Same wiring-list call as `spawn_standalone_stream`.
+#[allow(clippy::too_many_arguments)]
 fn standalone_stream_round(
     client: &reqwest::blocking::Client,
     url: &str,
@@ -1720,11 +2793,12 @@ fn standalone_stream_round(
     pending: &Pending,
     shutdown: &AtomicBool,
     round: Duration,
+    protocol_version: &str,
 ) -> StandaloneRound {
     let mut req = client
         .get(url)
         .header("accept", "text/event-stream")
-        .header("MCP-Protocol-Version", PROTOCOL_VERSION);
+        .header("MCP-Protocol-Version", protocol_version);
     for (k, v) in headers {
         req = req.header(k, v);
     }
@@ -1833,9 +2907,13 @@ struct SseTransport {
     /// the old session the moment its GET closes, so a `post_url` frozen at
     /// connect time 404s every call after the first rotation. Each refresh
     /// re-runs [`resolve_endpoint`] (the same-origin gate), and the POST side
-    /// clones the current Url per call — a POST already in flight across a
-    /// rotation may still hit the just-recycled session and fails honestly
-    /// with the server's error.
+    /// clones the current Url per call. `None` from the moment a rotation
+    /// retires the old connection until the next `endpoint` event: the POST
+    /// side waits through that gap ([`Self::post_target`]) instead of
+    /// addressing a session whose stream this client already closed. The
+    /// residual is a POST that cloned the target in the instant before the
+    /// retirement and reached the server after it — that one may still hit
+    /// the just-recycled session and fails honestly with the server's error.
     post_url: Arc<std::sync::Mutex<Option<reqwest::Url>>>,
     headers: HashMap<String, String>,
     pending: Pending,
@@ -1863,6 +2941,11 @@ struct SseTransport {
     /// observability/lifecycle; the reads it blocks in cannot be interrupted,
     /// but each one is round-bounded (STREAM_ROUND) — see Drop.
     reader: Option<std::thread::JoinHandle<()>>,
+    /// Resolved from the server entry at connect (see [`Timeouts`]).
+    timeouts: Timeouts,
+    /// When the last request completed with a response (see
+    /// [`Transport::idle_for`]). `None` until the first one does.
+    last_ok: Option<Instant>,
 }
 
 impl SseTransport {
@@ -1874,10 +2957,11 @@ impl SseTransport {
     /// teardown observable in milliseconds); production always passes
     /// [`STREAM_ROUND`].
     fn connect_with_round(url: &str, cfg: &McpServerConfig, round: Duration) -> Result<Self> {
+        let timeouts = Timeouts::for_http(cfg);
         // The GET is a long-lived stream: connect timeout only, no client
         // total timeout — the round bound is applied per request below.
         let client = reqwest::blocking::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
+            .connect_timeout(timeouts.connect)
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_else(|_| {
@@ -1976,6 +3060,22 @@ impl SseTransport {
                                 // Round deadline on a healthy stream: rotate
                                 // at once, silently (see spawn_standalone_stream).
                                 if is_stream_round_timeout(&e) {
+                                    // Retire the POST target BEFORE this
+                                    // connection drops. Its stream is the only
+                                    // road home for anything posted to its
+                                    // session, and a session-scoped server
+                                    // forgets the session on a timer, not the
+                                    // instant the GET closes (python-sdk polls
+                                    // every 100ms): a POST landing in that
+                                    // window is accepted with 202 and its
+                                    // answer is written into the dead
+                                    // connection — the caller then sat out
+                                    // the whole call timeout. post() now
+                                    // waits for the next connection's
+                                    // endpoint instead (bounded by the
+                                    // connect key).
+                                    *post_url_shared.lock().unwrap_or_else(|e| e.into_inner()) =
+                                        None;
                                     continue 'rounds;
                                 }
                                 // A line over the cap or a read error: the stream is
@@ -2072,7 +3172,7 @@ impl SseTransport {
         // already published into post_url_shared by the reader; later endpoint
         // events refresh that same slot (see the field doc).
         endpoint_rx
-            .recv_timeout(CONNECT_TIMEOUT)
+            .recv_timeout(timeouts.connect)
             .map_err(|e| {
                 // Timed out or the channel died before the endpoint arrived:
                 // tell the reader thread to stop. Its read() cannot be
@@ -2106,6 +3206,14 @@ impl SseTransport {
                         redact_url_credentials(url),
                         redact_url_credentials(&reason)
                     ),
+                    // The one bound this wait has is the connect key's (see
+                    // `Timeouts::connect`) — say so, and for how long it
+                    // waited, in the same terms as every other timeout here.
+                    None if e == mpsc::RecvTimeoutError::Timeout => anyhow!(
+                        "MCP SSE: no 'endpoint' event from {} within {:?} (limit: {CONNECT_LABEL})",
+                        redact_url_credentials(url),
+                        timeouts.connect
+                    ),
                     None => anyhow!(
                         "MCP SSE: no 'endpoint' event from {}: {e}",
                         redact_url_credentials(url)
@@ -2121,32 +3229,42 @@ impl SseTransport {
             "the first endpoint event published the POST target"
         );
         Ok(Self {
-            client: http_client(CALL_TIMEOUT),
+            client: http_client(timeouts.call, timeouts.connect),
             post_url: post_url_shared,
             headers: cfg.headers.clone(),
             pending,
             dead,
             shutdown,
             reader: Some(reader),
+            timeouts,
+            last_ok: None,
         })
     }
 
-    fn post(&self, body: &Value) -> Result<()> {
-        // Clone the CURRENT target (the reader refreshes it per connection —
-        // see the field doc): the fetched Url stays byte-identical to the one
-        // that passed resolve_endpoint's same-origin gate.
-        let target = self
-            .post_url
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-            // Unreachable while the transport lives: connect() only returns
-            // after the first endpoint event filled the slot, and only the
-            // reader writes None-free values.
-            .ok_or_else(|| anyhow!("MCP SSE POST target not resolved"))?;
+    /// POST one frame, the whole request bounded by `bound`. The legacy
+    /// transport has no session header and no protocol-version header (both
+    /// postdate it), so a 404 here is never "session expired". `label` names
+    /// the config key behind `bound` (for the gap wait's timeout message);
+    /// `cancel` is honored during that wait.
+    fn post(
+        &self,
+        body: &Value,
+        bound: Duration,
+        method: &str,
+        label: BoundLabel,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<()> {
+        let target = self.post_target(bound, method, label, cancel)?;
+        self.post_to(target, body, bound)
+    }
+
+    /// The HTTP exchange itself: one POST to an already-resolved `target`,
+    /// bounded by `bound`.
+    fn post_to(&self, target: reqwest::Url, body: &Value, bound: Duration) -> Result<()> {
         let mut req = self
             .client
             .post(target)
+            .timeout(bound)
             .header("content-type", "application/json");
         for (k, v) in &self.headers {
             req = req.header(k, v);
@@ -2164,6 +3282,110 @@ impl SseTransport {
         }
         Ok(())
     }
+
+    /// The current POST target: the fetched Url stays byte-identical to the
+    /// one that passed [`resolve_endpoint`]'s same-origin gate (the reader
+    /// publishes the parsed object, this clones it per call).
+    ///
+    /// `None` means a rotation just retired the previous connection and the
+    /// next one has not published its `endpoint` yet. Posting to the retired
+    /// target would address a session whose stream this client already
+    /// closed, so the caller WAITS for the fresh target. The wait is bounded
+    /// by the connect key — the same bound as the wait for the first
+    /// `endpoint` — and never exceeds the caller's own `bound`; when that is
+    /// the shorter one, the timeout is worded as the caller's (via `label`).
+    /// `cancel` is polled like in [`recv_cancelable`]: a Ctrl-C inside the
+    /// wait bails within one [`POST_TARGET_POLL`] instead of after the bound.
+    fn post_target(
+        &self,
+        bound: Duration,
+        method: &str,
+        label: BoundLabel,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<reqwest::Url> {
+        let by_connect = self.timeouts.connect <= bound;
+        let cap = if by_connect {
+            self.timeouts.connect
+        } else {
+            bound
+        };
+        let deadline = Instant::now() + cap;
+        loop {
+            if let Some(target) = self
+                .post_url
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+            {
+                return Ok(target);
+            }
+            // A reader death while we waited: no endpoint will ever be
+            // published again — fail with its reason, not on the bound.
+            if let Some(reason) = self.dead.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+                bail!("MCP SSE server '{method}' is unreachable: stream reader stopped ({reason})");
+            }
+            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                bail!("MCP call '{method}' cancelled");
+            }
+            let rest = deadline.saturating_duration_since(Instant::now());
+            if rest.is_zero() {
+                if by_connect {
+                    bail!(
+                        "MCP call '{method}' timed out after {cap:?} waiting for the SSE stream's \
+                         'endpoint' event after a rotation (limit: {CONNECT_LABEL})"
+                    );
+                }
+                return Err(timed_out(method, cap, label));
+            }
+            std::thread::sleep(rest.min(POST_TARGET_POLL));
+        }
+    }
+
+    /// One request under an explicit overall bound (`label` naming the config
+    /// key behind it) — the body of [`Transport::request`].
+    fn request_bounded(
+        &mut self,
+        id: u64,
+        method: &str,
+        params: Value,
+        cancel: Option<&AtomicBool>,
+        bound: Duration,
+        label: BoundLabel,
+    ) -> Result<Value> {
+        let (tx, rx) = mpsc::channel();
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, tx);
+        // Dead-reader latch: checked AFTER the slot is registered (same
+        // discipline as StdioTransport) so a reader exiting right under us
+        // cannot slip past both this check and its final pending_fail_all.
+        // Without it every later call sat out the full call timeout against
+        // a server that can no longer deliver — the zombie transport.
+        if let Some(reason) = self.dead.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            self.pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id);
+            bail!("MCP SSE server '{method}' is unreachable: stream reader stopped ({reason})");
+        }
+        let res = (|| -> Result<Value> {
+            self.post(&frame(id, method, params), bound, method, label, cancel)
+                .map_err(|e| name_the_bound(e, method, &self.timeouts, bound, label))?;
+            let msg = recv_cancelable(&rx, method, cancel, bound, label)?;
+            extract_result(msg, method)
+        })();
+        if res.is_ok() {
+            self.last_ok = Some(Instant::now());
+        }
+        if res.is_err() {
+            self.pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id);
+        }
+        res
+    }
 }
 
 impl Transport for SseTransport {
@@ -2174,35 +3396,31 @@ impl Transport for SseTransport {
         params: Value,
         cancel: Option<&AtomicBool>,
     ) -> Result<Value> {
-        let (tx, rx) = mpsc::channel();
-        self.pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(id, tx);
-        // Dead-reader latch: checked AFTER the slot is registered (same
-        // discipline as StdioTransport) so a reader exiting right under us
-        // cannot slip past both this check and its final pending_fail_all.
-        // Without it every later call sat out the full CALL_TIMEOUT against
-        // a server that can no longer deliver — the zombie transport.
-        if let Some(reason) = self.dead.lock().unwrap_or_else(|e| e.into_inner()).clone() {
-            self.pending
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&id);
-            bail!("MCP SSE server '{method}' is unreachable: stream reader stopped ({reason})");
-        }
-        let res = (|| -> Result<Value> {
-            self.post(&frame(id, method, params))?;
-            let msg = recv_cancelable(&rx, method, cancel)?;
-            extract_result(msg, method)
-        })();
-        if res.is_err() {
-            self.pending
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&id);
-        }
-        res
+        self.request_bounded(
+            id,
+            method,
+            params,
+            cancel,
+            self.timeouts.call,
+            Some(CALL_LABEL),
+        )
+    }
+
+    /// The probe's `ping` under its short bound — the POST and the wait on
+    /// the stream both. A legacy server accepts the POST (202) long before
+    /// the answer travels back on the SSE stream, so only the completed
+    /// round trip counts; `Transport::failure`'s default (`Other`) reports
+    /// an unanswered one as exactly that.
+    fn request_within(
+        &mut self,
+        id: u64,
+        method: &str,
+        params: Value,
+        bound: Duration,
+    ) -> Result<Value> {
+        let bound = bound.min(self.timeouts.call);
+        let label = (bound < MCP_PING_TIMEOUT).then_some(CALL_LABEL);
+        self.request_bounded(id, method, params, /* cancel: */ None, bound, label)
     }
 
     fn notify(&mut self, method: &str, params: Value) -> Result<()> {
@@ -2211,7 +3429,42 @@ impl Transport for SseTransport {
         if let Some(reason) = self.dead.lock().unwrap_or_else(|e| e.into_inner()).clone() {
             bail!("MCP SSE server '{method}' is unreachable: stream reader stopped ({reason})");
         }
-        self.post(&notify_frame(method, params))
+        self.post(
+            &notify_frame(method, params),
+            self.timeouts.call,
+            method,
+            Some(CALL_LABEL),
+            None,
+        )
+    }
+
+    /// A round trip is a POST answered on the stream, so only a completed
+    /// one says the path is alive (see [`Self::request_bounded`]).
+    fn idle_for(&self) -> Option<Duration> {
+        self.last_ok.map(|t| t.elapsed())
+    }
+
+    /// Same shape as [`Transport::notify`] — one small POST under its own
+    /// short bound, outcome ignored — minus the dead-reader bail: there is
+    /// nothing to protect when nobody is waiting on the result. It does NOT
+    /// wait out a rotation gap either (unlike `notify`): a cancel notification
+    /// expects no answer, so waiting could only delay the cancel path — with
+    /// no current target the frame is dropped, since the request it names
+    /// went to the retired session, which a session-scoped server has
+    /// recycled anyway.
+    fn notify_cancelled(&mut self, request_id: u64, reason: &str) {
+        let frame = notify_frame(
+            "notifications/cancelled",
+            json!({"requestId": request_id, "reason": reason}),
+        );
+        let target = self
+            .post_url
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(target) = target {
+            let _ = self.post_to(target, &frame, CANCEL_NOTIFY_TIMEOUT);
+        }
     }
 }
 
@@ -2346,6 +3599,91 @@ fn resolve_endpoint(sse_url: &str, endpoint: &str) -> Result<reqwest::Url> {
     }
 }
 
+/// Test-only: a python interpreter for the mock MCP servers (a real child
+/// process is the point of those tests). `TA_MCP_PYTHON` wins; otherwise the
+/// first of the usual names that answers `--version`. `None` = the tests that
+/// need one skip themselves.
+#[cfg(test)]
+pub(crate) fn test_python() -> Option<String> {
+    std::env::var("TA_MCP_PYTHON")
+        .ok()
+        .into_iter()
+        .chain(["python3", "python", "py"].iter().map(|s| s.to_string()))
+        .find(|c| {
+            std::process::Command::new(c)
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        })
+}
+
+/// Test-only: the script of a minimal stdio MCP server with ONE tool —
+/// `env {name}` → the value of that environment variable, or `<unset>`. For
+/// the credential-hygiene tests (kernel plan 2.5): the server reports what
+/// it inherited, which is the only thing those tests need to observe.
+#[cfg(test)]
+const ENV_SERVER: &str = r#"
+import sys, json, os
+for line in sys.stdin:
+    try:
+        msg = json.loads(line)
+    except Exception:
+        continue
+    if msg.get("id") is None:
+        continue
+    method = msg.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": "2025-03-26", "capabilities": {"tools": {}},
+                  "serverInfo": {"name": "env", "version": "0"}}
+    elif method == "tools/list":
+        result = {"tools": [{"name": "env", "description": "Read one environment variable.",
+                             "inputSchema": {"type": "object",
+                                             "properties": {"name": {"type": "string"}},
+                                             "required": ["name"]}}]}
+    elif method == "tools/call":
+        name = (msg.get("params") or {}).get("arguments", {}).get("name")
+        result = {"content": [{"type": "text", "text": os.environ.get(name, "<unset>")}],
+                  "isError": False}
+    else:
+        result = {}
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": result}) + "\n")
+    sys.stdout.flush()
+"#;
+
+/// Test-only: write [`ENV_SERVER`] to the temp dir and return its path. The
+/// file name carries the pid so two checkouts running the same test on one
+/// machine do not overwrite each other's script.
+#[cfg(test)]
+pub(crate) fn write_env_server(tag: &str) -> std::path::PathBuf {
+    let script = std::env::temp_dir().join(format!("ta_mcp_env_{tag}_{}.py", std::process::id()));
+    std::fs::write(&script, ENV_SERVER).expect("write the mock env MCP server");
+    script
+}
+
+/// Test-only: the server entry that runs [`write_env_server`]'s script with
+/// `py`, with `env` as its configured environment.
+#[cfg(test)]
+pub(crate) fn env_server_config(
+    py: &str,
+    script: &std::path::Path,
+    env: HashMap<String, String>,
+) -> McpServerConfig {
+    McpServerConfig {
+        deny_tools: Vec::new(),
+        call_timeout_secs: None,
+        connect_timeout_secs: None,
+        allow_tools: Vec::new(),
+        name: "env-server".into(),
+        command: Some(py.to_string()),
+        args: vec!["-X".into(), "utf8".into(), script.display().to_string()],
+        env,
+        url: None,
+        transport: None,
+        headers: HashMap::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2432,10 +3770,17 @@ mod tests {
         // The intra-turn cancel path: a set flag must bail within ~one 50ms
         // slice, NOT sit out the full 120s CALL_TIMEOUT (the old single
         // recv_timeout made a wedged server hold the turn hostage).
-        let (_tx, rx) = mpsc::channel();
+        let (_tx, rx) = mpsc::channel::<Value>();
         let cancel = AtomicBool::new(true);
         let t0 = Instant::now();
-        let err = recv_cancelable(&rx, "tools/call", Some(&cancel)).unwrap_err();
+        let err = recv_cancelable(
+            &rx,
+            "tools/call",
+            Some(&cancel),
+            CALL_TIMEOUT,
+            Some(CALL_LABEL),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("cancelled"), "err: {err}");
         assert!(
             t0.elapsed() < Duration::from_secs(15),
@@ -2449,15 +3794,67 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         tx.send(json!({"result": {"ok": true}})).unwrap();
         let cancel = AtomicBool::new(false);
-        let msg = recv_cancelable(&rx, "tools/call", Some(&cancel)).unwrap();
+        let msg = recv_cancelable(
+            &rx,
+            "tools/call",
+            Some(&cancel),
+            CALL_TIMEOUT,
+            Some(CALL_LABEL),
+        )
+        .unwrap();
         assert_eq!(msg["result"]["ok"], true);
         // And with no cancel flag at all (handshake shape).
         let (tx2, rx2) = mpsc::channel();
         tx2.send(json!({"result": 1})).unwrap();
         assert_eq!(
-            recv_cancelable(&rx2, "initialize", None).unwrap()["result"],
+            recv_cancelable(&rx2, "initialize", None, CALL_TIMEOUT, Some(CALL_LABEL)).unwrap()
+                ["result"],
             1
         );
+    }
+
+    /// The timeout message must let an operator act without reading source:
+    /// how long it waited and WHICH config key raises that. (It used to say
+    /// "timed out", full stop — with two timeout keys on a server entry that
+    /// is a coin flip.) Bound is honored to the slice, so the test uses a
+    /// 120ms one.
+    #[test]
+    fn recv_cancelable_timeout_names_bound_and_config_key() {
+        let (_tx, rx) = mpsc::channel::<Value>();
+        let t0 = Instant::now();
+        let err = recv_cancelable(
+            &rx,
+            "tools/call",
+            None,
+            Duration::from_millis(120),
+            Some("call_timeout_secs"),
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("timed out after 120ms (limit: call_timeout_secs)"),
+            "{msg}"
+        );
+        assert!(msg.contains("or server died"), "{msg}");
+        assert!(
+            t0.elapsed() >= Duration::from_millis(120) && t0.elapsed() < Duration::from_secs(5),
+            "must wait out the bound, took {:?}",
+            t0.elapsed()
+        );
+        // A clear cancel flag does not turn a timeout into a cancel.
+        let cancel = AtomicBool::new(false);
+        let (_tx2, rx2) = mpsc::channel::<Value>();
+        let err = recv_cancelable(
+            &rx2,
+            "initialize",
+            Some(&cancel),
+            Duration::from_millis(60),
+            Some("connect_timeout_secs"),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("(limit: connect_timeout_secs)"), "{msg}");
+        assert!(!msg.contains("cancelled"), "{msg}");
     }
 
     /// A writer whose write() never completes — stands in for a ChildStdin
@@ -2552,6 +3949,10 @@ mod tests {
     #[test]
     fn stdio_request_unblocks_promptly_on_cancel() {
         let cfg = McpServerConfig {
+            deny_tools: Vec::new(),
+            call_timeout_secs: None,
+            connect_timeout_secs: None,
+            allow_tools: Vec::new(),
             name: "sleep-server".into(),
             command: Some("sleep".into()),
             args: vec!["30".into()],
@@ -2560,7 +3961,7 @@ mod tests {
             headers: HashMap::new(),
             transport: None,
         };
-        let mut t = StdioTransport::spawn(&cfg).expect("spawn sleep server");
+        let mut t = StdioTransport::spawn(&cfg, &[]).expect("spawn sleep server");
         let cancel = AtomicBool::new(true);
         let t0 = Instant::now();
         let err = t
@@ -2753,6 +4154,375 @@ mod tests {
         assert_eq!(names, vec!["ok"]);
     }
 
+    /// The server's `annotations` / `outputSchema` on a `tools/list` entry:
+    /// all four hints parsed, a missing or non-boolean hint takes the spec
+    /// default (`idempotentHint` has none and stays unknown), and the output
+    /// schema is kept only when it is an object.
+    #[test]
+    fn bound_tools_parses_annotations_with_spec_defaults() {
+        use crate::tools::ToolAnnotations;
+        let infos = bound_tools(
+            json!({"tools": [
+                {"name": "full", "description": "d", "inputSchema": {"type": "object"},
+                 "annotations": {"readOnlyHint": true, "destructiveHint": false,
+                                 "idempotentHint": true, "openWorldHint": false},
+                 "outputSchema": {"type": "object", "properties": {"n": {"type": "number"}}}},
+                {"name": "bare", "description": "d", "inputSchema": {"type": "object"}},
+                {"name": "partial", "description": "d", "inputSchema": {"type": "object"},
+                 "annotations": {"readOnlyHint": true}},
+                {"name": "typed", "description": "d", "inputSchema": {"type": "object"},
+                 "annotations": {"readOnlyHint": "true", "idempotentHint": 1},
+                 "outputSchema": [1, 2]},
+            ]}),
+            "srv",
+        );
+        assert_eq!(
+            infos.len(),
+            4,
+            "a bad outputSchema costs the schema, never the tool"
+        );
+        let by = |n: &str| infos.iter().find(|i| i.name == n).unwrap();
+        assert_eq!(
+            by("full").annotations(),
+            ToolAnnotations {
+                read_only_hint: true,
+                destructive_hint: false,
+                idempotent_hint: Some(true),
+                open_world_hint: false,
+            }
+        );
+        assert!(by("full").output_schema.is_some());
+        // Nothing declared: the spec defaults (destructive / open-world true,
+        // read-only false) — `idempotentHint` stays unknown rather than guessed.
+        assert_eq!(by("bare").annotations(), ToolAnnotations::MISSING);
+        assert!(by("bare").output_schema.is_none());
+        // A partial object: the given hint, defaults for the rest.
+        assert_eq!(
+            by("partial").annotations(),
+            ToolAnnotations {
+                read_only_hint: true,
+                ..ToolAnnotations::MISSING
+            }
+        );
+        // A non-boolean hint reads as absent …
+        assert_eq!(by("typed").annotations(), ToolAnnotations::MISSING);
+        // … and a non-object outputSchema is dropped.
+        assert!(by("typed").output_schema.is_none());
+    }
+
+    /// An in-process scripted [`Transport`] for the handshake tests: every
+    /// `request` is answered from a FIFO of canned results in order (`Err`
+    /// entries answer with that error), and each request / notification is
+    /// logged as `(method, params)` — so a test can feed a multi-page
+    /// `tools/list` AND assert the exact wire sequence the client emitted,
+    /// with no server process and no sockets. `new` returns the transport
+    /// plus a handle that reads the log back after the handshake consumed it.
+    ///
+    /// Two knobs, both off by default (so the wire-sequence tests above see
+    /// nothing new): [`Self::with_idleness`] makes the client run its idle
+    /// probe, [`Self::holding_calls`] stands in for a tool that is still
+    /// running when the run is cancelled. A `notifications/cancelled` the
+    /// client sends is logged like any other message, so a test can check
+    /// which request it named.
+    struct ScriptedTransport {
+        results: Arc<std::sync::Mutex<std::collections::VecDeque<Result<Value>>>>,
+        log: Arc<std::sync::Mutex<Vec<(String, Value)>>>,
+        /// What [`Transport::idle_for`] reports; `None` = never probed.
+        idle: Option<Duration>,
+        /// Hold every `tools/call` until the cancel flag is set.
+        hold_calls: bool,
+    }
+
+    /// Test-only stand-in for a refusal a real transport classifies as
+    /// [`Failure::Answered`] (it derives that from what it saw on the wire).
+    #[derive(Debug)]
+    struct Refused;
+    impl std::error::Error for Refused {}
+    impl std::fmt::Display for Refused {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("the server answered, and said no")
+        }
+    }
+
+    #[derive(Clone)]
+    struct ScriptHandle {
+        log: Arc<std::sync::Mutex<Vec<(String, Value)>>>,
+    }
+
+    impl ScriptHandle {
+        /// The `(method, params)` sequence the client sent, in order.
+        fn log(&self) -> Vec<(String, Value)> {
+            self.lock_log().clone()
+        }
+        /// Just the `tools/list` params, in order.
+        fn list_params(&self) -> Vec<Value> {
+            self.lock_log()
+                .iter()
+                .filter(|(m, _)| m == "tools/list")
+                .map(|(_, p)| p.clone())
+                .collect()
+        }
+        fn lock_log(&self) -> std::sync::MutexGuard<'_, Vec<(String, Value)>> {
+            self.log.lock().unwrap_or_else(|e| e.into_inner())
+        }
+    }
+
+    impl ScriptedTransport {
+        fn new(results: Vec<Result<Value>>) -> (Self, ScriptHandle) {
+            let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+            (
+                Self {
+                    results: Arc::new(std::sync::Mutex::new(results.into())),
+                    log: Arc::clone(&log),
+                    idle: None,
+                    hold_calls: false,
+                },
+                ScriptHandle { log },
+            )
+        }
+
+        /// Report `idle` on every [`Transport::idle_for`] ask, so each
+        /// `tools/call` through this transport meets the client's probe
+        /// whatever its threshold.
+        fn with_idleness(mut self, idle: Duration) -> Self {
+            self.idle = Some(idle);
+            self
+        }
+
+        /// Like a real transport facing a tool that has not finished: a
+        /// `tools/call` given a cancel flag waits for the flag (bounded —
+        /// a call nobody cancels fails the test instead of hanging it) and
+        /// then fails the way `recv_cancelable` does. Such a call consumes
+        /// no scripted answer.
+        fn holding_calls(mut self) -> Self {
+            self.hold_calls = true;
+            self
+        }
+    }
+
+    impl Transport for ScriptedTransport {
+        fn request(
+            &mut self,
+            id: u64,
+            method: &str,
+            params: Value,
+            cancel: Option<&AtomicBool>,
+        ) -> Result<Value> {
+            self.log
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((method.to_string(), params));
+            if self.hold_calls && method == "tools/call" {
+                if let Some(cancel) = cancel {
+                    let wait = Instant::now() + Duration::from_secs(10);
+                    while !cancel.load(Ordering::Relaxed) {
+                        assert!(
+                            Instant::now() < wait,
+                            "scripted transport: tools/call #{id} was never cancelled"
+                        );
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }
+                return Err(anyhow!("MCP call '{method}' cancelled"));
+            }
+            self.results
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pop_front()
+                .unwrap_or_else(|| bail!("scripted transport: unexpected request #{id} {method}"))
+        }
+        fn notify(&mut self, method: &str, params: Value) -> Result<()> {
+            self.log
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((method.to_string(), params));
+            Ok(())
+        }
+        fn idle_for(&self) -> Option<Duration> {
+            self.idle
+        }
+        fn notify_cancelled(&mut self, request_id: u64, reason: &str) {
+            self.notify(
+                "notifications/cancelled",
+                json!({"requestId": request_id, "reason": reason}),
+            )
+            .expect("scripted transport: a notification is never refused");
+        }
+        fn failure(&self, err: &anyhow::Error) -> Failure {
+            if has_marker::<SessionExpired>(err) {
+                Failure::SessionLost
+            } else if has_marker::<Refused>(err) {
+                Failure::Answered
+            } else {
+                Failure::Other
+            }
+        }
+    }
+
+    fn init_ok() -> Value {
+        json!({"protocolVersion": PROTOCOL_VERSION, "capabilities": {"tools": {}}})
+    }
+
+    /// One `tools/list` page naming `names`, optionally followed by `next`.
+    fn page(names: &[&str], next: Option<&str>) -> Value {
+        let mut page = json!({"tools": names
+            .iter()
+            .map(|n| json!({"name": n, "description": format!("desc {n}"), "inputSchema": {"type": "object"}}))
+            .collect::<Vec<_>>()});
+        if let Some(next) = next {
+            page["nextCursor"] = json!(next);
+        }
+        page
+    }
+
+    #[test]
+    fn handshake_follows_tools_list_cursor_pagination() {
+        // A paging server's tools/list result carries `nextCursor`; the
+        // client must keep requesting with that cursor until a page has none,
+        // and the handshake must hand back the tools of EVERY page (the
+        // pre-pagination client stopped after page 1 and silently lost the
+        // rest).
+        let (t, h) = ScriptedTransport::new(vec![
+            Ok(init_ok()),
+            Ok(page(&["a", "b"], Some("p2"))),
+            Ok(page(&["c"], Some("p3"))),
+            Ok(page(&["d"], None)),
+        ]);
+        let (_client, infos) = McpClient::handshake(t, "srv").expect("handshake");
+        let names: Vec<&str> = infos.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b", "c", "d"], "all pages merged in order");
+        assert_eq!(
+            h.log(),
+            vec![
+                (
+                    "initialize".to_string(),
+                    json!({
+                        "protocolVersion": PROTOCOL_VERSION,
+                        "capabilities": {},
+                        "clientInfo": {"name": "tiny-agent", "version": env!("CARGO_PKG_VERSION")}
+                    })
+                ),
+                ("notifications/initialized".to_string(), json!({})),
+                ("tools/list".to_string(), json!({})),
+                ("tools/list".to_string(), json!({"cursor": "p2"})),
+                ("tools/list".to_string(), json!({"cursor": "p3"})),
+            ],
+            "initialize → initialized → one tools/list per page, cursor echoed"
+        );
+    }
+
+    #[test]
+    fn handshake_single_page_server_sees_the_unchanged_request_sequence() {
+        // A server that does not page (no nextCursor) gets exactly the
+        // pre-pagination wire sequence: one tools/list with empty params.
+        let (t, h) = ScriptedTransport::new(vec![Ok(init_ok()), Ok(page(&["a"], None))]);
+        let (_client, infos) = McpClient::handshake(t, "srv").expect("handshake");
+        assert_eq!(infos.len(), 1);
+        assert_eq!(h.list_params(), vec![json!({})]);
+        assert_eq!(
+            h.log().len(),
+            3,
+            "initialize + initialized + one tools/list"
+        );
+    }
+
+    #[test]
+    fn handshake_cross_page_duplicate_name_keeps_the_first_listing() {
+        // The same wire name on two pages is a server bug (dispatch is by
+        // name; two entries could never both be reachable). The first
+        // listing wins and the later one is ignored — not a failed server.
+        let mut second = page(&["b", "c"], None);
+        second["tools"][0]["description"] = json!("desc b (page 2)");
+        let (t, _h) = ScriptedTransport::new(vec![
+            Ok(init_ok()),
+            Ok(page(&["a", "b"], Some("p2"))),
+            Ok(second),
+        ]);
+        let (_client, infos) = McpClient::handshake(t, "srv").expect("handshake");
+        let names: Vec<&str> = infos.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
+        assert_eq!(
+            infos.iter().find(|i| i.name == "b").unwrap().description,
+            "desc b",
+            "the kept entry is the FIRST page's listing"
+        );
+    }
+
+    #[test]
+    fn handshake_stops_at_the_tool_cap_without_fetching_further_pages() {
+        // Once MCP_MAX_TOOLS tools are in hand there is nothing more to
+        // gain (bound_tools drops the rest anyway) — no further page is
+        // requested, so a hostile server cannot make the handshake fetch
+        // page after page for tools that will be discarded.
+        let many: Vec<String> = (0..MCP_MAX_TOOLS).map(|i| format!("t{i}")).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        let (t, h) = ScriptedTransport::new(vec![
+            Ok(init_ok()),
+            Ok(page(&many, Some("p2"))),
+            Ok(page(&["never"], None)),
+        ]);
+        let (_client, infos) = McpClient::handshake(t, "srv").expect("handshake");
+        assert_eq!(infos.len(), MCP_MAX_TOOLS);
+        assert_eq!(
+            h.list_params().len(),
+            1,
+            "the second page must not be requested"
+        );
+    }
+
+    #[test]
+    fn handshake_stops_on_a_repeated_cursor() {
+        // A server that keeps answering with a cursor it already handed out
+        // is looping: stop after the pages fetched so far instead of
+        // burning the whole page budget on the same page.
+        let (t, h) = ScriptedTransport::new(vec![
+            Ok(init_ok()),
+            Ok(page(&["a"], Some("again"))),
+            Ok(page(&["a"], Some("again"))),
+            Ok(page(&["a"], Some("again"))),
+        ]);
+        let (_client, infos) = McpClient::handshake(t, "srv").expect("handshake");
+        assert_eq!(infos.len(), 1, "the repeated page added nothing");
+        assert_eq!(
+            h.list_params().len(),
+            2,
+            "page 1, the repeated cursor's page, then stop"
+        );
+    }
+
+    #[test]
+    fn handshake_page_cap_bounds_an_endless_listing() {
+        // Fresh cursor on every page, forever: the listing stops at
+        // MCP_LIST_MAX_PAGES requests with whatever it has collected.
+        let mut results = vec![Ok(init_ok())];
+        for i in 0..MCP_LIST_MAX_PAGES + 10 {
+            results.push(Ok(json!({
+                "tools": [{"name": format!("t{i}"), "description": "d", "inputSchema": {"type": "object"}}],
+                "nextCursor": format!("c{i}")
+            })));
+        }
+        let (t, h) = ScriptedTransport::new(results);
+        let (_client, infos) = McpClient::handshake(t, "srv").expect("handshake");
+        assert_eq!(h.list_params().len(), MCP_LIST_MAX_PAGES);
+        assert_eq!(infos.len(), MCP_LIST_MAX_PAGES);
+    }
+
+    #[test]
+    fn handshake_fails_when_a_later_page_fails() {
+        // A partial tool table must not pass as a successful handshake:
+        // the operator could never tell tools were missing.
+        let (t, _h) = ScriptedTransport::new(vec![
+            Ok(init_ok()),
+            Ok(page(&["a"], Some("p2"))),
+            Err(anyhow!("tools/list page 2: server died")),
+        ]);
+        let err = McpClient::handshake(t, "srv").err().expect("must fail");
+        assert!(
+            format!("{err:#}").contains("page 2"),
+            "the page error is surfaced verbatim: {err:#}"
+        );
+    }
+
     #[test]
     fn pending_dispatch_ignores_server_initiated_requests() {
         // A server-initiated REQUEST (sampling, roots/list, …) carries a
@@ -2874,8 +4644,12 @@ mod tests {
             url: None,
             headers: HashMap::new(),
             transport: None,
+            call_timeout_secs: None,
+            connect_timeout_secs: None,
+            allow_tools: Vec::new(),
+            deny_tools: Vec::new(),
         };
-        let t = StdioTransport::spawn(&cfg).expect("spawn ping server");
+        let t = StdioTransport::spawn(&cfg, &[]).expect("spawn ping server");
         // Let the grandchild provably start before dropping — a kill that
         // lands before cmd even created ping would pass vacuously.
         std::thread::sleep(Duration::from_secs(2));
@@ -3718,8 +5492,12 @@ mod tests {
             url: None,
             headers: HashMap::new(),
             transport: None,
+            call_timeout_secs: None,
+            connect_timeout_secs: None,
+            allow_tools: Vec::new(),
+            deny_tools: Vec::new(),
         };
-        let mut t = StdioTransport::spawn(&cfg).expect("spawn ping server");
+        let mut t = StdioTransport::spawn(&cfg, &[]).expect("spawn ping server");
         let shutdown = Arc::new(AtomicBool::new(false));
         t.set_shutdown(&shutdown);
         // The grandchild must provably exist before the kill, or the test
@@ -3770,8 +5548,12 @@ mod tests {
             url: None,
             headers: HashMap::new(),
             transport: None,
+            call_timeout_secs: None,
+            connect_timeout_secs: None,
+            allow_tools: Vec::new(),
+            deny_tools: Vec::new(),
         };
-        let mut t = StdioTransport::spawn(&cfg).expect("spawn ping server");
+        let mut t = StdioTransport::spawn(&cfg, &[]).expect("spawn ping server");
         let first = Arc::new(AtomicBool::new(false));
         let second = Arc::new(AtomicBool::new(false));
         t.set_shutdown(&first);
@@ -3972,6 +5754,10 @@ mod tests {
         // legacy-SSE fallback against a Streamable server.
         let (url, log) = mock_202_then_sse();
         let cfg = McpServerConfig {
+            deny_tools: Vec::new(),
+            call_timeout_secs: None,
+            connect_timeout_secs: None,
+            allow_tools: Vec::new(),
             name: "mock-202".into(),
             command: None,
             args: vec![],
@@ -4101,6 +5887,10 @@ mod tests {
         // reopen is a window where the server's push finds nobody connected).
         let (url, log) = mock_202_shared_stream();
         let cfg = McpServerConfig {
+            deny_tools: Vec::new(),
+            call_timeout_secs: None,
+            connect_timeout_secs: None,
+            allow_tools: Vec::new(),
             name: "mock-shared".into(),
             command: None,
             args: vec![],
@@ -4243,6 +6033,10 @@ mod tests {
         // per request); the fix must keep it working while sharing.
         let (url, log) = mock_202_reconnect();
         let cfg = McpServerConfig {
+            deny_tools: Vec::new(),
+            call_timeout_secs: None,
+            connect_timeout_secs: None,
+            allow_tools: Vec::new(),
             name: "mock-reconn".into(),
             command: None,
             args: vec![],
@@ -4286,6 +6080,10 @@ mod tests {
             let _ = release_rx.recv_timeout(std::time::Duration::from_secs(30));
         });
         let cfg = McpServerConfig {
+            deny_tools: Vec::new(),
+            call_timeout_secs: None,
+            connect_timeout_secs: None,
+            allow_tools: Vec::new(),
             name: "detach".into(),
             command: None,
             args: vec![],
@@ -4339,6 +6137,10 @@ mod tests {
             std::thread::yield_now();
         }
         let cfg = McpServerConfig {
+            deny_tools: Vec::new(),
+            call_timeout_secs: None,
+            connect_timeout_secs: None,
+            allow_tools: Vec::new(),
             name: "joined".into(),
             command: None,
             args: vec![],
@@ -4535,6 +6337,10 @@ mod tests {
         // 到期轮转是例行节奏，不是故障：健康流每轮重连一次，全程零 diag。
         let (url, log) = mock_held_sse_stream(false);
         let cfg = McpServerConfig {
+            deny_tools: Vec::new(),
+            call_timeout_secs: None,
+            connect_timeout_secs: None,
+            allow_tools: Vec::new(),
             name: "rot-silent".into(),
             command: None,
             args: vec![],
@@ -4574,6 +6380,10 @@ mod tests {
         // 每条连接最终关闭——包括 drop 时仍挂着的那条。
         let (url, log) = mock_held_sse_stream(false);
         let cfg = McpServerConfig {
+            deny_tools: Vec::new(),
+            call_timeout_secs: None,
+            connect_timeout_secs: None,
+            allow_tools: Vec::new(),
             name: "rot-teardown".into(),
             command: None,
             args: vec![],
@@ -4672,6 +6482,10 @@ mod tests {
         // 形状；两者绝不能混淆。
         let (url, log) = mock_short_body_stream();
         let cfg = McpServerConfig {
+            deny_tools: Vec::new(),
+            call_timeout_secs: None,
+            connect_timeout_secs: None,
+            allow_tools: Vec::new(),
             name: "rot-err".into(),
             command: None,
             args: vec![],
@@ -4809,6 +6623,10 @@ mod tests {
         // 到达的消息、自己不重投——服务器不重发时调用方坐满 CALL_TIMEOUT。
         let (url, log) = mock_202_rotating_stream();
         let cfg = McpServerConfig {
+            deny_tools: Vec::new(),
+            call_timeout_secs: None,
+            connect_timeout_secs: None,
+            allow_tools: Vec::new(),
             name: "rot-202".into(),
             command: None,
             args: vec![],
@@ -4836,6 +6654,10 @@ mod tests {
         // 一轮退出——Drop 有界 join、静默，对端看到连接关闭。
         let (url, log) = mock_held_sse_stream(true);
         let cfg = McpServerConfig {
+            deny_tools: Vec::new(),
+            call_timeout_secs: None,
+            connect_timeout_secs: None,
+            allow_tools: Vec::new(),
             name: "legacy-teardown".into(),
             command: None,
             args: vec![],
@@ -4971,6 +6793,10 @@ mod tests {
         // 其响应落在当时活着的连接上照常送达。
         let (url, log) = mock_legacy_rotating_stream();
         let cfg = McpServerConfig {
+            deny_tools: Vec::new(),
+            call_timeout_secs: None,
+            connect_timeout_secs: None,
+            allow_tools: Vec::new(),
             name: "legacy-rot".into(),
             command: None,
             args: vec![],
@@ -5068,7 +6894,15 @@ mod tests {
                 // `event:` line resets instead of leaking onto the next
                 // event's name.
                 if !is_last && rng.below(2) == 0 {
-                    raw.extend_from_slice(rng.pick(GARBAGE));
+                    // Index the table directly instead of `rng.pick`: `pick`
+                    // is generic over the element, and rustc 1.93 infers `T`
+                    // from the `&[u8]` that `extend_from_slice` expects rather
+                    // than from the argument — pinning `T = [u8]` (unsized:
+                    // E0308 + E0277). The indexed element is concretely
+                    // `&[u8]`, so there is nothing left to infer. Same single
+                    // `below` draw as `pick`, so the fixed-seed byte stream is
+                    // unchanged.
+                    raw.extend_from_slice(GARBAGE[rng.below(GARBAGE.len())]);
                     raw.push(b'\n');
                 }
             }
@@ -5360,6 +7194,10 @@ mod tests {
         // 槽再 POST 的那个直接调用：真实结果必须照常返回。
         let (url, log) = mock_get405_direct_post(Duration::from_millis(250));
         let cfg = McpServerConfig {
+            deny_tools: Vec::new(),
+            call_timeout_secs: None,
+            connect_timeout_secs: None,
+            allow_tools: Vec::new(),
             name: "m01".into(),
             command: None,
             args: vec![],
@@ -5401,6 +7239,10 @@ mod tests {
         // transport="http" 下 10 次握手全部必须成功。
         let (url, log) = mock_get405_direct_post(Duration::from_millis(20));
         let cfg = McpServerConfig {
+            deny_tools: Vec::new(),
+            call_timeout_secs: None,
+            connect_timeout_secs: None,
+            allow_tools: Vec::new(),
             name: "m01-hs".into(),
             command: None,
             args: vec![],
@@ -5432,6 +7274,10 @@ mod tests {
         // （对纯 Streamable server 回落必然再失败）。
         let (url, _) = mock_get405_direct_post(Duration::from_millis(20));
         let cfg = McpServerConfig {
+            deny_tools: Vec::new(),
+            call_timeout_secs: None,
+            connect_timeout_secs: None,
+            allow_tools: Vec::new(),
             name: "m01-auto".into(),
             command: None,
             args: vec![],
@@ -5467,10 +7313,34 @@ mod tests {
     /// Legacy SSE (2024-11-05) server whose POST endpoint is SESSION-BOUND per
     /// GET connection — the shape of the reference implementations (python-sdk
     /// SseServerTransport): every `GET /sse` mints a fresh session id; the
-    /// `endpoint` event carries `/messages?session=<sid>`; the session is
-    /// forgotten the moment its GET connection closes; POSTs addressed to a
-    /// dead session answer `404`. Logs `get sid=N` / `post …` / `closed sid=N`.
+    /// `endpoint` event carries `/messages?session=<sid>`; POSTs addressed to
+    /// a forgotten session answer `404`. Logs `get sid=N` / `post …` /
+    /// `closed sid=N`.
     fn mock_legacy_session_bound_endpoint() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        mock_legacy_session_bound_endpoint_with(Duration::ZERO, Duration::from_millis(20))
+    }
+
+    /// [`mock_legacy_session_bound_endpoint`] with the two timings a test may
+    /// want to stretch:
+    ///
+    /// - `endpoint_delay`: how long every RECONNECTING GET (session > 1)
+    ///   holds back its `endpoint` event — the rotation gap, made wide enough
+    ///   for a test to issue a request inside it. The response HEADERS still
+    ///   go out at once; only the event waits, so the gap is a read-phase
+    ///   gap: the client's round deadline expires while it waits for the
+    ///   event, which is the silent rotation path. (Withholding the headers
+    ///   too would fail each reconnect at the connect phase instead — the
+    ///   warned-and-backed-off path — and a test doing that without holding
+    ///   `TEST_LOCK` leaks its warnings into whichever test holds the sink.)
+    /// - `close_poll`: how long a session may OUTLIVE the client closing its
+    ///   GET connection. The reference servers forget a session on a timer
+    ///   (python-sdk polls every 100ms), not at the instant the connection
+    ///   drops — so a POST addressed to a just-closed session is still
+    ///   accepted with 202, and its answer is written into the dead socket.
+    fn mock_legacy_session_bound_endpoint_with(
+        endpoint_delay: Duration,
+        close_poll: Duration,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
         use std::io::Read;
         use std::net::TcpListener;
         use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -5515,16 +7385,24 @@ mod tests {
                                 log_c.lock().unwrap().push(format!("get sid={sid}"));
                                 let (tx, rx) = mpsc::channel::<String>();
                                 sessions_c.lock().unwrap().insert(sid, tx);
-                                let resp = format!(
-                                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
-                                     cache-control: no-cache\r\nconnection: close\r\n\r\n\
-                                     event: endpoint\ndata: /messages?session={sid}\n\n"
-                                );
+                                let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                                            cache-control: no-cache\r\nconnection: close\r\n\r\n";
+                                let _ = sock.write_all(head.as_bytes());
+                                let _ = sock.flush();
+                                // Only the endpoint EVENT waits (see the doc).
+                                if sid > 1 {
+                                    std::thread::sleep(endpoint_delay);
+                                }
+                                let resp =
+                                    format!("event: endpoint\ndata: /messages?session={sid}\n\n");
                                 let _ = sock.write_all(resp.as_bytes());
                                 let _ = sock.flush();
                                 // Forward queued responses; detect the client
-                                // closing the connection (rotation/teardown).
+                                // closing the connection (rotation/teardown)
+                                // — only every `close_poll`, like a server
+                                // that reaps sessions on a timer.
                                 sock.set_nonblocking(true).ok();
+                                let mut next_close_check = Instant::now() + close_poll;
                                 loop {
                                     match rx.recv_timeout(Duration::from_millis(20)) {
                                         Ok(msg) => {
@@ -5535,12 +7413,16 @@ mod tests {
                                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                                     }
-                                    let mut b = [0u8; 1];
-                                    match sock.read(&mut b) {
-                                        Ok(0) => break,
-                                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                                        Err(_) => break,
-                                        Ok(_) => {}
+                                    if Instant::now() >= next_close_check {
+                                        next_close_check = Instant::now() + close_poll;
+                                        let mut b = [0u8; 1];
+                                        match sock.read(&mut b) {
+                                            Ok(0) => break,
+                                            Err(e)
+                                                if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                                            Err(_) => break,
+                                            Ok(_) => {}
+                                        }
                                     }
                                 }
                                 sessions_c.lock().unwrap().remove(&sid);
@@ -5598,6 +7480,10 @@ mod tests {
         // 会话轮转。
         let (url, log) = mock_legacy_session_bound_endpoint();
         let cfg = McpServerConfig {
+            deny_tools: Vec::new(),
+            call_timeout_secs: None,
+            connect_timeout_secs: None,
+            allow_tools: Vec::new(),
             name: "m02".into(),
             command: None,
             args: vec![],
@@ -5615,7 +7501,10 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         // 首个调用：修复后必然 Ok（post_url 跟随最新 endpoint；并行负载下可能
-        // 已轮转数次，不锚定 sid==1）。
+        // 已轮转数次，不锚定 sid==1）。请求恰好落在轮转间隙里时，POST 会等
+        // 新连接的 endpoint 再发（见
+        // legacy_sse_post_in_a_rotation_gap_waits_for_the_fresh_endpoint）——
+        // 上面持 TEST_LOCK 等了多久都一样。
         t.request(1, "tools/list", json!({}), None)
             .expect("first call must succeed on a live session");
         // 等 ≥2 次轮转（GET 断开 → 旧会话被 server 回收）。
@@ -5641,6 +7530,282 @@ mod tests {
             served_by.is_some_and(|s| s >= 3),
             "must be served by a CURRENT (post-rotation) session, got {served_by:?}"
         );
+    }
+
+    #[test]
+    fn legacy_sse_post_in_a_rotation_gap_waits_for_the_fresh_endpoint() {
+        // 请求恰好发在轮转间隙里（旧连接已退役、新连接的 endpoint 还没到）：
+        // 不能打向已退役的会话。会话绑定的 server 靠定时器回收会话（python-sdk
+        // 每 100ms 轮询一次），落在间隙里的 POST 照样被 202 受理，回执写进已经
+        // 死掉的连接——调用方于是等满整个 call 超时（全量并发跑时这个测试的
+        // 兄弟用例偶发「tools/list timed out」的根因）。这里把间隙拉到 800ms、
+        // 让会话在 GET 关闭后继续存活 5s：修复前的行为是 POST 打向 sid=1 → 202
+        // → 回执丢失 → 2s 后超时；修复后 POST 等到 sid=2 的 endpoint 再发。
+        let (url, log) = mock_legacy_session_bound_endpoint_with(
+            Duration::from_millis(800),
+            Duration::from_secs(5),
+        );
+        let cfg = McpServerConfig {
+            call_timeout_secs: Some(2),
+            ..http_cfg("legacy-gap", &url, McpTransport::Sse)
+        };
+        let mut t = SseTransport::connect_with_round(&url, &cfg, Duration::from_secs(2))
+            .expect("connect via the endpoint event");
+        // 第一次轮转落地：旧连接已退役，新连接的 endpoint 被扣着。
+        wait_for_log(
+            &log,
+            |e| e.iter().any(|l| l == "get sid=2"),
+            "the first rotation",
+        );
+        let v = t
+            .request(1, "tools/list", json!({}), None)
+            .expect("a request issued inside the gap must be served by the fresh session");
+        assert_eq!(
+            v["sid"].as_u64(),
+            Some(2),
+            "served by the session whose endpoint the POST waited for"
+        );
+        let log_snapshot = log.lock().unwrap().clone();
+        assert!(
+            !log_snapshot
+                .iter()
+                .any(|l| l.starts_with("post") && l.contains("session=1")),
+            "nothing may be posted to the retired session: {log_snapshot:?}"
+        );
+        assert!(
+            log_snapshot
+                .iter()
+                .any(|l| l.starts_with("post") && l.contains("session=2")),
+            "the POST must follow the fresh endpoint: {log_snapshot:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_sse_gap_wait_is_bounded_by_the_connect_key_and_never_posts_blind() {
+        // 新连接迟迟不给 endpoint（比一轮还慢 → 每轮都空转，目标一直是退役态）：
+        // 等它的上限是 connect 键（与等首个 endpoint 同一个界），不是 call 键；
+        // 期间不发任何 POST。修复前的行为是立刻打向已退役的 sid=1 → 404
+        // （"MCP SSE error 404"）——既不提 connect 键，也把请求送进了一个明知
+        // 已死的会话。
+        let (url, log) = mock_legacy_session_bound_endpoint_with(
+            Duration::from_secs(10),
+            Duration::from_millis(20),
+        );
+        let cfg = McpServerConfig {
+            call_timeout_secs: Some(20),
+            connect_timeout_secs: Some(1),
+            ..http_cfg("legacy-gap-bound", &url, McpTransport::Sse)
+        };
+        let mut t = SseTransport::connect_with_round(&url, &cfg, Duration::from_millis(300))
+            .expect("connect via the endpoint event");
+        wait_for_log(&log, |e| count_gets(e) >= 2, "the first rotation");
+        let t0 = Instant::now();
+        let err = unwrap_err(
+            t.request(1, "tools/list", json!({}), None),
+            "no fresh endpoint, no request",
+        );
+        let took = t0.elapsed();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(
+                "after 1s waiting for the SSE stream's 'endpoint' event after a rotation \
+                 (limit: connect_timeout_secs)"
+            ),
+            "{msg}"
+        );
+        assert!(!msg.contains("call_timeout_secs"), "{msg}");
+        assert!(
+            took >= Duration::from_millis(900) && took < Duration::from_secs(5),
+            "bounded by the connect key (1s), not the call key (20s): {took:?}"
+        );
+        // 通知要到达的是之后会服务请求的那个会话，所以同样等新目标、同一个界。
+        let err = unwrap_err(
+            t.notify("notifications/initialized", json!({})),
+            "no fresh endpoint, no notification",
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(
+                "after 1s waiting for the SSE stream's 'endpoint' event after a rotation \
+                 (limit: connect_timeout_secs)"
+            ),
+            "{msg}"
+        );
+        // 取消通知不等回执：不能为它耗掉间隙，立刻返回。
+        let t1 = Instant::now();
+        t.notify_cancelled(1, "cancelled");
+        assert!(
+            t1.elapsed() < Duration::from_millis(500),
+            "the cancel notice must not sit out the gap: {:?}",
+            t1.elapsed()
+        );
+        let log_snapshot = log.lock().unwrap().clone();
+        assert!(
+            !log_snapshot.iter().any(|l| l.starts_with("post")),
+            "nothing may be posted while there is no current target: {log_snapshot:?}"
+        );
+    }
+
+    /// A legacy-SSE transport with no connection and no reader thread: only the
+    /// POST side's gap wait is under test, driven through the same `post_url`
+    /// / `dead` slots the reader thread writes.
+    fn detached_sse_transport(call: Duration, connect: Duration) -> SseTransport {
+        SseTransport {
+            client: http_client(call, connect),
+            post_url: Arc::new(std::sync::Mutex::new(None)),
+            headers: HashMap::new(),
+            pending: pending_new(),
+            dead: Arc::new(std::sync::Mutex::new(None)),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            reader: None,
+            timeouts: Timeouts {
+                call,
+                connect,
+                boot: (call, CALL_LABEL),
+            },
+            last_ok: None,
+        }
+    }
+
+    #[test]
+    fn legacy_sse_gap_wait_names_the_connect_key_when_it_sets_the_bound() {
+        // connect 界比调用方自己的界短 → 等 connect 这么久，文案提 connect 键。
+        let t = detached_sse_transport(Duration::from_secs(5), Duration::from_millis(300));
+        let t0 = Instant::now();
+        let err = unwrap_err(
+            t.post_target(Duration::from_secs(5), "tools/call", Some(CALL_LABEL), None),
+            "no endpoint, no target",
+        );
+        let took = t0.elapsed();
+        let msg = err.to_string();
+        assert_eq!(
+            msg,
+            "MCP call 'tools/call' timed out after 300ms waiting for the SSE stream's \
+             'endpoint' event after a rotation (limit: connect_timeout_secs)"
+        );
+        assert!(
+            took >= Duration::from_millis(300) && took < Duration::from_secs(4),
+            "{took:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_sse_gap_wait_never_exceeds_the_callers_bound() {
+        // 调用方自己的界更短（空闲探测的 ping、取消通知那一档）→ 只等这么久，
+        // 文案按调用方的键来（这里没有键：与 recv_cancelable 同一个措辞）。
+        let t = detached_sse_transport(Duration::from_secs(120), Duration::from_secs(15));
+        let t0 = Instant::now();
+        let err = unwrap_err(
+            t.post_target(Duration::from_millis(200), "ping", None, None),
+            "no endpoint, no target",
+        );
+        let took = t0.elapsed();
+        assert_eq!(
+            err.to_string(),
+            "MCP call 'ping' timed out after 200ms or server died"
+        );
+        assert!(
+            took >= Duration::from_millis(200) && took < Duration::from_secs(4),
+            "{took:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_sse_gap_wait_follows_the_fresh_endpoint_and_the_dead_latch() {
+        let ms = Duration::from_millis;
+        let fresh = reqwest::Url::parse("http://127.0.0.1:1/messages?session=2").expect("url");
+
+        // 下一连接在等待途中发布了 endpoint：以那个目标（读者发布的对象本身）
+        // 结束等待。
+        let t = detached_sse_transport(Duration::from_secs(120), Duration::from_secs(15));
+        {
+            let slot = Arc::clone(&t.post_url);
+            let fresh = fresh.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(ms(100));
+                *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(fresh);
+            });
+        }
+        let t0 = Instant::now();
+        let got = t
+            .post_target(
+                Duration::from_secs(120),
+                "tools/call",
+                Some(CALL_LABEL),
+                None,
+            )
+            .expect("the fresh endpoint ends the wait");
+        assert_eq!(got, fresh);
+        assert!(t0.elapsed() >= ms(100), "{:?}", t0.elapsed());
+
+        // 读者在等待途中死亡：之后不会再有 endpoint——以读者的死因结束，不是
+        // 等满界。
+        let t = detached_sse_transport(Duration::from_secs(120), Duration::from_secs(15));
+        {
+            let latch = Arc::clone(&t.dead);
+            std::thread::spawn(move || {
+                std::thread::sleep(ms(100));
+                *latch.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some("stream ended (EOF)".into());
+            });
+        }
+        let t0 = Instant::now();
+        let err = unwrap_err(
+            t.post_target(
+                Duration::from_secs(120),
+                "tools/call",
+                Some(CALL_LABEL),
+                None,
+            ),
+            "a dead reader must end the wait",
+        );
+        assert_eq!(
+            err.to_string(),
+            "MCP SSE server 'tools/call' is unreachable: stream reader stopped (stream ended \
+             (EOF))"
+        );
+        assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", t0.elapsed());
+    }
+
+    #[test]
+    fn legacy_sse_gap_wait_honors_cancel() {
+        // Ctrl-C 落在间隙等待里：至多一个 POST_TARGET_POLL 内受理，而不是等满
+        // connect 界（默认 15s）——与 recv_cancelable 同一条纪律。
+        let t = detached_sse_transport(Duration::from_secs(120), Duration::from_secs(15));
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let cancel = Arc::clone(&cancel);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                cancel.store(true, Ordering::Relaxed);
+            });
+        }
+        let t0 = Instant::now();
+        let err = unwrap_err(
+            t.post_target(
+                Duration::from_secs(120),
+                "tools/call",
+                Some(CALL_LABEL),
+                Some(cancel.as_ref()),
+            ),
+            "a cancel must end the wait",
+        );
+        assert_eq!(err.to_string(), "MCP call 'tools/call' cancelled");
+        assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", t0.elapsed());
+
+        // 目标在手时 cancel 不归这段管：照常取到目标发出去，随后由
+        // recv_cancelable 在一个切片内受理取消（并让调用方补发取消通知）。
+        let live = reqwest::Url::parse("http://127.0.0.1:1/messages?session=3").expect("url");
+        *t.post_url.lock().unwrap_or_else(|e| e.into_inner()) = Some(live.clone());
+        let got = t
+            .post_target(
+                Duration::from_secs(120),
+                "tools/call",
+                Some(CALL_LABEL),
+                Some(cancel.as_ref()),
+            )
+            .expect("a live target is returned even under cancel");
+        assert_eq!(got, live);
     }
 
     #[test]
@@ -5684,6 +7849,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(300));
         });
         let cfg = McpServerConfig {
+            deny_tools: Vec::new(),
+            call_timeout_secs: None,
+            connect_timeout_secs: None,
+            allow_tools: Vec::new(),
             name: "m05".into(),
             command: None,
             args: vec![],
@@ -5727,18 +7896,7 @@ mod tests {
     /// 外部解释器的 [`stdio_reader_eof_latches_the_transport_dead`] 钉住。
     #[test]
     fn stdio_reader_death_fast_fails_later_calls() {
-        let py = std::env::var("TA_MCP_PYTHON")
-            .ok()
-            .into_iter()
-            .chain(["python3", "python", "py"].iter().map(|s| s.to_string()))
-            .find(|c| {
-                std::process::Command::new(c)
-                    .arg("--version")
-                    .output()
-                    .map(|o| o.status.success())
-                    .unwrap_or(false)
-            });
-        let Some(py) = py else {
+        let Some(py) = test_python() else {
             eprintln!(
                 "skip stdio_reader_death_fast_fails_later_calls: no python \
                  interpreter found (set TA_MCP_PYTHON to run it)"
@@ -5778,6 +7936,10 @@ for line in sys.stdin:
         )
         .unwrap();
         let cfg = McpServerConfig {
+            deny_tools: Vec::new(),
+            call_timeout_secs: None,
+            connect_timeout_secs: None,
+            allow_tools: Vec::new(),
             name: "zombie-server".into(),
             command: Some(py.to_string()),
             args: vec!["-X".into(), "utf8".into(), script.display().to_string()],
@@ -5786,7 +7948,7 @@ for line in sys.stdin:
             transport: None,
             headers: HashMap::new(),
         };
-        let mut t = StdioTransport::spawn(&cfg).expect("spawn mock stdio server");
+        let mut t = StdioTransport::spawn(&cfg, &[]).expect("spawn mock stdio server");
         let t0 = Instant::now();
         let r1 = t.request(1, "tools/list", json!({}), None);
         let e1 = t0.elapsed();
@@ -5825,6 +7987,10 @@ for line in sys.stdin:
             vec!["/C".to_string(), "exit".to_string()],
         );
         let cfg = McpServerConfig {
+            deny_tools: Vec::new(),
+            call_timeout_secs: None,
+            connect_timeout_secs: None,
+            allow_tools: Vec::new(),
             name: "eof-server".into(),
             command: Some(cmd),
             args,
@@ -5833,7 +7999,7 @@ for line in sys.stdin:
             transport: None,
             headers: HashMap::new(),
         };
-        let mut t = StdioTransport::spawn(&cfg).expect("spawn exiting child");
+        let mut t = StdioTransport::spawn(&cfg, &[]).expect("spawn exiting child");
         // Let the reader observe EOF and latch first — the calls below must
         // go through the latch, not the reader's one-shot final fail-all
         // (which only covers slots already registered at exit).
@@ -5928,6 +8094,10 @@ for line in sys.stdin:
     fn legacy_sse_reader_death_fast_fails_later_calls() {
         let (url, log) = mock_legacy_sse_die_after_first_get();
         let cfg = McpServerConfig {
+            deny_tools: Vec::new(),
+            call_timeout_secs: None,
+            connect_timeout_secs: None,
+            allow_tools: Vec::new(),
             name: "sse-die".into(),
             command: None,
             args: vec![],
@@ -5975,6 +8145,10 @@ for line in sys.stdin:
         );
         drop(listener);
         let cfg = McpServerConfig {
+            deny_tools: Vec::new(),
+            call_timeout_secs: None,
+            connect_timeout_secs: None,
+            allow_tools: Vec::new(),
             name: "sse-refused".into(),
             command: None,
             args: vec![],
@@ -5991,5 +8165,1881 @@ for line in sys.stdin:
             msg.contains("stream reader stopped (connect failed"),
             "connect error must surface the reader's latched reason, got {msg}"
         );
+    }
+
+    // ─── 超时 / 协商版本 / 取消通知 / 空闲 ping / 会话恢复 ─────────────────
+    //
+    // 纯逻辑三项（超时解析、版本协商、404 归类）不碰网络；客户端层的行为先用
+    // ScriptedTransport 钉 wire 序列（毫秒级、断言精确），再到下面的真 HTTP /
+    // stdio / legacy SSE mock 上各走一遍。两段都要：ScriptedTransport 只证明
+    // 客户端按 idle_for / failure 的答案走对了分支，真传输那一段才证明
+    // idle_for / notify_cancelled / failure / reset_session 真的接上了。
+    //
+    // 诊断行断言一律按「本测试的 server 名 / URL」过滤后计数：进程里其它
+    // 并发测试的 diag 行也会落进同一个 sink（它们不持有 TEST_LOCK）。
+
+    /// 本段测试 client 的 server 名——诊断行按它过滤，别处不用。
+    const SRV: &str = "srv24";
+
+    /// Hold the global diag lock, route every diag line into a buffer, and
+    /// restore the stderr fallback on drop — a failed assert included: a bare
+    /// install + clear pair leaves its sink installed for every LATER test in
+    /// the binary when an assert between the two fires. The lock is taken
+    /// FIRST: a sink installed while another test still holds the lock would
+    /// steal that test's lines while this one waits for its turn.
+    struct DiagCapture {
+        lines: Arc<std::sync::Mutex<Vec<String>>>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl DiagCapture {
+        fn install() -> Self {
+            let lock = crate::diag::TEST_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let lines: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+            let sink = Arc::clone(&lines);
+            crate::diag::install_diag_sink(Box::new(move |_level, msg| {
+                sink.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(msg.to_string());
+            }));
+            Self { lines, _lock: lock }
+        }
+
+        /// The captured lines that mention `needle`.
+        fn about(&self, needle: &str) -> Vec<String> {
+            self.lines
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|l| l.contains(needle))
+                .cloned()
+                .collect()
+        }
+    }
+
+    impl Drop for DiagCapture {
+        fn drop(&mut self) {
+            crate::diag::clear_diag_sink();
+        }
+    }
+
+    /// A client past its handshake against a scripted transport.
+    fn handshake_done(t: impl Transport + 'static) -> McpClient {
+        McpClient::handshake(t, SRV).expect("handshake").0
+    }
+
+    /// The `method` sequence the client sent, in order.
+    fn sent_methods(h: &ScriptHandle) -> Vec<String> {
+        h.log().into_iter().map(|(m, _)| m).collect()
+    }
+
+    /// What a completed handshake leaves in the wire log.
+    const HANDSHAKE: [&str; 3] = ["initialize", "notifications/initialized", "tools/list"];
+
+    /// The error a Streamable HTTP transport hands back for a 404 on a
+    /// request that carried our session id.
+    fn session_lost() -> anyhow::Error {
+        anyhow::Error::new(SessionExpired)
+            .context("MCP HTTP error 404 Not Found: Session not found")
+    }
+
+    /// `expect_err` for success types that are not `Debug` (transports,
+    /// clients): panic with the message instead of demanding a `Debug` impl.
+    fn unwrap_err<T>(r: Result<T>, what: &str) -> anyhow::Error {
+        match r {
+            Ok(_) => panic!("{what}"),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn timeouts_resolve_per_transport_and_name_the_key_to_raise() {
+        let cfg = |call: Option<u64>, connect: Option<u64>| McpServerConfig {
+            name: "t".into(),
+            command: None,
+            args: Vec::new(),
+            env: HashMap::new(),
+            url: None,
+            transport: None,
+            headers: HashMap::new(),
+            call_timeout_secs: call,
+            connect_timeout_secs: connect,
+            allow_tools: Vec::new(),
+            deny_tools: Vec::new(),
+        };
+        // Unset: the bounds every server had before the keys existed. stdio's
+        // boot IS the call bound — a server that used to come up in 100s
+        // still does.
+        assert_eq!(
+            Timeouts::for_stdio(&cfg(None, None)),
+            Timeouts {
+                call: CALL_TIMEOUT,
+                connect: CONNECT_TIMEOUT,
+                boot: (CALL_TIMEOUT, CALL_LABEL),
+            }
+        );
+        // `call_timeout_secs` moves a stdio server's boot with it, and the
+        // label names it (it is the key that was set).
+        assert_eq!(
+            Timeouts::for_stdio(&cfg(Some(7), None)),
+            Timeouts {
+                call: Duration::from_secs(7),
+                connect: CONNECT_TIMEOUT,
+                boot: (Duration::from_secs(7), CALL_LABEL),
+            }
+        );
+        // `connect_timeout_secs` set: the boot follows it, the call does not.
+        assert_eq!(
+            Timeouts::for_stdio(&cfg(None, Some(3))),
+            Timeouts {
+                call: CALL_TIMEOUT,
+                connect: Duration::from_secs(3),
+                boot: (Duration::from_secs(3), CONNECT_LABEL),
+            }
+        );
+        assert_eq!(
+            Timeouts::for_stdio(&cfg(Some(7), Some(3))),
+            Timeouts {
+                call: Duration::from_secs(7),
+                connect: Duration::from_secs(3),
+                boot: (Duration::from_secs(3), CONNECT_LABEL),
+            }
+        );
+        // HTTP: the connect key is the TCP/TLS bound only — `initialize` on
+        // a connected server is a call, bounded by the call key.
+        assert_eq!(
+            Timeouts::for_http(&cfg(None, Some(3))),
+            Timeouts {
+                call: CALL_TIMEOUT,
+                connect: Duration::from_secs(3),
+                boot: (CALL_TIMEOUT, CALL_LABEL),
+            }
+        );
+        assert_eq!(
+            Timeouts::for_http(&cfg(Some(9), None)),
+            Timeouts {
+                call: Duration::from_secs(9),
+                connect: CONNECT_TIMEOUT,
+                boot: (Duration::from_secs(9), CALL_LABEL),
+            }
+        );
+        // A value past the ceiling (validate() rejects it; a struct a host
+        // built by hand can still carry it) clamps instead of overflowing
+        // the clock add it ends up in.
+        let week = Duration::from_secs(MCP_MAX_TIMEOUT_SECS);
+        assert_eq!(timeout_secs(Some(u64::MAX), CALL_TIMEOUT), week);
+        assert_eq!(timeout_secs(Some(MCP_MAX_TIMEOUT_SECS), CALL_TIMEOUT), week);
+        assert_eq!(timeout_secs(None, CALL_TIMEOUT), CALL_TIMEOUT);
+    }
+
+    #[test]
+    fn timeout_wording_names_the_key_only_when_a_key_set_the_bound() {
+        assert_eq!(
+            timed_out("tools/call", CALL_TIMEOUT, Some(CALL_LABEL)).to_string(),
+            "MCP call 'tools/call' timed out after 120s (limit: call_timeout_secs) or server died"
+        );
+        // The idle probe's bound is no config key's — nothing to name.
+        assert_eq!(
+            timed_out("ping", MCP_PING_TIMEOUT, None).to_string(),
+            "MCP call 'ping' timed out after 5s or server died"
+        );
+    }
+
+    #[test]
+    fn protocol_version_negotiation_echoes_the_server_and_never_fails() {
+        let server = format!("MCP '{SRV}'");
+        // Known revisions — the requested one included — pass in silence.
+        let cap = DiagCapture::install();
+        for known in KNOWN_PROTOCOL_VERSIONS {
+            assert_eq!(negotiate_protocol_version(SRV, Some(known)), *known);
+        }
+        assert!(
+            cap.about(&server).is_empty(),
+            "a known revision is not worth a warning: {:?}",
+            cap.about(&server)
+        );
+        drop(cap);
+
+        // Unknown / missing / empty: one warning each, then the best guess.
+        let cap = DiagCapture::install();
+        assert_eq!(
+            negotiate_protocol_version(SRV, Some("2099-01-01")),
+            "2099-01-01",
+            "an unverified revision is still the server's call"
+        );
+        assert_eq!(negotiate_protocol_version(SRV, None), PROTOCOL_VERSION);
+        assert_eq!(negotiate_protocol_version(SRV, Some("")), PROTOCOL_VERSION);
+        let lines = cap.about(&server);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(
+            lines[0].contains("'2099-01-01'") && lines[0].contains("not verified"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1..]
+                .iter()
+                .all(|l| l.contains("names no protocol version")),
+            "{lines:?}"
+        );
+        drop(cap);
+
+        // Through the handshake the client keeps whatever the server chose.
+        let mut newer = init_ok();
+        newer["protocolVersion"] = json!("2025-11-25");
+        let (t, _) = ScriptedTransport::new(vec![Ok(newer), Ok(page(&["a"], None))]);
+        let client = handshake_done(t);
+        assert_eq!(client.protocol_version(), "2025-11-25");
+        let (t, _) = ScriptedTransport::new(vec![Ok(init_ok()), Ok(page(&["a"], None))]);
+        let client = handshake_done(t);
+        assert_eq!(client.protocol_version(), PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn only_a_404_on_a_session_carried_request_marks_the_session_lost() {
+        let not_found = reqwest::StatusCode::NOT_FOUND;
+        let lost = http_error(not_found, "Session not found", /* had_session: */ true);
+        assert!(has_marker::<SessionExpired>(&lost));
+        assert!(
+            !has_marker::<SessionExpired>(&http_error(not_found, "no such path", false)),
+            "a 404 on a request without a session id is an ordinary bad URL"
+        );
+        assert!(
+            !has_marker::<SessionExpired>(&http_error(
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                "boom",
+                true
+            )),
+            "a 500 says nothing about the session"
+        );
+        // The human half of the message is unchanged; the marker only adds
+        // the explanation of what a 404 means here.
+        let msg = format!("{lost:#}");
+        assert!(
+            msg.starts_with("MCP HTTP error 404 Not Found: Session not found")
+                && msg.contains("no longer knows this session"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn call_on_an_already_cancelled_run_sends_nothing() {
+        let (t, h) = ScriptedTransport::new(vec![
+            Ok(init_ok()),
+            Ok(page(&["a"], None)),
+            Ok(json!({"content": []})),
+        ]);
+        let mut client = handshake_done(t);
+        let cancel = AtomicBool::new(true);
+        let err = client
+            .call("tools/call", json!({"name": "a"}), Some(&cancel))
+            .expect_err("a cancelled run must not place one more tool call");
+        assert!(err.to_string().contains("cancelled"), "{err:#}");
+        assert_eq!(
+            sent_methods(&h),
+            HANDSHAKE,
+            "no call was sent, so there is nothing to revoke either"
+        );
+        // The call never reached the transport: its scripted answer is still
+        // queued for the first call of a live run.
+        cancel.store(false, Ordering::Relaxed);
+        assert_eq!(
+            client
+                .call("tools/call", json!({"name": "a"}), Some(&cancel))
+                .expect("the call goes through once the run is live"),
+            json!({"content": []})
+        );
+    }
+
+    #[test]
+    fn a_call_cancelled_in_flight_tells_the_server_which_request() {
+        let (t, h) = ScriptedTransport::new(vec![Ok(init_ok()), Ok(page(&["a"], None))]);
+        let mut client = handshake_done(t.holding_calls());
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let later = Arc::clone(&cancel);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                later.store(true, Ordering::Relaxed);
+            });
+        }
+        let id = client.next_id; // the id the call below is about to take
+        let t0 = Instant::now();
+        let err = client
+            .call("tools/call", json!({"name": "a"}), Some(&cancel))
+            .expect_err("the held call is cancelled");
+        assert!(err.to_string().contains("cancelled"), "{err:#}");
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "the cancel must land within a slice or two: {:?}",
+            t0.elapsed()
+        );
+        // Exactly one message follows the abandoned request, and it names
+        // THAT request — a server tracking several can stop the right one.
+        assert_eq!(
+            sent_methods(&h),
+            [
+                "initialize",
+                "notifications/initialized",
+                "tools/list",
+                "tools/call",
+                "notifications/cancelled",
+            ]
+        );
+        assert_eq!(
+            h.log()[4].1,
+            json!({"requestId": id, "reason": CANCEL_REASON})
+        );
+    }
+
+    #[test]
+    fn lost_session_is_reinitialized_and_the_call_sent_again_once() {
+        let (t, h) = ScriptedTransport::new(vec![
+            Ok(init_ok()),
+            Ok(page(&["a"], None)),
+            Err(session_lost()), // the call, on the session the server forgot
+            Ok(init_ok()),       // the new session
+            Ok(json!({"content": [{"type": "text", "text": "done"}]})), // the call again
+        ]);
+        let cap = DiagCapture::install();
+        let mut client = handshake_done(t);
+        let params = json!({"name": "a", "arguments": {"x": 1}});
+        let out = client
+            .call("tools/call", params.clone(), None)
+            .expect("a call refused before it ran is not a failed call");
+        assert_eq!(out["content"][0]["text"], "done");
+        assert_eq!(
+            sent_methods(&h),
+            [
+                "initialize",
+                "notifications/initialized",
+                "tools/list",
+                "tools/call",
+                "initialize",
+                "notifications/initialized",
+                "tools/call",
+            ]
+        );
+        // The second attempt carries the same input.
+        let entries = h.log();
+        assert_eq!(entries[3].1, params);
+        assert_eq!(entries[6].1, params);
+        let lines = cap.about("starting a new session");
+        assert!(
+            lines.len() == 1
+                && lines[0].contains(&format!("MCP '{SRV}'"))
+                && lines[0].contains("'tools/call'"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn session_lost_again_on_the_second_attempt_is_reported_not_chased() {
+        let (t, h) = ScriptedTransport::new(vec![
+            Ok(init_ok()),
+            Ok(page(&["a"], None)),
+            Err(session_lost()),
+            Ok(init_ok()),
+            Err(session_lost()),
+        ]);
+        let cap = DiagCapture::install();
+        let mut client = handshake_done(t);
+        let err = client
+            .call("tools/call", json!({"name": "a"}), None)
+            .expect_err("a session that will not stay up is a failed call");
+        assert!(
+            format!("{err:#}").contains("404"),
+            "the failure is the server's own answer: {err:#}"
+        );
+        assert_eq!(
+            sent_methods(&h),
+            [
+                "initialize",
+                "notifications/initialized",
+                "tools/list",
+                "tools/call",
+                "initialize",
+                "notifications/initialized",
+                "tools/call",
+            ],
+            "one re-initialize, one re-send, then stop"
+        );
+        assert_eq!(
+            cap.about(&format!("MCP '{SRV}'")).len(),
+            1,
+            "one warning per recovery: {:?}",
+            cap.about(&format!("MCP '{SRV}'"))
+        );
+    }
+
+    #[test]
+    fn an_ordinary_failed_call_is_never_resent() {
+        // A tool the server REFUSED to run (bad arguments) or that ran and
+        // failed is not retried: re-sending it could repeat a side effect.
+        let (t, h) = ScriptedTransport::new(vec![
+            Ok(init_ok()),
+            Ok(page(&["a"], None)),
+            Err(anyhow!("MCP 'tools/call' error -32602: invalid arguments")),
+        ]);
+        let cap = DiagCapture::install();
+        let mut client = handshake_done(t);
+        let err = client
+            .call("tools/call", json!({"name": "a"}), None)
+            .expect_err("the tool refused the call");
+        assert!(
+            format!("{err:#}").contains("-32602"),
+            "the failure reaches the model as it is: {err:#}"
+        );
+        assert_eq!(
+            sent_methods(&h),
+            [
+                "initialize",
+                "notifications/initialized",
+                "tools/list",
+                "tools/call"
+            ]
+        );
+        assert!(
+            cap.about(&format!("MCP '{SRV}'")).is_empty(),
+            "{:?}",
+            cap.about(&format!("MCP '{SRV}'"))
+        );
+    }
+
+    #[test]
+    fn idle_probe_admits_the_call_whenever_the_server_answers() {
+        // Fresh by the client's own threshold: no probe at all.
+        let (t, h) = ScriptedTransport::new(vec![
+            Ok(init_ok()),
+            Ok(page(&["a"], None)),
+            Ok(json!({"content": []})),
+        ]);
+        let mut client = handshake_done(t.with_idleness(Duration::ZERO));
+        client
+            .call("tools/call", json!({"name": "a"}), None)
+            .expect("call");
+        assert_eq!(
+            sent_methods(&h),
+            [
+                "initialize",
+                "notifications/initialized",
+                "tools/list",
+                "tools/call"
+            ]
+        );
+
+        // Past the threshold, ping answered with a result.
+        let (t, h) = ScriptedTransport::new(vec![
+            Ok(init_ok()),
+            Ok(page(&["a"], None)),
+            Ok(json!({})),
+            Ok(json!({"content": []})),
+        ]);
+        let mut client = handshake_done(t.with_idleness(Duration::from_secs(600)));
+        client.idle_ping = Duration::ZERO;
+        assert_eq!(
+            client
+                .call("tools/call", json!({"name": "a"}), None)
+                .expect("call"),
+            json!({"content": []})
+        );
+        assert_eq!(
+            sent_methods(&h),
+            [
+                "initialize",
+                "notifications/initialized",
+                "tools/list",
+                "ping",
+                "tools/call"
+            ]
+        );
+        assert_eq!(h.log()[3].1, json!({}), "ping carries no params");
+
+        // Answered with a JSON-RPC error — a server without `ping` says
+        // -32601, which still proves it is listening.
+        let refused =
+            || anyhow::Error::new(Refused).context("MCP 'ping' error -32601: Method not found");
+        let (t, h) = ScriptedTransport::new(vec![
+            Ok(init_ok()),
+            Ok(page(&["a"], None)),
+            Err(refused()),
+            Ok(json!({"content": []})),
+        ]);
+        let mut client = handshake_done(t.with_idleness(Duration::from_secs(600)));
+        client.idle_ping = Duration::ZERO;
+        assert_eq!(
+            client
+                .call("tools/call", json!({"name": "a"}), None)
+                .expect("call"),
+            json!({"content": []})
+        );
+        assert_eq!(
+            sent_methods(&h),
+            [
+                "initialize",
+                "notifications/initialized",
+                "tools/list",
+                "ping",
+                "tools/call"
+            ]
+        );
+
+        // Answered with 404: the session is renewed first, THEN the call.
+        let (t, h) = ScriptedTransport::new(vec![
+            Ok(init_ok()),
+            Ok(page(&["a"], None)),
+            Err(session_lost()),
+            Ok(init_ok()),
+            Ok(json!({"content": []})),
+        ]);
+        let cap = DiagCapture::install();
+        let mut client = handshake_done(t.with_idleness(Duration::from_secs(600)));
+        client.idle_ping = Duration::ZERO;
+        assert_eq!(
+            client
+                .call("tools/call", json!({"name": "a"}), None)
+                .expect("call"),
+            json!({"content": []})
+        );
+        assert_eq!(
+            sent_methods(&h),
+            [
+                "initialize",
+                "notifications/initialized",
+                "tools/list",
+                "ping",
+                "initialize",
+                "notifications/initialized",
+                "tools/call",
+            ]
+        );
+        assert_eq!(
+            cap.about(&format!("MCP '{SRV}'")).len(),
+            1,
+            "{:?}",
+            cap.about(&format!("MCP '{SRV}'"))
+        );
+    }
+
+    #[test]
+    fn idle_probe_blocks_the_call_while_the_server_stays_silent() {
+        let (t, h) = ScriptedTransport::new(vec![
+            Ok(init_ok()),
+            Ok(page(&["a"], None)),
+            Err(timed_out("ping", MCP_PING_TIMEOUT, None)),
+            Ok(json!({"tools": []})),
+        ]);
+        let mut client = handshake_done(t.with_idleness(Duration::from_secs(600)));
+        client.idle_ping = Duration::ZERO;
+        let err = client
+            .call("tools/call", json!({"name": "a"}), None)
+            .expect_err("a server that cannot be reached must not be handed a tool call");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unreachable after 600s idle")
+                && msg.contains("'tools/call' was not sent")
+                && msg.contains("ping failed: MCP call 'ping' timed out after 5s"),
+            "{msg}"
+        );
+        // Only tools/call is guarded: a listing has no side effect to protect.
+        assert_eq!(
+            client.call("tools/list", json!({}), None).expect("listing"),
+            json!({"tools": []})
+        );
+        assert_eq!(sent_methods(&h)[3..].to_vec(), ["ping", "tools/list"]);
+    }
+
+    // ─── 真 HTTP 传输：脚本化 mock ────────────────────────────────────────
+
+    type MockLog = Arc<std::sync::Mutex<Vec<MockRequest>>>;
+
+    /// One request as the scripted HTTP mock saw it.
+    #[derive(Clone, Debug)]
+    struct MockRequest {
+        /// Lowercased request head: the request line, then the headers.
+        head: String,
+        /// The JSON body; `Value::Null` when there is none (a GET).
+        body: Value,
+    }
+
+    impl MockRequest {
+        /// JSON-RPC method; `""` when the request carries none (a GET).
+        fn method(&self) -> &str {
+            self.body
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+        }
+        /// A request header's value, if present (heads are lowercased).
+        fn header(&self, name: &str) -> Option<&str> {
+            let prefix = format!("{}:", name.to_ascii_lowercase());
+            self.head
+                .lines()
+                .find_map(|l| l.trim().strip_prefix(&prefix))
+                .map(str::trim)
+        }
+    }
+
+    /// One answer of [`mock_http`].
+    enum MockReply {
+        /// `200`, `application/json`, this document.
+        Json(Value),
+        /// `202 Accepted`, no body (what a Streamable server answers a
+        /// notification with).
+        Accepted,
+        /// Any other status, no body.
+        Status(u16),
+        /// SSE headers at once, the one `message` event (this document) only
+        /// after `hold` — a tool that took the request and is working on it.
+        SseHeadersThen(Value, Duration),
+        /// Nothing at all for `hold`, then `inner` — a wedged server.
+        After(Duration, Box<MockReply>),
+        /// `inner`, plus an `Mcp-Session-Id` header.
+        WithSession(String, Box<MockReply>),
+        /// Legacy SSE stream: the `endpoint` event, then every document
+        /// pushed into the channel, until the mock's lifetime is up.
+        Pump(mpsc::Receiver<Value>),
+    }
+
+    /// How a request is answered. Called under a lock and logged around —
+    /// so it decides, and never waits (the waiting belongs to the reply).
+    type MockRouter = Box<dyn FnMut(&MockRequest) -> MockReply + Send>;
+
+    fn say(sock: &mut std::net::TcpStream, text: &str) {
+        let _ = sock.write_all(text.as_bytes());
+        let _ = sock.flush();
+    }
+
+    /// One whole response: the status line, whatever headers the reply rides
+    /// on, and a body of known length. One request per connection.
+    fn http_text(session: &str, status: &str, content_type: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\n{session}content-type: {content_type}\r\n\
+             content-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// The legacy-SSE answer ([`MockReply::Pump`]): a stream that stays open
+    /// for the mock's lifetime and carries whatever the router pushes.
+    fn mock_pump(sock: &mut std::net::TcpStream, rx: mpsc::Receiver<Value>) {
+        say(
+            sock,
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+             cache-control: no-cache\r\nconnection: close\r\n\r\n\
+             event: endpoint\ndata: /messages\n\n",
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(v) => {
+                    let event = format!("event: message\ndata: {v}\n\n");
+                    if sock
+                        .write_all(event.as_bytes())
+                        .and_then(|()| sock.flush())
+                        .is_err()
+                    {
+                        return; // the client went away
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        }
+    }
+
+    fn mock_answer(sock: &mut std::net::TcpStream, reply: MockReply) {
+        // Unwrap the decorators: the session header rides on whatever the
+        // inner reply is, `After` only delays it.
+        let mut session = String::new();
+        let mut reply = reply;
+        loop {
+            match reply {
+                MockReply::WithSession(id, inner) => {
+                    session = format!("mcp-session-id: {id}\r\n");
+                    reply = *inner;
+                }
+                MockReply::After(hold, inner) => {
+                    // On this request's own connection thread, never under
+                    // the router's lock.
+                    std::thread::sleep(hold);
+                    reply = *inner;
+                }
+                rest => {
+                    reply = rest;
+                    break;
+                }
+            }
+        }
+        let reason = |code: u16| match code {
+            202 => "Accepted",
+            404 => "Not Found",
+            405 => "Method Not Allowed",
+            500 => "Internal Server Error",
+            _ => "Status",
+        };
+        match reply {
+            MockReply::Json(v) => say(
+                sock,
+                &http_text(&session, "200 OK", "application/json", &v.to_string()),
+            ),
+            MockReply::SseHeadersThen(v, hold) => {
+                // Headers now, the event when the "tool" is done: the shape of
+                // a Streamable server working on a request it already took.
+                say(
+                    sock,
+                    &format!(
+                        "HTTP/1.1 200 OK\r\n{session}content-type: text/event-stream\r\n\
+                         cache-control: no-cache\r\nconnection: close\r\n\r\n"
+                    ),
+                );
+                std::thread::sleep(hold);
+                say(sock, &format!("event: message\ndata: {v}\n\n"));
+            }
+            MockReply::Accepted => say(
+                sock,
+                &http_text(&session, "202 Accepted", "application/json", ""),
+            ),
+            MockReply::Status(code) => say(
+                sock,
+                &http_text(
+                    &session,
+                    &format!("{code} {}", reason(code)),
+                    "text/plain",
+                    "",
+                ),
+            ),
+            // Unwrapped above.
+            MockReply::Pump(rx) => mock_pump(sock, rx),
+            MockReply::After(..) | MockReply::WithSession(..) => {}
+        }
+    }
+
+    /// A scripted HTTP/1.1 mock: every request is logged (head + body) and
+    /// answered by whatever `router` returns for it. One request per
+    /// connection, each served on its own thread (a held connection must not
+    /// block the next request). Bounded like the sibling mocks: the accept
+    /// loop is deadline-capped and sockets get a read timeout.
+    fn mock_http(router: MockRouter) -> (String, MockLog) {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let url = format!(
+            "http://127.0.0.1:{}/mcp",
+            listener.local_addr().unwrap().port()
+        );
+        let log: MockLog = Default::default();
+        let router = Arc::new(std::sync::Mutex::new(router));
+        let (log_main, router_main) = (Arc::clone(&log), Arc::clone(&router));
+        std::thread::Builder::new()
+            .name("mcp-scripted-mock".into())
+            .spawn(move || {
+                listener.set_nonblocking(true).expect("nonblocking");
+                let deadline = Instant::now() + Duration::from_secs(60);
+                while Instant::now() < deadline {
+                    let mut sock = match listener.accept() {
+                        Ok((s, _)) => s,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(10));
+                            continue;
+                        }
+                        Err(_) => return,
+                    };
+                    sock.set_nonblocking(false).ok();
+                    sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                    let log_c = Arc::clone(&log_main);
+                    let router_c = Arc::clone(&router_main);
+                    std::thread::Builder::new()
+                        .name("mcp-scripted-mock-conn".into())
+                        .spawn(move || {
+                            let (head, body) = mock_read_request_body(&mut sock);
+                            if head.is_empty() {
+                                return;
+                            }
+                            let req = MockRequest {
+                                head,
+                                body: serde_json::from_str(body.trim()).unwrap_or(Value::Null),
+                            };
+                            let reply = router_c.lock().unwrap_or_else(|e| e.into_inner())(&req);
+                            log_c.lock().unwrap_or_else(|e| e.into_inner()).push(req);
+                            mock_answer(&mut sock, reply);
+                        })
+                        .expect("spawn conn thread");
+                }
+            })
+            .expect("spawn mock");
+        (url, log)
+    }
+
+    fn snapshot(log: &MockLog) -> Vec<MockRequest> {
+        log.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The methods of the POSTed requests, in arrival order.
+    fn post_methods(reqs: &[MockRequest]) -> Vec<String> {
+        reqs.iter()
+            .filter(|r| r.head.starts_with("post"))
+            .map(|r| r.method().to_string())
+            .collect()
+    }
+
+    /// Poll the mock's log until `pred` holds (bounded, like `wait_for_log`).
+    fn wait_requests(log: &MockLog, pred: impl Fn(&[MockRequest]) -> bool, what: &str) {
+        let wait = Instant::now() + Duration::from_secs(5);
+        loop {
+            let reqs = snapshot(log);
+            if pred(&reqs) {
+                return;
+            }
+            assert!(
+                Instant::now() < wait,
+                "timed out waiting for {what}: {:?}",
+                post_methods(&reqs)
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn rpc_ok(req: &MockRequest, result: Value) -> Value {
+        json!({"jsonrpc": "2.0", "id": req.body["id"], "result": result})
+    }
+
+    /// One tool, `a` — the listing every HTTP fake below exposes.
+    fn one_tool() -> Value {
+        json!({"tools": [{"name": "a", "description": "d", "inputSchema": {"type": "object"}}]})
+    }
+
+    fn http_cfg(name: &str, url: &str, transport: McpTransport) -> McpServerConfig {
+        McpServerConfig {
+            name: name.into(),
+            command: None,
+            args: Vec::new(),
+            env: HashMap::new(),
+            url: Some(url.to_string()),
+            transport: Some(transport),
+            headers: HashMap::new(),
+            call_timeout_secs: None,
+            connect_timeout_secs: None,
+            allow_tools: Vec::new(),
+            deny_tools: Vec::new(),
+        }
+    }
+
+    fn stdio_cfg(name: &str, command: String, args: Vec<String>) -> McpServerConfig {
+        McpServerConfig {
+            name: name.into(),
+            command: Some(command),
+            args,
+            env: HashMap::new(),
+            url: None,
+            transport: None,
+            headers: HashMap::new(),
+            call_timeout_secs: None,
+            connect_timeout_secs: None,
+            allow_tools: Vec::new(),
+            deny_tools: Vec::new(),
+        }
+    }
+
+    /// How the fake answers `ping`.
+    #[derive(Clone, Copy, Default)]
+    enum Ping {
+        #[default]
+        Ok,
+        /// No `ping` here: JSON-RPC `-32601`.
+        NotSupported,
+        /// Never answers inside any bound a client would wait.
+        Wedged,
+    }
+
+    /// How the fake answers `tools/call`.
+    #[derive(Clone, Copy, Default)]
+    enum Call {
+        #[default]
+        Ok,
+        /// Takes the request (SSE headers at once), answers after `hold`.
+        Slow(Duration),
+        /// Never answers inside any bound a client would wait.
+        Wedged,
+    }
+
+    /// Knobs of [`streamable_router`], all shared so a test can turn them
+    /// while its client is connected.
+    struct FakeServer {
+        /// `protocolVersion` of the `initialize` result.
+        version: Value,
+        /// Whether answers carry `Mcp-Session-Id` (a fresh `sess-<n>` per
+        /// `initialize`).
+        sessions: bool,
+        /// Whether a session, once opened, stays remembered. `false` = a
+        /// server that restarts in a loop: a session opened after a forget
+        /// is forgotten again the moment the handshake that opened it
+        /// completes.
+        heals: bool,
+        /// Once set: every request carrying a session id answers `404`.
+        expired: Arc<AtomicBool>,
+        /// Once set: `initialize` itself answers `500`.
+        init_fails: Arc<AtomicBool>,
+        ping: Arc<std::sync::Mutex<Ping>>,
+        call: Arc<std::sync::Mutex<Call>>,
+    }
+
+    impl FakeServer {
+        fn new() -> Self {
+            Self {
+                version: json!(PROTOCOL_VERSION),
+                sessions: false,
+                heals: true,
+                expired: Arc::default(),
+                init_fails: Arc::default(),
+                ping: Arc::default(),
+                call: Arc::default(),
+            }
+        }
+    }
+
+    /// A Streamable HTTP server: `initialize` (per `version` / `sessions` /
+    /// `init_fails`), one tool, `ping` and `tools/call` per their knobs, a
+    /// bare `202` for notifications, and `404` for every session-carrying
+    /// request once `expired` is set. No standalone stream (GET → 405).
+    fn streamable_router(s: Arc<FakeServer>) -> MockRouter {
+        let sessions = Arc::new(std::sync::Mutex::new(0u32));
+        // Set by an `initialize` that picked up after a forget, on a server
+        // with `heals == false`.
+        let reforget = Arc::new(AtomicBool::new(false));
+        Box::new(move |req| {
+            if !req.head.starts_with("post") {
+                return MockReply::Status(405);
+            }
+            if req.method() == "initialize" {
+                if s.init_fails.load(Ordering::Relaxed) {
+                    return MockReply::Status(500);
+                }
+                let recovery = s.expired.load(Ordering::Relaxed);
+                reforget.store(recovery && !s.heals, Ordering::Relaxed);
+                // A restart that worked, as far as the handshake goes: the
+                // session being opened is remembered.
+                s.expired.store(false, Ordering::Relaxed);
+                let answer = MockReply::Json(rpc_ok(
+                    req,
+                    json!({"protocolVersion": s.version.clone(), "capabilities": {}}),
+                ));
+                if !s.sessions {
+                    return answer;
+                }
+                let n = {
+                    let mut count = sessions.lock().unwrap_or_else(|e| e.into_inner());
+                    *count += 1;
+                    *count
+                };
+                return MockReply::WithSession(format!("sess-{n}"), Box::new(answer));
+            }
+            if req.method() == "notifications/initialized"
+                && reforget.swap(false, Ordering::Relaxed)
+            {
+                // Restarts in a loop: everything is forgotten again the
+                // moment this handshake completes — this notification is the
+                // last request the new session is good for.
+                s.expired.store(true, Ordering::Relaxed);
+                return MockReply::Accepted;
+            }
+            if s.expired.load(Ordering::Relaxed) && req.header("mcp-session-id").is_some() {
+                // The spec's "session not found": refused BEFORE it ran.
+                return MockReply::Status(404);
+            }
+            let wedged = |result: Value| {
+                MockReply::After(
+                    Duration::from_secs(30),
+                    Box::new(MockReply::Json(rpc_ok(req, result))),
+                )
+            };
+            match req.method() {
+                "tools/list" => MockReply::Json(rpc_ok(req, one_tool())),
+                "ping" => match *s.ping.lock().unwrap_or_else(|e| e.into_inner()) {
+                    Ping::Ok => MockReply::Json(rpc_ok(req, json!({}))),
+                    Ping::NotSupported => MockReply::Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": req.body["id"],
+                        "error": {"code": -32601, "message": "Method not found"}
+                    })),
+                    Ping::Wedged => wedged(json!({})),
+                },
+                "tools/call" => match *s.call.lock().unwrap_or_else(|e| e.into_inner()) {
+                    Call::Ok => MockReply::Json(rpc_ok(req, json!({"content": []}))),
+                    Call::Slow(hold) => {
+                        MockReply::SseHeadersThen(rpc_ok(req, json!({"content": []})), hold)
+                    }
+                    Call::Wedged => wedged(json!({"content": []})),
+                },
+                _ => MockReply::Accepted,
+            }
+        })
+    }
+
+    /// A Streamable HTTP client handshaked against `s`, plus the mock's log.
+    fn streamable_pair(s: Arc<FakeServer>) -> (McpClient, MockLog) {
+        let (url, log) = mock_http(streamable_router(Arc::clone(&s)));
+        let (client, tools) = McpClient::handshake(
+            HttpTransport::new(&url, &http_cfg(SRV, &url, McpTransport::Http)).expect("transport"),
+            SRV,
+        )
+        .expect("handshake");
+        assert_eq!(tools.len(), 1, "the fake exposes exactly one tool");
+        (client, log)
+    }
+
+    fn call_a(client: &mut McpClient, cancel: Option<&AtomicBool>) -> Result<Value> {
+        client.call(
+            "tools/call",
+            json!({"name": "a", "arguments": {"x": 1}}),
+            cancel,
+        )
+    }
+
+    #[test]
+    fn http_requests_carry_the_negotiated_protocol_version() {
+        let s = Arc::new(FakeServer {
+            version: json!("2025-06-18"),
+            ..FakeServer::new()
+        });
+        let (mut client, log) = streamable_pair(s);
+        assert_eq!(client.protocol_version(), "2025-06-18");
+        assert_eq!(
+            call_a(&mut client, None).expect("call"),
+            json!({"content": []})
+        );
+        let reqs = snapshot(&log);
+        // The very first request (no session yet, so no GET can precede it).
+        assert_eq!(reqs[0].method(), "initialize");
+        assert_eq!(
+            reqs[0].header("mcp-protocol-version"),
+            Some(PROTOCOL_VERSION),
+            "initialize names the revision it asks for"
+        );
+        assert!(
+            reqs[1..]
+                .iter()
+                .all(|r| r.header("mcp-protocol-version") == Some("2025-06-18")),
+            "every later request names the NEGOTIATED revision: {:?}",
+            reqs
+        );
+        // A connection that just completed a round trip is not probed.
+        assert!(
+            !post_methods(&reqs).iter().any(|m| m == "ping"),
+            "{:?}",
+            post_methods(&reqs)
+        );
+    }
+
+    #[test]
+    fn http_standing_stream_get_carries_the_negotiated_version_too() {
+        // The standing stream's reader reads the negotiated value per round
+        // (an `initialize` answered 202 opens the stream before the revision
+        // is known), and must be holding the right one by the time a session
+        // exists. An unverified revision, to pin the warn-only path on real
+        // wire at the same time.
+        let s = Arc::new(FakeServer {
+            version: json!("2099-01-01"),
+            sessions: true,
+            ..FakeServer::new()
+        });
+        let cap = DiagCapture::install();
+        let (client, log) = streamable_pair(Arc::clone(&s));
+        wait_requests(
+            &log,
+            |rs| rs.iter().any(|r| r.head.starts_with("get")),
+            "the standing-stream GET",
+        );
+        let reqs = snapshot(&log);
+        let gets: Vec<&MockRequest> = reqs.iter().filter(|r| r.head.starts_with("get")).collect();
+        assert_eq!(
+            gets.len(),
+            1,
+            "one GET per session; the 405 ends the stream and dams further ones"
+        );
+        assert_eq!(gets[0].header("mcp-protocol-version"), Some("2099-01-01"));
+        assert_eq!(gets[0].header("mcp-session-id"), Some("sess-1"));
+        let lines = cap.about("not verified");
+        assert!(
+            lines.len() == 1 && lines[0].contains("'2099-01-01'"),
+            "{lines:?}"
+        );
+        drop(client);
+    }
+
+    #[test]
+    fn http_call_cancelled_mid_flight_is_revoked_with_the_server() {
+        let s = Arc::new(FakeServer {
+            call: Arc::new(std::sync::Mutex::new(Call::Slow(Duration::from_secs(3)))),
+            ..FakeServer::new()
+        });
+        let (mut client, log) = streamable_pair(s);
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let later = Arc::clone(&cancel);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                later.store(true, Ordering::Relaxed);
+            });
+        }
+        let id = client.next_id;
+        let t0 = Instant::now();
+        let err = call_a(&mut client, Some(&cancel)).expect_err("the running call is cancelled");
+        assert!(err.to_string().contains("cancelled"), "{err:#}");
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "the cancel must land within a slice or two: {:?}",
+            t0.elapsed()
+        );
+        wait_requests(
+            &log,
+            |rs| rs.iter().any(|r| r.method() == "notifications/cancelled"),
+            "the cancellation notice",
+        );
+        let reqs = snapshot(&log);
+        let notice = reqs
+            .iter()
+            .find(|r| r.method() == "notifications/cancelled")
+            .expect("the notice is in the log");
+        // The whole frame as the server sees it — and a notification carries
+        // no `id`.
+        assert_eq!(
+            notice.body,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": {"requestId": id, "reason": CANCEL_REASON}
+            })
+        );
+        assert_eq!(
+            post_methods(&reqs),
+            [
+                "initialize",
+                "notifications/initialized",
+                "tools/list",
+                "tools/call",
+                "notifications/cancelled",
+            ],
+            "the call was sent once and not re-sent"
+        );
+        // The server is none the worse: the next request is served as usual.
+        cancel.store(false, Ordering::Relaxed);
+        assert_eq!(
+            client
+                .call("ping", json!({}), None)
+                .expect("the server still answers"),
+            json!({})
+        );
+    }
+
+    #[test]
+    fn http_idle_connection_is_probed_before_a_tool_call() {
+        let (mut client, log) = streamable_pair(Arc::new(FakeServer::new()));
+        client.idle_ping = Duration::ZERO;
+        assert_eq!(
+            call_a(&mut client, None).expect("call"),
+            json!({"content": []})
+        );
+        let reqs = snapshot(&log);
+        let posts = post_methods(&reqs);
+        assert_eq!(posts[..3].to_vec(), HANDSHAKE);
+        assert_eq!(posts[3..].to_vec(), ["ping", "tools/call"]);
+        let ping = reqs
+            .iter()
+            .find(|r| r.method() == "ping")
+            .expect("the probe is in the log");
+        assert_eq!(ping.body["params"], json!({}), "ping carries no params");
+    }
+
+    #[test]
+    fn http_silent_idle_connection_fails_the_call_without_sending_it() {
+        let s = Arc::new(FakeServer {
+            ping: Arc::new(std::sync::Mutex::new(Ping::Wedged)),
+            ..FakeServer::new()
+        });
+        let (mut client, log) = streamable_pair(s);
+        client.idle_ping = Duration::ZERO;
+        let t0 = Instant::now();
+        let err = call_a(&mut client, None)
+            .expect_err("an unreachable server must not be handed a tool call");
+        let took = t0.elapsed();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unreachable after 0s idle")
+                && msg.contains("'tools/call' was not sent")
+                && msg.contains("MCP call 'ping' timed out after 5s or server died"),
+            "{msg}"
+        );
+        assert!(
+            took >= Duration::from_millis(4500) && took < Duration::from_secs(20),
+            "the probe gives up at MCP_PING_TIMEOUT, not at the call timeout: {took:?}"
+        );
+        // Only `tools/call` is guarded — a listing has no side effect.
+        assert_eq!(
+            client.call("tools/list", json!({}), None).expect("listing"),
+            one_tool()
+        );
+        assert_eq!(
+            post_methods(&snapshot(&log))[3..].to_vec(),
+            ["ping", "tools/list"]
+        );
+    }
+
+    #[test]
+    fn http_probe_is_bounded_by_a_shorter_call_timeout_and_says_so() {
+        // The probe never waits longer than the server's own call bound; when
+        // THAT is the shorter one, the message names it.
+        let s = Arc::new(FakeServer {
+            ping: Arc::new(std::sync::Mutex::new(Ping::Wedged)),
+            ..FakeServer::new()
+        });
+        let (url, _log) = mock_http(streamable_router(Arc::clone(&s)));
+        let cfg = McpServerConfig {
+            call_timeout_secs: Some(1),
+            ..http_cfg(SRV, &url, McpTransport::Http)
+        };
+        let (mut client, _) =
+            McpClient::handshake(HttpTransport::new(&url, &cfg).expect("transport"), SRV)
+                .expect("handshake");
+        client.idle_ping = Duration::ZERO;
+        let t0 = Instant::now();
+        let err = call_a(&mut client, None).expect_err("the probe gives up");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("'tools/call' was not sent")
+                && msg.contains("timed out after 1s (limit: call_timeout_secs)"),
+            "{msg}"
+        );
+        assert!(
+            t0.elapsed() < Duration::from_secs(4),
+            "bounded by the call key, not the probe's 5s: {:?}",
+            t0.elapsed()
+        );
+    }
+
+    #[test]
+    fn http_probe_refused_with_an_error_still_admits_the_call() {
+        // A server without `ping` answers -32601 — a refusal is proof of
+        // life. The real transport must read it as "answered", which is the
+        // one verdict it derives from the wire rather than from a marker.
+        let s = Arc::new(FakeServer {
+            ping: Arc::new(std::sync::Mutex::new(Ping::NotSupported)),
+            ..FakeServer::new()
+        });
+        let (mut client, log) = streamable_pair(s);
+        client.idle_ping = Duration::ZERO;
+        assert_eq!(
+            call_a(&mut client, None).expect("call"),
+            json!({"content": []})
+        );
+        assert_eq!(
+            post_methods(&snapshot(&log))[3..].to_vec(),
+            ["ping", "tools/call"]
+        );
+    }
+
+    #[test]
+    fn http_probe_finding_a_forgotten_session_renews_it_before_the_call() {
+        let s = Arc::new(FakeServer {
+            sessions: true,
+            ..FakeServer::new()
+        });
+        let cap = DiagCapture::install();
+        let (mut client, log) = streamable_pair(Arc::clone(&s));
+        client.idle_ping = Duration::ZERO;
+        s.expired.store(true, Ordering::Relaxed);
+        assert_eq!(
+            call_a(&mut client, None).expect("the call rides the renewed session"),
+            json!({"content": []})
+        );
+        let reqs = snapshot(&log);
+        assert_eq!(
+            post_methods(&reqs),
+            [
+                "initialize",
+                "notifications/initialized",
+                "tools/list",
+                "ping",
+                "initialize",
+                "notifications/initialized",
+                "tools/call",
+            ]
+        );
+        let ping = reqs
+            .iter()
+            .find(|r| r.method() == "ping")
+            .expect("the probe is in the log");
+        let call = reqs
+            .iter()
+            .find(|r| r.method() == "tools/call")
+            .expect("the call is in the log");
+        assert_eq!(ping.header("mcp-session-id"), Some("sess-1"));
+        assert_eq!(
+            call.header("mcp-session-id"),
+            Some("sess-2"),
+            "the call was not sent on the dead session"
+        );
+        assert_eq!(
+            cap.about("starting a new session").len(),
+            1,
+            "{:?}",
+            cap.about("starting a new session")
+        );
+    }
+
+    #[test]
+    fn http_call_refused_by_a_forgotten_session_is_resent_on_a_new_one() {
+        let s = Arc::new(FakeServer {
+            sessions: true,
+            ..FakeServer::new()
+        });
+        let cap = DiagCapture::install();
+        let (mut client, log) = streamable_pair(Arc::clone(&s));
+        s.expired.store(true, Ordering::Relaxed);
+        assert_eq!(
+            call_a(&mut client, None).expect("a 404 before the tool ran is not a failed call"),
+            json!({"content": []})
+        );
+        let reqs = snapshot(&log);
+        assert_eq!(
+            post_methods(&reqs),
+            [
+                "initialize",
+                "notifications/initialized",
+                "tools/list",
+                "tools/call",
+                "initialize",
+                "notifications/initialized",
+                "tools/call",
+            ]
+        );
+        let sessions: Vec<Option<&str>> = reqs
+            .iter()
+            .filter(|r| r.method() == "tools/call")
+            .map(|r| r.header("mcp-session-id"))
+            .collect();
+        assert_eq!(sessions, [Some("sess-1"), Some("sess-2")]);
+        assert_eq!(
+            cap.about("starting a new session").len(),
+            1,
+            "{:?}",
+            cap.about("starting a new session")
+        );
+    }
+
+    #[test]
+    fn http_session_that_cannot_be_renewed_fails_the_call_without_a_resend() {
+        let s = Arc::new(FakeServer {
+            sessions: true,
+            ..FakeServer::new()
+        });
+        let cap = DiagCapture::install();
+        let (mut client, log) = streamable_pair(Arc::clone(&s));
+        s.expired.store(true, Ordering::Relaxed);
+        s.init_fails.store(true, Ordering::Relaxed);
+        let err = call_a(&mut client, None).expect_err("no session, no call");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("a new one could not be started") && msg.contains("500"),
+            "{msg}"
+        );
+        assert_eq!(
+            post_methods(&snapshot(&log)),
+            [
+                "initialize",
+                "notifications/initialized",
+                "tools/list",
+                "tools/call",
+                "initialize",
+            ],
+            "the call is not sent blind against a server that is down"
+        );
+        assert_eq!(
+            cap.about("starting a new session").len(),
+            1,
+            "{:?}",
+            cap.about("starting a new session")
+        );
+    }
+
+    #[test]
+    fn http_session_lost_again_on_the_resent_call_is_reported_not_chased() {
+        let s = Arc::new(FakeServer {
+            sessions: true,
+            heals: false,
+            ..FakeServer::new()
+        });
+        let cap = DiagCapture::install();
+        let (mut client, log) = streamable_pair(Arc::clone(&s));
+        s.expired.store(true, Ordering::Relaxed);
+        let err = call_a(&mut client, None)
+            .expect_err("a session that will not stay up is a failed call");
+        assert!(
+            format!("{err:#}").contains("404"),
+            "the failure is the server's own answer: {err:#}"
+        );
+        assert_eq!(
+            post_methods(&snapshot(&log)),
+            [
+                "initialize",
+                "notifications/initialized",
+                "tools/list",
+                "tools/call",
+                "initialize",
+                "notifications/initialized",
+                "tools/call",
+            ],
+            "one re-initialize, one re-send, then stop"
+        );
+        assert_eq!(
+            cap.about("starting a new session").len(),
+            1,
+            "{:?}",
+            cap.about("starting a new session")
+        );
+    }
+
+    #[test]
+    fn http_call_timeout_names_the_config_key_that_set_it() {
+        let s = Arc::new(FakeServer {
+            call: Arc::new(std::sync::Mutex::new(Call::Wedged)),
+            ..FakeServer::new()
+        });
+        let (url, _log) = mock_http(streamable_router(Arc::clone(&s)));
+        let cfg = McpServerConfig {
+            call_timeout_secs: Some(1),
+            ..http_cfg(SRV, &url, McpTransport::Http)
+        };
+        let (mut client, _) =
+            McpClient::handshake(HttpTransport::new(&url, &cfg).expect("transport"), SRV)
+                .expect("handshake");
+        let want = "timed out after 1s (limit: call_timeout_secs)";
+        // Without a cancel flag the exchange runs inline (a library host's
+        // own call) — the timeout arrives as reqwest's and is worded here.
+        let t0 = Instant::now();
+        let err = call_a(&mut client, None).expect_err("a wedged tool times out");
+        assert!(format!("{err:#}").contains(want), "{err:#}");
+        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+        // With one it runs on a worker and the wait is sliced (what the agent
+        // loop always passes) — same bound, same words.
+        let cancel = AtomicBool::new(false);
+        let err = call_a(&mut client, Some(&cancel)).expect_err("still wedged");
+        assert!(format!("{err:#}").contains(want), "{err:#}");
+    }
+
+    #[test]
+    fn legacy_sse_endpoint_wait_names_the_connect_key() {
+        // The stream opens and then says nothing: the one bound on the wait
+        // for the `endpoint` event is the connect key's.
+        let (url, _log) = mock_http(Box::new(|_| {
+            MockReply::After(Duration::from_secs(30), Box::new(MockReply::Status(404)))
+        }));
+        let cfg = McpServerConfig {
+            connect_timeout_secs: Some(1),
+            ..http_cfg("legacy24", &url, McpTransport::Sse)
+        };
+        let cap = DiagCapture::install();
+        let t0 = Instant::now();
+        let err = unwrap_err(
+            SseTransport::connect(&url, &cfg),
+            "no endpoint event, no transport",
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no 'endpoint' event")
+                && msg.contains("within 1s (limit: connect_timeout_secs)"),
+            "{msg}"
+        );
+        assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", t0.elapsed());
+        let lines = cap.about("exiting late");
+        assert!(
+            lines.iter().any(|l| l.contains(&url)),
+            "the abandoned reader is worth a line: {lines:?}"
+        );
+    }
+
+    /// The legacy transport gets the same probe and the same cancellation
+    /// notice — minus the session recovery it has no concept of.
+    #[test]
+    fn legacy_sse_is_probed_and_revoked_the_same_way() {
+        let (tx, rx) = mpsc::channel::<Value>();
+        // The one legacy stream this mock serves (a second GET would be a
+        // rotation, 30s in — far past this test).
+        let mut stream = Some(rx);
+        let router: MockRouter = Box::new(move |req| {
+            if !req.head.starts_with("post") {
+                return match stream.take() {
+                    Some(rx) => MockReply::Pump(rx),
+                    None => MockReply::Status(404),
+                };
+            }
+            // `hold: true` marks the call this test cancels: never answered.
+            let held = req.body["params"]["arguments"].get("hold").is_some();
+            let answer = match (req.method(), held) {
+                ("initialize", _) => Some(rpc_ok(
+                    req,
+                    json!({"protocolVersion": PROTOCOL_VERSION, "capabilities": {}}),
+                )),
+                ("tools/list", _) => Some(rpc_ok(req, one_tool())),
+                ("ping", _) => Some(rpc_ok(req, json!({}))),
+                ("tools/call", false) => Some(rpc_ok(req, json!({"content": []}))),
+                _ => None,
+            };
+            if let Some(answer) = answer {
+                tx.send(answer).expect("the stream is still pumping");
+            }
+            MockReply::Accepted
+        });
+        let (url, log) = mock_http(router);
+        let cfg = http_cfg("legacy24", &url, McpTransport::Sse);
+        let mut client =
+            handshake_done(SseTransport::connect(&url, &cfg).expect("legacy SSE connect"));
+        // Past the idle threshold: the probe runs on this transport too.
+        client.idle_ping = Duration::ZERO;
+        assert_eq!(
+            call_a(&mut client, None).expect("call"),
+            json!({"content": []})
+        );
+        assert_eq!(
+            post_methods(&snapshot(&log)),
+            [
+                "initialize",
+                "notifications/initialized",
+                "tools/list",
+                "ping",
+                "tools/call",
+            ]
+        );
+        // A call cancelled in flight is revoked with the server here too.
+        client.idle_ping = Duration::from_secs(3600);
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let later = Arc::clone(&cancel);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                later.store(true, Ordering::Relaxed);
+            });
+        }
+        let id = client.next_id;
+        let t0 = Instant::now();
+        let err = client
+            .call(
+                "tools/call",
+                json!({"name": "a", "arguments": {"hold": true}}),
+                Some(&cancel),
+            )
+            .expect_err("the held call is cancelled");
+        assert!(err.to_string().contains("cancelled"), "{err:#}");
+        assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+        wait_requests(
+            &log,
+            |rs| rs.iter().any(|r| r.method() == "notifications/cancelled"),
+            "the cancellation notice",
+        );
+        let reqs = snapshot(&log);
+        let notice = reqs
+            .iter()
+            .rev()
+            .find(|r| r.method() == "notifications/cancelled")
+            .expect("the notice is in the log");
+        // The whole frame as the server sees it — and a notification carries
+        // no `id`.
+        assert_eq!(
+            notice.body,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": {"requestId": id, "reason": CANCEL_REASON}
+            })
+        );
+    }
+
+    // ─── stdio：真子进程 ─────────────────────────────────────────────────
+
+    /// A stdio server whose one tool `slow` answers after 4s on a thread of
+    /// its own — the client gives up on the call long before, and the notice
+    /// it sends must show up in the server's own log, naming that request.
+    #[test]
+    fn stdio_cancel_notice_reaches_the_server_and_the_server_keeps_serving() {
+        let Some(py) = test_python() else {
+            eprintln!(
+                "skip stdio_cancel_notice_reaches_the_server_and_the_server_keeps_serving: \
+                 no python interpreter found (set TA_MCP_PYTHON to run it)"
+            );
+            return;
+        };
+        let tag = format!("ta_mcp_cancel_{}", std::process::id());
+        let script = std::env::temp_dir().join(format!("{tag}.py"));
+        let seen = std::env::temp_dir().join(format!("{tag}.log"));
+        std::fs::write(
+            &script,
+            r#"
+import json, sys, threading, time
+LOG = sys.argv[1]
+LOCK = threading.Lock()
+
+def note(msg):
+    # Every frame as it arrives: the client's claims are checked here.
+    with LOCK:
+        with open(LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(msg, sort_keys=True) + "\n")
+
+def reply(msg, result):
+    with LOCK:
+        sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": msg.get("id"),
+                                     "result": result}) + "\n")
+        sys.stdout.flush()
+
+def slow(msg):
+    time.sleep(4)
+    reply(msg, {"content": []})
+
+for line in sys.stdin:
+    try:
+        msg = json.loads(line)
+    except Exception:
+        continue
+    note(msg)
+    method = msg.get("method")
+    if method == "tools/call":
+        threading.Thread(target=slow, args=(msg,), daemon=True).start()
+    elif "id" in msg:
+        if method == "initialize":
+            reply(msg, {"protocolVersion": "2025-03-26", "capabilities": {}})
+        elif method == "tools/list":
+            reply(msg, {"tools": [{"name": "slow", "description": "d",
+                                   "inputSchema": {"type": "object"}}]})
+        else:
+            reply(msg, {})
+"#,
+        )
+        .expect("write mock server");
+        let cfg = stdio_cfg(
+            "slow",
+            py,
+            vec![
+                "-X".into(),
+                "utf8".into(),
+                script.display().to_string(),
+                seen.display().to_string(),
+            ],
+        );
+        let (mut client, tools) = McpClient::start(&cfg).expect("stdio handshake");
+        assert_eq!(tools.len(), 1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let later = Arc::clone(&cancel);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                later.store(true, Ordering::Relaxed);
+            });
+        }
+        let id = client.next_id; // the id the call below is about to take
+        let t0 = Instant::now();
+        let err = client
+            .call(
+                "tools/call",
+                json!({"name": "slow", "arguments": {}}),
+                Some(&cancel),
+            )
+            .expect_err("the running call is cancelled");
+        assert!(err.to_string().contains("cancelled"), "{err:#}");
+        assert!(
+            t0.elapsed() < Duration::from_secs(3),
+            "the cancel must land within a slice or two: {:?}",
+            t0.elapsed()
+        );
+        // The server's own log has the notice, naming THAT request.
+        let wait = Instant::now() + Duration::from_secs(5);
+        let mut last;
+        loop {
+            last = std::fs::read_to_string(&seen).unwrap_or_default();
+            let noticed = last
+                .lines()
+                .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                .any(|m| {
+                    m["method"] == "notifications/cancelled" && m["params"]["requestId"] == id
+                });
+            if noticed {
+                break;
+            }
+            assert!(
+                Instant::now() < wait,
+                "no cancellation notice for request {id} in the server's log: {last}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // A cancelled RECEIVE leaves the server alive: the next call is
+        // served on the same child.
+        cancel.store(false, Ordering::Relaxed);
+        assert_eq!(
+            client
+                .call("ping", json!({}), Some(&cancel))
+                .expect("the server still answers"),
+            json!({})
+        );
+        drop(client);
+        let _ = std::fs::remove_file(&script);
+        let _ = std::fs::remove_file(&seen);
+    }
+
+    /// A stdio server's boot bound comes from `connect_timeout_secs` when the
+    /// key is set, and from the call timeout otherwise — and the message says
+    /// which, because those are the two keys an operator would reach for.
+    #[test]
+    fn stdio_boot_timeout_comes_from_connect_then_call_key() {
+        let Some(py) = test_python() else {
+            eprintln!(
+                "skip stdio_boot_timeout_comes_from_connect_then_call_key: \
+                 no python interpreter found (set TA_MCP_PYTHON to run it)"
+            );
+            return;
+        };
+        // Never answers: a server still downloading itself.
+        let script =
+            std::env::temp_dir().join(format!("ta_mcp_never_boots_{}.py", std::process::id()));
+        std::fs::write(&script, "import time\ntime.sleep(30)\n").expect("write mock server");
+        let entry = |extra: &str| {
+            format!(
+                r#"{{"name":"boot","command":{},"args":["-X","utf8",{}]{}}}"#,
+                serde_json::to_string(&py).unwrap(),
+                serde_json::to_string(&script.display().to_string()).unwrap(),
+                extra
+            )
+        };
+        let boot = |json: &str| {
+            let cfg: McpServerConfig = serde_json::from_str(json).expect("server config");
+            let t0 = Instant::now();
+            let err = unwrap_err(
+                McpClient::start(&cfg),
+                "a server that never answers `initialize` fails the handshake",
+            );
+            assert!(
+                t0.elapsed() < Duration::from_secs(6),
+                "bounded by the 1s the test sets, not by a default: {:?}",
+                t0.elapsed()
+            );
+            format!("{err:#}")
+        };
+        let msg = boot(&entry(r#","connect_timeout_secs":1"#));
+        assert!(
+            msg.contains("timed out after 1s (limit: connect_timeout_secs)"),
+            "{msg}"
+        );
+        let msg = boot(&entry(r#","call_timeout_secs":1"#));
+        assert!(
+            msg.contains("timed out after 1s (limit: call_timeout_secs)"),
+            "{msg}"
+        );
+        let _ = std::fs::remove_file(&script);
+    }
+
+    /// Credential hygiene (kernel plan 2.5): the strip decision for a stdio
+    /// server's spawn, checked on the `Command` itself — a hidden name is
+    /// removed from what the child inherits unless the server entry sets it
+    /// in its own `env` (handed over on purpose), and nothing else is touched.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn strip_inherited_env_removes_hidden_names_unless_configured() {
+        let mut command = std::process::Command::new("probe");
+        command.env("TA_MCP_SET", "configured");
+        let configured = HashMap::from([("TA_MCP_SET".to_string(), "configured".to_string())]);
+        strip_inherited_env(
+            &mut command,
+            &configured,
+            &["TA_MCP_HIDDEN".into(), "TA_MCP_SET".into()],
+        );
+        // What std will apply at spawn: explicit changes only — `None` is a
+        // removal, absent means untouched.
+        let change = |key: &str| -> Option<Option<String>> {
+            command
+                .get_envs()
+                .find(|(name, _)| *name == std::ffi::OsStr::new(key))
+                .map(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+        };
+        assert_eq!(change("TA_MCP_HIDDEN"), Some(None), "hidden: removed");
+        assert_eq!(
+            change("TA_MCP_SET"),
+            Some(Some("configured".into())),
+            "configured in the server's own env: kept"
+        );
+        assert_eq!(change("PATH"), None, "nothing else is touched");
+    }
+
+    /// The probe variable for the real-process hygiene test: one every test
+    /// process has, so the test never edits the process environment (the
+    /// test binary runs its tests on parallel threads). `None` when it is
+    /// somehow absent — the caller skips.
+    #[cfg(any(unix, windows))]
+    fn hygiene_probe() -> Option<&'static str> {
+        #[cfg(unix)]
+        let name = "HOME";
+        #[cfg(windows)]
+        let name = "USERNAME";
+        std::env::var_os(name).is_some().then_some(name)
+    }
+
+    /// Credential hygiene, through a real stdio server: `start_with_env`
+    /// spawns it without the hidden names; `start` — the public form, which
+    /// the kernel's own assembly never uses for a server the model can
+    /// drive — hides nothing (the control that proves the probe works); and
+    /// a name the server entry configures in its own `env` is handed over
+    /// even while hidden. Skips itself without a python interpreter.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn stdio_server_is_spawned_without_the_hidden_env() {
+        let Some(py) = test_python() else {
+            eprintln!(
+                "skip stdio_server_is_spawned_without_the_hidden_env: no python \
+                 interpreter found (set TA_MCP_PYTHON to run it)"
+            );
+            return;
+        };
+        let Some(probe) = hygiene_probe() else {
+            eprintln!("skip stdio_server_is_spawned_without_the_hidden_env: probe variable unset");
+            return;
+        };
+        let script = write_env_server("start");
+        // What a freshly started server reports for `probe`.
+        let seen = |hidden: &[&str], env: HashMap<String, String>| -> String {
+            let hidden: Vec<String> = hidden.iter().map(|s| s.to_string()).collect();
+            let (mut client, tools) =
+                McpClient::start_with_env(&env_server_config(&py, &script, env), &hidden)
+                    .expect("handshake with the mock stdio server");
+            assert!(!tools.is_empty(), "tools/list came back empty");
+            let value = client
+                .call(
+                    "tools/call",
+                    json!({"name": "env", "arguments": {"name": probe}}),
+                    None,
+                )
+                .expect("tools/call env");
+            value["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+        let inherited = std::env::var_os(probe)
+            .expect("checked above")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            seen(&[], HashMap::new()),
+            inherited,
+            "control: nothing hidden, the server inherits the variable"
+        );
+        assert_eq!(
+            seen(&[probe], HashMap::new()),
+            "<unset>",
+            "hidden: the name is gone from the server's environment"
+        );
+        let configured = HashMap::from([(probe.to_string(), "handed-over".to_string())]);
+        assert_eq!(
+            seen(&[probe], configured),
+            "handed-over",
+            "a name in the server's own env wins over the hidden set"
+        );
+        let _ = std::fs::remove_file(&script);
     }
 }

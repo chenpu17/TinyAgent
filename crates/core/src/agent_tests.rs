@@ -323,7 +323,7 @@ fn window_lines_cut_beyond_len_yields_empty_not_panic() {
     // `messages[..cut]` panicked on cut > len. An empty transcript on a
     // degenerate cut degrades the summary prompt; a panic kills the run.
     let msgs = vec![user_text("task"), user_text("u1")];
-    assert!(window_lines(&msgs, msgs.len() + 3).is_empty());
+    assert!(window_lines(&msgs, msgs.len() + 3, 200).is_empty());
 }
 
 #[test]
@@ -578,7 +578,7 @@ fn window_lines_skips_all_head_marker_blocks() {
         Message::assistant(vec![Block::Text("a1".into())]),
         user_text("raw"),
     ];
-    let lines = window_lines(&msgs, 3).concat();
+    let lines = window_lines(&msgs, 3, 200).concat();
     assert!(lines.contains("task"));
     assert!(lines.contains("raw"));
     assert!(!lines.contains("old"), "no running summary in transcript");
@@ -659,6 +659,8 @@ fn cfg_with(max_turns: u32, timeout_secs: u64, compress: usize) -> Config {
 
 fn test_ctx() -> ToolCtx {
     ToolCtx {
+        tool_annotations: std::sync::Arc::new(std::collections::BTreeMap::new()),
+        hidden_env: Vec::new(),
         tool_absent_notes: Vec::new(),
         workdir: std::env::current_dir().expect("cwd"),
         max_output_chars: 1000,
@@ -749,6 +751,9 @@ impl Tool for ShutdownTrackingTool {
 struct FakeMcpTool {
     server: String,
     name: String,
+    /// What this fake "server" declared about the tool (`None` = it sends no
+    /// `annotations`, like a plain built-in).
+    hints: Option<crate::tools::ToolAnnotations>,
 }
 impl Tool for FakeMcpTool {
     fn def(&self) -> ToolDef {
@@ -763,6 +768,9 @@ impl Tool for FakeMcpTool {
     }
     fn mcp_server(&self) -> Option<&str> {
         Some(&self.server)
+    }
+    fn annotations(&self) -> Option<crate::tools::ToolAnnotations> {
+        self.hints
     }
 }
 
@@ -784,6 +792,7 @@ impl Tool for BillTool {
             image: None,
             is_error: false,
             usage: Some(crate::provider::Usage {
+                reasoning_tokens: 0,
                 input_tokens: 111,
                 output_tokens: 22,
                 cache_creation_input_tokens: 0,
@@ -870,6 +879,7 @@ impl Tool for TaskTool {
             image: None,
             is_error: false,
             usage: Some(crate::provider::Usage {
+                reasoning_tokens: 0,
                 input_tokens: 100,
                 output_tokens: 10,
                 cache_creation_input_tokens: 0,
@@ -984,6 +994,7 @@ fn tool_reported_usage_folds_into_run_totals_and_events() {
                 cache_creation_input_tokens,
                 cache_read_input_tokens,
                 tool_folded,
+                reasoning_tokens: _,
             } => Some((
                 *input_tokens,
                 *output_tokens,
@@ -1060,6 +1071,7 @@ fn parallel_task_calls_both_run_and_keep_order_with_usage_folded() {
     let cfg = cfg_with(5, 0, 0);
     let (prov, _) = MockProvider::new(vec![
         MockTurn::Ok(ChatResponse {
+            reasoning: None,
             blocks: vec![
                 Block::ToolUse {
                     id: "a".into(),
@@ -1145,6 +1157,7 @@ fn parallel_task_calls_actually_overlap_in_wall_clock() {
     let cfg = cfg_with(5, 0, 0);
     let (prov, _) = MockProvider::new(vec![
         MockTurn::Ok(ChatResponse {
+            reasoning: None,
             blocks: vec![
                 Block::ToolUse {
                     id: "a".into(),
@@ -1191,6 +1204,7 @@ fn third_party_parallel_tool_overlaps_by_capability_not_name() {
     let cfg = cfg_with(5, 0, 0);
     let (prov, _) = MockProvider::new(vec![
         MockTurn::Ok(ChatResponse {
+            reasoning: None,
             blocks: vec![
                 Block::ToolUse {
                     id: "a".into(),
@@ -1243,6 +1257,7 @@ fn sequential_tool_calls_stay_inline_and_serialized() {
     let cfg = cfg_with(5, 0, 0);
     let (prov, _) = MockProvider::new(vec![
         MockTurn::Ok(ChatResponse {
+            reasoning: None,
             blocks: vec![
                 Block::ToolUse {
                     id: "a".into(),
@@ -1295,6 +1310,7 @@ fn mixed_turn_assembles_results_in_block_order() {
     let cfg = cfg_with(5, 0, 0);
     let (prov, _) = MockProvider::new(vec![
         MockTurn::Ok(ChatResponse {
+            reasoning: None,
             blocks: vec![
                 Block::ToolUse {
                     id: "e1".into(),
@@ -1351,6 +1367,7 @@ fn cancel_gates_the_parallel_task_batch_and_keeps_n_n_pairing() {
     // recorded as executed.
     let cfg = cfg_with(5, 0, 0);
     let (prov, _) = MockProvider::new(vec![MockTurn::Ok(ChatResponse {
+        reasoning: None,
         blocks: vec![
             Block::ToolUse {
                 id: "a".into(),
@@ -1924,6 +1941,7 @@ fn hooks_parallel_batch_gates_all_calls_in_block_order() {
     let cfg = cfg_with(5, 0, 0);
     let (prov, _) = MockProvider::new(vec![
         MockTurn::Ok(ChatResponse {
+            reasoning: None,
             blocks: vec![
                 Block::ToolUse {
                     id: "a".into(),
@@ -2147,6 +2165,7 @@ impl Tool for CancellingTaskTool {
 /// Nine tool_use blocks in ONE turn (id t0..t8) — one more than the wave cap.
 fn nine_task_turn() -> MockTurn {
     MockTurn::Ok(ChatResponse {
+        reasoning: None,
         blocks: (0..9)
             .map(|k| Block::ToolUse {
                 id: format!("t{k}"),
@@ -2276,6 +2295,7 @@ fn parallel_event_sink_panic_unwinds_instead_of_deadlocking() {
     let cfg = cfg_with(5, 0, 0);
     let (prov, _) = MockProvider::new(vec![
         MockTurn::Ok(ChatResponse {
+            reasoning: None,
             blocks: (0..2)
                 .map(|k| Block::ToolUse {
                     id: format!("t{k}"),
@@ -2349,6 +2369,10 @@ impl Tool for PanicOnMarkTool {
             // output carries usage_in_shared_budget=true so the fold will not
             // re-share.
             let u = Usage {
+                // A reasoning split (OF the 20 output tokens): it must ride
+                // the same recovery channel as the axes — the nested-panic
+                // test below reads it back off the parent's outcome.
+                reasoning_tokens: 2,
                 input_tokens: 100,
                 output_tokens: 20,
                 cache_creation_input_tokens: 0,
@@ -2372,6 +2396,7 @@ fn parallel_worker_panic_becomes_an_error_slot_and_siblings_survive() {
     let cfg = cfg_with(5, 0, 0);
     let (prov, _) = MockProvider::new(vec![
         MockTurn::Ok(ChatResponse {
+            reasoning: None,
             blocks: ["a", "boom", "c"]
                 .iter()
                 .enumerate()
@@ -2444,6 +2469,7 @@ fn parallel_worker_panic_reports_after_tool_true_without_duration() {
     let cfg = cfg_with(5, 0, 0);
     let (prov, _) = MockProvider::new(vec![
         MockTurn::Ok(ChatResponse {
+            reasoning: None,
             blocks: vec![Block::ToolUse {
                 id: "t0".into(),
                 name: "task".into(),
@@ -2568,6 +2594,8 @@ impl Tool for NestedTaskTool {
             // Mirror child_ctx: sandbox inherited, fleet budget + deadline
             // Arc-shared, sub-agent identity tagged.
             ToolCtx {
+                tool_annotations: std::sync::Arc::new(std::collections::BTreeMap::new()),
+                hidden_env: Vec::new(),
                 tool_absent_notes: ctx.tool_absent_notes.clone(),
                 workdir: ctx.workdir.clone(),
                 max_output_chars: ctx.max_output_chars,
@@ -2589,6 +2617,7 @@ impl Tool for NestedTaskTool {
                 image: None,
                 is_error: false,
                 usage: Some(Usage {
+                    reasoning_tokens: 0,
                     input_tokens: o.input_tokens,
                     output_tokens: o.output_tokens,
                     cache_creation_input_tokens: o.cache_creation_input_tokens,
@@ -2621,6 +2650,7 @@ impl Tool for NestedTaskTool {
 /// final text — the no-panic twin for the no-double-count regression.
 fn nested_child_script(label: &str) -> (Vec<MockTurn>, Vec<Box<dyn Tool>>) {
     let usage = |i: u64, o: u64| Usage {
+        reasoning_tokens: 0,
         input_tokens: i,
         output_tokens: o,
         cache_creation_input_tokens: 0,
@@ -2641,6 +2671,7 @@ fn nested_child_script(label: &str) -> (Vec<MockTurn>, Vec<Box<dyn Tool>>) {
     ];
     let tool_turn = |blocks: Vec<Block>, u: Option<Usage>| {
         MockTurn::Ok(ChatResponse {
+            reasoning: None,
             blocks,
             stop_reason: "tool_use".into(),
             usage: u,
@@ -2703,6 +2734,7 @@ fn nested_parallel_panic_probe_carries_the_childs_full_ledger() {
     cfg.limits.max_total_tokens = 1_000_000;
     let (prov, _) = MockProvider::new(vec![
         MockTurn::Ok(ChatResponse {
+            reasoning: None,
             blocks: ["boom-a", "boom-b"]
                 .iter()
                 .enumerate()
@@ -2741,6 +2773,15 @@ fn nested_parallel_panic_probe_carries_the_childs_full_ledger() {
         (1000 + 500 + 290 + 294, 100 + 50 + 56 + 60),
         "recovered child usage must include the fold-point records"
     );
+    // The reasoning split rides the same channel end to end: each of the
+    // four recovered worker panics (two per child) carried 2 thinking tokens
+    // through its thread-local probe, the child's own fold, the child's
+    // probe and the parent's join arm. Drop the fold at `usage_probe::record`
+    // and this reads 0 while the token totals above stay green.
+    assert_eq!(
+        o.reasoning_tokens, 8,
+        "recovered thinking must reach the bill"
+    );
     // No divergence: every token entered the shared counter exactly once —
     // child LLM chats via bill_chat, the billed tool's usage at the child's
     // fold (usage_in_shared_budget=false), each panic's usage shared by the
@@ -2772,6 +2813,7 @@ fn nested_parallel_normal_child_completion_bills_exactly_once() {
     cfg.limits.max_total_tokens = 1_000_000;
     let (prov, _) = MockProvider::new(vec![
         MockTurn::Ok(ChatResponse {
+            reasoning: None,
             blocks: ["calm-a", "calm-b"]
                 .iter()
                 .enumerate()
@@ -2835,6 +2877,7 @@ fn cancel_landed_mid_gate_loop_skips_the_remaining_gates() {
     let cfg = cfg_with(5, 0, 0);
     let (prov, _) = MockProvider::new(vec![
         MockTurn::Ok(ChatResponse {
+            reasoning: None,
             blocks: (0..2)
                 .map(|k| Block::ToolUse {
                     id: format!("t{k}"),
@@ -2906,6 +2949,7 @@ fn cancel_landed_mid_gate_loop_skips_the_remaining_gates() {
 /// output), for the stuck-detector-in-the-batch-path tests.
 fn identical_task_turn(n: usize, label: &str) -> MockTurn {
     MockTurn::Ok(ChatResponse {
+        reasoning: None,
         blocks: (0..n)
             .map(|k| Block::ToolUse {
                 id: format!("t{k}"),
@@ -2988,6 +3032,7 @@ fn hooks_mixed_turn_gates_leaves_first_then_batch_in_block_order() {
     let cfg = cfg_with(5, 0, 0);
     let (prov, _) = MockProvider::new(vec![
         MockTurn::Ok(ChatResponse {
+            reasoning: None,
             blocks: vec![
                 Block::ToolUse {
                     id: "a".into(),
@@ -3334,6 +3379,7 @@ impl Provider for CancelOnChatProvider {
         // whatever stop_reason the provider last sent.)
         self.flag.store(true, Ordering::Relaxed);
         Ok(ChatResponse {
+            reasoning: None,
             blocks: vec![Block::Text("partial".into())],
             stop_reason: "end_turn".into(),
             usage: None,
@@ -3375,6 +3421,7 @@ fn empty_assistant_turn_is_not_persisted() {
     // session is cleared. The loop stops here without persisting the turn.
     let cfg = cfg_with(5, 0, 0);
     let (prov, _) = MockProvider::new(vec![MockTurn::Ok(ChatResponse {
+        reasoning: None,
         blocks: vec![],
         stop_reason: "end_turn".into(),
         usage: None,
@@ -3508,14 +3555,17 @@ fn remove_mcp_server_routes_by_config_name_marker() {
         Box::new(FakeMcpTool {
             server: "db".into(),
             name: "mcp_db_query".into(),
+            hints: None,
         }),
         Box::new(FakeMcpTool {
             server: "db".into(),
             name: "mcp_db_exec".into(),
+            hints: None,
         }),
         Box::new(FakeMcpTool {
             server: "fs".into(),
             name: "mcp_fs_read".into(),
+            hints: None,
         }),
     ];
     let mut agent = Agent::new(
@@ -3558,6 +3608,57 @@ fn remove_mcp_server_unknown_name_is_err_and_keeps_tools() {
     assert_eq!(agent.tool_names(), before, "failed remove mutates nothing");
 }
 
+/// A tool whose description and schema carry CJK text — the shape that tells
+/// the two size yardsticks apart (a raw byte sum vs the CJK-aware
+/// `compress::tool_schema_units`).
+struct CjkTool;
+impl Tool for CjkTool {
+    fn def(&self) -> ToolDef {
+        ToolDef {
+            name: "cjk".into(),
+            description: "读取工作目录下的文件并返回内容（测试用工具，描述含中文）".into(),
+            schema: json!({
+                "type": "object",
+                "properties": {"路径": {"type": "string", "description": "相对工作目录的路径"}}
+            }),
+        }
+    }
+    fn run(&self, _input: &Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+        Ok(ToolOutput::text("ok"))
+    }
+}
+
+#[test]
+fn refresh_tool_defs_recomputes_on_the_construction_yardstick() {
+    // Construction sizes the tool table with `tool_schema_units` (CJK-aware);
+    // the hot add/remove path (`refresh_tool_defs`) used to re-sum RAW BYTES,
+    // so the first MCP hot add/remove silently swapped the yardstick under
+    // the preflight estimate and the usage anchor. Both paths must agree.
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, _) = MockProvider::new(vec![]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(EchoTool::new("shell")), Box::new(CjkTool)],
+        vec![user_text("hi")],
+        test_ctx(),
+    );
+    let built = agent.tool_schema_chars;
+    agent.refresh_tool_defs();
+    assert_eq!(
+        agent.tool_schema_chars, built,
+        "hot add/remove must re-sum on the construction yardstick"
+    );
+    // …and the two yardsticks really differ for this table, so the equality
+    // above has teeth (it is not two names for the same number).
+    let raw_bytes: usize = agent
+        .tool_defs
+        .iter()
+        .map(|t| t.name.len() + t.description.len() + t.schema.to_string().len())
+        .sum();
+    assert_ne!(raw_bytes, built);
+}
+
 #[test]
 fn add_mcp_server_failed_handshake_leaves_agent_unchanged() {
     // Hermetic add-path guard: a server that can't even spawn (nonexistent
@@ -3576,6 +3677,10 @@ fn add_mcp_server_failed_handshake_leaves_agent_unchanged() {
     );
     let before = agent.tool_names();
     let bad = McpServerConfig {
+        deny_tools: Vec::new(),
+        call_timeout_secs: None,
+        connect_timeout_secs: None,
+        allow_tools: Vec::new(),
         name: "nope".into(),
         command: Some("/nonexistent-tinyagent-test-mcp".into()),
         args: vec![],
@@ -3594,6 +3699,10 @@ fn lenient_mcp_assembly_skips_failed_server() {
     // plugin must degrade the toolset, not fail the session. Strict assembly
     // keeps its old contract (CLI/batch fail fast).
     let bad = McpServerConfig {
+        deny_tools: Vec::new(),
+        call_timeout_secs: None,
+        connect_timeout_secs: None,
+        allow_tools: Vec::new(),
         name: "nope".into(),
         command: Some("/nonexistent-tinyagent-test-mcp".into()),
         args: vec![],
@@ -3602,13 +3711,16 @@ fn lenient_mcp_assembly_skips_failed_server() {
         headers: Default::default(),
         env: Default::default(),
     };
-    let e = match crate::tools::mcp::build(std::slice::from_ref(&bad)) {
+    let e = match crate::tools::mcp::build(std::slice::from_ref(&bad), &[]) {
         Err(e) => e,
         Ok(_) => panic!("strict build stays fail-fast"),
     };
     let (tools, failures) =
-        crate::tools::mcp::build_lenient(std::slice::from_ref(&bad)).unwrap();
-    assert!(tools.is_empty(), "no tools from a server that never started");
+        crate::tools::mcp::build_lenient(std::slice::from_ref(&bad), &[]).unwrap();
+    assert!(
+        tools.is_empty(),
+        "no tools from a server that never started"
+    );
     assert_eq!(failures.len(), 1);
     assert_eq!(failures[0].server, "nope");
     // 同一份坏配置，两个入口各走一次 start_server：宽松清单里的 error 必须
@@ -3625,6 +3737,10 @@ fn build_agent_with_lenient_degrades_bad_mcp() {
     // 命令，与上层 lenient_mcp_assembly_skips_failed_server 同一株毒。
     let mut cfg = cfg_with(5, 0, 0);
     cfg.mcp_servers = vec![McpServerConfig {
+        deny_tools: Vec::new(),
+        call_timeout_secs: None,
+        connect_timeout_secs: None,
+        allow_tools: Vec::new(),
         name: "nope".into(),
         command: Some("/nonexistent-tinyagent-test-mcp".into()),
         args: vec![],
@@ -3634,14 +3750,9 @@ fn build_agent_with_lenient_degrades_bad_mcp() {
         env: Default::default(),
     }];
     let client = crate::provider::new_client(cfg.limits.timeout_secs);
-    let (agent, failures) = crate::build_agent_with_lenient(
-        &cfg,
-        vec![],
-        &client,
-        vec![],
-        "sk-test",
-    )
-    .expect("lenient assembly degrades a dead plugin instead of failing");
+    let (agent, failures) =
+        crate::build_agent_with_lenient(&cfg, vec![], &client, vec![], "sk-test")
+            .expect("lenient assembly degrades a dead plugin instead of failing");
     assert_eq!(failures.len(), 1);
     assert_eq!(failures[0].server, "nope");
     let names = agent.tool_names();
@@ -3664,6 +3775,10 @@ fn build_agent_with_lenient_degrades_bad_mcp() {
 #[ignore]
 fn hot_add_remove_mcp_server_live() {
     let echo = McpServerConfig {
+        deny_tools: Vec::new(),
+        call_timeout_secs: None,
+        connect_timeout_secs: None,
+        allow_tools: Vec::new(),
         name: "e1".into(),
         command: Some("python3".into()),
         args: vec![format!(
@@ -3693,6 +3808,13 @@ fn hot_add_remove_mcp_server_live() {
     let added = agent.add_mcp_server(echo.clone()).unwrap();
     assert_eq!(added, vec!["mcp_e1_echo".to_string()]);
     assert_eq!(agent.tool_names(), vec!["mcp_e1_echo".to_string()]);
+    // The annotation side table follows the hot add. The echo server
+    // declares nothing, so the entry holds the spec defaults — but every MCP
+    // tool is listed, declared or not.
+    assert_eq!(
+        agent.ctx.annotations("mcp_e1_echo"),
+        Some(&crate::tools::ToolAnnotations::MISSING)
+    );
 
     // Real dispatch through the live server (not a mock): the model calls the
     // hot-added tool and the loop's tools/call must reach the python child.
@@ -3702,6 +3824,11 @@ fn hot_add_remove_mcp_server_live() {
         state.captured()[0].tool_names,
         vec!["mcp_e1_echo".to_string()],
         "hot-added tool reaches the request side"
+    );
+    assert_eq!(
+        o.tool_calls[0].annotations,
+        Some(crate::tools::ToolAnnotations::MISSING),
+        "the record snapshots the table entry"
     );
     let echoed = agent.messages.iter().find_map(|m| {
         m.content.iter().find_map(|b| match b {
@@ -3729,6 +3856,10 @@ fn hot_add_remove_mcp_server_live() {
     // process group synchronously, so no orphan survives the call.
     assert_eq!(agent.remove_mcp_server("e1").unwrap(), 1);
     assert!(agent.tool_names().is_empty());
+    assert!(
+        agent.ctx.annotations("mcp_e1_echo").is_none(),
+        "pruned together with the tools"
+    );
     if let Ok(out) = std::process::Command::new("pgrep")
         .arg("-f")
         .arg("mcp_echo.py")
@@ -3742,6 +3873,76 @@ fn hot_add_remove_mcp_server_live() {
     } // no pgrep on this platform → best-effort, skip the process check
 }
 
+/// 凭据卫生（内核改进计划 2.5）：热增的 server 与装配期的走同一条纪律——按 agent
+/// 自己的 `ToolCtx::hidden_env` 起进程（`add_mcp_server` 手里没有 config，ctx 是唯一
+/// 真值）。真实 python 子进程：探针变量（unix `HOME` / windows `USERNAME`）在集合里
+/// 时 server 读不到，不在时读得到（对照组证明探针有效）；测试不改进程环境。无
+/// python 或探针缺失时自行跳过并在 stderr 说明。
+#[cfg(any(unix, windows))]
+#[test]
+fn add_mcp_server_spawns_with_the_agent_hidden_env() {
+    let Some(py) = crate::mcp::test_python() else {
+        eprintln!(
+            "skip add_mcp_server_spawns_with_the_agent_hidden_env: no python interpreter \
+             found (set TA_MCP_PYTHON to run it)"
+        );
+        return;
+    };
+    #[cfg(unix)]
+    let probe = "HOME";
+    #[cfg(windows)]
+    let probe = "USERNAME";
+    let Some(inherited) = std::env::var_os(probe) else {
+        eprintln!("skip add_mcp_server_spawns_with_the_agent_hidden_env: {probe} is unset");
+        return;
+    };
+    let script = crate::mcp::write_env_server("hotadd");
+    // What a hot-added server reports for `probe` when the agent's set is
+    // `hidden`: the model calls its `env` tool through the real loop.
+    let seen = |hidden: &[&str]| -> String {
+        let server = crate::mcp::env_server_config(&py, &script, std::collections::HashMap::new());
+        let (prov, _state) = MockProvider::new(vec![
+            mock::resp_tool("c1", "mcp_env_server_env", json!({"name": probe}), None),
+            mock::resp_text("done", None),
+        ]);
+        let mut ctx = test_ctx();
+        ctx.hidden_env = hidden.iter().map(|s| s.to_string()).collect();
+        let mut agent = Agent::new(
+            &cfg_with(5, 0, 0),
+            Box::new(prov),
+            vec![],
+            vec![user_text("hi")],
+            ctx,
+        );
+        assert_eq!(
+            agent.add_mcp_server(server).unwrap(),
+            vec!["mcp_env_server_env".to_string()]
+        );
+        agent.run(&mut |_| {}).expect("run");
+        agent
+            .messages
+            .iter()
+            .find_map(|m| {
+                m.content.iter().find_map(|b| match b {
+                    Block::ToolResult { content, .. } => Some(content.clone()),
+                    _ => None,
+                })
+            })
+            .expect("the tool result reached the history")
+    };
+    assert_eq!(
+        seen(&[]),
+        inherited.to_string_lossy(),
+        "control: nothing hidden, the hot-added server inherits the variable"
+    );
+    assert_eq!(
+        seen(&[probe]),
+        "<unset>",
+        "hidden: the agent's set is applied to a hot-added server"
+    );
+    let _ = std::fs::remove_file(&script);
+}
+
 #[test]
 fn parallel_tool_uses_pair_with_n_tool_results() {
     // One assistant turn with 2 tool_use → the NEXT request's trailing
@@ -3750,6 +3951,7 @@ fn parallel_tool_uses_pair_with_n_tool_results() {
     let cfg = cfg_with(5, 0, 0);
     let (prov, state) = MockProvider::new(vec![
         MockTurn::Ok(ChatResponse {
+            reasoning: None,
             blocks: vec![
                 Block::ToolUse {
                     id: "a".into(),
@@ -3791,6 +3993,7 @@ fn cancel_mid_batch_synthesizes_results_for_remaining_tools() {
     // 2 tool_use are answered 1:1, and the run ends "cancelled".
     let cfg = cfg_with(5, 0, 0);
     let (prov, _) = MockProvider::new(vec![MockTurn::Ok(ChatResponse {
+        reasoning: None,
         blocks: vec![
             Block::ToolUse {
                 id: "a".into(),
@@ -3836,6 +4039,7 @@ fn aborted_stream_does_not_execute_truncated_tool_use() {
     // tool_result is synthesized — the orphaned tool_use is dropped.
     let cfg = cfg_with(5, 0, 0);
     let (prov, state) = MockProvider::new(vec![MockTurn::Ok(ChatResponse {
+        reasoning: None,
         blocks: vec![
             Block::Text("partial...".into()),
             Block::ToolUse {
@@ -3880,6 +4084,7 @@ fn aborted_stream_does_not_execute_truncated_tool_use() {
 
 fn max_tokens_turn(text: &str) -> MockTurn {
     MockTurn::Ok(ChatResponse {
+        reasoning: None,
         blocks: vec![Block::Text(text.into())],
         stop_reason: "max_tokens".into(),
         usage: None,
@@ -3969,6 +4174,7 @@ fn salvage_fires_on_empty_blocks() {
     let cfg = cfg_with(5, 0, 0);
     let (prov, state) = MockProvider::new(vec![
         MockTurn::Ok(ChatResponse {
+            reasoning: None,
             blocks: vec![],
             stop_reason: "max_tokens".into(),
             usage: None,
@@ -4235,6 +4441,7 @@ fn stuck_stop_clears_when_a_later_call_in_the_same_turn_differs() {
     });
     let (prov, state) = MockProvider::new(vec![
         MockTurn::Ok(ChatResponse {
+            reasoning: None,
             blocks,
             stop_reason: "tool_use".into(),
             usage: None,
@@ -4544,6 +4751,7 @@ impl Tool for LeafHundredBillTool {
             image: None,
             is_error: false,
             usage: Some(crate::provider::Usage {
+                reasoning_tokens: 0,
                 input_tokens: 100,
                 output_tokens: 0,
                 cache_creation_input_tokens: 0,
@@ -4987,6 +5195,7 @@ fn compress_records_anchor_backed_measured_tokens() {
     // (3 messages <= keep+2); turn-3 preflight trips again with 5 messages.
     let (prov, _) = MockProvider::new(vec![
         MockTurn::Ok(ChatResponse {
+            reasoning: None,
             blocks: vec![
                 Block::Text(t1),
                 Block::ToolUse {
@@ -4999,6 +5208,7 @@ fn compress_records_anchor_backed_measured_tokens() {
             usage: mock::mk_usage(50, 5),
         }),
         MockTurn::Ok(ChatResponse {
+            reasoning: None,
             blocks: vec![
                 Block::Text(t2),
                 Block::ToolUse {
@@ -5097,6 +5307,7 @@ fn compress_reports_none_measured_after_anchor_voiding_prune() {
         // echo result is the prune fuel (history: hi / t1+tool_use a /
         // tool_result a BIG).
         MockTurn::Ok(ChatResponse {
+            reasoning: None,
             blocks: vec![
                 Block::Text(t1),
                 Block::ToolUse {
@@ -5258,6 +5469,7 @@ fn tool_call_records_carry_execution_duration() {
     let cfg = cfg_with(5, 0, 0);
     let (prov, _) = MockProvider::new(vec![
         MockTurn::Ok(ChatResponse {
+            reasoning: None,
             blocks: vec![
                 Block::ToolUse {
                     id: "a".into(),
@@ -5334,6 +5546,7 @@ fn cancelled_call_records_no_duration() {
     }
     let cfg = cfg_with(5, 0, 0);
     let (prov, _) = MockProvider::new(vec![MockTurn::Ok(ChatResponse {
+        reasoning: None,
         blocks: vec![
             Block::ToolUse {
                 id: "a".into(),
@@ -5407,6 +5620,7 @@ fn failed_compress_still_bills_its_burned_summary_tokens() {
         // The summary call: partial text + usage reported, then a
         // non-end_turn stop (the mid-stream death shape).
         MockTurn::Ok(ChatResponse {
+            reasoning: None,
             blocks: vec![Block::Text("half-written su".into())],
             stop_reason: "refusal".into(),
             usage: mock::mk_usage(77, 7),
@@ -5697,6 +5911,7 @@ impl Provider for TransientFailThenCancelProvider {
             }
         }
         Ok(ChatResponse {
+            reasoning: None,
             blocks: vec![Block::Text("unused main reply".into())],
             stop_reason: "end_turn".into(),
             usage: None,
@@ -6216,6 +6431,7 @@ fn compact_retries_when_reasoning_burns_the_whole_budget() {
     let (prov, state) = MockProvider::new(vec![
         // Attempt 1: length-capped, zero body — the failure shape.
         MockTurn::Ok(ChatResponse {
+            reasoning: None,
             blocks: vec![],
             stop_reason: "max_tokens".into(),
             usage: mock::mk_usage(30, 1024),
@@ -6264,6 +6480,7 @@ fn compact_degrades_without_retry_on_empty_end_turn_summary() {
         user_text("u2"),
     ];
     let (prov, state) = MockProvider::new(vec![MockTurn::Ok(ChatResponse {
+        reasoning: None,
         blocks: vec![],
         stop_reason: "end_turn".into(),
         usage: mock::mk_usage(10, 5),
@@ -6296,6 +6513,7 @@ fn compact_accepts_a_truncated_but_nonempty_summary_first_try() {
         user_text("u2"),
     ];
     let (prov, state) = MockProvider::new(vec![MockTurn::Ok(ChatResponse {
+        reasoning: None,
         blocks: vec![Block::Text("partial summary…".into())],
         stop_reason: "max_tokens".into(),
         usage: mock::mk_usage(10, 1024),
@@ -6780,6 +6998,7 @@ fn compress_accepts_summary_truncated_by_max_tokens() {
     ];
     let (prov, _) = MockProvider::new(vec![
         MockTurn::Ok(ChatResponse {
+            reasoning: None,
             blocks: vec![Block::Text("partial summary".into())],
             stop_reason: "max_tokens".into(),
             usage: None,
@@ -6963,6 +7182,7 @@ fn compress_partial_summary_is_not_folded_into_history() {
     ];
     let (prov, state) = MockProvider::new(vec![
         MockTurn::Ok(ChatResponse {
+            reasoning: None,
             blocks: vec![Block::Text("half a summa".into())],
             stop_reason: "cancelled".into(), // partial stream, not end_turn
             usage: None,
@@ -7658,6 +7878,7 @@ fn stream_error_stop_reason_maps_to_run_error_with_usage() {
     // provider, dropping usage Anthropic had already billed.
     let cfg = cfg_with(5, 0, 0);
     let (prov, _) = MockProvider::new(vec![MockTurn::Ok(ChatResponse {
+        reasoning: None,
         blocks: vec![
             Block::Text("partial reply".into()),
             Block::Text("[stream error] overloaded".into()),
@@ -7700,6 +7921,7 @@ fn stream_error_past_deadline_ends_run_as_timeout() {
     let (prov, _) = MockProvider::new(vec![MockTurn::OkAfter {
         delay: std::time::Duration::from_millis(1200),
         resp: ChatResponse {
+            reasoning: None,
             blocks: vec![Block::Text("[stream error] operation timed out".into())],
             stop_reason: "stream_error".into(),
             usage: mock::mk_usage(1500, 7),
@@ -7848,6 +8070,7 @@ fn run_normalizes_adjacent_user_messages_before_request() {
 
 fn todo_rec(todos: Value, is_error: bool) -> ToolCallRecord {
     ToolCallRecord {
+        annotations: None,
         name: "todo".into(),
         input: todos,
         output: "rendered".into(),
@@ -7862,6 +8085,7 @@ fn extract_plan_picks_last_nonerror_todo() {
     let recs = vec![
         todo_rec(json!({"todos":[{"subject":"a","status":"pending"}]}), false),
         ToolCallRecord {
+            annotations: None,
             name: "shell".into(),
             input: json!({}),
             output: "y".into(),
@@ -7899,6 +8123,7 @@ fn extract_plan_skips_errored_todo_and_falls_back() {
 #[test]
 fn extract_plan_none_when_no_todo() {
     let recs = vec![ToolCallRecord {
+        annotations: None,
         name: "shell".into(),
         input: json!({}),
         output: "y".into(),
@@ -8158,6 +8383,7 @@ fn loop_two_broken_turns_mint_distinct_repair_ids() {
     let echo = EchoTool::new("shell");
     let (prov, state) = MockProvider::new(vec![
         MockTurn::Ok(ChatResponse {
+            reasoning: None,
             blocks: vec![Block::ToolUse {
                 id: "".into(),
                 name: "shell".into(),
@@ -8167,6 +8393,7 @@ fn loop_two_broken_turns_mint_distinct_repair_ids() {
             usage: None,
         }),
         MockTurn::Ok(ChatResponse {
+            reasoning: None,
             blocks: vec![Block::ToolUse {
                 id: "".into(),
                 name: "shell".into(),
@@ -8220,6 +8447,7 @@ fn loop_pairs_results_after_id_repair() {
     let echo = EchoTool::new("shell");
     let (prov, state) = MockProvider::new(vec![
         MockTurn::Ok(ChatResponse {
+            reasoning: None,
             blocks: vec![
                 Block::ToolUse {
                     id: "".into(),
@@ -8357,6 +8585,8 @@ fn run_code_a1_loop_round_trip() {
         mock::resp_text("done", None),
     ]);
     let ctx = ToolCtx {
+        tool_annotations: std::sync::Arc::new(std::collections::BTreeMap::new()),
+        hidden_env: Vec::new(),
         tool_absent_notes: Vec::new(),
         workdir: dir.clone(),
         max_output_chars: 2000,
@@ -8487,6 +8717,8 @@ fn run_code_a2_csv_pipeline() {
         mock::resp_text("done", None),
     ]);
     let ctx = ToolCtx {
+        tool_annotations: std::sync::Arc::new(std::collections::BTreeMap::new()),
+        hidden_env: Vec::new(),
         tool_absent_notes: Vec::new(),
         workdir: dir.clone(),
         max_output_chars: 4000,
@@ -8575,6 +8807,8 @@ fn run_code_a3_gate_sequence_equivalence() {
         mock::resp_text("done", None),
     ]);
     let ctx = ToolCtx {
+        tool_annotations: std::sync::Arc::new(std::collections::BTreeMap::new()),
+        hidden_env: Vec::new(),
         tool_absent_notes: Vec::new(),
         workdir: dir.clone(),
         max_output_chars: 2000,
@@ -8884,6 +9118,169 @@ fn set_code_config_warns_when_llm_was_pinned_by_the_registry() {
 // is pinned in context_report.rs's unit tests; these cover the AGENT side —
 // where the parts come from (fields, anchor, tool table) and the anchor's
 // lifecycle around runs and folds.
+
+/// Construction-time advisory for an oversized tool table: one `[context]`
+/// warn message through the diag channel (one statement per line, the first
+/// line tagged) naming the crossed line and the table's numbers. Nothing
+/// under both lines, nothing for a `task` sub-agent
+/// (its parent already spoke), and the same table is said once per process.
+/// `/context`'s side of the contract: the live breakdown carries the same
+/// verdict.
+#[test]
+fn tool_defs_advisory_noted_once_at_construction() {
+    /// A tool with a fixed name and a description `desc` units long.
+    #[derive(Clone)]
+    struct Sized {
+        name: String,
+        desc: usize,
+    }
+    impl Tool for Sized {
+        fn def(&self) -> ToolDef {
+            ToolDef {
+                name: self.name.clone(),
+                description: "w".repeat(self.desc),
+                schema: json!({"type": "object"}),
+            }
+        }
+        fn run(&self, _input: &serde_json::Value, _ctx: &ToolCtx) -> anyhow::Result<ToolOutput> {
+            Ok(ToolOutput::text("ok"))
+        }
+    }
+    // The once-per-process memory is keyed on the text, so the sizes are
+    // deliberately odd: no other test's table can produce these exact lines
+    // first and swallow the emission this test waits for.
+    let wide = Sized {
+        name: "wide".into(),
+        desc: 4 * 10_003, // → 10008 tokens (name + schema add 21 units)
+    };
+    let cfg = cfg_with(5, 0, 0);
+    let got: std::sync::Arc<std::sync::Mutex<Vec<(crate::diag::DiagLevel, String)>>> =
+        Default::default();
+    let sink = std::sync::Arc::clone(&got);
+    let _guard = crate::diag::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    crate::diag::install_diag_sink(Box::new(move |level, msg| {
+        sink.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((level, msg.to_owned()));
+    }));
+    // The sink is process-global: filter by content.
+    let advisory = || -> Vec<(crate::diag::DiagLevel, String)> {
+        got.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(_, m)| m.contains("[context] tool definitions"))
+            .cloned()
+            .collect()
+    };
+    let build = |tools: Vec<Box<dyn Tool>>, ctx: ToolCtx| {
+        Agent::new(
+            &cfg,
+            Box::new(MockProvider::new(vec![]).0),
+            tools,
+            vec![],
+            ctx,
+        )
+    };
+
+    // Under both lines: no line.
+    let small = build(
+        vec![Box::new(Sized {
+            name: "small".into(),
+            desc: 10,
+        })],
+        test_ctx(),
+    );
+    assert_eq!(small.context_breakdown().tools.advisory(), None);
+    assert!(advisory().is_empty(), "{:?}", advisory());
+
+    // Over the token line: exactly one WARN message, naming the line and
+    // the table. One statement per line, continuation lines indented two
+    // spaces: the message reaches a terminal through the stderr fallback,
+    // where only the line breaks the text carries are its own.
+    let agent = build(vec![Box::new(wide.clone())], test_ctx());
+    let bd = agent.context_breakdown();
+    assert_eq!(
+        bd.tools.advisory(),
+        Some(crate::context_report::ToolDefsAdvisory::Tokens)
+    );
+    // The breakdown's number and the notice's agree.
+    assert!(
+        (10_008..=10_009).contains(&bd.tools.tokens),
+        "fixture drifted: {}",
+        bd.tools.tokens
+    );
+    let lines = advisory();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0].0, crate::diag::DiagLevel::Warn);
+    assert!(
+        lines[0].1.starts_with(&format!(
+            "[context] tool definitions ≈ {} tokens",
+            bd.tools.tokens
+        )),
+        "{}",
+        lines[0].1
+    );
+    assert_eq!(
+        lines[0].1,
+        concat!(
+            "[context] tool definitions ≈ 10008 tokens across 1 tool.\n",
+            "  Over the advisory line of 10000 tokens.\n",
+            "  Fixed cost on every request; compaction cannot fold it.\n",
+            "  Trim tools / MCP servers, or move rarely used tools into skills.\n",
+            "  Rules of thumb from Anthropic's Tool search docs, on estimates."
+        )
+    );
+
+    // The same table built again: said once per process.
+    drop(build(vec![Box::new(wide.clone())], test_ctx()));
+    // A sub-agent's table never notes — the top-level parent spoke.
+    let mut child_ctx = test_ctx();
+    child_ctx.subagent = Some("child".into());
+    drop(build(vec![Box::new(wide)], child_ctx));
+    assert_eq!(advisory().len(), 1);
+
+    // The count line through the same gate: 31 small tools cross it on
+    // number alone (a few hundred tokens in total).
+    let many: Vec<Box<dyn Tool>> = (0..31)
+        .map(|i| {
+            Box::new(Sized {
+                name: format!("t{i}"),
+                desc: 10,
+            }) as Box<dyn Tool>
+        })
+        .collect();
+    let many = build(many, test_ctx());
+    assert_eq!(
+        many.context_breakdown().tools.advisory(),
+        Some(crate::context_report::ToolDefsAdvisory::Count)
+    );
+    let count_line = advisory();
+    assert_eq!(count_line.len(), 2, "{count_line:?}");
+    let tokens = many.context_breakdown().tools.tokens;
+    assert!(tokens < 10_000, "the token line must stay under: {tokens}");
+    assert_eq!(count_line[1].0, crate::diag::DiagLevel::Warn);
+    // Same shape; the second line names the line actually crossed.
+    let mut said = count_line[1].1.lines();
+    assert_eq!(
+        said.next(),
+        Some(format!("[context] tool definitions ≈ {tokens} tokens across 31 tools.").as_str())
+    );
+    assert_eq!(said.next(), Some("  Over the advisory line of 30 tools."));
+    // …and never the one the table is under.
+    let rest: Vec<&str> = said.collect();
+    assert!(!rest.join("\n").contains("10000"), "{rest:?}");
+    assert_eq!(
+        rest,
+        [
+            "  Fixed cost on every request; compaction cannot fold it.",
+            "  Trim tools / MCP servers, or move rarely used tools into skills.",
+            "  Rules of thumb from Anthropic's Tool search docs, on estimates.",
+        ]
+    );
+    crate::diag::clear_diag_sink();
+}
 
 #[test]
 fn context_breakdown_uncalibrated_matches_estimate() {
@@ -9252,6 +9649,7 @@ fn every_agent_event_has_a_stable_ndjson_type_tag() {
         (AgentEvent::TodoUpdate { todos: Vec::new() }, "todo"),
         (
             AgentEvent::Usage {
+                reasoning_tokens: 0,
                 input_tokens: 0,
                 output_tokens: 0,
                 cache_creation_input_tokens: 0,
@@ -9449,6 +9847,7 @@ fn observe_slots(
     let cfg = cfg_with(5, 0, 0);
     let (prov, _) = MockProvider::new(vec![
         MockTurn::Ok(ChatResponse {
+            reasoning: None,
             blocks,
             stop_reason: "tool_use".into(),
             usage: None,
@@ -10123,7 +10522,7 @@ fn window_lines_renders_middle_note_and_skips_head_note() {
             SUPERVISOR_NOTE_MARKER
         ))]),
     ];
-    let lines = window_lines(&msgs, 2).join("\n");
+    let lines = window_lines(&msgs, 2, 200).join("\n");
     // Middle note reaches the summarizer transcript with its marker (the
     // prompt guidance keys off it).
     assert!(lines.contains("middle note"));
@@ -10966,6 +11365,7 @@ fn gateway_fixes_export_serializes_only_when_non_default() {
     // （既有产出字节不变）；学到任一位 → 键出现且位如实。
     fn outcome(fixes: crate::provider::GatewayFixes) -> RunOutcome {
         RunOutcome {
+            reasoning_tokens: 0,
             final_text: "done".into(),
             turns: 1,
             stop_reason: "end_turn".into(),
@@ -11150,6 +11550,7 @@ fn session_rebuild_reproduces_the_model_visible_face_id_by_id() {
     let dir = dir_for("degenerate");
     let path = dir.join("s.json");
     let (prov, _) = MockProvider::new(vec![MockTurn::Ok(ChatResponse {
+        reasoning: None,
         blocks: vec![],
         stop_reason: "end_turn".into(),
         usage: mock::mk_usage(10, 5),
@@ -11399,6 +11800,7 @@ fn turn_stop_info_reports_the_ending_turn_and_cap_alignment() {
     // 是已兑现数（不含本次）；cap 恒 6 = STUCK_STOP_AT；final_text 始终是
     // 最后一个非空轮，仲裁全程不改写它。
     let blank = MockTurn::Ok(ChatResponse {
+        reasoning: None,
         blocks: vec![Block::Text(String::new())],
         stop_reason: "end_turn".into(),
         usage: None,
@@ -11476,6 +11878,7 @@ fn zero_block_final_turn_never_consults_arbitration() {
     // 零块收尾轮（内容过滤吞回复 / thinking-only）：没有可判的完成声称
     // ——钩子绝不触发、无 TurnArbitration 事件、正常 end_turn 收尾。
     let (prov, _s) = MockProvider::new(vec![MockTurn::Ok(ChatResponse {
+        reasoning: None,
         blocks: vec![],
         stop_reason: "end_turn".into(),
         usage: None,
@@ -11679,6 +12082,7 @@ fn run_cost_folds_failed_attempt_arbitrations_and_gateway_fixes() {
     assert!(v.get("arbitrations_used").is_none(), "{v}");
     assert!(v.get("gateway_fixes").is_none(), "{v}");
     let mut o = RunOutcome {
+        reasoning_tokens: 0,
         final_text: String::new(),
         turns: 1,
         stop_reason: "end_turn".into(),
@@ -11747,6 +12151,7 @@ fn cancel_middleware_inflight_second_request_keeps_first_usage() {
     let (prov, _state) = MockProvider::new(vec![
         mock::resp_tool("t1", "echo", json!({}), mock::mk_usage(100, 20)),
         MockTurn::Ok(ChatResponse {
+            reasoning: None,
             blocks: vec![Block::Text("partial".into())],
             stop_reason: "cancelled".into(),
             usage: None,
@@ -11776,6 +12181,7 @@ fn stream_idle_after_completed_request_keeps_usage() {
     let (prov, _state) = MockProvider::new(vec![
         mock::resp_tool("t1", "echo", json!({}), mock::mk_usage(100, 20)),
         MockTurn::Ok(ChatResponse {
+            reasoning: None,
             blocks: vec![],
             stop_reason: "stream_idle".into(),
             usage: None,
@@ -11805,6 +12211,7 @@ fn zero_usage_cancel_reports_zero_usage() {
     // usage 未回传」的形状（真实 provider 的 Ok(cancelled, usage=None)）。
     let cfg = cfg_with(5, 0, 0);
     let (prov, state) = MockProvider::new(vec![MockTurn::Ok(ChatResponse {
+        reasoning: None,
         blocks: vec![],
         stop_reason: "cancelled".into(),
         usage: None,
@@ -11867,6 +12274,7 @@ fn cancelled_stream_with_partial_usage_bills_the_received_part() {
     // parse_loop 返回 Some(部分用量) + stop_reason=cancelled 的真实形状。
     let cfg = cfg_with(5, 0, 0);
     let (prov, _state) = MockProvider::new(vec![MockTurn::Ok(ChatResponse {
+        reasoning: None,
         blocks: vec![Block::Text("partial".into())],
         stop_reason: "cancelled".into(),
         usage: mock::mk_usage_cache(70, 0, 30, 10),
@@ -11967,4 +12375,2668 @@ fn ghost_first_initial_history_starts_clean_through_agent_ingest() {
     );
     assert_eq!(msgs[0].role, Role::User);
     assert!(matches!(&msgs[0].content[0], Block::Text(t) if t == "go"));
+}
+
+// ── Reasoning carry (`Config.preserved_reasoning`) ─────────────────────
+//
+// Several current APIs want a thinking model's reasoning handed back with
+// the tool results inside a tool loop (GLM: mandatory for interleaved
+// thinking + tools; Anthropic: the last assistant message of a tool loop
+// must start with its signed thinking block). The kernel's side is storage +
+// verbatim echo. ON by default since 2026-11-26 (A/B on deepseek-flash:
+// 15/15 vs 14/15 tasks, −39% tokens); it spends input tokens and puts the
+// model's scratchpad into history, so `preserved_reasoning: false` opts out.
+// These pin the three rules the loop must keep:
+//
+//   1. OFF = byte-identical to the pre-feature behaviour: display still
+//      streams ThinkingDelta, history and every request carry nothing.
+//   2. ON  = the CURRENT turn's assistant turns carry their state through
+//      the tool loop, with structure (roles, N:N pairing) untouched.
+//   3. The state never outlives its turn, and never leaves a PARTIAL
+//      history ("early turns carry it, later ones don't" is the mix strict
+//      APIs reject): a new user turn, a model switch and a same-role merge
+//      all drop the whole history's; fold and prune keep the survivors'.
+
+/// An assistant message with one text block, carrying `thinking` (OpenAI
+/// family tag — bare text, nothing opaque).
+fn thinking_assistant(text: &str, thinking: &str) -> Message {
+    let mut m = Message::assistant(vec![Block::Text(text.into())]);
+    m.reasoning = mock::mk_reasoning(crate::provider::REASONING_OPENAI, thinking);
+    m
+}
+
+/// `[user "go"] [tool_use t1] [result] [tool_use t2] [result] [assistant
+/// "done"]` — a two-step tool loop whose every model turn thinks.
+fn carry_agent(cfg: &Config) -> (Agent, Arc<mock::MockState>) {
+    let (prov, state) = MockProvider::new(vec![
+        mock::resp_tool_reasoning(
+            "t1",
+            "echo",
+            json!({}),
+            "first thought",
+            mock::mk_usage(1, 1),
+        ),
+        mock::resp_tool_reasoning(
+            "t2",
+            "echo",
+            json!({}),
+            "second thought",
+            mock::mk_usage(1, 1),
+        ),
+        mock::resp_text("done", mock::mk_usage(1, 1)),
+    ]);
+    let agent = Agent::new(
+        cfg,
+        Box::new(prov),
+        vec![Box::new(EchoTool::new("echo"))],
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    (agent, state)
+}
+
+fn reasoning_of(state: &mock::MockState) -> Vec<Vec<mock::CapturedReasoning>> {
+    state.captured().into_iter().map(|c| c.reasoning).collect()
+}
+
+/// `Some(texts joined by "|")` per message that still carries state.
+fn live_reasoning(msgs: &[Message]) -> Vec<Option<String>> {
+    msgs.iter()
+        .map(|m| {
+            m.reasoning.as_ref().map(|r| {
+                r.blocks
+                    .iter()
+                    .map(|b| b.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+        })
+        .collect()
+}
+
+#[test]
+fn reasoning_carry_off_strips_everything_and_serializes_without_the_key() {
+    // Rule 1. The display feed is untouched (one ThinkingDelta per reply's
+    // reasoning), and nothing else changes: no request carries state, the
+    // history holds none, and it serializes without the key at all.
+    let mut cfg = cfg_with(5, 0, 0);
+    cfg.preserved_reasoning = false;
+    let (mut agent, state) = carry_agent(&cfg);
+    let mut events = Vec::new();
+    let o = agent.run(&mut |e| events.push(e)).unwrap();
+    assert_eq!(o.final_text, "done");
+    let thinking: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ThinkingDelta(t) => Some(t.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(thinking, vec!["first thought", "second thought"]);
+    let carried = reasoning_of(&state);
+    assert_eq!(carried.len(), 3, "three model turns");
+    for (i, c) in carried.iter().enumerate() {
+        assert!(c.is_empty(), "request {i} must carry nothing: {c:?}");
+    }
+    let wire = serde_json::to_string(agent.messages()).unwrap();
+    assert!(
+        !wire.contains("reasoning"),
+        "no `reasoning` key while the switch is off: {wire}"
+    );
+    assert_eq!(agent.messages().len(), 6);
+}
+
+#[test]
+fn reasoning_carry_on_echoes_inside_the_tool_loop() {
+    // Rule 2. Each request carries exactly the assistant turns produced so
+    // far in this turn; the rest of the request is the same as with the
+    // switch off (roles, N:N pairing, reply text, usage).
+    let mut cfg = cfg_with(5, 0, 0);
+    cfg.preserved_reasoning = true;
+    let (mut agent, state) = carry_agent(&cfg);
+    let mut events = Vec::new();
+    let o = agent.run(&mut |e| events.push(e)).unwrap();
+    assert_eq!(o.final_text, "done");
+    assert_eq!((o.input_tokens, o.output_tokens), (3, 3));
+    let cap = state.captured();
+    let first = mock::CapturedReasoning {
+        msg: 1,
+        provider: "openai".into(),
+        blocks: vec![(0, "first thought".into())],
+    };
+    let second = mock::CapturedReasoning {
+        msg: 3,
+        provider: "openai".into(),
+        blocks: vec![(0, "second thought".into())],
+    };
+    assert!(
+        cap[0].reasoning.is_empty(),
+        "nothing before the first reply"
+    );
+    assert_eq!(cap[1].reasoning, vec![first.clone()]);
+    assert_eq!(cap[2].reasoning, vec![first, second]);
+    for c in &cap {
+        assert_eq!(c.tool_use_ids, c.tool_result_ids, "N:N pairing intact");
+    }
+    // The request that produced the final reply: everything but that reply.
+    assert_eq!(
+        cap[2].roles,
+        vec![
+            Role::User,
+            Role::Assistant,
+            Role::User,
+            Role::Assistant,
+            Role::User
+        ]
+    );
+    // Display is the same feed as with the switch off.
+    let thinking: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ThinkingDelta(t) => Some(t.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(thinking, vec!["first thought", "second thought"]);
+    assert_eq!(
+        live_reasoning(agent.messages()),
+        vec![
+            None,
+            Some("first thought".into()),
+            None,
+            Some("second thought".into()),
+            None,
+            None
+        ]
+    );
+}
+
+#[test]
+fn reasoning_carry_ends_at_a_new_user_turn() {
+    // Rule 3a. Inside the turn the state lives; `push_user` opens a new turn
+    // and the WHOLE history drops it — the next request carries none.
+    let mut cfg = cfg_with(5, 0, 0);
+    cfg.preserved_reasoning = true;
+    let (prov, state) = MockProvider::new(vec![
+        mock::resp_tool_reasoning("t1", "echo", json!({}), "thought", None),
+        mock::resp_text("done", None),
+        mock::resp_text("again", None),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(EchoTool::new("echo"))],
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    agent.run(&mut |_| {}).unwrap();
+    assert_eq!(reasoning_of(&state)[1].len(), 1, "kept inside the turn");
+
+    let _ = agent.push_user(vec![Block::Text("next".into())]);
+    // [user "go"] [tool_use] [result] [assistant "done"] [user "next"]
+    assert_eq!(
+        live_reasoning(agent.messages()),
+        vec![None; 5],
+        "a new user turn ends every earlier turn's state"
+    );
+    agent.run(&mut |_| {}).unwrap();
+    let carried = reasoning_of(&state);
+    assert_eq!(carried.len(), 3);
+    assert!(carried[2].is_empty(), "{:?}", carried[2]);
+}
+
+#[test]
+fn reasoning_carry_survives_a_continued_turn() {
+    // The other half of the turn boundary: running again WITHOUT a new user
+    // message (a `/resume` after a failed turn, a host's "continue") is still
+    // the same turn — its state stays, or a thinking model would hit exactly
+    // the "missing thinking block" 400 this feature exists to avoid.
+    let mut cfg = cfg_with(5, 0, 0);
+    cfg.preserved_reasoning = true;
+    let (prov, state) = MockProvider::new(vec![
+        mock::resp_tool_reasoning("t1", "echo", json!({}), "thought", None),
+        mock::resp_text("done", None),
+        mock::resp_text("more", None),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(EchoTool::new("echo"))],
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    agent.run(&mut |_| {}).unwrap();
+    agent.run(&mut |_| {}).unwrap();
+    let carried = reasoning_of(&state);
+    assert_eq!(carried.len(), 3);
+    assert_eq!(
+        carried[2]
+            .iter()
+            .map(|c| (c.msg, c.blocks[0].1.clone()))
+            .collect::<Vec<_>>(),
+        vec![(1, "thought".to_string())],
+        "same turn → the tool loop's state is still echoed"
+    );
+}
+
+#[test]
+fn reasoning_carry_stops_on_a_model_switch() {
+    // Rule 3b. `set_model` may cross vendors; the old provider's blocks are
+    // meaningless (or rejected) on the new wire → whole history dropped.
+    let mut cfg = cfg_with(5, 0, 0);
+    cfg.preserved_reasoning = true;
+    let (prov, state) = MockProvider::new(vec![
+        mock::resp_tool_reasoning("t1", "echo", json!({}), "thought", None),
+        mock::resp_text("done", None),
+        mock::resp_text("more", None),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(EchoTool::new("echo"))],
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    agent.run(&mut |_| {}).unwrap();
+    agent.set_model("other-vendor-model");
+    assert!(agent.messages().iter().all(|m| m.reasoning.is_none()));
+    agent.run(&mut |_| {}).unwrap();
+    let carried = reasoning_of(&state);
+    assert_eq!(carried.len(), 3);
+    assert!(carried[2].is_empty(), "{:?}", carried[2]);
+}
+
+#[test]
+fn reasoning_carry_merge_drops_the_merged_messages_state() {
+    // Rule 3c. Two adjacent assistant messages (a resumed or hand-edited
+    // session) fold into one before the request; two turns' states cannot be
+    // spliced (positions are relative to the old blocks, a signature covers
+    // one turn's block) — whole or nothing, so the merged message gets
+    // nothing. Pinned through the loop's own chokepoint (`normalize_adjacent`
+    // runs inside the request block).
+    let mut cfg = cfg_with(5, 0, 0);
+    cfg.preserved_reasoning = true;
+    let (prov, state) = MockProvider::new(vec![mock::resp_text("ok", None)]);
+    let initial = vec![
+        user_text("q"),
+        thinking_assistant("a", "one"),
+        thinking_assistant("b", "two"),
+    ];
+    let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+    agent.run(&mut |_| {}).unwrap();
+    let cap = state.captured();
+    assert_eq!(
+        cap[0].message_count, 2,
+        "the adjacent assistants merged before the request"
+    );
+    assert!(cap[0].reasoning.is_empty(), "{:?}", cap[0].reasoning);
+}
+
+#[test]
+fn append_user_turn_rules_for_carried_reasoning() {
+    // The two branches of the one entry point: opening a NEW user turn strips
+    // the whole history; folding blocks into a trailing user turn does not
+    // touch anyone's state (that is how a tool-result message keeps the
+    // loop's state alive between tool steps).
+    let mut msgs = vec![user_text("q"), thinking_assistant("a", "one")];
+    append_user_turn(&mut msgs, vec![Block::Text("more".into())]);
+    assert_eq!(msgs.len(), 3);
+    assert_eq!(
+        live_reasoning(&msgs),
+        vec![None, None, None],
+        "new user turn → whole history stripped"
+    );
+
+    let mut msgs = vec![
+        user_text("q"),
+        thinking_assistant("a", "one"),
+        user_text("result"),
+    ];
+    append_user_turn(&mut msgs, vec![Block::Text("x".into())]);
+    assert_eq!(msgs.len(), 3, "merged into the trailing user turn");
+    assert_eq!(live_reasoning(&msgs)[1].as_deref(), Some("one"));
+}
+
+#[test]
+fn fold_summary_keeps_the_survivors_and_drops_the_folded() {
+    // A mid-loop fold: the folded-away messages leave with their state; the
+    // kept tail KEEPS its own — including the assistant tool_use turn the
+    // request is about to be built around.
+    let msgs = vec![
+        user_text("task"),
+        thinking_assistant("a1", "old thought"),
+        user_text("u1"),
+        thinking_assistant("a2", "live thought"),
+        user_text("u2"),
+    ];
+    let out = fold_summary(&msgs, 3, "summary");
+    assert_eq!(out.len(), 3, "head + the 2 tail messages");
+    assert_eq!(
+        live_reasoning(&out),
+        vec![None, Some("live thought".into()), None]
+    );
+    assert!(
+        matches!(&out[1].content[..], [Block::Text(t)] if t == "a2"),
+        "{:?}",
+        out[1].content
+    );
+    assert!(msgs[1].reasoning.is_some(), "pure: the input is untouched");
+}
+
+#[test]
+fn prune_leaves_carried_reasoning_alone() {
+    // The prune only rewrites tool-result text. A reasoning block is
+    // self-contained (its signature covers the block alone), so the
+    // assistant messages keep theirs — rewritten region and protected tail
+    // alike, which is what keeps the history free of the partial mix.
+    let mut msgs = vec![user_text("task")];
+    let mut turn = big_tool_turn("t1", "shell", 30_000);
+    turn[0].reasoning = mock::mk_reasoning(crate::provider::REASONING_OPENAI, "thought");
+    msgs.extend(turn);
+    msgs.push(user_text("u1"));
+    let (pruned, touched, freed) = prune_tool_results(&msgs, 1).expect("prunes");
+    assert_eq!(touched, vec![2]);
+    assert!(freed > 0);
+    assert_eq!(
+        live_reasoning(&pruned),
+        vec![None, Some("thought".into()), None, None]
+    );
+}
+
+#[test]
+fn estimates_count_carried_reasoning() {
+    // It rides on every request of its turn, so both preflight yardsticks
+    // (the legacy chars gate and the token estimate `/context` draws) must
+    // see it — or a reasoning-heavy loop overflows a window the estimate
+    // says is fine.
+    let bare = vec![
+        user_text("q"),
+        Message::assistant(vec![Block::Text("a".repeat(400))]),
+    ];
+    let mut with = bare.clone();
+    with[1].reasoning = mock::mk_reasoning(crate::provider::REASONING_OPENAI, &"t".repeat(800));
+    // 800 chars of text + the opaque payload as it rides on the wire (the
+    // OpenAI family carries none: `{}` is 2 chars).
+    assert_eq!(total_chars(&with).saturating_sub(total_chars(&bare)), 802);
+    assert_eq!(
+        estimate_tokens(&with, None, 0).saturating_sub(estimate_tokens(&bare, None, 0)),
+        200
+    );
+}
+
+#[test]
+fn summary_call_never_sees_carried_reasoning() {
+    // The summary prompt is a rendered transcript in ONE user message, so
+    // the compression request carries no state and the scratchpad text never
+    // reaches the transcript render — while the main turn after the fold
+    // still carries whatever survived it (here: nothing, the thinking turn
+    // was folded away).
+    let mut cfg = cfg_with(5, 0, 30);
+    cfg.preserved_reasoning = true;
+    cfg.limits.keep_recent_messages = 2;
+    let initial = vec![
+        user_text(&"x".repeat(40)),
+        thinking_assistant("a1", "secret scratchpad"),
+        user_text("u1"),
+        Message::assistant(vec![Block::Text("a2".into())]),
+        user_text("u2"),
+    ];
+    let (prov, state) = MockProvider::new(vec![
+        mock::resp_text("SUMMARY", None),
+        mock::resp_text("final answer", None),
+    ]);
+    let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+    let mut events = Vec::new();
+    agent.run(&mut |e| events.push(e)).unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Compressed { .. })),
+        "compression must actually fire for this test to mean anything"
+    );
+    let cap = state.captured();
+    assert_eq!(cap.len(), 2, "summary + main");
+    assert_eq!(
+        cap[0].message_count, 1,
+        "the summary call is one user message"
+    );
+    assert!(cap[0].reasoning.is_empty());
+    let transcript = cap[0].user_texts.join("\n");
+    assert!(transcript.contains("a1"), "the reply text is summarized");
+    assert!(
+        !transcript.contains("secret scratchpad"),
+        "the scratchpad is never rendered into the transcript"
+    );
+    assert!(cap[1].reasoning.is_empty(), "the thinking turn was folded");
+}
+
+#[test]
+fn carry_off_strips_state_from_a_restored_history() {
+    // A session written while the switch was on, resumed with it off: the
+    // state must not leak into any request (the agent is the single gate —
+    // construction strips it, so no later path has to remember).
+    let (prov, state) = MockProvider::new(vec![mock::resp_text("ok", None)]);
+    let initial = vec![user_text("q"), thinking_assistant("a", "leftover")];
+    let mut cfg = cfg_with(5, 0, 0);
+    cfg.preserved_reasoning = false;
+    let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+    assert_eq!(live_reasoning(agent.messages()), vec![None, None]);
+    agent.run(&mut |_| {}).unwrap();
+    assert!(reasoning_of(&state)[0].is_empty());
+}
+
+#[test]
+fn carry_on_is_the_default_so_a_restored_history_keeps_its_state() {
+    // The same session resumed WITHOUT naming the switch (the default since
+    // 2026-11-26) behaves exactly like the explicit-on case below — the
+    // default must not depend on the config file mentioning the key.
+    let (prov, state) = MockProvider::new(vec![mock::resp_text("ok", None)]);
+    let initial = vec![user_text("q"), thinking_assistant("a", "leftover")];
+    let mut agent = Agent::new(
+        &cfg_with(5, 0, 0),
+        Box::new(prov),
+        vec![],
+        initial,
+        test_ctx(),
+    );
+    assert_eq!(
+        live_reasoning(agent.messages()),
+        vec![None, Some("leftover".to_string())]
+    );
+    agent.run(&mut |_| {}).unwrap();
+    assert_eq!(reasoning_of(&state)[0][0].blocks[0].1, "leftover");
+}
+
+#[test]
+fn carry_on_keeps_a_restored_history_until_its_turn_ends() {
+    // The same session resumed with the switch on is a continued turn
+    // (a crash mid-tool-loop, `--resume`): its state is exactly what the
+    // next request needs.
+    let mut cfg = cfg_with(5, 0, 0);
+    cfg.preserved_reasoning = true;
+    let (prov, state) = MockProvider::new(vec![mock::resp_text("ok", None)]);
+    let initial = vec![user_text("q"), thinking_assistant("a", "resumed")];
+    let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+    agent.run(&mut |_| {}).unwrap();
+    let carried = reasoning_of(&state);
+    assert_eq!(carried[0].len(), 1);
+    assert_eq!(carried[0][0].blocks[0].1, "resumed");
+}
+
+#[test]
+fn archived_originals_never_carry_reasoning() {
+    // A fold archives the folded messages' originals for host-side
+    // undo/audit — as CONTENT. The scratchpad has no audit value, nothing
+    // will ever echo an archived message again, and it must not outlive its
+    // use in a session file. An archive handed back in (a hand-edited file)
+    // is stripped the same way.
+    let mut cfg = cfg_with(5, 0, 0);
+    cfg.preserved_reasoning = true;
+    cfg.limits.keep_recent_messages = 2;
+    let dir = std::env::temp_dir().join(format!("ta-archrsn-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("s.json");
+    let initial = vec![
+        user_text("task"),
+        thinking_assistant("a1", "private scratchpad"),
+        user_text("u1"),
+        Message::assistant(vec![Block::Text("a2".into())]),
+        user_text("u2"),
+    ];
+    let (prov, _state) = MockProvider::new(vec![mock::resp_text("SUMMARY", None)]);
+    let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+    agent.enable_session(path.clone());
+    let o = agent.compact(&mut |_| {}).unwrap().expect("folds");
+    assert_eq!(o.dropped, 2);
+    let (_, live, archive) = crate::session::load_with_archive(&path)
+        .unwrap()
+        .expect("session written");
+    assert_eq!(archive.len(), 2);
+    assert!(archive.iter().all(|m| m.reasoning.is_none()));
+    // The surviving tail of the same turn keeps its own (none here: a2 is a
+    // plain reply) — archive and live history are decided independently.
+    assert_eq!(live.len(), 3);
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !raw.contains("private scratchpad"),
+        "the scratchpad must not reach the session file's archive"
+    );
+    assert!(archive
+        .iter()
+        .any(|m| matches!(&m.content[0], Block::Text(t) if t == "a1")));
+
+    agent.set_session_archive(vec![thinking_assistant("x", "smuggled in")]);
+    assert!(
+        agent.session_archive.iter().all(|m| m.reasoning.is_none()),
+        "a restored archive is stripped too"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn reasoning_only_reply_is_still_an_empty_reply() {
+    // A reply that only thought (budget spent on reasoning, no block) is
+    // `blocks == []` for every shape rule — salvage fires on it exactly as
+    // before (nudge, then a real answer), and the orphan state dies with the
+    // reply that never entered history, switch on or not (nothing stored →
+    // nothing to echo). The nudge merges into the trailing user turn, so it
+    // is not a new turn and strips nothing.
+    let mut cfg = cfg_with(5, 0, 0);
+    cfg.preserved_reasoning = true;
+    let (prov, state) = MockProvider::new(vec![
+        MockTurn::Ok(ChatResponse {
+            reasoning: mock::mk_reasoning(crate::provider::REASONING_OPENAI, "all budget"),
+            blocks: vec![],
+            stop_reason: "max_tokens".into(),
+            usage: None,
+        }),
+        mock::resp_text("answer", None),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o.stop_reason, "end_turn");
+    assert_eq!(o.final_text, "answer");
+    let cap = state.captured();
+    assert_eq!(cap.len(), 2);
+    assert!(cap[1].reasoning.is_empty());
+    assert_eq!(
+        live_reasoning(agent.messages()),
+        vec![None, None],
+        "user (+ the folded nudge) and the answer — no reasoning anywhere"
+    );
+}
+
+// ── `Usage.reasoning_tokens` on the bill ─────────────────────────────────
+//
+// The reasoning split is a subset OF `output_tokens`: it is summed wherever
+// that axis is summed (so the bill can say how much of the output was
+// thinking) and never added to `total()` (the same tokens would be billed
+// twice). Sparse in every serialization: a result that reported none is
+// byte-identical to one written before the field existed.
+
+/// Scripted usage with a reasoning split (`think` of the `o` output tokens).
+fn usage_think(i: u64, o: u64, think: u64) -> Option<Usage> {
+    let mut u = mock::mk_usage(i, o).expect("mk_usage always returns Some");
+    u.reasoning_tokens = think;
+    Some(u)
+}
+
+/// Through the loop: one `Usage` event per request carrying that request's
+/// own split, the failed attempt's split leaving through `RunError`, and
+/// `RunCost::add_failed` / `fold_into` summing it into `RunOutcome`.
+#[test]
+fn reasoning_tokens_reach_the_bill_through_every_fold() {
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, _state) = MockProvider::new(vec![
+        // Attempt 1, turn 1: a tool turn billed with 3 thinking tokens …
+        mock::resp_tool("t1", "echo", json!({}), usage_think(100, 10, 3)),
+        // … then a transient error: the attempt's cost leaves via RunError.
+        MockTurn::Err("503 transient".into()),
+        // Attempt 2: two clean turns.
+        mock::resp_tool("t2", "echo", json!({}), usage_think(70, 8, 4)),
+        mock::resp_text("done", usage_think(50, 5, 5)),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(EchoTool::new("echo"))],
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    let mut events = Vec::new();
+    let mut acc = RunCost::default();
+    let mut o = match agent.run(&mut |e| events.push(e)) {
+        Ok(o) => o,
+        Err(re) => {
+            assert_eq!(
+                re.usage.reasoning_tokens, 3,
+                "the failed attempt's thinking is billed"
+            );
+            acc.add_failed(&re);
+            events.clear();
+            agent
+                .run(&mut |e| events.push(e))
+                .expect("attempt 2 succeeds")
+        }
+    };
+    let splits: Vec<(u64, u64, u64, bool)> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Usage {
+                input_tokens,
+                output_tokens,
+                reasoning_tokens,
+                tool_folded,
+                ..
+            } => Some((
+                *input_tokens,
+                *output_tokens,
+                *reasoning_tokens,
+                *tool_folded,
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        splits,
+        vec![(70, 8, 4, false), (50, 5, 5, false)],
+        "one event per request, each with its own split"
+    );
+    assert_eq!(acc.usage.reasoning_tokens, 3);
+    assert_eq!(
+        o.reasoning_tokens, 9,
+        "the successful attempt's own requests"
+    );
+    acc.fold_into(&mut o);
+    assert_eq!(
+        o.reasoning_tokens, 12,
+        "the failed attempt's thinking folds in"
+    );
+    // Sparse serialization: present when non-zero …
+    let v = serde_json::to_value(&o).unwrap();
+    assert_eq!(v["reasoning_tokens"], 12);
+    assert_eq!(v["output_tokens"], 23, "the axis it is a split of");
+    // … and saturating, like every other fold.
+    let full = RunError {
+        source: anyhow::anyhow!("boom"),
+        usage: Usage {
+            reasoning_tokens: u64::MAX,
+            ..Usage::default()
+        },
+        tool_calls: vec![],
+        compressions: vec![],
+        turns: 1,
+        arbitrations_used: 0,
+        gateway_fixes: Default::default(),
+        elapsed: Duration::ZERO,
+    };
+    acc.add_failed(&full);
+    acc.add_failed(&full);
+    assert_eq!(acc.usage.reasoning_tokens, u64::MAX);
+    acc.fold_into(&mut o);
+    assert_eq!(o.reasoning_tokens, u64::MAX, "never wraps to a small bill");
+
+    // A provider that reports no split: 0, and the key is absent (not null) —
+    // a non-reasoning model's result.json is byte-identical to before.
+    let (prov, _) = MockProvider::new(vec![mock::resp_text("done", mock::mk_usage(50, 5))]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o.reasoning_tokens, 0);
+    let v = serde_json::to_value(&o).unwrap();
+    assert!(
+        v.get("reasoning_tokens").is_none(),
+        "zero must leave the key out: {v}"
+    );
+}
+
+/// The split is NOT a fifth axis: the fleet counter (`Usage::total`) bills
+/// the output tokens once, whatever part of them was thinking.
+#[test]
+fn reasoning_tokens_never_double_bill_the_budget_counter() {
+    let mut cfg = cfg_with(5, 0, 0);
+    // > 0 makes the run install the real fleet counter (read back below).
+    cfg.limits.max_total_tokens = 1_000_000;
+    let (prov, _) = MockProvider::new(vec![
+        mock::resp_tool("t1", "echo", json!({}), usage_think(70, 8, 4)),
+        mock::resp_text("done", usage_think(50, 5, 5)),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(EchoTool::new("echo"))],
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o.reasoning_tokens, 9);
+    let used = agent
+        .ctx
+        .budget
+        .as_ref()
+        .expect("fleet counter installed by the top-level run")
+        .used
+        .load(Ordering::Relaxed);
+    assert_eq!(
+        used,
+        (70 + 8) + (50 + 5),
+        "the counter bills in + out once, without the split"
+    );
+}
+
+/// `compress::merge_usage` — the summary-call accumulator's fold — sums the
+/// split like any axis; one absent side keeps the other's.
+#[test]
+fn merge_usage_sums_the_reasoning_split() {
+    let both = merge_usage(
+        Some(usage_think(10, 6, 4).unwrap()),
+        Some(usage_think(5, 3, 2).unwrap()),
+    )
+    .unwrap();
+    assert_eq!(
+        (both.input_tokens, both.output_tokens, both.reasoning_tokens),
+        (15, 9, 6)
+    );
+    assert_eq!(
+        merge_usage(None, Some(usage_think(5, 3, 2).unwrap()))
+            .unwrap()
+            .reasoning_tokens,
+        2
+    );
+    assert!(merge_usage(None, None).is_none());
+}
+
+/// The worker-thread probe (the only channel that survives a worker panic)
+/// carries the split too — without this fold a panicked parallel worker's
+/// thinking died with its thread while its other axes were recovered.
+#[test]
+fn usage_probe_carries_the_reasoning_split() {
+    let probe = Arc::new(Mutex::new(Usage::default()));
+    crate::usage_probe::install(probe.clone());
+    crate::usage_probe::record(&usage_think(10, 6, 4).unwrap());
+    crate::usage_probe::record(&usage_think(1, 1, u64::MAX).unwrap());
+    let got = crate::usage_probe::read(&probe);
+    assert_eq!((got.input_tokens, got.output_tokens), (11, 7));
+    assert_eq!(got.reasoning_tokens, u64::MAX, "saturates, never wraps");
+    // `total()` stays the four axes: the split is not added on top.
+    assert_eq!(got.total(), 18);
+    // A report with nothing billed is not recorded at all (same gate as the
+    // axes) — the split alone cannot make a usage "billed".
+    crate::usage_probe::record(&Usage {
+        reasoning_tokens: 9,
+        ..Usage::default()
+    });
+    assert_eq!(crate::usage_probe::read(&probe).reasoning_tokens, u64::MAX);
+}
+
+// ── Model-window diagnostics (`max_tokens` vs. thinking) ─────────────────
+
+/// Run `script` once against an empty toolset while trapping the diag
+/// channel (process-global sink, hence `TEST_LOCK`). Returns the run's stop
+/// reason and how many "truncated while reasoning" hints were printed.
+fn run_truncation_hint(script: Vec<MockTurn>) -> (String, usize) {
+    let got = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink = Arc::clone(&got);
+    let _guard = crate::diag::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    crate::diag::install_diag_sink(Box::new(move |level, msg| {
+        if level == crate::diag::DiagLevel::Warn {
+            sink.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(msg.to_string());
+        }
+    }));
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, _) = MockProvider::new(script);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    let stop = match agent.run(&mut |_| {}) {
+        Ok(o) => o.stop_reason,
+        Err(_) => "error".into(),
+    };
+    crate::diag::clear_diag_sink();
+    let hints = got
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|m| m.contains("[context]") && m.contains("max_tokens") && m.contains("reasoning"))
+        .count();
+    (stop, hints)
+}
+
+/// A reply cut off at `max_tokens` while the model was reasoning: reasoning
+/// tokens count against the same output budget, so the fix is a larger
+/// `max_tokens` (or a lower effort). Said on the diag channel — advice for
+/// the operator, not a run fact — and ONCE per run, however many turns hit
+/// the wall (the first truncation is salvaged with a wrap-up nudge, the
+/// second ends the run).
+#[test]
+fn truncation_while_thinking_hints_once_per_run() {
+    let cut = |text: &str| {
+        let MockTurn::Ok(mut resp) = mock::resp_text(text, None) else {
+            unreachable!("resp_text always builds a MockTurn::Ok")
+        };
+        resp.stop_reason = "max_tokens".into();
+        resp.reasoning = mock::mk_reasoning(crate::provider::REASONING_OPENAI, "thinking hard");
+        MockTurn::Ok(resp)
+    };
+    let (stop, hints) = run_truncation_hint(vec![cut("cut off mid-"), cut("still cut")]);
+    assert_eq!(stop, "max_tokens");
+    assert_eq!(hints, 1, "once per run, not once per truncated turn");
+}
+
+/// Only the combination speaks: a truncation without reasoning is the
+/// ordinary `max_tokens` case (it already has its own salvage event), and
+/// reasoning that fits is not a problem at all.
+#[test]
+fn no_hint_for_a_plain_truncation_or_for_thinking_that_fits() {
+    let mut plain = mock::resp_text("cut off", None);
+    if let MockTurn::Ok(ref mut r) = plain {
+        r.stop_reason = "max_tokens".into();
+    }
+    let (stop, hints) = run_truncation_hint(vec![plain, mock::resp_text("wrapped up", None)]);
+    assert_eq!(stop, "end_turn");
+    assert_eq!(hints, 0, "truncation without thinking: no hint");
+
+    let (stop, hints) = run_truncation_hint(vec![
+        mock::resp_tool_reasoning("t1", "noop", json!({}), "brief thought", None),
+        mock::resp_text("done", None),
+    ]);
+    assert_eq!(stop, "end_turn");
+    assert_eq!(hints, 0, "thinking that fits: no hint");
+}
+
+// ── MCP annotation side table ─────────────────────────────────────────────
+//
+// `ToolCtx::tool_annotations` is DERIVED from the tool list — at construction
+// (`Agent::try_new`) and again on every mutation (`refresh_tool_defs`) — and
+// each call record snapshots the entry, so the audit says what the SERVER
+// claimed about a tool without re-attaching the server.
+
+/// Adding, removing and re-adding a tool all land in the side table: a hook
+/// or a record never reads a removed server's declaration, and learns a
+/// freshly attached one's without any rebuild by the host.
+#[test]
+fn refresh_tool_defs_rebuilds_the_annotation_side_table() {
+    use crate::tools::ToolAnnotations;
+    let ro = ToolAnnotations {
+        read_only_hint: true,
+        ..ToolAnnotations::MISSING
+    };
+    let rw = ToolAnnotations {
+        read_only_hint: false,
+        destructive_hint: true,
+        idempotent_hint: Some(false),
+        open_world_hint: false,
+    };
+    let cfg = cfg_with(5, 0, 0);
+    let (prov, _) = MockProvider::new(vec![]);
+    let tools: Vec<Box<dyn Tool>> = vec![
+        Box::new(EchoTool::new("shell")),
+        Box::new(FakeMcpTool {
+            server: "db".into(),
+            name: "mcp_db_query".into(),
+            hints: Some(ro),
+        }),
+    ];
+    // The ctx carries an EMPTY table (`test_ctx`): construction derives the
+    // real one from the list, so a hand-built agent cannot get this wrong.
+    assert!(test_ctx().tool_annotations.is_empty());
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        tools,
+        vec![user_text("hi")],
+        test_ctx(),
+    );
+    assert_eq!(agent.ctx.annotations("mcp_db_query"), Some(&ro));
+    assert_eq!(
+        agent.ctx.annotations("shell"),
+        None,
+        "built-ins declare nothing"
+    );
+
+    // Hot-remove prunes the server's entries …
+    assert_eq!(agent.remove_mcp_server("db").unwrap(), 1);
+    assert!(agent.ctx.annotations("mcp_db_query").is_none());
+    assert!(agent.ctx.tool_annotations.is_empty());
+
+    // … and the same rebuild path (MCP hot add, the run_code gate flip)
+    // picks a freshly pushed tool up — the entry is the NEW tool's, not a
+    // stale copy of the old one.
+    agent.tools.push(Box::new(FakeMcpTool {
+        server: "db".into(),
+        name: "mcp_db_query".into(),
+        hints: Some(rw),
+    }));
+    agent.refresh_tool_defs();
+    assert_eq!(agent.ctx.annotations("mcp_db_query"), Some(&rw));
+    // A tool that declares nothing joins the list without joining the table.
+    agent.tools.push(Box::new(EchoTool::new("plain")));
+    agent.refresh_tool_defs();
+    assert_eq!(agent.tool_names().len(), 3);
+    assert_eq!(agent.ctx.tool_annotations.len(), 1);
+    assert_eq!(agent.ctx.annotations("plain"), None);
+}
+
+/// Records, for every gated call, what the side table said about the tool at
+/// gate time — the value a policy hook reads to decide.
+#[derive(Default)]
+struct AnnotationProbe {
+    seen: Mutex<Vec<(String, Option<crate::tools::ToolAnnotations>)>>,
+    deny: Option<String>,
+}
+impl Hooks for AnnotationProbe {
+    fn before_tool(&self, tool: &str, _input: &Value, ctx: &ToolCtx) -> ToolDecision {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((tool.to_string(), ctx.annotations(tool).copied()));
+        if self.deny.as_deref() == Some(tool) {
+            ToolDecision::Deny("declared destructive".into())
+        } else {
+            ToolDecision::Allow
+        }
+    }
+}
+
+/// Every call record snapshots what the server declared about the tool
+/// (`tool_calls[].annotations`) — run, refused, or never started alike — a
+/// built-in's record stays byte-identical, and the `before_tool` gate reads
+/// the very same table.
+#[test]
+fn call_records_snapshot_what_the_server_declared() {
+    use crate::tools::ToolAnnotations;
+    let hints = ToolAnnotations {
+        read_only_hint: true,
+        destructive_hint: false,
+        idempotent_hint: Some(true),
+        open_world_hint: false,
+    };
+    let cfg = cfg_with(5, 0, 0);
+    let tools = || -> Vec<Box<dyn Tool>> {
+        vec![
+            Box::new(FakeMcpTool {
+                server: "db".into(),
+                name: "mcp_db_query".into(),
+                hints: Some(hints),
+            }),
+            Box::new(EchoTool::new("echo")),
+        ]
+    };
+    let (prov, _) = MockProvider::new(vec![
+        MockTurn::Ok(ChatResponse {
+            reasoning: None,
+            blocks: vec![
+                Block::ToolUse {
+                    id: "a".into(),
+                    name: "mcp_db_query".into(),
+                    input: json!({}),
+                },
+                Block::ToolUse {
+                    id: "b".into(),
+                    name: "echo".into(),
+                    input: json!({}),
+                },
+            ],
+            stop_reason: "tool_use".into(),
+            usage: None,
+        }),
+        mock::resp_text("done", None),
+    ]);
+    let probe = Arc::new(AnnotationProbe::default());
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        tools(),
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    agent.set_hooks(probe.clone());
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o.tool_calls.len(), 2);
+    // The record carries the declaration …
+    assert!(!o.tool_calls[0].is_error);
+    assert_eq!(o.tool_calls[0].annotations, Some(hints));
+    // … and a built-in's record stays byte-identical (key absent).
+    assert_eq!(o.tool_calls[1].annotations, None);
+    let v = serde_json::to_value(&o).unwrap();
+    assert_eq!(v["tool_calls"][0]["annotations"]["read_only_hint"], true);
+    assert_eq!(v["tool_calls"][0]["annotations"]["destructive_hint"], false);
+    assert_eq!(v["tool_calls"][0]["annotations"]["idempotent_hint"], true);
+    assert!(
+        v["tool_calls"][1].get("annotations").is_none(),
+        "{}",
+        v["tool_calls"][1]
+    );
+    // The gate read the same table, in block order.
+    assert_eq!(
+        *probe.seen.lock().unwrap(),
+        vec![
+            ("mcp_db_query".to_string(), Some(hints)),
+            ("echo".to_string(), None)
+        ]
+    );
+
+    // A refused call still gets its record — with the declaration it was
+    // refused against, which is the whole point of keeping it.
+    let (prov, _) = MockProvider::new(vec![
+        mock::resp_tool("d1", "mcp_db_query", json!({"cmd": "drop"}), None),
+        mock::resp_text("done", None),
+    ]);
+    let probe = Arc::new(AnnotationProbe {
+        seen: Mutex::new(Vec::new()),
+        deny: Some("mcp_db_query".into()),
+    });
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        tools(),
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    agent.set_hooks(probe);
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o.tool_calls.len(), 1);
+    let rec = &o.tool_calls[0];
+    assert!(rec.is_error);
+    assert_eq!(rec.duration_ms, None, "never executed");
+    assert_eq!(rec.annotations, Some(hints));
+    assert_eq!(rec.output, "declared destructive");
+}
+
+// ── Hooks::on_before_compact ──────────────────────────────────────────────
+
+/// First text / tool-result content of a message ("" when it has neither).
+fn compact_text_of(m: &Message) -> String {
+    m.content
+        .iter()
+        .find_map(|b| match b {
+            Block::Text(t) => Some(t.clone()),
+            Block::ToolResult { content, .. } => Some(content.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// What one `on_before_compact` call saw, reduced to owned data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompactSeen {
+    trigger: CompressTrigger,
+    subagent: Option<String>,
+    dropped: usize,
+    dropped_chars: usize,
+    todo: Option<String>,
+    /// (role, first text / tool-result content, id) of every folded
+    /// message, in history order.
+    folding: Vec<(Role, String, Option<String>)>,
+}
+
+/// Records every `on_before_compact` call. `log` is shared with the test's
+/// event closure (`note`), so hook-vs-event order is provable.
+struct CompactProbe {
+    seen: Mutex<Vec<CompactSeen>>,
+    log: Mutex<Vec<String>>,
+    /// The 1-based call index that panics instead of recording.
+    panic_at: Option<usize>,
+}
+
+impl CompactProbe {
+    fn with_panic_at(panic_at: Option<usize>) -> Arc<Self> {
+        Arc::new(Self {
+            seen: Mutex::new(Vec::new()),
+            log: Mutex::new(Vec::new()),
+            panic_at,
+        })
+    }
+    fn new() -> Arc<Self> {
+        Self::with_panic_at(None)
+    }
+    fn snapshot(&self) -> Vec<CompactSeen> {
+        self.seen.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+    fn note(&self, what: &str) {
+        self.log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(what.to_string());
+    }
+    fn log(&self) -> Vec<String> {
+        self.log.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+impl Hooks for CompactProbe {
+    fn on_before_compact(&self, info: &crate::hooks::CompactionInfo) {
+        self.note("hook");
+        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        if self.panic_at == Some(seen.len() + 1) {
+            panic!("hook boom");
+        }
+        seen.push(CompactSeen {
+            trigger: info.trigger,
+            subagent: info.subagent.map(str::to_string),
+            dropped: info.dropped,
+            dropped_chars: info.dropped_chars,
+            todo: info.todo.clone(),
+            folding: info
+                .folding
+                .iter()
+                .map(|m| (m.role, compact_text_of(m), m.id.clone()))
+                .collect(),
+        });
+    }
+}
+
+/// The five-message history every probe test folds: user head, two
+/// (assistant, user) turns, user tail. With `keep_recent_messages = 2` the
+/// middle pair (a1, u1) is dropped and three messages stay live.
+fn five_message_history() -> Vec<Message> {
+    vec![
+        user_text("task"),
+        Message::assistant(vec![Block::Text("a1".into())]),
+        user_text("u1"),
+        Message::assistant(vec![Block::Text("a2".into())]),
+        user_text("u2"),
+    ]
+}
+
+/// A layer that overrides nothing — the default `on_before_compact` in place.
+struct NoopHooks;
+impl Hooks for NoopHooks {}
+
+#[test]
+fn before_compact_hook_fires_once_on_every_trigger_path() {
+    // The hook contract: exactly one call per fold, on all three paths that
+    // fold (host-initiated, preflight estimate, overflow recovery). It sees
+    // the trigger, EXACTLY the messages about to be dropped (with their
+    // stable ids — the same ids the `Compressed` event reports as
+    // `folded_ids`), their char size under the core's own yardstick, and it
+    // runs BEFORE the event — while the originals are still live.
+    let mut cfg = cfg_with(5, 0, 0);
+    cfg.limits.keep_recent_messages = 2;
+
+    // (a) the host's idle-time compact
+    let (prov, _) = MockProvider::new(vec![mock::resp_text("SUMMARY", None)]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        five_message_history(),
+        test_ctx(),
+    );
+    // What the hook must see, read off the live history BEFORE the fold
+    // (ids exactly as the ingest point minted them).
+    let middle = agent.messages()[1..3].to_vec();
+    let middle_chars = total_chars(&middle);
+    let expect_folding: Vec<(Role, String, Option<String>)> = middle
+        .iter()
+        .map(|m| (m.role, compact_text_of(m), m.id.clone()))
+        .collect();
+    let expect_ids: Vec<String> = middle.iter().filter_map(|m| m.id.clone()).collect();
+    assert_eq!(expect_ids.len(), 2, "the ingest point minted both ids");
+    let probe = CompactProbe::new();
+    agent.set_hooks(probe.clone());
+    let mut seen_folded_ids = Vec::<String>::new();
+    let o = {
+        let mut on_event = |e: AgentEvent| {
+            if let AgentEvent::Compressed { folded_ids, .. } = e {
+                probe.note("compressed");
+                seen_folded_ids.extend(folded_ids);
+            }
+        };
+        agent
+            .compact(&mut on_event)
+            .unwrap()
+            .expect("five messages have a safe cut")
+    };
+    let seen = probe.snapshot();
+    assert_eq!(seen.len(), 1, "exactly once per fold: {seen:?}");
+    assert_eq!(seen[0].trigger, CompressTrigger::Manual);
+    assert_eq!(seen[0].subagent, None, "the top-level agent's history");
+    assert_eq!(seen[0].dropped, 2);
+    assert_eq!(
+        seen[0].dropped, o.dropped,
+        "same number the outcome reports"
+    );
+    assert_eq!(seen[0].dropped_chars, middle_chars);
+    assert_eq!(seen[0].todo, None, "no todo call in this history");
+    assert_eq!(
+        seen[0].folding, expect_folding,
+        "exactly the dropped middle"
+    );
+    assert_eq!(
+        probe.log(),
+        ["hook", "compressed"],
+        "the hook sees the originals before the fold reports"
+    );
+    assert_eq!(
+        seen_folded_ids, expect_ids,
+        "the hook saw the very originals the outcome reports as folded"
+    );
+    assert_eq!(agent.messages().len(), 3, "…and they left the live history");
+
+    // (b) the run loop's preflight path (char threshold tripped at turn top)
+    let mut pre = cfg.clone();
+    pre.limits.compress_threshold_chars = 10;
+    let (prov, _) = MockProvider::new(vec![
+        mock::resp_text("SUMMARY", None), // summarize_prefix
+        mock::resp_text("final answer", None),
+    ]);
+    let mut agent = Agent::new(
+        &pre,
+        Box::new(prov),
+        vec![],
+        five_message_history(),
+        test_ctx(),
+    );
+    let probe = CompactProbe::new();
+    agent.set_hooks(probe.clone());
+    agent.run(&mut |_| {}).unwrap();
+    let seen = probe.snapshot();
+    assert_eq!(seen.len(), 1, "exactly once per preflight fold: {seen:?}");
+    assert_eq!(seen[0].trigger, CompressTrigger::Preflight);
+    assert_eq!(seen[0].dropped, 2);
+    assert_eq!(seen[0].folding, expect_folding);
+
+    // (c) overflow recovery (the provider rejected the request)
+    let (prov, _) = MockProvider::new(vec![
+        MockTurn::Err("mock: maximum context length exceeded".into()),
+        mock::resp_text("SUMMARY", None), // forced compression call
+        mock::resp_text("final answer", None),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        five_message_history(),
+        test_ctx(),
+    );
+    let probe = CompactProbe::new();
+    agent.set_hooks(probe.clone());
+    agent.run(&mut |_| {}).unwrap();
+    let seen = probe.snapshot();
+    assert_eq!(seen.len(), 1, "exactly once per overflow fold: {seen:?}");
+    assert_eq!(seen[0].trigger, CompressTrigger::Overflow);
+    assert_eq!(seen[0].dropped, 2);
+    assert_eq!(seen[0].folding, expect_folding);
+}
+
+#[test]
+fn before_compact_hook_sees_the_todo_checklist_in_the_folded_middle() {
+    // Plan state is what a summary is most likely to blur, so the checklist
+    // rides the info — here from a todo turn that is itself being folded
+    // (the core re-attaches it to the folded head right after).
+    let mut cfg = cfg_with(5, 0, 0);
+    cfg.limits.keep_recent_messages = 2;
+    let checklist = "[x] step one\n[ ] step two";
+    let mut history = vec![user_text("task")];
+    history.extend(todo_turn("t1", checklist));
+    history.push(user_text("u1"));
+    history.push(Message::assistant(vec![Block::Text("a2".into())]));
+    history.push(user_text("u2"));
+    let (prov, _) = MockProvider::new(vec![mock::resp_text("SUMMARY", None)]);
+    let mut agent = Agent::new(&cfg, Box::new(prov), vec![], history, test_ctx());
+    let probe = CompactProbe::new();
+    agent.set_hooks(probe.clone());
+    let o = agent.compact(&mut |_| {}).unwrap().expect("safe cut");
+    assert_eq!(o.dropped, 3, "tool_use + tool_result + u1");
+    let seen = probe.snapshot();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].todo.as_deref(), Some(checklist));
+    assert_eq!(
+        seen[0].folding[1].1, checklist,
+        "the todo result is among the folded originals"
+    );
+    assert!(
+        agent.messages()[0]
+            .content
+            .iter()
+            .any(|b| matches!(b, Block::Text(t) if t.contains("step two"))),
+        "…and the core restored it to the folded head"
+    );
+}
+
+#[test]
+fn before_compact_hook_panic_does_not_cost_the_fold() {
+    // The summary is already billed when the hook runs, so a broken
+    // observer must not lose the fold: the panic is swallowed, ONE diag_warn
+    // reports it (with the panic's message), and history/event/outcome look
+    // exactly like a clean fold.
+    let got = Arc::new(Mutex::new(Vec::<(crate::diag::DiagLevel, String)>::new()));
+    let sink = Arc::clone(&got);
+    let _guard = crate::diag::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    crate::diag::install_diag_sink(Box::new(move |level, msg| {
+        sink.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((level, msg.to_string()));
+    }));
+    let mut cfg = cfg_with(5, 0, 0);
+    cfg.limits.keep_recent_messages = 2;
+    let (prov, state) = MockProvider::new(vec![mock::resp_text("SUMMARY", None)]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        five_message_history(),
+        test_ctx(),
+    );
+    let probe = CompactProbe::with_panic_at(Some(1));
+    agent.set_hooks(probe.clone());
+    let mut events = Vec::new();
+    let o = agent
+        .compact(&mut |e| events.push(e))
+        .unwrap()
+        .expect("the fold still happens");
+    crate::diag::clear_diag_sink();
+    assert_eq!(o.dropped, 2, "the fold happened despite the panic");
+    assert_eq!(o.kept, 3);
+    assert_eq!(agent.messages().len(), 3);
+    assert_eq!(state.calls(), 1, "no retry of the summary call");
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::Compressed { dropped: 2, .. })));
+    assert!(
+        probe.snapshot().is_empty(),
+        "the panicking call recorded nothing"
+    );
+    let lines = got.lock().unwrap_or_else(|e| e.into_inner());
+    let reported: Vec<&(crate::diag::DiagLevel, String)> = lines
+        .iter()
+        .filter(|(_, l)| l.contains("on_before_compact hook panicked"))
+        .collect();
+    assert_eq!(
+        reported.len(),
+        1,
+        "one diag line, not one per message: {lines:?}"
+    );
+    assert_eq!(reported[0].0, crate::diag::DiagLevel::Warn);
+    assert!(
+        reported[0].1.contains("hook boom"),
+        "the panic's own message rides the diag line: {reported:?}"
+    );
+}
+
+#[test]
+fn before_compact_hook_is_silent_whenever_nothing_folds() {
+    // "Once per fold" has a converse: no fold, no call. Not when there is no
+    // safe cut, not when the summary request fails, not when it comes back
+    // empty (the degenerate billed pass), and not when the cheap prune alone
+    // relieved the pressure — none of them moves a message out of history
+    // by way of a summary.
+    let mut cfg = cfg_with(5, 0, 0);
+    cfg.limits.keep_recent_messages = 2;
+
+    // (a) no safe cut: two messages cannot keep two AND drop one
+    let (prov, _) = MockProvider::new(vec![]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        vec![
+            user_text("task"),
+            Message::assistant(vec![Block::Text("a1".into())]),
+        ],
+        test_ctx(),
+    );
+    let probe = CompactProbe::new();
+    agent.set_hooks(probe.clone());
+    assert!(agent.compact(&mut |_| {}).unwrap().is_none());
+    assert!(probe.snapshot().is_empty(), "no cut → no call");
+
+    // (b) the summary request fails
+    let (prov, _) = MockProvider::new(vec![MockTurn::Err("mock: provider down".into())]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        five_message_history(),
+        test_ctx(),
+    );
+    let probe = CompactProbe::new();
+    agent.set_hooks(probe.clone());
+    assert!(agent.compact(&mut |_| {}).is_err());
+    assert_eq!(agent.messages().len(), 5, "nothing folded");
+    assert!(probe.snapshot().is_empty(), "failed summary → no call");
+
+    // (c) the summary comes back empty (billed, nothing folded)
+    let (prov, _) = MockProvider::new(vec![mock::resp_text("   ", None)]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        five_message_history(),
+        test_ctx(),
+    );
+    let probe = CompactProbe::new();
+    agent.set_hooks(probe.clone());
+    assert_eq!(agent.compact(&mut |_| {}).unwrap().unwrap().dropped, 0);
+    assert_eq!(agent.messages().len(), 5, "nothing folded");
+    assert!(probe.snapshot().is_empty(), "empty summary → no call");
+
+    // (d) a preflight pass the prune alone resolves — no summary, no call
+    let mut prune_cfg = cfg.clone();
+    prune_cfg.limits.compress_threshold_chars = 200;
+    let mut history = vec![user_text("task")];
+    history.extend(big_tool_turn("t1", "shell", 30_000));
+    history.push(user_text("u1"));
+    history.push(Message::assistant(vec![Block::Text("a2".into())]));
+    history.push(user_text("u2"));
+    let (prov, state) = MockProvider::new(vec![mock::resp_text("final answer", None)]);
+    let mut agent = Agent::new(&prune_cfg, Box::new(prov), vec![], history, test_ctx());
+    let probe = CompactProbe::new();
+    agent.set_hooks(probe.clone());
+    agent.run(&mut |_| {}).unwrap();
+    assert_eq!(state.calls(), 1, "the prune replaced the summary call");
+    assert!(probe.snapshot().is_empty(), "prune-only → no call");
+}
+
+#[test]
+fn before_compact_default_hook_is_zero_drift() {
+    // A layer that does not override `on_before_compact` must leave the fold
+    // what it is without any layer: same shape, same billing routed to the
+    // host, same events.
+    let fold = |hooks: Option<Arc<NoopHooks>>| {
+        let mut cfg = cfg_with(5, 0, 0);
+        cfg.limits.keep_recent_messages = 2;
+        let (prov, _) = MockProvider::new(vec![mock::resp_text("SUMMARY", mock::mk_usage(3, 5))]);
+        let mut agent = Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![],
+            five_message_history(),
+            test_ctx(),
+        );
+        if let Some(h) = hooks {
+            agent.set_hooks(h);
+        }
+        let mut events = Vec::new();
+        let o = agent.compact(&mut |e| events.push(e)).unwrap().unwrap();
+        let compressed = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::Compressed { .. }))
+            .count();
+        (
+            o.dropped,
+            o.kept,
+            o.usage,
+            agent.usage(),
+            agent
+                .messages()
+                .iter()
+                .map(|m| (m.role, compact_text_of(m)))
+                .collect::<Vec<_>>(),
+            events.len(),
+            compressed,
+        )
+    };
+    assert_eq!(fold(None), fold(Some(Arc::new(NoopHooks))));
+}
+
+#[test]
+fn before_compact_hook_tags_a_subagent_fold() {
+    // A child's own compaction reaches the inherited layer from that child's
+    // run; `info.subagent` is the only reliable attribution (children run
+    // concurrently). Simulated child side, exactly as
+    // `hooks_see_subagent_tag_when_gating_inside_a_subagent_ctx` tags it.
+    let mut cfg = cfg_with(8, 0, 10);
+    cfg.limits.keep_recent_messages = 2;
+    let (prov, _) = MockProvider::new(vec![
+        mock::resp_text("SUMMARY", None),
+        mock::resp_text("child done", None),
+    ]);
+    let mut ctx = test_ctx();
+    ctx.subagent = Some("scout".into());
+    let mut agent = Agent::new(&cfg, Box::new(prov), vec![], five_message_history(), ctx);
+    let probe = CompactProbe::new();
+    agent.set_hooks(probe.clone());
+    let o = agent.run_impl(&mut |_| {}, false).unwrap();
+    assert_eq!(o.stop_reason, "end_turn");
+    let seen = probe.snapshot();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].subagent.as_deref(), Some("scout"));
+    assert_eq!(seen[0].trigger, CompressTrigger::Preflight);
+}
+
+// ─── Summary output budget on reasoning models (`SummaryBudget`) ───────────
+//
+// Real-model evidence (docs/kernel_improvement_plan.md §0.0.5): in the three
+// paid batches 204 of 240 summary calls came back cut at the 1024-token
+// floor, 199 of them because the model's reasoning was billed against the
+// same budget — and every one of those folds carried a truncated brief.
+// These pin the ladder:
+//
+//   truncated + reasoning        → one retry at twice the budget
+//   the retry can only improve   → its own text, the longer of two bodies, or
+//                                   the first body whenever it disappoints
+//   a served retry               → that budget is learned (later summaries
+//                                   start there); `set_model` forgets it
+//   a refused retry              → that budget or more is never asked again
+//   truncated WITHOUT reasoning  → accepted on the first attempt, as before
+
+/// A summary-shaped reply: `text` as the body (none when empty), the given
+/// stop reason, optionally a reasoning trace that shares the output budget.
+fn summary_turn(
+    text: &str,
+    stop_reason: &str,
+    thinking: Option<&str>,
+    usage: Option<Usage>,
+) -> MockTurn {
+    MockTurn::Ok(ChatResponse {
+        reasoning: thinking.and_then(|t| mock::mk_reasoning(crate::provider::REASONING_OPENAI, t)),
+        blocks: if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![Block::Text(text.into())]
+        },
+        stop_reason: stop_reason.into(),
+        usage,
+    })
+}
+
+/// A usage report with a reasoning split (the cache axes zero).
+fn usage_split(input: u64, output: u64, reasoning: u64) -> Option<Usage> {
+    Some(Usage {
+        reasoning_tokens: reasoning,
+        input_tokens: input,
+        output_tokens: output,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+    })
+}
+
+/// The shape the real-model batch hit on nearly every summary: the trace ate
+/// most of the 1024-token budget and the body was cut off.
+fn reasoning_truncated(text: &str) -> MockTurn {
+    summary_turn(
+        text,
+        "max_tokens",
+        Some("weighing what matters…"),
+        usage_split(300, 1024, 600),
+    )
+}
+
+/// The running summary the head message carries after a fold.
+fn folded_summary(agent: &Agent) -> String {
+    agent.messages()[0]
+        .content
+        .iter()
+        .find_map(|b| match b {
+            Block::Text(t) if t.starts_with(SUMMARY_MARKER) => Some(t.clone()),
+            _ => None,
+        })
+        .expect("the head carries the folded summary")
+}
+
+/// Append one more (assistant, user) round to the live history — the shape
+/// the loop leaves behind — so a test can fold the SAME agent again.
+fn push_round(agent: &mut Agent, assistant_text: &str, user_msg: &str) {
+    agent
+        .messages
+        .push(Message::assistant(vec![Block::Text(assistant_text.into())]));
+    let _ = agent.push_user(vec![Block::Text(user_msg.into())]);
+}
+
+/// [task, a1, u1, a2, u2, a3, u3]: with `keep_recent_messages = 2` a fold
+/// drops four messages and leaves a history that can still grow and fold again.
+fn seven_message_history() -> Vec<Message> {
+    let mut h = five_message_history();
+    h.push(Message::assistant(vec![Block::Text("a3".into())]));
+    h.push(user_text("u3"));
+    h
+}
+
+/// An agent with `keep_recent_messages = 2` (the window every summary-ladder
+/// test here uses), the scripted turns as its provider, and `history` live.
+fn ladder_agent(turns: Vec<MockTurn>, history: Vec<Message>) -> (Agent, Arc<mock::MockState>) {
+    let mut cfg = cfg_with(5, 0, 0);
+    cfg.limits.keep_recent_messages = 2;
+    let (prov, state) = MockProvider::new(turns);
+    let agent = Agent::new(&cfg, Box::new(prov), vec![], history, test_ctx());
+    (agent, state)
+}
+
+#[test]
+fn summary_cut_short_by_reasoning_is_retried_at_double_the_budget() {
+    // The real-model failure shape, end to end through the run's preflight
+    // fold: attempt 1 is cut at 1024 tokens with a reasoning trace attached →
+    // ONE retry at 2048 → the retry's complete text is what gets folded, both
+    // attempts bill, and the main request proceeds with its own `max_tokens`.
+    let mut cfg = cfg_with(5, 0, 30);
+    cfg.limits.keep_recent_messages = 2;
+    let initial = vec![
+        user_text(&"x".repeat(40)),
+        Message::assistant(vec![Block::Text("a1".into())]),
+        user_text("u1"),
+        Message::assistant(vec![Block::Text("a2".into())]),
+        user_text("u2"),
+    ];
+    let (prov, state) = MockProvider::new(vec![
+        reasoning_truncated("cut off su"),
+        summary_turn(
+            "THE WHOLE SUMMARY",
+            "end_turn",
+            None,
+            usage_split(300, 300, 0),
+        ),
+        mock::resp_text("final answer", mock::mk_usage(50, 5)),
+    ]);
+    let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+    let mut events = Vec::new();
+    let o = agent.run(&mut |e| events.push(e)).unwrap();
+    assert_eq!(o.stop_reason, "end_turn");
+    assert_eq!(
+        state.calls(),
+        3,
+        "truncated attempt + one retry + the main call"
+    );
+    let caps = state.captured();
+    assert_eq!(caps[0].max_tokens, 1024, "the proportional budget");
+    assert_eq!(
+        caps[1].max_tokens, 2048,
+        "the retry asks for exactly double"
+    );
+    assert_eq!(
+        caps[2].max_tokens, 8192,
+        "the main turn keeps its own budget"
+    );
+    let summary = folded_summary(&agent);
+    assert!(summary.contains("THE WHOLE SUMMARY"), "{summary}");
+    assert!(
+        !summary.contains("cut off su"),
+        "the retry's complete text replaces the cut-off body"
+    );
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::Compressed {
+            dropped: 2,
+            kept: 3,
+            trigger: CompressTrigger::Preflight,
+            ..
+        }
+    )));
+    // Honest billing: both summary attempts and the main call.
+    let u = agent.usage();
+    assert_eq!(
+        (u.input_tokens, u.output_tokens, u.reasoning_tokens),
+        (650, 1329, 600)
+    );
+    assert_eq!(
+        agent.summary_budget,
+        SummaryBudget {
+            floor: 2048,
+            ceiling: None
+        }
+    );
+}
+
+#[test]
+fn summary_retry_that_truncates_again_keeps_the_longer_body() {
+    // The retry is served at 2048 but runs out too (a text-only truncation
+    // this time): whichever body is longer is folded, both attempts bill, and
+    // the served budget is learned — it did answer.
+    let fold = |first: &str, second: &str| {
+        let (mut agent, state) = ladder_agent(
+            vec![
+                reasoning_truncated(first),
+                summary_turn(second, "max_tokens", None, usage_split(300, 2048, 0)),
+            ],
+            five_message_history(),
+        );
+        let o = agent.compact(&mut |_| {}).unwrap().expect("folds");
+        assert_eq!(state.calls(), 2, "one retry, never a third request");
+        assert_eq!(o.dropped, 2);
+        assert_eq!(o.usage, usage_split(600, 3072, 600));
+        (folded_summary(&agent), agent.summary_budget)
+    };
+    // A longer retry replaces the first attempt.
+    let (summary, budget) = fold("short", &"b".repeat(400));
+    assert!(summary.contains(&"b".repeat(400)), "{summary}");
+    assert!(!summary.contains("short"));
+    assert_eq!(budget.floor, 2048);
+    // A shorter retry loses to the first attempt's longer body.
+    let (summary, budget) = fold(&"a".repeat(400), "tiny");
+    assert!(summary.contains(&"a".repeat(400)), "{summary}");
+    assert!(!summary.contains("tiny"));
+    assert_eq!(budget.floor, 2048, "served all the same");
+}
+
+#[test]
+fn summary_reasoning_known_only_from_the_usage_split_still_gets_the_retry() {
+    // A gateway that reports the reasoning token count but streams no
+    // `reasoning_content` (no reasoning blocks reach the response): the usage
+    // split is the second, independent signal.
+    let (mut agent, state) = ladder_agent(
+        vec![
+            summary_turn("cut", "max_tokens", None, usage_split(10, 1024, 700)),
+            summary_turn("WHOLE", "end_turn", None, usage_split(10, 200, 0)),
+        ],
+        five_message_history(),
+    );
+    let o = agent.compact(&mut |_| {}).unwrap().expect("folds");
+    assert_eq!(state.calls(), 2);
+    assert_eq!(state.captured()[1].max_tokens, 2048);
+    assert!(folded_summary(&agent).contains("WHOLE"));
+    assert_eq!(o.usage, usage_split(20, 1224, 700));
+}
+
+#[test]
+fn summary_truncation_without_reasoning_keeps_the_old_single_attempt() {
+    // The trace is what makes a truncation retryable. Without one the summary
+    // is simply longer than its budget — a bigger budget would buy a longer
+    // summary, not a complete one — so the first attempt stands (exactly as
+    // before this ladder existed) and nothing is learned.
+    let (mut agent, state) = ladder_agent(
+        vec![summary_turn(
+            "partial summary…",
+            "max_tokens",
+            None,
+            usage_split(10, 1024, 0),
+        )],
+        five_message_history(),
+    );
+    let o = agent.compact(&mut |_| {}).unwrap().expect("folds");
+    assert_eq!(state.calls(), 1);
+    assert_eq!(o.dropped, 2);
+    assert!(folded_summary(&agent).contains("partial summary…"));
+    assert_eq!(agent.summary_budget, SummaryBudget::default());
+}
+
+#[test]
+fn summary_retry_survives_one_transient_blip_of_its_own() {
+    // `summary_request`'s single transient retry applies to the doubled-budget
+    // request too.
+    let (mut agent, state) = ladder_agent(
+        vec![
+            reasoning_truncated("cut"),
+            MockTurn::Err("mock: connection reset by peer".into()),
+            summary_turn("RETRY OK", "end_turn", None, usage_split(300, 200, 0)),
+        ],
+        five_message_history(),
+    );
+    let o = agent.compact(&mut |_| {}).unwrap().expect("folds");
+    assert_eq!(state.calls(), 3);
+    assert!(folded_summary(&agent).contains("RETRY OK"));
+    assert_eq!(o.usage, usage_split(600, 1224, 600));
+    assert_eq!(agent.summary_budget.floor, 2048);
+}
+
+#[test]
+fn failed_summary_retry_folds_the_first_body_and_blames_neither_budget() {
+    // The retry fails twice (transient both times): the first attempt's
+    // coherent body is folded rather than losing the fold, every request
+    // bills, and a blip is no verdict on the budget — a later truncated
+    // summary may still retry.
+    let (mut agent, state) = ladder_agent(
+        vec![
+            reasoning_truncated("first body"),
+            MockTurn::Err("mock: connection reset by peer".into()),
+            MockTurn::Err("mock: connection reset by peer".into()),
+        ],
+        five_message_history(),
+    );
+    let o = agent.compact(&mut |_| {}).unwrap().expect("folds");
+    assert_eq!(state.calls(), 3);
+    assert_eq!(o.dropped, 2);
+    assert!(folded_summary(&agent).contains("first body"));
+    assert_eq!(o.usage, usage_split(300, 1024, 600));
+    assert_eq!(
+        agent.summary_budget,
+        SummaryBudget::default(),
+        "nothing served, nothing refused"
+    );
+}
+
+#[test]
+fn refused_summary_retry_folds_the_first_body_and_is_never_asked_for_again() {
+    // A strict gateway's 400 on the doubled value is deterministic: paying it
+    // again on every later truncated summary buys nothing. The first body is
+    // folded (a truncated brief beats losing the fold), the refusal is
+    // remembered as a threshold, and the next fold truncates at the original
+    // budget WITHOUT a retry.
+    let (mut agent, state) = ladder_agent(
+        vec![
+            reasoning_truncated("first body"),
+            MockTurn::ErrAny(anyhow::Error::new(crate::provider::ApiStatusError::new(
+                400,
+                "mock: API error 400: max_tokens must be <= 1024".into(),
+            ))),
+            reasoning_truncated("second body"),
+        ],
+        seven_message_history(),
+    );
+    let o = agent.compact(&mut |_| {}).unwrap().expect("folds");
+    assert_eq!(state.calls(), 2, "a 400 is not retried");
+    assert_eq!(o.dropped, 4);
+    assert_eq!(
+        o.usage,
+        usage_split(300, 1024, 600),
+        "the refused request billed nothing"
+    );
+    assert!(folded_summary(&agent).contains("first body"));
+    assert_eq!(
+        agent.summary_budget,
+        SummaryBudget {
+            floor: 0,
+            ceiling: Some(2048)
+        }
+    );
+
+    push_round(&mut agent, "a4", "u4");
+    let o = agent.compact(&mut |_| {}).unwrap().expect("folds again");
+    assert_eq!(state.calls(), 3, "no retry at the refused budget");
+    assert_eq!(state.captured()[2].max_tokens, 1024);
+    assert_eq!(o.dropped, 2);
+    assert!(folded_summary(&agent).contains("second body"));
+}
+
+#[test]
+fn summary_retry_that_dies_mid_stream_folds_the_first_body() {
+    // A retry that breaks mid-stream (half-written blocks) must never reach
+    // the history — but the first attempt's coherent body is still worth
+    // folding, and the broken stream still bills.
+    let (mut agent, state) = ladder_agent(
+        vec![
+            reasoning_truncated("first body"),
+            summary_turn("half-wri", "stream_error", None, usage_split(300, 50, 0)),
+        ],
+        five_message_history(),
+    );
+    let o = agent
+        .compact(&mut |_| {})
+        .unwrap()
+        .expect("the first body is folded");
+    assert_eq!(state.calls(), 2);
+    assert_eq!(o.dropped, 2);
+    let summary = folded_summary(&agent);
+    assert!(summary.contains("first body"));
+    assert!(!summary.contains("half-wri"));
+    assert_eq!(o.usage, usage_split(600, 1074, 600));
+}
+
+#[test]
+fn a_cancelled_summary_retry_folds_nothing() {
+    // Cancel is the exception to "fold the first body": the user stopped the
+    // work, and nothing may land on a history they cancelled — whichever way
+    // the provider reports it.
+    let (mut agent, state) = ladder_agent(
+        vec![
+            reasoning_truncated("first body"),
+            summary_turn("", "cancelled", None, usage_split(300, 50, 0)),
+        ],
+        five_message_history(),
+    );
+    let err = agent.compact(&mut |_| {}).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("stop_reason=cancelled"),
+        "{err:#}"
+    );
+    assert_eq!(state.calls(), 2);
+    assert_eq!(agent.messages.len(), 5, "a cancelled retry folds nothing");
+    assert_eq!(
+        err.downcast_ref::<CompressError>().unwrap().burned,
+        usage_split(600, 1074, 600),
+        "the cancelled retry still bills what it streamed"
+    );
+
+    // Same, with the flag: Ctrl-C lands while the retry is in flight and the
+    // stream breaks with a stop reason of its own.
+    let mut cfg = cfg_with(5, 0, 0);
+    cfg.limits.keep_recent_messages = 2;
+    let flag = Arc::new(AtomicBool::new(false));
+    let prov = CancelDuringSummaryRetry {
+        flag: flag.clone(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        five_message_history(),
+        test_ctx(),
+    );
+    agent.set_cancel(flag);
+    let err = agent.compact(&mut |_| {}).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("stop_reason=stream_error"),
+        "{err:#}"
+    );
+    assert_eq!(agent.messages.len(), 5, "nothing folded");
+}
+
+/// Serves the first request as a reasoning-truncated summary, then flips the
+/// run's cancel flag and answers the retry with a broken stream — a Ctrl-C
+/// landing while the doubled-budget retry is in flight.
+struct CancelDuringSummaryRetry {
+    flag: Arc<AtomicBool>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+impl Provider for CancelDuringSummaryRetry {
+    fn chat(
+        &self,
+        _req: &ChatRequest,
+        _on_event: &mut dyn FnMut(ChatEvent),
+    ) -> Result<ChatResponse> {
+        if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+            let MockTurn::Ok(resp) = reasoning_truncated("first body") else {
+                unreachable!("summary_turn always builds a MockTurn::Ok")
+            };
+            return Ok(resp);
+        }
+        self.flag.store(true, Ordering::Relaxed);
+        Ok(ChatResponse {
+            reasoning: None,
+            blocks: vec![Block::Text("half-wri".into())],
+            stop_reason: "stream_error".into(),
+            usage: usage_split(300, 50, 0),
+        })
+    }
+}
+
+#[test]
+fn a_served_retry_lifts_later_summaries_until_the_model_changes() {
+    // The lesson is the point of the ladder: a model whose summaries need
+    // 2048 tokens should not pay a doomed 1024 first attempt on every fold.
+    let (mut agent, state) = ladder_agent(
+        vec![
+            reasoning_truncated("cut"),
+            summary_turn("FIRST FOLD", "end_turn", None, None),
+            summary_turn("SECOND FOLD", "end_turn", None, None),
+            summary_turn("THIRD FOLD", "end_turn", None, None),
+        ],
+        seven_message_history(),
+    );
+    agent.compact(&mut |_| {}).unwrap().expect("folds 1");
+    assert!(folded_summary(&agent).contains("FIRST FOLD"));
+    push_round(&mut agent, "a4", "u4");
+    agent.compact(&mut |_| {}).unwrap().expect("folds 2");
+    assert!(folded_summary(&agent).contains("SECOND FOLD"));
+    // …and it describes one model's reasoning appetite.
+    agent.set_model("other-model");
+    push_round(&mut agent, "a5", "u5");
+    agent.compact(&mut |_| {}).unwrap().expect("folds 3");
+    assert!(folded_summary(&agent).contains("THIRD FOLD"));
+    let caps = state.captured();
+    let budgets: Vec<u32> = caps.iter().map(|c| c.max_tokens).collect();
+    assert_eq!(budgets, [1024, 2048, 2048, 1024]);
+    assert_eq!(caps[3].model, "other-model");
+    assert_eq!(agent.summary_budget, SummaryBudget::default());
+}
+
+#[test]
+fn refused_empty_summary_retry_is_not_repeated_on_the_next_fold() {
+    // The zero-body ladder shares the ceiling: once the doubled budget was
+    // refused, a later empty summary is not retried into the same refusal —
+    // it takes the empty-summary degradation (nothing folded, billed, warned).
+    let (mut agent, state) = ladder_agent(
+        vec![
+            summary_turn("", "max_tokens", None, usage_split(30, 1024, 900)),
+            MockTurn::ErrAny(anyhow::Error::new(crate::provider::ApiStatusError::new(
+                400,
+                "mock: API error 400: max_tokens must be <= 1024".into(),
+            ))),
+            summary_turn("", "max_tokens", None, usage_split(30, 1024, 900)),
+        ],
+        seven_message_history(),
+    );
+    let err = agent.compact(&mut |_| {}).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("max_tokens must be <= 1024"),
+        "{err:#}"
+    );
+    assert_eq!(state.calls(), 2);
+    assert_eq!(agent.messages.len(), 7, "nothing to fold from");
+    assert_eq!(
+        err.downcast_ref::<CompressError>().unwrap().burned,
+        usage_split(30, 1024, 900),
+        "the burned first attempt rides the error"
+    );
+    assert_eq!(agent.summary_budget.ceiling, Some(2048));
+
+    push_round(&mut agent, "a4", "u4");
+    let mut events = Vec::new();
+    let o = agent
+        .compact(&mut |e| events.push(e))
+        .unwrap()
+        .expect("the degenerate pass");
+    assert_eq!(state.calls(), 3, "no second request for the refused budget");
+    assert_eq!(o.dropped, 0);
+    assert_eq!(o.usage, usage_split(30, 1024, 900));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::Warning(w) if w.contains("empty summary")
+    )));
+}
+
+#[test]
+fn summary_budget_for_raises_to_the_floor_and_never_past_the_cap() {
+    let (mut agent, _) = ladder_agent(vec![], vec![user_text("hi")]);
+    assert_eq!(
+        agent.summary_budget_for(1024, 8192),
+        1024,
+        "nothing learned: the proportional value"
+    );
+    agent.summary_budget.floor = 2048;
+    assert_eq!(
+        agent.summary_budget_for(1024, 8192),
+        2048,
+        "raised to the floor"
+    );
+    assert_eq!(
+        agent.summary_budget_for(4096, 8192),
+        4096,
+        "a larger proportional value stands"
+    );
+    assert_eq!(
+        agent.summary_budget_for(1024, 1500),
+        1500,
+        "the endpoint's cap wins over the floor"
+    );
+}
+
+#[test]
+fn summary_budget_learns_upward_only_and_treats_a_refusal_as_a_threshold() {
+    let mut b = SummaryBudget::default();
+    assert!(b.may_ask(8192), "nothing refused yet");
+    b.learned(2048);
+    b.learned(1024);
+    assert_eq!(b.floor, 2048, "the floor never moves down");
+    b.ceiling = Some(4096);
+    assert!(b.may_ask(2048), "a lower budget may still be tried");
+    assert!(!b.may_ask(4096), "not the refused value itself");
+    assert!(!b.may_ask(8192), "nor anything higher");
+}
+
+#[test]
+fn summary_transcript_excerpts_follow_summary_preview_chars() {
+    // The summarizer sees tool calls and tool results as excerpts, sized by
+    // `limits.summary_preview_chars`: 200 by default, 0 = the tag alone, and
+    // a value at or above the content's length shows it whole.
+    let prompt_for = |preview: usize| {
+        let mut cfg = cfg_with(5, 0, 0);
+        cfg.limits.keep_recent_messages = 2;
+        cfg.limits.summary_preview_chars = preview;
+        let mut initial = vec![user_text("task")];
+        initial.extend(big_tool_turn("t1", "shell", 300));
+        initial.push(user_text("u1"));
+        initial.push(Message::assistant(vec![Block::Text("a2".into())]));
+        initial.push(user_text("u2"));
+        let (prov, state) = MockProvider::new(vec![mock::resp_text("SUMMARY", None)]);
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+        assert!(agent.compact(&mut |_| {}).unwrap().is_some());
+        state.captured()[0].user_texts[0].clone()
+    };
+    let result_line = |n: usize| format!("[user] tool_result: {}…\n", "x".repeat(n));
+
+    let prompt = prompt_for(200);
+    assert!(prompt.contains(&result_line(200)), "{prompt}");
+    assert!(!prompt.contains(&"x".repeat(201)));
+    assert!(prompt.contains("[assistant] tool_call shell: {}\n"));
+
+    let prompt = prompt_for(0);
+    assert!(prompt.contains("[user] tool_result: \n"), "{prompt}");
+    assert!(prompt.contains("[assistant] tool_call shell: \n"));
+    assert!(
+        !prompt.contains(&"x".repeat(20)),
+        "0 = no excerpt at all: {prompt}"
+    );
+
+    let prompt = prompt_for(1000);
+    assert!(
+        prompt.contains(&format!("[user] tool_result: {}\n", "x".repeat(300))),
+        "{prompt}"
+    );
+    assert!(
+        !prompt.contains(&"x".repeat(301)),
+        "nothing is cut: {prompt}"
+    );
+}
+
+// ─── Adaptive kept window (the fold-thrash fix) ──────────────────────────
+//
+// A preflight fold keeps `keep_recent_messages` verbatim. Once that tail
+// alone holds most of the room under the compaction threshold, every fold
+// leaves the history over it again: the next turn folds once more and drops a
+// round or two, for one billed summary each time (real-model run:
+// docs/kernel_improvement_plan.md §0.0.5 — 32 folds in 56 turns, 27 of them
+// dropping exactly 2 messages). The preflight fold now keeps the largest
+// window whose tail fits HALF the room; everything else keeps the configured
+// window. `compress::shrink_keep` has the arithmetic; these pin the wiring.
+
+/// A tool whose every answer is the same `size`-char payload — the shape of
+/// a read/shell round in the run that exposed the thrash.
+struct BigTool(usize);
+impl Tool for BigTool {
+    fn def(&self) -> ToolDef {
+        ToolDef {
+            name: "big".into(),
+            description: "test tool returning a fixed-size payload".into(),
+            schema: json!({"type": "object", "properties": {}}),
+        }
+    }
+    fn run(&self, _input: &Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+        Ok(ToolOutput::text("x".repeat(self.0)))
+    }
+}
+
+/// `[task]` plus `rounds` (assistant tool_use `{"k": n}`, user tool result)
+/// pairs of `size`-char results — exactly what `BigTool(size)` leaves behind.
+fn heavy_history(rounds: usize, size: usize) -> Vec<Message> {
+    let mut h = vec![user_text("task")];
+    for k in 0..rounds {
+        h.push(Message::assistant(vec![Block::ToolUse {
+            id: format!("t{k}"),
+            name: "big".into(),
+            input: json!({ "k": k }),
+        }]));
+        h.push(Message::user(vec![Block::ToolResult {
+            tool_use_id: format!("t{k}"),
+            content: "x".repeat(size),
+            image: None,
+            is_error: false,
+        }]));
+    }
+    h
+}
+
+/// An agent under the char-threshold preflight gate with the given kept window.
+fn gated_agent(threshold: usize, keep: usize, history: Vec<Message>) -> Agent {
+    let mut cfg = cfg_with(99, 0, threshold);
+    cfg.limits.keep_recent_messages = keep;
+    let (prov, _) = MockProvider::new(vec![]);
+    Agent::new(&cfg, Box::new(prov), vec![], history, test_ctx())
+}
+
+#[test]
+fn adaptive_keep_only_lowers_the_configured_window() {
+    // Room = 3000 chars, so the kept tail may hold at most 1500. A round of
+    // `heavy_history(_, 600)` is 607-608 chars: two rounds (1214) fit in
+    // 1500, three (1821) do not. The window that keeps exactly two rounds is
+    // four messages — or five, which shares the same cut, so five it is.
+    let mut agent = gated_agent(3000, 8, heavy_history(10, 600));
+    assert_eq!(agent.adaptive_keep(), 5, "two rounds fit, three do not");
+    // Light tail: eight rounds fit easily → the configured window stands.
+    let mut agent = gated_agent(3000, 8, heavy_history(10, 100));
+    assert_eq!(agent.adaptive_keep(), 8);
+    // No gate configured: nothing to adapt to.
+    let mut agent = gated_agent(0, 8, heavy_history(10, 600));
+    assert_eq!(agent.adaptive_keep(), 8);
+    // An explicit "fold everything" is the user's decision, not a window.
+    let mut agent = gated_agent(3000, 0, heavy_history(10, 600));
+    assert_eq!(agent.adaptive_keep(), 0);
+    // Too short for the configured window: the caller's `find_safe_cut` then
+    // reports "nothing to compress", exactly as before.
+    let mut agent = gated_agent(3000, 8, five_message_history());
+    assert_eq!(agent.adaptive_keep(), 8);
+}
+
+#[test]
+fn heavy_tail_preflight_folds_further_back_instead_of_once_per_turn() {
+    // Ten tool rounds of ~607 chars against a 3000-char threshold. The
+    // configured 8-message window is four rounds (~2430 chars) — four fifths
+    // of the room — so a fold that keeps it leaves the next round over the
+    // threshold again: with the configured window turns 6-11 would EACH fold
+    // and drop 2 messages (six billed summaries for six rounds of relief).
+    // Holding the tail to two rounds, the same run folds twice (before the
+    // 6th and the 9th request) and drops six messages each time.
+    let mut cfg = cfg_with(99, 0, 3000);
+    cfg.limits.keep_recent_messages = 8;
+    // Distinct inputs: same payload, but not one consecutive repeated call
+    // (that would be the stuck guard's business, not compression's).
+    let mut turns: Vec<MockTurn> = (0..10)
+        .map(|i| mock::resp_tool(&format!("t{i}"), "big", json!({ "k": i }), None))
+        .collect();
+    // Calls, in order: t1..t5, the first summary, t6..t8, the second
+    // summary, t9, t10, the final answer.
+    let mut script: Vec<MockTurn> = turns.drain(..5).collect();
+    script.push(mock::resp_text("SUMMARY", None));
+    script.extend(turns.drain(..3));
+    script.push(mock::resp_text("SUMMARY", None));
+    script.extend(turns);
+    script.push(mock::resp_text("final answer", None));
+    let (prov, state) = MockProvider::new(script);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![Box::new(BigTool(600))],
+        vec![user_text("task")],
+        test_ctx(),
+    );
+    let mut events = Vec::new();
+    let o = agent.run(&mut |e| events.push(e)).unwrap();
+    assert_eq!(o.stop_reason, "end_turn");
+    let folds: Vec<(usize, usize)> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Compressed {
+                dropped,
+                kept,
+                trigger: CompressTrigger::Preflight,
+                ..
+            } => Some((*dropped, *kept)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(folds, [(6, 5), (6, 5)]);
+    assert_eq!(state.calls(), 13, "11 main calls + 2 summaries");
+    // What is left: the head, the four rounds since the second fold (the
+    // kept two, each opening on an assistant message — a safe cut — plus
+    // two more), and the final answer, N:N paired.
+    let live = agent.messages();
+    assert_eq!(live.len(), 10, "head + four rounds + the final answer");
+    assert!(matches!(live[1].role, Role::Assistant));
+    let uses = tool_ids(live, true);
+    let results = tool_ids(live, false);
+    assert_eq!(uses, ["t6", "t7", "t8", "t9"]);
+    assert_eq!(uses, results, "every kept tool_use has its result");
+}
+
+/// Every `tool_use` id (`uses`) or `tool_result` id in `messages`, in order.
+fn tool_ids(messages: &[Message], uses: bool) -> Vec<String> {
+    messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter_map(|b| match b {
+            Block::ToolUse { id, .. } if uses => Some(id.clone()),
+            Block::ToolResult { tool_use_id, .. } if !uses => Some(tool_use_id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn light_tail_preflight_fold_keeps_the_configured_window() {
+    // The window only ever shrinks: when the configured tail already fits in
+    // half the room the fold is exactly what it was before — eight rounds
+    // kept, however many characters that is.
+    let mut cfg = cfg_with(5, 0, 2000);
+    cfg.limits.keep_recent_messages = 8;
+    let (prov, state) = MockProvider::new(vec![
+        mock::resp_text("SUMMARY", None),
+        mock::resp_text("final answer", None),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        heavy_history(20, 100), // 2044 chars: just over
+        test_ctx(),
+    );
+    let mut events = Vec::new();
+    let o = agent.run(&mut |e| events.push(e)).unwrap();
+    assert_eq!(o.stop_reason, "end_turn");
+    assert_eq!(state.calls(), 2);
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::Compressed {
+            dropped: 32,
+            kept: 9,
+            trigger: CompressTrigger::Preflight,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn manual_compact_and_overflow_recovery_keep_the_configured_window() {
+    // Only the preflight fold adapts. The host's `/compact` asks for its
+    // configured window by name, and overflow recovery carries its own
+    // shrinking prune backstop — both keep `keep_recent_messages`, whatever
+    // the tail weighs.
+    let mut cfg = cfg_with(5, 0, 100);
+    cfg.limits.keep_recent_messages = 4;
+    let (prov, state) = MockProvider::new(vec![mock::resp_text("SUMMARY", None)]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        heavy_history(6, 600),
+        test_ctx(),
+    );
+    let o = agent.compact(&mut |_| {}).unwrap().expect("folds");
+    assert_eq!((o.dropped, o.kept), (8, 5));
+    assert_eq!(state.calls(), 1);
+
+    let mut cfg = cfg_with(5, 0, 0);
+    cfg.limits.keep_recent_messages = 4;
+    let (prov, state) = MockProvider::new(vec![
+        MockTurn::Err("mock: maximum context length exceeded".into()),
+        mock::resp_text("SUMMARY", None),
+        mock::resp_text("final answer", None),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        heavy_history(6, 600),
+        test_ctx(),
+    );
+    let mut events = Vec::new();
+    let o = agent.run(&mut |e| events.push(e)).unwrap();
+    assert_eq!(o.stop_reason, "end_turn");
+    assert_eq!(
+        state.calls(),
+        3,
+        "overflow + summary + the retried main call"
+    );
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::Compressed {
+            dropped: 8,
+            kept: 5,
+            trigger: CompressTrigger::Overflow,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn token_gate_preflight_fold_shrinks_the_window_in_tokens() {
+    // With `max_context_tokens` set the room is measured in the gate's own
+    // unit — the token estimate (ASCII: four chars to a token), not chars.
+    // Window = 8000 → 85% = 6800, minus the 1000-token output reserve →
+    // 5800 tokens of room, 2900 for the kept tail.
+    let fold = |result_chars: usize| {
+        let mut cfg = cfg_with(5, 0, 0);
+        cfg.limits.keep_recent_messages = 6;
+        cfg.limits.max_context_tokens = 8000;
+        cfg.max_tokens = 1000;
+        let mut initial = vec![user_text("task")];
+        for k in 0..3 {
+            initial.extend(big_tool_turn(&format!("big{k}"), "big", result_chars));
+        }
+        initial.extend(big_tool_turn("last", "big", 5));
+        let (prov, _) = MockProvider::new(vec![
+            mock::resp_text("SUMMARY", None),
+            mock::resp_text("final answer", None),
+        ]);
+        let mut agent = Agent::new(&cfg, Box::new(prov), vec![], initial, test_ctx());
+        let mut events = Vec::new();
+        agent.run(&mut |e| events.push(e)).unwrap();
+        events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::Compressed {
+                    dropped,
+                    kept,
+                    trigger: CompressTrigger::Preflight,
+                    ..
+                } => Some((*dropped, *kept)),
+                _ => None,
+            })
+            .expect("over the token gate, so it folds")
+    };
+    // History of nine messages; the cuts are 3 (k = 6: two big results), 5
+    // (k = 4 and 5: one big result — the nominal start of k = 5 is a tool
+    // result, which slides forward to the next assistant message), 7 (k = 2
+    // and 3: only the tiny last round).
+    //
+    // One 8000-char result is 2000 tokens — more than 2900 CHARS, well under
+    // 2900 tokens. Measured in the gate's own unit it fits, two results
+    // (4000 tokens) do not: the window shrinks from six to the widest one
+    // with a single big result, and five messages stay live (the summary head
+    // plus the four-message tail).
+    assert_eq!(fold(8000), (4, 5));
+    // One 12000-char result is 3000 tokens: no window that keeps a big result
+    // fits, so the fold falls back to the smallest one and keeps only the
+    // last (tiny) round — instead of keeping two results and folding again
+    // next turn.
+    assert_eq!(fold(12000), (6, 3));
+}
+
+#[test]
+fn explicit_keep_recent_zero_still_folds_everything_on_preflight() {
+    // `keep_recent_messages: 0` is "fold everything", not a window to size.
+    let mut cfg = cfg_with(5, 0, 3000);
+    cfg.limits.keep_recent_messages = 0;
+    let (prov, _) = MockProvider::new(vec![
+        mock::resp_text("SUMMARY", None),
+        mock::resp_text("final answer", None),
+    ]);
+    let mut agent = Agent::new(
+        &cfg,
+        Box::new(prov),
+        vec![],
+        heavy_history(6, 600),
+        test_ctx(),
+    );
+    let mut events = Vec::new();
+    agent.run(&mut |e| events.push(e)).unwrap();
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::Compressed {
+            dropped: 12,
+            kept: 1,
+            trigger: CompressTrigger::Preflight,
+            ..
+        }
+    )));
+}
+
+// ─── Non-consecutive repeat notice (`RepeatWindow`) ──────────────────────
+//
+// The consecutive-streak guard (`stuck_nudge` / `stuck_loop`) is reset by any
+// differing call, so a model that alternates between two calls never hears
+// it: the real-model run polled a job 9 times with the same arguments and
+// the same answer, other calls in between, longest consecutive streak 3. A
+// second, notice-only window now counts a key across the last
+// `REPEAT_WINDOW` calls and appends `repeat_nudge` at its 4th, 6th, 8th…
+// occurrence. The hard stop still counts consecutive calls only — a
+// non-consecutive repeat cannot tell "going in circles" from "change one
+// thing, run the test again".
+
+/// Every tool_result content block in the live history, in order.
+fn all_tool_results(agent: &Agent) -> Vec<String> {
+    agent
+        .messages()
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .filter_map(|b| match b {
+            Block::ToolResult { content, .. } => Some(content.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Run `script` (one tool call per turn, then a final text turn) against
+/// `tools`; returns the outcome, the history's tool results, and the
+/// ToolResult events the host saw.
+fn run_tool_script(
+    tools: Vec<Box<dyn Tool>>,
+    script: Vec<(&str, Value)>,
+) -> (RunOutcome, Vec<String>, Vec<String>) {
+    let mut turns: Vec<MockTurn> = script
+        .iter()
+        .enumerate()
+        .map(|(i, (name, input))| mock::resp_tool(&format!("t{i}"), name, input.clone(), None))
+        .collect();
+    turns.push(mock::resp_text("done", None));
+    let (prov, _) = MockProvider::new(turns);
+    let mut agent = Agent::new(
+        &cfg_with(99, 0, 0),
+        Box::new(prov),
+        tools,
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    let mut events = Vec::new();
+    let o = agent.run(&mut |e| events.push(e)).unwrap();
+    let shown: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolResult { content, .. } => Some(content.clone()),
+            _ => None,
+        })
+        .collect();
+    (o, all_tool_results(&agent), shown)
+}
+
+/// Indices of `results` that carry the repeat notice / the streak nudge.
+fn noticed(results: &[String], needle: &str) -> Vec<usize> {
+    (0..results.len())
+        .filter(|&i| results[i].contains(needle))
+        .collect()
+}
+
+const REPEAT_WORDING: &str = "with other tool calls in between";
+const STREAK_WORDING: &str = "times in a row";
+
+#[test]
+fn repeat_window_counts_a_key_while_its_last_call_is_still_inside() {
+    let key = |s: &str| (s.to_string(), String::new(), 0);
+    let mut w = RepeatWindow::default();
+    // A two-step cycle: each key is seen every other call, so the chain
+    // never breaks — 1, 2, 3, then 4 on the 7th and 8th calls.
+    for (i, (a, b)) in [(1, 1), (2, 2), (3, 3), (4, 4)].into_iter().enumerate() {
+        assert_eq!(w.observe(key("a")), a, "call {}", i * 2 + 1);
+        assert_eq!(w.observe(key("b")), b, "call {}", i * 2 + 2);
+    }
+    assert_eq!(w.observe(key("a")), 5);
+    // The lookup happens BEFORE the oldest entry slides out, so an 8-cycle
+    // (seven other calls in between) still counts…
+    let mut w = RepeatWindow::default();
+    assert_eq!(w.observe(key("a")), 1);
+    for k in 0..7 {
+        assert_eq!(w.observe(key(&format!("c{k}"))), 1);
+    }
+    assert_eq!(w.observe(key("a")), 2, "the 1st is just sliding out");
+    // …and once the key has slid out, it starts over.
+    for k in 0..REPEAT_WINDOW {
+        assert_eq!(w.observe(key(&format!("d{k}"))), 1);
+    }
+    assert_eq!(w.observe(key("a")), 1, "nine calls later");
+}
+
+#[test]
+fn alternating_identical_calls_get_the_repeat_notice_without_stopping() {
+    // x, y, x, y… ten times: each key's 4th occurrence (calls 7 and 8) is
+    // told it has returned this same result four times; the 5th is not told
+    // again, and the run is never stopped.
+    let mut script = Vec::new();
+    for _ in 0..5 {
+        script.push(("echo", json!({"q": "x"})));
+        script.push(("echo", json!({"q": "y"})));
+    }
+    let (o, results, shown) = run_tool_script(vec![Box::new(EchoTool::new("echo"))], script);
+    assert_eq!(o.stop_reason, "end_turn", "a notice only — never a stop");
+    assert_eq!(o.tool_calls.len(), 10);
+    assert_eq!(noticed(&results, "system notice"), [6, 7]);
+    assert!(results[6].contains("returned this same result 4 times"));
+    assert!(results[6].contains(REPEAT_WORDING));
+    assert!(
+        results[6].starts_with("ok\n\n[system notice]"),
+        "{}",
+        results[6]
+    );
+    assert!(
+        noticed(&results, STREAK_WORDING).is_empty(),
+        "never the streak wording"
+    );
+    // The notice lives only in the history block: what the host sees — the
+    // ToolResult events and the run's records — is the tool's own output.
+    assert!(shown.iter().all(|c| !c.contains("system notice")));
+    assert!(o
+        .tool_calls
+        .iter()
+        .all(|r| !r.output.contains("system notice")));
+}
+
+#[test]
+fn three_occurrences_of_a_key_stay_silent() {
+    let mut script = Vec::new();
+    for _ in 0..3 {
+        script.push(("echo", json!({"q": "x"})));
+        script.push(("echo", json!({"q": "y"})));
+    }
+    let (o, results, _) = run_tool_script(vec![Box::new(EchoTool::new("echo"))], script);
+    assert_eq!(o.stop_reason, "end_turn");
+    assert!(noticed(&results, "system notice").is_empty());
+}
+
+#[test]
+fn progressing_polls_never_get_the_repeat_notice() {
+    // Same call, a different result each time: a different key each time.
+    let script: Vec<(&str, Value)> = (0..9).map(|_| ("poll", json!({"job": 42}))).collect();
+    let (o, results, _) = run_tool_script(
+        vec![Box::new(PollTool {
+            n: std::sync::atomic::AtomicUsize::new(0),
+        })],
+        script,
+    );
+    assert_eq!(o.stop_reason, "end_turn");
+    assert!(noticed(&results, "system notice").is_empty());
+}
+
+#[test]
+fn repeat_notice_neither_stacks_on_the_streak_nudge_nor_delays_the_hard_stop() {
+    // a a a (streak nudge on the 3rd) → b (streak broken) → a ×6. The first
+    // `a` after the break is that key's 4th occurrence with a streak of 1:
+    // the repeat notice. From there the consecutive streak builds again —
+    // its own nudge on its 3rd, nothing stacked on any result — and the 6th
+    // ends the run exactly as before: the hard stop counts consecutive calls
+    // only.
+    let (a, b) = (json!({"q": "a"}), json!({"q": "b"}));
+    let script = vec![
+        ("echo", a.clone()),
+        ("echo", a.clone()),
+        ("echo", a.clone()),
+        ("echo", b),
+        ("echo", a.clone()),
+        ("echo", a.clone()),
+        ("echo", a.clone()),
+        ("echo", a.clone()),
+        ("echo", a.clone()),
+        ("echo", a),
+    ];
+    let (o, results, _) = run_tool_script(vec![Box::new(EchoTool::new("echo"))], script);
+    assert_eq!(o.stop_reason, "stuck_loop");
+    assert_eq!(results.len(), 10, "the 11th request is never sent");
+    assert_eq!(noticed(&results, STREAK_WORDING), [2, 6]);
+    assert_eq!(noticed(&results, REPEAT_WORDING), [4]);
+    assert_eq!(
+        noticed(&results, "system notice"),
+        [2, 4, 6],
+        "no result carries two"
+    );
+}
+
+#[test]
+fn repeat_notice_reaches_every_block_of_a_batch() {
+    // Two calls per turn, the same two every turn: each key is seen once per
+    // turn with the other call in between — on the 4th turn BOTH blocks
+    // carry the notice.
+    let two_call_turn = |i: usize| {
+        MockTurn::Ok(ChatResponse {
+            reasoning: None,
+            blocks: vec![
+                Block::ToolUse {
+                    id: format!("a{i}"),
+                    name: "echo".into(),
+                    input: json!({"q": "x"}),
+                },
+                Block::ToolUse {
+                    id: format!("b{i}"),
+                    name: "echo".into(),
+                    input: json!({"q": "y"}),
+                },
+            ],
+            stop_reason: "tool_use".into(),
+            usage: None,
+        })
+    };
+    let mut turns: Vec<MockTurn> = (0..4).map(two_call_turn).collect();
+    turns.push(mock::resp_text("done", None));
+    let (prov, state) = MockProvider::new(turns);
+    let mut agent = Agent::new(
+        &cfg_with(99, 0, 0),
+        Box::new(prov),
+        vec![Box::new(EchoTool::new("echo"))],
+        vec![user_text("go")],
+        test_ctx(),
+    );
+    let o = agent.run(&mut |_| {}).unwrap();
+    assert_eq!(o.stop_reason, "end_turn");
+    assert_eq!(state.calls(), 5);
+    let results = all_tool_results(&agent);
+    assert_eq!(results.len(), 8);
+    assert_eq!(noticed(&results, REPEAT_WORDING), [6, 7]);
 }

@@ -26,6 +26,7 @@ use std::sync::{Arc, Barrier, Mutex, OnceLock};
 fn call(provider: &dyn Provider, model: &str) -> anyhow::Result<ChatResponse> {
     let cancel = Arc::new(AtomicBool::new(false));
     let msgs = vec![Message {
+        reasoning: None,
         id: None, // 稳定 id 由 ingest 点分配，构造时留 None
         role: Role::User,
         content: vec![Block::Text("probe".into())],

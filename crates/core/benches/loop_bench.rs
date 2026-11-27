@@ -256,6 +256,8 @@ mod agent_bench {
         // All fields are public by contract (the bindings and sub-agents build
         // this by hand). No tools are registered, so the ctx is inert here.
         ToolCtx {
+            tool_annotations: std::sync::Arc::new(std::collections::BTreeMap::new()),
+            hidden_env: Vec::new(),
             workdir: std::env::current_dir().expect("cwd"),
             max_output_chars: 30_000,
             restrict_to_workdir: false,
@@ -272,6 +274,7 @@ mod agent_bench {
     /// One scripted turn: a plain text reply that ends the run.
     fn text_reply() -> MockTurn {
         MockTurn::Ok(ChatResponse {
+            reasoning: None,
             blocks: vec![Block::Text("bench reply".into())],
             stop_reason: "end_turn".into(),
             usage: None,

@@ -1292,7 +1292,10 @@ impl Agent {
         Ok(promise)
     }
 
-    /// Cumulative token usage of the current/latest run (4 axes), as an object.
+    /// Cumulative token usage of the current/latest run, as an object: the four
+    /// cache axes (`input_tokens`, `output_tokens`, `cache_creation_input_tokens`,
+    /// `cache_read_input_tokens`) plus `reasoning_tokens` — the reasoning share
+    /// of `output_tokens`, a subset split on its own axis (never an extra axis).
     /// Busy-errors while `run()` is in flight (see [`agent_busy`]).
     #[napi]
     pub fn usage(&self) -> Result<Value> {

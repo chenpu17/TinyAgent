@@ -22,8 +22,11 @@ pub struct OpenAi {
     /// the correct shape for a `dyn Provider`.
     fixes: std::sync::Mutex<LearnedFixes>,
     /// Strip inline `<think>…</think>` blocks from the content stream into
-    /// ThinkingDelta (FR-2, `Config::strip_think_tags`, default on).
+    /// ThinkingDelta (FR-2, `Config.strip_think_tags`, default on).
     strip_think_tags: bool,
+    /// `Config.extra_body` / `Config.extra_headers`, applied to every
+    /// request (see the `with_extra_*` builders).
+    extras: super::RequestExtras,
 }
 
 impl OpenAi {
@@ -43,6 +46,39 @@ impl OpenAi {
             idle,
             fixes: std::sync::Mutex::new(LearnedFixes::default()),
             strip_think_tags: true,
+            extras: super::RequestExtras::default(),
+        }
+    }
+
+    /// Extra top-level request-body fields for every request
+    /// (`Config.extra_body`, wired by `provider::build`). Replaces any set
+    /// earlier. Ignored unless it is a JSON object; a field the kernel
+    /// already writes (`model`, `messages`, …) is never overridden.
+    pub fn with_extra_body(mut self, extra_body: Value) -> Self {
+        {
+            self.extras.set_body(extra_body);
+            self
+        }
+    }
+
+    /// Extra request headers for every request (`Config.extra_headers`,
+    /// wired by `provider::build`). Replaces any set earlier. Dropped here:
+    /// a header the kernel manages (authentication, content type, protocol
+    /// version) and anything that is not a valid header — the config
+    /// validation already rejects both with the entry blamed, this is the
+    /// guard for a provider built by hand.
+    pub fn with_extra_headers(mut self, extra_headers: crate::config::ExtraHeaders) -> Self {
+        {
+            self.extras.set_headers(&extra_headers);
+            self
+        }
+    }
+
+    /// Both extras as parsed from a config — `provider::build`'s entry.
+    pub(crate) fn with_request_extras(mut self, extras: super::RequestExtras) -> Self {
+        {
+            self.extras = extras;
+            self
         }
     }
 
@@ -66,13 +102,18 @@ impl OpenAi {
             fixes.max_completion_tokens |= preset.max_completion_tokens;
             fixes.no_stream_options |= preset.no_stream_options;
             fixes.no_reasoning_effort |= preset.no_reasoning_effort;
+            fixes.no_reasoning_echo |= preset.no_reasoning_echo;
         }
         self
     }
 
     /// One internal Message may expand to several wire messages
-    /// (tool results become separate `tool` role messages).
-    fn message_jsons(m: &Message) -> Vec<Value> {
+    /// (tool results become separate `tool` role messages). `echo_reasoning`
+    /// false sends assistant messages without their carried reasoning — the
+    /// shape every request had before reasoning carry, and the one used once
+    /// this gateway taught us it rejects the field (see `BodyFix::
+    /// DropReasoningEcho`).
+    fn message_jsons(m: &Message, echo_reasoning: bool) -> Vec<Value> {
         match m.role {
             Role::Assistant => {
                 // Join multiple Text blocks with a newline — a bare collect()
@@ -107,6 +148,25 @@ impl OpenAi {
                 }
                 if !calls.is_empty() {
                     msg["tool_calls"] = json!(calls);
+                }
+                // Reasoning carry, OpenAI-compatible side
+                // (`Config.preserved_reasoning`): hand the turn's
+                // `reasoning_content` back on the assistant message, the way
+                // the gateway gave it — the DeepSeek / GLM contract for a
+                // model to keep its reasoning across a tool-use loop. Only
+                // this family's state, and only when there is text to send.
+                if echo_reasoning {
+                    if let Some(r) = m.reasoning_for(super::REASONING_OPENAI) {
+                        let carried: Vec<&str> = r
+                            .blocks
+                            .iter()
+                            .map(|b| b.text.as_str())
+                            .filter(|t| !t.is_empty())
+                            .collect();
+                        if !carried.is_empty() {
+                            msg["reasoning_content"] = json!(carried.join("\n"));
+                        }
+                    }
                 }
                 vec![msg]
             }
@@ -218,15 +278,22 @@ enum BodyFix {
     DropStreamOptions,
     /// Omit `reasoning_effort` (old gateways don't know it).
     DropReasoningEffort,
+    /// Strip `reasoning_content` off every assistant message (gateways that
+    /// reject the echo of a previous turn's reasoning). Only ever relevant
+    /// while `Config.preserved_reasoning` is on.
+    DropReasoningEcho,
 }
 
 /// Fixes already learned for this gateway, applied proactively each turn so the
 /// 400 that taught them isn't re-triggered on every subsequent request.
-#[derive(Default)]
+/// `Copy`: `chat` snapshots it once per request — the echo decision (message
+/// building) and `apply_learned` (body finishing) must read the same bits.
+#[derive(Default, Clone, Copy)]
 struct LearnedFixes {
     max_completion_tokens: bool,
     no_stream_options: bool,
     no_reasoning_effort: bool,
+    no_reasoning_echo: bool,
 }
 
 /// Streaming `<think>…</think>` separator for the openai-compat content
@@ -339,17 +406,21 @@ impl LearnedFixes {
             BodyFix::MaxCompletionTokens => self.max_completion_tokens = true,
             BodyFix::DropStreamOptions => self.no_stream_options = true,
             BodyFix::DropReasoningEffort => self.no_reasoning_effort = true,
+            BodyFix::DropReasoningEcho => self.no_reasoning_echo = true,
         }
     }
 
     /// Export projection (FR-3): the public, serializable bit set — this is
     /// what `gateway_fixes()` reports and what a host persists into the next
-    /// process's `Config::gateway_fixes_preset`.
-    fn to_fixes(&self) -> super::GatewayFixes {
+    /// process's `Config::gateway_fixes_preset`. Takes `self` by value: four
+    /// booleans, `Copy`, and a by-value receiver is the convention for a
+    /// `to_*` method on a `Copy` type.
+    fn to_fixes(self) -> super::GatewayFixes {
         super::GatewayFixes {
             max_completion_tokens: self.max_completion_tokens,
             no_stream_options: self.no_stream_options,
             no_reasoning_effort: self.no_reasoning_effort,
+            no_reasoning_echo: self.no_reasoning_echo,
         }
     }
 }
@@ -377,6 +448,45 @@ fn reject_documents(messages: &[Message]) -> Result<()> {
     Ok(())
 }
 
+/// Does this request body echo reasoning on any assistant message
+/// (`reasoning_content` present)? The no-op guard for
+/// `BodyFix::DropReasoningEcho` — same discipline as the other fixes: only
+/// diagnose a fix the body actually has something to undo.
+fn body_echoes_reasoning(body: &Value) -> bool {
+    body["messages"]
+        .as_array()
+        .is_some_and(|msgs| msgs.iter().any(|m| m.get("reasoning_content").is_some()))
+}
+
+/// The replayable form of a response's `reasoning_content` so far: one block
+/// that preceded every content block (`before: 0` — chat-completions streams
+/// the reasoning trace ahead of `content` and `tool_calls`, so "first" is
+/// both its real and its only position). `None` when none arrived.
+fn reasoning_so_far(text: &str) -> Option<super::Reasoning> {
+    if text.is_empty() {
+        return None;
+    }
+    super::into_reasoning(
+        super::REASONING_OPENAI,
+        vec![super::ReasoningBlock {
+            before: 0,
+            text: text.to_string(),
+            opaque: json!({}),
+        }],
+    )
+}
+
+/// Remove `reasoning_content` from every message of a chat body.
+fn strip_reasoning_echo(obj: &mut serde_json::Map<String, Value>) {
+    if let Some(Value::Array(msgs)) = obj.get_mut("messages") {
+        for m in msgs {
+            if let Some(o) = m.as_object_mut() {
+                o.remove("reasoning_content");
+            }
+        }
+    }
+}
+
 impl Provider for OpenAi {
     fn chat(&self, req: &ChatRequest, on_event: &mut dyn FnMut(ChatEvent)) -> Result<ChatResponse> {
         // Cancel checkpoint before the first POST — the anthropic side has
@@ -401,8 +511,13 @@ impl Provider for OpenAi {
         if let Some(sys) = req.system {
             messages.push(json!({"role": "system", "content": sys}));
         }
+        // Snapshot the learned fixes ONCE per request (Copy): the message
+        // building below (does the gateway take `reasoning_content`?) and
+        // `apply_learned` further down must agree — reading the mutex twice
+        // would let a fix recorded in between produce a half-adjusted body.
+        let learned = self.snapshot_fixes();
         for m in req.messages {
-            messages.extend(Self::message_jsons(m));
+            messages.extend(Self::message_jsons(m, !learned.no_reasoning_echo));
         }
 
         let mut body = json!({
@@ -430,18 +545,17 @@ impl Provider for OpenAi {
         if !req.tools.is_empty() {
             body["tools"] = Self::tools_json(req.tools);
         }
+        // Config extras, BEFORE the learned fixes: a fix learned from a 400
+        // about a field that only the extras supply (say `reasoning_effort`
+        // spelled by a relay) must still stick on later turns — merging after
+        // would re-add it every time.
+        self.extras.merge_body(&mut body);
         // Apply fixes learned from prior turns' 400s proactively: a reasoning
         // model on an old gateway otherwise 400s on `max_tokens` every single
         // turn (and eats the retry round-trip each time). Learned fixes are
         // sticky for the provider's lifetime — a gateway's quirks don't change
         // mid-session.
-        {
-            // Poison-tolerant lock (mcp.rs precedent): this critical section
-            // has no panic path, so into_inner is safe — and a poisoning
-            // elsewhere can't cascade into a second panic here.
-            let learned = self.fixes.lock().unwrap_or_else(|e| e.into_inner());
-            Self::apply_learned(&mut body, &learned);
-        }
+        Self::apply_learned(&mut body, &learned);
 
         // The per-request timeout is a BUDGET for the whole chat() call, not
         // a fresh allowance per HTTP round-trip (external re-review P2): a
@@ -459,9 +573,10 @@ impl Provider for OpenAi {
 
         // A 400 may name a field this gateway doesn't accept (newer reasoning
         // models reject `max_tokens`; older gateways/vLLM reject the unknown
-        // `stream_options` / `reasoning_effort`). Diagnose, apply the fix, and
-        // RECORD it so the next turn's body is already fixed. At most three
-        // turns of the loop (three distinct fields); when no known fix applies
+        // `stream_options` / `reasoning_effort`; some reject `reasoning_content`
+        // echoed back on assistant messages). Diagnose, apply the fix, and
+        // RECORD it so the next turn's body is already fixed. At most four
+        // turns of the loop (four distinct fields); when no known fix applies
         // the 400 bails with the text.
         //
         // RECORD-ON-SUCCESS: fixes are persisted only after the adjusted body
@@ -475,7 +590,7 @@ impl Provider for OpenAi {
         // for the same value reason (and the 400s it triggers are of the
         // unfixable kind).
         let mut applied: Vec<BodyFix> = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..4 {
             if resp.status() != reqwest::StatusCode::BAD_REQUEST {
                 break;
             }
@@ -501,12 +616,14 @@ impl Provider for OpenAi {
                 }
                 None => {
                     // Structured status + historical display text
-                    // (see ApiStatusError).
-                    return Err(super::ApiStatusError::new(
-                        400,
-                        format!("OpenAI-compatible API error 400: {text}"),
-                    )
-                    .into());
+                    // (see ApiStatusError) — plus the carry hint when the 400
+                    // is the "reasoning trace missing" class (a body edit
+                    // can't repair what was never kept).
+                    let mut msg = format!("OpenAI-compatible API error 400: {text}");
+                    if !body_echoes_reasoning(&body) && text.contains("reasoning_content") {
+                        msg.push_str(super::REASONING_CARRY_HINT);
+                    }
+                    return Err(super::ApiStatusError::new(400, msg).into());
                 }
             }
         }
@@ -527,8 +644,9 @@ impl Provider for OpenAi {
         // The gateway accepted the (possibly adjusted) body — now the applied
         // fixes are proven to be about field acceptance, persist them.
         if !applied.is_empty() {
-            // Same poison-tolerant lock (mcp.rs precedent) as the
-            // apply_learned site above.
+            // Poison-tolerant lock (mcp.rs precedent): this critical section
+            // has no panic path, so into_inner is safe — and a poisoning
+            // elsewhere can't cascade into a second panic here.
             let mut learned = self.fixes.lock().unwrap_or_else(|e| e.into_inner());
             for fix in applied {
                 learned.record(fix);
@@ -563,16 +681,27 @@ impl Provider for OpenAi {
 }
 
 impl OpenAi {
+    /// The learned fixes as of now. Poison-tolerant lock (mcp.rs precedent):
+    /// nothing under the lock can panic, so a poisoning elsewhere can't
+    /// cascade into a second panic here.
+    fn snapshot_fixes(&self) -> LearnedFixes {
+        *self
+            .fixes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn post(
         &self,
         body: &Value,
         timeout: Option<std::time::Duration>,
     ) -> Result<reqwest::blocking::Response> {
-        let mut rb = self
+        let rb = self
             .client
             .post(format!("{}/chat/completions", self.base_url))
             .bearer_auth(&self.api_key)
             .header("content-type", "application/json");
+        let mut rb = self.extras.apply_headers(rb);
         if let Some(t) = timeout {
             rb = rb.timeout(t);
         }
@@ -587,6 +716,8 @@ impl OpenAi {
     /// - `stream_options` → drop it (older gateways / vLLM). Usage then goes
     ///   unreported, which `parse_loop` already tolerates as `None`.
     /// - `reasoning_effort` → drop it (old gateways don't know the field).
+    /// - `reasoning_content` → strip it off the assistant messages (gateways
+    ///   that reject an echoed reasoning trace).
     ///
     /// Thin wrapper over `diagnose_400` + `apply_fix` so the live path can
     /// RECORD the specific fix (to skip the 400 next turn) while this stays a
@@ -612,6 +743,13 @@ impl OpenAi {
         if text.contains("reasoning_effort") && body.get("reasoning_effort").is_some() {
             return Some(BodyFix::DropReasoningEffort);
         }
+        // A 400 naming `reasoning_content` while the body echoes some: the
+        // gateway takes no reasoning on assistant messages. (A 400 about
+        // `reasoning_effort` never reads "reasoning_content", so the two
+        // rules can't shadow each other.)
+        if text.contains("reasoning_content") && body_echoes_reasoning(body) {
+            return Some(BodyFix::DropReasoningEcho);
+        }
         None
     }
 
@@ -633,6 +771,7 @@ impl OpenAi {
             BodyFix::DropReasoningEffort => {
                 obj.remove("reasoning_effort");
             }
+            BodyFix::DropReasoningEcho => strip_reasoning_echo(obj),
         }
     }
 
@@ -653,6 +792,12 @@ impl OpenAi {
         }
         if learned.no_reasoning_effort {
             obj.remove("reasoning_effort");
+        }
+        // Belt and braces: `chat` already builds the messages without the
+        // echo under this bit; a preset or a concurrent learner makes this the
+        // single place the guarantee is kept regardless.
+        if learned.no_reasoning_echo {
+            strip_reasoning_echo(obj);
         }
     }
 
@@ -690,6 +835,10 @@ impl OpenAi {
         let mut saw_payload = false;
         let mut abort: Option<&'static str> = None;
         let mut usage: Option<Usage> = None;
+        // Reasoning carry: the turn's `reasoning_content` deltas, joined.
+        // Display still goes through ThinkingDelta per delta; this copy is
+        // the replayable state the agent may keep (`Config.preserved_reasoning`).
+        let mut reasoning_text = String::new();
         // FR-2: `<think>` splitter across the content channel. `None` = knob
         // off, the raw passthrough shape (byte-identical to pre-FR-2).
         let mut stripper = strip_think_tags.then(ThinkStripper::default);
@@ -742,6 +891,7 @@ impl OpenAi {
                         "[stream error] OpenAI stream read error: {msg}"
                     )));
                     return Ok(ChatResponse {
+                        reasoning: reasoning_so_far(&reasoning_text),
                         blocks,
                         stop_reason: "stream_error".into(),
                         usage,
@@ -770,6 +920,7 @@ impl OpenAi {
                     err["message"].as_str().unwrap_or("(no message)")
                 )));
                 return Ok(ChatResponse {
+                    reasoning: reasoning_so_far(&reasoning_text),
                     blocks,
                     stop_reason: "stream_error".into(),
                     usage,
@@ -796,6 +947,13 @@ impl OpenAi {
                     .unwrap_or(0);
                 let prompt = u["prompt_tokens"].as_u64().unwrap_or(0);
                 usage = Some(Usage {
+                    // OpenAI-compat reports the reasoning share of the
+                    // completion separately (`completion_tokens_details.
+                    // reasoning_tokens`); a subset split of output_tokens,
+                    // never an extra axis — 0 when the gateway doesn't say.
+                    reasoning_tokens: u["completion_tokens_details"]["reasoning_tokens"]
+                        .as_u64()
+                        .unwrap_or(0),
                     input_tokens: prompt.saturating_sub(cached),
                     output_tokens: u["completion_tokens"].as_u64().unwrap_or(0),
                     cache_creation_input_tokens: 0,
@@ -837,8 +995,15 @@ impl OpenAi {
             }
             // Reasoning models stream the thinking trace to the UI. Surface it as
             // a ThinkingDelta event ONLY — never into `text`/blocks: the reply is
-            // `content`, and no major API asks thinking to be echoed back.
-            // Field absent → non-reasoning model, zero behavior change.
+            // `content`, and the trace is not part of it. What the trace CAN do
+            // is ride back as replayable state (reasoning carry, the agent's
+            // decision) — and only the vendor-native field qualifies: a
+            // gateway that sends `reasoning_content` is speaking the
+            // DeepSeek/GLM protocol whose assistant messages take it back,
+            // whereas OpenRouter's normalized `reasoning` is a display
+            // projection with no documented input twin, so it stays
+            // display-only. Field absent → non-reasoning model, zero behavior
+            // change.
             //
             // The field name is NOT standardized across OpenAI-compatible gateways:
             //   - DeepSeek-R1 / GLM / o-series (direct) → delta.reasoning_content
@@ -855,6 +1020,9 @@ impl OpenAi {
                 .or_else(|| delta["reasoning"].as_str().filter(|s| !s.is_empty()))
             {
                 on_event(ChatEvent::ThinkingDelta(r.to_string()));
+                if delta["reasoning_content"].as_str() == Some(r) {
+                    reasoning_text.push_str(r);
+                }
             }
             if let Some(tc) = delta["tool_calls"].as_array() {
                 for call in tc {
@@ -943,6 +1111,7 @@ impl OpenAi {
             }
         };
         Ok(ChatResponse {
+            reasoning: reasoning_so_far(&reasoning_text),
             blocks,
             stop_reason,
             usage,
@@ -985,7 +1154,7 @@ mod review_pins;
 mod tests {
     use super::*;
     use crate::provider::Message;
-    use std::io::{BufRead, BufReader, Read, Write};
+    use std::io::Write;
     use std::net::TcpListener;
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
@@ -1036,6 +1205,72 @@ mod tests {
         assert_eq!(fixed.get("max_tokens"), Some(&json!(100))); // untouched
     }
 
+    /// A chat body whose assistant message echoes a reasoning trace — the
+    /// shape `chat()` builds while reasoning carry is on.
+    fn echoing_body() -> Value {
+        json!({
+            "model": "m",
+            "max_tokens": 100,
+            "reasoning_effort": "high",
+            "messages": [
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": "a", "reasoning_content": "trace one"},
+                {"role": "assistant", "content": "b", "reasoning_content": "trace two"},
+            ],
+        })
+    }
+
+    #[test]
+    fn body_fix_strips_the_reasoning_echo() {
+        // A gateway that takes no `reasoning_content` on assistant messages
+        // 400s naming it — strip the field from EVERY message and retry; the
+        // message order, contents and every other field stay untouched.
+        let fixed = OpenAi::body_fix_for_400(
+            "Invalid value for 'messages[1]': reasoning_content is not supported",
+            &echoing_body(),
+        )
+        .unwrap();
+        let msgs = fixed["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        for m in msgs {
+            assert!(m.get("reasoning_content").is_none(), "{m}");
+        }
+        assert_eq!(msgs[1]["content"], "a");
+        assert_eq!(msgs[2]["content"], "b");
+        assert_eq!(fixed["reasoning_effort"], "high");
+        assert_eq!(fixed["max_tokens"], 100);
+    }
+
+    #[test]
+    fn body_fix_reasoning_echo_400_without_an_echo_is_not_a_fix() {
+        // The no-op guard: the body echoes nothing, so stripping would change
+        // nothing and the resend would loop on the same 400. Notably this is
+        // the "Missing reasoning_content" class — the endpoint WANTS the
+        // trace and the carry switch is off — which no body fix can repair.
+        let body = json!({"model": "m", "max_tokens": 100, "messages": [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "a"},
+        ]});
+        assert!(OpenAi::body_fix_for_400(
+            "Missing `reasoning_content` field in the assistant message at message index 1",
+            &body
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn reasoning_effort_400_does_not_touch_the_echo() {
+        // The two rules read different substrings: a 400 about
+        // `reasoning_effort` drops that field only — the echo survives.
+        let fixed = OpenAi::body_fix_for_400(
+            "Unrecognized request argument: reasoning_effort",
+            &echoing_body(),
+        )
+        .unwrap();
+        assert!(fixed.get("reasoning_effort").is_none());
+        assert_eq!(fixed["messages"][1]["reasoning_content"], "trace one");
+    }
+
     #[test]
     fn tool_result_becomes_tool_message() {
         let m = Message::user(vec![Block::ToolResult {
@@ -1044,7 +1279,7 @@ mod tests {
             image: None,
             is_error: false,
         }]);
-        let msgs = OpenAi::message_jsons(&m);
+        let msgs = OpenAi::message_jsons(&m, false);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0]["role"], "tool");
         assert_eq!(msgs[0]["tool_call_id"], "call_1");
@@ -1062,7 +1297,7 @@ mod tests {
             })),
             is_error: false,
         }]);
-        let msgs = OpenAi::message_jsons(&m);
+        let msgs = OpenAi::message_jsons(&m, false);
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0]["role"], "tool");
         assert_eq!(msgs[1]["role"], "user");
@@ -1112,7 +1347,7 @@ mod tests {
             media_type: "application/pdf".into(),
             data: "JVBERi0=".into(),
         }]);
-        let msgs = OpenAi::message_jsons(&m);
+        let msgs = OpenAi::message_jsons(&m, false);
         assert_eq!(msgs[0]["content"][0]["type"], "text");
         assert!(msgs[0]["content"][0]["text"]
             .as_str()
@@ -1130,7 +1365,7 @@ mod tests {
                 input: json!({"command": "ls"}),
             },
         ]);
-        let msgs = OpenAi::message_jsons(&m);
+        let msgs = OpenAi::message_jsons(&m, false);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0]["content"], "checking");
         assert_eq!(msgs[0]["tool_calls"][0]["function"]["name"], "shell");
@@ -1380,6 +1615,146 @@ mod tests {
         // reasoning + reasoning_details did NOT leak into the reply text / blocks.
         assert_eq!(resp.blocks.len(), 1);
         assert!(matches!(&resp.blocks[0], Block::Text(t) if t == "ok"));
+        // …and they are not replayable state either: OpenRouter's normalized
+        // field is a display channel with no vendor echo contract (the
+        // per-vendor encrypted details ride `reasoning_details`, which are not
+        // plain text to hand back). Only the native `reasoning_content` is.
+        assert!(resp.reasoning.is_none());
+    }
+
+    #[test]
+    fn stream_reasoning_content_is_kept_as_replayable_state() {
+        // The vendor-native field is the one with an echo contract (DeepSeek /
+        // GLM inside a tool loop): its deltas are joined into the response's
+        // `reasoning` side field, ahead of every content block, and stay out of
+        // `blocks` exactly as before.
+        let raw = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"let me think\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" more\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let resp = OpenAi::parse_stream(raw.as_bytes(), &mut |_| {}).unwrap();
+        let r = resp.reasoning.expect("reasoning_content must be captured");
+        assert_eq!(r.provider, super::super::REASONING_OPENAI);
+        assert_eq!(r.blocks.len(), 1);
+        assert_eq!(r.blocks[0].before, 0);
+        assert_eq!(r.blocks[0].text, "let me think more");
+        assert_eq!(r.blocks[0].opaque, json!({}));
+        assert_eq!(resp.blocks.len(), 1);
+    }
+
+    #[test]
+    fn stream_without_reasoning_content_has_no_state() {
+        // A plain reply, and one whose thinking arrived as inline `<think>`
+        // tags on the content channel (a content convention, stripped for
+        // display only): neither leaves replayable state.
+        let plain = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let resp = OpenAi::parse_stream(plain.as_bytes(), &mut |_| {}).unwrap();
+        assert!(resp.reasoning.is_none());
+        assert_eq!(resp.blocks.len(), 1);
+        let inline = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"<think>inner</think>ok\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut thinking = String::new();
+        let resp = OpenAi::parse_stream(inline.as_bytes(), &mut |e| {
+            if let crate::provider::ChatEvent::ThinkingDelta(t) = e {
+                thinking.push_str(&t);
+            }
+        })
+        .unwrap();
+        assert_eq!(thinking, "inner");
+        assert!(resp.reasoning.is_none());
+        assert!(matches!(&resp.blocks[0], Block::Text(t) if t == "ok"));
+    }
+
+    #[test]
+    fn stream_error_keeps_the_reasoning_received_so_far() {
+        // Same honest-partial discipline as text and usage: the trace that
+        // arrived before the error is not thrown away by the error path.
+        let raw = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"half a thought\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"half a reply\"}}]}\n\n",
+            "data: {\"error\":{\"message\":\"server overloaded mid-generation\"}}\n\n",
+        );
+        let resp = OpenAi::parse_stream(raw.as_bytes(), &mut |_| {}).unwrap();
+        assert_eq!(resp.stop_reason, "stream_error");
+        assert_eq!(
+            resp.reasoning.map(|r| r.blocks[0].text.clone()),
+            Some("half a thought".to_string())
+        );
+    }
+
+    #[test]
+    fn stream_usage_reads_reasoning_tokens() {
+        // OpenAI-compat reports the reasoning share of the completion as
+        // completion_tokens_details.reasoning_tokens — a subset split of
+        // completion_tokens, surfaced on its own axis (never added to the
+        // totals). 0 when the gateway doesn't report it (test above).
+        let raw = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"mull\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":50,\"total_tokens\":60,\"completion_tokens_details\":{\"reasoning_tokens\":40}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let resp = OpenAi::parse_stream(raw.as_bytes(), &mut |_| {}).unwrap();
+        let u = resp.usage.expect("usage frame present");
+        assert_eq!(u.reasoning_tokens, 40);
+        assert_eq!(u.output_tokens, 50);
+    }
+
+    /// An assistant message carrying reasoning `texts`, tagged for `provider`.
+    fn carried(provider: &str, texts: &[&str]) -> Message {
+        let mut m = Message::assistant(vec![Block::Text("answer".into())]);
+        m.reasoning = Some(super::super::Reasoning {
+            provider: provider.into(),
+            blocks: texts
+                .iter()
+                .map(|t| super::super::ReasoningBlock {
+                    before: 0,
+                    text: (*t).into(),
+                    opaque: json!({}),
+                })
+                .collect(),
+        });
+        m
+    }
+
+    #[test]
+    fn message_jsons_echoes_reasoning_content_on_assistant_messages() {
+        let m = carried("openai", &["step one", "step two"]);
+        let v = OpenAi::message_jsons(&m, true);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0]["role"], "assistant");
+        assert_eq!(v[0]["reasoning_content"], "step one\nstep two");
+        assert_eq!(v[0]["content"], "answer");
+        // Echo off = the pre-carry wire shape (switch off, or the gateway
+        // taught us it rejects the field).
+        let v = OpenAi::message_jsons(&m, false);
+        assert!(v[0].get("reasoning_content").is_none());
+        assert_eq!(v[0]["content"], "answer");
+    }
+
+    #[test]
+    fn message_jsons_echo_skips_foreign_state_and_empty_text() {
+        // Anthropic-tagged state (signed thinking) never goes out on the
+        // chat-completions wire.
+        let v = OpenAi::message_jsons(&carried("anthropic", &["x"]), true);
+        assert!(v[0].get("reasoning_content").is_none());
+        // A block with no readable text (redacted-only) has nothing to send.
+        let v = OpenAi::message_jsons(&carried("openai", &[""]), true);
+        assert!(v[0].get("reasoning_content").is_none());
+        // User messages never carry the field, whatever is attached to them.
+        let mut u = Message::user(vec![Block::Text("hi".into())]);
+        u.reasoning = carried("openai", &["x"]).reasoning;
+        let v = OpenAi::message_jsons(&u, true);
+        assert_eq!(v[0]["role"], "user");
+        assert!(v[0].get("reasoning_content").is_none());
     }
 
     #[test]
@@ -1455,7 +1830,7 @@ mod tests {
                 is_error: false,
             },
         ]);
-        let msgs = OpenAi::message_jsons(&m);
+        let msgs = OpenAi::message_jsons(&m, false);
         let roles: Vec<&str> = msgs
             .iter()
             .map(|v| v["role"].as_str().unwrap_or(""))
@@ -1582,32 +1957,9 @@ mod tests {
     // socket per request (no pool reuse) — exactly one mock accept per request,
     // in arrival order, with no keep-alive ambiguity.
 
-    /// Read one HTTP request's body off `stream`: parse the headers for
-    /// Content-Length, then read exactly that many bytes. Consumes the request
-    /// so the response can be written back on the same socket.
-    fn read_http_body(stream: &std::net::TcpStream) -> String {
-        let mut reader = BufReader::new(stream.try_clone().expect("clone tcp"));
-        let mut content_length = 0usize;
-        loop {
-            let mut line = String::new();
-            match reader.read_line(&mut line) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
-            }
-            let trimmed = line.trim_end_matches(['\r', '\n']);
-            if trimmed.is_empty() {
-                break; // end of headers
-            }
-            if let Some(v) = trimmed.to_ascii_lowercase().strip_prefix("content-length:") {
-                content_length = v.trim().parse().unwrap_or(0);
-            }
-        }
-        let mut body = vec![0u8; content_length];
-        if content_length > 0 {
-            let _ = reader.read_exact(&mut body);
-        }
-        String::from_utf8_lossy(&body).into_owned()
-    }
+    /// Read one HTTP request's body off `stream` (the shared loopback
+    /// reader — see `provider::testhttp`).
+    use crate::provider::testhttp::read_http_body;
 
     /// Loopback OpenAI-compatible mock driven by the REQUEST BODY (not request
     /// position): any request whose body carries the `max_tokens` key gets a
@@ -2172,12 +2524,239 @@ mod tests {
         assert_eq!(
             provider.gateway_fixes(),
             crate::provider::GatewayFixes {
+                no_reasoning_echo: false,
                 max_completion_tokens: true,
                 no_stream_options: false,
                 no_reasoning_effort: false,
             },
             "exactly the learned bit exports"
         );
+    }
+
+    /// Loopback gateway that takes no `reasoning_content` on assistant
+    /// messages: any request whose body carries the key gets a 400 naming it
+    /// (driving diagnose_400 → DropReasoningEcho); every other request gets a
+    /// minimal success SSE. Bodies recorded in arrival order.
+    fn reasoning_echo_400_mock() -> (String, Arc<Mutex<Vec<Value>>>) {
+        crate::provider::testhttp::gateway(|body| {
+            let echoes = serde_json::from_str::<Value>(body)
+                .map(|v| body_echoes_reasoning(&v))
+                .unwrap_or(false);
+            if echoes {
+                crate::provider::testhttp::json_error(
+                    "400 Bad Request",
+                    "Invalid value for 'messages[1]': reasoning_content is not supported",
+                )
+            } else {
+                crate::provider::testhttp::sse_says("hi")
+            }
+        })
+    }
+
+    /// A request whose history echoes a reasoning trace on the assistant turn
+    /// (what the agent sends inside a tool loop while reasoning carry is on).
+    fn echoing_req(cancel: &Arc<AtomicBool>) -> ChatRequest<'static> {
+        let msgs: &'static [Message] = Box::leak(
+            vec![
+                Message::user(vec![Block::Text("turn one".into())]),
+                carried("openai", &["thinking"]),
+            ]
+            .into_boxed_slice(),
+        );
+        ChatRequest {
+            system: None,
+            messages: msgs,
+            tools: &[],
+            model: "m",
+            max_tokens: 100,
+            per_request_timeout: Some(std::time::Duration::from_secs(10)),
+            cancel: cancel.clone(),
+            cache: true,
+            reasoning_effort: None,
+            temperature: None,
+        }
+    }
+
+    /// The echo's own teaching 400, end to end: the first request carries
+    /// `reasoning_content`, the gateway rejects the field, the resend strips
+    /// it and succeeds, and the fix is recorded so the NEXT turn's first
+    /// request already goes out without it (no repeated 400 round-trip).
+    #[test]
+    fn reasoning_echo_400_teaches_the_provider_to_stop_echoing() {
+        let (url, bodies) = reasoning_echo_400_mock();
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("reqwest client");
+        let provider = OpenAi::new(client, url, "k", std::time::Duration::from_secs(30));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let req = echoing_req(&cancel);
+
+        let r1 = provider
+            .chat(&req, &mut |_| {})
+            .expect("turn 1 recovers after the teaching 400");
+        assert_eq!(r1.stop_reason, "end_turn");
+        let r2 = provider.chat(&req, &mut |_| {}).expect("turn 2 succeeds");
+        assert_eq!(r2.stop_reason, "end_turn");
+
+        let received = bodies.lock().unwrap().clone();
+        assert_eq!(
+            received.len(),
+            3,
+            "turn 1 = 400 + fixed resend, turn 2 = one request; saw {}",
+            received.len()
+        );
+        assert_eq!(received[0]["messages"][1]["reasoning_content"], "thinking");
+        assert!(
+            received[1]["messages"][1]
+                .get("reasoning_content")
+                .is_none(),
+            "the resend must carry the stripped body"
+        );
+        assert!(
+            received[2]["messages"][1]
+                .get("reasoning_content")
+                .is_none(),
+            "turn 2 must go out without the echo from the start"
+        );
+        assert_eq!(
+            provider.gateway_fixes(),
+            crate::provider::GatewayFixes {
+                no_reasoning_echo: true,
+                ..Default::default()
+            },
+            "exactly the learned bit exports"
+        );
+    }
+
+    /// A preset `no_reasoning_echo` (learned in a previous process, fed
+    /// through `Config::gateway_fixes_preset`) makes the very first request
+    /// skip the echo — and the teaching 400 with it.
+    #[test]
+    fn preset_no_reasoning_echo_skips_the_teaching_400() {
+        let (url, bodies) = reasoning_echo_400_mock();
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("reqwest client");
+        let preset = crate::provider::GatewayFixes {
+            no_reasoning_echo: true,
+            ..Default::default()
+        };
+        let provider =
+            OpenAi::new(client, url, "k", std::time::Duration::from_secs(30)).with_preset(preset);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let r = provider
+            .chat(&echoing_req(&cancel), &mut |_| {})
+            .expect("request succeeds on the preset");
+        assert_eq!(r.stop_reason, "end_turn");
+        let received = bodies.lock().unwrap().clone();
+        assert_eq!(
+            received.len(),
+            1,
+            "preset must skip the teaching 400 entirely; saw {} requests",
+            received.len()
+        );
+        assert!(received[0]["messages"][1]
+            .get("reasoning_content")
+            .is_none());
+        assert_eq!(received[0]["messages"][1]["content"], "answer");
+        // 导出/预置往返等价。
+        assert_eq!(provider.gateway_fixes(), preset);
+    }
+
+    /// The other reasoning 400: carry is off (the default), the request
+    /// carries no `reasoning_content`, and the endpoint insists on it. No
+    /// body edit can supply what was never kept, so the turn fails honestly —
+    /// with the text naming the switch that repairs it.
+    #[test]
+    fn missing_reasoning_400_names_the_carry_switch() {
+        let (url, bodies) = crate::provider::testhttp::gateway(|_| {
+            crate::provider::testhttp::json_error(
+                "400 Bad Request",
+                "Missing `reasoning_content` field in the assistant message at message index 1",
+            )
+        });
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("reqwest client");
+        let provider = OpenAi::new(client, url, "k", std::time::Duration::from_secs(30));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let m = vec![
+            Message::user(vec![Block::Text("q".into())]),
+            Message::assistant(vec![Block::Text("a".into())]),
+        ];
+        let req = ChatRequest {
+            system: None,
+            messages: &m,
+            tools: &[],
+            model: "m",
+            max_tokens: 100,
+            per_request_timeout: Some(std::time::Duration::from_secs(10)),
+            cancel,
+            cache: true,
+            reasoning_effort: None,
+            temperature: None,
+        };
+        let err = provider
+            .chat(&req, &mut |_| {})
+            .err()
+            .expect("nothing to resend — the missing trace was never kept")
+            .to_string();
+        assert!(err.contains("Missing `reasoning_content`"), "{err}");
+        assert!(
+            err.contains("`preserved_reasoning: true`"),
+            "the 400 must name the switch: {err}"
+        );
+        // One request, nothing learned: there is no field to drop.
+        assert_eq!(bodies.lock().unwrap().len(), 1);
+        assert_eq!(
+            provider.gateway_fixes(),
+            crate::provider::GatewayFixes::default()
+        );
+    }
+
+    /// The hint is specific to the reasoning 400 — any other 400 keeps its
+    /// plain text.
+    #[test]
+    fn unrelated_400_carries_no_carry_hint() {
+        let (url, _bodies) = crate::provider::testhttp::gateway(|_| {
+            crate::provider::testhttp::json_error(
+                "400 Bad Request",
+                "your account is out of credits",
+            )
+        });
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("reqwest client");
+        let provider = OpenAi::new(client, url, "k", std::time::Duration::from_secs(30));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let m = vec![Message::user(vec![Block::Text("q".into())])];
+        let req = ChatRequest {
+            system: None,
+            messages: &m,
+            tools: &[],
+            model: "m",
+            max_tokens: 100,
+            per_request_timeout: Some(std::time::Duration::from_secs(10)),
+            cancel,
+            cache: true,
+            reasoning_effort: None,
+            temperature: None,
+        };
+        let err = provider
+            .chat(&req, &mut |_| {})
+            .err()
+            .expect("an unfixable 400 fails the turn")
+            .to_string();
+        assert!(err.contains("out of credits"), "{err}");
+        assert!(!err.contains("preserved_reasoning"), "{err}");
     }
 
     // ── FR-2 缩减版：内联 <think> 剥离（ThinkStripper） ──────────────────
@@ -2384,5 +2963,126 @@ mod tests {
         assert!(!o.strip_think_tags);
         let o = o.with_strip_think_tags(true);
         assert!(o.strip_think_tags);
+    }
+
+    /// A plain one-message request (no carried reasoning, no tools).
+    fn plain_req() -> ChatRequest<'static> {
+        let msgs: &'static [Message] =
+            Box::leak(vec![Message::user(vec![Block::Text("hi".into())])].into_boxed_slice());
+        ChatRequest {
+            system: None,
+            messages: msgs,
+            tools: &[],
+            model: "m",
+            max_tokens: 100,
+            per_request_timeout: Some(std::time::Duration::from_secs(10)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            cache: true,
+            reasoning_effort: None,
+            temperature: None,
+        }
+    }
+
+    /// `Config.extra_body` / `extra_headers` reach the wire through the one
+    /// production wiring point (`provider::build`): new fields and headers
+    /// ride along, while a kernel-written body field or header keeps its
+    /// value — here from a config that skipped the load-time check (built
+    /// straight from JSON, reserved entries and all).
+    #[test]
+    fn chat_sends_the_config_extras_on_the_wire() {
+        use crate::provider::testhttp;
+        let gw = testhttp::gateway_inspected(|_| testhttp::sse_says("ok"));
+        let cfg: crate::config::Config = serde_json::from_str(&format!(
+            r#"{{"provider":"openai","api_key_env":"K","model":"m","base_url":{:?},
+                "extra_body":{{"top_p":0.9,"model":"smuggled","stream":false}},
+                "extra_headers":{{"X-Title":"app","Authorization":"Bearer evil",
+                                  "HTTP-Referer":"https://example.test"}}}}"#,
+            gw.url
+        ))
+        .unwrap();
+        let prov = crate::provider::build(&cfg, "k", reqwest::blocking::Client::new());
+        let req = plain_req();
+        let resp = prov.chat(&req, &mut |_| {}).unwrap();
+        assert!(
+            matches!(resp.blocks.as_slice(), [Block::Text(t)] if t == "ok"),
+            "{:?}",
+            resp.blocks
+        );
+        let bodies = gw.bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0]["top_p"], 0.9);
+        assert_eq!(bodies[0]["model"], "m");
+        assert_eq!(bodies[0]["max_tokens"], 100);
+        assert_eq!(
+            bodies[0]["stream"], true,
+            "streaming is the kernel's decision"
+        );
+        let heads = gw.heads.lock().unwrap();
+        let head = &heads[0];
+        for wanted in [
+            "authorization: bearer k",
+            "content-type: application/json",
+            "x-title: app",
+            "http-referer: https://example.test",
+        ] {
+            assert!(
+                head.iter().any(|l| l == wanted),
+                "{wanted} missing from {head:?}"
+            );
+        }
+        assert!(
+            !head
+                .iter()
+                .any(|l| l.starts_with("authorization: bearer evil")),
+            "the key header cannot be swapped from the extras: {head:?}"
+        );
+    }
+
+    /// A fix learned from a 400 about a field only the extras supply must
+    /// stick: the extras are merged BEFORE the learned fixes, so the next
+    /// turn's first request already goes out without the field instead of
+    /// paying the teaching 400 again on every turn.
+    #[test]
+    fn learned_fix_outlasts_a_field_supplied_by_extra_body() {
+        use crate::provider::testhttp;
+        let gw = testhttp::gateway_inspected(|body| {
+            if body.contains("reasoning_effort") {
+                testhttp::json_error(
+                    "400 Bad Request",
+                    "Unrecognized request argument supplied: reasoning_effort",
+                )
+            } else {
+                testhttp::sse_says("ok")
+            }
+        });
+        let cfg: crate::config::Config = serde_json::from_str(&format!(
+            r#"{{"provider":"openai","api_key_env":"K","model":"m","base_url":{:?},
+                "extra_body":{{"reasoning_effort":"high"}}}}"#,
+            gw.url
+        ))
+        .unwrap();
+        let prov = crate::provider::build(&cfg, "k", reqwest::blocking::Client::new());
+        let req = plain_req();
+        prov.chat(&req, &mut |_| {}).unwrap();
+        prov.chat(&req, &mut |_| {}).unwrap();
+        let heads = gw.heads.lock().unwrap();
+        assert_eq!(
+            heads.len(),
+            3,
+            "teaching 400 + its resend, then one request"
+        );
+        let bodies = gw.bodies.lock().unwrap();
+        assert_eq!(
+            bodies[0]["reasoning_effort"], "high",
+            "the extra rides along"
+        );
+        assert!(
+            bodies[1].get("reasoning_effort").is_none(),
+            "fixed on the resend"
+        );
+        assert!(
+            bodies[2].get("reasoning_effort").is_none(),
+            "the learned fix outlasts the extras merge"
+        );
     }
 }

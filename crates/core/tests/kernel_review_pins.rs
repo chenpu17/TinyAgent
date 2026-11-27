@@ -16,6 +16,7 @@ use tiny_agent::{
 
 fn user_text(s: &str) -> Message {
     Message {
+        reasoning: None,
         id: None,
         role: tiny_agent::Role::User,
         content: vec![Block::Text(s.to_string())],
@@ -35,6 +36,8 @@ fn cfg_with(max_turns: u32) -> Config {
 
 fn test_ctx() -> ToolCtx {
     ToolCtx {
+        tool_annotations: std::sync::Arc::new(std::collections::BTreeMap::new()),
+        hidden_env: Vec::new(),
         tool_absent_notes: Vec::new(),
         workdir: std::env::current_dir().unwrap(),
         max_output_chars: 1000,
@@ -70,9 +73,11 @@ impl Provider for ZeroBlockProvider {
         _on_event: &mut dyn FnMut(tiny_agent::provider::ChatEvent),
     ) -> anyhow::Result<ChatResponse> {
         Ok(ChatResponse {
+            reasoning: None,
             blocks: vec![],
             stop_reason: self.stop_reason.into(),
             usage: Some(tiny_agent::provider::Usage {
+                reasoning_tokens: 0,
                 input_tokens: 10,
                 output_tokens: 5,
                 cache_creation_input_tokens: 0,
@@ -127,9 +132,11 @@ fn text_block_cancel_race_is_cancelled() {
     let flag = Arc::new(AtomicBool::new(false));
     let f2 = flag.clone();
     let (prov, _state) = MockProvider::new(vec![MockTurn::Ok(ChatResponse {
+        reasoning: None,
         blocks: vec![Block::Text("partial".into())],
         stop_reason: "end_turn".into(),
         usage: Some(tiny_agent::provider::Usage {
+            reasoning_tokens: 0,
             input_tokens: 10,
             output_tokens: 5,
             cache_creation_input_tokens: 0,

@@ -209,7 +209,7 @@ pub fn save_with_archive(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{Block, Message, Role};
+    use crate::provider::{Block, Message, Reasoning, ReasoningBlock, Role};
 
     #[test]
     fn message_serde_roundtrip() {
@@ -528,6 +528,81 @@ mod tests {
             3,
             "paired history must not gain a synthetic result"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `Message::reasoning` is an optional side field: absent from the wire
+    /// when `None` (pre-carry session files stay byte-identical and load),
+    /// present as `{provider, blocks[{before, text, opaque}]}` otherwise, and
+    /// a block's `text`/`opaque` may be missing from a partial record.
+    #[test]
+    fn reasoning_roundtrips_and_old_format_loads() {
+        let mut m = Message::assistant(vec![Block::Text("a".into())]);
+        let json = serde_json::to_value(&m).unwrap();
+        assert!(
+            json.get("reasoning").is_none(),
+            "no key while there is nothing to carry: {json}"
+        );
+
+        m.reasoning = Some(Reasoning {
+            provider: "anthropic".into(),
+            blocks: vec![ReasoningBlock {
+                before: 0,
+                text: "t".into(),
+                opaque: serde_json::json!({"signature": "sig=="}),
+            }],
+        });
+        let json = serde_json::to_value(&m).unwrap();
+        assert_eq!(
+            json["reasoning"],
+            serde_json::json!({
+                "provider": "anthropic",
+                "blocks": [{"before": 0, "text": "t", "opaque": {"signature": "sig=="}}],
+            })
+        );
+        let back: Message = serde_json::from_value(json).unwrap();
+        assert_eq!(back.reasoning, m.reasoning);
+
+        // A block record without text/opaque (a hand-trimmed file) still
+        // loads: text is empty, the opaque payload is an empty object.
+        let partial: Message = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": [],
+            "reasoning": {"provider": "openai", "blocks": [{"before": 0}]},
+        }))
+        .unwrap();
+        assert_eq!(
+            partial.reasoning,
+            Some(Reasoning {
+                provider: "openai".into(),
+                blocks: vec![ReasoningBlock {
+                    before: 0,
+                    text: String::new(),
+                    opaque: serde_json::Value::Object(Default::default())
+                }],
+            })
+        );
+
+        // The pre-carry format (no key anywhere) loads as `None`, and a
+        // save/load round trip keeps the carried state verbatim.
+        let legacy: Message = serde_json::from_value(serde_json::json!({
+            "role": "assistant", "content": [{"text": "a"}],
+        }))
+        .unwrap();
+        assert!(legacy.reasoning.is_none());
+
+        let dir = std::env::temp_dir().join(format!("ta-rsn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.json");
+        save(
+            &path,
+            "m",
+            &[Message::user(vec![Block::Text("hi".into())]), m.clone()],
+        )
+        .unwrap();
+        let (_, loaded) = load(&path).unwrap().unwrap();
+        assert_eq!(loaded[1].reasoning, m.reasoning);
+        assert_eq!(loaded[0].reasoning, None);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

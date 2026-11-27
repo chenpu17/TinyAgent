@@ -3,8 +3,12 @@
 //! assembly, and the width / control-strip text utilities shared across
 //! the TUI.
 
+use super::input::InputBuffer;
 use super::markdown::MdCache;
-use super::theme::{dim_fg, fmt_elapsed, AGENT_FG, BADGE_BG, BADGE_FG, USER_FG};
+use super::theme::{
+    dim_fg, fmt_elapsed, fmt_tokens, keycap_bg, keycap_fg, AGENT_FG, TOOL_CALL_FG, TOOL_ERR_FG,
+    USER_FG,
+};
 use super::transcript::{build_history_lines, LiveRow, Row};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -12,10 +16,11 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 /// Keep prose readable on wide terminals while leaving the reading column
-/// left-anchored. Input and status chrome use the available terminal width.
+/// left-anchored. Composer, queue and status share the same capped work area.
 const CONTENT_MAX_WIDTH: u16 = 120;
 
 /// Best-effort copy to the system clipboard via the platform's CLI tool. Tries
@@ -77,9 +82,104 @@ pub(super) fn copy_to_clipboard(text: &str) -> bool {
     false
 }
 
-/// The startup welcome line: model and tool count, and the /help pointer.
+/// The startup connection note. The branded empty state below it owns command
+/// discovery, so this committed row only records what session was opened.
 pub(super) fn welcome_text(model: &str, n_tools: usize) -> String {
-    format!("tiny-agent · model {model} · {n_tools} tools · /help lists commands")
+    format!("session ready · {model} · {n_tools} tools")
+}
+
+/// A small raised keycap used by the welcome sheet and composer footer.
+pub(super) fn keycap(label: &str) -> Span<'static> {
+    Span::styled(
+        format!(" {label} "),
+        Style::default()
+            .fg(keycap_fg())
+            .bg(keycap_bg())
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+/// Three-row opening composition for a fresh/cleared session. The wide layout
+/// is an editorial masthead rather than a paragraph of instructions: a spaced
+/// wordmark with the version pinned to the same right edge as the composer, a
+/// two-tone rule across the full work area, and one concise promise. Keys are
+/// not repeated here — the composer's own bottom border carries the legend two
+/// rows below. Render-only: hints never become fake conversation rows or
+/// `/export` noise.
+pub(super) fn empty_state_lines(width: usize) -> Vec<Line<'static>> {
+    let mut brand_spans = vec![
+        Span::styled(
+            "◆",
+            Style::default().fg(AGENT_FG).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " T I N Y A G E N T",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ];
+    let brand_left = brand_spans.iter().map(|s| s.content.width()).sum::<usize>();
+    let version = format!("v{}", env!("CARGO_PKG_VERSION"));
+    if width >= 80 && brand_left + version.width() + 2 <= width {
+        brand_spans.push(Span::raw(" ".repeat(width - brand_left - version.width())));
+        brand_spans.push(Span::styled(version, Style::default().fg(dim_fg())));
+    }
+    let brand = Line::from(brand_spans);
+
+    let accent = width.min(12);
+    let rule = Line::from(vec![
+        Span::styled("━".repeat(accent), Style::default().fg(AGENT_FG)),
+        Span::styled(
+            "─".repeat(width.saturating_sub(accent)),
+            Style::default().fg(dim_fg()),
+        ),
+    ]);
+    let tagline = Line::from(Span::styled(
+        if width >= 42 {
+            "A small agent for real terminal work."
+        } else {
+            "Ask. Build. Debug."
+        },
+        Style::default(),
+    ));
+    [brand, rule, tagline]
+        .into_iter()
+        .map(|line| truncate_line(line, width))
+        .collect()
+}
+
+/// Key legend drawn inside the composer's bottom border. Keycaps match the
+/// slash menu; narrow frames keep only send + help. This is the only key
+/// legend on an empty screen — the welcome sheet deliberately does not repeat
+/// it.
+pub(super) fn composer_footer(busy: bool, width: usize) -> Option<Line<'static>> {
+    if busy {
+        return None;
+    }
+    let full = Line::from(vec![
+        Span::raw(" "),
+        keycap("Enter"),
+        Span::styled(" send  ", Style::default().fg(dim_fg())),
+        keycap("/"),
+        Span::styled(" commands  ", Style::default().fg(dim_fg())),
+        keycap("Ctrl-J"),
+        Span::styled(" newline  ", Style::default().fg(dim_fg())),
+        keycap("/help"),
+        Span::raw(" "),
+    ]);
+    let short = Line::from(vec![
+        Span::raw(" "),
+        keycap("Enter"),
+        Span::styled(" send  ", Style::default().fg(dim_fg())),
+        keycap("/help"),
+        Span::raw(" "),
+    ]);
+    if full.width() <= width {
+        Some(full.right_aligned())
+    } else if short.width() <= width {
+        Some(short.right_aligned())
+    } else {
+        None
+    }
 }
 
 /// The one color for the bottom chrome (input border + its title): AGENT_FG
@@ -108,7 +208,7 @@ pub(super) fn build_input_title(
     queued: usize,
     width: usize,
 ) -> String {
-    if busy {
+    let title = if busy {
         let queue = if queued == 0 {
             String::new()
         } else {
@@ -119,17 +219,79 @@ pub(super) fn build_input_title(
         if full.width() <= width {
             full
         } else {
-            format!(" {spinner} {tail}")
+            // Shed decoration before the actionable cancellation hint. Queue
+            // details have their own live preview, so they are the next segment
+            // to go; elapsed time disappears only when the hint cannot fit.
+            let no_queue = format!(" {spinner} {} · Ctrl-C cancel ", fmt_elapsed(secs));
+            let cancel_only = format!(" {spinner} Ctrl-C cancel ");
+            let degraded = format!(" {spinner} {tail}");
+            if degraded.width() <= width {
+                degraded
+            } else if no_queue.width() <= width {
+                no_queue
+            } else {
+                cancel_only
+            }
         }
     } else {
-        " Ask TinyAgent ".to_string()
+        " ◆ MESSAGE ".to_string()
+    };
+    truncate_display(&title, width)
+}
+
+/// Input border title for the `failed` phase, already truncated to `width`.
+/// `/resume` only acts while a paused queue is holding messages — with nothing
+/// held it would answer "[no paused queue]" — so the hint names the action
+/// that exists for the current state. Narrow titles keep the shorter form
+/// rather than losing the right-hand hint to ratatui's right clip.
+pub(super) fn failed_title(held: usize, width: usize) -> String {
+    let (full, short) = if held > 0 {
+        (
+            " failed · /resume continues the held queue ",
+            " failed · /resume ",
+        )
+    } else {
+        (" failed · type a message to retry ", " failed ")
+    };
+    if full.width() <= width {
+        full.to_string()
+    } else {
+        truncate_display(short, width)
     }
+}
+
+/// Cumulative token segment for the status bar. Empty until the first billed
+/// turn: "0 in / 0 out" on a fresh session is pure noise. Cache counters count
+/// as activity even when the plain counters have not moved yet.
+pub(super) fn status_stats(
+    in_tokens: u64,
+    out_tokens: u64,
+    cache_create: u64,
+    cache_read: u64,
+) -> String {
+    if in_tokens == 0 && out_tokens == 0 && cache_create == 0 && cache_read == 0 {
+        return String::new();
+    }
+    let cache_seg = if cache_read > 0 || cache_create > 0 {
+        format!(
+            "   cache {} w {} r",
+            fmt_tokens(cache_create),
+            fmt_tokens(cache_read)
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "   {} in  /  {} out{cache_seg}",
+        fmt_tokens(in_tokens),
+        fmt_tokens(out_tokens)
+    )
 }
 
 /// Assemble the status bar in two density levels. Wide terminals get token
 /// detail; medium ones keep the context-window segment (`ctx`) after the stats
 /// drop out (it's the most decision-relevant number, so it outlives the stats);
-/// narrow ones preserve only the model badge and broad run state. The cwd path
+/// narrow ones preserve only the model label and broad run state. The cwd path
 /// pins to the right edge in whatever room the left side leaves (it is the
 /// first thing narrow terminals lose). Keyboard help lives behind `/help`.
 // The bar is assembled from independent segments; grouping them into a
@@ -145,20 +307,42 @@ pub(super) fn build_status_line(
     path: &str,
     width: usize,
 ) -> Line<'static> {
-    let badge = format!(" {model} ");
-    let state_seg = format!("  {state}");
-    let state_style = if busy {
-        // One busy color across the chrome: the input border title already
-        // pops AGENT_FG, the status state segment matches it.
-        Style::default().fg(AGENT_FG).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(dim_fg())
+    let model_label = format!(" ◆ {model}");
+    let (state_mark, state_label) = match state {
+        "idle" => ("●", "ready"),
+        "running" => ("◆", "running"),
+        "cancelling" => ("!", "cancelling"),
+        "failed" => ("✗", "failed"),
+        _ => ("·", state),
+    };
+    let state_seg = format!("  {state_mark} {state_label}");
+    let state_style = match state {
+        "cancelling" => Style::default()
+            .fg(TOOL_CALL_FG)
+            .add_modifier(Modifier::BOLD),
+        "failed" => Style::default()
+            .fg(TOOL_ERR_FG)
+            .add_modifier(Modifier::BOLD),
+        "idle" | "running" => Style::default().fg(AGENT_FG).add_modifier(Modifier::BOLD),
+        _ if busy => Style::default().fg(AGENT_FG).add_modifier(Modifier::BOLD),
+        _ => Style::default().fg(dim_fg()),
     };
     let mut spans = vec![
-        Span::styled(badge, Style::default().fg(BADGE_FG).bg(BADGE_BG)),
+        Span::styled(
+            model_label,
+            Style::default().fg(USER_FG).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(state_seg, state_style),
     ];
     let used = spans.iter().map(|s| s.content.width()).sum::<usize>();
+    if used > width {
+        // Last-resort density: the broad state is more actionable than the
+        // model label. ratatui must never be left to right-clip it silently.
+        return Line::from(Span::styled(
+            truncate_display(state_label, width),
+            state_style,
+        ));
+    }
     // Optional segments in SURVIVAL order (highest priority first): ctx, plan,
     // stats. Each is added only if it AND every higher-priority segment fit, so
     // narrowing drops right-to-left — stats first, then plan, then ctx (ctx
@@ -194,43 +378,39 @@ pub(super) fn build_status_line(
 /// Right-aligned cwd path segment for the status bar. Returns None when the
 /// leftover after the left segments is under 12 columns (anything less is
 /// useless truncation), when the path is empty, or when even "…" + the
-/// basename cannot fit with a 2-column gap. Long paths are LEFT-truncated
-/// with a leading "…" on a char boundary, so the most identifying tail —
-/// the project directory — stays visible.
+/// basename cannot fit with its separator and a 2-column gap. Long paths keep
+/// the longest component-aligned suffix with a leading "…", so the identifying
+/// project directories survive without half a directory name.
 pub(super) fn right_path_seg(path: &str, avail: usize) -> Option<Span<'static>> {
     if path.is_empty() || avail < 12 {
         return None;
     }
-    let budget = avail - 2; // minimum gap to the left segments
+    // Even on a wide display a full absolute path becomes visual noise. Keep
+    // the identifying tail within a fixed 48-cell budget and right-align it.
+    let budget = (avail - 2).min(48);
     let pw = path.width();
-    let (text, tw) = if pw <= budget {
-        (path.to_string(), pw)
+    let text = if pw <= budget {
+        path.to_string()
     } else {
-        // Basename after EITHER separator: on Windows the cwd arrives
-        // backslash-delimited, where an rsplit('/')-only "basename" is the
-        // WHOLE path (no split hit) — it then can't fit the budget and the
-        // segment vanishes entirely, taking the cwd out of the status bar.
-        let base = path.rsplit(['/', '\\']).next().unwrap_or(path);
-        if base.width() + 1 > budget {
-            return None; // even "…" + basename is too wide
-        }
-        // Longest char-boundary suffix that fits next to the "…" marker.
-        let mut w = 0;
-        let mut start = 0; // 0 = whole path fits (unreachable here, defensive)
+        // Ellipsize at component boundaries, keeping the LONGEST trailing
+        // run that fits. A character-level suffix produced noisy fragments
+        // such as `…de-code/TinyAgent`; `…/TinyAgent` is easier to scan.
+        // Either separator works, including mixed-separator Windows paths.
+        let mut shortened = None;
         for (i, c) in path.char_indices().rev() {
-            let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-            if w + cw + 1 > budget {
+            if !matches!(c, '/' | '\\') {
+                continue;
+            }
+            let candidate = format!("…{}", &path[i..]);
+            if candidate.width() <= budget {
+                shortened = Some(candidate);
+            } else {
                 break;
             }
-            w += cw;
-            start = i;
         }
-        if start == 0 {
-            (path.to_string(), pw)
-        } else {
-            (format!("…{}", &path[start..]), w + 1)
-        }
+        shortened?
     };
+    let tw = text.width();
     let pad = avail - tw;
     Some(Span::styled(
         format!("{}{text}", " ".repeat(pad)),
@@ -249,6 +429,86 @@ pub(super) fn wrap_history(lines: &[Line<'static>], width: usize) -> Vec<Line<'s
 /// there is no horizontal inset, but prose is still capped at a readable max.
 pub(super) fn content_width(term_w: u16) -> usize {
     (term_w as usize).min(CONTENT_MAX_WIDTH as usize).max(1)
+}
+
+/// Soft-wrapped composer rendering and its display-cell caret. Kept pure so
+/// cell-grid tests can assert the exact same geometry the app draws.
+pub(super) struct ComposerLayout {
+    pub(super) lines: Vec<Line<'static>>,
+    pub(super) caret_row: usize,
+    pub(super) caret_col: usize,
+}
+
+pub(super) fn layout_composer(
+    input: &InputBuffer,
+    width: usize,
+    prompt: &str,
+    prompt_style: Style,
+) -> ComposerLayout {
+    let mut lines = Vec::new();
+    let mut caret_row = 0usize;
+    let mut caret_col = 0usize;
+    for (logical_row, text) in input.lines_view().iter().enumerate() {
+        let prefix = if logical_row == 0 { prompt } else { "  " };
+        let prefix_style = if logical_row == 0 {
+            prompt_style
+        } else {
+            Style::default()
+        };
+        let source = Line::from(vec![
+            Span::styled(prefix.to_string(), prefix_style),
+            Span::raw(text.clone()),
+        ]);
+        let caret = (logical_row == input.row)
+            .then(|| prefix.chars().count() + text[..input.col].chars().count());
+        let (wrapped, caret_pos) = wrap_line_with_caret(&source, width, caret);
+        if let Some((row, col)) = caret_pos {
+            caret_row = lines.len() + row;
+            caret_col = col;
+        }
+        lines.extend(wrapped);
+    }
+    ComposerLayout {
+        lines,
+        caret_row,
+        caret_col,
+    }
+}
+
+/// First composer visual row to display in a fixed-height input box. Keeping
+/// this calculation beside the layout makes cell-grid tests exercise the same
+/// vertical scrolling rule as the app.
+pub(super) fn composer_scroll(caret_row: usize, inner_rows: usize) -> u16 {
+    caret_row
+        .saturating_sub(inner_rows.saturating_sub(1))
+        .min(u16::MAX as usize) as u16
+}
+
+/// One-line queue status outside the transcript: pending input must never
+/// hold back tool results or streaming text from the commit watermark.
+pub(super) fn queue_preview_line(
+    queued: &std::collections::VecDeque<String>,
+    paused: bool,
+    width: usize,
+) -> Option<Line<'static>> {
+    let first = queued.front()?;
+    let state = if paused { "paused" } else { "queued" };
+    let suffix = if queued.len() > 1 {
+        format!(" · +{}", queued.len() - 1)
+    } else {
+        String::new()
+    };
+    let action = if paused { " · /resume" } else { "" };
+    let head = truncate_display(
+        &format!("⇢ {} {state}{suffix}{action} · ", queued.len()),
+        width,
+    );
+    let remaining = width.saturating_sub(head.width());
+    let preview = truncate_display(&first.replace('\n', " ↵ "), remaining);
+    Some(Line::from(vec![
+        Span::styled(head, Style::default().fg(USER_FG)),
+        Span::styled(preview, Style::default().fg(dim_fg())),
+    ]))
 }
 
 pub(super) fn commit_rows<B: ratatui::backend::Backend>(
@@ -366,120 +626,406 @@ pub(super) fn strip_controls_json(v: &serde_json::Value) -> serde_json::Value {
     }
 }
 
-/// Estimated display rows `text` occupies when wrapped at `width` — per
-/// logical line, `ceil(cols / width)` with a floor of one. This is an UPPER
-/// bound of what the markdown render shows (the renderer soft-joins lines
-/// inside a paragraph, and joining can only shrink the row count), so the
-/// split fires at least as eagerly as the viewport needs.
+/// Estimated display rows `text` occupies under the same greedy word-wrap
+/// used by [`wrap_line`]. Markdown may soft-join adjacent source lines, so the
+/// streaming splitter still treats this as an eager threshold, but hard wraps,
+/// CJK width and word boundaries no longer use a second, incompatible ruler.
 pub(super) fn est_display_rows(text: &str, width: usize) -> usize {
-    let w = width.max(1);
     text.split('\n')
-        .map(|l| {
-            let cols: usize = l
-                .chars()
-                .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
-                .sum();
-            cols.div_ceil(w).max(1)
+        .map(|line| {
+            let cells = layout_cells(line, &[]);
+            wrap_ranges(&cells, width, 0, 0).len()
         })
         .sum()
 }
 
-/// Wrap one styled line to `width` display columns, returning one `Line` per
-/// visual row. Greedy word wrap: fill a row until the next word won't fit, then
-/// break at the last space; a word longer than `width` is hard-broken. A space
-/// landing right after a break is dropped (cleaner left edge). Span styles are
-/// preserved across breaks — a span split by a wrap becomes two spans with the
-/// same style. With this, `lines.len()` equals the rendered height, so the
-/// scroll range is exact.
-pub(super) fn wrap_line(src: &Line, width: usize) -> Vec<Line<'static>> {
-    let width = width.max(1);
-    // Flatten to (char, style) so a wrap can split a span at any char.
+/// Source byte offsets at which each wrapped display row starts. The splitter
+/// uses this to cut on exactly the boundaries produced by `wrap_line`, never
+/// inside a grapheme cluster such as a ZWJ emoji sequence.
+pub(super) fn display_row_starts(text: &str, width: usize) -> Vec<usize> {
+    let mut starts = Vec::new();
+    let mut line_start = 0usize;
+    for line in text.split('\n') {
+        let cells = layout_cells(line, &[]);
+        for (start, _) in wrap_ranges(&cells, width, 0, 0) {
+            let at = cells.get(start).map(|cell| cell.byte_start).unwrap_or(0);
+            starts.push(line_start + at);
+        }
+        line_start += line.len() + 1;
+    }
+    if starts.is_empty() {
+        starts.push(0);
+    }
+    starts
+}
+
+/// Cell-aware styled-line truncation. Preserves span styling and grapheme
+/// boundaries; every positive width reserves its last cell for `…` on overflow.
+pub(super) fn truncate_line(mut line: Line<'static>, width: usize) -> Line<'static> {
+    if line.width() <= width {
+        return line;
+    }
+    if width == 0 {
+        return Line::default();
+    }
+    let budget = width - 1;
+    let mut used = 0usize;
+    let mut stopped = false;
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for span in line.spans.drain(..) {
+        let style = span.style;
+        let mut text = String::new();
+        for grapheme in span.content.graphemes(true) {
+            let cell_w = UnicodeWidthStr::width(grapheme);
+            if used.saturating_add(cell_w) > budget {
+                stopped = true;
+                break;
+            }
+            used = used.saturating_add(cell_w);
+            text.push_str(grapheme);
+        }
+        if !text.is_empty() {
+            spans.push(Span::styled(text, style));
+        }
+        if stopped {
+            break;
+        }
+    }
+    let ellipsis_style = spans.last().map(|span| span.style).unwrap_or_default();
+    spans.push(Span::styled("…", ellipsis_style));
+    line.spans = spans;
+    line
+}
+
+/// Truncate plain text to a display-cell budget, adding an ellipsis when
+/// content was removed. Every caller uses this instead of byte slicing so CJK
+/// and emoji never produce invalid UTF-8 or half-visible columns.
+pub(super) fn truncate_display(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return "…".to_string();
+    }
+    let budget = width - 1;
+    let mut out = String::new();
+    let mut used = 0usize;
+    for grapheme in text.graphemes(true) {
+        let w = UnicodeWidthStr::width(grapheme);
+        if used + w > budget {
+            break;
+        }
+        out.push_str(grapheme);
+        used += w;
+    }
+    out.push('…');
+    out
+}
+
+/// Continuation prefix inferred from the line's existing visual language.
+/// Role markers become two blank cells; existing indentation is retained;
+/// code/tool guides (`▎ ` / `│ `) repeat on every visual row. System markers
+/// become an equivalent hanging indent. This lets the FINAL wrap pass restore
+/// gutters without every renderer pre-wrapping its own text.
+fn continuation_cells(src: &Line) -> Vec<(String, Style)> {
     let cells: Vec<(char, Style)> = src
         .spans
         .iter()
         .flat_map(|s| s.content.chars().map(|c| (c, s.style)))
         .collect();
-    let char_w = |c: char| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+    let leading = cells.iter().take_while(|(c, _)| *c == ' ').count();
+    if leading > 0 {
+        let marker = cells.get(leading).map(|(c, _)| *c);
+        let take = match marker {
+            Some('▎' | '│') => (leading + 2).min(cells.len()),
+            Some('·') => leading + 2,
+            _ => leading,
+        };
+        return cells
+            .iter()
+            .take(take)
+            .map(|(c, style)| {
+                let c = if matches!(marker, Some('·')) {
+                    ' '
+                } else {
+                    *c
+                };
+                (c.to_string(), *style)
+            })
+            .collect();
+    }
+    if cells
+        .first()
+        .is_some_and(|(c, _)| matches!(c, '❯' | '◆' | '●' | '✻' | '·'))
+    {
+        return cells
+            .iter()
+            .take(2)
+            .map(|(_, style)| (' '.to_string(), *style))
+            .collect();
+    }
+    Vec::new()
+}
 
-    let mut rows: Vec<Line<'static>> = Vec::new();
-    let mut row_start = 0usize; // cells index where the current row began
-    let mut col = 0usize; // display width of [row_start, i)
-                          // Index just past the most recent space — a valid break point as long as
-                          // there's non-space content before it on this row.
-    let mut last_space_after: Option<usize> = None;
+/// A narrow input/transcript still needs at least one content column. Degrade
+/// the continuation gutter instead of letting it occupy the whole row and
+/// clip every character that follows it.
+fn fit_continuation(cells: Vec<(String, Style)>, width: usize) -> Vec<(String, Style)> {
+    let budget = width.saturating_sub(1);
+    let mut used = 0usize;
+    cells
+        .into_iter()
+        .take_while(|(text, _)| {
+            let w = UnicodeWidthStr::width(text.as_str());
+            if used + w > budget {
+                return false;
+            }
+            used += w;
+            true
+        })
+        .collect()
+}
 
+/// Wrap one styled line to `width` display columns. Greedy word wrap with a
+/// hard-break fallback for over-wide words; styles and line-level style survive
+/// every split. Continuation rows receive the inferred indent/gutter, and are
+/// measured against the correspondingly smaller content width.
+pub(super) fn wrap_line(src: &Line, width: usize) -> Vec<Line<'static>> {
+    wrap_line_with_caret(src, width, None).0
+}
+
+/// One terminal-shaped grapheme and its source mapping. `char_*` offsets serve
+/// the composer caret; `byte_start` serves streaming soft cuts. Width is the
+/// width of the WHOLE grapheme, so ZWJ emoji and variation selectors cannot be
+/// split or counted as several unrelated characters.
+#[derive(Clone)]
+struct LayoutCell<'a> {
+    text: &'a str,
+    style: Style,
+    char_start: usize,
+    char_end: usize,
+    byte_start: usize,
+    width: usize,
+}
+
+fn layout_cells<'a>(text: &'a str, styles: &[Style]) -> Vec<LayoutCell<'a>> {
+    let mut cells = Vec::new();
+    let mut char_start = 0usize;
+    for (byte_start, grapheme) in text.grapheme_indices(true) {
+        let char_end = char_start + grapheme.chars().count();
+        cells.push(LayoutCell {
+            text: grapheme,
+            style: styles.get(char_start).copied().unwrap_or_default(),
+            char_start,
+            char_end,
+            byte_start,
+            width: UnicodeWidthStr::width(grapheme),
+        });
+        char_start = char_end;
+    }
+    cells
+}
+
+/// `wrap_line` plus an optional caret expressed as a flattened CHARACTER
+/// index. Returned caret coordinates are `(visual_row, display_column)` within
+/// the returned lines. The composer uses this so wrapping and cursor placement
+/// can never disagree about wide characters or dropped wrap spaces.
+fn wrap_line_with_caret(
+    src: &Line,
+    width: usize,
+    caret: Option<usize>,
+) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
+    let width = width.max(1);
+    let text: String = src.spans.iter().map(|s| s.content.as_ref()).collect();
+    let styles: Vec<Style> = src
+        .spans
+        .iter()
+        .flat_map(|s| s.content.chars().map(|_| s.style))
+        .collect();
+    let cells = layout_cells(&text, &styles);
+    let raw_continuation = continuation_cells(src);
+    let prefix_cells = raw_continuation.len();
+    let continuation = fit_continuation(raw_continuation, width);
+    let cont_w: usize = continuation
+        .iter()
+        .map(|(text, _)| UnicodeWidthStr::width(text.as_str()))
+        .sum();
+    let ranges = wrap_ranges(&cells, width, cont_w, prefix_cells);
+    let total_chars = cells.last().map(|cell| cell.char_end).unwrap_or(0);
+    let mut rows = Vec::with_capacity(ranges.len());
+    let mut caret_pos = None;
+    for (row_idx, (start, end)) in ranges.iter().copied().enumerate() {
+        let mut row_cells = if row_idx == 0 {
+            Vec::new()
+        } else {
+            continuation.clone()
+        };
+        row_cells.extend(
+            cells[start..end]
+                .iter()
+                .map(|cell| (cell.text.to_string(), cell.style)),
+        );
+        let mut line = line_from_cells(&row_cells);
+        line.style = src.style;
+        rows.push(line);
+
+        let Some(at) = caret else { continue };
+        if caret_pos.is_some() {
+            continue;
+        }
+        let row_char_start = cells.get(start).map(|cell| cell.char_start).unwrap_or(0);
+        let row_char_end = if start < end {
+            cells[end - 1].char_end
+        } else {
+            row_char_start
+        };
+        let next_char_start = ranges
+            .get(row_idx + 1)
+            .and_then(|(next, _)| cells.get(*next))
+            .map(|cell| cell.char_start)
+            .unwrap_or(total_chars);
+        // A word-wrap space is omitted from the rendered rows. The caret
+        // BEFORE that space belongs to the previous row; the caret AFTER it
+        // belongs at the next row's start. Hard-wrap boundaries intentionally
+        // choose the next row, matching normal terminal editing behavior.
+        let before_dropped_space = at == row_char_end && next_char_start > row_char_end;
+        let in_row = at >= row_char_start
+            && (at < row_char_end
+                || before_dropped_space
+                || start == end && at == row_char_start
+                || row_idx + 1 == ranges.len());
+        if !in_row {
+            continue;
+        }
+        let mut col = if row_idx == 0 { 0 } else { cont_w };
+        for cell in &cells[start..end] {
+            if at >= cell.char_end {
+                col += cell.width;
+            } else {
+                break;
+            }
+        }
+        let cap = width;
+        if col >= cap && row_idx + 1 < ranges.len() {
+            // There is no cell beyond a full row; use the next row's start.
+            continue;
+        }
+        caret_pos = Some((row_idx, col));
+    }
+    // At an exact full-width end, place the caret on a fresh continuation row
+    // rather than one cell beyond the Paragraph's inner rectangle.
+    if caret.is_some_and(|at| at == total_chars) {
+        if let Some((_, col)) = caret_pos {
+            if col >= width {
+                let mut blank = line_from_cells(&continuation);
+                blank.style = src.style;
+                rows.push(blank);
+                caret_pos = Some((rows.len() - 1, cont_w));
+            }
+        }
+    }
+    (rows, caret_pos)
+}
+
+/// Half-open ranges into grapheme `cells`, one per visual row. `cont_width`
+/// reserves room for the continuation prefix on every row after the first;
+/// `prefix_cells` protects a role/gutter prefix from becoming a word-break
+/// candidate. Break spaces are omitted from both adjacent ranges.
+fn wrap_ranges(
+    cells: &[LayoutCell<'_>],
+    width: usize,
+    cont_width: usize,
+    prefix_cells: usize,
+) -> Vec<(usize, usize)> {
+    let width = width.max(1);
+    if cells.is_empty() {
+        return vec![(0, 0)];
+    }
+    let mut rows = Vec::new();
+    let mut start = 0usize;
     let mut i = 0usize;
+    let mut col = 0usize;
+    let mut last_space_after: Option<usize> = None;
     while i < cells.len() {
-        let (c, _style) = cells[i];
-        let w = char_w(c);
-        if c == ' ' {
-            if col + w > width && col > 0 {
-                // The space itself would overflow: break before it and drop it.
-                rows.push(line_from_cells(&cells[row_start..i]));
-                row_start = i + 1;
+        let cell = &cells[i];
+        let w = cell.width;
+        let cap = if rows.is_empty() {
+            width
+        } else {
+            width.saturating_sub(cont_width).max(1)
+        };
+        if cell.text == " " {
+            if col + w > cap && col > 0 {
+                rows.push((start, i));
+                start = i + 1;
+                i += 1;
                 col = 0;
                 last_space_after = None;
-                i += 1;
                 continue;
             }
             col += w;
-            // Only treat it as a break point if real content precedes it.
-            if row_start < i {
+            if start < i && i + 1 > prefix_cells {
                 last_space_after = Some(i + 1);
             }
             i += 1;
             continue;
         }
-        if col + w > width {
-            // Overflow on a non-space char. Prefer breaking at the last space.
+        if col + w > cap {
             if let Some(after) = last_space_after {
-                if after - 1 > row_start {
-                    // Row = everything before the space (space dropped).
-                    rows.push(line_from_cells(&cells[row_start..after - 1]));
-                    row_start = after;
-                    col = cells[row_start..i].iter().map(|(ch, _)| char_w(*ch)).sum();
-                    last_space_after = None;
-                    continue; // re-process cell i on the new row
+                if after - 1 > start {
+                    rows.push((start, after - 1));
+                    start = after;
+                    col = cells[start..i].iter().map(|cell| cell.width).sum();
+                    last_space_after = cells[start..i]
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find(|(_, cell)| cell.text == " ")
+                        .map(|(j, _)| start + j + 1);
+                    continue;
                 }
             }
-            // No usable break point: hard-break before this char.
             if col > 0 {
-                rows.push(line_from_cells(&cells[row_start..i]));
-                row_start = i;
+                rows.push((start, i));
+                start = i;
                 col = 0;
                 last_space_after = None;
-                continue; // re-process cell i
+                continue;
             }
-            // Row empty and char wider than width (or width 1): emit it anyway
-            // so we make progress instead of looping forever.
+            // A wide grapheme in a one-cell viewport still gets emitted:
+            // splitting it would corrupt the glyph, and forcing progress is
+            // preferable to an infinite wrap loop.
         }
         col += w;
         i += 1;
     }
-    if row_start < cells.len() {
-        rows.push(line_from_cells(&cells[row_start..]));
+    if start < cells.len() {
+        rows.push((start, cells.len()));
     }
     if rows.is_empty() {
-        rows.push(Line::default());
+        rows.push((0, cells.len()));
     }
     rows
 }
 
-/// Build a `Line` from (char, style) cells, coalescing adjacent same-style chars
-/// into one span so a wrapped row doesn't explode into one span per char.
-fn line_from_cells(cells: &[(char, Style)]) -> Line<'static> {
+/// Build a `Line` from owned grapheme/style cells, coalescing adjacent
+/// same-style cells so a wrapped row doesn't explode into one span per glyph.
+fn line_from_cells(cells: &[(String, Style)]) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut text = String::new();
     let mut style = Style::default();
-    for (c, st) in cells {
+    for (cell, st) in cells {
         if text.is_empty() {
-            text.push(*c);
+            text.push_str(cell);
             style = *st;
         } else if *st == style {
-            text.push(*c);
+            text.push_str(cell);
         } else {
             spans.push(Span::styled(std::mem::take(&mut text), style));
-            text.push(*c);
+            text.push_str(cell);
             style = *st;
         }
     }

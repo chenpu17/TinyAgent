@@ -571,6 +571,11 @@ struct TaskReport {
     cache_creation_input_tokens: u64,
     #[serde(default)]
     cache_read_input_tokens: u64,
+    /// Reasoning tokens — a split OF `output_tokens` (0 when the provider
+    /// reports no split; see `Usage::reasoning_tokens`). `#[serde(default)]`
+    /// like the axes above, and written to report.json only when non-zero.
+    #[serde(default)]
+    reasoning_tokens: u64,
     // Attribution (P3): WHICH model ran this task and WHEN it started. `model`
     // because a task fragment may override it — a mixed-model batch is exactly
     // when per-task attribution matters. `started_at` because parallel workers
@@ -820,6 +825,7 @@ pub fn run(
                 output_tokens: 0,
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 0,
+                reasoning_tokens: 0,
                 model: String::new(),
                 started_at: String::new(),
             }
@@ -934,6 +940,7 @@ pub fn run(
                         output_tokens: 0,
                         cache_creation_input_tokens: 0,
                         cache_read_input_tokens: 0,
+                        reasoning_tokens: 0,
                         // Never started: no model ran it, no start time. Empty
                         // string = "not applicable", written verbatim.
                         model: String::new(),
@@ -1118,6 +1125,7 @@ fn run_one_attempt(
         output_tokens: usage.output_tokens,
         cache_creation_input_tokens: usage.cache_creation_input_tokens,
         cache_read_input_tokens: usage.cache_read_input_tokens,
+        reasoning_tokens: usage.reasoning_tokens,
         // bad_task / setup_error fail before apply/build; attribute to the
         // BASE model (a bad fragment's model never ran) and the task start.
         model: base.model.clone(),
@@ -1275,6 +1283,7 @@ fn run_one_attempt(
                 output_tokens: o.output_tokens,
                 cache_creation_input_tokens: o.cache_creation_input_tokens,
                 cache_read_input_tokens: o.cache_read_input_tokens,
+                reasoning_tokens: o.reasoning_tokens,
                 model: meta.model.clone(),
                 started_at: meta.started_at.clone(),
             };
@@ -1418,6 +1427,7 @@ fn panic_report(name: &str, payload: &(dyn std::any::Any + Send)) -> TaskReport 
         output_tokens: 0,
         cache_creation_input_tokens: 0,
         cache_read_input_tokens: 0,
+        reasoning_tokens: 0,
         model: String::new(),
         started_at: crate::harness::now_rfc3339(),
     }
@@ -1479,6 +1489,7 @@ fn run_one(
                 output_tokens: 0,
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 0,
+                reasoning_tokens: 0,
                 model: base.model.clone(),
                 started_at,
             };
@@ -1569,6 +1580,7 @@ fn run_one(
                 output_tokens: acc.usage.output_tokens,
                 cache_creation_input_tokens: acc.usage.cache_creation_input_tokens,
                 cache_read_input_tokens: acc.usage.cache_read_input_tokens,
+                reasoning_tokens: acc.usage.reasoning_tokens,
                 // Attribution lost across the attempt boundary: run_one doesn't
                 // know the applied model (a fragment may override it). The
                 // last attempt's results/<name>.json (written by
@@ -1682,7 +1694,7 @@ fn write_report(path: &Path, reports: &[TaskReport], provider: &str) -> Result<(
     let tasks: Vec<_> = reports
         .iter()
         .map(|r| {
-            json!({
+            let mut task = json!({
                 "name": r.name,
                 "success": r.success,
                 "stop_reason": r.stop_reason,
@@ -1695,7 +1707,13 @@ fn write_report(path: &Path, reports: &[TaskReport], provider: &str) -> Result<(
                 "cache_creation_input_tokens": r.cache_creation_input_tokens,
                 "cache_read_input_tokens": r.cache_read_input_tokens,
                 "error": r.error,
-            })
+            });
+            // Sparse: a task whose provider reported no reasoning split leaves
+            // the key out, so a non-reasoning batch's report is unchanged.
+            if r.reasoning_tokens > 0 {
+                task["reasoning_tokens"] = json!(r.reasoning_tokens);
+            }
+            task
         })
         .collect();
     let succeeded = reports.iter().filter(|r| r.success).count();
@@ -1703,8 +1721,10 @@ fn write_report(path: &Path, reports: &[TaskReport], provider: &str) -> Result<(
     // live in `tasks[]`; these sums (and per-task averages) let a CI pipeline
     // read a batch's real spend at a glance instead of summing the array after
     // each `--failed` iteration. All four token axes are summed; cache_read is
-    // included because it still reflects tokens moved over the wire.
-    let (mut ti, mut to, mut tcc, mut tcr) = (0u64, 0u64, 0u64, 0u64);
+    // included because it still reflects tokens moved over the wire. The
+    // reasoning split of `output_tokens` is summed alongside, but written only
+    // when some task reported it (a non-reasoning batch stays byte-identical).
+    let (mut ti, mut to, mut tcc, mut tcr, mut trt) = (0u64, 0u64, 0u64, 0u64, 0u64);
     for r in reports {
         // Saturating: matches the core usage folds — absurd per-task numbers
         // must not wrap the batch bill to a small total.
@@ -1712,6 +1732,7 @@ fn write_report(path: &Path, reports: &[TaskReport], provider: &str) -> Result<(
         to = to.saturating_add(r.output_tokens);
         tcc = tcc.saturating_add(r.cache_creation_input_tokens);
         tcr = tcr.saturating_add(r.cache_read_input_tokens);
+        trt = trt.saturating_add(r.reasoning_tokens);
     }
     // per-task average; 0 when there are no tasks (avoids div-by-zero).
     let avg = |t: u64| {
@@ -1721,6 +1742,22 @@ fn write_report(path: &Path, reports: &[TaskReport], provider: &str) -> Result<(
             t as f64 / reports.len() as f64
         }
     };
+    let mut totals = json!({
+        "input_tokens": ti,
+        "output_tokens": to,
+        "cache_creation_input_tokens": tcc,
+        "cache_read_input_tokens": tcr,
+    });
+    let mut averages = json!({
+        "input_tokens": avg(ti),
+        "output_tokens": avg(to),
+        "cache_creation_input_tokens": avg(tcc),
+        "cache_read_input_tokens": avg(tcr),
+    });
+    if trt > 0 {
+        totals["reasoning_tokens"] = json!(trt);
+        averages["reasoning_tokens"] = json!(avg(trt));
+    }
     let report = json!({
         "total": reports.len(),
         "succeeded": succeeded,
@@ -1731,18 +1768,8 @@ fn write_report(path: &Path, reports: &[TaskReport], provider: &str) -> Result<(
         // mid-series) must be distinguishable from the bill alone.
         "provider": provider,
         "agent_version": env!("CARGO_PKG_VERSION"),
-        "totals": {
-            "input_tokens": ti,
-            "output_tokens": to,
-            "cache_creation_input_tokens": tcc,
-            "cache_read_input_tokens": tcr,
-        },
-        "averages": {
-            "input_tokens": avg(ti),
-            "output_tokens": avg(to),
-            "cache_creation_input_tokens": avg(tcc),
-            "cache_read_input_tokens": avg(tcr),
-        },
+        "totals": totals,
+        "averages": averages,
         "tasks": tasks,
     });
     let bytes = serde_json::to_string_pretty(&report)?;
@@ -1825,6 +1852,7 @@ mod tests {
             output_tokens: 0,
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
+            reasoning_tokens: 0,
             model: "test-model".into(),
             started_at: "2026-08-15T07:41:02Z".into(),
         }
@@ -1889,6 +1917,11 @@ mod tests {
         // Per-task totals in tasks[] are unchanged.
         assert_eq!(v["tasks"][0]["input_tokens"].as_u64().unwrap(), 100);
         assert_eq!(v["tasks"][1]["input_tokens"].as_u64().unwrap(), 200);
+        // No task reported a reasoning split: the key is absent everywhere
+        // (a non-reasoning batch's report is byte-identical to before).
+        assert!(v["totals"].get("reasoning_tokens").is_none());
+        assert!(v["averages"].get("reasoning_tokens").is_none());
+        assert!(v["tasks"][0].get("reasoning_tokens").is_none());
         // Attribution: top-level provider + per-task model/started_at.
         assert_eq!(v["provider"], "openai");
         assert_eq!(v["agent_version"], env!("CARGO_PKG_VERSION"));
@@ -4041,6 +4074,44 @@ mod tests {
             tasks[0].error
         );
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The reasoning split of `output_tokens` reaches the batch bill: per
+    /// task, summed, averaged — and only when some task reported it.
+    #[test]
+    fn write_report_sums_reasoning_tokens_when_reported() {
+        let dir = std::env::temp_dir().join(format!("ta-batch-think-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("report.json");
+        let mut a = tr_tok("a", true, 100, 40, 0, 0);
+        a.reasoning_tokens = 30;
+        // `b` reports no split (a non-reasoning model in a mixed batch, or a
+        // provider that does not say): it contributes 0 and gets no key.
+        let b = tr_tok("b", true, 100, 20, 0, 0);
+        write_report(&path, &[a, b], "openai").unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["tasks"][0]["reasoning_tokens"], 30);
+        assert!(v["tasks"][1].get("reasoning_tokens").is_none());
+        assert_eq!(v["totals"]["reasoning_tokens"], 30);
+        assert_eq!(v["averages"]["reasoning_tokens"].as_f64().unwrap(), 15.0);
+        // The split never inflates the axis it is a part of.
+        assert_eq!(v["totals"]["output_tokens"], 60);
+        assert_eq!(v["totals"]["input_tokens"], 200);
+
+        // A report written before the key existed still parses (`--failed`).
+        let old = dir.join("old.json");
+        std::fs::write(
+            &old,
+            r#"{"total":1,"tasks":[{"name":"a","success":false,"stop_reason":"error","model":"m",
+                "started_at":"","turns":0,"elapsed_secs":0.0,"input_tokens":1,"output_tokens":2,
+                "cache_creation_input_tokens":0,"cache_read_input_tokens":0}]}"#,
+        )
+        .unwrap();
+        let prior: ReportFile =
+            serde_json::from_str(&std::fs::read_to_string(&old).unwrap()).unwrap();
+        assert_eq!(prior.tasks[0].reasoning_tokens, 0);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -97,6 +97,8 @@ test('Agent multi-turn: events stream, getters reflect state', async (t) => {
   assert.ok(Array.isArray(a.messages()));
   assert.ok(a.messages().length >= 2);
   const u = a.usage();
+  // usage: the four cache axes. (`reasoning_tokens` rides along only when the
+  // provider reports it — see the usage-getter test below.)
   for (const k of ['input_tokens', 'output_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens']) {
     assert.ok(k in u, `usage missing ${k}`);
   }
@@ -181,6 +183,7 @@ test('usage four axes are reported', async (t) => {
     completion_tokens: 9,
     total_tokens: 51,
     prompt_tokens_details: { cached_tokens: 30 },
+    completion_tokens_details: { reasoning_tokens: 4 },
   };
   const mock = await ScriptedMock.start([
     (_body, res) => respondSse(res, textSse('done', usage)),
@@ -193,6 +196,36 @@ test('usage four axes are reported', async (t) => {
   assert.strictEqual(out.output_tokens, 9);
   assert.strictEqual(out.cache_read_input_tokens, 30);
   assert.strictEqual(out.cache_creation_input_tokens, 0);  // OpenAI has no creation axis
+  assert.strictEqual(out.reasoning_tokens, 4);             // subset of the 9, not extra
+});
+
+test('usage getter reports reasoning tokens as a split, and omits the key when unreported', async (t) => {
+  // The usage() getter sums `reasoning_tokens` across turns like the other
+  // axes, never adds it on top of output_tokens (it is a subset split), and
+  // omits the key entirely when nothing reported it — a run whose model sends
+  // no reasoning split keeps the four-key shape, byte-identical to before.
+  const frame = {
+    prompt_tokens: 40,
+    completion_tokens: 10,
+    total_tokens: 50,
+    completion_tokens_details: { reasoning_tokens: 6 },
+  };
+  const mock = await ScriptedMock.start([
+    (_body, res) => respondSse(res, toolCallSse('c1', 'read_file', { path: 'x' }, frame)),
+    (_body, res) => respondSse(res, textSse('all done', frame)),
+  ]);
+  t.after(() => mock.stop());
+
+  const { cfgPath } = writeConfig(t, mock.url, { tools: ['read_file'] });
+  const a = new Agent(cfgPath, { apiKey: MOCK_KEY });
+  assert.ok(!('reasoning_tokens' in a.usage()));           // nothing reported yet: no key
+
+  a.pushUser('read x');
+  await a.run();
+
+  const u = a.usage();
+  assert.strictEqual(u.reasoning_tokens, 12);               // 6 per turn, summed
+  assert.strictEqual(u.output_tokens, 20);                  // the split is NOT added on top
 });
 
 // ── 5. custom JS tool is invoked (the headline capability) ───────────────────

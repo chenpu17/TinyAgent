@@ -452,6 +452,8 @@ mod tests {
 
     fn ctx(dir: &std::path::Path) -> ToolCtx {
         ToolCtx {
+            tool_annotations: std::sync::Arc::new(std::collections::BTreeMap::new()),
+            hidden_env: Vec::new(),
             tool_absent_notes: Vec::new(),
             workdir: dir.to_path_buf(),
             max_output_chars: 1000,

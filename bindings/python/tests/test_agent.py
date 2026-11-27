@@ -168,7 +168,9 @@ def test_agent_getters_reflect_state(tmp_path):
         msgs = a.messages()
         assert isinstance(msgs, list)
         assert len(msgs) >= 2  # at least the user turn + one assistant turn
-        # usage() returns the 4-axis dict, summed across the run.
+        # usage() returns the usage dict, summed across the run: the four
+        # cache axes. (`reasoning_tokens` rides along only when the provider
+        # reports it — test_usage_getter_reports_reasoning_tokens.)
         u = a.usage()
         for k in ("input_tokens", "output_tokens",
                   "cache_creation_input_tokens", "cache_read_input_tokens"):
@@ -465,12 +467,16 @@ def test_usage_four_axes_reported():
     """Usage reported by the provider reaches Python with all four axes.
     OpenAI's mapping: input = prompt_tokens − cached_tokens, cache_read =
     cached_tokens, cache_creation = 0 (OpenAI has no separate cache-write
-    event). Verifies the binding round-trips the Usage struct faithfully."""
+    event). Verifies the binding round-trips the Usage struct faithfully —
+    including the reasoning share of the completion (OpenAI reports it as
+    completion_tokens_details.reasoning_tokens; a subset split of
+    output_tokens on its own axis, never added to the totals)."""
     usage = {
         "prompt_tokens": 42,
         "completion_tokens": 9,
         "total_tokens": 51,
         "prompt_tokens_details": {"cached_tokens": 30},
+        "completion_tokens_details": {"reasoning_tokens": 4},
     }
 
     def respond(handler, body):
@@ -483,6 +489,37 @@ def test_usage_four_axes_reported():
         assert out["output_tokens"] == 9
         assert out["cache_read_input_tokens"] == 30
         assert out["cache_creation_input_tokens"] == 0  # OpenAI: no creation axis
+        assert out["reasoning_tokens"] == 4            # subset of the 9, not extra
+    finally:
+        mock.stop()
+
+
+def test_usage_getter_reports_reasoning_tokens(tmp_path):
+    """The usage() getter sums `reasoning_tokens` across turns like the other
+    axes, never adds it on top of `output_tokens` (it is a subset split), and
+    omits the key entirely when nothing reported it — a run whose model sends
+    no reasoning split keeps the four-key shape, byte-identical to before."""
+    frame = {"prompt_tokens": 40, "completion_tokens": 10, "total_tokens": 50,
+             "completion_tokens_details": {"reasoning_tokens": 6}}
+
+    def first(handler, body):
+        write_sse(handler, tool_call_sse("c1", "read_file", {"path": "x"}, usage=frame))
+
+    def second(handler, body):
+        write_sse(handler, text_sse("all done", usage=frame))
+
+    mock = ScriptedMock([first, second]).start()
+    try:
+        cfg = openai_config(mock.url, tools=["read_file"], workdir=str(tmp_path))
+        a = tiny_agent.Agent(cfg, api_key=MOCK_KEY)
+        assert "reasoning_tokens" not in a.usage()      # nothing reported yet: no key
+
+        a.push_user("read x")
+        a.run()
+
+        u = a.usage()
+        assert u["reasoning_tokens"] == 12              # 6 per turn, summed
+        assert u["output_tokens"] == 20                 # the split is NOT added on top
     finally:
         mock.stop()
 

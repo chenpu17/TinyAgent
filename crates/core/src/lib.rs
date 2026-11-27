@@ -83,16 +83,16 @@ pub use context_report::{
     Calibration, ContextBreakdown, MessageKinds, MessagesBreakdown, SystemBreakdown, ToolCategory,
     ToolEntry, ToolsBreakdown,
 };
-pub use hooks::{Hooks, ToolDecision, TurnStopDecision, TurnStopInfo};
+pub use hooks::{CompactionInfo, Hooks, ToolDecision, TurnStopDecision, TurnStopInfo};
 pub use provider::{
     Block, ChatRequest, ChatResponse, GatewayFixes, Message, Provider, Role, SimpleChatResponse,
     ToolDef, Usage,
 };
+pub use tools::mcp::McpFailure;
 pub use tools::{
     load_document_block, BudgetGate, CallbackTool, Tool, ToolConcurrency, ToolCtx, ToolOrigin,
     ToolOutput,
 };
-pub use tools::mcp::McpFailure;
 // The sandboxed JS tool only exists behind `--features code`; its CONFIG is
 // plain data and unconditional (above) so configs parse on any build.
 #[cfg(feature = "code")]
@@ -133,9 +133,15 @@ pub fn build_agent_with(
     extra_tools: Vec<Box<dyn tools::Tool>>,
     api_key: &str,
 ) -> anyhow::Result<Agent> {
-    finish_build(cfg, initial, client, extra_tools, api_key, false, |augmented| {
-        provider::build(augmented, api_key, client.clone())
-    })
+    finish_build(
+        cfg,
+        initial,
+        client,
+        extra_tools,
+        api_key,
+        false,
+        |augmented| provider::build(augmented, api_key, client.clone()),
+    )
     // 严格路径的 MCP 失败清单恒空（起不来已整条 Err），取 .0 即可。
     .map(|(agent, _)| agent)
 }
@@ -155,9 +161,15 @@ pub fn build_agent_with_lenient(
     extra_tools: Vec<Box<dyn tools::Tool>>,
     api_key: &str,
 ) -> anyhow::Result<(Agent, Vec<McpFailure>)> {
-    finish_build(cfg, initial, client, extra_tools, api_key, true, |augmented| {
-        provider::build(augmented, api_key, client.clone())
-    })
+    finish_build(
+        cfg,
+        initial,
+        client,
+        extra_tools,
+        api_key,
+        true,
+        |augmented| provider::build(augmented, api_key, client.clone()),
+    )
 }
 
 /// Like [`build_agent_with`], but the caller supplies the [`Provider`] directly
@@ -180,9 +192,11 @@ pub fn build_agent_with_provider(
     extra_tools: Vec<Box<dyn tools::Tool>>,
     api_key: &str,
 ) -> anyhow::Result<Agent> {
-    finish_build(cfg, initial, client, extra_tools, api_key, false, |_| provider)
-        // 严格路径的 MCP 失败清单恒空（起不来已整条 Err），取 .0 即可。
-        .map(|(agent, _)| agent)
+    finish_build(cfg, initial, client, extra_tools, api_key, false, |_| {
+        provider
+    })
+    // 严格路径的 MCP 失败清单恒空（起不来已整条 Err），取 .0 即可。
+    .map(|(agent, _)| agent)
 }
 
 /// What `assemble` hands back for the `code` feature: the ONE top-level
@@ -256,15 +270,23 @@ fn assemble_with(
         )?,
     };
 
+    // The credential-hygiene set (env vars removed from every tool
+    // subprocess: the shell tool and stdio MCP servers) — computed here
+    // because the MCP servers are the first things spawned.
+    let hidden_env = tools::hidden_env_vars(cfg);
+
     // Build MCP tools ONCE. The parent boxes them into its own tool list, and
     // tools::build hands SubAgent a clone of the same set — so a `task` call
     // shares the parent's MCP connections instead of re-spawning every server.
     let (mcp_tools, mcp_failures) = if cfg.mcp_servers.is_empty() {
         (Vec::new(), Vec::new())
     } else if lenient_mcp {
-        tools::mcp::build_lenient(&cfg.mcp_servers)?
+        tools::mcp::build_lenient(&cfg.mcp_servers, &hidden_env)?
     } else {
-        (tools::mcp::build(&cfg.mcp_servers)?, Vec::new())
+        (
+            tools::mcp::build(&cfg.mcp_servers, &hidden_env)?,
+            Vec::new(),
+        )
     };
 
     // run_code (H3/H4): the tool's membership in the model-visible list is
@@ -488,7 +510,26 @@ fn assemble_with(
     // too; this call keeps the failure attributed to assembly.
     tools::validate_tool_names(&tool_list)?;
 
+    // The MCP annotation side table (what each server declared about its
+    // tools — read by hooks via `ToolCtx::annotations` and snapshotted on
+    // each call record) is NOT built here: `Agent::try_new`, the single
+    // construction chokepoint every entry funnels through, derives it from
+    // the tool list, so it can never disagree with the tools an agent
+    // dispatches. The placeholder below is overwritten there.
+    //
+    // The credential-hygiene set (env vars removed from every tool
+    // subprocess) is a Vec a `task` child or run_code guest ctx clone
+    // carries as-is.
+    if let Some(line) = hygiene_notice(&cfg, &hidden_env) {
+        // Once per PROCESS (batch assembles one agent per task): the notice
+        // is a behavior-change beacon, not a per-run event.
+        static SAID: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        SAID.get_or_init(|| crate::diag::diag_info!("{line}"));
+    }
     let ctx = ToolCtx {
+        // Overwritten by `Agent::try_new` (see above).
+        tool_annotations: Default::default(),
+        hidden_env,
         workdir,
         max_output_chars: cfg.limits.max_output_chars,
         restrict_to_workdir: cfg.restrict_to_workdir,
@@ -661,4 +702,102 @@ fn resolve_skill_dirs(workdir: &std::path::Path) -> Vec<std::path::PathBuf> {
     }
     dirs.push(workdir.join(".tinyagent").join("skills"));
     dirs
+}
+
+/// The startup line naming the hidden variable(s) — `None` when nothing is
+/// hidden, and when the assembly spawns no tool subprocess at all (a
+/// file-tools-only config with an HTTP-only MCP list has nothing to be told;
+/// a `task` child only ever gets a subset of the parent's tools, and a
+/// run_code guest reaches the shell through the same `shell` entry). The pure
+/// half of the once-per-process notice, so the test below needs no sink.
+fn hygiene_notice(cfg: &Config, hidden_env: &[String]) -> Option<String> {
+    let spawns = cfg.tools.iter().any(|t| t == "shell")
+        || cfg.mcp_servers.iter().any(|s| s.command.is_some());
+    (spawns && !hidden_env.is_empty()).then(|| {
+        format!(
+            "[config] API key variable(s) {} hidden from tool subprocesses (shell, stdio MCP \
+             servers); list a name in env_passthrough to pass it through",
+            hidden_env.join(", ")
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The assembled `ToolCtx` carries the config's credential-hygiene set
+    /// (kernel plan 2.5): the `api_key_env` variable, empty once
+    /// `env_passthrough` re-allows it. Every spawn site — the shell tool, the
+    /// MCP servers assembled here, the ones hot-added later — reads this one
+    /// Vec.
+    #[test]
+    fn assembled_ctx_carries_the_credential_hygiene_set() {
+        let client = reqwest::blocking::Client::new();
+        let cfg = |passthrough: &[&str]| Config {
+            env_passthrough: passthrough.iter().map(|s| s.to_string()).collect(),
+            ..serde_json::from_value(serde_json::json!({
+                "provider": "openai", "api_key_env": "TA_ASSEMBLY_KEY", "model": "m",
+                "tools": ["shell", "read_file"], "inject_environment": false
+            }))
+            .unwrap()
+        };
+        let hidden = |cfg: &Config| {
+            assemble_with(cfg, &client, Vec::new(), "k", false)
+                .unwrap()
+                .1
+                .hidden_env
+        };
+        assert_eq!(
+            hidden(&cfg(&[])),
+            vec!["TA_ASSEMBLY_KEY".to_string()],
+            "the key variable is hidden by default"
+        );
+        assert!(
+            hidden(&cfg(&["TA_ASSEMBLY_KEY"])).is_empty(),
+            "env_passthrough naming it re-allows it"
+        );
+    }
+
+    /// The startup notice names the hidden set only for an assembly that can
+    /// spawn: with the `shell` tool, or with a stdio MCP server (an entry
+    /// with `command`); never for a file-tools-only / HTTP-only config, and
+    /// never once `env_passthrough` emptied the set.
+    #[test]
+    fn hygiene_notice_names_the_set_only_when_something_can_spawn() {
+        let cfg = |tools: &[&str], mcp: serde_json::Value| Config {
+            ..serde_json::from_value(serde_json::json!({
+                "provider": "openai", "api_key_env": "TA_NOTICE_KEY", "model": "m",
+                "tools": tools, "mcp_servers": mcp, "inject_environment": false
+            }))
+            .unwrap()
+        };
+        let http_only = serde_json::json!([{"name": "h", "url": "http://127.0.0.1:9/mcp"}]);
+        let stdio = serde_json::json!([{"name": "s", "command": "true"}]);
+        let set = vec!["TA_NOTICE_KEY".to_string()];
+        let line = |cfg: &Config| hygiene_notice(cfg, &set);
+        let said = |line: Option<String>| {
+            let line = line.expect("an assembly that spawns gets the notice");
+            assert!(
+                line.starts_with("[config] API key variable(s) TA_NOTICE_KEY hidden"),
+                "{line}"
+            );
+            assert!(line.contains("env_passthrough"), "{line}");
+        };
+        said(line(&cfg(&["shell", "read_file"], serde_json::json!([]))));
+        said(line(&cfg(&["read_file"], stdio)));
+        // `transport` is an HTTP knob: a `command` entry is stdio whatever it says.
+        said(line(&cfg(
+            &["read_file"],
+            serde_json::json!([{"name": "s", "command": "true", "transport": "sse"}]),
+        )));
+        assert!(
+            line(&cfg(&["read_file", "write_file", "task"], http_only)).is_none(),
+            "nothing in this assembly spawns a process"
+        );
+        assert!(
+            hygiene_notice(&cfg(&["shell"], serde_json::json!([])), &[]).is_none(),
+            "an empty hidden set has nothing to announce"
+        );
+    }
 }

@@ -1067,7 +1067,10 @@ impl Agent {
         finish_with_interrupt(interrupt, result, py)
     }
 
-    /// Cumulative token usage of the current/latest run (4 axes).
+    /// Cumulative token usage of the current/latest run: the four cache axes
+    /// (`input_tokens`, `output_tokens`, `cache_creation_input_tokens`,
+    /// `cache_read_input_tokens`) plus `reasoning_tokens` — the reasoning share
+    /// of `output_tokens`, a subset split on its own axis (never an extra axis).
     fn usage(&self, py: Python<'_>) -> PyResult<PyObject> {
         let u = self.with_agent(py, |a| a.usage())?;
         let bound = pythonize(py, &u)?;

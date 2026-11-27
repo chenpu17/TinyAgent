@@ -446,6 +446,7 @@ impl Tool for LlmTool {
         // temperature pinned at the provider layer (the only in-tree
         // setter), 120s per-request backstop (LD-10).
         let messages = [Message {
+            reasoning: None,
             // Not entering any history — no id allocation point applies.
             id: None,
             role: Role::User,
@@ -671,6 +672,8 @@ mod tests {
 
     fn ctx_with_cap(max_output_chars: usize) -> ToolCtx {
         ToolCtx {
+            tool_annotations: std::sync::Arc::new(std::collections::BTreeMap::new()),
+            hidden_env: Vec::new(),
             tool_absent_notes: Vec::new(),
             workdir: std::env::temp_dir(),
             max_output_chars,

@@ -15,15 +15,51 @@ pub(super) const AGENT_FG: Color = Color::Green;
 pub(super) const TOOL_CALL_FG: Color = Color::Yellow;
 pub(super) const TOOL_OK_FG: Color = Color::Green;
 pub(super) const TOOL_ERR_FG: Color = Color::Red;
+pub(super) const THINKING_FG: Color = Color::Magenta;
+
+/// Quiet surface behind the bottom status instrument strip. Indexed colors
+/// avoid assuming true-color support; the light/dark knob selects a tint that
+/// stays close to the host background instead of painting a heavy panel.
+pub(super) fn surface_bg() -> Color {
+    if *THEME_LIGHT.get().unwrap_or(&false) {
+        Color::Indexed(254)
+    } else {
+        Color::Indexed(233)
+    }
+}
+
+/// Slightly raised composer surface: enough separation to read as the active
+/// work area, close enough to the host background to stay quiet.
+pub(super) fn composer_bg() -> Color {
+    if *THEME_LIGHT.get().unwrap_or(&false) {
+        Color::Indexed(253)
+    } else {
+        Color::Indexed(234)
+    }
+}
+
+/// Shared keycap / selected-command / inline-code surface. One visual vocabulary
+/// across the welcome sheet, composer footer, slash popup and Markdown.
+pub(super) fn keycap_bg() -> Color {
+    if *THEME_LIGHT.get().unwrap_or(&false) {
+        Color::Indexed(251)
+    } else {
+        Color::Indexed(237)
+    }
+}
+
+pub(super) fn keycap_fg() -> Color {
+    if *THEME_LIGHT.get().unwrap_or(&false) {
+        Color::Black
+    } else {
+        Color::White
+    }
+}
 
 // Markdown header emphasis by level: h1 pops, h2/h3 steady, deeper recedes.
 pub(super) const MD_H1_FG: Color = Color::Yellow;
 pub(super) const MD_H23_FG: Color = Color::Cyan;
 pub(super) const MD_DEEP_FG: Color = Color::DarkGray;
-
-// Status-bar model badge: black on cyan (echoes USER_FG as a solid block).
-pub(super) const BADGE_FG: Color = Color::Black;
-pub(super) const BADGE_BG: Color = Color::Cyan;
 
 // ── Light-terminal theme knob ────────────────────────────────────────────
 // The named colors above map onto the terminal's 16-color palette, which
@@ -33,7 +69,7 @@ pub(super) const BADGE_BG: Color = Color::Cyan;
 // and tui-markdown styles inline code fg White (white-on-white). No
 // autodetection (COLORFGBG et al. are unreliable); `TINYAGENT_TUI_THEME=`
 // light|dark (default dark) is the explicit knob, read once at TUI start.
-// Everything else (role/tool colors, the badge, the ANSI-parsing palettes
+// Everything else (role/tool colors, the model label, the ANSI-parsing palettes
 // that carry TOOL OUTPUT colors chosen by other programs) stays put — those
 // read fine on both backgrounds.
 
@@ -56,7 +92,11 @@ pub(super) fn set_theme_from_env(var: Option<String>) {
 /// The dim foreground: Gray on dark terminals (color 7, the classic dim),
 /// DarkGray on light ones (color 8 — there it IS the mid-gray).
 pub(super) fn dim_fg() -> Color {
-    if *THEME_LIGHT.get().unwrap_or(&false) {
+    dim_fg_for(*THEME_LIGHT.get().unwrap_or(&false))
+}
+
+pub(super) fn dim_fg_for(light: bool) -> Color {
+    if light {
         Color::DarkGray
     } else {
         Color::Gray
@@ -66,7 +106,11 @@ pub(super) fn dim_fg() -> Color {
 /// Inline-code foreground: tui-markdown hardcodes fg White, which vanishes on
 /// light backgrounds — the light theme re-dyes it cyan (readable on both).
 pub(super) fn code_fg() -> Color {
-    if *THEME_LIGHT.get().unwrap_or(&false) {
+    code_fg_for(*THEME_LIGHT.get().unwrap_or(&false))
+}
+
+pub(super) fn code_fg_for(light: bool) -> Color {
+    if light {
         MD_H23_FG
     } else {
         Color::White

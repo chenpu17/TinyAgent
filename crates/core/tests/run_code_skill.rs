@@ -129,6 +129,8 @@ fn execute(scenario: Scenario) -> (ToolOutput, State) {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let ctx = ToolCtx {
+        tool_annotations: std::sync::Arc::new(std::collections::BTreeMap::new()),
+        hidden_env: Vec::new(),
         tool_absent_notes: Vec::new(),
         workdir: dir.clone(),
         max_output_chars: 5000,
@@ -300,6 +302,8 @@ fn response_recipe_unwraps_json_without_treating_invalid_results_as_empty_pages(
         }});"#
     );
     let ctx = ToolCtx {
+        tool_annotations: std::sync::Arc::new(std::collections::BTreeMap::new()),
+        hidden_env: Vec::new(),
         tool_absent_notes: Vec::new(),
         workdir: std::env::temp_dir(),
         max_output_chars: 5000,

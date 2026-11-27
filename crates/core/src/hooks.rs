@@ -2,7 +2,8 @@
 //!
 //! Lets library users observe and gate what an agent does without touching the
 //! core: approve / deny / rewrite each tool call before it runs, audit results
-//! after, and watch every outgoing chat request. Install on a built agent with
+//! after, watch every outgoing chat request, and get a look at the history
+//! right before a compaction folds it. Install on a built agent with
 //! [`crate::Agent::set_hooks`]; `task` sub-agents inherit the layer
 //! automatically (via [`ToolCtx::hooks`]).
 //!
@@ -27,6 +28,7 @@
 
 use crate::provider::ChatRequest;
 use crate::tools::{ToolCtx, ToolOutput};
+use crate::{CompressTrigger, Message};
 use serde_json::Value;
 
 /// What a [`Hooks::before_tool`] gate decides for one pending tool call.
@@ -108,6 +110,41 @@ pub struct TurnStopInfo<'a> {
     pub continuations_cap: u32,
 }
 
+/// The context one history compaction sees. Core-constructed, hook-read — an
+/// implementation never constructs it.
+///
+/// Everything borrows from the agent's live history: the struct is valid only
+/// for the duration of the [`Hooks::on_before_compact`] call it is handed to
+/// (clone whatever must outlive that call).
+pub struct CompactionInfo<'a> {
+    /// What brought the fold about — the preflight estimate crossing its
+    /// threshold, overflow recovery after the provider rejected a request as
+    /// too long, or the host's explicit [`crate::Agent::compact`].
+    pub trigger: CompressTrigger,
+    /// The `task` sub-agent whose history is being folded when this is a
+    /// child's compaction — the same identity as [`ToolCtx::subagent`];
+    /// `None` on the top-level agent.
+    pub subagent: Option<&'a str>,
+    /// How many messages are about to leave the live history — always
+    /// `folding.len()`, and the number the `Compressed` event and the
+    /// compress outcome report as `dropped`.
+    pub dropped: usize,
+    /// Those messages' size in chars under the core's own accounting (the
+    /// yardstick the `compress_threshold_chars` gate uses).
+    pub dropped_chars: usize,
+    /// The rendered checklist of the latest `todo` call in the live history —
+    /// plan state a summary may blur, surfaced so a host can file it next to
+    /// its own notes. `None` when the history holds no completed `todo` call.
+    /// The fold does not lose it either way: when the kept tail carries no
+    /// todo result, the core re-attaches this same checklist to the folded
+    /// head.
+    pub todo: Option<String>,
+    /// The messages about to be folded — exactly those `dropped` originals,
+    /// in history order, still live (the fold happens when this call
+    /// returns; afterwards they live on in the session archive).
+    pub folding: &'a [Message],
+}
+
 /// Third-party interception points into the agent loop. All methods default
 /// to no-ops, so an implementation overrides only what it needs. The layer is
 /// installed per agent via [`crate::Agent::set_hooks`]; `task` sub-agents
@@ -127,15 +164,19 @@ pub struct TurnStopInfo<'a> {
 /// race each other. BUT a `task` sub-agent inherits this layer, and a
 /// sub-agent's OWN gates (its leaf tools' `before_tool`/`after_tool` and its
 /// `on_chat_request`) run on that sub-agent's worker thread. Sibling
-/// sub-agents are genuinely concurrent, so all three methods may be called
-/// from several threads at once. `Send + Sync` only makes handing the trait
+/// sub-agents are genuinely concurrent, so all of those methods — and
+/// `on_before_compact`, which a child's own compaction fires on its worker
+/// thread — may be called from several threads at once. `Send + Sync` only
+/// makes handing the trait
 /// object across threads memory-safe — the implementation must be thread-safe
 /// by itself (interior mutability + synchronization, e.g. `Mutex`/atomics).
 ///
 /// **Scope.** `on_chat_request` observes MAIN-turn requests only; the
 /// compression summary request is deliberately not surfaced (it's an internal
 /// housekeeping call, and rewriting it would need summary-consistency
-/// semantics this layer doesn't define). Likewise, `run_code`'s
+/// semantics this layer doesn't define) — the compaction's observation point
+/// is [`Hooks::on_before_compact`], which sees the fold, not the request.
+/// Likewise, `run_code`'s
 /// `tools.list()` self-introspection (code feature) bypasses the gate —
 /// listing which tools exist is not a side-effecting policy surface, while
 /// every `tools.call(...)` from the sandbox DOES gate, with
@@ -175,7 +216,8 @@ pub struct TurnStopInfo<'a> {
 ///   hooks that pair before/after counts will see these as unmatched
 ///   `before_tool`s; the rejection itself lands in the sandbox's `meta`
 ///   audit trace.
-/// - A panicking HOOKS method is not caught anywhere: on the parent thread
+/// - A panicking HOOKS method is not caught anywhere (the one exception is
+///   `on_before_compact`, next bullet): on the parent thread
 ///   (top-level gate / after-notify / chat observation) it unwinds through
 ///   `Agent::run` and may leave the already-saved session with an unpaired
 ///   tool_use — the same consequence as a Sequential tool's `run`
@@ -191,6 +233,16 @@ pub struct TurnStopInfo<'a> {
 ///   hold in the test profile and any host that overrides the profile;
 ///   implementers must not rely on unwinding — return `Deny`/`Stop` on bad
 ///   input.
+/// - The caught panic: `on_before_compact` runs inside `catch_unwind`. By the
+///   time it fires the summary request has already been billed and the
+///   history is one request away from one the provider cannot take — losing
+///   the fold to a broken observer would be the expensive outcome — so a
+///   panic there is reported, not propagated: the process's panic hook still
+///   prints it, the core adds ONE `diag_warn`
+///   (`[compress] on_before_compact hook panicked (…) — folding anyway`), and
+///   the fold proceeds exactly as it would have without the hook. The RELEASE
+///   CAVEAT above applies here too: under `panic = "abort"` the process ends
+///   before `catch_unwind` sees the panic.
 /// - `Modify` on a `todo` call changes only what EXECUTES; the `plan` field
 ///   in `result.json` is derived from the recorded (original) input — the
 ///   plan reflects what the model wanted to send. A denied `todo` is recorded
@@ -215,8 +267,9 @@ pub struct TurnStopInfo<'a> {
 /// host's own lock — that self-lock is the host's bug to avoid, but it is
 /// why the safe surface above is deliberately named. Slow hooks are
 /// OBSERVED, not bounded: `on_turn_stopping` runs in a serial window where
-/// a cancel waits for it; over a 5s threshold the core emits one
-/// `diag_warn` (no timeout, no interruption — see
+/// a cancel waits for it, and `on_before_compact` in one the run (or the
+/// host's `compact`) waits for; over a 5s threshold the core emits one
+/// `diag_warn` for either (no timeout, no interruption — see
 /// [`TurnStopDecision::Continue`]).
 pub trait Hooks: Send + Sync {
     /// Gate a tool call before execution. `tool` is the tool's name, `input`
@@ -322,14 +375,38 @@ pub trait Hooks: Send + Sync {
     ///   before that turn's preflight compression — so the note's bytes
     ///   are counted by the token precheck like any tail content.
     /// - **Errors fail safe.** On any internal error return `Stop`, not a
-    ///   panic: a panicking hook is not caught anywhere (same discipline as
-    ///   the other hooks — see *Edges*) and would unwind `Agent::run`
-    ///   instead of ending the run cleanly.
+    ///   panic: a panicking hook is not caught anywhere (the discipline of
+    ///   every hook but `on_before_compact` — see *Edges*) and would unwind
+    ///   `Agent::run` instead of ending the run cleanly.
     /// - An agent rebuilt from `--resume` does NOT carry hooks over (see
     ///   *Edges*), so a resumed run arbitrates only after the host re-runs
     ///   `set_hooks`.
     fn on_turn_stopping(&self, info: &TurnStopInfo) -> TurnStopDecision {
         let _ = info;
         TurnStopDecision::Stop
+    }
+
+    /// Observe an imminent history compaction. Called synchronously, once per
+    /// compaction that reaches the fold, immediately before the live history
+    /// is rewritten: the summary request has already succeeded (a summary
+    /// that failed or came back empty fires nothing — the fold it would have
+    /// announced does not happen), and the `dropped` originals in
+    /// [`CompactionInfo::folding`] are about to leave the live history for
+    /// the session archive. A prune-only pass (stale tool results replaced by
+    /// placeholders, no summary) is not a compaction and fires nothing.
+    ///
+    /// Use it to flush whatever the fold would otherwise cost the host —
+    /// notes to disk, an index, a UI snapshot — while the originals are
+    /// still readable. It cannot veto or alter the fold: `info` is read-only
+    /// and the summary is already paid for.
+    ///
+    /// Fires on every path that folds — the run loop's preflight and
+    /// overflow compactions, the host's [`crate::Agent::compact`], and a
+    /// `task` sub-agent's own compaction (then with
+    /// [`CompactionInfo::subagent`] set, on that child's worker thread).
+    /// Unlike the other hooks a panic here is caught: the fold proceeds and
+    /// one `diag_warn` reports it (see *Edges*). Default no-op.
+    fn on_before_compact(&self, info: &CompactionInfo) {
+        let _ = info;
     }
 }

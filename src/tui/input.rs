@@ -1,25 +1,5 @@
-//! Text input: the multi-line `InputBuffer` editor, input-history recall,
-//! and the input-box horizontal-scroll math.
-
-use unicode_width::UnicodeWidthStr;
-
-/// Horizontal scroll for the input box: returns `(scroll_offset, caret_x)`
-/// where `caret_x` is the caret's on-screen column relative to the box's
-/// inner left edge, guaranteed `< inner_cols`. The input Paragraph doesn't
-/// wrap, so a line wider than the box must be horizontally scrolled to keep
-/// the caret visible — an unclamped caret would be drawn past the border,
-/// over the conversation area (or off-screen on a narrow terminal).
-pub(super) fn input_hscroll(caret_col: usize, inner_cols: usize) -> (u16, u16) {
-    let inner_cols = inner_cols.max(1);
-    let scroll = caret_col
-        .saturating_sub(inner_cols.saturating_sub(1))
-        .min(u16::MAX as usize) as u16;
-    let x = caret_col
-        .saturating_sub(scroll as usize)
-        .min(inner_cols.saturating_sub(1))
-        .min(u16::MAX as usize) as u16;
-    (scroll, x)
-}
+//! Text input: the multi-line `InputBuffer` editor and input-history recall.
+//! Soft wrapping and display-cell caret placement live in `render`.
 
 /// Multi-line input editor: a vec of lines with a (row, col) cursor. `col` is
 /// a byte offset kept on UTF-8 char boundaries, so insert/remove never split a
@@ -256,14 +236,6 @@ impl InputBuffer {
     /// so a multiline buffer must be split into multiple `Line`s to render).
     pub(super) fn lines_view(&self) -> &[String] {
         &self.lines
-    }
-
-    /// (row, DISPLAY width of the text before the caret on that line). Display
-    /// width — not a char count — so the caret column is correct for wide (CJK)
-    /// chars, which occupy two columns each (a char count drifts one column per
-    /// wide char and lands the caret mid-text).
-    pub(super) fn cursor_pos(&self) -> (usize, usize) {
-        (self.row, self.lines[self.row][..self.col].width())
     }
 }
 

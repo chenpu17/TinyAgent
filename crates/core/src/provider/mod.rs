@@ -41,7 +41,7 @@ impl std::fmt::Display for ApiStatusError {
 
 impl std::error::Error for ApiStatusError {}
 
-use crate::config::{Config, ProviderKind};
+use crate::config::{header_is_reserved, Config, ExtraHeaders, ProviderKind};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -141,6 +141,125 @@ pub struct Message {
     /// Ordered content blocks. A turn's text, images, tool calls, and tool
     /// results all live in this one vector.
     pub content: Vec<Block>,
+    /// Reasoning state the provider emitted for this assistant turn, kept ONLY
+    /// to echo back on the next request (see [`Reasoning`]). A side field by
+    /// design — never a [`Block`] variant — so every "shape of the blocks"
+    /// rule in the kernel (empty reply ≠ persisted, the zero-block rules of
+    /// turn arbitration, salvage detection, a sub-agent's `final_text`) holds
+    /// unchanged, and rendering never sees it: `content` stays exactly what
+    /// it was before reasoning carry-forward existed. `None` on user messages,
+    /// on every message while `Config::preserved_reasoning` is off, and on
+    /// every message that outlived its turn (a new user turn,
+    /// a `set_model` switch and a same-role merge all drop it — see
+    /// `agent::append_user_turn`). Serialized only when present,
+    /// so pre-carry session files stay valid and round-trip byte-identically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<Reasoning>,
+}
+
+/// One reasoning (thinking) block a provider emitted in an assistant turn,
+/// positioned relative to the turn's [`Block`]s. Not model-visible text the
+/// kernel reasons about: an OPAQUE record whose only job is to be echoed back
+/// verbatim so the provider can restore its own reasoning state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReasoningBlock {
+    /// Index into [`Message::content`] this block PRECEDED in the provider's
+    /// stream (`content.len()` = it trailed every block). Preserved because
+    /// position is part of the contract for Anthropic interleaved thinking —
+    /// a block must be echoed where it appeared, and "all thinking first" is
+    /// only correct for the non-interleaved case, where the blocks do come
+    /// first.
+    pub before: usize,
+    /// The thinking text exactly as the provider emitted it. Empty for a
+    /// redacted block (the payload is all there is).
+    #[serde(default)]
+    pub text: String,
+    /// Vendor-private companion data, echoed byte-for-byte and never
+    /// interpreted: Anthropic `{"signature": "…"}` (the cryptographic
+    /// signature a thinking block must carry when sent back — an unsigned one
+    /// is dropped rather than echoed) or `{"data": "…"}` for a redacted block.
+    /// `{}` when the provider attaches nothing (OpenAI-compat
+    /// `reasoning_content` is bare text) and when a record arrives without it
+    /// (a hand-trimmed session file) — never `null`, so "echo the payload
+    /// verbatim" has one shape.
+    #[serde(default = "empty_object")]
+    pub opaque: Value,
+}
+
+/// `#[serde(default)]` for [`ReasoningBlock::opaque`]: an empty object rather
+/// than `Value::Null`.
+fn empty_object() -> Value {
+    Value::Object(Default::default())
+}
+
+/// The reasoning state of one assistant turn ([`Message::reasoning`]).
+///
+/// Why it exists: several current APIs REQUIRE the reasoning to come back
+/// with the tool results for the model to keep its chain of thought across a
+/// tool-use loop — GLM's docs make it mandatory for interleaved thinking +
+/// tools (preserved thinking is default-on there), OpenAI's Responses API
+/// needs its reasoning items passed back, and Anthropic rejects a tool-loop
+/// request whose last assistant message starts with `tool_use` instead of the
+/// signed thinking block while thinking is enabled (the API strips older
+/// turns' blocks itself). The kernel's side of the contract is storage +
+/// verbatim echo; whether to keep it at all is `Config::preserved_reasoning`
+/// (on by default since the A/B in `docs/kernel_improvement_plan.md` §1.2
+/// settled the question; `false` opts out).
+///
+/// What it never is: content. It is not rendered, not summarized, not shown
+/// to the user as part of the reply, and [`ChatEvent::ThinkingDelta`] remains
+/// the one display feed — unchanged.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Reasoning {
+    /// Provider family that produced these blocks (`"anthropic"` /
+    /// `"openai"`, matching `Config::provider`'s wire spelling). A provider
+    /// echoes ONLY its own family's blocks: after `set_model` to another
+    /// vendor, or on a session written by the other provider, foreign state
+    /// is skipped instead of sent — the wire shapes share nothing.
+    pub provider: String,
+    /// The turn's reasoning blocks in emission order.
+    pub blocks: Vec<ReasoningBlock>,
+}
+
+/// `Reasoning::provider` tag of the Anthropic Messages API family.
+pub const REASONING_ANTHROPIC: &str = "anthropic";
+
+/// `Reasoning::provider` tag of the OpenAI-compatible chat-completions family.
+pub const REASONING_OPENAI: &str = "openai";
+
+/// Appended to a 400 whose text says the endpoint wanted reasoning state on
+/// an assistant message and the request carried none. Reasoning carry can
+/// be switched off (`Config::preserved_reasoning`), so the class of failure
+/// it repairs has to name the switch — otherwise the user reads
+/// "Expected thinking … but found tool_use" with nothing pointing at the fix.
+/// Host-facing diagnostic text (an error message), never model-visible.
+pub(crate) const REASONING_CARRY_HINT: &str = " [hint: this endpoint wants the reasoning \
+     trace passed back on assistant messages inside a tool loop; TinyAgent \
+     echoes it when the model config sets `preserved_reasoning: true`]";
+
+/// Pack a response's collected reasoning blocks into its `reasoning` side
+/// field — `None` when nothing replayable arrived, so a reply without
+/// reasoning is indistinguishable from one built before the feature existed.
+pub(crate) fn into_reasoning(
+    provider: &'static str,
+    blocks: Vec<ReasoningBlock>,
+) -> Option<Reasoning> {
+    (!blocks.is_empty()).then(|| Reasoning {
+        provider: provider.to_string(),
+        blocks,
+    })
+}
+
+impl Message {
+    /// The reasoning this message carries for ONE provider family — `None`
+    /// when it carries none or when another family produced it (a session
+    /// written by the other provider, a model switched across vendors): the
+    /// wire shapes share nothing, so foreign state is skipped, never sent.
+    pub(crate) fn reasoning_for(&self, provider: &str) -> Option<&Reasoning> {
+        self.reasoning
+            .as_ref()
+            .filter(|r| r.provider == provider && !r.blocks.is_empty())
+    }
 }
 
 impl Message {
@@ -154,6 +273,7 @@ impl Message {
             id: None,
             role: Role::User,
             content: blocks,
+            reasoning: None,
         }
     }
 
@@ -165,6 +285,7 @@ impl Message {
             id: None,
             role: Role::Assistant,
             content: blocks,
+            reasoning: None,
         }
     }
 }
@@ -195,11 +316,13 @@ pub enum ChatEvent {
     /// turn's [`Block::Text`].
     TextDelta(String),
     /// Reasoning/thinking increment from a reasoning model (OpenAI-style
-    /// `reasoning_content`, Anthropic `thinking` blocks). Surfaced as an event
-    /// ONLY — it never enters the conversation history (`text`/`blocks`), since
-    /// no major API requires thinking to be echoed back on the next turn
-    /// (DeepSeek V4 thinking + tool-use multi-turn is the documented exception;
-    /// not handled here).
+    /// `reasoning_content`, Anthropic `thinking` blocks). A DISPLAY feed only:
+    /// it never enters `text`/`blocks`, so concatenating a turn's text deltas
+    /// still yields exactly the turn's [`Block::Text`]. (Providers separately
+    /// record the turn's reasoning as [`ChatResponse::reasoning`] — an opaque
+    /// side field the agent may echo back when `Config::preserved_reasoning`
+    /// is on; that is storage for the provider's benefit, not content, and
+    /// this event is unchanged by it.)
     ThinkingDelta(String),
     /// Incremental fragment of a tool call's input JSON while the model
     /// streams it (OpenAI `tool_calls[].function.arguments` fragments /
@@ -245,10 +368,28 @@ pub struct Usage {
     /// Prompt-cache reads (Anthropic and OpenAI; billed at ~0.1×). 0 = none.
     #[serde(default)]
     pub cache_read_input_tokens: u64,
+    /// Reasoning (thinking) tokens the provider reports SEPARATELY — a subset
+    /// split OF `output_tokens` (OpenAI-compat
+    /// `completion_tokens_details.reasoning_tokens`), not a fifth axis:
+    /// [`Usage::total`] deliberately does NOT add it (that would bill the
+    /// same tokens twice). It exists so the bill can say how much of a
+    /// reply's output budget went to thinking. 0 when the provider does not
+    /// report the split (Anthropic today) — "unknown" and "none" are
+    /// indistinguishable here, by design: nothing gates on the value.
+    /// Serialized only when non-zero, so reports for non-reasoning models
+    /// stay byte-identical.
+    #[serde(default, skip_serializing_if = "Usage::reasoning_is_zero")]
+    pub reasoning_tokens: u64,
 }
 
 impl Usage {
+    /// serde `skip_serializing_if` predicate for `reasoning_tokens`.
+    fn reasoning_is_zero(n: &u64) -> bool {
+        *n == 0
+    }
+
     /// Sum of all token axes — input + output + cache write + cache read.
+    /// (`reasoning_tokens` is a split of `output_tokens`, not an axis.)
     /// The run's `max_total_tokens` budget guard checks this against the cap at
     /// each turn boundary. Includes cache_read even though providers discount
     /// it: it still reflects tokens transmitted, and the guard is a coarse
@@ -273,6 +414,14 @@ pub struct ChatResponse {
     pub stop_reason: String,
     /// Tokens this request cost; `None` when the provider reported none.
     pub usage: Option<Usage>,
+    /// The turn's reasoning state, whenever the response carried any —
+    /// produced unconditionally by the built-in providers; the AGENT decides
+    /// whether to keep it (`Config.preserved_reasoning`; switched off, it is
+    /// dropped before anything is stored and the history is byte-identical
+    /// to a carry-off build). `None` for a reply without
+    /// reasoning and for custom providers that never set it. See
+    /// [`Reasoning`].
+    pub reasoning: Option<Reasoning>,
 }
 
 /// A simplified, **non-streaming** chat response shape: the full assistant text
@@ -333,6 +482,7 @@ impl ChatResponse {
             blocks,
             stop_reason: s.stop_reason.unwrap_or_else(|| "end_turn".to_string()),
             usage: s.usage,
+            reasoning: None,
         }
     }
 }
@@ -440,6 +590,11 @@ pub struct GatewayFixes {
     /// Omit the `reasoning_effort` field (old gateways don't know it).
     #[serde(default)]
     pub no_reasoning_effort: bool,
+    /// Strip `reasoning_content` off every assistant message before sending
+    /// (gateways that reject the echo of a previous turn's reasoning with a
+    /// 400). Only matters while `Config.preserved_reasoning` is on.
+    #[serde(default)]
+    pub no_reasoning_echo: bool,
 }
 
 impl GatewayFixes {
@@ -460,6 +615,90 @@ impl GatewayFixes {
         self.max_completion_tokens |= other.max_completion_tokens;
         self.no_stream_options |= other.no_stream_options;
         self.no_reasoning_effort |= other.no_reasoning_effort;
+        self.no_reasoning_echo |= other.no_reasoning_echo;
+    }
+}
+
+/// `Config.extra_body` / `Config.extra_headers` in the form the providers
+/// apply per request: parsed once at construction ([`Self::from_config`]), so
+/// the per-request work is a merge and a header loop with no parsing left to
+/// fail mid-request.
+///
+/// Two guarantees, whatever it is handed — the kernel's own body fields always
+/// win, and authentication / protocol headers cannot be swapped from the
+/// extras. [`Config`](crate::config::Config)'s load-time validation already
+/// rejects reserved entries with the entry blamed; the filters here are the
+/// second, silent line for a provider constructed by hand
+/// ([`Anthropic::with_extra_headers`] and friends).
+#[derive(Default, Clone)]
+pub(crate) struct RequestExtras {
+    /// `extra_body` — kept only while it is a JSON object.
+    body: Option<Value>,
+    /// `extra_headers` as parsed pairs; every value is flagged sensitive, so
+    /// no `Debug`/trace output downstream can print one.
+    headers: Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)>,
+}
+
+impl RequestExtras {
+    /// The extras of a config, for [`build`].
+    pub(crate) fn from_config(cfg: &Config) -> Self {
+        let mut extras = Self::default();
+        if let Some(body) = &cfg.extra_body {
+            extras.set_body(body.clone());
+        }
+        if let Some(headers) = &cfg.extra_headers {
+            extras.set_headers(headers);
+        }
+        extras
+    }
+
+    /// Replace the extra body fields (ignored unless a JSON object).
+    pub(crate) fn set_body(&mut self, body: Value) {
+        self.body = body.is_object().then_some(body);
+    }
+
+    /// Replace the extra headers. Dropped here: a kernel-managed name
+    /// ([`crate::config::header_is_reserved`], case-insensitive) and anything
+    /// that is not a valid header — an invalid one would otherwise turn every
+    /// request into an unsent "builder error".
+    pub(crate) fn set_headers(&mut self, headers: &ExtraHeaders) {
+        self.headers = headers
+            .0
+            .iter()
+            .filter(|(name, _)| !header_is_reserved(name))
+            .filter_map(|(name, value)| {
+                let name = reqwest::header::HeaderName::from_bytes(name.trim().as_bytes()).ok()?;
+                let mut value = reqwest::header::HeaderValue::from_str(value).ok()?;
+                value.set_sensitive(true);
+                Some((name, value))
+            })
+            .collect();
+    }
+
+    /// Merge the extra body fields into a built request body: each is added
+    /// when the body does not carry it and skipped otherwise — the kernel's
+    /// field always wins, whatever slipped past the load-time check.
+    pub(crate) fn merge_body(&self, body: &mut Value) {
+        let (Some(extra), Some(body)) = (
+            self.body.as_ref().and_then(Value::as_object),
+            body.as_object_mut(),
+        ) else {
+            return;
+        };
+        for (key, value) in extra {
+            body.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+
+    /// Append the extra headers to a request built by the kernel.
+    pub(crate) fn apply_headers(
+        &self,
+        mut rb: reqwest::blocking::RequestBuilder,
+    ) -> reqwest::blocking::RequestBuilder {
+        for (name, value) in &self.headers {
+            rb = rb.header(name.clone(), value.clone());
+        }
+        rb
     }
 }
 
@@ -473,10 +712,14 @@ pub fn build(cfg: &Config, api_key: &str, client: reqwest::blocking::Client) -> 
     // deep-reasoning models with long first-token latency (DeepSeek-R1,
     // o-series) raise it via `limits.stream_idle_secs` in the config.
     let idle = Duration::from_secs(cfg.limits.stream_idle_secs.max(1));
+    let extras = RequestExtras::from_config(cfg);
     match cfg.provider {
-        ProviderKind::Anthropic => Box::new(Anthropic::new(client, base, api_key, idle)),
+        ProviderKind::Anthropic => {
+            Box::new(Anthropic::new(client, base, api_key, idle).with_request_extras(extras))
+        }
         ProviderKind::Openai => Box::new(
             OpenAi::new(client, base, api_key, idle)
+                .with_request_extras(extras)
                 .with_preset(cfg.gateway_fixes_preset.unwrap_or_default())
                 .with_strip_think_tags(cfg.strip_think_tags),
         ),
@@ -915,6 +1158,150 @@ impl SseSource for CancellableSse {
     }
 }
 
+/// Loopback HTTP fixtures shared by the kernel's tests: a tiny body-driven
+/// gateway speaking HTTP/1.1 to a real `reqwest::blocking` client, so the
+/// wire a provider (or a sub-agent's freshly built provider) actually sends
+/// can be asserted — no Python mock, no network. Test-only.
+#[cfg(test)]
+pub(crate) mod testhttp {
+    /// Read one HTTP request off `stream`: parse the headers for
+    /// Content-Length, then read exactly that many bytes. Consumes the request
+    /// so the response can be written back on the same socket. Returns the
+    /// request line and header lines (each lowercased, line endings trimmed)
+    /// beside the body.
+    pub(crate) fn read_http_request(stream: &std::net::TcpStream) -> (Vec<String>, String) {
+        use std::io::{BufRead, BufReader, Read};
+        let mut reader = BufReader::new(stream.try_clone().expect("clone tcp"));
+        let mut content_length = 0usize;
+        let mut head = Vec::new();
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let trimmed = line.trim_end_matches(['\r', '\n']).to_ascii_lowercase();
+            if trimmed.is_empty() {
+                break; // end of headers
+            }
+            if let Some(v) = trimmed.strip_prefix("content-length:") {
+                content_length = v.trim().parse().unwrap_or(0);
+            }
+            head.push(trimmed);
+        }
+        let mut body = vec![0u8; content_length];
+        if content_length > 0 {
+            let _ = reader.read_exact(&mut body);
+        }
+        (head, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// [`read_http_request`]'s body half.
+    pub(crate) fn read_http_body(stream: &std::net::TcpStream) -> String {
+        read_http_request(stream).1
+    }
+
+    /// A `(&'static str status, &'static str content-type, String payload)`
+    /// reply, chosen per request from its body.
+    pub type Reply = (&'static str, &'static str, String);
+
+    /// What a loopback gateway saw: the URL to point a provider at, every
+    /// parsed request body in arrival order, and each request's head.
+    pub(crate) struct Gateway {
+        pub(crate) url: String,
+        pub(crate) bodies: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        /// Per request (same order as `bodies`, for every request whose body
+        /// parsed): the request line and the header lines as `name: value`,
+        /// all lowercased.
+        pub(crate) heads: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    }
+
+    /// [`gateway_inspected`] minus the heads, for tests that only read bodies.
+    pub(crate) fn gateway(
+        reply: impl Fn(&str) -> Reply + Send + 'static,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) {
+        let gw = gateway_inspected(reply);
+        (gw.url, gw.bodies)
+    }
+
+    /// Loopback gateway driven by a per-request decision function: `reply(body)`
+    /// returns the response for that request body; every parsed body is
+    /// recorded in arrival order. Each response carries Content-Length AND
+    /// `connection: close`, so the client opens a fresh socket per request —
+    /// exactly one accept per request, in arrival order, with no keep-alive
+    /// ambiguity.
+    pub(crate) fn gateway_inspected(reply: impl Fn(&str) -> Reply + Send + 'static) -> Gateway {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let bodies: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+        let heads: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>> = Default::default();
+        let seen = bodies.clone();
+        let seen_heads = heads.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = match stream {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let (head, body) = read_http_request(&stream);
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                    seen.lock().unwrap().push(v);
+                    seen_heads.lock().unwrap().push(head);
+                }
+                let (status, ct, payload) = reply(&body);
+                let head = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: {ct}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    payload.len(),
+                );
+                let _ = std::io::Write::write_all(&mut stream, head.as_bytes());
+                let _ = std::io::Write::write_all(&mut stream, payload.as_bytes());
+                let _ = std::io::Write::flush(&mut stream);
+            }
+        });
+        Gateway { url, bodies, heads }
+    }
+
+    /// A minimal successful chat-completions SSE stream whose assistant says
+    /// `content` — the "accepted" reply for gateways that only reject certain
+    /// request shapes.
+    pub(crate) fn sse_says(content: &str) -> Reply {
+        let payload = format!(
+            "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":{content}}}}}]}}\n\n\
+             data: {{\"choices\":[{{\"index\":0,\"finish_reason\":\"stop\",\"delta\":{{}}}}]}}\n\n\
+             data: [DONE]\n\n",
+            content = serde_json::json!(content),
+        );
+        ("200 OK", "text/event-stream", payload)
+    }
+
+    /// A minimal successful Anthropic Messages SSE stream whose assistant says
+    /// `content` — one text block, no thinking.
+    pub(crate) fn sse_anthropic(content: &str) -> Reply {
+        let payload = format!(
+            "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"usage\":{{\"input_tokens\":1}}}}}}\n\n\
+             event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n\
+             event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":{content}}}}}\n\n\
+             event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+             event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n",
+            content = serde_json::json!(content),
+        );
+        ("200 OK", "text/event-stream", payload)
+    }
+
+    /// A JSON error body with the given HTTP status and message.
+    pub(crate) fn json_error(status: &'static str, message: &str) -> Reply {
+        (
+            status,
+            "application/json",
+            serde_json::json!({"error": {"message": message, "type": "invalid_request_error"}})
+                .to_string(),
+        )
+    }
+}
+
 #[cfg(test)]
 #[path = "sse_review_pins.rs"]
 mod sse_review_pins;
@@ -1187,5 +1574,81 @@ mod tests {
             }
             other => panic!("expected Cancelled, got {other:?}"),
         }
+    }
+
+    /// `Config.extra_body` as the providers apply it: a new field rides
+    /// along, a kernel-written field is never overridden. The guarantee is
+    /// the provider's, not only the load-time check's — a `Config` built by
+    /// hand skips the check.
+    #[test]
+    fn request_extras_merge_without_overriding_kernel_fields() {
+        let mut extras = RequestExtras::default();
+        extras.set_body(serde_json::json!({"top_k": 5, "model": "smuggled", "max_tokens": 1}));
+        let mut body = serde_json::json!({"model": "m", "max_tokens": 10, "messages": []});
+        extras.merge_body(&mut body);
+        assert_eq!(
+            body,
+            serde_json::json!({"model": "m", "max_tokens": 10, "messages": [], "top_k": 5})
+        );
+
+        // Not an object: nothing to merge (the body is never corrupted).
+        extras.set_body(serde_json::json!("model"));
+        let mut body = serde_json::json!({"model": "m"});
+        extras.merge_body(&mut body);
+        assert_eq!(body, serde_json::json!({"model": "m"}));
+
+        // No extras at all: the body is untouched.
+        RequestExtras::default().merge_body(&mut body);
+        assert_eq!(body, serde_json::json!({"model": "m"}));
+    }
+
+    /// `Config.extra_headers` as the providers apply it: a kernel-managed
+    /// name (case-insensitive, whitespace-tolerant) and an invalid header are
+    /// dropped before any request — an invalid one would otherwise turn every
+    /// request into an unsent "builder error" — and the values that remain
+    /// never print.
+    #[test]
+    fn request_extras_drop_reserved_or_invalid_headers_and_mask_values() {
+        let mut extras = RequestExtras::default();
+        extras.set_headers(
+            &serde_json::from_value(serde_json::json!({
+                "Anthropic-Beta": "flag-1",
+                "AUTHORIZATION": "Bearer evil",
+                "  Content-Type ": "text/plain",
+                "Host": "evil.test",
+                "X-Tenant": "tenant-7",
+                "bad name": "v",
+                "X-Nl": "a\r\nInjected: 1",
+            }))
+            .unwrap(),
+        );
+        let names: Vec<&str> = extras.headers.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["anthropic-beta", "x-tenant"]);
+        let values: Vec<&str> = extras
+            .headers
+            .iter()
+            .map(|(_, v)| v.to_str().unwrap())
+            .collect();
+        assert_eq!(values, vec!["flag-1", "tenant-7"]);
+        let printed = format!("{:?} {:?}", extras.headers[0].1, extras.headers);
+        assert!(
+            !printed.contains("flag-1") && !printed.contains("tenant-7"),
+            "values are credentials: {printed}"
+        );
+
+        // Applied on top of the kernel's own headers, which stay as written.
+        let req = extras
+            .apply_headers(
+                reqwest::blocking::Client::new()
+                    .post("http://127.0.0.1:1/x")
+                    .header("content-type", "application/json"),
+            )
+            .build()
+            .unwrap();
+        let h = req.headers();
+        assert_eq!(h.get("content-type").unwrap(), "application/json");
+        assert_eq!(h.get("anthropic-beta").unwrap(), "flag-1");
+        assert_eq!(h.get("x-tenant").unwrap(), "tenant-7");
+        assert_eq!(h.len(), 3, "no header was smuggled in");
     }
 }

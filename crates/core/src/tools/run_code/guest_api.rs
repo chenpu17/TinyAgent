@@ -1875,6 +1875,10 @@ return t.length;"#}),
     fn guest_reaches_mcp_tools_live() {
         use crate::config::McpServerConfig;
         let echo = McpServerConfig {
+            deny_tools: Vec::new(),
+            call_timeout_secs: None,
+            connect_timeout_secs: None,
+            allow_tools: Vec::new(),
             name: "e1".into(),
             command: Some("python3".into()),
             args: vec![format!(
@@ -1886,7 +1890,7 @@ return t.length;"#}),
             headers: Default::default(),
             env: Default::default(),
         };
-        let mcp_tools = mcp::build(&[echo]).expect("echo server starts");
+        let mcp_tools = mcp::build(&[echo], &[]).expect("echo server starts");
         let cfg: Config = serde_json::from_str(
             r#"{"provider":"openai","api_key_env":"K","model":"m","inject_environment":false,
                 "tools":["read_file"]}"#,
@@ -2251,12 +2255,14 @@ return t.length;"#}),
     #[test]
     fn inner_usage_folds_saturating() {
         let mut acc = Usage {
+            reasoning_tokens: u64::MAX,
             input_tokens: u64::MAX / 2,
             output_tokens: 1,
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: u64::MAX,
         };
         let inner = Usage {
+            reasoning_tokens: 5,
             input_tokens: u64::MAX,
             output_tokens: u64::MAX,
             cache_creation_input_tokens: 7,
@@ -2271,6 +2277,11 @@ return t.length;"#}),
         assert_eq!(acc.output_tokens, u64::MAX);
         assert_eq!(acc.cache_creation_input_tokens, 7);
         assert_eq!(acc.cache_read_input_tokens, u64::MAX);
+        assert_eq!(
+            acc.reasoning_tokens,
+            u64::MAX,
+            "the reasoning split folds too"
+        );
     }
 
     /// The undeliverable-result fallback text is SIZE-ONLY by construction:
@@ -2542,6 +2553,7 @@ return t.length;"#}),
         let (prov, _) =
             crate::provider::mock::MockProvider::new(vec![crate::provider::mock::MockTurn::Ok(
                 crate::provider::ChatResponse {
+                    reasoning: None,
                     blocks: vec![crate::provider::Block::Text("par".into())],
                     stop_reason: "stream_error".into(),
                     usage: crate::provider::mock::mk_usage(10, 5),
@@ -2600,6 +2612,7 @@ return t.length;"#}),
         let (prov, _) =
             crate::provider::mock::MockProvider::new(vec![crate::provider::mock::MockTurn::Ok(
                 crate::provider::ChatResponse {
+                    reasoning: None,
                     blocks: vec![crate::provider::Block::Text("partial".into())],
                     stop_reason: "stream_truncated".into(),
                     usage: None,
@@ -2652,6 +2665,7 @@ return t.length;"#}),
         let (prov, _) =
             crate::provider::mock::MockProvider::new(vec![crate::provider::mock::MockTurn::Ok(
                 crate::provider::ChatResponse {
+                    reasoning: None,
                     blocks: vec![crate::provider::Block::Text("ye".into())],
                     stop_reason: "max_tokens".into(),
                     usage: crate::provider::mock::mk_usage(10, 8),
@@ -2780,6 +2794,7 @@ return t.length;"#}),
             let dir = scratch();
             let (prov, state) = crate::provider::mock::MockProvider::new(vec![
                 crate::provider::mock::MockTurn::Ok(crate::provider::ChatResponse {
+                    reasoning: None,
                     // Residual text that WOULD pass the labels check — the
                     // laundering probe's exact shape.
                     blocks: vec![crate::provider::Block::Text("yes".into())],
@@ -3364,6 +3379,7 @@ return t.length;"#}),
                     .unwrap()
                     .push((s, std::time::Instant::now()));
                 Ok(crate::provider::ChatResponse {
+                    reasoning: None,
                     blocks: vec![crate::provider::Block::Text("yes".into())],
                     stop_reason: "end_turn".into(),
                     usage: crate::provider::mock::mk_usage(1, 1),

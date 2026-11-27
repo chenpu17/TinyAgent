@@ -1,12 +1,16 @@
 // User-facing TypeScript types for tiny-agent (the wrapper API).
 // Outcome / event shapes mirror the Rust structs (snake_case, matching Python).
 
-/** Token usage (4 axes). cache_creation is 0 for OpenAI (no creation event). */
+/** Token usage (4 axes + the reasoning split). cache_creation is 0 for OpenAI
+ *  (no creation event). */
 export interface Usage {
   input_tokens: number;
   output_tokens: number;
   cache_creation_input_tokens: number;
   cache_read_input_tokens: number;
+  /** Reasoning (thinking) tokens — a split OF output_tokens, not a fifth
+   *  axis (never added on top); absent when the provider reported none. */
+  reasoning_tokens?: number;
 }
 
 /** Audit record of one completed compression during a run (`RunOutcome.compressions`,
@@ -72,6 +76,10 @@ export interface RunOutcome {
   output_tokens: number;
   cache_creation_input_tokens: number;
   cache_read_input_tokens: number;
+  /** Reasoning tokens summed over the run (a split OF output_tokens — never
+   *  added on top; includes `task` children and failed attempts). Sparse —
+   *  absent when 0. */
+  reasoning_tokens?: number;
   /** Elapsed wall-clock time for the run. */
   elapsed: { secs: number; nanos: number };
   /** FR-4 pairing key: stable fingerprint of the construction-time config

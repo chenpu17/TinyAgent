@@ -184,6 +184,64 @@ impl std::error::Error for CompressError {
     }
 }
 
+/// Ceiling for a summary call's `max_tokens`: the doubled-budget retries never
+/// go past it. Matches the default `Config::max_tokens` and stays under common
+/// model output caps, so a retry is not refused for its size alone.
+const SUMMARY_MAX_BUDGET: u32 = 8192;
+
+/// What an agent has learned, across its runs, about how much output a
+/// summary from THIS model needs.
+///
+/// The problem (`docs/kernel_improvement_plan.md` §0.0.5, real-model
+/// verification): a summary's budget is proportional to the transcript
+/// (`compress::summary_budget`, 1024–4096 tokens) on the assumption that the
+/// summary text is what gets generated. A reasoning model bills its thinking
+/// against the same `max_tokens`: in the three real-model batches 204 of
+/// 240 summary calls came back cut at the 1024-token floor — 199 of them
+/// with reasoning taking part of the budget (up to 992 tokens) — and every
+/// one of those folds carried a truncated brief.
+///
+/// - `floor`: the smallest FIRST-attempt budget known to let this model's
+///   summary finish (0 = nothing learned). Set only when a doubled-budget
+///   retry answers, so a model that never truncates never moves it. Every
+///   later summary call starts at `max(proportional, floor)`, capped by the
+///   turn's `max_tokens` (`Agent::summary_budget_for`).
+/// - `ceiling`: a retry budget the endpoint refused (a strict gateway's 400
+///   on the doubled value). That much or more is never asked for again
+///   ([`Self::may_ask`]) — a larger value would be refused for the same
+///   reason, and retrying it on every later truncated summary would pay the
+///   same doomed request each time. Lower values may still be tried.
+///
+/// Agent-level state, cleared by `Agent::set_model` (the lesson describes one
+/// model's reasoning appetite, and one endpoint's limits).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SummaryBudget {
+    floor: u32,
+    ceiling: Option<u32>,
+}
+
+impl SummaryBudget {
+    /// The doubled-budget retry answered at `used`: that budget works for
+    /// this model, so later summary calls start from it instead of repeating
+    /// the truncated first attempt. Loud when it moves — a higher first-attempt
+    /// budget changes what a summary can cost.
+    fn learned(&mut self, used: u32) {
+        if used > self.floor {
+            crate::diag::diag_info!(
+                "[compress] summary output budget raised to {used} tokens for this agent \
+                 (the model's reasoning is billed against the summary's max_tokens)"
+            );
+            self.floor = used;
+        }
+    }
+
+    /// Whether a retry may ask for `budget`: false once the endpoint refused
+    /// that much or more.
+    fn may_ask(&self, budget: u32) -> bool {
+        self.ceiling.is_none_or(|c| budget < c)
+    }
+}
+
 /// Events emitted during a run; frontends (headless printer / TUI) consume them.
 ///
 /// `Serialize` is derived so the Python / TypeScript bindings can hand each event
@@ -247,9 +305,9 @@ pub enum AgentEvent {
         input: Value,
     },
     /// A tool call finished. `content` is what the MODEL saw (possibly
-    /// truncated; the stuck-loop nudge appended to the history block is NOT
-    /// included here — see `stuck_nudge`); the full text lives in
-    /// [`ToolCallRecord::output`].
+    /// truncated; the stuck-loop nudges appended to the history block —
+    /// `stuck_nudge`, `repeat_nudge` — are NOT included here); the full text
+    /// lives in [`ToolCallRecord::output`].
     ToolResult {
         /// Tool name.
         name: String,
@@ -305,6 +363,9 @@ pub enum AgentEvent {
         /// occupancy truth); `true` = a tool call's bill folded into the run
         /// totals — see the variant docs for the full contract.
         tool_folded: bool,
+        /// Reasoning tokens reported as a split OF `output_tokens` (0 when the
+        /// provider reports no split) — see [`Usage::reasoning_tokens`].
+        reasoning_tokens: u64,
     },
     /// History was compressed: how many middle messages were dropped,
     /// how many remain, which path triggered it, and the estimated-vs-
@@ -576,6 +637,17 @@ pub struct ToolCallRecord {
     /// with the key omitted when None.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    /// The MCP server's own declarations about this tool (`readOnlyHint` /
+    /// `destructiveHint` / `idempotentHint` / `openWorldHint`), snapshotted
+    /// from the side table at dispatch time so the audit trail says what the
+    /// SERVER claimed — useful when a run did something surprising. `None` for
+    /// built-in tools (they declare nothing); an MCP tool always carries its
+    /// entry — the spec defaults (`ToolAnnotations::MISSING`) when its server
+    /// sends no annotations, so "built-in" and "MCP, nothing declared" read
+    /// apart. Serialized as `tool_calls[].annotations` with the key omitted
+    /// when None (leaf tools stay byte-identical to before).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<crate::tools::ToolAnnotations>,
 }
 
 /// Per-turn wall-clock timing for a completed run (`RunOutcome.turn_timings`).
@@ -719,6 +791,16 @@ pub struct RunOutcome {
     pub cache_creation_input_tokens: u64,
     /// Prompt-cache reads summed over every request (0 without caching).
     pub cache_read_input_tokens: u64,
+    /// Reasoning (thinking) tokens summed over every request — a split OF
+    /// `output_tokens`, never added on top. 0 both when no provider reported
+    /// the split and when the model does not reason: the two are not told
+    /// apart here (nothing gates on the value — it is for the bill). Folded
+    /// across retry attempts like the other totals (a failed attempt's
+    /// thinking was paid for too), and it includes what `task` children
+    /// spent. Sparse in the serialization (0 → key absent), so results for
+    /// non-reasoning models stay byte-identical.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub reasoning_tokens: u64,
     /// Wall-clock time from run entry to return — includes the failed
     /// attempt's work when a retry ladder folded costs in (`RunCost`).
     pub elapsed: Duration,
@@ -760,6 +842,14 @@ pub struct RunOutcome {
 ///
 /// `Display`/`Debug` delegate to `source`, so existing `{e}` / `{e:#}`
 /// formatting at call sites is unchanged.
+///
+/// SIZE: 128 bytes — exactly at clippy's `result_large_err` threshold since
+/// [`Usage`] gained `reasoning_tokens`. It is returned by value ONCE per
+/// failed run, on the coldest path there is, so the four functions returning
+/// it carry an explicit `allow` instead of trading a public field's type for
+/// a few bytes (every field here is read by the retry ladders and both
+/// bindings; boxing one would move a deref into each of them for nothing
+/// measurable).
 pub struct RunError {
     /// The underlying failure. `Display`/`Debug` delegate here, so existing
     /// formatting is unchanged; the cost fields below are the extra payload a
@@ -795,9 +885,11 @@ pub struct RunError {
     pub elapsed: Duration,
 }
 
-/// `serde` `skip_serializing_if` predicate for [`RunOutcome::arbitrations_used`].
-fn is_zero(v: &u32) -> bool {
-    *v == 0
+/// `serde` `skip_serializing_if` predicate for the sparse numeric fields of
+/// [`RunOutcome`] (`arbitrations_used`, `reasoning_tokens`): a zero field
+/// leaves the key out, so an unaffected result stays byte-identical.
+fn is_zero<T: Default + PartialEq>(v: &T) -> bool {
+    *v == T::default()
 }
 
 impl std::fmt::Display for RunError {
@@ -950,6 +1042,10 @@ impl RunCost {
             .usage
             .cache_read_input_tokens
             .saturating_add(re.usage.cache_read_input_tokens);
+        self.usage.reasoning_tokens = self
+            .usage
+            .reasoning_tokens
+            .saturating_add(re.usage.reasoning_tokens);
         self.tool_calls.extend(re.tool_calls.iter().cloned());
         self.compressions.extend(re.compressions.iter().cloned());
         self.turns = self.turns.saturating_add(re.turns);
@@ -971,6 +1067,9 @@ impl RunCost {
         o.cache_read_input_tokens = o
             .cache_read_input_tokens
             .saturating_add(self.usage.cache_read_input_tokens);
+        o.reasoning_tokens = o
+            .reasoning_tokens
+            .saturating_add(self.usage.reasoning_tokens);
         // Earlier attempts first, then this attempt's tool calls.
         self.tool_calls.append(&mut o.tool_calls);
         o.tool_calls = std::mem::take(&mut self.tool_calls);
@@ -1013,8 +1112,24 @@ const SALVAGE_NUDGE_EMPTY: &str = "Your previous reply produced no visible \
 /// （edit → test → edit）永不误伤。轮数帽只数次数，分不清「慢而稳」和
 /// 「原地打转」；轮帽放松（GUI 交互会话放到千级）后，这道护栏才是防失控
 /// 烧钱的主力（Codex CLI 无打转保护出现过 9 小时压缩死循环）。
+///
+/// **隔次重复提示**（2026-11 真模型验证抓到的绕行，`docs/kernel_improvement_plan.md`
+/// §0.0.5）：连续计数被任何一次不同调用重置——模型吃到第 3 次的纠偏提示后
+/// 换个工具调一次再回来，同样的「同参同果」调用就永远数不到 6（实测一次
+/// run 里 9 次同参同果的状态轮询，中间夹着别的调用、最长连续只有 3）。所以
+/// 另开一个只提示、不硬停的窗口（[`RepeatWindow`]）：最近 [`REPEAT_WINDOW`]
+/// 次调用里同一键累计到第 4、6、8… 次，就在这次的 tool_result 历史块追加
+/// 一条 [`repeat_nudge`]。硬停仍然只认连续——隔次重复分不清「原地打转」与
+/// 「改一步验一次」（改完再跑测试，没修好就是同参同果），误停比漏停贵。
 const STUCK_NUDGE_AT: u32 = 3;
 const STUCK_STOP_AT: u32 = 6;
+
+/// 隔次重复窗口：最近多少次调用里数同一个打转键。取 8 是为了让
+/// 「查状态 → 干点别的 → 再查」这类两三步一循环的节奏至少转上一两圈
+/// 才够到 [`REPEAT_NUDGE_AT`]；再长就会把隔了很久的两次巧合重合也算成重复。
+const REPEAT_WINDOW: usize = 8;
+/// 同一键在窗口内累计到第几次发隔次重复提示；之后每隔一次再发（4、6、8…）。
+const REPEAT_NUDGE_AT: u32 = 4;
 
 /// 单次 run 内轮末仲裁（[`Hooks::on_turn_stopping`]，宿主集成需求单 FR-1）
 /// `Continue` 决策的上限。对齐 [`STUCK_STOP_AT`] 的计数纪律：仲裁本质也是
@@ -1030,6 +1145,12 @@ const TURN_ARBITRATION_CAP: u32 = STUCK_STOP_AT;
 /// （内存查表/一次本地审计）远低于此」与「宿主调试期够早看见卡死」之间。
 const ARBITRATION_HOOK_SLOW_WARN: std::time::Duration = std::time::Duration::from_millis(5_000);
 
+/// 压缩前观察钩子（[`crate::hooks::Hooks::on_before_compact`]）的「慢」观测阈值。同上，
+/// observe-only：这个窗同样串行、无超时（run 内压缩路径下钩子睡多久，
+/// 剩余预算就被吃掉多少），超过即 diag_warn 一次。量级与上者共用——正常
+/// 钩子（落一次盘/一次本地审计）远低于此。
+const COMPACT_HOOK_SLOW_WARN: std::time::Duration = ARBITRATION_HOOK_SLOW_WARN;
+
 /// 纠偏提示（对模型的一次性警告，随第 N 次重复的 tool_result 下发）。
 fn stuck_nudge(n: u32) -> String {
     format!(
@@ -1038,6 +1159,56 @@ fn stuck_nudge(n: u32) -> String {
          result. Change the approach: adjust the arguments, pick a different \
          tool, or stop and explain the situation to the user."
     )
+}
+
+/// 隔次重复提示：同一个（工具名 + 生效参数 + 结果指纹）累计第 `n` 次给出同样的
+/// 结果，且中间隔着别的调用。措辞只陈述观察到的事实、不替模型下结论——它既可能
+/// 是「在等一个不会自己变化的外部状态」（该多等一会儿或者如实告诉用户），也可能
+/// 是「改一步验一步但改动没生效」（该回头查为什么），两种读法都成立，所以两条路
+/// 都点到。刻意不写「最近 N 次调用里」：计数是跨窗口的累计链（见
+/// [`RepeatWindow::observe`]），那 n 次未必都落在当前窗口内。与 [`stuck_nudge`]
+/// 同一纪律：只进历史块，不进事件与 records。
+fn repeat_nudge(n: u32) -> String {
+    format!(
+        "\n\n[system notice] This exact tool call (same name and arguments) has now returned \
+         this same result {n} times, with other tool calls in between. If you are waiting for \
+         something outside this conversation to change (a job, a server, a background process), \
+         this result shows it has not changed yet: wait longer before checking again, or stop \
+         waiting and tell the user. If you expected your own earlier calls to change the result, \
+         they did not — re-examine why before repeating the same sequence."
+    )
+}
+
+/// 打转护栏的调用键：（工具名, 规范化生效参数, 结果指纹）。
+type StuckKey = (String, String, u64);
+
+/// 隔次重复的计数窗口（见护栏说明）：记住最近 [`REPEAT_WINDOW`] 次调用的键，
+/// 以及每个键的累计次数。键滑出窗口即失忆——隔了很久的两次相同调用不算重复。
+/// run 级状态（`run_loop` 持有），随 run 结束丢弃。
+#[derive(Debug, Default)]
+struct RepeatWindow {
+    recent: VecDeque<(StuckKey, u32)>,
+}
+
+impl RepeatWindow {
+    /// 记下一次调用，返回它的键累计出现了几次（首次为 1）。累计链跟着窗口里
+    /// 最近一次同键调用走：那一次还在窗口里（哪怕正要滑出）就接着数，已经
+    /// 滑出就从 1 重新数。首次必须是 1 而不是 0：这个数原样写进
+    /// [`repeat_nudge`] 的文案（「已返回同样结果 n 次」），从 0 数起会让提示
+    /// 晚一次才发、而且报出的次数少一。
+    fn observe(&mut self, key: StuckKey) -> u32 {
+        let seen = self
+            .recent
+            .iter()
+            .rev()
+            .find(|(k, _)| *k == key)
+            .map_or(1, |(_, n)| n.saturating_add(1));
+        if self.recent.len() >= REPEAT_WINDOW {
+            self.recent.pop_front();
+        }
+        self.recent.push_back((key, seen));
+        seen
+    }
 }
 
 /// Cap on the session archive (messages folded out of the live history by
@@ -1078,6 +1249,19 @@ fn ms_since(t: Instant) -> u64 {
 /// `Serialize` cannot error here) and only satisfies the `Result` shape.
 fn archive_message_bytes(m: &Message) -> usize {
     serde_json::to_vec(m).map_or(0, |v| v.len())
+}
+
+/// The tool table's size on the CJK-aware UNITS yardstick
+/// (`compress::tool_schema_units`), summed over every definition. The ONE
+/// implementation behind `Agent::tool_schema_chars`: `try_new` (construction)
+/// and `refresh_tool_defs` (MCP hot add/remove) both call it, so the two
+/// paths cannot drift apart in unit again — the hot path used to re-sum RAW
+/// BYTES, under-counting a CJK description/schema ~3x and with it the whole
+/// preflight estimate from the first hot add/remove on.
+fn tool_schema_units_sum(defs: &[ToolDef]) -> usize {
+    defs.iter()
+        .map(|t| crate::compress::tool_schema_units(&t.name, &t.description, &t.schema.to_string()))
+        .sum()
 }
 
 /// A real provider measurement the preflight estimate anchors to: the prompt
@@ -1165,6 +1349,16 @@ pub struct Agent {
     /// tool calls gets the one-shot wrap-up turn (from
     /// `Config::salvage_on_max_tokens`).
     salvage_on_max_tokens: bool,
+    /// `Config.preserved_reasoning`: whether a reply's provider reasoning
+    /// state (`ChatResponse::reasoning`) is kept on the assistant message for
+    /// verbatim echo on the next request. On by default since 2026-11-26
+    /// (`default_preserved_reasoning` cites the A/B); switched off, the
+    /// reply's reasoning is dropped before anything is stored, and history is
+    /// byte-identical to a build without the feature. Construction-time only
+    /// (no setter): what's already in history under the other setting would
+    /// need a sweep, and a host that wants the other setting rebuilds its
+    /// agent anyway.
+    preserved_reasoning: bool,
     ctx: ToolCtx,
     session_path: Option<std::path::PathBuf>,
     /// Set by the frontend (e.g. TUI Esc) to stop at the next turn boundary.
@@ -1189,6 +1383,16 @@ pub struct Agent {
     /// One compression failure disables further attempts for this run,
     /// so a persistent error doesn't retry (and warn) every single turn.
     compress_failed: bool,
+    /// What the agent has learned about how much output a summary from THIS
+    /// model needs (see [`SummaryBudget`]). Agent-level, not run-level: the
+    /// model doesn't change between runs of a long-lived agent, and
+    /// re-learning it per run would pay the truncated first summary again.
+    /// Cleared by `set_model` — the one move that invalidates the lesson.
+    summary_budget: SummaryBudget,
+    /// One-shot diag per run for a preflight fold that shrank its kept window
+    /// below `keep_recent_messages` (see `adaptive_keep`). Reset at run entry
+    /// with `compress_failed`: the note describes this run's history shape.
+    adaptive_window_noted: bool,
     /// Monotonic source for agent-minted message ids (`m<n>`). Survives
     /// `clear_messages` on purpose — ids must never repeat within a session
     /// lineage, even after the transcript is dropped. Seeded past any ids in
@@ -1351,13 +1555,9 @@ impl Agent {
         // CJK-aware UNITS channel (compress::tool_schema_units, round-4
         // R4D-F1): byte counting under-estimated CJK descriptions/schemas 3x
         // and delayed the preflight gate. Byte-identical for ASCII-only
-        // schemas.
-        let tool_schema_chars = tool_defs
-            .iter()
-            .map(|t| {
-                crate::compress::tool_schema_units(&t.name, &t.description, &t.schema.to_string())
-            })
-            .sum();
+        // schemas. Same yardstick as the hot add/remove path
+        // (`refresh_tool_defs`) — one summing function for both.
+        let tool_schema_chars = tool_schema_units_sum(&tool_defs);
         // Prepend runtime environment facts (OS / Shell / cwd) to the system
         // prompt so the model emits platform-correct commands (e.g. it learns
         // it's under `cmd /C`, not bash, and stops writing `$((...))` that
@@ -1386,13 +1586,47 @@ impl Agent {
         // and sub-agents. `build_agent*` narrows this via
         // `set_skill_intro_base` when assembly appended a skill intro.
         let skill_intro_base_chars = cfg.system_prompt.as_ref().map(|p| p.len()).unwrap_or(0);
+        // The MCP annotation side table (what each server declared about its
+        // tools — read by hooks via `ToolCtx::annotations`, snapshotted on
+        // each call record) is derived from the tool list HERE, at the single
+        // construction chokepoint, so it can never disagree with the tools
+        // this agent dispatches — however the agent was built (`build_agent*`
+        // assembly, a hand-built list, a `task` sub-agent's snapshot). The
+        // caller's `ToolCtx` value is overwritten; a sub-agent's clone of the
+        // parent's table holds the same entries by construction. Same builder
+        // as `refresh_tool_defs`, which keeps it current after a mutation.
+        let mut ctx = ctx;
+        ctx.tool_annotations = crate::tools::annotation_table(&tools);
         // Ingest point for the initial history: id-less messages (a fresh
         // task, an old-format session file) get agent-minted ids here; ones
         // that already carry an id (resumed save, host-supplied) keep it.
         let mut messages = initial;
         drop_orphan_tool_results(&mut messages);
+        // Carry-off build: a resumed session written under
+        // `preserved_reasoning` must not have its stored reasoning echoed by
+        // a provider that was never asked to. Strip it at the ingest point —
+        // the one place history enters this agent from outside the loop.
+        if !cfg.preserved_reasoning {
+            compress::strip_reasoning(&mut messages);
+        }
         let mut next_msg_id = 0u64;
         assign_missing_ids(&mut messages, &mut next_msg_id);
+        // Fixed-cost advisory: the whole table rides on every request and no
+        // compaction folds it, so a table over the empirical lines is worth
+        // one diag notice. Top-level agents only — a `task` fan-out builds
+        // its sub-agents from a bounded subset and would repeat it per child.
+        // Advise only; nothing here trims or reorders the table. Hot
+        // add/remove (`refresh_tool_defs`) stays silent by its own contract —
+        // `/context` reports the live table. The token number is the one
+        // `/context` shows for this table before any calibration, so the
+        // notice and the report cannot disagree — not even on the running
+        // floor's rounding.
+        if ctx.subagent.is_none() {
+            crate::context_report::note_tool_defs_advisory(
+                crate::context_report::tool_table_tokens(system.as_deref(), tool_schema_chars),
+                tool_defs.len(),
+            );
+        }
         // Box→Arc at the single chokepoint (see the field doc): callers keep
         // their Box-based API, the agent's internals (and the LD-16 llm cell
         // fill in `set_code_tool`) share one Arc.
@@ -1410,12 +1644,15 @@ impl Agent {
             reasoning_effort: cfg.reasoning_effort.clone(),
             limits: cfg.limits.clone(),
             salvage_on_max_tokens: cfg.salvage_on_max_tokens,
+            preserved_reasoning: cfg.preserved_reasoning,
             ctx,
             session_path: None,
             cancel: None,
             shutdown: None,
             notes: Arc::new(Mutex::new(VecDeque::new())),
             compress_failed: false,
+            summary_budget: SummaryBudget::default(),
+            adaptive_window_noted: false,
             next_msg_id,
             usage: Usage::default(),
             usage_anchor: None,
@@ -1526,8 +1763,18 @@ impl Agent {
     ///   resumed session keeps the swap.
     /// - Validity is the caller's: an unknown model name fails at the next
     ///   request, honestly, like a config typo.
+    /// - Carried reasoning (`Message.reasoning`) is dropped from the whole
+    ///   history: its signatures were minted for the previous model, and
+    ///   whether another model accepts them is the vendor's secret — stale
+    ///   state is worth less than a clean slate. Only visible while
+    ///   `Config.preserved_reasoning` is on.
+    /// - The learned summary-output budget ([`SummaryBudget`]) is forgotten:
+    ///   it describes the previous model's reasoning appetite, and a new
+    ///   model's summaries start from the proportional budget again.
     pub fn set_model(&mut self, model: &str) {
         self.model = model.to_string();
+        compress::strip_reasoning(&mut self.messages);
+        self.summary_budget = SummaryBudget::default();
     }
 
     /// Swap the reasoning-effort hint forwarded to the provider verbatim
@@ -1642,7 +1889,11 @@ impl Agent {
     ///   hot-added shortly before quit isn't orphaned.
     pub fn add_mcp_server(&mut self, cfg: McpServerConfig) -> Result<Vec<String>> {
         let existing = self.tool_names();
-        let fresh = crate::tools::mcp::build_one(&cfg, &existing)?;
+        // Same credential hygiene as every other spawn the tools make: the
+        // agent's own set (`ToolCtx::hidden_env`, fixed at assembly) decides
+        // what the new server's environment lacks.
+        let hidden_env = self.ctx.hidden_env.clone();
+        let fresh = crate::tools::mcp::build_one(&cfg, &existing, &hidden_env)?;
         let mut added = Vec::with_capacity(fresh.len());
         for mut t in fresh {
             if let Some(flag) = &self.shutdown {
@@ -1678,18 +1929,22 @@ impl Agent {
     }
 
     /// Rebuild the cached request-side tool mirror (`tool_defs` + the
-    /// schema-char estimate) after the tool list changed at runtime.
-    /// `validate_tool_names` doesn't re-run: hot-added names are structurally
-    /// valid (`sanitize_name` emits only `[A-Za-z0-9_]`, capped at 64) and
-    /// unique by construction (`build_one`'s collision gate), so the
-    /// `try_new` invariant holds.
+    /// schema-char estimate + the MCP annotation side table) after the tool
+    /// list changed at runtime. `validate_tool_names` doesn't re-run:
+    /// hot-added names are structurally valid (`sanitize_name` emits only
+    /// `[A-Za-z0-9_]`, capped at 64) and unique by construction
+    /// (`build_one`'s collision gate), so the `try_new` invariant holds.
+    ///
+    /// The side table is derived from the same list as the definitions, so
+    /// it is rebuilt with them: without this, a hook or a call record kept
+    /// reading what a REMOVED server claimed and never learned what a
+    /// hot-added one declares. Replaced wholesale under the Arc — a `task`
+    /// sub-agent in flight keeps the table it cloned at construction, which
+    /// is exactly the snapshot of tools it still dispatches.
     fn refresh_tool_defs(&mut self) {
         self.tool_defs = self.tools.iter().map(|t| t.def()).collect();
-        self.tool_schema_chars = self
-            .tool_defs
-            .iter()
-            .map(|t| t.name.len() + t.description.len() + t.schema.to_string().len())
-            .sum();
+        self.tool_schema_chars = tool_schema_units_sum(&self.tool_defs);
+        self.ctx.tool_annotations = crate::tools::annotation_table(&self.tools);
     }
 
     /// Install the third-party interception layer ([`crate::hooks::Hooks`]).
@@ -1946,12 +2201,20 @@ impl Agent {
             .usage
             .cache_read_input_tokens
             .saturating_add(u.cache_read_input_tokens);
+        // A split of output_tokens, not an axis: never part of `total()` (the
+        // budget counter reads `total()` via share_budget) — folded only so
+        // the bill can say how much of the output was thinking.
+        self.usage.reasoning_tokens = self
+            .usage
+            .reasoning_tokens
+            .saturating_add(u.reasoning_tokens);
         events(AgentEvent::Usage {
             input_tokens: u.input_tokens,
             output_tokens: u.output_tokens,
             cache_creation_input_tokens: u.cache_creation_input_tokens,
             cache_read_input_tokens: u.cache_read_input_tokens,
             tool_folded,
+            reasoning_tokens: u.reasoning_tokens,
         });
     }
 
@@ -2054,6 +2317,10 @@ impl Agent {
     /// archive holds only the new fold's messages. No-op for hosts that don't
     /// consume the archive.
     pub fn set_session_archive(&mut self, archive: Vec<Message>) {
+        // The archive never carries reasoning (`archive_messages`): keep the
+        // invariant for entries this process did not file itself.
+        let mut archive = archive;
+        compress::strip_reasoning(&mut archive);
         // Re-derive the byte ledger for the restored entries — their push-time
         // accounting lived in the process that saved the file, not this one.
         // One serialization pass per restore, not per save/cap-check after it.
@@ -2122,6 +2389,7 @@ impl Agent {
     /// is TERMINAL for the ladder (`EXIT_CANCELLED`, see
     /// the CLI crate's `harness::run_with_retries`) — clearing it there would revive a run
     /// the user already vetoed.
+    #[allow(clippy::result_large_err)] // see the size note on `RunError`
     pub fn run(&mut self, events: &mut dyn FnMut(AgentEvent)) -> Result<RunOutcome, RunError> {
         self.run_impl(events, /* top_level */ true)
     }
@@ -2140,6 +2408,7 @@ impl Agent {
     /// would race every sibling. The child is freshly built per call, so it
     /// has no stale cancel of its own; any `true` it observes on the shared
     /// flag is a real cancel it must honour.
+    #[allow(clippy::result_large_err)] // see the size note on `RunError`
     pub(crate) fn run_as_subagent(
         &mut self,
         events: &mut dyn FnMut(AgentEvent),
@@ -2248,6 +2517,7 @@ impl Agent {
     /// the one shape the R1 contract forbids). Moving the emission out of the
     /// loop body preserves its exact historical semantics: only on Ok (error
     /// paths emit no `Done`), last event of a successful run.
+    #[allow(clippy::result_large_err)] // see the size note on `RunError`
     fn run_impl(
         &mut self,
         events: &mut dyn FnMut(AgentEvent),
@@ -2263,6 +2533,7 @@ impl Agent {
         result
     }
 
+    #[allow(clippy::result_large_err)] // see the size note on `RunError`
     fn run_loop(
         &mut self,
         events: &mut dyn FnMut(AgentEvent),
@@ -2273,7 +2544,9 @@ impl Agent {
         // same Agent is reused across follow-ups; without this reset, one
         // transient compression failure would disable it for the rest of the
         // session and the history would grow until it hit the model's limit.
+        // Same lifetime for the kept-window note: it explains one run's folds.
         self.compress_failed = false;
+        self.adaptive_window_noted = false;
         // Fresh usage totals per run (this Agent may be reused across runs —
         // TUI follow-ups, harness retries). The usage anchor is deliberately
         // NOT reset here: it survives run boundaries (its validity check
@@ -2316,6 +2589,10 @@ impl Agent {
         // wrap-up turn per run (a salvage turn that ALSO truncates is
         // returned as-is, never salvaged twice).
         let mut salvage_used = false;
+        // One-shot diag for a reply cut off at `max_tokens` while the model
+        // was reasoning — the thinking shares the output budget. Checked
+        // right after the request loop.
+        let mut thought_budget_hinted = false;
         // 轮末仲裁（FR-1）已兑现的 Continue 计数——上限
         // [`TURN_ARBITRATION_CAP`]，只在 top_level 的 end_turn 收尾点消耗。
         let mut arbitrations_used = 0u32;
@@ -2335,8 +2612,10 @@ impl Agent {
         // 没有 stuck_stop 闩锁——轮尾直接读 stuck_len，任何不同键的调用重置
         // 计数即自动解除停止条件（外审第四轮 P2：闩锁曾让同轮第 7 次换法
         // 仍被停）。
-        let mut stuck_key: Option<(String, String, u64)> = None;
+        let mut stuck_key: Option<StuckKey> = None;
         let mut stuck_len: u32 = 0;
+        // 隔次重复窗口：只发提示、不硬停（见护栏说明的「隔次重复提示」段）。
+        let mut repeat_window = RepeatWindow::default();
         let mut stop_reason: String;
 
         // Labeled: the per-turn overflow-retry loop below is itself a `loop`
@@ -2482,6 +2761,9 @@ impl Agent {
             // point the usage anchor below is measured against. Assigned inside
             // every loop iteration before any read.
             let mut request_msg_count: usize;
+            // Whether THIS turn streamed any reasoning (ThinkingDelta) — set
+            // by the event bridge below, read after the loop.
+            let mut turn_thought = false;
             let mut resp = loop {
                 let r = {
                     // Safety net: fold any adjacent same-role messages (e.g. a
@@ -2523,7 +2805,10 @@ impl Agent {
                     }
                     self.provider.chat(&req, &mut |e| match e {
                         ChatEvent::TextDelta(t) => events(AgentEvent::TextDelta(t)),
-                        ChatEvent::ThinkingDelta(t) => events(AgentEvent::ThinkingDelta(t)),
+                        ChatEvent::ThinkingDelta(t) => {
+                            turn_thought = true;
+                            events(AgentEvent::ThinkingDelta(t))
+                        }
                         ChatEvent::ToolInputDelta { id, name, delta } => {
                             events(AgentEvent::ToolInputDelta { id, name, delta })
                         }
@@ -2730,6 +3015,29 @@ impl Agent {
                 }
             }
 
+            // Thinking ate the output budget: the reply was cut off at
+            // `max_tokens` while reasoning tokens count against the same
+            // allowance. The salvage turn may still finish the reply, but
+            // the next one can hit the same wall — say how to fix it, once
+            // per run (a run that truncates on every turn must not repeat it).
+            // Through the diag channel, not the event stream: it is advice
+            // for the operator, not a run fact.
+            if turn_thought && resp.stop_reason == "max_tokens" && !thought_budget_hinted {
+                thought_budget_hinted = true;
+                let who = self
+                    .ctx
+                    .subagent
+                    .as_deref()
+                    .map(|n| format!("subagent '{n}': "))
+                    .unwrap_or_default();
+                crate::diag::diag_warn!(
+                    "[context] {who}hit max_tokens ({}) while reasoning — thinking counts \
+                     against the same output budget, so the reply was cut off. Raise \
+                     `max_tokens` (or lower `reasoning_effort`) so both fit.",
+                    self.max_tokens
+                );
+            }
+
             // A provider mid-stream error (Anthropic error event / read failure)
             // returns stop_reason "stream_error" carrying the message in a Text
             // block + the usage accumulated before the failure. fold_usage above
@@ -2858,6 +3166,14 @@ impl Agent {
             let assistant_id = fresh_message_id(&self.messages, &mut self.next_msg_id);
             let mut assistant = Message::assistant(resp.blocks.clone());
             assistant.id = Some(assistant_id);
+            // Reasoning carry (Config.preserved_reasoning): the reply's
+            // reasoning state rides the message as a side field — never a
+            // block — so every blocks-shape rule above and below (the
+            // zero-block exit, the abort filter, salvage detection) is
+            // untouched by it. Off (default): dropped here, nothing stored.
+            if self.preserved_reasoning {
+                assistant.reasoning = resp.reasoning.take();
+            }
             self.messages.push(assistant);
             if let Some(w) = self.save_session() {
                 events(AgentEvent::Warning(w));
@@ -3058,6 +3374,7 @@ impl Agent {
                 &mut records,
                 &mut stuck_key,
                 &mut stuck_len,
+                &mut repeat_window,
             );
             // Turn-timing row: the turn body is complete (assistant message +
             // tool results in history). One push here covers all three exits
@@ -3096,6 +3413,7 @@ impl Agent {
             output_tokens: self.usage.output_tokens,
             cache_creation_input_tokens: self.usage.cache_creation_input_tokens,
             cache_read_input_tokens: self.usage.cache_read_input_tokens,
+            reasoning_tokens: self.usage.reasoning_tokens,
             elapsed: start.elapsed(),
             config_fingerprint: self.config_fingerprint.clone(),
             gateway_fixes: self.provider.gateway_fixes(),
@@ -3106,14 +3424,16 @@ impl Agent {
     ///
     /// 从 `run_loop` 的轮体中原样抽出（纯搬移，零行为变更）：顺序叶子工具
     /// 就地执行、`ToolConcurrency::Parallel` 的调用按波次 fan-out、结果按块序
-    /// 装配。`stuck_*` 是跨轮状态（打转护栏），由轮循环持有、这里以 &mut 传入。
+    /// 装配。`stuck_*` 与 `repeat_window` 是跨轮状态（打转护栏的连续计数
+    /// 与隔次重复窗口），由轮循环持有、这里以 &mut 传入。
     fn execute_tool_calls(
         &mut self,
         events: &mut dyn FnMut(AgentEvent),
         blocks: &[Block],
         records: &mut Vec<ToolCallRecord>,
-        stuck_key: &mut Option<(String, String, u64)>,
+        stuck_key: &mut Option<StuckKey>,
         stuck_len: &mut u32,
+        repeat_window: &mut RepeatWindow,
     ) {
         // Execute each tool call, collect results into one user message.
         // Once cancelled (e.g. Ctrl-C during tool #1), stop running further
@@ -3541,7 +3861,14 @@ impl Agent {
                         // measurement of this history's context occupancy.
                         self.fold_usage(events, &u, true);
                     }
+                    // What the server claimed about this tool at dispatch —
+                    // the audit says "the run called something declared
+                    // destructive" without having to re-attach the server.
+                    // Nothing can mutate the table between the gate and here
+                    // (`run` holds `&mut self`), so reading it now IS the
+                    // dispatch-time snapshot.
                     records.push(ToolCallRecord {
+                        annotations: self.ctx.tool_annotations.get(name).copied(),
                         name: name.clone(),
                         input: input.clone(),
                         output: output.content.clone(),
@@ -3557,11 +3884,12 @@ impl Agent {
                     // 打转计数：键 =（工具名, 规范化生效参数, 结果指纹）——
                     // 同参不同果（轮询有进展）不同键、自动重置；nudge 只
                     // 追加进历史块——ToolResult 事件与 records 保持原样输出
-                    let key = (
+                    let key: StuckKey = (
                         name.clone(),
                         canon_input(effective_inputs[i].as_ref().unwrap_or(input)),
                         stuck_result_hash(output),
                     );
+                    let seen = repeat_window.observe(key.clone());
                     if stuck_key.as_ref() == Some(&key) {
                         *stuck_len = (*stuck_len).saturating_add(1);
                     } else {
@@ -3571,6 +3899,15 @@ impl Agent {
                     let mut content = output.content.clone();
                     if *stuck_len == STUCK_NUDGE_AT {
                         content.push_str(&stuck_nudge(*stuck_len));
+                    } else if *stuck_len < STUCK_NUDGE_AT
+                        && seen >= REPEAT_NUDGE_AT
+                        && seen % 2 == 0
+                    {
+                        // 隔次重复（中间夹着别的调用）：连续计数不够不到
+                        // 纠偏线，由窗口计数补一条提示。连续重复的调用
+                        // （stuck_len ≥ NUDGE_AT）不走这里——它们已有
+                        // 自己的提示与硬停，不叠两条。
+                        content.push_str(&repeat_nudge(seen));
                     }
                     results.push(Block::ToolResult {
                         tool_use_id: id.clone(),
@@ -3771,19 +4108,13 @@ pub(crate) fn execute_tool_call(
 /// never split) with a trailing `…` appended when anything was cut. For
 /// collapsed one-line tool rows in a UI; single pass, so it is cheap enough
 /// to call per row per frame. Shorter input comes back unchanged.
+///
+/// One clipping implementation for the whole kernel: this is
+/// [`compress::clip`] at its historical fixed width, the same function the
+/// summary transcript's excerpts go through (there sized by
+/// `Limits::summary_preview_chars`).
 pub fn preview(s: &str) -> String {
-    const MAX: usize = 200;
-    // Single pass: take MAX chars, then test whether anything remained. The
-    // old `.chars().count() > MAX` walked the WHOLE string just to decide
-    // truncation — O(n) per call, and the renderer calls this every frame for
-    // every collapsed tool row.
-    let mut it = s.chars();
-    let head: String = it.by_ref().take(MAX).collect();
-    if it.next().is_some() {
-        format!("{head}…")
-    } else {
-        head
-    }
+    compress::clip(s, 200)
 }
 
 /// Merge adjacent messages that share a role into one. Anthropic rejects two
@@ -3796,7 +4127,14 @@ fn normalize_adjacent(messages: &mut Vec<Message>) {
     let mut out: Vec<Message> = Vec::with_capacity(messages.len());
     for m in messages.drain(..) {
         match out.last_mut() {
-            Some(prev) if prev.role == m.role => prev.content.extend(m.content),
+            // A merged message carries no reasoning: two turns' states can't
+            // be spliced into one (positions are relative to the old blocks,
+            // and a signature covers one turn's block alone) — whole or
+            // nothing, so the merged message gets nothing.
+            Some(prev) if prev.role == m.role => {
+                prev.content.extend(m.content);
+                prev.reasoning = None;
+            }
             _ => out.push(m),
         }
     }
@@ -3903,6 +4241,17 @@ fn append_user_turn(messages: &mut Vec<Message>, blocks: Vec<Block>) {
             last.content.extend(blocks);
         }
     } else {
+        // A NEW user turn opened: every carried reasoning state in history
+        // has just outlived its turn. Vendors only ever ask for the echo
+        // inside the turn it was produced in — back with the tool results of
+        // the tool loop the model is still in (GLM's interleaved-thinking
+        // contract; Anthropic strips older turns server-side and bills them
+        // at zero; DeepSeek rejects previous turns' outright) — so keeping it
+        // would only spend input tokens on OpenAI-compatible gateways. Whole
+        // history, never partial: see `compress::strip_reasoning`. Tool
+        // results take the merge branch above (a user message is already
+        // trailing), which is what keeps the current loop's state alive.
+        compress::strip_reasoning(messages);
         messages.push(Message::user(blocks));
     }
 }
@@ -4203,6 +4552,101 @@ impl Agent {
         freed
     }
 
+    /// The kept window for a preflight fold: `keep_recent_messages`, or less
+    /// when that window alone would hold more than half the room under the
+    /// compaction threshold.
+    ///
+    /// Why (real-model verification, `docs/kernel_improvement_plan.md`
+    /// §0.0.5): a fold keeps the configured tail verbatim, so once the tail
+    /// itself is over the threshold the fold leaves the history still over
+    /// it — the next turn folds again and drops only a round or two, for one
+    /// billed summary call each time. In the 56-turn run that exposed it, 27
+    /// of 32 folds dropped exactly 2 messages and its fold turns took a
+    /// median 16.1 s against 2.5 s for the other turns; across the
+    /// real-model batches 213 of 240 folds dropped exactly 2. Holding the
+    /// kept tail to half the room leaves the other half for the head plus
+    /// the next turns' growth, so a fold buys real headroom instead of one
+    /// turn.
+    ///
+    /// The window is an upper bound, never a floor raiser: it only ever
+    /// LOWERS `keep_recent_messages`, the last complete round is the smallest
+    /// it goes, and an explicit `keep_recent_messages: 0` is left alone.
+    /// Returns the configured value whenever nothing can be adapted — no gate
+    /// configured, or no feasible cut at the configured window (the caller's
+    /// `find_safe_cut` then reports "nothing to compress" exactly as before).
+    fn adaptive_keep(&mut self) -> usize {
+        let configured = self.limits.keep_recent_messages;
+        let Some(room) = self.gate_room() else {
+            return configured;
+        };
+        if configured == 0 || compress::find_safe_cut(&self.messages, configured).is_none() {
+            return configured;
+        }
+        match compress::shrink_keep(
+            &self.messages,
+            configured,
+            |tail| self.window_usage(tail),
+            room / 2,
+        ) {
+            Some(k) if k < configured => {
+                if !self.adaptive_window_noted {
+                    self.adaptive_window_noted = true;
+                    crate::diag::diag_info!(
+                        "[compress] keeping {k} recent messages instead of the configured \
+                         {configured}: the configured window alone would exceed half the \
+                         compaction room ({room})"
+                    );
+                }
+                k
+            }
+            _ => configured,
+        }
+    }
+
+    /// The room under the preflight gate, in the gate's own unit — the same
+    /// decision `over_compaction_threshold` makes, written as a budget:
+    /// `compress_threshold_chars` chars for the char heuristic; for the token
+    /// estimate the compact utilization cap minus what every request carries
+    /// regardless of history (system prompt + tool schemas) and minus this
+    /// turn's output reserve. `None` when neither knob is set.
+    fn gate_room(&self) -> Option<usize> {
+        if self.limits.max_context_tokens > 0 {
+            let cap = usize::try_from(
+                self.limits
+                    .max_context_tokens
+                    .saturating_mul(compress::COMPACT_UTILIZATION_PCT)
+                    / 100,
+            )
+            .unwrap_or(usize::MAX);
+            let fixed =
+                compress::estimate_tokens(&[], self.system.as_deref(), self.tool_schema_chars);
+            let out_room = usize::try_from(self.max_tokens).unwrap_or(usize::MAX);
+            Some(cap.saturating_sub(fixed).saturating_sub(out_room))
+        } else if self.limits.compress_threshold_chars > 0 {
+            Some(self.limits.compress_threshold_chars)
+        } else {
+            None
+        }
+    }
+
+    /// Size of a slice of history in [`Self::gate_room`]'s unit: chars for
+    /// the char heuristic; for the token estimate, the heuristic over the
+    /// slice alone, scaled by the live anchor's measured/estimated ratio
+    /// while one is valid (a CJK-heavy history tokenizes well above 4
+    /// chars/token — the uncalibrated estimate would call a tail "fitting"
+    /// that the provider still counts too large).
+    fn window_usage(&self, slice: &[Message]) -> usize {
+        if self.limits.max_context_tokens == 0 {
+            return compress::total_chars(slice);
+        }
+        let est = compress::estimate_tokens(slice, None, 0);
+        let scale = self.live_anchor().map_or(1.0, |a| a.scale);
+        // `as f64` / `as u64` are the lossless-enough directions here (usize
+        // below 2^53; f64→u64 saturates, NaN → 0) — no wrapping either way.
+        let scaled = (est as f64 * scale).ceil() as u64;
+        usize::try_from(scaled).unwrap_or(usize::MAX)
+    }
+
     /// Append messages leaving the live history (compression fold / prune) to
     /// the session archive, FIFO-capped. Ids ride along, so a host can anchor
     /// undo/audit assets to the same stable ids the live history uses.
@@ -4216,8 +4660,16 @@ impl Agent {
     /// by skipping collisions against the LIVE history only, so without this
     /// a resumed session would re-issue the ids of long-folded messages and
     /// collide with their archived originals.
+    ///
+    /// Carried reasoning (`Message::reasoning`) does not travel: an archived
+    /// message has left the live history, so its turn is over and nothing
+    /// will ever echo it again — while the text itself is the model's private
+    /// scratchpad, which has no audit value and no business outliving its use
+    /// in a session file. Content is the original; the reasoning is dropped
+    /// (see `compress::strip_reasoning` for the whole-turn rule).
     fn archive_messages<I: IntoIterator<Item = Message>>(&mut self, msgs: I) {
-        for m in msgs {
+        for mut m in msgs {
+            m.reasoning = None;
             let dup = m.id.as_deref().is_some_and(|id| {
                 self.session_archive
                     .iter()
@@ -4299,6 +4751,11 @@ impl Agent {
     ///   reports it as an event (and bills `burned`), the host-facing
     ///   `compact` propagates the `Err` — so emitting it here would
     ///   double-report on one of them.
+    ///
+    /// Every attempt that reaches the fold fires
+    /// [`crate::hooks::Hooks::on_before_compact`] exactly once, right before
+    /// the history is rewritten (see `notify_before_compact`); a `None`
+    /// return — and a summary that failed or came back empty — fires nothing.
     fn compress(
         &mut self,
         events: &mut dyn FnMut(AgentEvent),
@@ -4335,7 +4792,18 @@ impl Agent {
                 return Ok(None);
             }
         }
-        let cut = match compress::find_safe_cut(&self.messages, self.limits.keep_recent_messages) {
+        // Kept window: the configured `keep_recent_messages`, except for a
+        // preflight fold whose configured window alone would hold more than
+        // half the room under the threshold — there the largest window that
+        // fits takes over (`adaptive_keep`). Overflow recovery and the manual
+        // compact keep the configured window: the provider has just PROVEN
+        // the request too long (that path carries its own shrinking prune
+        // backstop), and the host asked for its configured window by name.
+        let keep = match trigger {
+            CompressTrigger::Preflight => self.adaptive_keep(),
+            _ => self.limits.keep_recent_messages,
+        };
+        let cut = match compress::find_safe_cut(&self.messages, keep) {
             Some(c) => c,
             None => return Ok(None),
         };
@@ -4397,6 +4865,8 @@ impl Agent {
             1
         };
         let dropped = cut - archive_from;
+        // Observer hook — the last moment the originals are still live.
+        self.notify_before_compact(trigger, archive_from, cut);
         let dropped_middle: Vec<Message> = self.messages[archive_from..cut].to_vec();
         // FR-6: snapshot the originals' ids BEFORE the move — these locate
         // the archive entries ("what did this summary replace") for the
@@ -4445,12 +4915,67 @@ impl Agent {
         }))
     }
 
+    /// Fire [`crate::hooks::Hooks::on_before_compact`] for the imminent fold
+    /// of `messages[archive_from..cut]` — the one observation point of a
+    /// compaction, on every path that folds. No-op without an installed layer.
+    ///
+    /// The call sits between the summary's success and the history rewrite:
+    /// the originals are still live (the hook reads them in place — no clone
+    /// of a possibly multi-MB middle), and nothing has moved yet. It runs
+    /// inside `catch_unwind` (the one hook that does): by now the summary is
+    /// billed and the un-folded history is one request away from an overflow,
+    /// so a broken observer must not cost the fold — its panic is reported
+    /// once on the diag channel and the fold proceeds. No lock is held
+    /// across the call; a `task` sub-agent's compaction reaches the same
+    /// layer from that child's worker thread (`info.subagent` says whose
+    /// history it is).
+    ///
+    /// Slow is observed, not bounded (same stance as the arbitration hook):
+    /// past [`COMPACT_HOOK_SLOW_WARN`] one `diag_warn`.
+    fn notify_before_compact(&self, trigger: CompressTrigger, archive_from: usize, cut: usize) {
+        let Some(hooks) = self.ctx.hooks.clone() else {
+            return;
+        };
+        let folding = &self.messages[archive_from..cut];
+        let info = crate::hooks::CompactionInfo {
+            trigger,
+            subagent: self.ctx.subagent.as_deref(),
+            dropped: folding.len(),
+            dropped_chars: compress::total_chars(folding),
+            todo: compress::latest_todo_checklist(&self.messages),
+            folding,
+        };
+        let started = Instant::now();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            hooks.on_before_compact(&info)
+        }));
+        let elapsed = started.elapsed();
+        if let Err(payload) = panicked {
+            // The panic hook has already printed the location; the diag line
+            // carries the message so a TUI/host log shows the cause too.
+            let text = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".into());
+            crate::diag::diag_warn!(
+                "[compress] on_before_compact hook panicked ({text}) — folding anyway"
+            );
+        }
+        if elapsed >= COMPACT_HOOK_SLOW_WARN {
+            crate::diag::diag_warn!(
+                "[compress] on_before_compact took {}ms — the run waits on it serially",
+                elapsed.as_millis()
+            );
+        }
+    }
+
     /// Build the transcript of the prefix being summarized and the prior running
     /// summary (if any). Pure function — unit-tested directly.
     #[cfg(test)]
     fn build_window_transcript(messages: &[Message], cut: usize) -> (String, Option<String>) {
         let old_summary = compress::extract_running_summary(messages);
-        let transcript = compress::window_lines(messages, cut).concat();
+        let transcript = compress::window_lines(messages, cut, 200).concat();
         (transcript, old_summary)
     }
 
@@ -4472,14 +4997,18 @@ impl Agent {
     /// errors, decisions) survives, and keeps each call small enough that a
     /// summary request itself can't overflow — which matters for overflow
     /// recovery, which force-compresses exactly when the context is huge.
+    ///
+    /// Every budget goes through [`Self::summary_budget_for`]: the
+    /// proportional/fixed value, raised to the floor this agent has learned
+    /// for its model, capped by the turn's `max_tokens`.
     fn summarize_prefix(
-        &self,
+        &mut self,
         cut: usize,
         deadline: Option<Instant>,
         instructions: Option<&str>,
     ) -> std::result::Result<(String, Option<Usage>), CompressError> {
         let old_summary = compress::extract_running_summary(&self.messages);
-        let lines = compress::window_lines(&self.messages, cut);
+        let lines = compress::window_lines(&self.messages, cut, self.limits.summary_preview_chars);
         let transcript_size: usize = lines.iter().map(|l| l.len()).sum();
         // The summary request's max_tokens must stay within the configured
         // turn budget: strict gateways (some OpenAI-compatible deployments)
@@ -4494,7 +5023,7 @@ impl Agent {
         if transcript_size <= compress::SUMMARY_CHUNK_CHARS {
             // Common case: one summary call with a proportional budget.
             let transcript = lines.concat();
-            let budget = compress::summary_budget(transcript_size).min(cap);
+            let budget = self.summary_budget_for(compress::summary_budget(transcript_size), cap);
             self.summary_call(
                 &compress::with_focus_instructions(
                     &compress::summary_prompt(&transcript, old_summary.as_deref()),
@@ -4511,12 +5040,14 @@ impl Agent {
             // packed into one piece) needs no separate combine round — summarize
             // it directly with the running-summary update prompt.
             if chunks.len() == 1 {
+                let budget =
+                    self.summary_budget_for(compress::summary_budget(chunks[0].len()), cap);
                 return self.summary_call(
                     &compress::with_focus_instructions(
                         &compress::summary_prompt(&chunks[0], old_summary.as_deref()),
                         instructions,
                     ),
-                    compress::summary_budget(chunks[0].len()).min(cap),
+                    budget,
                     deadline,
                     1,
                 );
@@ -4524,10 +5055,11 @@ impl Agent {
             let n_calls = chunks.len() + 1; // per-chunk + combine
             let mut usage = None;
             let mut chunk_summaries = Vec::with_capacity(chunks.len());
+            let chunk_budget = self.summary_budget_for(compress::SUMMARY_CHUNK_BUDGET, cap);
             for chunk in &chunks {
                 let (s, u) = match self.summary_call(
                     &compress::summary_prompt(chunk, None),
-                    compress::SUMMARY_CHUNK_BUDGET.min(cap),
+                    chunk_budget,
                     deadline,
                     n_calls,
                 ) {
@@ -4553,7 +5085,7 @@ impl Agent {
             for (i, s) in chunk_summaries.iter().enumerate() {
                 combined.push_str(&format!("\n[segment {}]\n{s}\n", i + 1));
             }
-            let budget = compress::summary_budget(combined.len()).min(cap);
+            let budget = self.summary_budget_for(compress::summary_budget(combined.len()), cap);
             let (final_summary, u) = match self.summary_call(
                 &compress::with_focus_instructions(
                     &compress::summary_prompt(&combined, old_summary.as_deref()),
@@ -4576,12 +5108,125 @@ impl Agent {
         }
     }
 
+    /// The `max_tokens` for a summary call: the caller's proportional (or,
+    /// per chunk, fixed) value, raised to the floor learned for this agent's
+    /// model, and never above `cap` — the turn's `max_tokens`, the value the
+    /// main requests already send and some strict gateways hold as an
+    /// account/model ceiling. The floor says what the model NEEDS, the cap
+    /// what the endpoint ACCEPTS; the cap wins.
+    fn summary_budget_for(&self, base: u32, cap: u32) -> u32 {
+        base.max(self.summary_budget.floor).min(cap)
+    }
+
+    /// Send one summary request with its own single transient retry. On
+    /// failure the error carries `spent` (what the earlier attempts of this
+    /// summary call already billed) plus whatever the dying request reported —
+    /// the caller's ledger must see every request sent.
+    fn summary_request(
+        &self,
+        req: &ChatRequest<'_>,
+        spent: Option<Usage>,
+    ) -> std::result::Result<crate::provider::ChatResponse, CompressError> {
+        // One transient retry (Codex-style backoff): a single lost
+        // packet/5xx on the summary request currently disables
+        // compression for the WHOLE run (compress_failed) — an expensive
+        // loss for one blip. Deterministic failures don't retry: a
+        // summary that itself overflows the window won't fit after 1s
+        // either, and a cancel flag already set means the user asked to
+        // stop. The transient/deterministic ladder is `RunError`'s
+        // taxonomy applied to the bare provider error here (401/403/404/
+        // 400/422 get no backoff + full-prompt resend — external review
+        // IMP: the old guard only excluded overflow and cancel). Cancel
+        // mid-request doesn't arrive as an Err at all (it maps to a
+        // stop_reason, handled by the caller), so no cancel-shape sniffing here.
+        let mut request_attempt = 0u32;
+        loop {
+            match self.provider.chat(req, &mut |_| {}) {
+                Ok(r) => return Ok(r),
+                Err(e) => {
+                    if request_attempt == 0
+                        && is_transient_error(&e)
+                        && !compress::is_context_overflow(&e)
+                        && !self.cancelled()
+                    {
+                        request_attempt += 1;
+                        let flag = self.cancel_flag();
+                        if crate::retry::sleep_cancelable(
+                            &flag,
+                            crate::retry::backoff(/* attempt: */ 0),
+                        ) {
+                            // Cancel landed during the backoff — the very
+                            // case sleep_cancelable exists for. Resending
+                            // would upload the (possibly multi-MB) summary
+                            // prompt one more time on a run the user
+                            // already aborted, and only the in-request SSE
+                            // cancel check would stop it — after the body
+                            // left. Bail here instead, in the same
+                            // CompressError shape as the mid-request
+                            // cancel (stop_reason=cancelled arm):
+                            // `spent` rides along because the failed
+                            // attempt may still have billed mid-stream.
+                            return Err(CompressError {
+                                source: anyhow::anyhow!(
+                                    "summary request cancelled during retry backoff"
+                                ),
+                                burned: spent,
+                            });
+                        }
+                        continue;
+                    }
+                    // Honest cost: a provider Err can still have burned
+                    // tokens (usage reported mid-stream, before the
+                    // error) — pull the RunError's usage out of the
+                    // chain and return it alongside `spent` instead of
+                    // dropping both on the floor (same discipline as the
+                    // failed-attempt folding in run_with_retries).
+                    // NOTE on when the downcast can EVER match: built-in
+                    // providers never put a RunError in an Err — their
+                    // mid-stream partial usage travels the
+                    // Ok(stop_reason="stream_error") channel instead
+                    // (billed + wrapped by the main loop, not here).
+                    // This downcast is for HOST-injected custom
+                    // providers (bindings/FFI wrappers) whose boxed
+                    // error legitimately IS a nested run's RunError
+                    // carrying that run's usage; for everyone else it
+                    // reads None and `spent` (this call's own
+                    // accumulation) stands alone.
+                    let burned =
+                        compress::merge_usage(spent, e.downcast_ref::<RunError>().map(|r| r.usage));
+                    return Err(CompressError { source: e, burned });
+                }
+            }
+        }
+    }
+
     /// One summary chat call (no tools, no cache). `n_calls` shares the
     /// remaining run budget evenly across all summary calls of this compression
     /// so a multi-chunk summarize can't eat the main turn's time budget.
     /// Failures leave as [`CompressError`] carrying whatever was billed first.
+    ///
+    /// At most two requests. The second exists for the two shapes a reasoning
+    /// model produces when its thinking is billed against the same
+    /// `max_tokens` as the summary text (see [`SummaryBudget`]):
+    ///
+    /// - **empty body** at the budget (`max_tokens`, no text — the trace ate
+    ///   it all): retried once with a doubled budget. Unconditional: there is
+    ///   nothing to fold from an empty body, so one request is cheap against
+    ///   losing the fold.
+    /// - **truncated body** (`max_tokens`, some text): retried once with a
+    ///   doubled budget only when that attempt carried reasoning — the body
+    ///   was then cut short by thinking, not by the summary's own length. A
+    ///   truncation WITHOUT reasoning is a genuinely long summary, which the
+    ///   first attempt answers as well as the budget allows; that shape keeps
+    ///   the long-standing accept-on-first-attempt behaviour.
+    ///
+    /// The retry can only improve on its first attempt: it completes → its
+    /// text; it truncates too → the longer of the two bodies; it comes back
+    /// empty, is refused (a strict gateway's 400 on the doubled value) or
+    /// fails → the first attempt's body, with every attempt billed. A
+    /// cancelled run still returns `Err`, as on every path.
     fn summary_call(
-        &self,
+        &mut self,
         prompt: &str,
         max_tokens: u32,
         deadline: Option<Instant>,
@@ -4591,6 +5236,11 @@ impl Agent {
         // Honest cost: a burned first attempt still bills, so usage merges
         // across attempts and the caller's ledger sees every request sent.
         let mut spent: Option<Usage> = None;
+        // The first attempt's truncated body while its retry is in flight —
+        // the fallback for every way the retry can disappoint.
+        let mut first_truncated: Option<String> = None;
+        // Whether the attempt being sent is a retry at a doubled budget.
+        let mut escalated = false;
         for attempt in 0..2 {
             let req = ChatRequest {
                 system: Some(compress::SUMMARY_SYSTEM),
@@ -4615,106 +5265,82 @@ impl Agent {
                 // effort ENABLES adaptive thinking — the opposite of the intent —
                 // and on unknown OpenAI-compatible gateways "low" is a coin flip.
                 // Gateways that default to thinking anyway are handled by the
-                // empty-body retry below, provider-agnostically.)
+                // retry ladder below, provider-agnostically.)
                 reasoning_effort: None,
                 temperature: None,
             };
-            // One transient retry (Codex-style backoff): a single lost
-            // packet/5xx on the summary request currently disables
-            // compression for the WHOLE run (compress_failed) — an expensive
-            // loss for one blip. Deterministic failures don't retry: a
-            // summary that itself overflows the window won't fit after 1s
-            // either, and a cancel flag already set means the user asked to
-            // stop. The transient/deterministic ladder is `RunError`'s
-            // taxonomy applied to the bare provider error here (401/403/404/
-            // 400/422 get no backoff + full-prompt resend — external review
-            // IMP: the old guard only excluded overflow and cancel). Cancel
-            // mid-request doesn't arrive as an Err at all (it maps to a
-            // stop_reason, handled below), so no cancel-shape sniffing here.
-            let mut request_attempt = 0u32;
-            let resp = loop {
-                match self.provider.chat(&req, &mut |_| {}) {
-                    Ok(r) => break r,
-                    Err(e) => {
-                        if request_attempt == 0
-                            && is_transient_error(&e)
-                            && !compress::is_context_overflow(&e)
-                            && !self.cancelled()
-                        {
-                            request_attempt += 1;
-                            let flag = self.cancel_flag();
-                            if crate::retry::sleep_cancelable(
-                                &flag,
-                                crate::retry::backoff(/* attempt: */ 0),
-                            ) {
-                                // Cancel landed during the backoff — the very
-                                // case sleep_cancelable exists for. Resending
-                                // would upload the (possibly multi-MB) summary
-                                // prompt one more time on a run the user
-                                // already aborted, and only the in-request SSE
-                                // cancel check would stop it — after the body
-                                // left. Bail here instead, in the same
-                                // CompressError shape as the mid-request
-                                // cancel below (stop_reason=cancelled arm):
-                                // `spent` rides along because the failed
-                                // attempt may still have billed mid-stream.
-                                return Err(CompressError {
-                                    source: anyhow::anyhow!(
-                                        "summary request cancelled during retry backoff"
-                                    ),
-                                    burned: spent,
-                                });
-                            }
-                            continue;
-                        }
-                        // Honest cost: a provider Err can still have burned
-                        // tokens (usage reported mid-stream, before the
-                        // error) — pull the RunError's usage out of the
-                        // chain and return it alongside `spent` instead of
-                        // dropping both on the floor (same discipline as the
-                        // failed-attempt folding in run_with_retries).
-                        // NOTE on when the downcast can EVER match: built-in
-                        // providers never put a RunError in an Err — their
-                        // mid-stream partial usage travels the
-                        // Ok(stop_reason="stream_error") channel instead
-                        // (billed + wrapped by the main loop, not here).
-                        // This downcast is for HOST-injected custom
-                        // providers (bindings/FFI wrappers) whose boxed
-                        // error legitimately IS a nested run's RunError
-                        // carrying that run's usage; for everyone else it
-                        // reads None and `spent` (this call's own
-                        // accumulation) stands alone.
-                        let burned = compress::merge_usage(
-                            spent,
-                            e.downcast_ref::<RunError>().map(|r| r.usage),
-                        );
-                        return Err(CompressError { source: e, burned });
+            let resp = match self.summary_request(&req, spent) {
+                Ok(r) => r,
+                // The RETRY being refused or failing. A body already in hand
+                // is folded rather than losing the fold — the alternative is
+                // `compress_failed`, which also gates overflow recovery for
+                // the rest of the run.
+                Err(e) if escalated => {
+                    // Cancel is not a failed retry: the user stopped the run,
+                    // and the fold must not land on a history they cancelled.
+                    if self.cancelled() {
+                        return Err(e);
                     }
+                    // A deterministic refusal (4xx on the doubled
+                    // `max_tokens`, an overflow) repeats whenever that much
+                    // is asked for again: stop escalating to it. A transient
+                    // blip (5xx, a timeout) says nothing about the budget.
+                    if !is_transient_error(&e.source) {
+                        if self.summary_budget.ceiling.is_none() {
+                            crate::diag::diag_warn!(
+                                "[compress] the endpoint refused the doubled summary budget \
+                                 {max_tokens} ({e}) — summaries are no longer retried at that \
+                                 budget or higher for this model"
+                            );
+                        }
+                        // Lower than any ceiling already recorded: a value at
+                        // or above it would not have been asked for.
+                        self.summary_budget.ceiling = Some(max_tokens);
+                    }
+                    return match first_truncated.take() {
+                        Some(first) => Ok((first, e.burned)),
+                        // Nothing to fold from (the zero-body retry failed):
+                        // the caller's failure handling, as before.
+                        None => Err(e),
+                    };
                 }
+                Err(e) => return Err(e),
             };
+            // Whether the attempt carried reasoning must be read before
+            // `usage` is merged away below. Two independent signals: the
+            // provider's reasoning blocks, or the usage split that says
+            // output tokens were spent on reasoning (a gateway that reports
+            // the count but streams no `reasoning_content` still counts).
+            let reasoned = resp
+                .reasoning
+                .as_ref()
+                .is_some_and(|r| !r.blocks.is_empty())
+                || resp.usage.is_some_and(|u| u.reasoning_tokens > 0);
             spent = compress::merge_usage(spent, resp.usage);
             // parse_loop reports cancel/idle-timeout/truncation as Ok with a
             // non-end_turn stop_reason and PARTIAL, half-written blocks. Folding
             // such a summary into the history would poison every later turn, so
             // bail on those. max_tokens is DIFFERENT: the model stopped at the
-            // output budget, so the text is coherent (just incomplete) — accepting
+            // output budget, so the text is coherent (just incomplete) — handling
             // it beats disabling compression, because compress_failed also gates
             // the overflow-recovery path (two failures for the price of one).
-            // EXCEPT the zero-body shape: hybrid-thinking gateways (deepseek /
-            // glm) bill reasoning_content against the same max_tokens, and an
-            // UPDATE-branch prompt can induce a long enough trace to consume the
-            // ENTIRE budget — finish=length with zero content characters (usage
-            // shows output == budget exactly; TinyWorker acceptance #7). "Truncated
-            // but coherent" is false for an empty body, so retry ONCE with a
-            // doubled budget, which leaves room for the same trace plus a body.
-            // A genuine long-text truncation (non-empty body) is still accepted on
-            // the first attempt; a retry that truncates again is accepted too.
+            let truncated = resp.stop_reason == "max_tokens";
             match resp.stop_reason.as_str() {
                 "end_turn" | "max_tokens" => {}
                 other => {
                     // `spent` was merged above — return it rather than bail it
                     // away: a cancelled/interrupted summary still billed its
-                    // partial stream.
+                    // partial stream. The RETRY dying this way still leaves
+                    // the first attempt's coherent body to fold — unless the
+                    // user cancelled, which must not fold anything. The stop
+                    // reason itself is read too: a reply that says it was
+                    // cancelled is a half-written one whatever the flag says.
+                    if let (Some(first), false) = (
+                        first_truncated.take(),
+                        other == "cancelled" || self.cancelled(),
+                    ) {
+                        return Ok((first, spent));
+                    }
                     return Err(CompressError {
                         source: anyhow::anyhow!(
                             "summary request did not complete (stop_reason={other})"
@@ -4732,29 +5358,64 @@ impl Agent {
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            if attempt == 0 && resp.stop_reason == "max_tokens" && text.trim().is_empty() {
-                // Deliberately NOT clamped to the caller's turn cap: the first
-                // attempt just proved a cap-sized budget dies to reasoning, so
-                // clamping would repeat a known-doomed request. A strict gateway
-                // that 400s on the doubled value fails this call (≈ today's
-                // degradation, one cheap request later). 8192 ceiling keeps the
-                // retry under common model output caps.
-                max_tokens = max_tokens.saturating_mul(2).min(8192);
+            // Deliberately NOT clamped to the caller's turn cap: the first
+            // attempt just proved a cap-sized budget dies to reasoning, so
+            // clamping would repeat a known-doomed request. A strict gateway
+            // that 400s on the doubled value gets the first attempt's body
+            // (the `Err` arm above) — one cheap request later, and never
+            // asked for again (`SummaryBudget::ceiling`).
+            let doubled = max_tokens.saturating_mul(2).min(SUMMARY_MAX_BUDGET);
+            let can_escalate =
+                attempt == 0 && doubled > max_tokens && self.summary_budget.may_ask(doubled);
+            if text.trim().is_empty() {
+                // EXCEPT the zero-body shape: hybrid-thinking gateways (deepseek /
+                // glm) bill reasoning_content against the same max_tokens, and an
+                // UPDATE-branch prompt can induce a long enough trace to consume the
+                // ENTIRE budget — finish=length with zero content characters (usage
+                // shows output == budget exactly; TinyWorker acceptance #7). "Truncated
+                // but coherent" is false for an empty body, so retry ONCE with a
+                // doubled budget, which leaves room for the same trace plus a body.
+                // Only when truncated: an empty `end_turn` body is the model
+                // choosing to say nothing — not a budget problem, so no retry.
+                if truncated && can_escalate {
+                    max_tokens = doubled;
+                    escalated = true;
+                    continue;
+                }
+                // At the ceiling already, or the retry came back empty too:
+                // fall back to the first attempt's body if there is one,
+                // else hand the empty text to the caller's empty-summary
+                // handling (compression disabled with a Warning).
+                return Ok((first_truncated.unwrap_or_default(), spent));
+            }
+            if truncated && reasoned && can_escalate {
+                first_truncated = Some(text);
+                max_tokens = doubled;
+                escalated = true;
                 continue;
             }
-            return Ok((text, spent));
+            if escalated {
+                // The retry was SERVED at the doubled budget (it answered with
+                // a body): that budget works for this model — remember it.
+                self.summary_budget.learned(max_tokens);
+            }
+            // A retry that truncated too keeps whichever body is longer.
+            let longer = match first_truncated.take() {
+                Some(first) if first.trim().len() > text.trim().len() => first,
+                _ => text,
+            };
+            return Ok((longer, spent));
         }
-        // The original argument for `unreachable!` here: the max_tokens
-        // empty-body retry's `continue` is guarded by `attempt == 0`, and
-        // attempt 1 always exits through a return/Err arm above. But that
-        // proof lives in this function's shape, not its types — one future
-        // edit adding an attempt-1 `continue` turns the fallthrough into a
-        // PRODUCTION panic on the compression path. Degrade instead: an
-        // empty summary text flows into the caller's existing empty-summary
-        // handling (compression disabled with a Warning, `spent` still
-        // billed) — the same outcome a genuinely empty attempt-1 response
-        // gets, so no new failure mode is invented. The debug_assert keeps
-        // the invariant loud in tests.
+        // The original argument for `unreachable!` here: both retries' `continue`s
+        // are guarded by `attempt == 0`, and attempt 1 always exits through a
+        // return/Err arm above. But that proof lives in this function's shape,
+        // not its types — one future edit adding an attempt-1 `continue` turns
+        // the fallthrough into a PRODUCTION panic on the compression path.
+        // Degrade instead: an empty summary text flows into the caller's
+        // existing empty-summary handling (compression disabled with a
+        // Warning, `spent` still billed) — the same outcome a genuinely empty
+        // attempt-1 response gets, so no new failure mode is invented. The
+        // debug_assert keeps the invariant loud in tests.
         debug_assert!(
             false,
             "summary_call fell through the attempt loop — attempt 1 must return"

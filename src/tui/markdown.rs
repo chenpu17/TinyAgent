@@ -2,7 +2,7 @@
 //! of tui-markdown), the ANSI escape parser for tool output, the fence
 //! scanner shared with the streaming split, and the single-slot `MdCache`.
 
-use super::theme::{code_fg, dim_fg, MD_DEEP_FG, MD_H1_FG, MD_H23_FG};
+use super::theme::{code_fg, dim_fg, keycap_bg, MD_DEEP_FG, MD_H1_FG, MD_H23_FG};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -29,16 +29,37 @@ const ANSI_BRIGHT: [Color; 8] = [
     Color::White,
 ];
 
+/// Parse the parameter tail of SGR 38/48. Recognized color forms consume a
+/// fixed number of slots even when a component is missing or invalid, so a
+/// malformed color cannot turn its tail into unrelated SGR commands. Only a
+/// complete, in-range form produces a color; malformed input leaves the
+/// channel unchanged.
+fn sgr_extended_color<'a>(params: &mut impl Iterator<Item = &'a str>) -> Option<Color> {
+    match params.next()?.parse::<u16>().ok()? {
+        5 => params.next()?.parse::<u8>().ok().map(Color::Indexed),
+        2 => {
+            let r = params.next().and_then(|p| p.parse::<u8>().ok());
+            let g = params.next().and_then(|p| p.parse::<u8>().ok());
+            let b = params.next().and_then(|p| p.parse::<u8>().ok());
+            Some(Color::Rgb(r?, g?, b?))
+        }
+        _ => None,
+    }
+}
+
 /// Apply one SGR parameter list ("1;31") to `style`. Supports reset, bold,
-/// dim, italic, underline, default fg/bg (39/49) and the two 8-color ranges;
-/// 256-color and RGB forms (38;5;n / 38;2;r;g;b and the 48* bg twins) have
-/// their extra parameters consumed and reset that channel — carrying a full
-/// palette here isn't worth it. Unknown parameters are ignored. An empty
-/// parameter list is reset (ESC[m).
+/// dim, italic, underline, default fg/bg (39/49), the two 8-color ranges,
+/// 256-color (38;5;n / 48;5;n) and truecolor (38;2;r;g;b / 48;2;r;g;b).
+/// Unknown or malformed parameters are ignored. An empty parameter list is
+/// reset (ESC[m).
 fn apply_sgr(style: &mut Style, params: &str) {
     let mut it = params.split(';');
     while let Some(p) = it.next() {
-        let n: u16 = p.parse().unwrap_or(0); // "" (ESC[m) behaves as 0
+        let n: u16 = match p.parse() {
+            Ok(n) => n,
+            Err(_) if p.is_empty() => 0, // "" (ESC[m) behaves as 0
+            Err(_) => continue,
+        };
         match n {
             0 => *style = Style::default(),
             1 => *style = style.add_modifier(Modifier::BOLD),
@@ -52,21 +73,12 @@ fn apply_sgr(style: &mut Style, params: &str) {
             39 => style.fg = None,
             49 => style.bg = None,
             38 | 48 => {
-                match it.next().and_then(|m| m.parse::<u16>().ok()) {
-                    Some(5) => {
-                        it.next(); // palette index
+                if let Some(color) = sgr_extended_color(&mut it) {
+                    if n == 38 {
+                        style.fg = Some(color);
+                    } else {
+                        style.bg = Some(color);
                     }
-                    Some(2) => {
-                        it.next(); // r
-                        it.next(); // g
-                        it.next(); // b
-                    }
-                    _ => {}
-                }
-                if n == 38 {
-                    style.fg = None;
-                } else {
-                    style.bg = None;
                 }
             }
             _ => {}
@@ -367,19 +379,21 @@ pub(super) fn render_markdown(md: &str, width: usize) -> Vec<Line<'_>> {
                 s0.content = "• ".into();
             }
         }
-        redye_inline_code(&mut line, code_fg());
+        redye_inline_code(&mut line, code_fg(), keycap_bg());
         lines.push(line);
     }
     lines
 }
 
-/// Re-dye tui-markdown's inline-code spans (fg White — invisible on a light
-/// background) to `fg`. Pure, so the light/dark pair is testable without the
+/// Restyle tui-markdown's inline-code spans (White on Black) onto the shared
+/// raised surface. The two-color predicate avoids touching ordinary white text;
+/// the explicit arguments keep the light/dark pair testable without changing the
 /// process-global theme knob.
-pub(super) fn redye_inline_code(line: &mut Line, fg: Color) {
+pub(super) fn redye_inline_code(line: &mut Line, fg: Color, bg: Color) {
     for s in line.spans.iter_mut() {
-        if s.style.fg == Some(Color::White) {
+        if s.style.fg == Some(Color::White) && s.style.bg == Some(Color::Black) {
             s.style.fg = Some(fg);
+            s.style.bg = Some(bg);
         }
     }
 }
@@ -628,5 +642,81 @@ fn header_level(s: &str) -> Option<usize> {
         Some(n)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ansi_plain, ansi_to_lines};
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::Line;
+
+    fn text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn sgr_extended_colors_cover_indexed_rgb_and_channel_resets() {
+        let lines = ansi_to_lines(concat!(
+            "\x1b[38;5;196;48;5;20mindexed",
+            "\x1b[38;2;0;128;255;48;2;255;128;0mrgb",
+            "\x1b[39;49mdefault"
+        ));
+        assert_eq!(lines.len(), 1);
+        assert_eq!(text(&lines[0]), "indexedrgbdefault");
+        assert_eq!(lines[0].spans.len(), 3);
+        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Indexed(196)));
+        assert_eq!(lines[0].spans[0].style.bg, Some(Color::Indexed(20)));
+        assert_eq!(lines[0].spans[1].style.fg, Some(Color::Rgb(0, 128, 255)));
+        assert_eq!(lines[0].spans[1].style.bg, Some(Color::Rgb(255, 128, 0)));
+        assert_eq!(lines[0].spans[2].style, Style::default());
+    }
+
+    #[test]
+    fn sgr_malformed_extended_colors_preserve_style_and_consume_their_slots() {
+        for sequence in [
+            "\x1b[38;5m",
+            "\x1b[38;5;256m",
+            "\x1b[38;2;1;2m",
+            "\x1b[38;2;256;2;3m",
+            "\x1b[38;2;1;2;256m",
+            "\x1b[48;5m",
+            "\x1b[48;5;256m",
+            "\x1b[48;2;1;2m",
+            "\x1b[38;7m",
+            "\x1b[38:5:196m",
+        ] {
+            let input = format!("\x1b[31;42mA{sequence}B");
+            let lines = ansi_to_lines(&input);
+            assert_eq!(text(&lines[0]), "AB", "{sequence:?}");
+            assert_eq!(lines[0].spans.len(), 2, "{sequence:?}");
+            for span in &lines[0].spans {
+                assert_eq!(span.style.fg, Some(Color::Red), "{sequence:?}");
+                assert_eq!(span.style.bg, Some(Color::Green), "{sequence:?}");
+            }
+            assert_eq!(ansi_plain(&input), "AB", "{sequence:?}");
+        }
+
+        // The invalid palette slot is still consumed; the following valid SGR
+        // parameter applies normally instead of being swallowed as color data.
+        let lines = ansi_to_lines("\x1b[31mA\x1b[38;5;256;1mB");
+        let bold_red = lines[0].spans[1].style;
+        assert_eq!(bold_red.fg, Some(Color::Red));
+        assert!(bold_red.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn sgr_truncated_extended_colors_drop_the_sequence_without_control_leaks() {
+        for tail in ["\x1b[38;5", "\x1b[38;5;", "\x1b[38;2;1;2", "\x1b[48;2;0;"] {
+            let input = format!("\x1b[31mred{tail}");
+            let lines = ansi_to_lines(&input);
+            assert_eq!(text(&lines[0]), "red", "{tail:?}");
+            assert_eq!(lines[0].spans[0].style.fg, Some(Color::Red));
+            assert_eq!(ansi_plain(&input), "red", "{tail:?}");
+            assert!(!ansi_plain(&input).chars().any(char::is_control));
+        }
     }
 }

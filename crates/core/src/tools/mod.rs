@@ -33,6 +33,7 @@ use crate::config::Config;
 use crate::provider::{Block, ToolDef, Usage};
 use anyhow::{bail, Result};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -107,6 +108,91 @@ pub struct ToolCtx {
     /// Cloned into `task` children and the run_code guest ctx like every other
     /// field.
     pub tool_absent_notes: Vec<(String, String)>,
+    /// The MCP servers' own declarations about the tools they expose, keyed by
+    /// the EXPOSED tool name (the name the model calls — what `Tool::def()`
+    /// reports and what a `ToolCallRecord` stores). A side table rather than
+    /// a `Tool` trait method on purpose: the declarations belong to the server,
+    /// and keeping them out of the trait means no built-in tool, binding
+    /// `CallbackTool`, or run_code registration has to answer for them.
+    ///
+    /// Derived from the tool list by [`annotation_table`] at agent
+    /// construction (`Agent::try_new` — whichever way the agent was built)
+    /// and rebuilt on every tool-list mutation (`Agent::refresh_tool_defs`:
+    /// `add_mcp_server`, `remove_mcp_server`, the `run_code` gate flip), so
+    /// it never disagrees with the tools the agent dispatches. Every MCP tool
+    /// is listed — with the spec defaults when its server declares nothing;
+    /// the table is empty for a list without MCP tools.
+    ///
+    /// Arc-shared: a `task` child or run_code guest ctx clone holds the table
+    /// as of its construction, and a later mutation on the parent replaces
+    /// the parent's Arc only — the clone keeps the snapshot that matches the
+    /// tools it still dispatches (the same snapshot discipline as the tool
+    /// list itself).
+    pub tool_annotations: Arc<BTreeMap<String, ToolAnnotations>>,
+    /// Environment variable names removed from every child process the tools
+    /// spawn (the `shell` tool and MCP stdio servers) — the credential-hygiene
+    /// set: the provider's `api_key_env` variable minus whatever
+    /// `Config::env_passthrough` explicitly re-allows. A library never edits
+    /// the process environment, so the removal happens at each spawn site
+    /// (`Command::env_remove`); explicitly configured MCP `env` entries still
+    /// win (a server the user handed the key on purpose keeps it).
+    pub hidden_env: Vec<String>,
+}
+
+/// An MCP server's self-declared hints about one of its tools
+/// (`tools/list` → `tools[].annotations`, MCP spec 2025-03-26). SERVER
+/// assertions, not kernel guarantees: nothing enforces them — the kernel
+/// records them (the side table on [`ToolCtx`], a snapshot on each
+/// `crate::agent::ToolCallRecord`) so a host policy hook or a post-run audit
+/// can read what the server claimed. Field names and defaults follow the
+/// spec: a missing hint falls back to its default, except `idempotentHint`,
+/// which has none and stays `None` when the server omits it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct ToolAnnotations {
+    /// The tool does not modify its environment (`readOnlyHint`, default
+    /// `false`).
+    #[serde(default)]
+    pub read_only_hint: bool,
+    /// The tool may perform destructive updates (addition is NOT destructive;
+    /// `destructiveHint`, default `true`). The spec's meaning is additive to
+    /// `read_only_hint`: only meaningful when `read_only_hint` is false.
+    #[serde(default = "default_true")]
+    pub destructive_hint: bool,
+    /// Calling repeatedly with the same arguments has no additional effect
+    /// (`idempotentHint`; no default — `None` when the server omits it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotent_hint: Option<bool>,
+    /// The tool may interact with an open world of external entities (web,
+    /// other processes; `openWorldHint`, default `true`). Only meaningful
+    /// when `read_only_hint` is false.
+    #[serde(default = "default_true")]
+    pub open_world_hint: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl ToolAnnotations {
+    /// The spec defaults for a tool whose listing carries no `annotations`.
+    pub const MISSING: Self = Self {
+        read_only_hint: false,
+        destructive_hint: true,
+        idempotent_hint: None,
+        open_world_hint: true,
+    };
+}
+
+impl ToolCtx {
+    /// The MCP server's declared hints for the tool named `tool` (the
+    /// exposed name a hook receives as its `tool` argument / a record
+    /// stores). `None` for built-in tools; an MCP tool is always listed —
+    /// [`ToolAnnotations::MISSING`] (the spec defaults) when its server
+    /// declares nothing, so "absent" and "declared nothing" do not blur.
+    /// SERVER assertions, not kernel guarantees.
+    pub fn annotations(&self, tool: &str) -> Option<&ToolAnnotations> {
+        self.tool_annotations.get(tool)
+    }
 }
 
 /// The run-level token-budget gate (`limits.max_total_tokens`): the fleet-wide
@@ -576,6 +662,17 @@ pub trait Tool: Send + Sync {
     fn origin(&self) -> ToolOrigin {
         ToolOrigin::Custom
     }
+
+    /// The server-declared hints for this tool, if it has any. `None` for
+    /// every built-in and third-party tool (nothing declares anything about
+    /// them); only MCP tools override it, with what their server's
+    /// `tools/list` carried. The kernel copies the value into the
+    /// [`ToolCtx::tool_annotations`] side table at agent construction and on
+    /// every tool-list change, which is where hooks and the audit record read
+    /// it — they see a `ToolCtx`, never the tool objects.
+    fn annotations(&self) -> Option<ToolAnnotations> {
+        None
+    }
 }
 
 /// A tool backed by a closure — the zero-boilerplate way to add a custom tool,
@@ -716,6 +813,42 @@ impl Tool for SharedTool {
     fn origin(&self) -> ToolOrigin {
         self.inner.origin()
     }
+    fn annotations(&self) -> Option<ToolAnnotations> {
+        self.inner.annotations()
+    }
+}
+
+/// The credential-hygiene set for `cfg`: environment variable names removed
+/// from every process the tools spawn (the `shell` tool, stdio MCP servers).
+/// Exactly one name by default — the provider's `api_key_env` variable — and
+/// empty when `Config::env_passthrough` re-allows it. A model-written shell
+/// command has no business reading the API key; without this, a
+/// prompt-injected `echo $THE_KEY` printed it into the transcript and the
+/// model's context. The agent's own requests are untouched (the key is read
+/// from the parent process), and a library never edits the process
+/// environment — the removal is per spawn, via `Command::env_remove`.
+pub(crate) fn hidden_env_vars(cfg: &Config) -> Vec<String> {
+    if cfg.api_key_env.is_empty() || cfg.env_passthrough.contains(&cfg.api_key_env) {
+        Vec::new()
+    } else {
+        vec![cfg.api_key_env.clone()]
+    }
+}
+
+/// Collect the annotation side table for a tool list: exposed name → the
+/// hints its server declared. Only tools whose [`Tool::annotations`] is
+/// `Some` appear, so the table is empty (one shared empty allocation) for a
+/// built-in-only tool list. The ONE builder: called by `Agent::try_new` (the
+/// construction chokepoint) and by `Agent::refresh_tool_defs` (every
+/// tool-list mutation).
+pub(crate) fn annotation_table(tools: &[Box<dyn Tool>]) -> Arc<BTreeMap<String, ToolAnnotations>> {
+    let mut table = BTreeMap::new();
+    for t in tools {
+        if let Some(a) = t.annotations() {
+            table.insert(t.def().name, a);
+        }
+    }
+    Arc::new(table)
 }
 
 /// Instantiate the built-in tools named in the config whitelist.
@@ -1068,6 +1201,49 @@ mod tests {
         assert!(err.contains("run_code") && err.contains("code"), "{err}");
     }
 
+    /// Only tools that declare annotations are listed, keyed by their
+    /// EXPOSED name (what the model calls and a record stores); a tool whose
+    /// override answers `None` — the trait default — is absent, so a list of
+    /// plain tools yields an empty table.
+    #[test]
+    fn annotation_table_lists_only_annotated_tools() {
+        struct Declared(Option<ToolAnnotations>);
+        impl Tool for Declared {
+            fn def(&self) -> ToolDef {
+                ToolDef {
+                    name: "declared".into(),
+                    description: String::new(),
+                    schema: serde_json::json!({"type": "object"}),
+                }
+            }
+            fn annotations(&self) -> Option<ToolAnnotations> {
+                self.0
+            }
+            fn run(&self, _input: &Value, _ctx: &ToolCtx) -> anyhow::Result<ToolOutput> {
+                Ok(ToolOutput::text("ok"))
+            }
+        }
+        let hints = ToolAnnotations {
+            read_only_hint: true,
+            ..ToolAnnotations::MISSING
+        };
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(Declared(Some(hints)))];
+        let table = annotation_table(&tools);
+        assert_eq!(table.len(), 1);
+        assert_eq!(
+            table.get("declared"),
+            Some(&hints),
+            "keyed by the exposed name"
+        );
+        let plain: Vec<Box<dyn Tool>> = vec![Box::new(Declared(None))];
+        let table = annotation_table(&plain);
+        assert!(
+            table.is_empty(),
+            "nothing declared → no entry: {:?}",
+            table.keys().collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn truncate_marks_omission() {
         let mut s = "x".repeat(5000);
@@ -1142,6 +1318,8 @@ mod tests {
     /// 空字段全集，测试按需覆盖。
     fn test_ctx_fields() -> ToolCtx {
         ToolCtx {
+            tool_annotations: std::sync::Arc::new(std::collections::BTreeMap::new()),
+            hidden_env: Vec::new(),
             workdir: std::env::temp_dir(),
             max_output_chars: 1000,
             restrict_to_workdir: false,
@@ -1168,6 +1346,8 @@ mod tests {
     #[test]
     fn resolve_rejects_dotdot_escape_when_restricted() {
         let ctx = ToolCtx {
+            tool_annotations: std::sync::Arc::new(std::collections::BTreeMap::new()),
+            hidden_env: Vec::new(),
             tool_absent_notes: Vec::new(),
             workdir: workdir("escape"),
             max_output_chars: 1000,
@@ -1190,6 +1370,8 @@ mod tests {
     fn resolve_allows_a_nested_not_yet_existing_path() {
         let dir = workdir("inside");
         let ctx = ToolCtx {
+            tool_annotations: std::sync::Arc::new(std::collections::BTreeMap::new()),
+            hidden_env: Vec::new(),
             tool_absent_notes: Vec::new(),
             workdir: dir.clone(),
             max_output_chars: 1000,
@@ -1213,6 +1395,8 @@ mod tests {
     #[test]
     fn resolve_skips_confinement_when_unrestricted() {
         let ctx = ToolCtx {
+            tool_annotations: std::sync::Arc::new(std::collections::BTreeMap::new()),
+            hidden_env: Vec::new(),
             tool_absent_notes: Vec::new(),
             workdir: std::env::temp_dir(),
             max_output_chars: 1000,
@@ -1529,6 +1713,8 @@ mod tests {
             inner: Arc::new(Box::new(AuditingTool) as Box<dyn Tool>),
         };
         let ctx = ToolCtx {
+            tool_annotations: std::sync::Arc::new(std::collections::BTreeMap::new()),
+            hidden_env: Vec::new(),
             tool_absent_notes: Vec::new(),
             workdir: std::env::temp_dir(),
             max_output_chars: 1000,
@@ -1550,6 +1736,8 @@ mod tests {
     fn confine_rejects_an_existing_path_outside_workdir() {
         let dir = workdir("abs");
         let ctx = ToolCtx {
+            tool_annotations: std::sync::Arc::new(std::collections::BTreeMap::new()),
+            hidden_env: Vec::new(),
             tool_absent_notes: Vec::new(),
             workdir: dir.clone(),
             max_output_chars: 1000,
@@ -1569,5 +1757,39 @@ mod tests {
             "{err}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The credential-hygiene set is exactly the provider's `api_key_env`
+    /// variable — and empty in the two cases where there is nothing to hide:
+    /// no variable named, or the variable re-allowed by `env_passthrough`.
+    #[test]
+    fn hidden_env_vars_is_the_key_variable_unless_passed_through() {
+        let cfg = |key_env: &str, passthrough: &[&str]| Config {
+            api_key_env: key_env.into(),
+            env_passthrough: passthrough.iter().map(|s| s.to_string()).collect(),
+            ..serde_json::from_value(serde_json::json!(
+                {"provider": "openai", "api_key_env": "K", "model": "m"}
+            ))
+            .unwrap()
+        };
+        assert_eq!(
+            hidden_env_vars(&cfg("THE_KEY", &[])),
+            vec!["THE_KEY".to_string()]
+        );
+        assert_eq!(
+            hidden_env_vars(&cfg("", &[])),
+            Vec::<String>::new(),
+            "no variable named: nothing to hide"
+        );
+        assert_eq!(
+            hidden_env_vars(&cfg("THE_KEY", &["OTHER_TOKEN"])),
+            vec!["THE_KEY".to_string()],
+            "other names passed through: the key is still hidden"
+        );
+        assert_eq!(
+            hidden_env_vars(&cfg("THE_KEY", &["THE_KEY"])),
+            Vec::<String>::new(),
+            "env_passthrough naming the key re-allows it"
+        );
     }
 }

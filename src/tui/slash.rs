@@ -2,10 +2,11 @@
 //! the read-only replies, the completion popup state machine, and the
 //! `/context` report renderer.
 
-use super::theme::{dim_fg, fmt_tokens, fmt_tokens_round, USER_FG};
+use super::render::{keycap, truncate_line};
+use super::theme::{dim_fg, fmt_tokens, fmt_tokens_round, keycap_bg, USER_FG};
 use crate::config::Config;
 use crossterm::event::{KeyCode, KeyModifiers};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 /// What a `/`-prefixed input line asks for. `Message` = not a command.
@@ -22,6 +23,16 @@ pub(super) enum SlashCmd {
     /// (only short failures auto-expand), so this is the in-TUI way to read
     /// a full output without /export round-tripping a file.
     Out(Option<usize>),
+    /// `/call [n]` — reprint the nth-last tool call with its full input JSON.
+    Call(Option<usize>),
+    /// `/thinking [n]` — reprint the nth-last reasoning block in full.
+    Thinking(Option<usize>),
+    /// `/queue` — list messages waiting behind the in-flight run.
+    Queue,
+    /// `/unqueue` — withdraw the newest queued message for editing.
+    Unqueue,
+    /// `/resume` — explicitly continue a queue paused after a failed run.
+    Resume,
     Model,
     Limits,
     Tools,
@@ -31,6 +42,13 @@ pub(super) enum SlashCmd {
     /// is live). Worker-side query (the agent lives there), rendered by the
     /// UI from the returned `ContextBreakdown`.
     Context,
+    /// `/compact [focus]` — fold the history into a running summary now
+    /// (idle only). The optional arg is a free-form focus hint for the
+    /// summarizer ("focus on the API changes"). Worker-side, like `/context`:
+    /// the fold runs on the thread that owns the agent and reports back
+    /// through `UiMsg::CompactDone`; the `Compressed { trigger: Manual }`
+    /// event it emits on the way is the transcript's audit row.
+    Compact(Option<String>),
     Help,
     /// `/quit` (or `/exit`): leave the TUI. Always quits, even mid-run — the
     /// quit path cancels the in-flight turn and tears down. Esc in idle no
@@ -55,37 +73,49 @@ pub(super) fn classify(trimmed: &str) -> SlashCmd {
     let arg = if raw_arg.is_empty() {
         None
     } else {
-        Some(raw_arg.to_string())
+        Some(raw_arg)
     };
-    // Only /export and /out take arguments. After the classify refactor the
-    // other commands silently dropped a trailing arg (`/model foo` ran /model
-    // with "foo" ignored); reject them as unknown so the typo is surfaced.
-    // Unknown carries the full `rest` so the message names what was typed.
-    let stray_arg = arg.is_some();
-    match word {
-        "clear" if !stray_arg => SlashCmd::Clear,
-        "export" => SlashCmd::Export(arg),
-        // /out takes an optional 1-based index; anything unparseable (or 0,
-        // which has no nth-last meaning) reads as unknown so the message
-        // names the typo.
-        "out" => match arg.as_deref().map(str::parse::<usize>) {
-            None => SlashCmd::Out(None),
-            Some(Ok(n)) if n >= 1 => SlashCmd::Out(Some(n)),
-            Some(_) => SlashCmd::Unknown(rest.to_string()),
+    let unknown = || SlashCmd::Unknown(rest.to_string());
+    let Some(spec) = SLASH_COMMANDS.iter().find(|c| c.accepts(word)) else {
+        return unknown();
+    };
+    // Argument grammar belongs to the same table as completion and /help.
+    // Invalid input remains Unknown (including the original argument), so the
+    // caller can leave it in the editor for correction instead of losing it.
+    let parsed = match (spec.arg_rule, arg) {
+        (ArgRule::None, None) => Some(ParsedArg::None),
+        (ArgRule::None, Some(_)) => None,
+        (ArgRule::OptionalText, value) => Some(ParsedArg::Text(value.map(str::to_string))),
+        (ArgRule::OptionalIndex, None) => Some(ParsedArg::Index(None)),
+        (ArgRule::OptionalIndex, Some(value)) => match value.parse::<usize>() {
+            Ok(n) if n >= 1 => Some(ParsedArg::Index(Some(n))),
+            _ => None,
         },
-        "model" if !stray_arg => SlashCmd::Model,
-        "limits" if !stray_arg => SlashCmd::Limits,
-        "tools" if !stray_arg => SlashCmd::Tools,
-        "system" if !stray_arg => SlashCmd::System,
-        "context" if !stray_arg => SlashCmd::Context,
-        "help" if !stray_arg => SlashCmd::Help,
-        "quit" | "exit" if !stray_arg => SlashCmd::Quit,
-        _ => SlashCmd::Unknown(rest.to_string()),
+    };
+    match (spec.kind, parsed) {
+        (SlashKind::Clear, Some(ParsedArg::None)) => SlashCmd::Clear,
+        (SlashKind::Export, Some(ParsedArg::Text(value))) => SlashCmd::Export(value),
+        (SlashKind::Compact, Some(ParsedArg::Text(value))) => SlashCmd::Compact(value),
+        (SlashKind::Out, Some(ParsedArg::Index(n))) => SlashCmd::Out(n),
+        (SlashKind::Call, Some(ParsedArg::Index(n))) => SlashCmd::Call(n),
+        (SlashKind::Thinking, Some(ParsedArg::Index(n))) => SlashCmd::Thinking(n),
+        (SlashKind::Queue, Some(ParsedArg::None)) => SlashCmd::Queue,
+        (SlashKind::Unqueue, Some(ParsedArg::None)) => SlashCmd::Unqueue,
+        (SlashKind::Resume, Some(ParsedArg::None)) => SlashCmd::Resume,
+        (SlashKind::Model, Some(ParsedArg::None)) => SlashCmd::Model,
+        (SlashKind::Limits, Some(ParsedArg::None)) => SlashCmd::Limits,
+        (SlashKind::Tools, Some(ParsedArg::None)) => SlashCmd::Tools,
+        (SlashKind::System, Some(ParsedArg::None)) => SlashCmd::System,
+        (SlashKind::Context, Some(ParsedArg::None)) => SlashCmd::Context,
+        (SlashKind::Help, Some(ParsedArg::None)) => SlashCmd::Help,
+        (SlashKind::Quit, Some(ParsedArg::None)) => SlashCmd::Quit,
+        _ => unknown(),
     }
 }
 
 /// Read-only reply text for an info slash command (everything but Clear, which
-/// has its own "[history cleared]" side effect). Pure given the config.
+/// has its own "[history cleared]" side effect, and the worker-backed Compact
+/// and Context). Pure given the config.
 pub(super) fn slash_reply(cmd: &SlashCmd, cfg: &Config) -> String {
     match cmd {
         SlashCmd::Model => format!(
@@ -114,39 +144,26 @@ pub(super) fn slash_reply(cmd: &SlashCmd, cfg: &Config) -> String {
             },
         ),
         SlashCmd::System => format!(
-            "system: {}",
+            "system (configured base): {}",
             cfg.system_prompt.as_deref().unwrap_or("(none)"),
         ),
-        // Generated from SLASH_COMMANDS — the single table the completion
-        // popup also reads — so a new command updates /help and the popup
-        // together. Column width follows the longest "/name [arg]".
-        SlashCmd::Help => {
-            let lhs = |c: &SlashSpec| {
-                if c.arg_hint.is_empty() {
-                    format!("/{}", c.name)
-                } else {
-                    format!("/{} {}", c.name, c.arg_hint)
-                }
-            };
-            let kw = SLASH_COMMANDS
-                .iter()
-                .map(|c| lhs(c).len())
-                .max()
-                .unwrap_or(0);
-            let mut s = "commands:".to_string();
-            for c in &SLASH_COMMANDS {
-                s.push_str(&format!("\n  {:<kw$}  {}", lhs(c), c.desc));
-            }
-            s
-        }
+        // Commands and keyboard help intentionally live here, next to the
+        // grammar: adding a table entry updates both completion and /help.
+        SlashCmd::Help => render_slash_help(),
         SlashCmd::Unknown(name) => format!("[unknown command: /{name} — try /help]"),
         // Message/Clear never reach here; empty keeps the match exhaustive.
-        // Export/Out, Context and Clear have their own side-effecting arms in
-        // the key handler (Context asks the worker for the breakdown).
+        // Export/Out, Compact, Context and Clear have their own side-effecting
+        // arms in the key handler (Compact and Context ask the worker).
         SlashCmd::Message
         | SlashCmd::Clear
         | SlashCmd::Export(_)
+        | SlashCmd::Compact(_)
         | SlashCmd::Out(_)
+        | SlashCmd::Call(_)
+        | SlashCmd::Thinking(_)
+        | SlashCmd::Queue
+        | SlashCmd::Unqueue
+        | SlashCmd::Resume
         | SlashCmd::Context
         | SlashCmd::Quit => String::new(),
     }
@@ -160,7 +177,10 @@ pub(super) fn slash_reply(cmd: &SlashCmd, cfg: &Config) -> String {
 /// module docs); the header line states which register the numbers are in —
 /// `calibrated ×s` when a measured anchor is live, `uncalibrated heuristic`
 /// otherwise. Per-tool lines are capped per category (sorted by tokens,
-/// display-only copy — the breakdown itself keeps tool-list order).
+/// display-only copy — the breakdown itself keeps tool-list order). A table
+/// over the kernel's advisory lines (10k estimated tokens / 30 tools) gets a
+/// short advisory block under the tool categories — prose only, nothing is
+/// trimmed.
 pub(super) fn render_context_report(
     bd: &crate::context_report::ContextBreakdown,
     max_context_tokens: u64,
@@ -263,6 +283,20 @@ pub(super) fn render_context_report(
             ));
         }
     }
+    // Fixed-cost advisory: the whole table rides on every request and no
+    // compaction folds it. Judged on the numbers as printed above (scaled
+    // when a calibration is live); absent under both lines. Prose, not a
+    // column row — the kernel's one text, also used by its diag line.
+    if let Some(lines) =
+        crate::context_report::tool_defs_advisory_lines(bd.tools.tokens, bd.tools.tool_count())
+    {
+        for (i, line) in lines.iter().enumerate() {
+            let lead = if i == 0 { "    advisory: " } else { "      " };
+            s.push_str(lead);
+            s.push_str(line);
+            s.push('\n');
+        }
+    }
 
     section(&mut s, "messages", bd.messages.tokens);
     let k = &bd.messages.by_kind;
@@ -278,6 +312,12 @@ pub(super) fn render_context_report(
     ] {
         sub(&mut s, label, tokens);
     }
+    // Carried reasoning state (`Config.preserved_reasoning`) rides on every
+    // request until its turn ends — context the model pays for. Sparse: a
+    // session that carries none shows no line, as before the bucket existed.
+    if k.reasoning > 0 {
+        sub(&mut s, "reasoning", k.reasoning);
+    }
 
     if let Some(used_pct) = total.saturating_mul(100).checked_div(max_context_tokens) {
         let free = max_context_tokens.saturating_sub(total);
@@ -290,73 +330,282 @@ pub(super) fn render_context_report(
             fmt_tokens(free),
         ));
     } else {
-        s.push_str("window: no max_context_tokens configured\n");
+        // Unset window: say what is missing and how to fix it — the same
+        // fact the startup note (`Limits::context_window_hint`) announces.
+        s.push_str(
+            "window: no max_context_tokens configured — set it to the model's context \
+             window to compact on a token estimate\n",
+        );
     }
     // Multi-line, rendered by its row as-is (same as /help's listing).
     s
 }
 
-/// One slash command as the completion popup shows it. KEEP IN SYNC with
-/// `classify` above — that match is the actual command set; this table only
-/// describes it (name, argument hint, one-line description).
-pub(super) struct SlashSpec {
-    pub(super) name: &'static str,
-    arg_hint: &'static str,
-    desc: &'static str,
+/// One command table drives classification, completion, availability and the
+/// command portion of /help. Command names must never be repeated in app.rs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlashKind {
+    Clear,
+    Export,
+    Out,
+    Call,
+    Thinking,
+    Queue,
+    Unqueue,
+    Resume,
+    Model,
+    Limits,
+    Tools,
+    System,
+    Context,
+    Compact,
+    Help,
+    Quit,
 }
 
-pub(super) const SLASH_COMMANDS: [SlashSpec; 10] = [
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArgRule {
+    None,
+    OptionalText,
+    OptionalIndex,
+}
+
+#[derive(Debug)]
+enum ParsedArg {
+    None,
+    Text(Option<String>),
+    Index(Option<usize>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HelpGroup {
+    Session,
+    Details,
+    Queue,
+}
+
+pub(super) struct SlashSpec {
+    pub(super) name: &'static str,
+    aliases: &'static [&'static str],
+    arg_hint: &'static str,
+    desc: &'static str,
+    kind: SlashKind,
+    arg_rule: ArgRule,
+    group: HelpGroup,
+    /// Hide from completion while a run is active. Direct invocation keeps its
+    /// established app-side refusal, so this is presentation, not enforcement.
+    idle_only: bool,
+}
+
+impl SlashSpec {
+    fn accepts(&self, word: &str) -> bool {
+        self.name == word || self.aliases.contains(&word)
+    }
+
+    fn usage(&self) -> String {
+        if self.arg_hint.is_empty() {
+            format!("/{}", self.name)
+        } else {
+            format!("/{} {}", self.name, self.arg_hint)
+        }
+    }
+}
+
+const fn no_arg(
+    name: &'static str,
+    desc: &'static str,
+    kind: SlashKind,
+    group: HelpGroup,
+    idle_only: bool,
+) -> SlashSpec {
     SlashSpec {
-        name: "clear",
+        name,
+        aliases: &[],
         arg_hint: "",
-        desc: "clear the conversation history",
-    },
+        desc,
+        kind,
+        arg_rule: ArgRule::None,
+        group,
+        idle_only,
+    }
+}
+
+const fn indexed(name: &'static str, desc: &'static str, kind: SlashKind) -> SlashSpec {
+    SlashSpec {
+        name,
+        aliases: &[],
+        arg_hint: "[n]",
+        desc,
+        kind,
+        arg_rule: ArgRule::OptionalIndex,
+        group: HelpGroup::Details,
+        idle_only: false,
+    }
+}
+
+pub(super) const SLASH_COMMANDS: &[SlashSpec] = &[
+    no_arg(
+        "clear",
+        "clear the conversation history",
+        SlashKind::Clear,
+        HelpGroup::Session,
+        true,
+    ),
     SlashSpec {
         name: "export",
+        aliases: &[],
         arg_hint: "[path]",
         desc: "dump the transcript to a file (or clipboard)",
+        kind: SlashKind::Export,
+        arg_rule: ArgRule::OptionalText,
+        group: HelpGroup::Details,
+        idle_only: false,
     },
+    indexed(
+        "out",
+        "show a tool result in full (default: last)",
+        SlashKind::Out,
+    ),
+    indexed(
+        "call",
+        "show a tool call's full input (default: last)",
+        SlashKind::Call,
+    ),
+    indexed(
+        "thinking",
+        "show a reasoning block in full (default: last)",
+        SlashKind::Thinking,
+    ),
+    no_arg(
+        "queue",
+        "list messages queued behind the current run",
+        SlashKind::Queue,
+        HelpGroup::Queue,
+        false,
+    ),
+    no_arg(
+        "unqueue",
+        "withdraw the newest queued message for editing",
+        SlashKind::Unqueue,
+        HelpGroup::Queue,
+        false,
+    ),
+    no_arg(
+        "resume",
+        "continue a queue paused after a failed run",
+        SlashKind::Resume,
+        HelpGroup::Queue,
+        true,
+    ),
+    no_arg(
+        "model",
+        "model, provider, max_tokens, base URL",
+        SlashKind::Model,
+        HelpGroup::Session,
+        false,
+    ),
+    no_arg(
+        "limits",
+        "turn and timeout limits",
+        SlashKind::Limits,
+        HelpGroup::Session,
+        false,
+    ),
+    no_arg(
+        "tools",
+        "enabled tool list",
+        SlashKind::Tools,
+        HelpGroup::Session,
+        false,
+    ),
+    no_arg(
+        "system",
+        "configured base system prompt",
+        SlashKind::System,
+        HelpGroup::Session,
+        false,
+    ),
+    no_arg(
+        "context",
+        "context window composition (estimated tokens)",
+        SlashKind::Context,
+        HelpGroup::Session,
+        true,
+    ),
     SlashSpec {
-        name: "out",
-        arg_hint: "[n]",
-        desc: "show a tool result in full (default: last)",
+        name: "compact",
+        aliases: &[],
+        arg_hint: "[focus]",
+        desc: "fold the history into a summary now (idle only)",
+        kind: SlashKind::Compact,
+        arg_rule: ArgRule::OptionalText,
+        group: HelpGroup::Session,
+        idle_only: true,
     },
+    no_arg(
+        "help",
+        "commands and keyboard help",
+        SlashKind::Help,
+        HelpGroup::Session,
+        false,
+    ),
     SlashSpec {
-        name: "model",
-        arg_hint: "",
-        desc: "model, provider, max_tokens, base URL",
-    },
-    SlashSpec {
-        name: "limits",
-        arg_hint: "",
-        desc: "turn and timeout limits",
-    },
-    SlashSpec {
-        name: "tools",
-        arg_hint: "",
-        desc: "enabled tool list",
-    },
-    SlashSpec {
-        name: "system",
-        arg_hint: "",
-        desc: "the active system prompt",
-    },
-    SlashSpec {
-        name: "context",
-        arg_hint: "",
-        desc: "context window composition (estimated tokens)",
-    },
-    SlashSpec {
-        name: "help",
-        arg_hint: "",
-        desc: "list commands",
-    },
-    SlashSpec {
-        name: "quit",
-        arg_hint: "",
-        desc: "exit the TUI (alias: /exit)",
+        aliases: &["exit"],
+        ..no_arg(
+            "quit",
+            "exit the TUI (alias: /exit)",
+            SlashKind::Quit,
+            HelpGroup::Session,
+            false,
+        )
     },
 ];
+
+fn render_slash_help() -> String {
+    // A single width across groups keeps the detail column stable. ASCII usage
+    // strings make byte length and terminal cell width identical here.
+    let kw = SLASH_COMMANDS
+        .iter()
+        .map(|spec| spec.usage().len())
+        .max()
+        .unwrap_or(0);
+    let mut s = String::new();
+    for (group, title) in [
+        (HelpGroup::Session, "commands — session:"),
+        (HelpGroup::Details, "commands — details:"),
+        (HelpGroup::Queue, "commands — queue:"),
+    ] {
+        s.push_str(title);
+        for spec in SLASH_COMMANDS.iter().filter(|spec| spec.group == group) {
+            s.push_str(&format!("\n  {:<kw$}  {}", spec.usage(), spec.desc));
+        }
+        s.push('\n');
+    }
+    s.push_str(
+        "editing:\n\
+         \x20 Left/Right move · Ctrl/Alt+Left/Right by word · Home/End or Ctrl-A/Ctrl-E\n\
+         \x20 Backspace deletes left · Delete/Ctrl-D deletes right · Ctrl-W deletes a word\n\
+         \x20 Ctrl-U kills to line start · Ctrl-K kills to line end\n\
+         history:\n\
+         \x20 Up/Down recall in a single-line input; Alt+Up/Down always recall\n\
+         multiline:\n\
+         \x20 Shift+Enter, Alt+Enter or Ctrl+J inserts a newline; trailing \\ + Enter does too\n\
+         queue / cancel:\n\
+         \x20 Enter while running queues; /queue lists and /unqueue recalls the newest\n\
+         \x20 Esc or Ctrl-C cancels the run and drops its queued messages\n\
+         context:\n\
+         \x20 /context shows the estimated composition; /compact [focus] folds the history now\n\
+         \x20 /compact is idle-only, bills the summary request(s), and Esc cancels it\n\
+         native scroll / copy:\n\
+         \x20 Use the terminal's scrollback, wheel and selection; /export copies or saves\n\
+         exit:\n\
+         \x20 /quit or /exit · Ctrl-D on empty idle input · Ctrl-C twice while idle\n\
+         details:\n\
+         \x20 /out, /call and /thinking take a 1-based nth-last index (default: latest)\n\
+         \x20 Ctrl+O reprints the latest tool call, result or thinking detail",
+    );
+    s
+}
 
 /// Popup height cap; the match window scrolls to keep the selection visible.
 pub(super) const POPUP_MAX_ROWS: usize = 8;
@@ -376,6 +625,8 @@ pub(super) struct SlashPopup {
     /// `update` would reopen on the very next frame, making Esc/completion
     /// unable to close the popup at all. Any further edit lifts it.
     dismissed: Option<String>,
+    /// Current run state: idle-only commands are hidden while busy.
+    busy: bool,
 }
 
 impl SlashPopup {
@@ -385,26 +636,34 @@ impl SlashPopup {
             matches: Vec::new(),
             sel: 0,
             dismissed: None,
+            busy: false,
         }
     }
 
-    /// Recompute from the input text. Open only while the user is typing the
-    /// command NAME: the buffer starts with `/` and contains no space yet
-    /// (a space means the argument stage, e.g. the /export path). Bare `/`
-    /// lists everything; a non-empty prefix filters case-sensitively, like
-    /// classify (`/Model` matches nothing). Zero matches = closed.
+    /// Compatibility entry point for pure grammar tests: idle, all commands.
+    #[cfg(test)]
     pub(super) fn update(&mut self, text: &str) {
+        self.update_for(text, false);
+    }
+
+    /// Recompute from input text and run state. Open only while typing the
+    /// command NAME: `/` with no whitespace yet. Bare `/` lists all commands
+    /// available in this state; busy mode hides (rather than merely disables)
+    /// idle-only commands. Prefix matching remains case-sensitive.
+    pub(super) fn update_for(&mut self, text: &str, busy: bool) {
+        let availability_changed = self.busy != busy;
+        self.busy = busy;
         if self.dismissed.as_deref() == Some(text) {
             return; // dismissed on exactly this text: stay closed
         }
         self.dismissed = None;
         let matches: Vec<&'static SlashSpec> = text
             .strip_prefix('/')
-            .filter(|rest| !rest.contains(' '))
+            .filter(|rest| !rest.contains(char::is_whitespace))
             .map(|p| {
                 SLASH_COMMANDS
                     .iter()
-                    .filter(|c| c.name.starts_with(p))
+                    .filter(|c| (!busy || !c.idle_only) && c.name.starts_with(p))
                     .collect()
             })
             .unwrap_or_default();
@@ -415,8 +674,8 @@ impl SlashPopup {
             return;
         }
         let p = text.strip_prefix('/').unwrap_or("");
-        if p != self.prefix {
-            self.sel = 0; // the filter changed; restart at the top
+        if p != self.prefix || availability_changed {
+            self.sel = 0; // the filtered set changed; restart at the top
         }
         self.prefix = p.to_string();
         self.sel = self.sel.min(matches.len() - 1);
@@ -440,8 +699,8 @@ impl SlashPopup {
     }
 
     /// The completion text for the selected command: bare "/name", or
-    /// "/name " WITH a trailing space for argument-taking commands (/export),
-    /// so the path can be typed straight on.
+    /// "/name " WITH a trailing space for argument-taking commands (/export,
+    /// /compact), so the argument can be typed straight on.
     pub(super) fn completion(&self) -> Option<String> {
         let c = self.matches.get(self.sel)?;
         Some(if c.arg_hint.is_empty() {
@@ -482,6 +741,15 @@ pub(super) fn popup_key(
     code: KeyCode,
     modifiers: KeyModifiers,
 ) -> Option<PopupAction> {
+    // Terminals disagree on whether Shift+Tab arrives as BackTab or Tab+SHIFT;
+    // accept both spellings. Other modifier chords still fall through.
+    let reverse_tab = (code == KeyCode::BackTab
+        && (modifiers.is_empty() || modifiers == KeyModifiers::SHIFT))
+        || (code == KeyCode::Tab && modifiers == KeyModifiers::SHIFT);
+    if reverse_tab {
+        popup.prev();
+        return Some(PopupAction::Consumed);
+    }
     if !modifiers.is_empty() {
         return None;
     }
@@ -508,21 +776,49 @@ pub(super) fn visible_window(len: usize, sel: usize, max: usize) -> (usize, usiz
     (skip, take)
 }
 
-/// Render the popup rows: "/name [arg]  one-line description", the selected
-/// row in reverse video padded out to the popup's content width so the bar
-/// fills the whole row, not just the text.
-///
-/// `max_rows` is the live zone height: windowing to the ACTUAL band (not just
-/// the `POPUP_MAX_ROWS` ceiling) keeps the selection on-screen when the command
-/// list is taller than the zone (7 commands in a ~3-row band would otherwise
-/// scroll the highlighted row out the top).
+/// Original renderer retained as a small test-compatible wrapper: unbounded
+/// width, no footer. The app should use [`slash_popup_lines_for`].
+#[cfg(test)]
 pub(super) fn slash_popup_lines(popup: &SlashPopup, max_rows: usize) -> Vec<Line<'static>> {
+    render_slash_popup(popup, max_rows, usize::MAX, false)
+}
+
+/// Render popup rows within the actual zone width, with a one-line key footer.
+/// `/name [arg]` keeps its accent; descriptions and the footer use the theme's
+/// dim color in both dark and light mode. Long rows are cell-width truncated
+/// with an ellipsis, never byte-sliced or allowed to push the caret sideways.
+/// The footer reserves a row only when at least two rows are available.
+pub(super) fn slash_popup_lines_for(
+    popup: &SlashPopup,
+    max_rows: usize,
+    max_width: usize,
+) -> Vec<Line<'static>> {
+    render_slash_popup(popup, max_rows, max_width, true)
+}
+
+fn render_slash_popup(
+    popup: &SlashPopup,
+    max_rows: usize,
+    max_width: usize,
+    with_footer: bool,
+) -> Vec<Line<'static>> {
+    if max_width == 0 || popup.matches.is_empty() {
+        return Vec::new();
+    }
     let max = max_rows.clamp(1, POPUP_MAX_ROWS);
-    let (skip, take) = visible_window(popup.matches.len(), popup.sel, max);
+    let show_footer = with_footer && max >= 2;
+    let command_rows = if show_footer { max - 1 } else { max };
+    let (skip, take) = visible_window(popup.matches.len(), popup.sel, command_rows);
     let mut lines: Vec<Line<'static>> = popup.matches[skip..skip + take]
         .iter()
-        .map(|c| {
+        .enumerate()
+        .map(|(row, c)| {
+            let selected = skip + row == popup.sel;
             Line::from(vec![
+                Span::styled(
+                    if selected { " ❯ " } else { "   " },
+                    Style::default().fg(USER_FG),
+                ),
                 Span::styled(format!("/{}", c.name), Style::default().fg(USER_FG)),
                 if c.arg_hint.is_empty() {
                     Span::raw(String::new())
@@ -533,17 +829,36 @@ pub(super) fn slash_popup_lines(popup: &SlashPopup, max_rows: usize) -> Vec<Line
             ])
         })
         .collect();
-    let content_w = lines.iter().map(|l| l.width()).max().unwrap_or(0);
+    let content_w = lines
+        .iter()
+        .map(|line| line.width())
+        .max()
+        .unwrap_or(0)
+        .min(max_width);
+    for line in &mut lines {
+        *line = truncate_line(std::mem::take(line), content_w);
+    }
     if popup.sel >= skip && popup.sel < skip + take {
         let line = &mut lines[popup.sel - skip];
-        line.style = line.style.add_modifier(Modifier::REVERSED);
+        line.style = Style::default().bg(keycap_bg());
         let pad = content_w.saturating_sub(line.width());
         if pad > 0 {
-            line.spans.push(Span::styled(
-                " ".repeat(pad),
-                Style::default().add_modifier(Modifier::REVERSED),
-            ));
+            line.spans.push(Span::raw(" ".repeat(pad)));
         }
+    }
+    if show_footer {
+        lines.push(truncate_line(
+            Line::from(vec![
+                Span::raw(" "),
+                keycap("Tab"),
+                Span::styled(" complete  ", Style::default().fg(dim_fg())),
+                keycap("Enter"),
+                Span::styled(" select / again run  ", Style::default().fg(dim_fg())),
+                keycap("Esc"),
+                Span::styled(" close", Style::default().fg(dim_fg())),
+            ]),
+            max_width,
+        ));
     }
     lines
 }

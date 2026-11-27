@@ -11,6 +11,21 @@ use std::time::{Duration, Instant};
 
 pub struct Shell;
 
+/// Strip the credential-hygiene set ([`ToolCtx::hidden_env`]; see
+/// `tools::hidden_env_vars`) from a child's environment. Applied per spawn,
+/// to the interpreter process itself, so everything the command goes on to
+/// start inherits the stripped environment. A defense against the casual
+/// leak — a model-written `echo $THE_KEY` — not against a determined reader:
+/// a same-user process can still read this process's environment through the
+/// OS (`/proc/<pid>/environ`, `ps eww`); real isolation is a container or a
+/// restricted user. BOTH spawn chains (sh / cmd) must call it.
+#[cfg(any(unix, windows))]
+fn hide_env(command: &mut Command, hidden: &[String]) {
+    for name in hidden {
+        command.env_remove(name);
+    }
+}
+
 impl Tool for Shell {
     fn origin(&self) -> ToolOrigin {
         ToolOrigin::Builtin
@@ -83,7 +98,8 @@ impl Tool for Shell {
             #[cfg(unix)]
             {
                 use std::os::unix::process::CommandExt;
-                Command::new("sh")
+                let mut command = Command::new("sh");
+                command
                     .args(["-c", cmd])
                     .current_dir(&ctx.workdir)
                     // stdin null: a command that reads stdin would otherwise
@@ -92,8 +108,9 @@ impl Tool for Shell {
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
-                    .process_group(0)
-                    .spawn()
+                    .process_group(0);
+                hide_env(&mut command, &ctx.hidden_env);
+                command.spawn()
             }
             #[cfg(windows)]
             {
@@ -104,7 +121,8 @@ impl Tool for Shell {
                 // grandchildren inherit the hidden console, so nothing
                 // flashes twice.
                 use std::os::windows::process::CommandExt;
-                Command::new("cmd")
+                let mut command = Command::new("cmd");
+                command
                     .arg("/C")
                     // raw_arg puts `cmd` on cmd.exe's command line VERBATIM.
                     // The plain `.args(["/C", cmd])` route let std encode the
@@ -125,7 +143,9 @@ impl Tool for Shell {
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
-                    .creation_flags(0x0800_0000)
+                    .creation_flags(0x0800_0000);
+                hide_env(&mut command, &ctx.hidden_env);
+                command
                     .spawn()
                     // Wrap in a Job Object the moment the process exists
                     // (SpawnedChild): membership propagates to everything cmd
@@ -902,6 +922,8 @@ mod tests {
         // reports the cancellation distinctly from a timeout.
         let cancel = Arc::new(AtomicBool::new(true));
         let ctx = ToolCtx {
+            tool_annotations: std::sync::Arc::new(std::collections::BTreeMap::new()),
+            hidden_env: Vec::new(),
             tool_absent_notes: Vec::new(),
             workdir: std::env::temp_dir(),
             max_output_chars: 1000,
@@ -932,6 +954,8 @@ mod tests {
         // until the shell timeout kills it (and, under a harness, could eat
         // the harness's own piped input).
         let ctx = ToolCtx {
+            tool_annotations: std::sync::Arc::new(std::collections::BTreeMap::new()),
+            hidden_env: Vec::new(),
             tool_absent_notes: Vec::new(),
             workdir: std::env::temp_dir(),
             max_output_chars: 1000,
@@ -963,6 +987,8 @@ mod tests {
     #[test]
     fn multibyte_output_marks_truncation_by_chars_not_bytes() {
         let ctx = ToolCtx {
+            tool_annotations: std::sync::Arc::new(std::collections::BTreeMap::new()),
+            hidden_env: Vec::new(),
             tool_absent_notes: Vec::new(),
             workdir: std::env::temp_dir(),
             max_output_chars: 1000,
@@ -986,6 +1012,8 @@ mod tests {
 
     fn ctx(workdir: std::path::PathBuf, max_output_chars: usize) -> ToolCtx {
         ToolCtx {
+            tool_annotations: std::sync::Arc::new(std::collections::BTreeMap::new()),
+            hidden_env: Vec::new(),
             tool_absent_notes: Vec::new(),
             workdir,
             max_output_chars,
@@ -997,6 +1025,50 @@ mod tests {
             budget: None,
             deadline: None,
         }
+    }
+
+    /// Credential hygiene (kernel plan 2.5): a name in `ToolCtx::hidden_env`
+    /// is missing from the spawned shell's environment — on this platform's
+    /// own spawn chain (`sh -c` / `cmd /C`). The probe is a variable every
+    /// test process has (`HOME` on unix, `USERNAME` on Windows), so the test
+    /// never edits the process environment; the control run first proves the
+    /// probe sees it when nothing is hidden.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn hidden_env_is_removed_from_the_spawned_shell() {
+        #[cfg(unix)]
+        let (probe, command) = ("HOME", r##"echo "[$HOME"]"##);
+        #[cfg(windows)]
+        let (probe, command) = ("USERNAME", r"echo [%USERNAME%]");
+        let Some(inherited) = std::env::var_os(probe) else {
+            eprintln!("skip hidden_env_is_removed_from_the_spawned_shell: {probe} is unset");
+            return;
+        };
+        let mut ctx = ctx(std::env::temp_dir(), 1000);
+        let inherited = inherited.to_string_lossy().into_owned();
+        // Run the probe → (the output carries the variable's VALUE, the
+        // shell printed a bare `[]`). The tool's leading `$ command` line
+        // names the variable but never spells its value, so the first flag
+        // can only be raised by a real expansion.
+        let probe_output = |ctx: &ToolCtx| -> (bool, bool) {
+            let out = Shell
+                .run(&json!({"command": command}), ctx)
+                .expect("the shell tool returns an output");
+            assert!(!out.is_error, "probe must exit 0: {}", out.content);
+            let lines: Vec<&str> = out.content.lines().map(str::trim).collect();
+            (out.content.contains(&inherited), lines.contains(&"[]"))
+        };
+        assert_eq!(
+            probe_output(&ctx),
+            (true, false),
+            "control: nothing hidden, the shell expands the variable"
+        );
+        ctx.hidden_env = vec![probe.to_string()];
+        assert_eq!(
+            probe_output(&ctx),
+            (false, true),
+            "the hidden name is gone from the shell's environment"
+        );
     }
 
     #[test]
@@ -1081,6 +1153,8 @@ mod tests {
         // shell_timeout_secs is a real knob: 1s must kill `sleep 30` within a
         // poll interval, report an error, and name the configured timeout.
         let ctx = ToolCtx {
+            tool_annotations: std::sync::Arc::new(std::collections::BTreeMap::new()),
+            hidden_env: Vec::new(),
             tool_absent_notes: Vec::new(),
             workdir: std::env::temp_dir(),
             max_output_chars: 1000,
@@ -1115,6 +1189,8 @@ mod tests {
         // being cut by the default 120s (which wouldn't fire here) — and more
         // importantly the Option<Instant> deadline must not treat 0 as "now".
         let ctx = ToolCtx {
+            tool_annotations: std::sync::Arc::new(std::collections::BTreeMap::new()),
+            hidden_env: Vec::new(),
             tool_absent_notes: Vec::new(),
             workdir: std::env::temp_dir(),
             max_output_chars: 1000,

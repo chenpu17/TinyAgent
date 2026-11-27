@@ -55,6 +55,8 @@ fn custom_callback_tool_runs_and_usage_is_honest() {
 
     let cfg = minimal_config();
     let ctx = ToolCtx {
+        tool_annotations: std::sync::Arc::new(std::collections::BTreeMap::new()),
+        hidden_env: Vec::new(),
         workdir: std::env::current_dir().unwrap(),
         max_output_chars: cfg.limits.max_output_chars,
         restrict_to_workdir: false,
@@ -191,6 +193,8 @@ fn run_error_serializes_structured_cost() {
             "go".into(),
         )])],
         ToolCtx {
+            tool_annotations: std::sync::Arc::new(std::collections::BTreeMap::new()),
+            hidden_env: Vec::new(),
             workdir: std::env::current_dir().unwrap(),
             max_output_chars: 4000,
             restrict_to_workdir: false,
@@ -306,6 +310,8 @@ fn invalid_tool_name_fails_at_build() {
 
 fn plain_ctx() -> ToolCtx {
     ToolCtx {
+        tool_annotations: std::sync::Arc::new(std::collections::BTreeMap::new()),
+        hidden_env: Vec::new(),
         workdir: std::env::current_dir().unwrap(),
         max_output_chars: 4000,
         restrict_to_workdir: false,
@@ -985,5 +991,91 @@ fn eager_injection_skips_a_folded_history() {
         !re_injected,
         "folded-then-resumed history got the full skill body re-injected \
          (the summary already absorbed it), history: {msgs:?}"
+    );
+}
+
+/// Credential hygiene (kernel plan 2.5), through the real assembly and a
+/// real spawn: the variable `api_key_env` names is missing from what the
+/// `shell` tool spawns — until `env_passthrough` names it again. The config
+/// points `api_key_env` at a variable every test process has (`HOME` on
+/// unix, `USERNAME` on Windows), so nothing here edits the process
+/// environment; its value is only ever handed to the mock provider.
+#[cfg(any(unix, windows))]
+#[test]
+fn api_key_env_is_hidden_from_tool_subprocesses() {
+    use tiny_agent::provider::new_client;
+    #[cfg(unix)]
+    let (probe, command) = ("HOME", r##"echo "[$HOME"]"##);
+    #[cfg(windows)]
+    let (probe, command) = ("USERNAME", r"echo [%USERNAME%]");
+    if std::env::var_os(probe).is_none() {
+        eprintln!("skip api_key_env_is_hidden_from_tool_subprocesses: {probe} is unset");
+        return;
+    }
+    let client = new_client(0);
+    // One assembled agent run in which the model asks the shell for `probe`;
+    // returns what the tool reported.
+    let ask = |passthrough: bool| -> String {
+        let mut cfg: Config = serde_json::from_value(json!({
+            "provider": "openai", "api_key_env": probe, "model": "mock-model",
+            "base_url": "http://127.0.0.1:9/v1", "tools": ["shell"],
+            "inject_environment": false, "workdir": std::env::temp_dir()
+        }))
+        .expect("config");
+        if passthrough {
+            cfg.env_passthrough = vec![probe.to_string()];
+        }
+        let (provider, _state) = MockProvider::new(vec![
+            resp_tool("c1", "shell", json!({"command": command}), None),
+            resp_text("done", None),
+        ]);
+        let mut agent = tiny_agent::build_agent_with_provider(
+            &cfg,
+            Box::new(provider),
+            vec![tiny_agent::Message::user(vec![tiny_agent::Block::Text(
+                "go".into(),
+            )])],
+            &client,
+            Vec::new(),
+            "",
+        )
+        .expect("assemble");
+        let mut contents = Vec::new();
+        agent
+            .run(&mut |ev| {
+                if let AgentEvent::ToolResult { content, .. } = ev {
+                    contents.push(content);
+                }
+            })
+            .expect("run");
+        contents.remove(0)
+    };
+    // (the output has a line holding the variable's VALUE in brackets, it
+    // has a bare `[]`). The tool's leading `$ command` line names the
+    // variable but never spells its value, so the first flag can only be
+    // raised by a real expansion.
+    let inherited = std::env::var_os(probe)
+        .expect("checked above")
+        .to_string_lossy()
+        .into_owned();
+    let expanded_line = format!("[{inherited}]");
+    let bracketed = |content: &str| -> (bool, bool) {
+        let lines: Vec<&str> = content.lines().map(str::trim).collect();
+        (
+            lines.contains(&expanded_line.as_str()),
+            lines.contains(&"[]"),
+        )
+    };
+    let hidden = ask(false);
+    assert_eq!(
+        bracketed(&hidden),
+        (false, true),
+        "the shell the model drives must not see the key variable: {hidden:?}"
+    );
+    let control = ask(true);
+    assert_eq!(
+        bracketed(&control),
+        (true, false),
+        "env_passthrough names it: visible again: {control:?}"
     );
 }

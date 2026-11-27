@@ -1,6 +1,6 @@
-use super::{Tool, ToolCtx, ToolOrigin, ToolOutput};
+use super::{Tool, ToolAnnotations, ToolCtx, ToolOrigin, ToolOutput};
 use crate::config::McpServerConfig;
-use crate::mcp::McpClient;
+use crate::mcp::{McpClient, McpToolInfo};
 use crate::provider::{Block, ToolDef};
 use anyhow::{bail, Result};
 use serde::Serialize;
@@ -28,6 +28,14 @@ pub struct McpTool {
     /// [`Tool::batchable`] for the run_code `callBatch` surface. A scheduling
     /// hint, not a side-effect-freedom proof (LD-19).
     read_only_hint: bool,
+    /// All four server-declared hints, as listed. Audit data only: reported
+    /// through [`Tool::annotations`] into the side table and snapshotted on
+    /// each call record — never consulted by the kernel's own decisions.
+    annotations: crate::tools::ToolAnnotations,
+    /// The server declared an `outputSchema` for this tool, so a result's
+    /// `structuredContent` is the authoritative payload (see
+    /// [`shape_result`]).
+    has_output_schema: bool,
 }
 
 /// Cap on a base64 image payload from an MCP tool result, mirroring
@@ -58,7 +66,20 @@ const MAX_MCP_TEXT_BUDGET: usize = 16 * 1024 * 1024;
 /// kept, everything else noted, and the final `max_output_chars` truncation
 /// applied. Pure — split out of [`Tool::run`] so the budget/truncation
 /// behavior is testable without a live server.
+#[cfg(test)]
 fn shape_result(result: &Value, max_output_chars: usize, text_budget: usize) -> ToolOutput {
+    shape_result_with(result, max_output_chars, text_budget, false)
+}
+
+/// [`shape_result`] with the `structuredContent` preference made explicit:
+/// `prefer_structured` is true only for a tool that declared an
+/// `outputSchema`. See the structured-content note in the body.
+fn shape_result_with(
+    result: &Value,
+    max_output_chars: usize,
+    text_budget: usize,
+    prefer_structured: bool,
+) -> ToolOutput {
     let mut text = String::new();
     let mut image = None;
     let mut extra_images = 0u32;
@@ -133,13 +154,27 @@ fn shape_result(result: &Value, max_output_chars: usize, text_budget: usize) -> 
     // MCP 2025-06-18: a `tools/call` result may carry `structuredContent`; the
     // spec only SHOULDs a TextContent mirror of it, so a structured-only server
     // would otherwise render as "[empty tool result]". Surface the object
-    // serialized as one text segment (same accumulation budget; content takes
-    // precedence — no double mirror when both are present). Runs after the
-    // annotation notes, so budget overflow here can't join them — the final
-    // max_output_chars truncate bounds what the model sees either way.
-    if text.is_empty() && image.is_none() {
+    // serialized as one text segment (same accumulation budget). Precedence:
+    //  - a tool that DECLARED an outputSchema: the structured payload is the
+    //    authoritative one and wins over the text mirror even when both are
+    //    present — the mirror is a lossy human-readable rendering (rounded
+    //    numbers, dropped fields), and the model does better work from the
+    //    real object. An image still wins (the structured half cannot carry
+    //    one), and so does a text half the budget already cut.
+    //  - any other tool: `content` takes precedence — no double mirror when
+    //    both are present; the structured half is only the fallback for a
+    //    structured-only server.
+    // Runs after the annotation notes, so budget overflow here can't join
+    // them — the final max_output_chars truncate bounds what the model sees
+    // either way.
+    let structured_wins = prefer_structured && text_dropped == 0;
+    if (text.is_empty() || structured_wins) && image.is_none() {
         if let Some(sc) = result.get("structuredContent") {
             if sc.is_object() {
+                if structured_wins {
+                    // The mirror is replaced, not appended.
+                    text.clear();
+                }
                 if let Ok(seg) = serde_json::to_string(sc) {
                     let room = text_budget;
                     let mut take = room.min(seg.len());
@@ -171,6 +206,12 @@ fn shape_result(result: &Value, max_output_chars: usize, text_budget: usize) -> 
 impl Tool for McpTool {
     fn origin(&self) -> ToolOrigin {
         ToolOrigin::Mcp
+    }
+
+    /// What the server declared in `tools/list` — audit data for the side
+    /// table and the call record.
+    fn annotations(&self) -> Option<ToolAnnotations> {
+        Some(self.annotations)
     }
 
     /// Guest-registry opt-in (run_code's `tools.call` surface). CRITICAL:
@@ -222,10 +263,11 @@ impl Tool for McpTool {
             json!({"name": self.wire_name, "arguments": input}),
             ctx.cancel.as_deref(),
         )?;
-        Ok(shape_result(
+        Ok(shape_result_with(
             &result,
             ctx.max_output_chars,
             MAX_MCP_TEXT_BUDGET,
+            self.has_output_schema,
         ))
     }
 
@@ -246,13 +288,19 @@ impl Tool for McpTool {
 
 /// Start one MCP server and wrap its enumerated tools. Shared by `build`
 /// (startup) and `build_one` (hot-add); returns concrete tools holding one
-/// shared `Arc`'d client for the whole server.
-fn start_server(cfg: &McpServerConfig) -> Result<Vec<McpTool>> {
-    let (client, infos) = McpClient::start(cfg)?;
+/// shared `Arc`'d client for the whole server. `hidden_env` is the
+/// credential-hygiene set (see [`super::hidden_env_vars`]): a stdio server
+/// is spawned without those variables — every path that starts a server goes
+/// through here, so none of them can forget it.
+fn start_server(cfg: &McpServerConfig, hidden_env: &[String]) -> Result<Vec<McpTool>> {
+    let (client, infos) = McpClient::start_with_env(cfg, hidden_env)?;
+    let infos = filter_tools(infos, cfg)?;
     let client = Arc::new(Mutex::new(client));
     let mut out = Vec::with_capacity(infos.len());
     for info in infos {
         let display = sanitize_name(&cfg.name, &info.name);
+        let annotations = info.annotations();
+        let has_output_schema = info.output_schema.is_some();
         out.push(McpTool {
             client: client.clone(),
             // Config name, unsanitized — remove_mcp_server routes by it.
@@ -271,9 +319,45 @@ fn start_server(cfg: &McpServerConfig) -> Result<Vec<McpTool>> {
             // Only the name shown to the model is sanitized.
             wire_name: info.name,
             read_only_hint: info.read_only_hint,
+            annotations,
+            has_output_schema,
         });
     }
     Ok(out)
+}
+
+/// Apply the config's `allow_tools` / `deny_tools` to one server's listing
+/// (both match WIRE names, as the server spells them). `deny_tools` wins on
+/// overlap and never errors on a name the server does not have — deny
+/// entries are also forward-looking. A non-empty `allow_tools` is a
+/// contract, so it DOES error on a name the server does not list: a tool
+/// that was renamed or removed upstream must fail assembly loudly, not
+/// quietly stop being callable. The check runs against the server's raw
+/// listing, so a name that is both allowed and denied is simply not exposed.
+fn filter_tools(infos: Vec<McpToolInfo>, cfg: &McpServerConfig) -> Result<Vec<McpToolInfo>> {
+    if !cfg.allow_tools.is_empty() {
+        let missing: Vec<&str> = cfg
+            .allow_tools
+            .iter()
+            .filter(|n| !infos.iter().any(|i| &i.name == *n))
+            .map(String::as_str)
+            .collect();
+        if !missing.is_empty() {
+            bail!(
+                "mcp server '{}': allow_tools names tool(s) the server does not expose: {} \
+                 (renamed or removed upstream? list the server's tools and fix the config)",
+                cfg.name,
+                missing.join(", ")
+            );
+        }
+    }
+    let allow: HashSet<&str> = cfg.allow_tools.iter().map(String::as_str).collect();
+    let deny: HashSet<&str> = cfg.deny_tools.iter().map(String::as_str).collect();
+    Ok(infos
+        .into_iter()
+        .filter(|i| !deny.contains(i.name.as_str()))
+        .filter(|i| allow.is_empty() || allow.contains(i.name.as_str()))
+        .collect())
 }
 
 /// Start every configured MCP server and collect their tools.
@@ -283,8 +367,8 @@ fn start_server(cfg: &McpServerConfig) -> Result<Vec<McpTool>> {
 /// the `task` sub-agent can SHARE them: the parent boxes its copies, while each
 /// sub-agent `clone()`s the same set into its child (sharing the `Arc`'d MCP
 /// connection) instead of re-calling this — re-spawning every server per task.
-pub(crate) fn build(servers: &[McpServerConfig]) -> Result<Vec<McpTool>> {
-    let (tools, _) = build_inner(servers, false)?;
+pub(crate) fn build(servers: &[McpServerConfig], hidden_env: &[String]) -> Result<Vec<McpTool>> {
+    let (tools, _) = build_inner(servers, false, hidden_env)?;
     Ok(tools)
 }
 
@@ -315,8 +399,11 @@ pub struct McpFailure {
 /// 时序坑：被跳过的 server 若与某成功者 sanitize 后重名，等它恢复后下次装配
 /// 会在 dedup_check 上硬失败——宿主如需在恢复前预检，可对照返回的 failures
 /// 清单。
-pub(crate) fn build_lenient(servers: &[McpServerConfig]) -> Result<(Vec<McpTool>, Vec<McpFailure>)> {
-    build_inner(servers, true)
+pub(crate) fn build_lenient(
+    servers: &[McpServerConfig],
+    hidden_env: &[String],
+) -> Result<(Vec<McpTool>, Vec<McpFailure>)> {
+    build_inner(servers, true, hidden_env)
 }
 
 /// `build` 与 `build_lenient` 的共同实现（曾经两段逐行复制，改一处漏一处的
@@ -325,12 +412,16 @@ pub(crate) fn build_lenient(servers: &[McpServerConfig]) -> Result<(Vec<McpTool>
 /// CLI/batch 宁可不起跑也不带着缺工具跑；`lenient=true` 把失败收进 failures
 /// 继续起下一个，宿主（长驻 UI）拿清单降级提示。dedup_check 两种模式都跑，
 /// 位置不变：严格模式走到这里必然全部成功；宽松模式只对「起来了的」集合查重。
-fn build_inner(servers: &[McpServerConfig], lenient: bool) -> Result<(Vec<McpTool>, Vec<McpFailure>)> {
+fn build_inner(
+    servers: &[McpServerConfig],
+    lenient: bool,
+    hidden_env: &[String],
+) -> Result<(Vec<McpTool>, Vec<McpFailure>)> {
     let mut out: Vec<McpTool> = Vec::new();
     let mut display_names: Vec<String> = Vec::new();
     let mut failures: Vec<McpFailure> = Vec::new();
     for cfg in servers {
-        match start_server(cfg) {
+        match start_server(cfg, hidden_env) {
             Ok(tools) => {
                 let n = tools.len();
                 display_names.extend(tools.iter().map(|t| t.def.name.clone()));
@@ -367,8 +458,12 @@ fn build_inner(servers: &[McpServerConfig], lenient: bool) -> Result<(Vec<McpToo
 /// collision is a recoverable `Err`, and the `?` on that path drops the fresh
 /// tool set, killing the just-spawned child via the Drop chain — a failed
 /// hot-add leaves no orphan server process.
-pub(crate) fn build_one(cfg: &McpServerConfig, existing: &[String]) -> Result<Vec<McpTool>> {
-    let tools = start_server(cfg)?;
+pub(crate) fn build_one(
+    cfg: &McpServerConfig,
+    existing: &[String],
+    hidden_env: &[String],
+) -> Result<Vec<McpTool>> {
+    let tools = start_server(cfg, hidden_env)?;
     let names: Vec<String> = tools.iter().map(|t| t.def.name.clone()).collect();
     check_new_names(&names, existing)?;
     Ok(tools)
@@ -462,8 +557,10 @@ fn check_new_names(new: &[String], existing: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build, check_new_names, dedup_check, sanitize_name, shape_result, McpServerConfig,
+        build, check_new_names, dedup_check, filter_tools, sanitize_name, shape_result,
+        shape_result_with, McpServerConfig,
     };
+    use crate::mcp::McpToolInfo;
     use crate::tools::{Tool as _, ToolCtx};
     use serde_json::json;
 
@@ -576,6 +673,217 @@ mod tests {
         );
     }
 
+    /// `allow_tools` / `deny_tools` both match WIRE names; deny wins on
+    /// overlap, an unknown deny entry is fine (forward-looking), and an allow
+    /// entry the server does not list fails assembly loudly.
+    #[test]
+    fn filter_tools_applies_allow_then_deny_on_wire_names() {
+        let info = |name: &str| McpToolInfo {
+            name: name.into(),
+            description: String::new(),
+            input_schema: json!({"type": "object"}),
+            read_only_hint: false,
+            destructive_hint: true,
+            idempotent_hint: None,
+            open_world_hint: true,
+            output_schema: None,
+        };
+        let listing = || vec![info("read"), info("write"), info("exec")];
+        let cfg = |allow: &[&str], deny: &[&str]| McpServerConfig {
+            name: "srv".into(),
+            command: None,
+            args: Vec::new(),
+            url: Some("http://127.0.0.1:1/sse".into()),
+            transport: None,
+            headers: Default::default(),
+            env: Default::default(),
+            call_timeout_secs: None,
+            connect_timeout_secs: None,
+            allow_tools: allow.iter().map(|s| s.to_string()).collect(),
+            deny_tools: deny.iter().map(|s| s.to_string()).collect(),
+        };
+        let names = |r: anyhow::Result<Vec<McpToolInfo>>| {
+            r.unwrap().into_iter().map(|i| i.name).collect::<Vec<_>>()
+        };
+        // No filters: the listing as the server ordered it.
+        assert_eq!(
+            names(filter_tools(listing(), &cfg(&[], &[]))),
+            vec!["read", "write", "exec"]
+        );
+        // Deny only.
+        assert_eq!(
+            names(filter_tools(listing(), &cfg(&[], &["exec"]))),
+            vec!["read", "write"]
+        );
+        // Allow only — still in the server's order, not the config's.
+        assert_eq!(
+            names(filter_tools(listing(), &cfg(&["exec", "read"], &[]))),
+            vec!["read", "exec"]
+        );
+        // Overlap: deny wins, and it is no error (the name IS listed).
+        assert!(filter_tools(listing(), &cfg(&["read"], &["read"]))
+            .unwrap()
+            .is_empty());
+        // A deny entry for a tool the server does not have is fine …
+        assert_eq!(
+            names(filter_tools(listing(), &cfg(&[], &["gone-soon"]))),
+            vec!["read", "write", "exec"]
+        );
+        // … but an allow entry that is not there is a loud contract failure
+        // naming the server and every missing tool.
+        let err = filter_tools(listing(), &cfg(&["read", "renamed", "removed"], &[]))
+            .err()
+            .expect("an allow entry the server does not list is an assembly error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("'srv'") && msg.contains("allow_tools"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("renamed, removed"),
+            "all missing names listed: {msg}"
+        );
+        assert!(
+            !msg.contains("read,"),
+            "a present name is not reported: {msg}"
+        );
+    }
+
+    /// The filters run against a REAL server listing, by wire name — the
+    /// display prefix (`mcp_<server>_`) is not what the config matches.
+    #[test]
+    fn build_filters_a_real_listing_by_wire_name() {
+        let Some(py) = crate::mcp::test_python() else {
+            eprintln!(
+                "skip build_filters_a_real_listing_by_wire_name: no python \
+                 interpreter found (set TA_MCP_PYTHON to run it)"
+            );
+            return;
+        };
+        let script =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/mcp_echo.py");
+        if !script.is_file() {
+            eprintln!(
+                "skip build_filters_a_real_listing_by_wire_name: {} not found",
+                script.display()
+            );
+            return;
+        }
+        let cfg = |allow: &[&str], deny: &[&str]| McpServerConfig {
+            name: "srv".into(),
+            command: Some(py.clone()),
+            args: vec!["-X".into(), "utf8".into(), script.display().to_string()],
+            env: Default::default(),
+            url: None,
+            transport: None,
+            headers: Default::default(),
+            call_timeout_secs: None,
+            connect_timeout_secs: None,
+            allow_tools: allow.iter().map(|s| s.to_string()).collect(),
+            deny_tools: deny.iter().map(|s| s.to_string()).collect(),
+        };
+        let names = |r: anyhow::Result<Vec<super::McpTool>>| {
+            r.expect("assembly")
+                .iter()
+                .map(|t| t.def.name.clone())
+                .collect::<Vec<_>>()
+        };
+        // No filters: the one tool the mock exposes, under its display name.
+        assert_eq!(names(build(&[cfg(&[], &[])], &[])), ["mcp_srv_echo"]);
+        // `allow_tools` matches the WIRE name. The display name is not one:
+        // used here it names a tool the server does not expose — an assembly
+        // error, not a server that silently exposes nothing.
+        let err = build(&[cfg(&["mcp_srv_echo"], &[])], &[])
+            .err()
+            .expect("a display name is not a wire name");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("'srv'") && msg.contains("allow_tools") && msg.contains("mcp_srv_echo"),
+            "{msg}"
+        );
+        // Deny wins: the tool is gone and assembly is fine with it.
+        assert!(names(build(&[cfg(&[], &["echo"])], &[])).is_empty());
+        // A tool renamed or removed upstream fails the assembly loudly.
+        let err = build(&[cfg(&["echo", "gone"], &[])], &[])
+            .err()
+            .expect("missing allow entry");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("'srv'")
+                && msg.contains("allow_tools")
+                && msg.contains("gone")
+                && !msg.contains("echo,"),
+            "{msg}"
+        );
+    }
+
+    /// A tool that DECLARED an `outputSchema`: `structuredContent` is the
+    /// authoritative payload and replaces the lossy text mirror. Everything
+    /// that outranks it still does — an image, a text half the budget already
+    /// cut — and a non-object payload is never surfaced.
+    #[test]
+    fn shape_result_prefers_structured_content_for_schema_tools() {
+        let mirrored = json!({
+            "content": [{"type": "text", "text": "about 42 items"}],
+            "structuredContent": {"count": 42, "unit": "items"}
+        });
+        let out = shape_result_with(&mirrored, 4000, 2048, true);
+        assert_eq!(out.content, r#"{"count":42,"unit":"items"}"#);
+        // The same result for a tool without a schema keeps the text mirror
+        // (no double mirror) — the pre-existing contract.
+        assert_eq!(
+            shape_result_with(&mirrored, 4000, 2048, false).content,
+            "about 42 items"
+        );
+
+        // An image wins over the structured payload (it cannot carry one),
+        // and the text mirror stays with it.
+        let with_image = json!({
+            "content": [
+                {"type": "text", "text": "mirror"},
+                {"type": "image", "data": "AAAA", "mimeType": "image/png"}
+            ],
+            "structuredContent": {"count": 42}
+        });
+        let out = shape_result_with(&with_image, 4000, 2048, true);
+        assert_eq!(out.content, "mirror");
+        assert!(matches!(
+            out.image,
+            Some(crate::provider::Block::Image { .. })
+        ));
+
+        // A text half the budget already cut is not thrown away for it.
+        let fat = json!({
+            "content": [{"type": "text", "text": "x".repeat(3000)}, {"type": "text", "text": "y"}],
+            "structuredContent": {"count": 42}
+        });
+        let out = shape_result_with(&fat, 100_000, 2048, true);
+        assert!(
+            out.content.starts_with(&"x".repeat(2000)),
+            "the kept text stays"
+        );
+        assert!(
+            !out.content.contains("42"),
+            "no structured override: {}",
+            out.content
+        );
+
+        // A non-object payload is never surfaced …
+        let scalar = json!({"structuredContent": [1, 2, 3]});
+        assert_eq!(
+            shape_result_with(&scalar, 4000, 2048, true).content,
+            "[empty tool result]"
+        );
+        // … and the ordinary max_output_chars truncation still bounds the winner.
+        let big = json!({"structuredContent": {"n": "z".repeat(500)}});
+        let out = shape_result_with(&big, 100, 2048, true);
+        assert!(
+            out.content.contains("[truncated, limit 100 chars]"),
+            "{}",
+            out.content
+        );
+    }
+
     #[test]
     fn sanitize_keeps_clean_identifiers_unchanged() {
         assert_eq!(sanitize_name("fs", "read_file"), "mcp_fs_read_file");
@@ -667,6 +975,10 @@ mod tests {
         std::fs::write(dir.join("alpha.txt"), "a").unwrap();
         std::fs::write(dir.join("beta.md"), "b").unwrap();
         let server = McpServerConfig {
+            deny_tools: Vec::new(),
+            call_timeout_secs: None,
+            connect_timeout_secs: None,
+            allow_tools: Vec::new(),
             name: "fs".into(),
             command: Some("npx".into()),
             args: vec![
@@ -679,7 +991,7 @@ mod tests {
             headers: Default::default(),
             env: Default::default(),
         };
-        let tools = build(&[server]).expect("MCP server 应连接并枚举出工具");
+        let tools = build(&[server], &[]).expect("MCP server 应连接并枚举出工具");
         let names: Vec<String> = tools.iter().map(|t| t.def().name.clone()).collect();
         eprintln!("fs MCP 暴露的工具：{names:?}");
         assert!(
@@ -692,6 +1004,8 @@ mod tests {
         // 用它断言「执行」链路通；search_files 也调一次看输出（其 pattern 匹配
         // 语义随 server 版本而异，不强断言）。
         let ctx = ToolCtx {
+            tool_annotations: std::sync::Arc::new(std::collections::BTreeMap::new()),
+            hidden_env: Vec::new(),
             tool_absent_notes: Vec::new(),
             workdir: dir.clone(),
             max_output_chars: 4000,

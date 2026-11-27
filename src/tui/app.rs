@@ -2,25 +2,28 @@
 //! the event/input channels, the terminal guards, and `ui_loop` — the
 //! event-handling session loop that ties the other modules together.
 
-use super::input::{history_down, history_up, input_hscroll, up_is_history, InputBuffer};
+use super::input::{history_down, history_up, up_is_history, InputBuffer};
 use super::markdown::{ansi_plain, MdCache};
 use super::render::{
-    build_input_title, build_status_line, chrome_fg, commit_rows, content_width, copy_to_clipboard,
-    render_zone_tail, render_zone_top, strip_controls, strip_controls_json, welcome_text,
-    wrap_history,
+    build_input_title, build_status_line, chrome_fg, commit_rows, composer_footer, composer_scroll,
+    content_width, copy_to_clipboard, empty_state_lines, failed_title, layout_composer,
+    queue_preview_line, render_zone_tail, render_zone_top, status_stats, strip_controls,
+    strip_controls_json, truncate_display, welcome_text, wrap_history,
 };
 use super::slash::{
-    classify, popup_key, render_context_report, slash_popup_lines, slash_reply, PopupAction,
+    classify, popup_key, render_context_report, slash_popup_lines_for, slash_reply, PopupAction,
     SlashCmd, SlashPopup,
 };
 use super::theme::{
-    dim_fg, fmt_ctx, fmt_tokens, set_theme_from_env, AGENT_FG, TOOL_CALL_FG, USER_FG,
+    composer_bg, dim_fg, fmt_ctx, set_theme_from_env, surface_bg, AGENT_FG, TOOL_CALL_FG,
+    TOOL_ERR_FG, USER_FG,
 };
 use super::transcript::{
     append_delta, append_sub_delta, append_thinking_delta, auto_expand_result, build_history_lines,
-    code_log_row, commit_pending_end, compact, drop_queued_ghosts, inflight_row_index,
-    nth_last_tool_result, remove_oldest_queued, render_transcript, split_streaming_row,
-    tool_elapsed_for, tool_running_line, LiveRow, Row, ToolRunning, ROLE_BODY_INDENT,
+    code_log_row, commit_pending_end, compact, inflight_row_index, latest_detail,
+    nth_last_thinking, nth_last_tool_call, nth_last_tool_result, render_transcript,
+    split_streaming_row, tool_elapsed_for, tool_running_line, LiveRow, Row, SysLevel, ToolRunning,
+    AGENT_MARK, ROLE_BODY_INDENT, TOOL_HEAD_MARK,
 };
 use crate::agent::{Agent, AgentEvent};
 use crate::config::Config;
@@ -54,7 +57,9 @@ pub(super) const INLINE_HEIGHT: u16 = 8;
 
 /// Ghost placeholder shown in the empty input box. Keeps the /help pointer:
 /// the welcome line scrolls away, this is the standing discoverability hint.
-const INPUT_PLACEHOLDER: &str = "Message TinyAgent… (/help)";
+/// Leading space keeps the terminal's block caret off the first glyph of the
+/// placeholder — the empty composer reads as focused, not as a selected "D".
+const INPUT_PLACEHOLDER: &str = " Describe a task…  ·  / for commands";
 
 /// How long a first idle Ctrl-C arms the quit confirmation. A single press
 /// in idle only shows the "press again" notice — the busy-Ctrl-C muscle
@@ -133,17 +138,48 @@ pub(super) enum UiMsg {
     /// is self-describing ("[warn] …"), so the level only picks the row's
     /// color; the sink drops the send when the UI thread is already gone.
     Diag(tiny_agent::diag::DiagLevel, String),
+    /// `/compact [focus]` finished — the completion twin of `RunFinished`
+    /// for a fold (see [`CompactReport`]). The fold's own events (the
+    /// `Compressed { trigger: Manual }` audit row, a session-save warning,
+    /// …) streamed back as `Event`s ahead of this one.
+    CompactDone(CompactReport),
+}
+
+/// What one `/compact` came to, for the UI loop's completion arm. Built on
+/// the worker by [`compact_report`]; `compact_step` delivers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CompactReport {
+    /// A summary replaced part of the history. False for "nothing to fold",
+    /// an aborted request, a failed one, and the degenerate empty-summary
+    /// pass (whose own `Warning` event is the row).
+    pub(super) folded: bool,
+    /// The summary request was cut short by the cancel flag — the Esc /
+    /// Ctrl-C the user pressed while it was in flight. The UI answers with
+    /// its one `[cancelled]` row; nothing else is reported for it.
+    pub(super) aborted: bool,
+    /// A transcript row to add: why nothing folded, or why the request
+    /// failed. `None` on a clean fold (its `Compressed` event is the row)
+    /// and on an aborted one.
+    pub(super) note: Option<(tiny_agent::diag::DiagLevel, String)>,
+    /// What the summary request billed — on success AND on failure. The
+    /// kernel hands a manual compact's cost to the host (`compact` never
+    /// folds it into the run totals, which reset per run), so the status
+    /// bar's counters must take it from here or the fold would read as free.
+    pub(super) usage: Option<tiny_agent::Usage>,
 }
 
 /// Control or text input from the UI to the worker thread. `None` on the
 /// channel means "quit" (Esc / idle Ctrl-C); `Some(Text)` is a user message;
 /// `Some(Clear)` is the `/clear` command, which the worker applies to the
 /// agent's history without running a turn; `Some(Context)` asks for the
-/// breakdown snapshot (read-only, no turn).
+/// breakdown snapshot (read-only, no turn); `Some(Compact)` is
+/// `/compact [focus]` — the fold runs on the worker, which reports back
+/// through [`UiMsg::CompactDone`].
 pub(super) enum Input {
     Text(String),
     Clear,
     Context,
+    Compact(Option<String>),
 }
 
 /// On drop, latches the worker-exited flag and signals worker completion so
@@ -180,12 +216,121 @@ impl Drop for DoneSignal {
 /// stderr fallback was supposed to print.
 struct TerminalGuard;
 
+fn restore_terminal() {
+    let _ = stdout().execute(DisableBracketedPaste);
+    let _ = disable_raw_mode();
+    tiny_agent::diag::clear_diag_sink();
+}
+
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = stdout().execute(DisableBracketedPaste);
-        let _ = disable_raw_mode();
-        tiny_agent::diag::clear_diag_sink();
+        restore_terminal();
     }
+}
+
+/// crossterm 0.29's Unix event source loops inside `poll()` when the tty
+/// returns EOF: a zero-length read does not break its read loop, and non-
+/// WouldBlock errors are ignored. The UI thread therefore never gets a chance
+/// to observe an error after the pty master / controlling terminal disappears.
+/// Probe the same tty independently so that case still has a teardown path.
+#[cfg(unix)]
+pub(super) fn terminal_fd_disconnected(
+    fd: std::os::fd::RawFd,
+    wait: Duration,
+) -> std::io::Result<bool> {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let millis = wait.as_millis().min(i32::MAX as u128) as i32;
+    let rc = unsafe { libc::poll(&mut pfd, 1, millis) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0)
+}
+
+/// Matches crossterm's tty choice: stdin when it is a terminal, else `/dev/tty`.
+/// The owned File keeps a separately opened descriptor alive for the monitor.
+#[cfg(unix)]
+struct TerminalInput {
+    fd: std::os::fd::RawFd,
+    _owned: Option<std::fs::File>,
+}
+
+#[cfg(unix)]
+impl TerminalInput {
+    fn new() -> std::io::Result<Self> {
+        use std::os::fd::AsRawFd;
+        if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {
+            return Ok(Self {
+                fd: libc::STDIN_FILENO,
+                _owned: None,
+            });
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")?;
+        Ok(Self {
+            fd: file.as_raw_fd(),
+            _owned: Some(file),
+        })
+    }
+}
+
+/// Last-resort teardown for a terminal that no longer exists. The main thread
+/// may be trapped in crossterm's internal EOF loop, so this monitor cannot just
+/// send it a message. Cancel + shutdown + `None` give the worker the same stop
+/// signals as a normal quit; after the same bounded wait, restore what can be
+/// restored and exit the CLI rather than leaving a detached 100%-CPU process.
+#[cfg(unix)]
+fn spawn_terminal_disconnect_monitor(
+    in_tx: mpsc::Sender<Option<Input>>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    worker_exited: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::io::Result<()> {
+    use std::sync::atomic::Ordering;
+    let terminal = TerminalInput::new()?;
+    std::thread::Builder::new()
+        .name("tui-tty-watch".into())
+        .spawn(move || {
+            while !shutdown.load(Ordering::Acquire) {
+                match terminal_fd_disconnected(terminal.fd, Duration::from_millis(100)) {
+                    Ok(false) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    // An unexpected probe failure must not kill a healthy TUI.
+                    Err(_) => break,
+                    Ok(true) => {}
+                }
+                // Normal teardown may have won while the probe was blocked.
+                if shutdown.load(Ordering::Acquire) {
+                    break;
+                }
+                cancel.store(true, Ordering::Release);
+                shutdown.store(true, Ordering::Release);
+                let _ = in_tx.send(None);
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while !worker_exited.load(Ordering::Acquire) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                restore_terminal();
+                std::process::exit(0);
+            }
+        })?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn spawn_terminal_disconnect_monitor(
+    _in_tx: mpsc::Sender<Option<Input>>,
+    _cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    _shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    _worker_exited: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Install the TUI's diag bridge: every kernel `diag_warn!` / `diag_info!`
@@ -202,6 +347,127 @@ pub(super) fn install_diag_bridge(out_tx: mpsc::Sender<UiMsg>) {
         // the exact raw-mode garbage this bridge exists to prevent.
         let _ = out_tx.send(UiMsg::Diag(level, msg.to_owned()));
     }));
+}
+
+/// The worker side of `/compact [focus]`: fold on the worker (it owns the
+/// agent), stream the fold's own events to the UI exactly like a turn's,
+/// then report the outcome as ONE [`UiMsg::CompactDone`]. Split out of the
+/// worker loop so the translation is testable without a terminal. Returns
+/// false once the UI is gone (the report could not be delivered).
+pub(super) fn compact_step(
+    agent: &mut Agent,
+    focus: Option<&str>,
+    out_tx: &mpsc::Sender<UiMsg>,
+) -> bool {
+    let res = agent.compact_with(
+        &mut |ev| {
+            let _ = out_tx.send(UiMsg::Event(ev));
+        },
+        focus,
+    );
+    // Read AFTER the call: the flag an Esc raised during the summary
+    // request is what aborted it (the kernel clears a stale one at entry).
+    let report = compact_report(res, agent.cancelled(), agent.limits().keep_recent_messages);
+    out_tx.send(UiMsg::CompactDone(report)).is_ok()
+}
+
+/// Translate one finished `compact_with` into what the UI loop needs. Pure —
+/// every outcome is unit-tested without an agent or a channel.
+///
+/// Cost is honest on every path: the kernel hands a manual compact's bill to
+/// the host (it never folds it into the run totals, which reset per run), so
+/// `usage` carries the summary's tokens on success and whatever it burned
+/// before failing on error.
+pub(super) fn compact_report(
+    res: anyhow::Result<Option<tiny_agent::CompressOutcome>>,
+    cancelled: bool,
+    keep_recent_messages: usize,
+) -> CompactReport {
+    match res {
+        Ok(Some(o)) => CompactReport {
+            // `dropped == 0` is the degenerate pass — the summary came back
+            // empty; the kernel's Warning event already said so.
+            folded: o.dropped > 0,
+            aborted: false,
+            note: None,
+            usage: o.usage,
+        },
+        Ok(None) => CompactReport {
+            folded: false,
+            aborted: false,
+            note: Some((
+                tiny_agent::diag::DiagLevel::Info,
+                format!(
+                    "[compact] nothing to fold — the history is too short to keep its last \
+                     {keep_recent_messages} message(s) AND summarize what precedes them]"
+                ),
+            )),
+            usage: None,
+        },
+        Err(e) => {
+            let burned = e
+                .downcast_ref::<tiny_agent::CompressError>()
+                .and_then(|c| c.burned);
+            // `CompressError` both displays as its `source` and exposes it
+            // through `source()`, so `{e:#}` on the anyhow wrapper prints the
+            // inner chain TWICE ("A: A") — format that chain directly.
+            let text = match e.downcast_ref::<tiny_agent::CompressError>() {
+                Some(c) => format!("{:#}", c.source),
+                None => format!("{e:#}"),
+            };
+            // An Esc during the request is the user's call, not a failure
+            // to report: the UI prints `[cancelled]` itself, and "request
+            // cancelled" after it would only be noise.
+            CompactReport {
+                folded: false,
+                aborted: cancelled,
+                note: if cancelled {
+                    None
+                } else {
+                    Some((
+                        tiny_agent::diag::DiagLevel::Warn,
+                        format!("[compact] failed: {text}"),
+                    ))
+                },
+                usage: burned,
+            }
+        }
+    }
+}
+
+/// Status-bar bookkeeping for one finished `/compact`: the summary's bill
+/// lands in the four token totals (saturating, like every accumulator), and
+/// a real fold drops the ctx segment — it described a history that no longer
+/// exists, and the summary's own usage is no measurement of the new one (a
+/// one-off request over a bare transcript); the segment stays dark until the
+/// next direct request re-measures it, the same reset `/clear` applies.
+/// Anything that did not fold leaves the value alone. Pure, so the ledger is
+/// pinned without a terminal. `totals` is `[in, out, cache create, cache
+/// read]`.
+pub(super) fn compact_ledger(
+    report: &CompactReport,
+    totals: [u64; 4],
+    ctx_tokens: u64,
+) -> ([u64; 4], u64) {
+    let [in_tokens, out_tokens, cache_create, cache_read] = totals;
+    let (add_in, add_out, add_create, add_read) = match &report.usage {
+        Some(u) => (
+            u.input_tokens,
+            u.output_tokens,
+            u.cache_creation_input_tokens,
+            u.cache_read_input_tokens,
+        ),
+        None => (0, 0, 0, 0),
+    };
+    (
+        [
+            in_tokens.saturating_add(add_in),
+            out_tokens.saturating_add(add_out),
+            cache_create.saturating_add(add_create),
+            cache_read.saturating_add(add_read),
+        ],
+        if report.folded { 0 } else { ctx_tokens },
+    )
 }
 
 pub fn run(
@@ -258,6 +524,12 @@ pub fn run(
     // The guard above clears the sink on every teardown path, keeping the
     // global install/clear symmetric.
     install_diag_bridge(out_tx.clone());
+    // Startup note for an unset model window (`Limits::context_window_hint`):
+    // a diag row, because the TUI never shows stderr. Queued before the
+    // worker's first event, so it is the first thing the transcript shows.
+    if let Some(hint) = cfg.limits.context_window_hint() {
+        let _ = out_tx.send(UiMsg::Diag(tiny_agent::diag::DiagLevel::Warn, hint));
+    }
     // Bracketed paste: terminals that support it deliver a pasted blob as one
     // Event::Paste (newlines included) instead of replaying it as keystrokes —
     // which would hit the Enter handler and send each line as a message.
@@ -276,6 +548,22 @@ pub fn run(
         },
     )?;
 
+    // Install the hangup escape hatch before spawning the worker: monitor
+    // creation is fallible, and an early `?` after the worker starts would
+    // otherwise bypass the cancellation/join teardown at the end of `run`.
+    spawn_terminal_disconnect_monitor(
+        in_tx.clone(),
+        cancel.clone(),
+        shutdown.clone(),
+        worker_exited.clone(),
+    )?;
+
+    // The live tool table (builtin + MCP + the skill pair + custom), read
+    // before the worker takes the agent: the welcome row reports what the
+    // model actually sees. The config's own list is not that — `tools: []`
+    // plus MCP servers is a table of many, not of zero, and assembly always
+    // adds the skill pair.
+    let n_tools = agent.tool_names().len();
     // The worker thread owns the agent and drives run() per user input.
     let worker_cancel = cancel.clone();
     let worker_shutdown = shutdown.clone();
@@ -342,6 +630,12 @@ pub fn run(
                     // computed under the worker's exclusive hold of the agent.
                     let _ = out_tx.send(UiMsg::Context(agent.context_breakdown()));
                 }
+                Input::Compact(focus) => {
+                    // `/compact [focus]`: the worker owns the agent, so the
+                    // fold runs here; its events (the Compressed audit row,
+                    // a session-save warning, …) stream back like a turn's.
+                    compact_step(&mut agent, focus.as_deref(), &out_tx);
+                }
             }
         }
     });
@@ -355,6 +649,7 @@ pub fn run(
         &cancel,
         initial_task.as_deref(),
         auto_start,
+        n_tools,
         resume_rows,
     );
 
@@ -365,8 +660,8 @@ pub fn run(
     // Session end: fire the SEPARATE teardown flag so the MCP shutdown-reaper
     // kills a wedged server child and unblocks the worker's bounded join below.
     // (cancel alone won't: the worker may be stuck inside a 120s MCP call, not
-    // at a turn boundary where cancel is checked.) This is the ONLY place
-    // shutdown is raised — a per-turn Esc never reaches here.
+    // at a turn boundary where cancel is checked.) The disconnect monitor uses
+    // the same pair on terminal loss; a per-turn Esc never reaches either path.
     shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
     drop(in_tx); // signal worker to exit
                  // Wait a bounded time for the worker to actually exit. A cancel-aware
@@ -407,6 +702,32 @@ pub fn run(
     result.map(|_| ())
 }
 
+/// UI run lifecycle. Failed is idle for editing/submission, but its paused
+/// queue cannot advance until `/resume`; Cancelling keeps busy-key semantics
+/// while making repeated Esc/Ctrl-C idempotent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RunPhase {
+    Idle,
+    Running,
+    Cancelling,
+    Failed,
+}
+
+impl RunPhase {
+    fn busy(self) -> bool {
+        matches!(self, RunPhase::Running | RunPhase::Cancelling)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            RunPhase::Idle => "idle",
+            RunPhase::Running => "running",
+            RunPhase::Cancelling => "cancelling",
+            RunPhase::Failed => "failed",
+        }
+    }
+}
+
 // The loop state is threaded as plain locals (rows/queued/history/…); the
 // parameters are exactly the pieces owned by the caller. Grouping them into
 // a struct would only shuffle the same fields to one more place.
@@ -420,24 +741,25 @@ fn ui_loop(
     cancel: &std::sync::atomic::AtomicBool,
     initial_task: Option<&str>,
     auto_start: bool,
+    n_tools: usize,
     resume_rows: Vec<Row>,
 ) -> Result<usize> {
     // The full conversation, in append order. Finalized prefixes are committed
     // into the terminal scrollback via insert_before and never re-rendered; the
-    // live viewport only ever shows the tail end (the in-flight streaming row
-    // and queued ghosts), so memory grows with the session but per-frame work
-    // does not.
+    // live viewport only ever shows the in-flight tail, so memory grows with
+    // the session but per-frame work does not.
     let mut rows: Vec<Row> = Vec::new();
     // Watermark: rows[0..committed] have already been flushed to scrollback and
-    // are permanent (only Queued ghosts are ever removed, and they live in the
-    // uncommitted tail). See `pending_end` for the finalize rule.
+    // are permanent. Only the open streaming tail is withheld; pending input
+    // lives in a separate FIFO and cannot invalidate this index.
     let mut committed: usize = 0;
     let mut input = InputBuffer::new();
-    let mut busy = false;
-    // Messages typed while a run is in flight, oldest first. Enter queues
-    // here instead of sending; the RunFinished/Error flush pops one and sends
-    // it (only then committing its Row::User, so the transcript stays in true
-    // send order).
+    let mut phase = RunPhase::Idle;
+    // Failed runs hold the FIFO until an explicit /resume. This survives a
+    // separately submitted new prompt, which must not silently release it.
+    let mut queue_paused = false;
+    // Messages typed while a run is in flight, oldest first. This FIFO is the
+    // ONLY queue truth; its preview is render-only and never enters `rows`.
     let mut queued: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     // Start of the current run (one user message → possibly many turns), for
     // the status-bar elapsed time and the spinner frame. None when idle.
@@ -449,12 +771,14 @@ fn ui_loop(
     // Transient "agent is thinking" marker: set at TurnStart (and when a
     // queued message is flushed into a new run), cleared by the first visible
     // output (text delta or tool call) and at run end. Render-only — the live
-    // viewport renders a `● …` line from it; nothing is committed for it.
+    // viewport renders a `◆ …` line from it; nothing is committed for it.
     let mut thinking = false;
     // Transient in-flight tool tracker (render-only, like `thinking`): the
     // ToolCall row commits immediately, so this placeholder is what keeps the
     // live zone showing WHICH tool is running and for how long.
     let mut tool_running = ToolRunning::new();
+    // Latest ToolInputDelta, render-only: argument fragments never enter rows.
+    let mut tool_building: Option<(String, Instant)> = None;
     // Name of the sub-agent whose text is currently accumulating into the
     // trailing Assistant row, so consecutive deltas from the same sub-agent
     // merge — and a different sub-agent (or the parent) starts a fresh row.
@@ -507,7 +831,7 @@ fn ui_loop(
     let mut dirty = true; // first frame must paint
     let mut last_draw = Instant::now();
 
-    rows.push(Row::sys_info(welcome_text(&cfg.model, cfg.tools.len())));
+    rows.push(Row::sys_info(welcome_text(&cfg.model, n_tools)));
     if resume_rows.is_empty() {
         // Mirror the initial task (already in the agent's history) so the user
         // sees what's running. Do NOT re-send it over in_tx: main has already
@@ -532,7 +856,7 @@ fn ui_loop(
     // initial task, or a resumed session stopped mid-turn). Show "running" so
     // the status bar is honest; further submissions queue behind this run.
     if auto_start {
-        busy = true;
+        phase = RunPhase::Running;
         run_start = Some(Instant::now());
     }
 
@@ -556,10 +880,10 @@ fn ui_loop(
                     // (a panic in a debug build; release aborts the process)
                     // is therefore detected by the flag DoneSignal set on
                     // drop, not by channel state.
-                    if busy
+                    if phase.busy()
                         && worker_exited.load(std::sync::atomic::Ordering::Acquire)
                         && reset_after_worker_exit(
-                            &mut busy,
+                            &mut phase,
                             &mut run_start,
                             &mut streaming,
                             &mut sub_streaming_name,
@@ -569,7 +893,6 @@ fn ui_loop(
                             &mut tool_running,
                             &mut queued,
                             &mut rows,
-                            &mut md_cache,
                         )
                     {
                         dirty = true;
@@ -583,7 +906,7 @@ fn ui_loop(
                     // the bridge mid-session still resets the UI instead of
                     // hanging in "running".
                     if reset_after_worker_exit(
-                        &mut busy,
+                        &mut phase,
                         &mut run_start,
                         &mut streaming,
                         &mut sub_streaming_name,
@@ -593,7 +916,6 @@ fn ui_loop(
                         &mut tool_running,
                         &mut queued,
                         &mut rows,
-                        &mut md_cache,
                     ) {
                         dirty = true;
                     }
@@ -609,6 +931,7 @@ fn ui_loop(
                         activity = "thinking".into();
                         thinking = true;
                         tool_running.clear();
+                        tool_building = None;
                     }
                     AgentEvent::TextDelta(t) => {
                         // First visible output: the thinking placeholder is
@@ -620,6 +943,7 @@ fn ui_loop(
                         // anymore. (Sub-agent deltas below don't clear — a
                         // sibling parallel tool may legitimately still run.)
                         tool_running.clear();
+                        tool_building = None;
                         // Parent speaks: close any open sub-agent bubble AND
                         // keep this delta out of it — streaming=false forces
                         // append_delta to open a fresh row even though the sub
@@ -645,6 +969,7 @@ fn ui_loop(
                         // the reply read as one blob).
                         thinking = false;
                         tool_running.clear();
+                        tool_building = None;
                         // Parent speaks: close any open sub bubble so the
                         // trace doesn't merge into it (same rule as TextDelta).
                         if sub_streaming_name.take().is_some() {
@@ -654,11 +979,25 @@ fn ui_loop(
                             activity = "thinking".into();
                         }
                         append_thinking_delta(&mut rows, &mut thinking_stream, "", &t);
-                        // Long traces flush incrementally too (they are often
-                        // LONGER than the answer).
-                        split_streaming_row(&mut rows, split_w);
+                        // Thinking commits as one compact/folded row at close;
+                        // only Assistant text uses incremental row splitting.
+                    }
+                    AgentEvent::ToolInputDelta { name, .. } => {
+                        let name = tool_display_name(&name);
+                        thinking = false;
+                        // Argument construction follows any text/reasoning from
+                        // this assistant turn. Close those live rows so the new
+                        // render-only tool-building state is actually visible.
+                        streaming = false;
+                        sub_streaming_name = None;
+                        thinking_stream = None;
+                        activity = format!("→ {name} · receiving args");
+                        if tool_building.as_ref().is_none_or(|(n, _)| n != &name) {
+                            tool_building = Some((name, Instant::now()));
+                        }
                     }
                     AgentEvent::ToolCall { name, input } => {
+                        tool_building = None;
                         streaming = false;
                         thinking_stream = None;
                         thinking = false;
@@ -768,6 +1107,9 @@ fn ui_loop(
                         cache_creation_input_tokens,
                         cache_read_input_tokens,
                         tool_folded,
+                        // A split of output_tokens — the status bar keeps its
+                        // four counters (the TUI stays minimal).
+                        reasoning_tokens: _,
                     } => {
                         in_tokens = in_tokens.saturating_add(input_tokens);
                         out_tokens = out_tokens.saturating_add(output_tokens);
@@ -846,6 +1188,7 @@ fn ui_loop(
                                 append_thinking_delta(&mut rows, &mut thinking_stream, &name, t);
                             }
                             AgentEvent::ToolCall { name: tn, input } => {
+                                tool_building = None;
                                 sub_streaming_name = None;
                                 thinking_stream = None;
                                 thinking = false;
@@ -951,41 +1294,93 @@ fn ui_loop(
                     rows.push(Row::sys_error(format!("[error] {e}")));
                     activity.clear();
                     tool_running.clear();
-                    // End every open stream: a leftover `streaming` /
-                    // `sub_streaming_name` / `thinking_stream` would let the
-                    // NEXT run's first TextDelta merge into a stale row (or,
-                    // when the last row is this System row, be silently
-                    // dropped).
+                    tool_building = None;
+                    // End every open stream: a leftover streaming flag would
+                    // let the next run merge into a stale row.
                     streaming = false;
                     sub_streaming_name = None;
                     thinking_stream = None;
-                    // Flush the queue: send the next queued message right
-                    // away, keeping busy=true on success so no idle gap opens
-                    // (a Ctrl-C in that gap would quit instead of cancelling).
-                    let flush = flush_next_queued(&mut queued, &mut rows, &mut md_cache, in_tx);
-                    apply_flush(
-                        flush,
-                        &mut busy,
-                        &mut run_start,
-                        &mut activity,
-                        &mut thinking,
-                    );
+                    thinking = false;
+                    run_start = None;
+                    phase = RunPhase::Failed;
+                    queue_paused = pause_for_held(true, queued.len());
+                    if !queued.is_empty() {
+                        rows.push(Row::sys_warn(format!(
+                            "[queue paused — {} message(s) held; /resume continues, /unqueue edits]",
+                            queued.len()
+                        )));
+                    }
                 }
-                UiMsg::RunFinished => {
+                msg @ (UiMsg::RunFinished | UiMsg::CompactDone(_)) => {
+                    // A finished `/compact` takes the run's completion path
+                    // (busy state cleared, the queue flushed) after its own
+                    // bookkeeping: an optional row, the summary's bill into
+                    // the status-bar totals, and the ctx segment dropped by a
+                    // real fold (see `compact_ledger`).
+                    let compact = match &msg {
+                        UiMsg::CompactDone(report) => Some(report),
+                        _ => None,
+                    };
+                    if let Some(report) = compact {
+                        if let Some((level, text)) = &report.note {
+                            rows.push(match level {
+                                tiny_agent::diag::DiagLevel::Info => Row::sys_info(text.clone()),
+                                tiny_agent::diag::DiagLevel::Warn => Row::sys_warn(text.clone()),
+                            });
+                        }
+                        let (totals, ctx) = compact_ledger(
+                            report,
+                            [in_tokens, out_tokens, cache_create, cache_read],
+                            ctx_tokens,
+                        );
+                        [in_tokens, out_tokens, cache_create, cache_read] = totals;
+                        ctx_tokens = ctx;
+                    }
                     streaming = false;
                     sub_streaming_name = None;
                     thinking_stream = None;
                     activity.clear();
                     tool_running.clear();
-                    // Flush the queue (same contract as the Error branch).
-                    let flush = flush_next_queued(&mut queued, &mut rows, &mut md_cache, in_tx);
-                    apply_flush(
-                        flush,
-                        &mut busy,
-                        &mut run_start,
-                        &mut activity,
-                        &mut thinking,
-                    );
+                    tool_building = None;
+                    // A run was cancelled iff Esc was pressed; a compact
+                    // only if the cancel really aborted it (`aborted`).
+                    let aborted = match compact {
+                        Some(report) => report.aborted,
+                        None => phase == RunPhase::Cancelling,
+                    };
+                    if aborted {
+                        // Exactly one terminal notice; the initial keypress
+                        // already contributed the waiting-state row.
+                        rows.push(Row::sys_warn("[cancelled]"));
+                        phase = RunPhase::Idle;
+                        run_start = None;
+                        thinking = false;
+                    } else if compact.is_some() && phase == RunPhase::Cancelling {
+                        // Only reachable for a compact: an Esc raced a fold
+                        // that landed anyway (or a request that concluded on
+                        // its own). The outcome's row is already up — report
+                        // what happened, not a cancel that did nothing. The
+                        // queue is empty here: the Esc that entered Cancelling
+                        // dropped it.
+                        phase = RunPhase::Idle;
+                        run_start = None;
+                        thinking = false;
+                    } else if queue_paused {
+                        // A separate prompt may have completed while an older
+                        // failed queue remains explicitly held.
+                        phase = RunPhase::Idle;
+                        run_start = None;
+                        thinking = false;
+                    } else {
+                        let flush = flush_next_queued(&mut queued, &mut rows, in_tx);
+                        apply_flush(
+                            flush,
+                            &mut phase,
+                            &mut run_start,
+                            &mut activity,
+                            &mut thinking,
+                        );
+                    }
                 }
                 UiMsg::Context(bd) => {
                     // Read-only report: no busy/streaming state is touched —
@@ -999,10 +1394,9 @@ fn ui_loop(
                 UiMsg::Diag(level, msg) => {
                     // Kernel diag forwarded by the bridge (see UiMsg::Diag):
                     // reuse the ordinary system-row mechanism — the row rides
-                    // the normal commit path into scrollback, respecting the
-                    // queued-ghost watermark. The text is self-describing
-                    // ("[warn] MCP stdio read stopped: …"), so the level only
-                    // picks the color.
+                    // the normal commit path into scrollback. The text is
+                    // self-describing ("[warn] MCP stdio read stopped: …"), so
+                    // the level only picks the color.
                     rows.push(match level {
                         tiny_agent::diag::DiagLevel::Info => Row::sys_info(msg),
                         tiny_agent::diag::DiagLevel::Warn => Row::sys_warn(msg),
@@ -1013,9 +1407,10 @@ fn ui_loop(
 
         // Commit finalized turns into the terminal scrollback. A row is
         // "finalized" once it will never mutate again: everything except the
-        // in-flight streaming Assistant row (skipped while a stream is open)
-        // and queued ghosts (removed on flush, never committed). This is the
-        // one place the inline model writes the conversation to scrollback, so
+        // in-flight streaming Assistant/Thinking row (skipped while its stream
+        // is open). Pending input is outside `rows` and never blocks a commit.
+        // This is the one place the inline model writes the conversation to
+        // scrollback, so
         // the host terminal's native selection/scroll/search cover it.
         let stream_open = streaming || sub_streaming_name.is_some() || thinking_stream.is_some();
         let pending_end = commit_pending_end(&rows, committed, stream_open);
@@ -1039,8 +1434,8 @@ fn ui_loop(
         }
         // Index of the in-flight row shown live in the viewport's transcript
         // zone (None when nothing is streaming). Computed independently of the
-        // commit watermark above — see inflight_row_index — so a streaming
-        // Assistant that opened AFTER a queued ghost still renders.
+        // commit watermark above — see inflight_row_index — so a later streaming
+        // Assistant always renders even after earlier rows have finalized.
         let inflight_idx = inflight_row_index(&rows, stream_open);
 
         // Render the live viewport — only when something changed (worker event
@@ -1048,26 +1443,43 @@ fn ui_loop(
         // redraw on a fast tick so the spinner animates and the status-bar
         // elapsed time keeps moving. Committed turns are already in scrollback,
         // so this redraws only the small bottom band, not the whole history.
-        let clock_tick = busy && last_draw.elapsed() >= Duration::from_millis(120);
+        let clock_tick = phase.busy() && last_draw.elapsed() >= Duration::from_millis(120);
         if dirty || clock_tick {
             dirty = false;
             last_draw = Instant::now();
             // The slash popup tracks the input text: any edit sets dirty, so
             // this refresh rides the same redraw.
-            popup.update(&input.text());
+            popup.update_for(&input.text(), phase.busy());
             term.draw(|f| {
                 let area = f.area(); // the INLINE_HEIGHT-row band at the bottom
+                let busy = phase.busy();
                 let term_w = area.width;
-                // Input box grows with the number of lines typed, up to half
-                // the viewport so the zone + status stay visible.
+                let (prompt, prompt_style) = (
+                    "❯ ".to_string(),
+                    Style::default().fg(USER_FG).add_modifier(Modifier::BOLD),
+                );
+                let chrome_w = content_width(term_w) as u16;
+                let inner_cols = (chrome_w as usize).saturating_sub(2).max(1);
+                let composer = layout_composer(&input, inner_cols, &prompt, prompt_style);
+                // Soft-wrapped rows, not logical newlines, determine height.
+                // The fixed inline viewport keeps at least a small live zone.
                 let max_input = ((area.height as usize) / 2).max(3);
-                let input_h = (input.line_count() + 2).min(max_input) as u16;
-                let [zone_rect, input_rect, status_rect] = Layout::vertical([
-                    Constraint::Min(0),
-                    Constraint::Length(input_h),
-                    Constraint::Length(1),
-                ])
-                .areas(area);
+                let input_h = (composer.lines.len() + 2).clamp(3, max_input) as u16;
+                let queue_line = queue_preview_line(&queued, queue_paused, chrome_w as usize);
+                let queue_h = if queue_line.is_some() { 1 } else { 0 };
+                let [zone_rect, mut queue_rect, mut input_rect, mut status_rect] =
+                    Layout::vertical([
+                        Constraint::Min(0),
+                        Constraint::Length(queue_h),
+                        Constraint::Length(input_h),
+                        Constraint::Length(1),
+                    ])
+                    .areas(area);
+                // A 200-column prompt is harder to scan, not more useful. Keep
+                // the composer/status on the same readable column as prose.
+                queue_rect.width = chrome_w;
+                input_rect.width = chrome_w;
+                status_rect.width = chrome_w;
                 let content_w = content_width(term_w);
 
                 // Transcript zone (the rows above the input box inside the
@@ -1079,12 +1491,15 @@ fn ui_loop(
                 // Already-committed turns live in the host terminal's
                 // scrollback above this viewport.
                 if popup.is_open() {
-                    let lines = slash_popup_lines(&popup, zone_rect.height as usize);
+                    let lines = slash_popup_lines_for(&popup, zone_rect.height as usize, content_w);
+                    render_zone_top(f, zone_rect, &lines);
+                } else if phase == RunPhase::Idle && rows.len() <= 1 && input.is_empty() {
+                    let lines = empty_state_lines(content_w);
                     render_zone_top(f, zone_rect, &lines);
                 } else if thinking {
                     let line = Line::from(vec![
                         Span::styled(
-                            "● ".to_string(),
+                            AGENT_MARK.to_string(),
                             Style::default().fg(AGENT_FG).add_modifier(Modifier::BOLD),
                         ),
                         Span::styled("…", Style::default().fg(dim_fg())),
@@ -1108,8 +1523,25 @@ fn ui_loop(
                         let wrapped = wrap_history(&l, content_w);
                         render_zone_tail(f, zone_rect, &wrapped);
                     }
+                } else if let Some((name, started)) = tool_building.as_ref().filter(|_| busy) {
+                    let line = Line::from(vec![
+                        Span::styled(
+                            format!("{TOOL_HEAD_MARK}→ {name}"),
+                            Style::default()
+                                .fg(TOOL_CALL_FG)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            format!(" · receiving arguments · {}s", started.elapsed().as_secs()),
+                            Style::default().fg(dim_fg()),
+                        ),
+                    ]);
+                    render_zone_tail(f, zone_rect, &[line]);
                 } else if let Some(line) = tool_running_line(&tool_running, Instant::now()) {
                     render_zone_tail(f, zone_rect, &[line]);
+                }
+                if let Some(line) = queue_line {
+                    f.render_widget(Paragraph::new(line), queue_rect);
                 }
 
                 // Input box. The editing prompt is stable; Enter queues while
@@ -1120,109 +1552,74 @@ fn ui_loop(
                     .map(|t| t.elapsed().as_millis() / 100)
                     .unwrap_or(0) as usize)
                     % SPINNER.len()];
-                let (prompt, prompt_style) = (
-                    "❯ ".to_string(),
-                    Style::default().fg(USER_FG).add_modifier(Modifier::BOLD),
-                );
                 let body = input.text();
-                let lines_view = input.lines_view();
-                let (crow, ccol) = input.cursor_pos();
-                // The input box height is capped, so a long paste can exceed
-                // it. Scroll the box to follow the caret and place the caret
-                // within the visible window. The same applies HORIZONTALLY: the
-                // Paragraph doesn't wrap, so a line wider than the box is
-                // clipped and an unclamped caret would be drawn past the border.
+                // Vertical scrolling follows the caret through soft-wrapped
+                // rows. No horizontal scroll: long prompts remain reviewable.
                 let inner_rows = (input_h as usize).saturating_sub(2);
-                let input_scroll = crow
-                    .saturating_sub(inner_rows.saturating_sub(1))
-                    .min(u16::MAX as usize) as u16;
-                let inner_cols = (input_rect.width as usize).saturating_sub(2).max(1);
-                let lead = if crow == 0 { prompt.width() } else { 0 };
-                let caret_col = ccol + lead; // display column within the caret's line
-                let (hscroll, caret_x) = input_hscroll(caret_col, inner_cols);
+                let input_scroll = composer_scroll(composer.caret_row, inner_rows);
                 let secs = run_start.map(|t| t.elapsed().as_secs()).unwrap_or(0);
                 let act = if activity.is_empty() {
                     "working"
                 } else {
                     activity.as_str()
                 };
-                let input_title = build_input_title(
-                    busy,
-                    spinner_char,
-                    act,
-                    secs,
-                    queued.len(),
-                    (input_rect.width as usize).saturating_sub(2),
-                );
-                let title_fg = chrome_fg(busy);
-                // Ghost placeholder on an empty input box. The caret math below
-                // is unaffected: an empty buffer's caret sits at the prompt end,
-                // in front of the placeholder text.
-                // Build one Line per logical line so a multiline buffer renders
-                // across rows (a single Line carrying embedded `\n` collapses:
-                // ratatui's grapheme iterator filters control chars including
-                // `\n`, so the caret row math below would land on an empty row).
-                // The prompt spans only the first line; subsequent lines start
-                // at the left border so caret `lead` (computed below as
-                // prompt width only when crow==0) stays correct.
-                let input_lines: Vec<Line> = if body.is_empty() {
-                    vec![Line::from(vec![
-                        Span::styled(prompt.clone(), prompt_style),
-                        Span::styled(INPUT_PLACEHOLDER, Style::default().fg(dim_fg())),
-                    ])]
-                } else {
-                    lines_view
-                        .iter()
-                        .enumerate()
-                        .map(|(i, ln)| {
-                            if i == 0 {
-                                Line::from(vec![
-                                    Span::styled(prompt.clone(), prompt_style),
-                                    Span::raw(ln.clone()),
-                                ])
-                            } else {
-                                Line::from(vec![Span::raw(ln.clone())])
-                            }
-                        })
-                        .collect()
+                let title_w = (input_rect.width as usize).saturating_sub(2);
+                let input_title = match phase {
+                    RunPhase::Cancelling => {
+                        truncate_display(" ⠹ cancelling… · waiting for stop ", title_w)
+                    }
+                    RunPhase::Failed => failed_title(queued.len(), title_w),
+                    _ => build_input_title(busy, spinner_char, act, secs, queued.len(), title_w),
                 };
+                let title_fg = match phase {
+                    RunPhase::Cancelling => TOOL_CALL_FG,
+                    RunPhase::Failed => TOOL_ERR_FG,
+                    _ => chrome_fg(busy),
+                };
+                let mut input_lines = composer.lines;
+                if body.is_empty() {
+                    if let Some(first) = input_lines.first_mut() {
+                        first.spans.push(Span::styled(
+                            truncate_display(
+                                INPUT_PLACEHOLDER,
+                                inner_cols.saturating_sub(prompt.width()),
+                            ),
+                            Style::default().fg(dim_fg()),
+                        ));
+                    }
+                }
+                let border_fg = match phase {
+                    RunPhase::Idle => dim_fg(),
+                    _ => title_fg,
+                };
+                let mut input_block = WBlock::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .style(Style::default().bg(composer_bg()))
+                    .border_style(Style::default().fg(border_fg))
+                    .title(Span::styled(input_title, Style::default().fg(title_fg)));
+                if let Some(footer) = composer_footer(busy, title_w) {
+                    input_block = input_block.title_bottom(footer);
+                }
                 let input_widget = Paragraph::new(input_lines)
-                    .block(
-                        WBlock::default()
-                            .borders(Borders::ALL)
-                            .border_type(BorderType::Rounded)
-                            .border_style(Style::default().fg(title_fg))
-                            .title(Span::styled(input_title, Style::default().fg(title_fg))),
-                    )
-                    .scroll((input_scroll, hscroll));
+                    .block(input_block)
+                    .scroll((input_scroll, 0));
                 f.render_widget(input_widget, input_rect);
-                // Place the caret. Column = border(1) + display width of the text
-                // before the caret (+ the prompt, on the first line only), minus
-                // the horizontal scroll. Display width keeps it correct for wide
-                // chars; hscroll keeps it inside the box on over-wide lines.
-                let x = input_rect.x + 1 + caret_x;
-                let y = input_rect.y + 1 + (crow as u16).saturating_sub(input_scroll);
+                let x = input_rect.x
+                    + 1
+                    + (composer.caret_col.min(inner_cols.saturating_sub(1)) as u16);
+                let y = input_rect.y + 1 + (composer.caret_row as u16).saturating_sub(input_scroll);
                 f.set_cursor_position((x, y));
 
                 // Status bar. Detailed run activity lives in the input title;
                 // the bar only names the broad state so the two regions do not
                 // compete. Idle shows no clock — the run elapsed is the title's
                 // job.
-                let state = if busy { "running" } else { "idle" }.to_string();
-                let cache_seg = if cache_read > 0 || cache_create > 0 {
-                    format!(
-                        " · cache {}w {}r",
-                        fmt_tokens(cache_create),
-                        fmt_tokens(cache_read)
-                    )
-                } else {
-                    String::new()
-                };
-                let stats = format!(
-                    " · {} in · {} out{cache_seg}",
-                    fmt_tokens(in_tokens),
-                    fmt_tokens(out_tokens),
-                );
+                let state = phase.label().to_string();
+                // A brand-new session has nothing to report: showing
+                // "0 in / 0 out" is pure noise. The segment appears with the
+                // first billed turn (cache-only counters count as activity).
+                let stats = status_stats(in_tokens, out_tokens, cache_create, cache_read);
                 let ctx = fmt_ctx(ctx_tokens, cfg.limits.max_context_tokens);
                 // Plan segment: " · plan done/total", green when every step is
                 // completed, yellow while work remains. None when the agent
@@ -1249,14 +1646,17 @@ fn ui_loop(
                     &cwd_path,
                     status_rect.width as usize,
                 );
-                f.render_widget(Paragraph::new(status), status_rect);
+                f.render_widget(
+                    Paragraph::new(status).style(Style::default().bg(surface_bg())),
+                    status_rect,
+                );
             })?;
         }
 
         // Keyboard. Poll longer when idle: a keypress wakes the poll
         // immediately, so the longer timeout costs no input latency but
         // avoids spinning the loop while nothing is happening.
-        let poll_ms = if busy { 60 } else { 250 };
+        let poll_ms = if phase.busy() { 60 } else { 250 };
         if event::poll(Duration::from_millis(poll_ms))? {
             let ev = event::read()?;
             // Any event may change the view (caret, popup, …).
@@ -1301,27 +1701,31 @@ fn ui_loop(
                     // so quitting just releases the live region — the
                     // conversation stays selectable above it.
                     (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                        if busy {
+                        if phase.busy() {
                             cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-                            // End the current assistant bubble: a System row is
-                            // now last, so trailing TextDelta events still in
-                            // flight start a fresh Assistant row.
-                            streaming = false;
-                            sub_streaming_name = None;
-                            tool_running.clear();
-                            rows.push(Row::sys_warn("[cancelling…]"));
-                            // Cancelling stops the whole line: queued messages
-                            // are dropped too, and their ghost rows go with them.
-                            if !queued.is_empty() {
-                                rows.push(Row::sys_warn(format!(
-                                    "[dropped {} queued message(s)]",
-                                    queued.len()
-                                )));
-                                queued.clear();
-                                if drop_queued_ghosts(&mut rows) {
-                                    md_cache.clear();
+                            if phase == RunPhase::Running {
+                                phase = RunPhase::Cancelling;
+                                activity = "cancelling".into();
+                                // End the current assistant bubble: trailing
+                                // deltas start a fresh row after this notice.
+                                streaming = false;
+                                sub_streaming_name = None;
+                                tool_running.clear();
+                                tool_building = None;
+                                rows.push(Row::sys_warn("[cancelling…]"));
+                                if !queued.is_empty() {
+                                    rows.push(Row::sys_warn(format!(
+                                        "[dropped {} queued message(s)]",
+                                        queued.len()
+                                    )));
+                                    queued.clear();
+                                    // The pause is a property of held
+                                    // messages: nothing held, nothing paused.
+                                    queue_paused = false;
                                 }
                             }
+                            // Already Cancelling: keep the signal latched but
+                            // do not append another row on key repeat.
                         } else if matches!(key.code, KeyCode::Char('c')) {
                             // Ctrl-C in idle: first press arms (notice row),
                             // second within the window quits. /quit and /exit
@@ -1361,7 +1765,8 @@ fn ui_loop(
                             // enters rows / input history / the wire is clean.
                             let trimmed = strip_controls(input.text().trim());
                             if !trimmed.is_empty() {
-                                match classify(&trimmed) {
+                                let command = classify(&trimmed);
+                                match command.clone() {
                                     SlashCmd::Message => {
                                         if history.last().map(String::as_str) != Some(&trimmed) {
                                             history.push(trimmed.clone());
@@ -1369,16 +1774,11 @@ fn ui_loop(
                                         hist_idx = None;
                                         draft.clear();
                                         input.drain_to_string();
-                                        if busy {
-                                            // Queue behind the in-flight run. A
-                                            // dim Row::Queued ghost marks the
-                                            // spot; the flush swaps it for the
-                                            // real Row::User only when it sends,
-                                            // keeping the transcript in true send
-                                            // order. The queue depth shows in the
-                                            // input box title.
+                                        if phase.busy() {
+                                            // Queue behind the in-flight run.
+                                            // Pending text stays in the FIFO;
+                                            // only its preview is drawn live.
                                             queued.push_back(trimmed.clone());
-                                            rows.push(Row::Queued(trimmed));
                                         } else {
                                             rows.push(Row::User(trimmed.clone()));
                                             // Deliver before flipping busy. If the
@@ -1388,7 +1788,7 @@ fn ui_loop(
                                             // "running" waiting for a RunFinished that
                                             // will never arrive.
                                             if in_tx.send(Some(Input::Text(trimmed))).is_err() {
-                                                busy = false;
+                                                phase = RunPhase::Failed;
                                                 // The message never reached the agent —
                                                 // drop it from the transcript so the
                                                 // on-screen history matches what the agent
@@ -1401,16 +1801,17 @@ fn ui_loop(
                                                      type /quit to exit]",
                                                 ));
                                             } else {
-                                                busy = true;
+                                                phase = RunPhase::Running;
                                                 run_start = Some(Instant::now());
+                                                activity = "thinking".into();
+                                                thinking = true;
                                             }
                                         }
                                     }
-                                    SlashCmd::Clear if busy => {
-                                        // Clearing mid-run would yank history
-                                        // out from under the in-flight agent;
-                                        // refuse instead of queueing it.
-                                        input.drain_to_string();
+                                    SlashCmd::Clear if phase.busy() => {
+                                        // Keep the command in the composer for
+                                        // an idle retry; clearing mid-run would
+                                        // yank history under the active agent.
                                         rows.push(Row::sys_warn(
                                             "[busy — /clear is disabled while running]",
                                         ));
@@ -1456,14 +1857,13 @@ fn ui_loop(
                                             )
                                         });
                                     }
-                                    SlashCmd::Context if busy => {
+                                    SlashCmd::Context if phase.busy() => {
                                         // Same refusal as /clear: the worker
                                         // doesn't pump in_rx inside a run, so
                                         // queueing would only make the report
                                         // arrive after the run looking frozen;
                                         // an honest "disabled while running"
                                         // is better.
-                                        input.drain_to_string();
                                         rows.push(Row::sys_warn(
                                             "[busy — /context is disabled while running]",
                                         ));
@@ -1474,6 +1874,33 @@ fn ui_loop(
                                             rows.push(Row::sys_error(
                                                 "[worker stopped — context report unavailable]",
                                             ));
+                                        }
+                                    }
+                                    SlashCmd::Compact(_) if phase.busy() => {
+                                        // Same refusal as /clear: a fold
+                                        // rewrites the history the active
+                                        // run is working on. The command
+                                        // stays in the composer for an
+                                        // idle retry.
+                                        rows.push(Row::sys_warn(
+                                            "[busy — /compact is disabled while running]",
+                                        ));
+                                    }
+                                    SlashCmd::Compact(focus) => {
+                                        input.drain_to_string();
+                                        if in_tx.send(Some(Input::Compact(focus))).is_err() {
+                                            rows.push(Row::sys_error(
+                                                "[worker stopped — compact unavailable]",
+                                            ));
+                                        } else {
+                                            // The summary is a real, billed
+                                            // model request — busy like a
+                                            // turn, so Esc cancels it and
+                                            // typed messages queue behind.
+                                            phase = RunPhase::Running;
+                                            run_start = Some(Instant::now());
+                                            activity = "compacting".into();
+                                            thinking = false;
                                         }
                                     }
                                     SlashCmd::Quit => {
@@ -1548,24 +1975,109 @@ fn ui_loop(
                                                 }
                                             }
                                         };
+                                        if matches!(
+                                            row,
+                                            Row::System {
+                                                level: SysLevel::Error,
+                                                ..
+                                            }
+                                        ) {
+                                            input.set_text(&trimmed);
+                                        }
                                         rows.push(row);
                                     }
+                                    SlashCmd::Queue => {
+                                        input.drain_to_string();
+                                        if queued.is_empty() {
+                                            rows.push(Row::sys_info("[queue empty]"));
+                                        } else {
+                                            for (i, text) in queued.iter().enumerate() {
+                                                rows.push(Row::sys_info(format!(
+                                                    "[queued #{} · not sent]\n{text}",
+                                                    i + 1
+                                                )));
+                                            }
+                                        }
+                                    }
+                                    SlashCmd::Unqueue => {
+                                        input.drain_to_string();
+                                        match queued.pop_back() {
+                                            Some(text) => {
+                                                input.set_text(&text);
+                                                hist_idx = None;
+                                                draft.clear();
+                                                // Withdrawing the last held
+                                                // message lifts the pause.
+                                                queue_paused =
+                                                    pause_for_held(queue_paused, queued.len());
+                                            }
+                                            None => rows.push(Row::sys_warn(
+                                                "[queue empty — nothing to withdraw]",
+                                            )),
+                                        }
+                                    }
+                                    SlashCmd::Resume if phase.busy() => {
+                                        input.drain_to_string();
+                                        rows.push(Row::sys_warn(
+                                            "[busy — /resume continues a paused queue after the run]",
+                                        ));
+                                    }
+                                    SlashCmd::Resume => {
+                                        input.drain_to_string();
+                                        if !queue_paused && queued.is_empty() {
+                                            rows.push(Row::sys_info("[no paused queue]"));
+                                        } else {
+                                            queue_paused = false;
+                                            let flush =
+                                                flush_next_queued(&mut queued, &mut rows, in_tx);
+                                            apply_flush(
+                                                flush,
+                                                &mut phase,
+                                                &mut run_start,
+                                                &mut activity,
+                                                &mut thinking,
+                                            );
+                                        }
+                                    }
+                                    SlashCmd::Call(arg) => {
+                                        input.drain_to_string();
+                                        let n = arg.unwrap_or(1);
+                                        match nth_last_tool_call(&rows, n) {
+                                            Some(r) => rows.push(r),
+                                            None => {
+                                                let total = rows
+                                                    .iter()
+                                                    .filter(|r| matches!(r, Row::ToolCall { .. }))
+                                                    .count();
+                                                rows.push(Row::sys_warn(format!(
+                                                    "[no tool call #{n} — {total} call(s) so far]"
+                                                )));
+                                                input.set_text(&trimmed);
+                                            }
+                                        }
+                                    }
+                                    SlashCmd::Thinking(arg) => {
+                                        input.drain_to_string();
+                                        let n = arg.unwrap_or(1);
+                                        match nth_last_thinking(&rows, n) {
+                                            Some(r) => rows.push(r),
+                                            None => {
+                                                let total = rows
+                                                    .iter()
+                                                    .filter(|r| matches!(r, Row::Thinking { .. }))
+                                                    .count();
+                                                rows.push(Row::sys_warn(format!(
+                                                    "[no thinking block #{n} — {total} block(s) so far]"
+                                                )));
+                                                input.set_text(&trimmed);
+                                            }
+                                        }
+                                    }
                                     SlashCmd::Out(arg) => {
-                                        // Reprint a tool result in full.
-                                        // Rows commit at their default state
-                                        // and post-commit rows have no cursor
-                                        // to toggle, so the in-TUI way to read
-                                        // a full output is a fresh expanded
-                                        // row pushed through the normal commit
-                                        // channel (rendering and guides
-                                        // unchanged). Works mid-run like the
-                                        // other read-only commands.
                                         input.drain_to_string();
                                         let n = arg.unwrap_or(1);
                                         match nth_last_tool_result(&rows, n) {
-                                            Some(r) => {
-                                                rows.push(r);
-                                            }
+                                            Some(r) => rows.push(r),
                                             None => {
                                                 let total = rows
                                                     .iter()
@@ -1574,8 +2086,13 @@ fn ui_loop(
                                                 rows.push(Row::sys_warn(format!(
                                                     "[no tool result #{n} — {total} result(s) so far]"
                                                 )));
+                                                input.set_text(&trimmed);
                                             }
                                         }
+                                    }
+                                    cmd @ SlashCmd::Unknown(_) => {
+                                        // Correctable input stays in the composer.
+                                        rows.push(Row::sys_warn(slash_reply(&cmd, cfg)));
                                     }
                                     cmd => {
                                         input.drain_to_string();
@@ -1585,12 +2102,27 @@ fn ui_loop(
                             }
                         }
                     }
-                    // Line-editing shortcuts. The Alt+Left/Right word motions
-                    // must precede the plain Left/Right arms below (match arms
-                    // are tried in order); the Ctrl chords likewise precede
-                    // the plain-char arm at the bottom.
-                    (KeyCode::Left, KeyModifiers::ALT) => input.word_left(),
-                    (KeyCode::Right, KeyModifiers::ALT) => input.word_right(),
+                    // Detail and line-editing shortcuts. Word motions must
+                    // precede plain arrows; Ctrl chords precede plain chars.
+                    (KeyCode::Char('o'), KeyModifiers::CONTROL) => match latest_detail(&rows) {
+                        Some(row) => rows.push(row),
+                        None => rows.push(Row::sys_info(
+                            "[no tool call, result or thinking detail yet]",
+                        )),
+                    },
+                    (KeyCode::Char('j'), KeyModifiers::CONTROL) => input.newline(),
+                    (KeyCode::Left, m)
+                        if m.contains(KeyModifiers::ALT) || m.contains(KeyModifiers::CONTROL) =>
+                    {
+                        input.word_left()
+                    }
+                    (KeyCode::Right, m)
+                        if m.contains(KeyModifiers::ALT) || m.contains(KeyModifiers::CONTROL) =>
+                    {
+                        input.word_right()
+                    }
+                    (KeyCode::Backspace, KeyModifiers::CONTROL) => input.delete_word_back(),
+                    (KeyCode::Delete, _) => input.delete_forward(),
                     (KeyCode::Char('w'), KeyModifiers::CONTROL) => input.delete_word_back(),
                     (KeyCode::Char('u'), KeyModifiers::CONTROL) => input.kill_to_line_start(),
                     (KeyCode::Char('k'), KeyModifiers::CONTROL) => input.kill_to_line_end(),
@@ -1604,7 +2136,7 @@ fn ui_loop(
                     (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
                         if !input.is_empty() {
                             input.delete_forward();
-                        } else if !busy {
+                        } else if !phase.busy() {
                             let _ = in_tx.send(None);
                             return Ok(queued.len());
                         }
@@ -1675,25 +2207,17 @@ pub(super) enum Flush {
     Undeliverable,
 }
 
-/// Pop the oldest queued message after a run ended and start the next run
-/// with it. Shared by the Error and RunFinished arms, whose flush blocks were
-/// verbatim duplicates. Contract: pop_front ↔ remove the oldest ghost row ↔
-/// append the real Row::User at the END (the finished run's trailing output
-/// may already sit after the ghost, so only an append keeps true send order).
-/// Row removal shifts indices, so the MdCache slot is dropped alongside
-/// (content-keyed: hygiene, not an anti-aliasing necessity).
+/// Pop the oldest queued message and start its run. The pending FIFO never
+/// inserted ghost Rows, so no committed index can move here; the real User row
+/// is appended only at the send boundary, preserving true conversation order.
 pub(super) fn flush_next_queued(
     queued: &mut std::collections::VecDeque<String>,
     rows: &mut Vec<Row>,
-    md_cache: &mut MdCache,
     in_tx: &mpsc::Sender<Option<Input>>,
 ) -> Flush {
     let Some(text) = queued.pop_front() else {
         return Flush::Empty;
     };
-    if remove_oldest_queued(rows) {
-        md_cache.clear();
-    }
     rows.push(Row::User(text.clone()));
     if in_tx.send(Some(Input::Text(text))).is_ok() {
         Flush::Sent
@@ -1705,31 +2229,41 @@ pub(super) fn flush_next_queued(
     }
 }
 
-/// Apply a `flush_next_queued` outcome to the run state. Shared by the Error
-/// and RunFinished arms so the flush contract lives in exactly one place:
-/// Sent starts the next run with NO idle gap (a Ctrl-C in that gap would
-/// quit instead of cancelling), anything else drops the session to idle.
+/// Re-derive the queue pause from what is actually held, at the two moments
+/// the flag follows the queue: after a failed run (`paused` = true) and after
+/// `/unqueue` withdrew a message (`paused` = the flag before it). The pause is
+/// a property of the held messages — invariant: paused ⇒ non-empty queue. A
+/// stale flag on an empty queue would mark messages queued during a later
+/// healthy run as "paused", held when it ends without the user ever being told
+/// about a pause. A withdrawal never sets the flag: a live (unpaused) queue
+/// stays live.
+pub(super) fn pause_for_held(paused: bool, held: usize) -> bool {
+    paused && held > 0
+}
+
+/// Apply a `flush_next_queued` outcome to the run state. Sent starts the next
+/// run with NO idle gap (Ctrl-C must cancel, not quit); everything else idles.
 pub(super) fn apply_flush(
     flush: Flush,
-    busy: &mut bool,
+    phase: &mut RunPhase,
     run_start: &mut Option<Instant>,
     activity: &mut String,
     thinking: &mut bool,
 ) {
     match flush {
         Flush::Sent => {
-            *busy = true;
+            *phase = RunPhase::Running;
             *run_start = Some(Instant::now());
             *activity = "thinking".into();
             *thinking = true;
         }
         Flush::Undeliverable => {
-            *busy = false;
+            *phase = RunPhase::Failed;
             *run_start = None;
             *thinking = false;
         }
         Flush::Empty => {
-            *busy = false;
+            *phase = RunPhase::Idle;
             *run_start = None;
             *thinking = false;
         }
@@ -1744,7 +2278,7 @@ pub(super) fn apply_flush(
 /// changed (the caller turns that into a repaint).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn reset_after_worker_exit(
-    busy: &mut bool,
+    phase: &mut RunPhase,
     run_start: &mut Option<Instant>,
     streaming: &mut bool,
     sub_streaming_name: &mut Option<String>,
@@ -1754,18 +2288,14 @@ pub(super) fn reset_after_worker_exit(
     tool_running: &mut ToolRunning,
     queued: &mut std::collections::VecDeque<String>,
     rows: &mut Vec<Row>,
-    md_cache: &mut MdCache,
 ) -> bool {
     let mut changed = false;
-    if *busy {
-        *busy = false;
+    if phase.busy() {
+        *phase = RunPhase::Failed;
         *run_start = None;
         *streaming = false;
         *sub_streaming_name = None;
         *thinking_stream = None;
-        // TurnStart sets this true; without resetting it here a worker that
-        // dies during the thinking phase (before any TextDelta clears it)
-        // would leave a stale flag.
         *thinking = false;
         activity.clear();
         tool_running.clear();
@@ -1774,11 +2304,8 @@ pub(super) fn reset_after_worker_exit(
         ));
         changed = true;
     }
-    // Nothing queued can ever be delivered now: same notice as the Esc path,
-    // then drop the pending texts and their ghost rows. The MdCache slot is
-    // content-keyed so removal can't alias it, but dropping a slot that may
-    // reference a removed row is eager hygiene (the watermark stays valid —
-    // only uncommitted ghosts are ever removed).
+    // No worker can accept these messages; the FIFO contains no transcript
+    // ghosts, so dropping it cannot disturb committed row indices.
     if !queued.is_empty() {
         rows.push(Row::sys_warn(format!(
             "[dropped {} queued message(s)]",
@@ -1787,10 +2314,6 @@ pub(super) fn reset_after_worker_exit(
         changed = true;
     }
     queued.clear();
-    if drop_queued_ghosts(rows) {
-        md_cache.clear();
-        changed = true;
-    }
     changed
 }
 

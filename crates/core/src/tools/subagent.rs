@@ -279,6 +279,11 @@ fn child_tools(
 ///   sub-agent's calls from top-level ones.
 fn child_ctx(ctx: &ToolCtx, name: &str) -> ToolCtx {
     ToolCtx {
+        // Same side table and hygiene set as the parent (Arc clone / value
+        // clone): a hook inspecting a sub-agent call sees the same server
+        // hints, and a child's shell runs under the same hidden variables.
+        tool_annotations: ctx.tool_annotations.clone(),
+        hidden_env: ctx.hidden_env.clone(),
         tool_absent_notes: ctx.tool_absent_notes.clone(),
         workdir: ctx.workdir.clone(),
         max_output_chars: ctx.max_output_chars,
@@ -391,6 +396,7 @@ fn run_subagent(
 /// tagged with the sub-agent's name so the parent can tell which one stopped.
 fn outcome_to_output(o: &RunOutcome, name: &str, max_output_chars: usize) -> ToolOutput {
     let usage = Usage {
+        reasoning_tokens: o.reasoning_tokens,
         input_tokens: o.input_tokens,
         output_tokens: o.output_tokens,
         cache_creation_input_tokens: o.cache_creation_input_tokens,
@@ -435,7 +441,9 @@ fn outcome_to_output(o: &RunOutcome, name: &str, max_output_chars: usize) -> Too
 /// `tools` counts child tool calls by name (order-preserved map); `tokens.in`
 /// sums every input-facing axis (uncached input + cache write + cache read) so
 /// one number reflects how much the child read, while the exact cache split is
-/// already folded into the parent run's top-level totals.
+/// already folded into the parent run's top-level totals. `tokens.out` is the
+/// child's output, and `tokens.think` — present only when the child's
+/// provider reported the split — is the part of `out` spent on reasoning.
 fn trace_meta(
     turns: u32,
     tool_calls: &[ToolCallRecord],
@@ -450,7 +458,7 @@ fn trace_meta(
             tools.insert(c.name.clone(), json!(1u64));
         }
     }
-    json!({
+    let mut trace = json!({
         "turns": turns,
         "tools": tools,
         "tokens": {
@@ -463,7 +471,13 @@ fn trace_meta(
             "out": usage.output_tokens,
         },
         "stop_reason": stop_reason,
-    })
+    });
+    // Sparse: a child whose provider reports no split leaves the trace as it
+    // was before the key existed.
+    if usage.reasoning_tokens > 0 {
+        trace["tokens"]["think"] = json!(usage.reasoning_tokens);
+    }
+    trace
 }
 
 #[cfg(test)]
@@ -488,7 +502,29 @@ mod tests {
         max_total_tokens: u64,
         budget: Option<crate::tools::BudgetGate>,
     ) -> Agent {
-        let cfg = crate::config::Config {
+        let mut cfg = fake_cfg();
+        cfg.limits.max_total_tokens = max_total_tokens;
+        let mut ctx = test_ctx();
+        ctx.budget = budget;
+        let (prov, _state) = MockProvider::new(turns);
+        Agent::new(
+            &cfg,
+            Box::new(prov),
+            vec![],
+            vec![Message::user(vec![Block::Text("do it".into())])],
+            ctx,
+        )
+    }
+
+    /// A minimal valid config (no tools, key read from an env that does not
+    /// exist — tests hand the key to the tool directly) — the shape a `task`
+    /// tool is constructed with.
+    fn fake_cfg() -> Config {
+        crate::config::Config {
+            preserved_reasoning: false,
+            extra_body: None,
+            extra_headers: None,
+            env_passthrough: Vec::new(),
             tool_absent_notes: Vec::new(),
             provider: crate::config::ProviderKind::Anthropic,
             base_url: None,
@@ -508,28 +544,26 @@ mod tests {
             code: Default::default(),
             gateway_fixes_preset: None,
             strip_think_tags: true,
-        };
-        let mut cfg = cfg;
-        cfg.limits.max_total_tokens = max_total_tokens;
-        let (prov, _state) = MockProvider::new(turns);
-        Agent::new(
-            &cfg,
-            Box::new(prov),
-            vec![],
-            vec![Message::user(vec![Block::Text("do it".into())])],
-            ToolCtx {
-                tool_absent_notes: Vec::new(),
-                workdir: std::env::temp_dir(),
-                max_output_chars: 1000,
-                restrict_to_workdir: false,
-                cancel: None,
-                shell_timeout_secs: 120,
-                hooks: None,
-                subagent: None,
-                budget,
-                deadline: None,
-            },
-        )
+        }
+    }
+
+    /// A parent-side ToolCtx with nothing shared (no cancel flag, no budget
+    /// gate, no deadline) for driving a `task` tool directly.
+    fn test_ctx() -> ToolCtx {
+        ToolCtx {
+            tool_annotations: std::sync::Arc::new(std::collections::BTreeMap::new()),
+            hidden_env: Vec::new(),
+            tool_absent_notes: Vec::new(),
+            workdir: std::env::temp_dir(),
+            max_output_chars: 1000,
+            restrict_to_workdir: false,
+            cancel: None,
+            shell_timeout_secs: 120,
+            hooks: None,
+            subagent: None,
+            budget: None,
+            deadline: None,
+        }
     }
 
     #[test]
@@ -575,6 +609,8 @@ mod tests {
             vec![],
         );
         let ctx = ToolCtx {
+            tool_annotations: std::sync::Arc::new(std::collections::BTreeMap::new()),
+            hidden_env: Vec::new(),
             tool_absent_notes: Vec::new(),
             workdir: std::env::temp_dir(),
             max_output_chars: 1000, // cap = 8x = 8000 chars
@@ -623,10 +659,16 @@ mod tests {
         // child has no matching tool → an error result, but the loop continues
         // to turn 2), turn 2 is the final text + end_turn. The parent-facing
         // result must carry the child's last text as summary and the summed
-        // usage (100+50 input, 5+3 output) so cost is honest.
+        // usage (100+50 input, 5+3 output, 2+1 of that output spent
+        // thinking) so cost is honest.
+        let think = |i: u64, o: u64, r: u64| {
+            let mut u = mock::mk_usage(i, o).expect("mk_usage always returns Some");
+            u.reasoning_tokens = r;
+            Some(u)
+        };
         let mut agent = mock_agent(vec![
-            mock::resp_tool("t1", "noop", json!({}), mock::mk_usage(100, 5)),
-            mock::resp_text("done summary", mock::mk_usage(50, 3)),
+            mock::resp_tool("t1", "noop", json!({}), think(100, 5, 2)),
+            mock::resp_text("done summary", think(50, 3, 1)),
         ]);
         let out = run_subagent(&mut agent, "scout", &mut |_| {}, usize::MAX);
         assert_eq!(out.content, "done summary");
@@ -634,6 +676,12 @@ mod tests {
         let u = out.usage.expect("usage billed to parent");
         assert_eq!(u.input_tokens, 150);
         assert_eq!(u.output_tokens, 8);
+        assert_eq!(
+            u.reasoning_tokens, 3,
+            "the child's thinking is part of the parent's bill"
+        );
+        let meta = out.meta.expect("trace meta attached");
+        assert_eq!(meta["tokens"]["think"], 3, "{meta}");
     }
 
     #[test]
@@ -783,6 +831,7 @@ mod tests {
     #[test]
     fn outcome_to_output_end_turn_carries_usage() {
         let o = RunOutcome {
+            reasoning_tokens: 0,
             final_text: "all done".into(),
             turns: 2,
             stop_reason: "end_turn".into(),
@@ -812,12 +861,14 @@ mod tests {
         // (only the summary text reaches the model) while result.json is
         // self-contained. Pins the B design: separation of model view vs audit.
         let o = RunOutcome {
+            reasoning_tokens: 0,
             final_text: "summary".into(),
             turns: 3,
             stop_reason: "end_turn".into(),
             arbitrations_used: 0,
             tool_calls: vec![
                 ToolCallRecord {
+                    annotations: None,
                     name: "shell".into(),
                     input: json!({}),
                     output: "ok".into(),
@@ -826,6 +877,7 @@ mod tests {
                     duration_ms: None,
                 },
                 ToolCallRecord {
+                    annotations: None,
                     name: "read_file".into(),
                     input: json!({}),
                     output: "..".into(),
@@ -834,6 +886,7 @@ mod tests {
                     duration_ms: None,
                 },
                 ToolCallRecord {
+                    annotations: None,
                     name: "shell".into(),
                     input: json!({}),
                     output: "ok2".into(),
@@ -862,7 +915,56 @@ mod tests {
         // tokens.in sums every input-facing axis (input + cache_read here).
         assert_eq!(meta["tokens"]["in"], 1050);
         assert_eq!(meta["tokens"]["out"], 40);
+        // No split reported: the trace carries no `think` key (not a 0), so
+        // a non-reasoning child's audit is unchanged.
+        assert!(meta["tokens"].get("think").is_none(), "{meta}");
         assert_eq!(meta["stop_reason"], "end_turn");
+    }
+
+    /// The child's reasoning split reaches the parent through both audit
+    /// surfaces of its tool output: the billed usage (folded into the parent's
+    /// `RunOutcome.reasoning_tokens`) and the trace meta.
+    #[test]
+    fn outcome_to_output_carries_the_reasoning_split() {
+        let o = RunOutcome {
+            reasoning_tokens: 12,
+            final_text: "all done".into(),
+            turns: 2,
+            stop_reason: "end_turn".into(),
+            arbitrations_used: 0,
+            tool_calls: vec![],
+            compressions: vec![],
+            turn_timings: vec![],
+            input_tokens: 100,
+            output_tokens: 40,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            elapsed: std::time::Duration::from_secs_f64(1.0),
+            config_fingerprint: String::new(),
+            gateway_fixes: Default::default(),
+        };
+        let out = outcome_to_output(&o, "a", usize::MAX);
+        let u = out.usage.expect("usage billed");
+        assert_eq!(u.reasoning_tokens, 12);
+        // A split, not an axis: the child's bill to the budget is unchanged.
+        assert_eq!(u.total(), 140);
+        assert_eq!(
+            out.meta.expect("trace meta attached")["tokens"]["think"],
+            12
+        );
+        // … and the parent's fold sums it like any other billed usage.
+        let mut acc = crate::agent::RunCost::default();
+        acc.add_failed(&crate::agent::RunError {
+            source: anyhow::anyhow!("unused"),
+            usage: u,
+            tool_calls: vec![],
+            compressions: vec![],
+            turns: 0,
+            arbitrations_used: 0,
+            gateway_fixes: Default::default(),
+            elapsed: std::time::Duration::ZERO,
+        });
+        assert_eq!(acc.usage.reasoning_tokens, 12);
     }
 
     #[test]
@@ -912,6 +1014,7 @@ mod tests {
         // the sub-agent's name), but don't mark is_error — partial work may
         // still be useful to the parent.
         let o = RunOutcome {
+            reasoning_tokens: 0,
             final_text: "partial".into(),
             turns: 25,
             stop_reason: "max_turns_reached".into(),
@@ -943,6 +1046,7 @@ mod tests {
         // stays bounded, the whole point of offloading to a sub-agent.
         let big = "x".repeat(5000);
         let o = RunOutcome {
+            reasoning_tokens: 0,
             final_text: big,
             turns: 1,
             stop_reason: "end_turn".into(),
@@ -980,6 +1084,8 @@ mod tests {
             vec![],
         );
         let ctx = ToolCtx {
+            tool_annotations: std::sync::Arc::new(std::collections::BTreeMap::new()),
+            hidden_env: Vec::new(),
             tool_absent_notes: Vec::new(),
             workdir: std::env::temp_dir(),
             max_output_chars: 1000,
@@ -1042,6 +1148,8 @@ mod tests {
         let hooks: std::sync::Arc<dyn crate::hooks::Hooks> = std::sync::Arc::new(NoopHooks);
         let deadline = std::time::Instant::now();
         let parent = ToolCtx {
+            tool_annotations: std::sync::Arc::new(std::collections::BTreeMap::new()),
+            hidden_env: vec!["TA_CHILD_KEY".into()],
             tool_absent_notes: Vec::new(),
             workdir: std::env::temp_dir(),
             max_output_chars: 1234,
@@ -1077,29 +1185,101 @@ mod tests {
         assert_eq!(child.max_output_chars, 1234);
         assert!(child.restrict_to_workdir);
         assert_eq!(child.shell_timeout_secs, 77);
+        assert_eq!(
+            child.hidden_env,
+            vec!["TA_CHILD_KEY".to_string()],
+            "the credential-hygiene set travels with the child's own spawns"
+        );
     }
 
-    fn fake_cfg() -> Config {
-        Config {
-            tool_absent_notes: Vec::new(),
-            provider: crate::config::ProviderKind::Anthropic,
-            base_url: None,
-            api_key_env: "X".into(),
-            model: "m".into(),
-            max_tokens: 64,
-            system_prompt: None,
-            task: None,
-            workdir: None,
-            tools: vec![],
-            restrict_to_workdir: false,
-            limits: crate::config::Limits::default(),
-            mcp_servers: vec![],
-            reasoning_effort: None,
-            inject_environment: false,
-            salvage_on_max_tokens: true,
-            code: Default::default(),
-            gateway_fixes_preset: None,
-            strip_think_tags: true,
+    /// End-to-end through the REAL `task` tool: the child is built from a
+    /// clone of the parent's config, so it inherits the reasoning-carry
+    /// switch, and its own tool loop echoes its own reasoning on the wire
+    /// (a loopback gateway plays an OpenAI-compatible endpoint; the call
+    /// targets a tool the child does not have, so the loop runs for real:
+    /// reasoning + call, error result, final text).
+    #[test]
+    fn child_inherits_the_reasoning_carry_switch() {
+        use crate::provider::testhttp;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        fn thinking_tool_call(id: &str) -> testhttp::Reply {
+            let deltas = [
+                json!({"role": "assistant", "reasoning_content": "child thought"}),
+                json!({"tool_calls": [{"index": 0, "id": id, "type": "function", "function":
+                    {"name": "no_such_tool", "arguments": "{}"}}]}),
+            ];
+            let mut payload = String::new();
+            for d in &deltas {
+                payload.push_str(&format!(
+                    "data: {}\n\n",
+                    json!({"choices": [{"index": 0, "delta": d}]})
+                ));
+            }
+            payload.push_str(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            );
+            payload.push_str("data: [DONE]\n\n");
+            ("200 OK", "text/event-stream", payload)
+        }
+
+        for carry in [true, false] {
+            let (url, bodies) = testhttp::gateway({
+                let seen = std::sync::Arc::new(AtomicUsize::new(0));
+                move |_body: &str| {
+                    if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                        thinking_tool_call("c1")
+                    } else {
+                        testhttp::sse_says("child summary")
+                    }
+                }
+            });
+            let mut child_cfg = fake_cfg();
+            child_cfg.provider = crate::config::ProviderKind::Openai;
+            child_cfg.base_url = Some(url);
+            child_cfg.preserved_reasoning = carry;
+            let tool = SubAgent::new(
+                child_cfg,
+                reqwest::blocking::Client::new(),
+                "k".into(),
+                vec![],
+            );
+            let out = tool
+                .run(
+                    &json!({"name": "scout", "prompt": "look around"}),
+                    &test_ctx(),
+                )
+                .unwrap();
+            assert_eq!(out.content, "child summary");
+
+            let bodies = bodies.lock().unwrap();
+            assert_eq!(bodies.len(), 2, "carry={carry}: the tool loop ran");
+            // The OpenAI wire puts the child's system prompt first.
+            let first = &bodies[0]["messages"];
+            let second = &bodies[1]["messages"];
+            assert_eq!(
+                first.as_array().unwrap().len(),
+                2,
+                "carry={carry}: system + prompt"
+            );
+            assert_eq!(
+                second.as_array().unwrap().len(),
+                4,
+                "carry={carry}: system + prompt + call + result"
+            );
+            if carry {
+                assert_eq!(
+                    second[2]["reasoning_content"], "child thought",
+                    "carry={carry}: the child echoes its own reasoning"
+                );
+            } else {
+                for body in bodies.iter() {
+                    assert!(
+                        !body.to_string().contains("reasoning_content"),
+                        "carry={carry}: nothing echoes: {body}"
+                    );
+                }
+            }
         }
     }
 }

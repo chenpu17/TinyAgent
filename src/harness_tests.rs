@@ -33,6 +33,8 @@ fn cfg_with(max_turns: u32, timeout_secs: u64, compress: usize) -> Config {
 
 fn test_ctx() -> ToolCtx {
     ToolCtx {
+        tool_annotations: std::sync::Arc::new(std::collections::BTreeMap::new()),
+        hidden_env: Vec::new(),
         tool_absent_notes: Vec::new(),
         workdir: std::env::current_dir().expect("cwd"),
         max_output_chars: 1000,
@@ -850,6 +852,8 @@ fn build_ctx(label: &str) -> (ToolCtx, std::path::PathBuf) {
     std::fs::create_dir_all(&dir).unwrap();
     let canon = dir.canonicalize().unwrap();
     let ctx = ToolCtx {
+        tool_annotations: std::sync::Arc::new(std::collections::BTreeMap::new()),
+        hidden_env: Vec::new(),
         tool_absent_notes: Vec::new(),
         workdir: canon.clone(),
         max_output_chars: 10_000,

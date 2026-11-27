@@ -4,9 +4,9 @@
 //!
 //! The stateful orchestration (`Agent::compress` / `summarize_prefix` /
 //! `summary_call`, which read/write `Agent` fields and drive the provider) stays
-//! in `agent.rs`; this module holds only its leaf helpers. `window_lines` calls
-//! back into `crate::agent::preview` (a leaf display helper) — a one-way
-//! dependency, no cycle.
+//! in `agent.rs`; this module holds only its leaf helpers. `agent::preview` (a
+//! leaf display helper) delegates to [`clip`] here — a one-way dependency, no
+//! cycle.
 
 use crate::provider::{Block, Message, Role, Usage};
 use base64::Engine;
@@ -369,20 +369,73 @@ pub(crate) fn block_pdf_tokens(b: &Block) -> usize {
     }
 }
 
+/// Drop every message's carried reasoning state ([`Message::reasoning`]).
+/// The one invalidation primitive behind the three "it no longer describes
+/// the live history" exits — a new user turn, `Agent::set_model`, and a
+/// same-role merge (`normalize_adjacent`). Compression and prune deliberately
+/// do NOT call it: a fold removes the folded messages whole (their state goes
+/// with them) and a prune only rewrites tool-result text — a carried
+/// reasoning block is self-contained (its signature covers the block alone,
+/// not the surrounding history), so the kept messages stay valid, and
+/// stripping SOME of them would leave the "earlier assistant turns carry
+/// reasoning, later ones don't" mix that is exactly the shape strict APIs
+/// reject. Always whole-history, never partial.
+pub(crate) fn strip_reasoning(messages: &mut [Message]) {
+    for m in messages {
+        m.reasoning = None;
+    }
+}
+
+/// Units a message's carried reasoning adds under the token-estimate yardstick
+/// ([`text_units`], CJK-aware, for the readable text and the opaque vendor
+/// payload alike — signatures and redacted data are vendor ciphertext whose
+/// only honest measure is its length). 0 when the message carries none.
+pub(crate) fn reasoning_units(m: &Message) -> usize {
+    m.reasoning
+        .as_ref()
+        .map(|r| {
+            r.blocks
+                .iter()
+                .map(|b| text_units(&b.text).saturating_add(text_units(&b.opaque.to_string())))
+                .fold(0usize, usize::saturating_add)
+        })
+        .unwrap_or(0)
+}
+
+/// Bytes a message's carried reasoning adds under the legacy chars yardstick
+/// (`total_chars` — the `compress_threshold_chars` gate and prune/quote
+/// budgets). The byte twin of [`reasoning_units`], same two components.
+pub(crate) fn reasoning_chars(m: &Message) -> usize {
+    m.reasoning
+        .as_ref()
+        .map(|r| {
+            r.blocks
+                .iter()
+                .map(|b| b.text.len().saturating_add(b.opaque.to_string().len()))
+                .fold(0usize, usize::saturating_add)
+        })
+        .unwrap_or(0)
+}
+
 /// Rough size estimate of a conversation (chars; images count cheaply).
 pub(crate) fn total_chars(messages: &[Message]) -> usize {
     messages
         .iter()
-        .flat_map(|m| &m.content)
-        .map(block_chars)
-        .sum()
+        .map(|m| {
+            m.content
+                .iter()
+                .map(block_chars)
+                .fold(0usize, usize::saturating_add)
+                .saturating_add(reasoning_chars(m))
+        })
+        .fold(0usize, usize::saturating_add)
 }
 
 /// Rough token estimate of what the next request will cost the model: message
-/// content + system prompt + advertised tool schemas, divided by the
-/// units-per-token heuristic. Used ONLY for the preflight "should I compact
-/// before this request?" decision — never billed or reported; the provider's
-/// real usage is the source of truth for accounting.
+/// content + carried reasoning + system prompt + advertised tool schemas,
+/// divided by the units-per-token heuristic. Used ONLY for the preflight
+/// "should I compact before this request?" decision — never billed or
+/// reported; the provider's real usage is the source of truth for accounting.
 ///
 /// Text goes through [`block_units`] / [`text_units`], not raw bytes: the
 /// bytes/4 rule under-counted CJK 2–3× and let a Chinese-heavy history reach
@@ -396,11 +449,16 @@ pub(crate) fn estimate_tokens(
 ) -> usize {
     let units = messages
         .iter()
-        .flat_map(|m| &m.content)
-        .map(block_units)
-        .sum::<usize>()
-        + system.map(text_units).unwrap_or(0)
-        + tool_schema_chars;
+        .map(|m| {
+            m.content
+                .iter()
+                .map(block_units)
+                .fold(0usize, usize::saturating_add)
+                .saturating_add(reasoning_units(m))
+        })
+        .fold(0usize, usize::saturating_add)
+        .saturating_add(system.map(text_units).unwrap_or(0))
+        .saturating_add(tool_schema_chars);
     // PDF document blocks are estimated per PAGE (Anthropic processes each
     // page as text + image, 1.5–3k tokens/page), not by payload size — a
     // 10 MiB text PDF is hundreds of pages, which any bytes-per-token
@@ -486,6 +544,9 @@ pub(crate) fn fold_summary(messages: &[Message], cut: usize, summary: &str) -> V
                             || t.starts_with(USER_QUOTE_MARKER)
                 )
             });
+            // Defensive: a user head never carries reasoning (only assistant
+            // turns do), and a hand-edited session must not smuggle some in.
+            h.reasoning = None;
             (h, old)
         }
         _ => (Message::user(Vec::new()), Vec::new()),
@@ -554,6 +615,13 @@ pub(crate) fn fold_summary(messages: &[Message], cut: usize, summary: &str) -> V
     // yield an empty tail here, not a slice panic — same defensive stance as
     // the `tail` binding above and the `get(1..cut)` quote scan; fold_summary
     // is pub(crate), so a caller's bad cut must degrade, not crash.
+    //
+    // Carried reasoning: the folded-away messages take theirs with them (the
+    // caller archives the originals as content, reasoning dropped — see
+    // `Agent::archive_messages`); the kept tail KEEPS its own on purpose — see
+    // `strip_reasoning` for why a partial strip is the one shape that must
+    // never happen, and why the current tool loop's reasoning is exactly the
+    // state worth keeping through a fold.
     compressed.extend_from_slice(tail);
     compressed
 }
@@ -739,6 +807,68 @@ pub(crate) fn find_safe_cut(messages: &[Message], keep_recent: usize) -> Option<
     None
 }
 
+/// Shrink a kept window until the tail it keeps fits `room`. The preflight
+/// fold's fix for fold thrash: with a configured window of `keep` messages
+/// whose own tail is larger than the room left under the compaction
+/// threshold, every fold leaves the history still (or again) over the
+/// threshold, so the next turn folds again and drops a round or two each
+/// time — one billed summary call per turn for almost no relief.
+///
+/// Returns the window to use instead:
+/// - the LARGEST `k` in `1..=keep` whose tail (`messages[cut(k)..]`, the cut
+///   [`find_safe_cut`] picks for `k`) measures at most `room` under `usage`;
+/// - when no window fits, the SMALLEST feasible `k` — its tail is the
+///   shortest one there is (in an alternating history: the last complete
+///   round). The fold then still happens, and may still leave the history
+///   over the threshold (a single round bigger than `room` cannot be shrunk
+///   by choosing a window); that case belongs to pruning, not to this.
+/// - `keep == 0` (explicit "fold everything") is the caller's decision and
+///   comes back untouched.
+///
+/// `None` when no `k` has a feasible cut at all — the caller then behaves as
+/// if there were nothing to adapt (its configured-window path decides).
+///
+/// Pure: `usage` measures a slice the way the caller's gate does (chars, or
+/// the token estimate), so the unit of `room` is the caller's to keep
+/// consistent. Tails are nested — a wider window starts at or before the
+/// narrower one's cut — so the scan adds up each slice once: O(total tail),
+/// not O(keep × tail).
+pub(crate) fn shrink_keep(
+    messages: &[Message],
+    keep: usize,
+    usage: impl Fn(&[Message]) -> usize,
+    room: usize,
+) -> Option<usize> {
+    if keep == 0 {
+        return Some(0);
+    }
+    let n = messages.len();
+    // The previous window's cut: the tail measured so far is `messages[prev_cut..]`.
+    let mut prev_cut = n;
+    let mut measured = 0usize;
+    let (mut smallest, mut largest_fitting): (Option<usize>, Option<usize>) = (None, None);
+    for k in 1..=keep {
+        let Some(cut) = find_safe_cut(messages, k) else {
+            continue;
+        };
+        // find_safe_cut(k) scans from n-k for the first Assistant message, so
+        // a wider window's cut is never after a narrower one's. Defensive on
+        // purpose: this runs on the compression path, and a violated
+        // invariant must degrade to a re-measure, never to a slice panic.
+        measured = if cut <= prev_cut {
+            measured.saturating_add(usage(&messages[cut..prev_cut]))
+        } else {
+            usage(&messages[cut..])
+        };
+        prev_cut = cut;
+        smallest.get_or_insert(k);
+        if measured <= room {
+            largest_fitting = Some(k);
+        }
+    }
+    largest_fitting.or(smallest)
+}
+
 /// Pull the previous rolling summary out of the head message (if any). The
 /// summary is stored as a Text block beginning with SUMMARY_MARKER (see
 /// fold_summary); on a later compression we UPDATE it rather than re-feed
@@ -759,10 +889,38 @@ pub(crate) fn extract_running_summary(messages: &[Message]) -> Option<String> {
     })
 }
 
+/// `s` cut to its first `max_chars` CHARS (never splitting a multi-byte
+/// character), with a trailing `…` when anything was cut; `0` yields the empty
+/// string. The ONE clipping implementation: `agent::preview` is this at a fixed
+/// 200 (UI rows), and the summary transcript's excerpts go through it sized by
+/// `Limits::summary_preview_chars`. Single pass: it never walks past the cut
+/// except for the one character that proves a cut happened.
+pub(crate) fn clip(s: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut it = s.chars();
+    let head: String = it.by_ref().take(max_chars).collect();
+    if it.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
 /// Format each block of `messages[..cut]` (skipping the head's running-
 /// summary block) as a transcript line. Shared by the single-call and
 /// chunked summarize paths so the formatting lives in one place.
-pub(crate) fn window_lines(messages: &[Message], cut: usize) -> Vec<String> {
+///
+/// Tool calls and tool results are written as EXCERPTS, not in full: the call
+/// at `preview_chars` characters of its JSON input, the result at
+/// `preview_chars` of its text ([`clip`]). The summary model therefore never
+/// sees a folded tool output whole — that is the point (a multi-MB dump must
+/// not become a multi-MB summary prompt) and also the knob's whole effect
+/// (`Limits::summary_preview_chars`): a longer excerpt keeps more detail and
+/// makes the summary request bigger. Text blocks (user/assistant prose) are
+/// never clipped here; an oversized one is split by [`chunk_lines`] instead.
+pub(crate) fn window_lines(messages: &[Message], cut: usize, preview_chars: usize) -> Vec<String> {
     let mut lines = Vec::new();
     // get (not `messages[..cut]`): same pathological-cut defense as
     // fold_summary — a cut past the end summarizes an empty window instead
@@ -801,13 +959,13 @@ pub(crate) fn window_lines(messages: &[Message], cut: usize) -> Vec<String> {
                 Block::ToolUse { name, input, .. } => {
                     format!(
                         "[{role}] tool_call {name}: {}\n",
-                        crate::agent::preview(&input.to_string())
+                        clip(&input.to_string(), preview_chars)
                     )
                 }
                 Block::ToolResult {
                     content, is_error, ..
                 } => {
-                    let body = crate::agent::preview(content);
+                    let body = clip(content, preview_chars);
                     let tag = if *is_error {
                         "tool_error"
                     } else {
@@ -945,6 +1103,7 @@ pub(crate) fn merge_usage(a: Option<Usage>, b: Option<Usage>) -> Option<Usage> {
             x.cache_read_input_tokens = x
                 .cache_read_input_tokens
                 .saturating_add(y.cache_read_input_tokens);
+            x.reasoning_tokens = x.reasoning_tokens.saturating_add(y.reasoning_tokens);
             Some(x)
         }
     }
@@ -957,6 +1116,7 @@ mod tests {
 
     fn user_text(text: &str) -> Message {
         Message {
+            reasoning: None,
             id: None,
             role: Role::User,
             content: vec![Block::Text(text.to_string())],
@@ -1009,6 +1169,247 @@ mod tests {
     fn units_floor_once_on_the_total() {
         // "a汉b" = 11 units; 11/4 = 2 (per-segment division would give 0+2+0).
         assert_eq!(estimate_tokens(&[user_text("a汉b")], None, 0), 2);
+    }
+
+    // ─── Kept-window shrinking (fold-thrash fix) and excerpt clipping ────
+
+    fn assistant_text(text: &str) -> Message {
+        Message {
+            reasoning: None,
+            id: None,
+            role: Role::Assistant,
+            content: vec![Block::Text(text.to_string())],
+        }
+    }
+
+    /// `[assistant tool_use][user tool_result]` — one round of a tool loop.
+    fn tool_round(id: &str, result: &str) -> Vec<Message> {
+        vec![
+            Message {
+                reasoning: None,
+                id: None,
+                role: Role::Assistant,
+                content: vec![Block::ToolUse {
+                    id: id.into(),
+                    name: "shell".into(),
+                    input: serde_json::json!({"command": id}),
+                }],
+            },
+            Message {
+                reasoning: None,
+                id: None,
+                role: Role::User,
+                content: vec![Block::ToolResult {
+                    tool_use_id: id.into(),
+                    content: result.into(),
+                    image: None,
+                    is_error: false,
+                }],
+            },
+        ]
+    }
+
+    /// `[task][a 100][u 100][a 100][u 100][a 100][u 100][a 5][u 5]` — the wide
+    /// tail is heavy, the narrow one light, so a room between them discriminates.
+    /// Nine messages, so a keep of 6 is a feasible window (`find_safe_cut`
+    /// needs `n > keep + 2`). The cuts: 7 (k = 2, 3; a 10-char tail), 5
+    /// (k = 4, 5; 210 chars), 3 (k = 6; 410 chars). `k = 1` has none — its
+    /// nominal start is the last message, a tool result.
+    fn wide_heavy_history() -> Vec<Message> {
+        let (heavy, light) = ("x".repeat(100), "y".repeat(5));
+        vec![
+            user_text("task"),
+            assistant_text(&heavy),
+            user_text(&heavy),
+            assistant_text(&heavy),
+            user_text(&heavy),
+            assistant_text(&heavy),
+            user_text(&heavy),
+            assistant_text(&light),
+            user_text(&light),
+        ]
+    }
+
+    /// The window shrinks to the LARGEST tail that fits the room, measured
+    /// by the gate's own yardstick (`total_chars`, as the char gate does).
+    /// A window of 6 keeps a 410-char tail here; with 150 of room the widest
+    /// fitting window is 3 (its tail is the light 10-char round), so the fold
+    /// keeps that, not the configured 6.
+    #[test]
+    fn shrink_keep_returns_the_largest_window_that_fits() {
+        let msgs = wide_heavy_history();
+        // Sanity on the fixture: cuts are 7 (k = 2, 3), 5 (k = 4, 5), 3 (k = 6).
+        assert_eq!(find_safe_cut(&msgs, 2), Some(7));
+        assert_eq!(find_safe_cut(&msgs, 3), Some(7));
+        assert_eq!(find_safe_cut(&msgs, 4), Some(5));
+        assert_eq!(find_safe_cut(&msgs, 5), Some(5));
+        assert_eq!(find_safe_cut(&msgs, 6), Some(3));
+        assert_eq!(shrink_keep(&msgs, 6, total_chars, 150), Some(3));
+        assert_eq!(shrink_keep(&msgs, 6, total_chars, 209), Some(3));
+        // The 4-message tail (210 chars) fits from 210 on.
+        assert_eq!(shrink_keep(&msgs, 6, total_chars, 210), Some(5));
+        // The whole configured tail fits → nothing to shrink.
+        assert_eq!(shrink_keep(&msgs, 6, total_chars, 410), Some(6));
+        assert_eq!(shrink_keep(&msgs, 6, total_chars, usize::MAX), Some(6));
+    }
+
+    /// Nothing fits the room: the SMALLEST feasible window wins — its tail
+    /// is the shortest one there is. The shortest tail (10 chars) is still
+    /// over a room of 9, so the fold keeps it and may still leave the history
+    /// over the threshold — a tail that cannot be shrunk by choosing a
+    /// window belongs to pruning, not to this.
+    #[test]
+    fn shrink_keep_falls_back_to_the_smallest_window() {
+        let msgs = wide_heavy_history();
+        assert_eq!(shrink_keep(&msgs, 6, total_chars, 9), Some(2));
+        // Room 0 is a legal (degenerate) gate: still the smallest window.
+        assert_eq!(shrink_keep(&msgs, 6, total_chars, 0), Some(2));
+        // Only k = 1 has no feasible cut here (the tail would start on a
+        // user message and slide past the end): a keep of 1 has nothing to
+        // adapt, which the caller reads as "use the configured value".
+        assert_eq!(shrink_keep(&msgs, 1, total_chars, 0), None);
+    }
+
+    /// An explicit `keep_recent_messages: 0` ("fold everything") is the
+    /// caller's decision and comes back untouched — never raised to fit.
+    #[test]
+    fn shrink_keep_leaves_an_explicit_zero_alone() {
+        let msgs = wide_heavy_history();
+        assert_eq!(shrink_keep(&msgs, 0, total_chars, 0), Some(0));
+        assert_eq!(shrink_keep(&msgs, 0, total_chars, usize::MAX), Some(0));
+    }
+
+    /// The returned window's cut is a real safe cut: in a pure tool loop it
+    /// starts on an assistant message, so no tool_result is orphaned.
+    #[test]
+    fn shrink_keep_only_returns_windows_with_a_safe_cut() {
+        let mut msgs = vec![user_text("task")];
+        for i in 0..6 {
+            msgs.extend(tool_round(&format!("t{i}"), &"z".repeat(60)));
+        }
+        for room in [0, 61, 122, 200, 500, 10_000] {
+            let k = shrink_keep(&msgs, 10, total_chars, room).expect("some feasible k");
+            let cut = find_safe_cut(&msgs, k).expect("feasible");
+            assert_eq!(msgs[cut].role, Role::Assistant, "room {room}: k {k}");
+            // Wider room never yields a narrower window.
+            if room > 0 {
+                let narrower = shrink_keep(&msgs, 10, total_chars, room - 1).unwrap();
+                assert!(k >= narrower, "room {room}: k {k} < {narrower}");
+            }
+        }
+        // All the room in the world: the configured window itself.
+        assert_eq!(shrink_keep(&msgs, 10, total_chars, 10_000), Some(10));
+    }
+
+    /// Tails are nested, so the scan measures each slice once: `usage` runs
+    /// at most once per candidate window — never `keep × tail`.
+    #[test]
+    fn shrink_keep_measures_each_slice_once() {
+        let mut msgs = vec![user_text("task")];
+        for i in 0..40 {
+            msgs.extend(tool_round(&format!("t{i}"), &"z".repeat(60)));
+        }
+        let calls = std::cell::Cell::new(0usize);
+        let k = shrink_keep(
+            &msgs,
+            30,
+            |slice| {
+                calls.set(calls.get() + 1);
+                total_chars(slice)
+            },
+            usize::MAX,
+        );
+        assert_eq!(k, Some(30));
+        assert!(
+            calls.get() <= 30,
+            "usage ran {} times for 30 candidate windows",
+            calls.get()
+        );
+    }
+
+    /// `clip` cuts on a character boundary (a multi-byte character is never
+    /// split), marks a cut with `…`, and `0` yields the empty string.
+    #[test]
+    fn clip_cuts_on_char_boundaries() {
+        assert_eq!(clip("hello", 200), "hello");
+        assert_eq!(clip("hello", 5), "hello");
+        assert_eq!(clip("hello", 4), "hell…");
+        assert_eq!(clip("hello", 1), "h…");
+        assert_eq!(clip("hello", 0), "");
+        assert_eq!(clip("", 3), "");
+        // 2 chars = 6 bytes: the cut is after the second character, not at
+        // the second byte.
+        assert_eq!(clip("汉字汉字", 2), "汉字…");
+        assert_eq!(clip("汉字汉字", 4), "汉字汉字");
+        // The UI's fixed-width preview IS this function at 200.
+        assert_eq!(
+            clip(&"a".repeat(250), 200),
+            crate::agent::preview(&"a".repeat(250))
+        );
+        assert_eq!(clip("short", 200), crate::agent::preview("short"));
+    }
+
+    /// The summary transcript writes tool calls and tool results as
+    /// EXCERPTS of `preview_chars` — never whole — while prose is never
+    /// clipped here. `Limits::summary_preview_chars` is that width.
+    #[test]
+    fn window_lines_excerpts_tool_io_at_the_configured_width() {
+        let long_input = "c".repeat(600);
+        let long_output = "r".repeat(600);
+        let prose = "p".repeat(600);
+        let mut msgs = vec![user_text(&prose)];
+        msgs.extend(tool_round("t1", &long_output));
+        if let Block::ToolUse { input, .. } = &mut msgs[1].content[0] {
+            *input = serde_json::json!({ "command": long_input });
+        }
+        // The call's JSON is `{"command":"<600 c>"}` — 12 chars of scaffold.
+        let call_prefix = "[assistant] tool_call shell: {\"command\":\"";
+        // The default width is the UI preview's historical 200.
+        let lines = window_lines(&msgs, 3, 200);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            lines[0],
+            format!("[user] {prose}\n"),
+            "prose is not clipped"
+        );
+        assert!(lines[1].starts_with(call_prefix), "{}", lines[1]);
+        assert!(
+            lines[1].contains(&long_input[..188]),
+            "200 chars of JSON = 12 of scaffold + 188 of the argument"
+        );
+        assert!(!lines[1].contains(&long_input[..189]), "cut at 200 chars");
+        assert!(lines[1].ends_with("…\n"), "{}", lines[1]);
+        assert_eq!(
+            lines[2],
+            format!("[user] tool_result: {}…\n", &long_output[..200])
+        );
+        // Wider: a longer excerpt of the same call — and nothing else changes.
+        let wide = window_lines(&msgs, 3, 450);
+        assert!(wide[1].starts_with(call_prefix));
+        assert!(wide[1].contains(&long_input[..438]) && !wide[1].contains(&long_input[..439]));
+        assert!(wide[1].ends_with("…\n"));
+        assert_eq!(
+            wide[2],
+            format!("[user] tool_result: {}…\n", &long_output[..450])
+        );
+        assert_eq!(wide[0], lines[0]);
+        // Wider than the payload: the whole call, no ellipsis.
+        let whole = window_lines(&msgs, 3, 700);
+        assert_eq!(whole[2], format!("[user] tool_result: {long_output}\n"));
+        // `0` = the call's name and the result's tag only.
+        let bare = window_lines(&msgs, 3, 0);
+        assert_eq!(bare[1], "[assistant] tool_call shell: \n");
+        assert_eq!(bare[2], "[user] tool_result: \n");
+        // An errored result keeps its tag at every width.
+        let mut failed = vec![user_text("task")];
+        failed.extend(tool_round("t9", "boom"));
+        if let Block::ToolResult { is_error, .. } = &mut failed[2].content[0] {
+            *is_error = true;
+        }
+        assert_eq!(
+            window_lines(&failed, 3, 200)[2],
+            "[user] tool_error: boom\n"
+        );
     }
 
     /// R4D-F1: ToolUse argument JSON rides the CJK-aware units channel — the
