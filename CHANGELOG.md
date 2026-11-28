@@ -396,6 +396,15 @@
   上带 `-D warnings` 检查即红（CI 的 Windows 格因此连测试都没跑）。现在这个 import 也只在 Unix 上引入；
   任何平台的构建产物都不变。
 
+- **batch `--isolate git` 多 worker 并发时偶发 `isolation setup failed: git worktree add failed: … failed to
+  read .git/worktrees/…/commondir`（CI 的 macOS 格偶发红的根因）**：多个 worker 同时在同一个仓库上
+  `git worktree add`，而 git 写新 worktree 的 `commondir` 不是原子的，每条 `worktree add|remove` 开头又
+  都会读一遍全部 worktree 的 `commondir`——读到邻居那个刚建、还没写完的空文件就致命退出（macOS 上文案是
+  `Undefined error: 0`）。这是 git 自身的竞态（2.40.1 与 2.56.1 都有），本机用纯 git 4 路并行 600 轮
+  复现 7 次；任务因此被标成 `setup_error`（不重试），收尾的 `worktree remove` 同样会踩、失败会留下
+  孤儿条目。现在 `git worktree add` 与 `remove` 在进程内串行（含 checkout），由新增的回归测试钉住。
+  只管本进程：别的进程同时在对同一仓库增删 worktree 仍可能撞上。
+
 - **MCP legacy SSE：落在流轮转间隙里的请求被打到已退役的会话（全量并发测试里偶发「tools/list timed out」
   的根因）**：读线程到期轮转时丢掉旧 GET 再开新连接，而 POST 目标只在新连接的 `endpoint` 到达时刷新——
   这期间发出的请求被 POST 到旧会话。会话绑定的 server 靠定时器回收会话（python-sdk 每 100 ms 轮询一次，

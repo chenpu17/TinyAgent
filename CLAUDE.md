@@ -170,7 +170,7 @@ cargo clippy -p tiny-agent-node
 - **Anthropic 不允许相邻 user**：新 user 入口走 `append_user_turn`（同时结束上一轮推理寿命）；tool_use/tool_result 必须 N:N 配对。
 - **batch 覆盖白名单**：安全字段覆盖即 `bad_task`；limits 逐字段由 `Clamp` 三变体声明，`shell_timeout_secs` 是唯一 Replace。
 - **batch `--retries` 只重试 transient**（`stop_reason == "error"`；分类在 `RunError::is_transient`，单跑梯共用——4xx 非 429 为确定性 `request_error` 不重试，run 截止后失败的请求按 `timeout`/124 归属）；**重试=整任务重放**，前轮副作用不回滚；`stop_reason` 词汇含 `panic`（catch_unwind 兜底）。
-- **batch workdir 隔离**：沙箱目录 `create_dir`（非 `_all`）+ 计数重试拒绝符号链接预置（与 atomic_write 的 O_EXCL 同款纪律，git 模式先自建空目录再 worktree add）；`copy` 符号链接自包含策略；`git` 要 repo 根（macOS /tmp symlink 需 canonicalize 比较）；单个坏 JSON 任务文件是 per-task `bad_task` 不中止整批；merge_reports 保同名重复条目。
+- **batch workdir 隔离**：沙箱目录 `create_dir`（非 `_all`）+ 计数重试拒绝符号链接预置（与 atomic_write 的 O_EXCL 同款纪律，git 模式先自建空目录再 worktree add）；`copy` 符号链接自包含策略；`git` 要 repo 根（macOS /tmp symlink 需 canonicalize 比较）；`--isolate git` 的 `worktree add` / `remove` 全进程串行（`WORKTREE_LOCK`——并发互踩是上游 git 写 `commondir` 非原子的竞态，CI 在 macOS 上实遇；回归测试靠 repo 本地 `post-checkout` 钩子拉宽窗口，别用时间阈值断言）；单个坏 JSON 任务文件是 per-task `bad_task` 不中止整批；merge_reports 保同名重复条目。
 - **OpenAI 400 回退**：三条 fix 各管一个字段，record-on-success（只记最终 2xx 的修复），learned fixes 不落盘；整次 `chat()` 共用一个绝对截止时间（重发只花剩余额度），重发前查 cancel。
 - **流中途错误形状**：返回 Ok + 尾附 `[stream error]` 标记 + 已上报 usage——别 bail（会丢 usage 破坏失败计费）；run 截止已过时按 `timeout`/124 终态归属（不进重试梯）。
 - **`atomic_write` 用 `create_new(true)`**：别改回可预测单名（符号链接预置攻击面）；NDJSON 走 `print_ndjson` 别用 `println!`。

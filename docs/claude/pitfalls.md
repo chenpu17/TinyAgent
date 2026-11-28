@@ -224,6 +224,43 @@
   `atomic_write` 里的 `create_dir_all`（mkdir 报已存在、复核 `is_dir` 时目录已被删）→ 偶发
   `File exists (os error 17)` 假红。**只按 pid 键的临时目录名一律再带 `line!()`**（同文件
   `ta-attrib-…` 的写法）；并行测试偶发红先查共享目录名，别只重跑一遍变绿就算了。
+- **`--isolate git` 的 `git worktree add` / `remove` 必须全进程串行——并发互踩是上游 git 的竞态
+  （2026-11-28 CI 实遇）**：推送 `a2a5417` 后的 CI（run 46094462662）11 绿 1 红，红的是
+  `test (macos-latest)`：`batch::tests::isolate_git_gives_each_task_a_worktree_and_keeps_repo_clean`
+  在 `both worktree tasks succeed left: 1 right: 0` 上挂了，`[b]` 报 `isolation setup failed: git
+  worktree add failed: Preparing worktree (detached HEAD af37f62)` / `fatal: failed to read
+  .git/worktrees/ta-batch-a-12580-5/commondir: Undefined error: 0`——**b 的 add 死在读 a 的 admin
+  目录上**：两个 worker 同时在同一个 repo 上 `git worktree add`。**根因在上游**：git 写新 worktree
+  的 `.git/worktrees/<id>/commondir` **不是原子的**（`builtin/worktree.c` 的 `add_worktree` 调
+  `write_file` → `wrapper.c` 的 `write_file_buf`：`xopen(O_WRONLY | O_CREAT | O_TRUNC)` →
+  `write_in_full` → `close`，2.40.1 与 2.56.1 同款），文件有一瞬间是空的；而**每条**
+  `git worktree add|remove|list` 开头都要枚举仓库里**全部** worktree（`get_worktrees()` →
+  `refs_compute_filesystem_location` → `setup.c` 的 `get_common_dir_noenv`），后者 `file_exists()`
+  通过后 `strbuf_read_file() <= 0` 就 `die_errno`——空文件即致命（errno 还是 0，macOS libc 的
+  `strerror(0)` 就是 `Undefined error: 0`）。`git worktree remove` 同样会踩（并行 remove 撞上
+  **正在删**的邻居则报 `No such file or directory`：先查存在再读的竞态），失败即留下孤儿 admin
+  条目。**证据链**：① CI 日志（runner 镜像 macos-26-arm64，Git 2.56.1）；② git 2.56.1 源码（上面的
+  四处）；③ 本机 git 2.40.1 上确定性模拟——把邻居的 `commondir` 截成 0 字节，`worktree add` /
+  `remove --force` / `list` 全部同文案退出 128；④ 纯 git 自然加压（600 轮 × 4 路并行 add + 4 路
+  并行 remove，同一个 repo）：**add 失败 7 次、remove 失败 1 次**，文案与 CI 一致。TinyAgent 那条
+  测试本身本机单独循环 300 次没复现——窗口很窄（按加压比率粗估每次只有千分之几，300 次不出并不
+  反常），**偶发率低不等于没缺陷**：`--isolate git` + `--jobs ≥ 2` 是真实产品缺陷。既有的「stderr
+  含 `lock` 才重试」闸门救不了它（文案里没有 lock，`setup_error` 属确定性失败、重试梯不重试）。
+  **修法**：`batch::WORKTREE_LOCK`（进程级 `Mutex<()>`）包住**整条** `git worktree add`（含
+  checkout 子进程——致命的枚举是 add 的第一步）与 `IsolationGuard::drop` 里的整条
+  `git worktree remove`；锁中毒照常接管（持锁者 panic 留下的是 git 的磁盘状态、该交给
+  `git worktree prune`，不是下一个持有者不能看到的不变量）。**不覆盖（明示）**：别的进程在同一
+  时刻对同一 repo 增删 worktree、模型在任务 run 里自己敲 `git worktree …`——仍是上游的竞态；
+  实测到的平台只有 macOS（空文件窗口的机制与平台无关，文案随 libc 变）。否掉的方案：
+  `--no-checkout` 两阶段 + 单独 `reset --hard`（丢 `post-checkout` 钩子语义）、按 commondir 文案
+  重试（治症状不治因）。**回归测试怎么观测**
+  （`worktree_add_and_remove_are_serialized_across_workers`，`#[cfg(unix)]`）：repo 本地
+  `core.hooksPath` + `post-checkout` 钩子在**每条 `git worktree add` 内部** `sleep 0.2`（确定性地
+  拉宽窗口；真实 git，不动 PATH / 环境变量），钩子往日志写 `begin` / `end`——回放的嵌套深度必须
+  恒为 1（add 对 add）；第二段钩子睡醒后看「已收工 worker 的 worktree 的 `.git` 还在不在」
+  （`kept` / `gone`，remove 对 add）。不串行时两段都是**确定性红**（remove 路径换一把锁即红），
+  所以不用时间阈值断言（那种会假红）。改 `prepare_isolation` 的 git 分支或 `IsolationGuard::drop`
+  的 git 臂之前先读这条。
 - **批量 Ctrl-C 是 worker gate，不中断在跑任务**：`batch::run` 的 worker 在**起任务前**检查共享
   cancel 标志，命中则标 `cancelled` 跳过（首个命中的 worker 打一次性契约警告）；在跑的任务照常跑完
   （"收敛"）。**例外（A5，既定取舍）**：每个 agent 都用 `set_shutdown` 挂了同一个 flag 的 reaper——首次

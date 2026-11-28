@@ -127,6 +127,74 @@ fn cleanup_failed_worktree_dir(tmp: &Path) {
     }
 }
 
+/// Serializes `git worktree add` / `remove` across this process's batch
+/// workers. Concurrent `git worktree` mutations on ONE repo are an upstream
+/// race, not a lock the batch could take over: git writes a new worktree's
+/// `commondir` NON-atomically (open(O_TRUNC) → write), while every
+/// `worktree add|remove|list` in that repo enumerates ALL worktrees and dies
+/// on an empty `commondir` ("failed to read .git/worktrees/<id>/commondir:
+/// Undefined error: 0"). Seen in CI on git 2.56.1; plain git 2.40.1 does it
+/// too — four parallel adds fail 7 times in 600 rounds, parallel removes hit
+/// a sibling's vanishing `commondir` as well. So the workers take turns,
+/// checkout included (the fatal enumeration is the first thing an add does).
+/// Scope is this process only: another process mutating worktrees of the same
+/// repo at that moment is still upstream's race.
+static WORKTREE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Run `op` holding `WORKTREE_LOCK`. Never call it from inside itself (the
+/// mutex is not reentrant): both users — the git arm of `prepare_isolation`
+/// and of `IsolationGuard::drop` — drop no guard while they hold it.
+fn with_worktree_lock<T>(op: impl FnOnce() -> T) -> T {
+    // A holder that panicked (debug builds; release aborts) leaves git's
+    // on-disk state for `git worktree prune`, not an invariant the next
+    // holder must not observe — a poisoned lock is still a lock.
+    let _held = WORKTREE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    op()
+}
+
+/// `git worktree add --detach <tmp>` on `toplevel`. Lock contention
+/// (index.lock / config.lock held by a concurrent git process on this repo)
+/// is a TRANSIENT failure mode of `worktree add` — and setup_error in batch is
+/// otherwise deterministic (not retried by the attempt loop). Bound the retry
+/// to lock failures only: a non-lock failure (bad repo, unwritable temp, …)
+/// fails fast as before. Callers hold `WORKTREE_LOCK`; a failed add leaves the
+/// sandbox cleanup to them.
+fn add_worktree(toplevel: &str, tmp: &Path) -> Result<()> {
+    let mut last_err = String::new();
+    for attempt in 0..3u32 {
+        // A spawn failure is returned as is: the sandbox dir already exists,
+        // so the caller must hear about it to clean it up (same contract as
+        // the non-lock bail below).
+        let out = no_window(&mut std::process::Command::new("git"))
+            // Pin the locale: the retry gate below matches the English
+            // "lock" substring in git's stderr, which a localized git would
+            // translate away (then a transient lock contention fails fast
+            // instead of retrying).
+            .env("LC_ALL", "C")
+            .args([
+                "-C",
+                toplevel,
+                "worktree",
+                "add",
+                "--detach",
+                &tmp.display().to_string(),
+            ])
+            .output()
+            .context("git worktree add failed to spawn")?;
+        if out.status.success() {
+            return Ok(());
+        }
+        last_err = String::from_utf8_lossy(&out.stderr).to_string();
+        if !last_err.contains("lock") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(
+            200 * u64::from(attempt + 1),
+        ));
+    }
+    bail!("git worktree add failed: {last_err}")
+}
+
 /// Prepare a task's isolated workdir. Returns `Ok(None)` for `IsolateMode::None`
 /// (no isolation, nothing to clean). The returned guard removes the directory
 /// on Drop — including panic unwinds in debug builds. Under release
@@ -201,59 +269,16 @@ fn prepare_isolation(
             // out through a predicted-name symlink into an attacker-chosen
             // directory. git accepts an existing EMPTY directory.
             let tmp = create_isolation_dir(&ISO_COUNTER, &std::env::temp_dir(), task_name)?;
-            // Lock contention (index.lock / config.lock held by a concurrent
-            // git process on this repo) is the one TRANSIENT failure mode of
-            // `worktree add` — and setup_error in batch is otherwise
-            // deterministic (not retried by the attempt loop). Bound the
-            // retry to lock failures only: a non-lock failure (bad repo,
-            // unwritable temp, …) fails fast as before.
-            let mut last_err = String::new();
-            let mut added = false;
-            for attempt in 0..3u32 {
-                // No `?` on the spawn: the sandbox dir already exists here, so
-                // a spawn failure must clean it up before propagating (same
-                // contract as the non-lock bail below).
-                let out = match no_window(&mut std::process::Command::new("git"))
-                    // Pin the locale: the retry gate below matches the English
-                    // "lock" substring in git's stderr, which a localized git
-                    // would translate away (then a transient lock contention
-                    // fails fast instead of retrying).
-                    .env("LC_ALL", "C")
-                    .args([
-                        "-C",
-                        &toplevel,
-                        "worktree",
-                        "add",
-                        "--detach",
-                        &tmp.display().to_string(),
-                    ])
-                    .output()
-                {
-                    Ok(o) => o,
-                    Err(e) => {
-                        cleanup_failed_worktree_dir(&tmp);
-                        return Err(e).context("git worktree add failed to spawn");
-                    }
-                };
-                if out.status.success() {
-                    added = true;
-                    break;
-                }
-                last_err = String::from_utf8_lossy(&out.stderr).to_string();
-                if !last_err.contains("lock") {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(
-                    200 * u64::from(attempt + 1),
-                ));
-            }
-            if !added {
+            // In and out under the worktree lock: a sibling worker's
+            // `worktree add` / `remove` must never overlap this one (the
+            // whole command — checkout child included; see `WORKTREE_LOCK`).
+            if let Err(e) = with_worktree_lock(|| add_worktree(&toplevel, &tmp)) {
                 // The dir is ours now — don't leak it on failure. It may be
                 // non-empty (partial checkout before git gave up), hence the
                 // recursive helper; see its doc for why plain remove_dir
                 // silently failed exactly here.
                 cleanup_failed_worktree_dir(&tmp);
-                bail!("git worktree add failed: {last_err}");
+                return Err(e);
             }
             Ok(Some(IsolationGuard {
                 mode,
@@ -292,18 +317,23 @@ impl Drop for IsolationGuard {
                 }
             }
             IsolateMode::Git => {
+                // Same lock as the add: `worktree remove` enumerates its
+                // siblings too and dies on a half-written one, which would
+                // strand the admin entry (see `WORKTREE_LOCK`).
                 let removed = self.src_repo.as_deref().is_some_and(|repo| {
-                    no_window(&mut std::process::Command::new("git"))
-                        .args([
-                            "-C",
-                            &repo.display().to_string(),
-                            "worktree",
-                            "remove",
-                            "--force",
-                            &self.dir.display().to_string(),
-                        ])
-                        .output()
-                        .is_ok_and(|o| o.status.success())
+                    with_worktree_lock(|| {
+                        no_window(&mut std::process::Command::new("git"))
+                            .args([
+                                "-C",
+                                &repo.display().to_string(),
+                                "worktree",
+                                "remove",
+                                "--force",
+                                &self.dir.display().to_string(),
+                            ])
+                            .output()
+                            .is_ok_and(|o| o.status.success())
+                    })
                 });
                 if !removed {
                     // git missing / index lock / anything: still don't leave the
@@ -3794,6 +3824,181 @@ mod tests {
             "writes stayed in the worktrees"
         );
         // Worktree admin cleaned: `git worktree list` shows only the main one.
+        let list = git(&["worktree", "list"]);
+        let out = String::from_utf8_lossy(&list.stdout);
+        assert_eq!(
+            out.lines().count(),
+            1,
+            "no lingering worktrees after cleanup: {out}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_add_and_remove_are_serialized_across_workers() {
+        // An upstream git race, pinned. git writes a new worktree's
+        // `commondir` NON-atomically (open(O_TRUNC) → write), and every
+        // `git worktree add|remove|list` in the same repo enumerates ALL
+        // worktrees — reading an empty `commondir` is fatal. Two workers
+        // doing their isolation setup / teardown at the same moment race
+        // each other: CI 2026-11-28 (macOS runner, git 2.56.1) lost a task
+        // of `isolate_git_gives_each_task_a_worktree_and_keeps_repo_clean`
+        // to "failed to read .git/worktrees/ta-batch-a-…/commondir:
+        // Undefined error: 0", and plain git 2.40.1 does it too (four
+        // parallel adds: 7 failures in 600 rounds; parallel removes hit a
+        // sibling mid-deletion the same way). The runner serializes both
+        // operations process-wide.
+        //
+        // Observed with real git and no PATH games: a repo-local
+        // `post-checkout` hook sleeps INSIDE each `git worktree add` (so
+        // unserialized adds overlap for certain) and logs what it sees.
+        let root =
+            std::env::temp_dir().join(format!("ta-batch-wtser-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let hook_log = root.join("hook.log");
+        let hooks = root.join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        // Shell-quote a path for the hook script ('…' with the '\'' escape).
+        let sh_quote = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', "'\\''"));
+        let install_hook = |script: String| {
+            use std::os::unix::fs::OpenOptionsExt;
+            let script = script.replace("__LOG__", &sh_quote(&hook_log));
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o755)
+                .open(hooks.join("post-checkout"))
+                .unwrap()
+                .write_all(script.as_bytes())
+                .unwrap();
+        };
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .expect("git on PATH")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        std::fs::write(repo.join("seed.txt"), "seed").unwrap();
+        assert!(git(&["add", "."]).status.success());
+        assert!(git(&["commit", "-qm", "init"]).status.success());
+        // Repo-local, so a global `core.hooksPath` on the machine running the
+        // tests cannot switch the hook off.
+        assert!(
+            git(&["config", "core.hooksPath", &hooks.display().to_string()])
+                .status
+                .success()
+        );
+
+        // Setup vs setup: every add's hook brackets its own `worktree add`,
+        // so two hooks in flight at once mean two adds were.
+        install_hook(
+            "#!/bin/sh\n\
+             printf 'begin\\n' >> __LOG__\n\
+             sleep 0.2\n\
+             printf 'end\\n' >> __LOG__\n"
+                .to_string(),
+        );
+        let base: Config = serde_json::from_value(json!({
+            "provider": "openai",
+            "api_key_env": "K",
+            "model": "m",
+            "workdir": repo.display().to_string(),
+        }))
+        .unwrap();
+        const ADDS: usize = 4;
+        let setup: Vec<_> = (0..ADDS)
+            .map(|i| {
+                let base = base.clone();
+                std::thread::spawn(move || {
+                    prepare_isolation(IsolateMode::Git, &base, &format!("wtser{i}"))
+                })
+            })
+            .collect();
+        let mut guards: Vec<_> = setup
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .unwrap()
+                    .expect("the adds do not race each other")
+                    .expect("git mode always yields a guard")
+            })
+            .collect();
+        let log = std::fs::read_to_string(&hook_log).expect("worktree add runs post-checkout");
+        let (mut depth, mut peak, mut ends) = (0usize, 0usize, 0usize);
+        for line in log.lines() {
+            match line {
+                "begin" => depth += 1,
+                "end" => {
+                    ends += 1;
+                    depth -= 1;
+                }
+                other => panic!("unexpected hook log line {other:?}"),
+            }
+            peak = peak.max(depth);
+        }
+        assert_eq!(
+            (ends, depth, peak),
+            (ADDS, 0, 1),
+            "one `git worktree add` in flight at a time; hook log: {log:?}"
+        );
+
+        // Teardown vs setup: `git worktree remove` enumerates its siblings
+        // too, so a finished worker's removal has to wait for an in-flight
+        // add. The in-flight add reports it itself — its hook, back from the
+        // sleep, says whether the finished worker's worktree is still there.
+        let finished = guards.pop().expect("one worktree left to tear down");
+        drop(guards);
+        let marker = sh_quote(&finished.dir.join(".git"));
+        install_hook(
+            "#!/bin/sh\n\
+             printf 'begin\\n' >> __LOG__\n\
+             sleep 0.2\n\
+             if [ -e __MARKER__ ]; then printf 'kept\\n' >> __LOG__\n\
+             else printf 'gone\\n' >> __LOG__; fi\n"
+                .replace("__MARKER__", &marker),
+        );
+        std::fs::write(&hook_log, "").unwrap();
+        let late = {
+            let base = base.clone();
+            std::thread::spawn(move || prepare_isolation(IsolateMode::Git, &base, "wtserlate"))
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !std::fs::read_to_string(&hook_log)
+            .unwrap_or_default()
+            .contains("begin")
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the late add never reached its post-checkout hook"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // The late add is inside its hook now — mid-`git worktree add`.
+        drop(finished);
+        let late = late
+            .join()
+            .unwrap()
+            .expect("the late add succeeds")
+            .expect("git mode always yields a guard");
+        assert_eq!(
+            std::fs::read_to_string(&hook_log).unwrap(),
+            "begin\nkept\n",
+            "a removal ran while another worker's `git worktree add` was in flight"
+        );
+        drop(late);
+        // Nothing lingers in the source repo.
         let list = git(&["worktree", "list"]);
         let out = String::from_utf8_lossy(&list.stdout);
         assert_eq!(

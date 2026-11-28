@@ -1449,7 +1449,7 @@ crates/core/src/  # kernel crate (package tiny-agent-core, lib name tiny_agent):
 src/  # CLI crate (package tiny-agent, bin tiny-agent): process shell + headless rendering + batch + TUI
 ├── main.rs               ( 1279)  # CLI entry + assembly (build_agent) + --session none
 ├── signal.rs             (  123)  # headless SIGINT → cancel (first press graceful / second hard-exit 130)
-├── batch.rs              ( 4117)  # batch tasks + --retries/--failed + report merging
+├── batch.rs              ( 4322)  # batch tasks + --retries/--failed + report merging
 ├── harness.rs            ( 2697)  # headless mode + result.json + NDJSON + exit codes
 ├── harness_tests.rs      ( 1216)  # harness behavior tests (retry ladder / result.json / NDJSON; moved here with harness from the kernel's agent_tests.rs)
 ├── tui.rs                (   33)  # TUI module root (feature tui): mod declarations + public exports (run / transcript_rows)
