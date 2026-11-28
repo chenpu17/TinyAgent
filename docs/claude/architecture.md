@@ -637,7 +637,10 @@
   ③ `max_wasm_stack` **384 KiB**（非 1.5 MiB）——开 epoch 插桩后深递归会先损坏 quickjs 无检查的内部递归状态
   （终态是不可归因的 OOB trap），384 KiB 让原生栈上限决定性赢得竞速、稳定归因 StackOverflow；④ wasmtime 按模块缓存
   机器码——冷首次执行 ~10s 懒编译（debug），**测试必须先 warm 模块再计时/再 spawn cancel 翻转线程**（翻转线程先于
-  warmup spawn 会让入口门吃掉用例而不是在飞投递）。
+  warmup spawn 会让入口门吃掉用例而不是在飞投递）。**全量套件跑绿不证明计时用例自己 warm 过**：最早的几个 guest
+  测试会把其余测试线程一起堵在编译上，后面的用例到得再晚也是热的——漏了 warm 的用例只在单独 / 按名过滤跑时才红
+  （2026-11-27 `batch::tests::batch_parallel_wave_actually_overlaps`：冷编译落进 960ms 墙钟断言，实测 `wall 10117ms`；
+  已改为量时间前先预热）。
   **结果装配（D3）**：`assemble_with_logs(value, logs, cap)`——值优先整行适配，只有值**单独**超限才截断值、日志整段丢；
   `truncated` 审计键稀疏；`logs_dropped` 只计**超宿主日志上限未收集**的行。宿主日志上限按 `chars + 1`（**0 字符行也计费**——
   chars-only 检查放过 `while(1) console.log()`，sec 评审 M-1）。**wall_deadline 一律 `checked_add().flatten()`**

@@ -10,7 +10,7 @@
     "crates/core/src/tools/run_code/guest_api.rs": "bb3352725e48e9fac4a9aa9b8baec68fe538756102b480d727f989fcb5108cce",
     "crates/core/src/tools/run_code/fs_policy.rs": "84b47d96d8f21cd0ca13df143b03ee0b8e86dff415e854135b23a4163bdd0bae",
     "crates/core/src/tools/run_code/lib_index.rs": "1ec3b9c65a3dafce02bc73d2f7202aeef8352087305759db699c88f679919913",
-    "crates/core/src/tools/run_code/batch.rs": "02b278e157f5cdbcdf2eec4bc9526fd9360040aa820dc1d6e0613d7bfae52587",
+    "crates/core/src/tools/run_code/batch.rs": "960ddb021fd92020fa1cbf9aad26d8ab565bbf36429f5789648f03d8b7f57d28",
     "crates/core/src/tools/run_code/precheck.rs": "fa59312c184bafdc63d645ed7e1735055f5e05281d66cff688e186450945b728",
     "crates/core/src/tools/run_code/tool.rs": "f1277ae7227e137459e1c91c347a30c2d21ef53a336a964b129716b46185412f",
     "crates/core/src/tools/run_code/test_util.rs": "28403244669299fa08396118769faa426caea40ffd1df1388d9e57150fc2fe5a",

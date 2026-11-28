@@ -2084,6 +2084,12 @@ mod tests {
             vec![],
             vec![probe],
         );
+        // Warm the process-level module OnceLock first: a cold process pays
+        // the ~10s module compile inside the timed window below and the wave
+        // reads as serialized. In the full suite this test always arrives
+        // warm (earlier guest tests block on the compile); an isolated or
+        // filtered run in a fresh process did not.
+        assert!(!run_code("return 1", batch_cfg()).is_error);
         let t0 = Instant::now();
         let out = tool
             .run_with_emit(

@@ -1916,7 +1916,7 @@ crates/core/src/  # kernel crate (package tiny-agent-core, lib name tiny_agent):
 │       ├── guest_api.rs          ( 3603)  # host function surface: unpack/read/write, host_call_tool dispatch, inner-result envelope, llm marker parse folding, audit meta
 │       ├── fs_policy.rs          ( 2444)  # fs/glob policy: path interception & lexical normalization, write-dir constraints, symlink checks, glob matching (** folding + segment caps)
 │       ├── lib_index.rs          ( 2051)  # lib family: session library index/read-write caps, sha256, reserved names, include delivery
-│       ├── batch.rs              ( 2289)  # callBatch: wave scheduling, output admission (total-cap degradation), entry envelopes
+│       ├── batch.rs              ( 2295)  # callBatch: wave scheduling, output admission (total-cap degradation), entry envelopes
 │       ├── precheck.rs           (  858)  # FR-2 precheck: lexer + keyword-hit rendering
 │       ├── tool.rs               ( 1115)  # the tool itself: RunCodeTool state machine + Tool impl (hash-pinned description/schema)
 │       └── test_util.rs          (  125)  # shared test helpers (cfg(test): scratch/ctx/llm assembly)
