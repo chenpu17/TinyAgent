@@ -8,6 +8,11 @@ use crossterm::terminal::disable_raw_mode;
 use crossterm::ExecutableCommand;
 use std::io::stdout;
 use std::sync::mpsc;
+
+// Only the Unix pieces below deal in time: an ungated import is an
+// `unused_imports` error under `-D warnings` on Windows, where none of them
+// compile.
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 /// Restores the terminal on drop. Installed right after raw mode is entered,

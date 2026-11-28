@@ -29,7 +29,8 @@ cargo fmt --all                            # 格式化（CI 有 --check 门禁�
 不带该 feature 的构建与 clippy 都看不到——单跑一两个会漏。TUI 代码在 `tui` 后；
 `run_code.rs` 与 `agent.rs` 的 `set_code_*` 在 `code` 后；tui 与 code 的**交叉面**
 （TUI 的 CodeLog 渲染、`/code` 命令）只在第四配置可见。`#[cfg(windows)]` 后的代码是同款盲区——本地
-任何配置都不编译它，只在 CI 的 Windows 格见分晓；动了它或给内核结构体加字段后，按 pitfalls 的
+任何配置都不编译它，只在 CI 的 Windows 格见分晓；动了它、给内核结构体加字段、或**拆分/搬运带 `cfg(unix)`
+代码的文件**（import 的使用方全落进 cfg 门后，Windows 上就是 unused import）之后，按 pitfalls 的
 zig 包装配方做一次 Windows 目标交叉 clippy。CI 里四个 clippy 都带 `-D warnings`，
 本地跑出任何黄字即等于红灯。**`cargo fmt --all` 同理**（CI 的 fmt job 对全 workspace
 `--check`，含双绑定 crate；存量 305 处漂移已在一个纯格式 commit 清零，该 commit 记在

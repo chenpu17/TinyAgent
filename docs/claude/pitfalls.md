@@ -337,6 +337,21 @@
   panic、没有跳过开关），本机没有 win32 的 node 库时把 `LIBNODE_PATH` 指向一个放了同名空占位文件的临时目录即可
   （`cargo clippy` 不链接，只过它的存在性检查）。类型检查过了不等于行为对——cmd.exe 的运行时语义交叉检查
   管不到，见下文「CI-only 的门，修完要对着日志逐格复核」条。
+  **第二种触发——没碰任何 `cfg(windows)` 块也中招（2026-11-27，TUI 重构的教训）**：重构把 `app.rs`（2.3k 行）
+  里的终端守卫拆进新的 `tui/terminal.rs`，`use std::time::{Duration, Instant}` 跟着搬了过去，而那个文件里
+  只有 `#[cfg(unix)]` 的函数用它。本机四套 clippy 全绿，CI 的 `test (windows-latest)` 在
+  `cargo clippy --locked -p tiny-agent --features tui --all-targets` 当场红（`unused imports: Duration and
+  Instant`），Windows 的三组测试整组被跳过。**规则要读宽**：要跑交叉检查的不只是「动了 `cfg(windows)`
+  块 / 给内核结构体加字段」，还包括**任何让一个 import 的使用方全部落进 cfg 门的改动**——拆文件、搬函数、
+  给函数加 `#[cfg]`；自查方法是逐个 `use` 问「去掉 `cfg(unix)` 代码后还有没有人用」。修法是给 import 本身
+  加 `#[cfg(unix)]`（自成一组，前面留空行，rustfmt 不会把它并回去）。配方不变，补两条实操：① shell 里
+  用不了环境变量前缀时，把 `CC_…` / `AR_…` / zig 缓存目录连同 `[build] target-dir` 写进一个临时配置文件
+  （放被忽略的 `target/` 下），`cargo clippy --config <文件> --target x86_64-pc-windows-gnu …` 加载——
+  **`--config` 必须写在子命令之后**：写在 `cargo` 和 `clippy` 之间会被外层 cargo 吃掉、不传给内层的
+  `cargo check`，配置静默失效、构建落回日常 `target/`（交叉目标下要到 `ring` 的 build script 报
+  `failed to find tool "x86_64-w64-mingw32-gcc"` 才看得出来）；② `x86_64-pc-windows-gnu` 的标准库只装在
+  本机默认工具链上，CI 同版的 1.100.0 没有（装目标属于装工具链，不做）——用默认工具链跑即可，
+  `unused_imports` 这类与工具链版本无关。
 - **思考内容展示策略**：`ThinkingDelta` 在 `harness` 的 `--json` NDJSON 发 `{"type":"thinking","delta":...}`；
   headless 终端打印写 **stderr**（不进 stdout 的 `summary`，可 `2>/dev/null` 屏蔽）；TUI 渲染为独立
   独立色斜体 `✻` 区块（`Row::Thinking`，不走 markdown/MdCache，与答复视觉分离）。**Thinking 不走

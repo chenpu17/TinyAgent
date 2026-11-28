@@ -1461,7 +1461,7 @@ src/  # CLI crate (package tiny-agent, bin tiny-agent): process shell + headless
     ├── keys.rs               (  271)  # reducer: keys → session (popup pick / Esc & Ctrl-C chords / line editing / history recall; returns Effect)
     ├── commands.rs           (  384)  # reducer: Enter → send now / queue / slash command (busy refusals, worker-bound /clear /context /compact)
     ├── view.rs               (  302)  # commit + paint: scrollback commit / live viewport draw / the final frame on quit
-    ├── terminal.rs           (  159)  # terminal ownership: restore guard / tty-disconnect monitor / kernel diag bridge
+    ├── terminal.rs           (  164)  # terminal ownership: restore guard / tty-disconnect monitor / kernel diag bridge
     ├── input.rs              (  333)  # multi-line InputBuffer editor / input history recall / word & line editing
     ├── slash.rs              (  867)  # slash commands: classify grammar / read-only replies / completion popup state machine / /context report
     ├── theme.rs              (  191)  # theme: single source for history-row & chrome colors / light-dark switch TINYAGENT_TUI_THEME / number formatting helpers
