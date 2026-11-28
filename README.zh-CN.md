@@ -229,10 +229,13 @@ tiny-agent --config examples/harness.json --task "跑测试" --retries 3 --outpu
 | `Ctrl-C` | 忙 → 取消当前轮（同时丢弃排队消息）；空闲 → 连按两次退出（2 秒内再按一次，首按只提示） |
 | `Esc` | 忙 → 取消当前轮；空闲 → 清空输入框（补全弹窗打开时只关弹窗）。退出用 `/quit`、`/exit`，或空闲连按两次 `Ctrl-C` |
 
-运行中（running）输入框保持可编辑：可以继续打字，`Enter` 按 FIFO 排队。独立 live 预览显示最老的
-待发送消息与队列长度——待发送文本**不会**作为 ghost 行进入 transcript，也不会阻塞已完成工具结果
-提交；真正开始投递时才追加对应的 `❯` 用户行。`/queue` 查看待发全文，`/unqueue` 取回最新一条待发
-消息到编辑框，`Ctrl-C`/`Esc` 取消当前轮并**丢弃它的队列**。运行失败会暂停保留的队列，避免连续
+运行中（running）输入框保持可编辑：可以继续打字，`Enter` 按 FIFO 排队。输入框正上方、工具行所在的
+gutter 里有一行 live 预览，显示条数与最老的待发送消息——`  ❯ 2 queued · +1 · <最老的消息>`，运行失败后
+变成警告 `  ! 2 paused · +1 · /resume · <最老的消息>`——待发送文本**不会**作为 ghost 行进入 transcript，
+也不会阻塞已完成工具结果提交；真正开始投递时才追加对应的 `❯` 用户行。`/queue` 查看待发全文，
+`/unqueue` 取回最新一条待发消息到编辑框，`Ctrl-C`/`Esc` 取消当前轮并**丢弃它的队列**：`! [cancelled]`
+提示（队列里有消息时再跟一条 `! [dropped N queued message(s)]`）等运行真正停下才打印，紧接在答复的
+最后一行之后。运行失败会暂停保留的队列，避免连续
 故障自动触发一串请求：`/resume` 显式释放下一条；另发一条新 prompt 不会隐式释放被保留的 FIFO。
 `/clear`、`/context`、`/resume`、`/compact` 在运行中从补全弹窗隐藏（`/context` 要向持有 agent 的 worker 线程
 查询，`/resume` 只在轮次间有意义，`/compact` 不能折叠一轮还在追加的历史），其余斜杠命令照常可用。
@@ -246,39 +249,48 @@ scrollback 里，是真正的终端文本——鼠标拖选即选中原文，复
 按**显示行**切分，内容以行为单位连续向上滚出（与 Claude Code 同款观感），live 区只保留正在生成的
 尾部两三行（已提前定稿的行不再随后续重排；未闭合的行内代码会等反引号配对后再切，避免独立 Markdown
 片段显出多余反引号）。**思考刻意走另一条路径**：live 区只渲染有界尾部，最终整块一次提交，长思考因此
-仍可折叠。空对话（或 `/clear` 之后）live 区显示三行 render-only 报头：宽屏下带版本号的
-`T I N Y A G E N T` 间隔字标（版本号与输入框右缘对齐）、横跨整个工作区的双色规则线，以及一句简洁标语；
-键帽只出现在两行之下的输入框底边框上，报头不重复。窄屏先省略版本号。空态只在渲染期合成，不进
-transcript 或 `/export`。报头上方那一行已提交的 `· session ready · <model> · <n> tools` 也是
-`limits.max_context_tokens` 未设时的提示落点：暗色的第二行、指向 `/context`，不再单发一条警告。
-对话正文在宽屏下限制为 120 列并左对齐，角色用行内图标区分——你的消息以青色 `❯ ` 和粗体正文显示、助手
-以绿色 `◆ ` 开头（无独立标题行，每条消息省一行）；长行软换行并保留悬挂缩进，代码块与展开的工具输出
-在续行继续显示 `▎` / `│` guide；行内代码与键帽共用随明暗主题切换的凸起表面。工具调用和结果以连续 `▎`
-执行导轨缩进归属于助手：调用显示紧凑参数摘要（`key=value` 对，长值省略；完整参数用 `/call`），
-结果显示状态、耗时和输出预览；失败结果只有同时满足不超过 20 行且不超过 2000 字符时才自动展开，避免一个超长单行
+仍可折叠。空对话以一行已提交的 `◆ TinyAgent v<版本> · <model> · <n> tools` 开场（字标加粗，
+其余为次要色）。`limits.max_context_tokens` 未设时的提示也落在这里：次要色的第二行、指向
+`/context`，不再单发一条警告。空对话或 `/clear` 之后，输入框正上方有一行 render-only 的键位提示——
+`  Ctrl-J newline · Esc cancel · /help keys`——补上输入框自己没写的键（`/` 的指引留在占位符里）；
+窄屏先省略中间的 `Esc` 一项。这行提示随第一条消息消失，不进 transcript 或 `/export`。
+配色刻意安静。对话正文在宽屏下限制为 120 列并左对齐，用终端默认的前景色绘制——界面任何地方都不铺
+底色——全部视觉靠五种墨色：强调色（提示符、角色标记、运行中状态）、次要色 dim（名称、预览、次级
+文字）、更淡的 faint（分隔符、耗时、路径），以及警告色与错误色。角色用行内标记区分——你的消息以
+强调色 `❯ ` 开头、助手以强调色 `◆ ` 开头（无独立标题行，每条消息省一行），后面都是普通正文。块与块
+之间空一行、绝不连续两行空行（流式回复分批提交时同样如此）；长行软换行并保留悬挂缩进，围栏代码块
+带淡色 `▎ ` 竖条，展开的工具输出带淡色 `│ ` 引导线。Markdown 里行内代码用强调色，链接用强调色加
+下划线，标题加粗（h1–h3 用默认前景色、h4 及以下用次要色）且不显示 `#` 标记。工具调用和结果放在
+助手下方、缩进两格的 gutter 里：调用显示 `  → 名称  <参数摘要>`（`key=value` 对，长值省略；完整参数
+用 `/call`），结果显示 `  ✓ 名称 · <耗时>  <预览>`，出错时用错误色 `  ✗ 名称 · <耗时>  <预览>`；
+失败结果只有同时满足不超过 20 行且不超过 2000 字符时才自动展开，避免一个超长单行
 报错冲满屏幕。`/out` 重印完整结果，`/call` 重印完整输入 JSON；两者都追加一份展开副本，不改写不可变
-scrollback。工具参数流式生成时显示 render-only 的 `receiving arguments` 活动，JSON 增量不进 transcript。
-正文、composer、队列预览与状态行在宽屏共用同一处最多 120 列的工作区；composer 使用圆角边框与略凸起、
-随主题切换的表面色，对长 prompt 软换行，并在固定八行 inline viewport 内纵向滚动
-保持光标可见，不再有输入水平滚动。running 时输入框标题显示 spinner、当前活动（thinking / writing /
-→ 工具名）、本轮耗时、取消提示和队列长度，窄终端分级省略细节但始终保留取消提示；idle / running /
-cancelling / failed 有各自标题与边框/状态颜色，空闲时标题为 ` ◆ MESSAGE `，底边框在空间足够时
-显示同款 `Enter` / `/` / `Ctrl-J` / `/help` 键帽（窄框先省 `/` 与 Ctrl-J）。
+scrollback。工具参数流式生成时显示 render-only 的 `  → 名称 · receiving arguments · 3s` 活动，JSON 增量不进 transcript。
+系统行共用同一 gutter——`  · 文本`（信息）、`  ! 文本`（警告）、`  ✗ 文本`（错误）——提示与工具行对齐，
+不和对话抢注意力。正文、composer、队列预览与状态行在宽屏共用同一处最多 120 列的工作区；composer
+是不带底色的圆角边框，空闲时没有标题——` ❯ ` 提示符和占位符 ` Describe a task… · / for commands`
+已经说明了它是什么。composer 对长 prompt 软换行，并在固定八行 inline viewport 内纵向滚动
+保持光标可见，不再有输入水平滚动。running 时边框与标题取强调色；标题显示 spinner、当前活动
+（thinking / writing / → 工具名）、本轮耗时、取消提示和队列长度（如
+` ⠋ writing… · 3s · Ctrl-C cancel · 1 queued `），窄终端分级省略细节但始终保留取消提示；
+cancelling 时边框转琥珀色（` ⠹ cancelling… · waiting for stop `），运行失败转红色
+（` failed · /resume continues the held queue `）。
 一轮开始还没有可见输出时，live 区显示瞬时的 `◆ …` 占位（渲染期合成，不进对话历史），首个文本或
-工具调用出现即消失。推理模型的思考过程单独渲染为品红斜体的 `✻` 区块——不走 markdown、和答复正文
+工具调用出现即消失。推理模型的思考过程单独渲染为次要色斜体的 `✻` 区块——不走 markdown、和答复正文
 视觉分离，流式期间带 `▌` 光标、输入框标题显示 thinking；答复开始后 ✻ 区块定稿进 scrollback，答复以
-正常样式另起一块（子 agent 的思考带 `[名字]` 标注）。定稿后超过 8 个显示行的思考折叠为紧凑头部加
-末尾 3 行预览；`/thinking [n]` 追加重印第 n 新的完整思考（默认最新），`/export` 始终收录完整原文为
-`✻ Thinking` 段落。
-状态行使用随明暗主题切换的低对比底色，模型以青色文字标识而非厚重的实心徽章；左侧只保留模型、
-整体运行状态（ready / running / cancelling / failed，空闲不计时）、上下文占用和累计 token
-（如 `1.2k in / 0.8k out`；尚未产生计费的新会话不显示 token 段，而不是显示 0）；右侧右对齐显示当前目录
-（并行开多个窗口时一眼区分）。路径超过 48 列显示预算时，
+正常样式另起一块（子 agent 的思考带 `[名字]` 标注）。定稿后超过 8 个显示行的思考折叠为紧凑头部
+（`✻ Thinking · folded · N rows · /thinking`）加末尾 3 行预览；`/thinking [n]` 追加重印第 n 新的完整思考
+（默认最新），`/export` 始终收录完整原文为 `✻ Thinking` 段落。
+状态行是不带底色的普通一行。运行状态打头，以该状态的墨色显示符号与名称——次要色 `● ready`、
+强调色 `◆ running`、琥珀色 `! cancelling`、红色 `✗ failed`，空闲不计时——后面依次是默认前景色的模型、
+上下文占用和累计 token（后两者为次要色，如 `● my-model · ready · ctx 21% (54.7k/256k) · 1.2k in / 0.8k out`；
+尚未产生计费的新会话不显示 token 段，而不是显示 0）；右侧以最淡的颜色右对齐显示当前目录（并行开多个
+窗口时一眼区分）。路径超过 48 列显示预算时，
 保留能放下的最长完整尾部目录段并加 `…` 前缀，不把目录名从中间截断；剩余不足 12 列则整段隐藏——窄屏时它最先消失。
 上下文占用显示为 `ctx 54.7k`；在配置的
-`limits.max_context_tokens` 里设了模型上下文窗口后变为 `ctx 21% (54.7k/256k)`，占用 ≥60% 转黄、
-≥80% 转红。agent 用过 `todo` 后，状态条另显一段 `plan done/total`（如 `plan 2/5`，全部完成转绿、
-进行中为黄），实时反映任务计划进度——完整 checklist 仍在最近一条 `todo` 工具结果行里。
+`limits.max_context_tokens` 里设了模型上下文窗口后变为 `ctx 21% (54.7k/256k)`，占用 ≥60% 转琥珀色、
+≥80% 转红。agent 用过 `todo` 后，状态条另显一段 `plan done/total`（如 `plan 2/5`，全部完成转强调色、
+进行中为次要色），实时反映任务计划进度——完整 checklist 仍在最近一条 `todo` 工具结果行里。
 终端变窄时状态条先省略 token、再省略 plan，上下文段保留到最后，只保留模型和运行状态为止。退出
 （`/quit`、`/exit`，或空闲 `Ctrl-C` 连按两次）时若仍有排队消息，终端还原后会在 stderr 提示被丢弃的条数。
 一轮正常结束（end_turn / stop 等）不再打印 `[done: …]` 行，只有异常停止（max_tokens /
@@ -290,7 +302,8 @@ length / error 等）才显示警告。工具输出里的 ANSI SGR 颜色序列�
 `Tab`/`Enter` 把选中命令补全进输入框
 （`/export` 自动带尾空格方便输路径；补全只是填入，再按一次 `Enter` 才执行，防止缩写误触发 `/clear`——
 已经完整拼出的命令第一次 `Enter` 就执行），
-`Esc` 只关弹窗。选中行带 `❯` 侧栏标记与凸起表面，底部键帽明确标出补全、执行和关闭。输入空格进入参数阶段；
+`Esc` 只关弹窗。选中行以强调色 `❯` 标记、默认前景色显示（没有高亮底色）；底部一行纯文字——
+`Tab complete · Enter select / again run · Esc close`——点明补全、执行和关闭。输入空格进入参数阶段；
 删掉 `/` 或无匹配时弹窗自动关闭；暂不支持鼠标点选；运行中同样可用（命令照常即时执行，消息照旧排队）：
 
 | 命令 | 作用 |
@@ -316,7 +329,7 @@ length / error 等）才显示警告。工具输出里的 ANSI SGR 颜色序列�
 多行粘贴：终端开启 bracketed paste，一次粘贴含换行的多行会被当作**单条**消息，不会因换行被提前发送——直接粘贴即可，无需手动改 Alt+Enter（顺带粘进来的转义序列，
 比如从终端里复制带出的，会被整段剥掉）。手动输入多行可用 `Shift+Enter` / `Alt+Enter` / `Ctrl+J`，也可在行尾打 `\` 再按 `Enter` 换行（行续接）——终端不上报修饰键时（如 macOS Terminal.app）这是唯一的手动多行入口。
 
-浅色终端适配：`TINYAGENT_TUI_THEME=light` 启动 TUI，系统行 / 预览 / 状态段等暗色文字换用更深的中灰（深浅底都可读），行内代码从白色改染青色（浅色底上白字几乎隐形）。未设置或其它值保持深色主题不变；不做自动探测（终端背景色上报不可靠），需要浅色就显式设这个环境变量。
+主题与色深：TUI 默认用深色调色板；`TINYAGENT_TUI_THEME=light` 把每种墨色换成浅色底上的对应色（次要色文字更深、强调色是更深的蓝、琥珀与红在浅底上依然可读——行内代码跟随强调色）。未设置或其它值保持深色调色板不变；不做自动探测（终端背景色上报不可靠），需要浅色就显式设这个环境变量。`TINYAGENT_TUI_COLOR` 指定颜色的输出方式：`truecolor`（24 位 RGB）、`256`（对应的 xterm-256 色）或 `16`（标准 ANSI 颜色）。未设置时跟随 `COLORTERM`：`truecolor` 或 `24bit` 用 24 位色，其余按 256 色。
 
 ## MCP 客户端
 
@@ -557,7 +570,7 @@ API key 从 `api_key_env` 指定的环境变量读取，不写进配置文件。
 
 **思考内容透出**：推理模型的思考过程作为 `ThinkingDelta` 事件流式透出（OpenAI 系 `delta.reasoning_content`、Anthropic `thinking` content block），`--json` 下为 `{"type":"thinking","delta":...}`；默认**不进对话历史正文与上下文回传**（只作事件透出给 UI）。
 唯一的例外是 `preserved_reasoning`（默认开；见上文）：此时 provider 的推理块保留在 assistant 消息的旁字段里，
-在**当前轮**的后续请求中回传给同一模型——同样不进答复正文。GUI（如 TinyWorker）据此渲染可折叠"思考过程"区块；headless 终端把思考写到 **stderr**（不污染 stdout 的最终回复 / `summary`）；TUI 渲染为**独立的品红斜体 `✻` 区块**（不走 markdown、与答复正文视觉分离，流式期间输入框标题显示 thinking，结束后随答复一起定稿进 scrollback）。批量任务片段可覆盖此项（软字段，与 `model`/`max_tokens` 同类，不在 `forbidden_batch_override`）。
+在**当前轮**的后续请求中回传给同一模型——同样不进答复正文。GUI（如 TinyWorker）据此渲染可折叠"思考过程"区块；headless 终端把思考写到 **stderr**（不污染 stdout 的最终回复 / `summary`）；TUI 渲染为**独立的次要色斜体 `✻` 区块**（不走 markdown、与答复正文视觉分离，流式期间输入框标题显示 thinking，结束后随答复一起定稿进 scrollback）。批量任务片段可覆盖此项（软字段，与 `model`/`max_tokens` 同类，不在 `forbidden_batch_override`）。
 
 ### 上下文压缩
 
@@ -1454,21 +1467,21 @@ src/  # CLI crate (package tiny-agent, bin tiny-agent): process shell + headless
 ├── harness_tests.rs      ( 1216)  # harness behavior tests (retry ladder / result.json / NDJSON; moved here with harness from the kernel's agent_tests.rs)
 ├── tui.rs                (   33)  # TUI module root (feature tui): mod declarations + public exports (run / transcript_rows)
 └── tui/  # TUI submodules (same tui gate): split from the original 8.7k-line single file by concern, then gathered around one Session state machine
-    ├── app.rs                (  312)  # session assembly + event loop: run entry / channels / worker start / ui_loop (drain → commit → repaint → one key) — holds no state of its own
-    ├── session.rs            (  535)  # the one Session: all interactive state + RunState (phase transitions / queue release / stream closing); the reducers are impl Session blocks in events / keys / commands
+    ├── app.rs                (  317)  # session assembly + event loop: run entry / channels / worker start / ui_loop (drain → commit → repaint → one key) — holds no state of its own
+    ├── session.rs            (  561)  # the one Session: all interactive state + RunState (phase transitions / queue release / stream closing); the reducers are impl Session blocks in events / keys / commands
     ├── worker.rs             (  259)  # worker side: the thread that owns the agent (run / clear / context / compact per input) + the UiMsg / Input messages crossing to and from it
-    ├── events.rs             (  530)  # reducer: worker messages → session (run-level outcomes + one arm per AgentEvent)
-    ├── keys.rs               (  271)  # reducer: keys → session (popup pick / Esc & Ctrl-C chords / line editing / history recall; returns Effect)
+    ├── events.rs             (  534)  # reducer: worker messages → session (run-level outcomes + one arm per AgentEvent)
+    ├── keys.rs               (  270)  # reducer: keys → session (popup pick / Esc & Ctrl-C chords / line editing / history recall; returns Effect)
     ├── commands.rs           (  384)  # reducer: Enter → send now / queue / slash command (busy refusals, worker-bound /clear /context /compact)
-    ├── view.rs               (  302)  # commit + paint: scrollback commit / live viewport draw / the final frame on quit
+    ├── view.rs               (  305)  # commit + paint: scrollback commit / live viewport draw / the final frame on quit
     ├── terminal.rs           (  164)  # terminal ownership: restore guard / tty-disconnect monitor / kernel diag bridge
     ├── input.rs              (  333)  # multi-line InputBuffer editor / input history recall / word & line editing
-    ├── slash.rs              (  867)  # slash commands: classify grammar / read-only replies / completion popup state machine / /context report
-    ├── theme.rs              (  191)  # theme: single source for history-row & chrome colors / light-dark switch TINYAGENT_TUI_THEME / number formatting helpers
-    ├── markdown.rs           (  769)  # markdown & ANSI rendering: render_markdown / escape parsing / fence scanning (shared with streaming splits) / MdCache single-slot cache
-    ├── transcript.rs         ( 1338)  # conversation Row model and all build/mutation logic: history rendering / streaming increments & incremental splits / /export dump / resume rebuild
-    ├── render.rs             ( 1049)  # terminal drawing: scrollback commit_rows / live-region render / input & status bar chrome / width & control-char utilities
-    ├── tests.rs              ( 5101)  # TUI regression tests (TestBackend cell-grid assertions + input / completion / streaming-split logic)
-    └── tests_loop.rs         ( 2399)  # loop-level TUI tests: keys and worker messages driven through a real Session the way ui_loop drives it (rows / queue / worker messages)
+    ├── slash.rs              (  887)  # slash commands: classify grammar / read-only replies / completion popup state machine / /context report
+    ├── theme.rs              (  261)  # five inks (accent / dim / faint / warn / error), each defined for truecolor, 256 and 16 colors: light-dark switch TINYAGENT_TUI_THEME / depth switch TINYAGENT_TUI_COLOR / number formatting helpers
+    ├── markdown.rs           (  919)  # markdown & ANSI rendering: theme-bound style sheet (Sheet) / render_markdown / escape parsing / fence scanning (shared with streaming splits) / MdCache single-slot cache
+    ├── transcript.rs         ( 1413)  # conversation Row model and all build/mutation logic: history rendering (gutter tool lines, block gaps by the row_gap pair rule) / streaming increments & incremental splits / /export dump / resume rebuild
+    ├── render.rs             ( 1032)  # terminal drawing: scrollback commit_rows / live-region chrome (opening row, key legend, queue line, composer title, status line) / width & control-char utilities
+    ├── tests.rs              ( 6766)  # TUI regression tests (TestBackend cell-grid assertions + input / completion / streaming-split logic)
+    └── tests_loop.rs         ( 3760)  # loop-level TUI tests: keys and worker messages driven through a real Session the way ui_loop drives it (rows / queue / worker messages)
 ```
 <!-- END CODE STRUCTURE -->

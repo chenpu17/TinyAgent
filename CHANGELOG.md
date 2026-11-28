@@ -7,6 +7,10 @@
 
 ### Added
 
+- **TUI 色深开关 `TINYAGENT_TUI_COLOR`**（`truecolor` / `256` / `16`）：不设时按 `COLORTERM` 推断
+  （`truecolor` / `24bit` 即 true color，否则 256 色）。五档墨色（强调 / 次要 / 淡 / 警告 / 错误）各自
+  为三档色深与明暗两套主题定义，16 色下落到 ANSI 基本色。
+
 - **Anthropic 线回传自检 `scripts/e2e_anthropic_wire.py`（进 CI 的 e2e job 与 `./scripts/check.sh e2e`）**：
   进程内脚本化 Messages API mock 驱动真实 headless 二进制，离线、零密钥、约 2 秒。十个场景（真实流量上见过的
   块形状、边界块、关回传、`reasoning_effort` `none` / `low`、多轮对话、跨进程 `--resume`、截断后与空回复后的
@@ -234,6 +238,30 @@
   真机矩阵 `scripts/e2e_mcp.py`（不是 CI 门禁）十组 A–K 覆盖以上全部行为。
 
 ### Changed
+
+- **TUI 视觉重做：「安静的终端」**（按键、命令与 inline viewport + 原生 scrollback 模型不变）：
+  - **不再铺底色**。全界面只用五种墨色（强调 `accent_fg` / 次要 `dim_fg` / 淡 `faint_fg` / 警告
+    `warn_fg` / 错误 `error_fg`），对话正文走终端默认前景色——终端自己的配色方案（含透明、
+    truecolor 主题）原样透出来。键帽底色、选中行高亮、代码块底色、输入框标题底色与报头规则线全部移除。
+  - **对话的语法**：助手 `◆ `、用户 `❯ `、思考 `✻ `（次要色斜体）；工具行与系统提示共用两格 gutter——
+    调用 `  → 工具名  <摘要>`，结果 `  ✓ 工具名 · <耗时>  <预览>`（失败为 `  ✗ …`），系统提示
+    `  · ` / 警告 `  ! ` / 错误 `  ✗ `；展开的输出缩进在淡色 `│ ` 引导线后。
+  - **Markdown 样式表**（`markdown::Sheet`）：标题加粗不带 `#`（h4 起转次要色），行内代码与链接用强调色
+    （无底色，链接带下划线），引用块次要色，表格边框淡色，围栏代码块用淡色 `▎` 竖线引导。
+  - **块间距只有一条规则**（`row_gap`，批内与跨批同一把尺）：任意两块之间恰好一个空行，连续的系统提示
+    紧贴成一组，不再出现双空行或贴死的情况。
+  - **首屏**：一行 `◆ TinyAgent v<版本> · <模型> · <N> tools`；输入框上方一行键位提示
+    `  Ctrl-J newline · Esc cancel · /help keys`（窄屏自动省略）。
+  - **输入框**：空闲时无标题（占位符 ` Describe a task… · / for commands`）；运行中标题为
+    ` ⠙ <正在做的事>… · <已用时> · Ctrl-C cancel[ · N queued] `，取消中转警告色，失败转错误色并提示
+    `/resume`。
+  - **队列预览**回到 gutter：`  ❯ 2 queued · +1 · <最早的消息>`，失败暂停时 `  ! 2 paused · +1 · /resume · …`。
+  - **取消提示延后到 run 结束**：Esc / Ctrl-C 时不再在答复中间插入一行 `[cancelling…]`，也不关闭
+    还在收尾的流；`[cancelled]` 与 `[dropped N queued message(s)]` 在答复的尾巴落定后才出现，
+    不再有孤零零的 `◆` 残片掉在提示下面。
+  - **状态栏**：`● <模型> · ready · ctx N% (…/…) · N in / N out`，右侧淡色显示工作目录；
+    状态标记与标签按相位换墨色（`ready` 次要色、`running` 强调色、`cancelling` 警告色、`failed` 错误色）。
+  - 补全弹窗选中行改为强调色 `❯` + 默认前景色。
 
 - **TUI 重构：交互状态收拢为 `Session` 状态机，并修四处体验问题**（渲染模型与键位表不变）：
   `src/tui/app.rs` 的 2362 行拆成按关注点的模块——`app`（装配 + `ui_loop`）、`session`（全部交互状态

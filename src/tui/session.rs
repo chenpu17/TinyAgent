@@ -162,17 +162,19 @@ impl RunState {
         self.thinking = false;
     }
 
-    /// Esc / Ctrl-C during a run. The status line says the stop is on its way
-    /// and the kernel acknowledges at its next checkpoint — the run stays busy
-    /// (a second press must not quit) until then. The parent's answer and
-    /// every child bubble are final: trailing deltas start a fresh row after
-    /// the `[cancelling…]` notice. The reasoning trace is left open; it closes
-    /// when the run ends, as on any other path.
+    /// Esc / Ctrl-C during a run. The status line and the input title say the
+    /// stop is on its way and the kernel acknowledges at its next checkpoint —
+    /// the run stays busy (a second press must not quit) until then. Nothing
+    /// closes here: every open stream (the parent's answer, a child bubble,
+    /// the reasoning trace) stays open, so the chunks that still land before
+    /// the kernel stops append to the row they belong to. The transcript
+    /// notices (`[cancelled]`, the discarded queue) follow the answer when
+    /// the run ends — a `[cancelling…]` row at the keypress used to sit
+    /// between an answer and its own last words, which then reappeared below
+    /// it as a bare `◆` fragment.
     pub(super) fn begin_cancelling(&mut self) {
         self.phase = RunPhase::Cancelling;
         self.activity = "cancelling".into();
-        self.streaming = false;
-        self.sub_streaming_name = None;
         self.tool_running.clear();
         self.tool_building = None;
     }
@@ -225,9 +227,18 @@ pub(super) struct Session {
     // are permanent. Only the open streaming tail is withheld; pending input
     // lives in a separate FIFO and cannot invalidate this index.
     pub committed: usize,
+    // Whether the last commit ended on a blank line. A mid-stream batch
+    // carries no end-of-history spacer, so the next batch has to open with
+    // the gap its first row owes its predecessor (`row_gap`); one that ended
+    // at the end of history already carries that blank.
+    pub committed_tail_blank: bool,
     // Failed runs hold the FIFO until an explicit /resume. This survives a
     // separately submitted new prompt, which must not silently release it.
     pub queue_paused: bool,
+    // Messages an in-flight cancel discarded (`on_cancel`). The queue is gone
+    // the moment Esc is pressed; its notice waits for the run to end, when it
+    // can follow the answer instead of cutting into it.
+    pub cancel_dropped: Option<usize>,
     // Messages typed while a run is in flight, oldest first. This FIFO is the
     // ONLY queue truth; its preview is render-only and never enters `rows`.
     pub queued: VecDeque<String>,
@@ -273,7 +284,9 @@ impl Session {
         let mut session = Self {
             rows: Vec::new(),
             committed: 0,
+            committed_tail_blank: true,
             queue_paused: false,
+            cancel_dropped: None,
             queued: VecDeque::new(),
             run: RunState {
                 phase: RunPhase::Idle,
@@ -310,7 +323,7 @@ impl Session {
             cancel,
         };
 
-        session.rows.push(Row::sys_info(welcome_text(
+        session.rows.push(Row::sys_head(welcome_text(
             startup.model,
             startup.n_tools,
             startup.window_note,
@@ -409,6 +422,15 @@ impl Session {
         }
     }
 
+    /// The notice owed for the queue an Esc discarded — once the run is over,
+    /// so it lands after the answer instead of inside it (see `on_cancel`).
+    pub(super) fn push_cancel_dropped(&mut self) {
+        if let Some(n) = self.cancel_dropped.take() {
+            self.rows
+                .push(Row::sys_warn(format!("[dropped {n} queued message(s)]")));
+        }
+    }
+
     /// Reset the run state after the worker thread died mid-run: drop the UI out
     /// of "running" (the RunFinished that would reset it is never coming),
     /// surface the death, and drop the queued messages — nothing can deliver
@@ -429,11 +451,15 @@ impl Session {
             changed = true;
         }
         // No worker can accept these messages; the FIFO contains no transcript
-        // ghosts, so dropping it cannot disturb committed row indices.
-        if !self.queued.is_empty() {
+        // ghosts, so dropping it cannot disturb committed row indices. The
+        // count an in-flight cancel already discarded joins the same notice.
+        let dropped = self
+            .queued
+            .len()
+            .saturating_add(self.cancel_dropped.take().unwrap_or(0));
+        if dropped > 0 {
             self.rows.push(Row::sys_warn(format!(
-                "[dropped {} queued message(s)]",
-                self.queued.len()
+                "[dropped {dropped} queued message(s)]"
             )));
             changed = true;
         }

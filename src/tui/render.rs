@@ -5,11 +5,8 @@
 
 use super::input::InputBuffer;
 use super::markdown::MdCache;
-use super::theme::{
-    dim_fg, fmt_elapsed, fmt_tokens, keycap_bg, keycap_fg, AGENT_FG, TOOL_CALL_FG, TOOL_ERR_FG,
-    USER_FG,
-};
-use super::transcript::{build_history_lines, LiveRow, Row};
+use super::theme::{accent_fg, dim_fg, error_fg, faint_fg, fmt_elapsed, fmt_tokens, warn_fg};
+use super::transcript::{build_history_lines, gutter_mark, is_blank_line, LiveRow, Row};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -82,8 +79,9 @@ pub(super) fn copy_to_clipboard(text: &str) -> bool {
     false
 }
 
-/// The startup connection note. The branded empty state below it owns command
-/// discovery, so this committed row only records what session was opened.
+/// The startup row — the session's caption, committed to scrollback so it
+/// stays reachable (and lands in `/export`): the product, the version, what
+/// it is talking to and with how many tools.
 ///
 /// `window_note` (`Limits::context_window_hint_line`) is the one thing a
 /// default config leaves worth saying, and it rides the SAME row as a second
@@ -91,7 +89,10 @@ pub(super) fn copy_to_clipboard(text: &str) -> bool {
 /// yellow lines — which pushed the transcript past the empty screen's "no
 /// row beyond the welcome one" test and buried the masthead under it.
 pub(super) fn welcome_text(model: &str, n_tools: usize, window_note: Option<&str>) -> String {
-    let mut text = format!("session ready · {model} · {n_tools} tools");
+    let mut text = format!(
+        "TinyAgent v{} · {model} · {n_tools} tools",
+        env!("CARGO_PKG_VERSION")
+    );
     if let Some(note) = window_note {
         text.push('\n');
         text.push_str(note);
@@ -101,108 +102,63 @@ pub(super) fn welcome_text(model: &str, n_tools: usize, window_note: Option<&str
     text
 }
 
-/// A small raised keycap used by the welcome sheet and composer footer.
-pub(super) fn keycap(label: &str) -> Span<'static> {
-    Span::styled(
-        format!(" {label} "),
-        Style::default()
-            .fg(keycap_fg())
-            .bg(keycap_bg())
-            .add_modifier(Modifier::BOLD),
-    )
+/// One key-legend line: key names in the secondary ink, their labels and the
+/// ` · ` separators one step fainter. Plain text, not filled keycaps — a chip
+/// assumes a surface (a keycap background) the terminal's own theme never
+/// promised. `indent` is the leading blank cells.
+pub(super) fn hint_line(indent: usize, pairs: &[(&str, &str)]) -> Line<'static> {
+    let key = Style::default().fg(dim_fg());
+    let soft = Style::default().fg(faint_fg());
+    let mut spans = vec![Span::raw(" ".repeat(indent))];
+    for (i, (k, label)) in pairs.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", soft));
+        }
+        spans.push(Span::styled(k.to_string(), key));
+        spans.push(Span::styled(format!(" {label}"), soft));
+    }
+    Line::from(spans)
 }
 
-/// Three-row opening composition for a fresh/cleared session. The wide layout
-/// is an editorial masthead rather than a paragraph of instructions: a spaced
-/// wordmark with the version pinned to the same right edge as the composer, a
-/// two-tone rule across the full work area, and one concise promise. Keys are
-/// not repeated here — the composer's own bottom border carries the legend two
-/// rows below. Render-only: hints never become fake conversation rows or
-/// `/export` noise.
+/// The key legend of a fresh/cleared session: the keys the box itself does
+/// not name (the placeholder keeps the `/` pointer). Render-only — hints never
+/// become fake conversation rows or `/export` noise — and it leaves with the
+/// first message; `/help` is the standing reference. A narrow line drops the
+/// middle pair before it is truncated.
 pub(super) fn empty_state_lines(width: usize) -> Vec<Line<'static>> {
-    let mut brand_spans = vec![
-        Span::styled(
-            "◆",
-            Style::default().fg(AGENT_FG).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            " T I N Y A G E N T",
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-    ];
-    let brand_left = brand_spans.iter().map(|s| s.content.width()).sum::<usize>();
-    let version = format!("v{}", env!("CARGO_PKG_VERSION"));
-    if width >= 80 && brand_left + version.width() + 2 <= width {
-        brand_spans.push(Span::raw(" ".repeat(width - brand_left - version.width())));
-        brand_spans.push(Span::styled(version, Style::default().fg(dim_fg())));
-    }
-    let brand = Line::from(brand_spans);
-
-    let accent = width.min(12);
-    let rule = Line::from(vec![
-        Span::styled("━".repeat(accent), Style::default().fg(AGENT_FG)),
-        Span::styled(
-            "─".repeat(width.saturating_sub(accent)),
-            Style::default().fg(dim_fg()),
-        ),
-    ]);
-    let tagline = Line::from(Span::styled(
-        if width >= 42 {
-            "A small agent for real terminal work."
-        } else {
-            "Ask. Build. Debug."
-        },
-        Style::default(),
-    ));
-    [brand, rule, tagline]
-        .into_iter()
-        .map(|line| truncate_line(line, width))
-        .collect()
-}
-
-/// Key legend drawn inside the composer's bottom border. Keycaps match the
-/// slash menu; narrow frames keep only send + help. This is the only key
-/// legend on an empty screen — the welcome sheet deliberately does not repeat
-/// it.
-pub(super) fn composer_footer(busy: bool, width: usize) -> Option<Line<'static>> {
-    if busy {
-        return None;
-    }
-    let full = Line::from(vec![
-        Span::raw(" "),
-        keycap("Enter"),
-        Span::styled(" send  ", Style::default().fg(dim_fg())),
-        keycap("/"),
-        Span::styled(" commands  ", Style::default().fg(dim_fg())),
-        keycap("Ctrl-J"),
-        Span::styled(" newline  ", Style::default().fg(dim_fg())),
-        keycap("/help"),
-        Span::raw(" "),
-    ]);
-    let short = Line::from(vec![
-        Span::raw(" "),
-        keycap("Enter"),
-        Span::styled(" send  ", Style::default().fg(dim_fg())),
-        keycap("/help"),
-        Span::raw(" "),
-    ]);
-    if full.width() <= width {
-        Some(full.right_aligned())
-    } else if short.width() <= width {
-        Some(short.right_aligned())
+    const FULL: &[(&str, &str)] = &[("Ctrl-J", "newline"), ("Esc", "cancel"), ("/help", "keys")];
+    const SHORT: &[(&str, &str)] = &[("Ctrl-J", "newline"), ("/help", "keys")];
+    let indent = super::transcript::TOOL_GUTTER.len();
+    let full = hint_line(indent, FULL);
+    let line = if full.width() <= width {
+        full
     } else {
-        None
-    }
+        truncate_line(hint_line(indent, SHORT), width)
+    };
+    vec![line]
 }
 
-/// The one color for the bottom chrome (input border + its title): AGENT_FG
+/// Ghost placeholder shown in the empty composer: the standing discoverability
+/// hint — the legend above the box leaves with the first keystroke, this one
+/// returns whenever the box is empty again. The leading space keeps the
+/// terminal's block caret off the first glyph: the empty composer reads as
+/// focused, not as a selected "D".
+pub(super) fn placeholder_line() -> Line<'static> {
+    Line::from(vec![
+        Span::styled(" Describe a task…", Style::default().fg(dim_fg())),
+        Span::styled(" · ", Style::default().fg(faint_fg())),
+        Span::styled("/ for commands", Style::default().fg(dim_fg())),
+    ])
+}
+
+/// The color of the bottom chrome (input border + its title): the accent
 /// while a run is in flight so the frame reads as a single busy unit, the
-/// idle color otherwise. One busy color across chrome AND status bar.
+/// secondary ink when idle. One busy color across chrome AND status bar.
 pub(super) fn chrome_fg(busy: bool) -> Color {
     if busy {
-        AGENT_FG
+        accent_fg()
     } else {
-        USER_FG
+        dim_fg()
     }
 }
 
@@ -247,7 +203,9 @@ pub(super) fn build_input_title(
             }
         }
     } else {
-        " ◆ MESSAGE ".to_string()
+        // Idle: no title. A label naming the box "MESSAGE" was chrome that
+        // said nothing; the prompt and the placeholder already do.
+        String::new()
     };
     truncate_display(&title, width)
 }
@@ -287,7 +245,7 @@ pub(super) fn status_stats(
     }
     let cache_seg = if cache_read > 0 || cache_create > 0 {
         format!(
-            "   cache {} w {} r",
+            " · cache {} w {} r",
             fmt_tokens(cache_create),
             fmt_tokens(cache_read)
         )
@@ -295,7 +253,7 @@ pub(super) fn status_stats(
         String::new()
     };
     format!(
-        "   {} in  /  {} out{cache_seg}",
+        " · {} in / {} out{cache_seg}",
         fmt_tokens(in_tokens),
         fmt_tokens(out_tokens)
     )
@@ -307,6 +265,11 @@ pub(super) fn status_stats(
 /// narrow ones preserve only the model label and broad run state. The cwd path
 /// pins to the right edge in whatever room the left side leaves (it is the
 /// first thing narrow terminals lose). Keyboard help lives behind `/help`.
+///
+/// A readout, not a banner: the model keeps the default ink, every segment
+/// after it is secondary, and only the state glyph + label carry a color —
+/// quiet when idle, the accent while running, warn and error for the two
+/// states that need a glance.
 // The bar is assembled from independent segments; grouping them into a
 // struct would only shuffle the same fields to every call site.
 #[allow(clippy::too_many_arguments)]
@@ -320,32 +283,21 @@ pub(super) fn build_status_line(
     path: &str,
     width: usize,
 ) -> Line<'static> {
-    let model_label = format!(" ◆ {model}");
-    let (state_mark, state_label) = match state {
-        "idle" => ("●", "ready"),
-        "running" => ("◆", "running"),
-        "cancelling" => ("!", "cancelling"),
-        "failed" => ("✗", "failed"),
-        _ => ("·", state),
-    };
-    let state_seg = format!("  {state_mark} {state_label}");
-    let state_style = match state {
-        "cancelling" => Style::default()
-            .fg(TOOL_CALL_FG)
-            .add_modifier(Modifier::BOLD),
-        "failed" => Style::default()
-            .fg(TOOL_ERR_FG)
-            .add_modifier(Modifier::BOLD),
-        "idle" | "running" => Style::default().fg(AGENT_FG).add_modifier(Modifier::BOLD),
-        _ if busy => Style::default().fg(AGENT_FG).add_modifier(Modifier::BOLD),
-        _ => Style::default().fg(dim_fg()),
+    let (state_mark, state_label, state_style) = match state {
+        "idle" => ("●", "ready", Style::default().fg(dim_fg())),
+        "running" => ("◆", "running", Style::default().fg(accent_fg())),
+        "cancelling" => ("!", "cancelling", Style::default().fg(warn_fg())),
+        "failed" => ("✗", "failed", Style::default().fg(error_fg())),
+        _ => (
+            "·",
+            state,
+            Style::default().fg(if busy { accent_fg() } else { dim_fg() }),
+        ),
     };
     let mut spans = vec![
-        Span::styled(
-            model_label,
-            Style::default().fg(USER_FG).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(state_seg, state_style),
+        Span::styled(state_mark.to_string(), state_style),
+        Span::styled(format!(" {model}"), Style::default()),
+        Span::styled(format!(" · {state_label}"), state_style),
     ];
     let used = spans.iter().map(|s| s.content.width()).sum::<usize>();
     if used > width {
@@ -427,7 +379,7 @@ pub(super) fn right_path_seg(path: &str, avail: usize) -> Option<Span<'static>> 
     let pad = avail - tw;
     Some(Span::styled(
         format!("{}{text}", " ".repeat(pad)),
-        Style::default().fg(dim_fg()),
+        Style::default().fg(faint_fg()),
     ))
 }
 
@@ -461,8 +413,14 @@ pub(super) fn layout_composer(
     let mut lines = Vec::new();
     let mut caret_row = 0usize;
     let mut caret_col = 0usize;
+    // Wrapped rows and typed newlines continue under the first row's text.
+    let cont = " ".repeat(UnicodeWidthStr::width(prompt));
     for (logical_row, text) in input.lines_view().iter().enumerate() {
-        let prefix = if logical_row == 0 { prompt } else { "  " };
+        let prefix = if logical_row == 0 {
+            prompt
+        } else {
+            cont.as_str()
+        };
         let prefix_style = if logical_row == 0 {
             prompt_style
         } else {
@@ -512,30 +470,55 @@ pub(super) fn queue_preview_line(
         String::new()
     };
     let action = if paused { " · /resume" } else { "" };
+    // A notice in the tool gutter, so it lines up with the tool and notice
+    // rows of the conversation. The glyph says what is held: the user's own
+    // mark for messages waiting their turn, the warning mark for a queue
+    // nothing releases by itself — and the count and state ride it in the
+    // same ink.
+    let (glyph, ink) = if paused {
+        ("!", warn_fg())
+    } else {
+        ("❯", accent_fg())
+    };
+    let style = Style::default().fg(ink);
+    let n = queued.len();
     let head = truncate_display(
-        &format!("⇢ {} {state}{suffix}{action} · ", queued.len()),
+        &format!("{}{n} {state}{suffix}{action} · ", gutter_mark(glyph)),
         width,
     );
     let remaining = width.saturating_sub(head.width());
     let preview = truncate_display(&first.replace('\n', " ↵ "), remaining);
     Some(Line::from(vec![
-        Span::styled(head, Style::default().fg(USER_FG)),
+        Span::styled(head, style),
         Span::styled(preview, Style::default().fg(dim_fg())),
     ]))
 }
 
+/// `leading_spacer` opens the batch with a blank row — the gap its first row
+/// owes the row before it, when that row was committed in an earlier,
+/// mid-stream batch (those carry no trailing spacer; see `view::commit`).
+/// `trailing_spacer` closes the batch with one (end of history).
+///
+/// Returns whether the batch, as written, ends on a blank line — `None` when
+/// it rendered nothing at all and the caller should keep what it knew.
 pub(super) fn commit_rows<B: ratatui::backend::Backend>(
     term: &mut Terminal<B>,
     rows: &[Row],
     md_cache: &mut MdCache,
     width: usize,
+    leading_spacer: bool,
     trailing_spacer: bool,
-) -> Result<(), B::Error> {
-    let lines = build_history_lines(rows, md_cache, width, LiveRow::None, false, trailing_spacer);
+) -> Result<Option<bool>, B::Error> {
+    let mut lines =
+        build_history_lines(rows, md_cache, width, LiveRow::None, false, trailing_spacer);
+    if leading_spacer {
+        lines.insert(0, Line::default());
+    }
     let wrapped = wrap_history(&lines, width);
     if wrapped.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
+    let tail_blank = wrapped.last().is_some_and(is_blank_line);
     // Cap at u16::MAX: insert_before's height is a u16, and `y as u16` in the
     // loop would wrap past 65,535 rendered lines — silently reserving too few
     // rows while the loop overwrites past them. A single commit reaching that
@@ -551,7 +534,7 @@ pub(super) fn commit_rows<B: ratatui::backend::Backend>(
             buf.set_line(0, y as u16, line, width as u16);
         }
     })?;
-    Ok(())
+    Ok(Some(tail_blank))
 }
 
 /// Top-anchored render for a menu (the slash popup): line 0 sits at the top of
@@ -740,9 +723,11 @@ pub(super) fn truncate_display(text: &str, width: usize) -> String {
 
 /// Continuation prefix inferred from the line's existing visual language.
 /// Role markers become two blank cells; existing indentation is retained;
-/// code/tool guides (`▎ ` / `│ `) repeat on every visual row. System markers
-/// become an equivalent hanging indent. This lets the FINAL wrap pass restore
-/// gutters without every renderer pre-wrapping its own text.
+/// code/tool guides (`▎ ` / `│ `) repeat on every visual row. The transcript's
+/// guttered lines — notices (`·`, `!`, `✗`) and tool heads (`→`, `✓`, `✗`),
+/// all `{gutter}{glyph} ` — continue under their text as a hanging indent, so
+/// the glyph is never repeated down the wrapped rows. This lets the FINAL wrap
+/// pass restore gutters without every renderer pre-wrapping its own text.
 fn continuation_cells(src: &Line) -> Vec<(String, Style)> {
     let cells: Vec<(char, Style)> = src
         .spans
@@ -753,19 +738,17 @@ fn continuation_cells(src: &Line) -> Vec<(String, Style)> {
     if leading > 0 {
         let marker = cells.get(leading).map(|(c, _)| *c);
         let take = match marker {
-            Some('▎' | '│') => (leading + 2).min(cells.len()),
-            Some('·') => leading + 2,
+            Some('▎' | '│' | '·' | '→' | '✓' | '✗' | '!') => {
+                (leading + 2).min(cells.len())
+            }
             _ => leading,
         };
+        let blanks = matches!(marker, Some('·' | '→' | '✓' | '✗' | '!'));
         return cells
             .iter()
             .take(take)
             .map(|(c, style)| {
-                let c = if matches!(marker, Some('·')) {
-                    ' '
-                } else {
-                    *c
-                };
+                let c = if blanks { ' ' } else { *c };
                 (c.to_string(), *style)
             })
             .collect();

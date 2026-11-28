@@ -877,19 +877,43 @@
   **TUI 定位（原"冻结只修 bug"政策已按产品决定放宽）**：交互体验对齐主流终端 AI 工具的基础项
   已落地一批（见下），红线仍是**架构与渲染模型**——不做全屏 / 鼠标托管 / 主题系统这类结构性扩张。
   已落地的扩展面速记：
-  - **视觉语言与底部 chrome**：空态是三行 render-only 报头——宽屏为与 120 列工作区同宽、版本号右对齐到
-    输入框右缘的 `T I N Y A G E N T` 间隔字标，加双色规则线与简洁标语；窄屏先舍版本号。键帽只在
-    composer 底边框上出现一次，空态不重复。正文、composer、队列预览、状态行与空态/弹窗共享左锚定、
-    最多 120 列的工作区（空态/弹窗的宽度参数必须传 `content_w`，不能传 zone 的全宽）。正文用粗体青色
-    `❯` 用户行与绿色 `◆` 助手行分层，工具头以 `TOOL_HEAD_MARK="    ▎ "` 串联调用/结果，展开正文延续
-    `│` guide；Thinking 用独立色斜体，系统信息/警告/错误分别用 `·`/`!`/`✗`。行内代码与键帽、slash
-    选中行共用 `keycap_bg()` 的主题感知凸起表面（选中行另有 `❯` gutter，不再整行反色）；普通白字不被
-    重染。composer 使用圆角边框与 `composer_bg()`，空闲标题为 ` ◆ MESSAGE `，底边框在空间足够时放
-    Enter / / / Ctrl-J / /help 键帽（窄框先省 `/` 与 Ctrl-J），忙时撤下。状态栏以 `surface_bg()` 铺
-    低对比底色，模型是青色粗体文字而非实心徽章，状态文案为 ready/running/cancelling/failed；累计 token
-    段只在该会话已产生计费（含仅缓存流量）时出现，新会话不显示 0；路径有 48 列显示预算，超长时保留
-    最长完整尾部目录段并加 `…`，不足 12 列则隐藏。空态与 slash popup 共用 grapheme-aware
-    `truncate_line`，角色/工具符号变更必须同步最终折行的 `continuation_prefix`。
+  - **视觉语言与底部 chrome（2026-11 重做，起因是用户原话「显示的 tui 很糟糕，劣质 ui，视觉体验差」）**：
+    定位是「安静的终端」——对话正文用终端默认前景色，**界面任何地方不铺底色**（键帽、composer 与
+    状态行的凸起表面、slash 选中行高亮全部撤掉：填充块预设了终端主题没有承诺的表面，白字黑底的行内
+    代码在浅色主题上直接隐形）。全部视觉靠五种墨色（`theme.rs` 的 `Ink { rgb, idx, ansi }`：
+    accent / dim / faint / warn / error，各给 truecolor、256、16 三种形态，`*_for(light, depth)` 纯函数
+    是单一事实源，`accent_fg()` 等五个取值函数按两个环境变量一次性设定——见下面「调色板与色深」）。
+    角色用行内标记区分：用户 `❯ `、助手 `◆ `（accent，正文默认色，无独立标题行）、思考 `✻ `（dim
+    斜体）。**工具行与系统提示共用两格 gutter**（`transcript::gutter_mark(glyph)` = `TOOL_GUTTER` +
+    符号 + 空格）：调用 `  → name  摘要`（箭头 accent、名称与摘要 dim）、结果 `  ✓ / ✗ name · 耗时  预览`
+    （成功整行 dim、失败 error、耗时 faint）、展开正文走 faint `│ ` guide；系统行 `  · `（dim）/
+    `  ! `（warn）/ `  ✗ `（error），Head 级是 `push_head`（首词加粗默认色、其余 dim、续行缩进 2）。
+    **新增任何一行先问它落在哪条语法上**——角色行、gutter 行、提示行三选一，别发明第四种缩进。
+    **块间距是一条配对规则** `row_gap(prev, next)`：`build_history_lines` 管批内、`view::commit` 管跨批
+    （`Session::committed_tail_blank` 记上一批是否以空行收尾），永不连续两个空行（连续两条系统提示
+    例外地叠成一块）；渲染为空的非末尾 Assistant/Cont 块不占位（流式 Markdown 半截时不留悬空洞），
+    定稿思考去尾空白。开工行只有一行 `◆ TinyAgent v{版本} · {model} · {n} tools`（字标加粗，其余
+    dim；窗口未设的提示是它的 dim 第二行）。空态在输入框正上方放一行 render-only 键位提示
+    （`render::hint_line` / `empty_state_lines`：`  Ctrl-J newline · Esc cancel · /help keys`，键名 dim、
+    标签与分隔符 faint，窄屏先舍中间一对），随第一条消息离开。composer 是圆角边框、空闲时无标题
+    （占位符 `placeholder_line()`），边框色 idle=dim、忙=accent、cancelling=warn、failed=error，忙时
+    标题 `{spinner} {activity}… · {耗时} · Ctrl-C cancel[ · N queued]`。队列预览同样落在 gutter：
+    `  ❯ N queued[ · +M] · 预览`（accent）／`  ! N paused[ · +M] · /resume · 预览`（warn）。
+    状态行一行无底色：`● {model} · ready · ctx … · N in / N out`——状态符号与标签按相位取墨（idle
+    dim / running accent / cancelling warn / failed error），模型默认色，其余段 dim，路径 faint 右对齐；
+    累计 token 段只在该会话已产生计费（含仅缓存流量）时出现，新会话不显示 0；路径有 48 列显示预算，
+    超长时保留最长完整尾部目录段并加 `…`，不足 12 列则隐藏。slash 弹窗无键帽无选中底色（选中行
+    accent `❯` + 默认色），页脚一行 `Tab complete · Enter select / again run · Esc close`。正文、
+    composer、队列行、状态行与空态/弹窗共享左锚定、最多 120 列的工作区（空态/弹窗的宽度参数必须
+    传 `content_w`，不能传 zone 的全宽）。空态与 slash popup 共用 grapheme-aware `truncate_line`，
+    角色/工具符号变更必须同步最终折行的 `continuation_prefix`。
+  - **Markdown 样式表（`markdown::Sheet`，实现 tui-markdown 的 `StyleSheet`）**：样式绑定主题而非
+    库默认色——标题 h1–h3 加粗默认色、h4 起加粗 dim（**字重不靠颜色**，`#` 标记不显示），行内代码
+    accent 无底色，链接 accent 加下划线，引用 dim、GFM alert 按轻重取 accent / warn / error，列表
+    标记 dim、表格边框 faint；围栏代码块由 `render_markdown` 重排成 faint `▎ ` 竖条 + 默认色正文。
+    tui-markdown 把块样式挂在 **line** 上（`flatten_line_style` 把它搬到各 span 再清零——否则行
+    渲染器加在行首的前缀也会被染色）。坑：**孤立的围栏开标记会被库补一个闭标记、渲染成两行**
+    （流式半截的 ``` 开头就凭空多两行），`render_markdown` 对 lone opener 返回零行。
   - **流式增量定稿（`split_streaming_row(&mut rows, width)` + `Row::AssistantCont{text,tight}`）**：
     **只切在途 Assistant，Thinking 与子 agent 都不切**。显示行测量与最终折行共用 grapheme-aware
     `LayoutCell`/`unicode-width` 口径（CJK、ZWJ emoji、variation selector 都按完整 grapheme 处理），
@@ -939,8 +963,14 @@
     的消息标成 paused 并在轮末扣住，而用户从未见过暂停提示。failed 态标题由
     `failed_title(held, width)` 按有无扣住消息给出 `/resume` 或重试提示（空队列时 `/resume` 只会答
     `[no paused queue]`）。
-    `RunPhase::{Idle,Running,Cancelling,Failed}` 驱动标题/边框/状态与 busy popup，重复取消不重复刷
-    `[cancelling…]`。
+    `RunPhase::{Idle,Running,Cancelling,Failed}` 驱动标题/边框/状态与 busy popup。
+    **取消的提示行延后到 run 结束**：`Esc`/`Ctrl-C` 按下当下**不落任何行**——`begin_cancelling`
+    不关流（父正文、子气泡、推理流都留着），队列当场清空但条数记进 `Session::cancel_dropped`；
+    内核停下后（`RunFinished`）才依次落 `! [cancelled]` 与 `! [dropped N queued message(s)]`
+    （`push_cancel_dropped`；error / compact 落地 / worker 死亡三条出口同样把它补上）。原先按键时就
+    落 `[cancelling…]` + dropped 两行，之后还在到达的 delta 只能另起一行，答复的尾巴以孤零零的
+    `◆ 片段` 出现在提示下面——观感像坏了。等待状态只由 chrome 表达（标题
+    `cancelling… · waiting for stop`、状态行 `! cancelling`）。
     相位的转场只经 `RunState` 的方法（`start` / `idle` / `fail` / `begin_cancelling`；`apply_flush`
     是「队列结局 → 转场」的唯一映射），别在 reducer 或按键处理里直接写 `phase`。
   - **TUI 结构（2026-11 重构：`Session` 状态机）**：交互状态只住在一个 `Session`（`session.rs`）里——
@@ -992,12 +1022,12 @@
     （查不到用 `(unknown)`），`elapsed: None`（字段本就为 resume 设计）；Image/Document 分别显示
     `[image attached]` / `[PDF document attached]` 轻量占位，不静默抹掉轮次。resume 时**跳过
     initial_task 镜像**（末条 user 已在转录里，再镜像重复）；`Row` 因此 `pub(crate)`。
-  - **浅色主题**（`TINYAGENT_TUI_THEME=light`）：`THEME_LIGHT: OnceLock<bool>` 进程级一次设定
-    （`run()` 入口读 env，OnceLock 无法复位——**测试不得 set 它**，light/dark 两态逻辑抽纯函数
-    `theme_light_from` / `dim_fg_for` / `code_fg_for` 测）；dim 文字走 `dim_fg()`（dark=Gray 现状 /
-    light=DarkGray），行内代码走 `code_fg()`（dark=White / light=青）并统一铺 `keycap_bg()`——
-    `redye_inline_code` 只重写 tui-markdown 原生的 white-on-black span，别误染普通白字。新增暗色
-    UI 元素用 `dim_fg()` 别再引常量。
+  - **调色板与色深（`theme.rs`）**：`TINYAGENT_TUI_THEME`（`light` / 其它=dark）与
+    `TINYAGENT_TUI_COLOR`（`truecolor` / `256` / `16`，未设看 `COLORTERM`）各是进程级一次设定
+    （`run()` 入口读 env，OnceLock 无法复位——**测试不得 set 它**；纯函数 `theme_light_from` /
+    `color_depth_from` / 五个 `*_for(light, depth)` 才是可测面）。dim 文字走 `dim_fg()`，更淡的
+    分隔符 / 耗时 / 路径走 `faint_fg()`，行内代码与链接走 `accent_fg()`，**都不铺底色**。新增 UI
+    元素从这五个取值函数里选，别引常量、别造第六种墨色。
   - **键位语义**：单行输入（含空）或浏览中 ↑/↓ 走历史召回（判定 `up_is_history`），多行恢复跨行
     移动；`Ctrl-D`/Delete 删后字符（空输入空闲时 Ctrl-D 退出），Ctrl/Alt+←/→ 按词移动，
     Ctrl+Backspace 删词；Shift+Enter / Alt+Enter / Ctrl+J 或行尾 `\`+Enter 换行；补全弹窗

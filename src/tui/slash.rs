@@ -2,12 +2,13 @@
 //! the read-only replies, the completion popup state machine, and the
 //! `/context` report renderer.
 
-use super::render::{keycap, truncate_line};
-use super::theme::{dim_fg, fmt_tokens, fmt_tokens_round, keycap_bg, USER_FG};
+use super::render::{hint_line, truncate_line};
+use super::theme::{accent_fg, dim_fg, faint_fg, fmt_tokens, fmt_tokens_round};
 use crate::config::Config;
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
 
 /// What a `/`-prefixed input line asks for. `Message` = not a command.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -787,10 +788,13 @@ pub(super) fn slash_popup_lines(popup: &SlashPopup, max_rows: usize) -> Vec<Line
 }
 
 /// Render popup rows within the actual zone width, with a one-line key footer.
-/// `/name [arg]` keeps its accent; descriptions and the footer use the theme's
-/// dim color in both dark and light mode. Long rows are cell-width truncated
-/// with an ellipsis, never byte-sliced or allowed to push the caret sideways.
-/// The footer reserves a row only when at least two rows are available.
+/// Selection is a glyph and an ink, never a highlight band: the chosen row
+/// carries the accent `❯` and its name in the terminal's default ink, while
+/// the other rows recede into the secondary ink (their descriptions and
+/// argument hints one step fainter). Names share one column so the
+/// descriptions line up. Long rows are cell-width truncated with an ellipsis,
+/// never byte-sliced or allowed to push the caret sideways. The footer
+/// reserves a row only when at least two rows are available.
 pub(super) fn slash_popup_lines_for(
     popup: &SlashPopup,
     max_rows: usize,
@@ -812,23 +816,48 @@ fn render_slash_popup(
     let show_footer = with_footer && max >= 2;
     let command_rows = if show_footer { max - 1 } else { max };
     let (skip, take) = visible_window(popup.matches.len(), popup.sel, command_rows);
-    let mut lines: Vec<Line<'static>> = popup.matches[skip..skip + take]
+    let visible = &popup.matches[skip..skip + take];
+    // Width of the name column across the visible rows (`/name` plus its
+    // argument hint): every description starts in the same cell.
+    let name_col = visible
+        .iter()
+        .map(|c| {
+            c.name.width()
+                + if c.arg_hint.is_empty() {
+                    1
+                } else {
+                    c.arg_hint.width() + 2
+                }
+        })
+        .max()
+        .unwrap_or(0);
+    let dim = Style::default().fg(dim_fg());
+    let faint = Style::default().fg(faint_fg());
+    let mut lines: Vec<Line<'static>> = visible
         .iter()
         .enumerate()
         .map(|(row, c)| {
             let selected = skip + row == popup.sel;
+            let (mark, name, desc) = if selected {
+                (
+                    Span::styled(" ❯ ", Style::default().fg(accent_fg())),
+                    Style::default(),
+                    dim,
+                )
+            } else {
+                (Span::raw("   "), dim, faint)
+            };
+            let name_text = if c.arg_hint.is_empty() {
+                format!("/{}", c.name)
+            } else {
+                format!("/{} {}", c.name, c.arg_hint)
+            };
+            let pad = name_col.saturating_sub(name_text.width());
             Line::from(vec![
-                Span::styled(
-                    if selected { " ❯ " } else { "   " },
-                    Style::default().fg(USER_FG),
-                ),
-                Span::styled(format!("/{}", c.name), Style::default().fg(USER_FG)),
-                if c.arg_hint.is_empty() {
-                    Span::raw(String::new())
-                } else {
-                    Span::styled(format!(" {}", c.arg_hint), Style::default().fg(dim_fg()))
-                },
-                Span::styled(format!("  {}", c.desc), Style::default().fg(dim_fg())),
+                mark,
+                Span::styled(name_text, name),
+                Span::raw(" ".repeat(pad + 2)),
+                Span::styled(c.desc.to_string(), desc),
             ])
         })
         .collect();
@@ -841,25 +870,16 @@ fn render_slash_popup(
     for line in &mut lines {
         *line = truncate_line(std::mem::take(line), content_w);
     }
-    if popup.sel >= skip && popup.sel < skip + take {
-        let line = &mut lines[popup.sel - skip];
-        line.style = Style::default().bg(keycap_bg());
-        let pad = content_w.saturating_sub(line.width());
-        if pad > 0 {
-            line.spans.push(Span::raw(" ".repeat(pad)));
-        }
-    }
     if show_footer {
         lines.push(truncate_line(
-            Line::from(vec![
-                Span::raw(" "),
-                keycap("Tab"),
-                Span::styled(" complete  ", Style::default().fg(dim_fg())),
-                keycap("Enter"),
-                Span::styled(" select / again run  ", Style::default().fg(dim_fg())),
-                keycap("Esc"),
-                Span::styled(" close", Style::default().fg(dim_fg())),
-            ]),
+            hint_line(
+                1,
+                &[
+                    ("Tab", "complete"),
+                    ("Enter", "select / again run"),
+                    ("Esc", "close"),
+                ],
+            ),
             max_width,
         ));
     }

@@ -10,7 +10,7 @@ use super::keys::Effect;
 use super::render::content_width;
 use super::session::{Session, Startup};
 use super::terminal::{install_diag_bridge, spawn_terminal_disconnect_monitor, TerminalGuard};
-use super::theme::set_theme_from_env;
+use super::theme::{set_color_depth_from_env, set_theme_from_env};
 use super::transcript::{Row, ROLE_BODY_INDENT};
 use super::view;
 use super::worker::{worker_main, DoneSignal, Input, UiMsg};
@@ -35,8 +35,13 @@ pub fn run(
     auto_start: bool,
     resume_rows: Vec<Row>,
 ) -> Result<()> {
-    // Bind the palette knob before any rendering reads dim_fg()/code_fg().
+    // Bind the palette knobs before any rendering reads a color: the theme
+    // (light/dark) and the color depth (TINYAGENT_TUI_COLOR, else COLORTERM).
     set_theme_from_env(std::env::var("TINYAGENT_TUI_THEME").ok());
+    set_color_depth_from_env(
+        std::env::var("TINYAGENT_TUI_COLOR").ok(),
+        std::env::var("COLORTERM").ok(),
+    );
     // UI → worker: user inputs (None = quit).
     let (in_tx, in_rx) = mpsc::channel::<Option<Input>>();
     // Worker → quit-path: the worker signals it has exited, so quitting can

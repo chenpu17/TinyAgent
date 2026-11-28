@@ -418,6 +418,11 @@
   切点前的完整逻辑行（半个 `"```ab"` 不是 closing fence），未闭合 inline code 内不切，closing fence
   滑到 EOF 不切。Markdown 已按正文宽度预折行，**不要再把裸 `◆ `/continuation 宽度重复计入 soft-cut**；
   正确性用真实 `build_history_lines → wrap_history` 的切分前后逐行等价测试钉住。
+- **tui-markdown 0.3 给孤立的围栏开标记自动补一个闭标记**：`render_markdown("```text")` 不是零行
+  也不是一行，而是开标记 + 虚构的闭标记两行；流式回复刚打出半截 ``` 时凭空多两行，闭合后还跳回去。
+  `render_markdown` 对 lone opener 直接返回零行（设计即规格，改之前想清楚为什么）。另：它把块样式
+  挂在 **line** 上，行渲染器之后加在行首的前缀会被一并染色——`flatten_line_style` 先把样式搬到
+  各 span 再清零 line 样式。
 - **TUI 队列不能做成 transcript ghost**：`VecDeque<String>` 是唯一真值，queue preview 仅 render-only；
   真正发送才追加 `Row::User`，否则未发生的输入会阻塞 commit watermark。失败置 Failed + queue_paused，
   只有 `/resume` 释放旧 FIFO；另发新 prompt 不得隐式放行，重复 cancel 不得重复刷状态行。
@@ -681,7 +686,23 @@
   下面、随提交上移。让模拟器自己回（`screen.write_process_input = lambda s: os.write(fd, s.encode())`，
   pyte 的 `report_device_status` 会回真实行列）才贴近用户看到的布局。另：边读边剥 ANSI 时，缓冲区尾部
   的半个转义序列会在补全后改变剥离结果——「发键之后的输出」这类标记要打在解码后的缓冲上，别打在
-  剥离后的长度上。
+  剥离后的长度上。2026-11 视觉重做时又踩到六个，每一个看起来都像产品 bug、实际全是抓屏链路的：
+  ④ **光标要从终端最后一行起步**：真实启动发生在 shell 提示符下面，视口在屏幕底部打开、每次提交滚动
+  整屏；让模拟器从第 0 行起步，视口会沿屏下滑、底下留一串残影——一个用户永远看不到的布局。
+  ⑤ **pty 输出必须用同一个增量 UTF-8 解码器**（`codecs.getincrementaldecoder("utf-8")("replace")`
+  喂整条流）：逐块 `bytes.decode(…, "replace")` 会把跨两次 read 的多字节字符劈成 U+FFFD——画面上是
+  composer 上边框的一个洞加下一行整体错位一格，中文 / emoji 多的流里常见。
+  ⑥ **文本转储要按列稠密取**：ratatui 的 diff 不画「默认样式的空格」cell，pyte 的行缓冲是稀疏字典，
+  只迭代存在的 key 会把其后的格子整体左移（composer 右侧留白消失、`● demo-scripted` 粘在一起）。
+  稠密的 cell grid 才是事实，文本转储只用来搜子串。
+  ⑦ **背靠背写入的两个键会被 crossterm 合成一个组合键**：`Esc` 紧跟 `Ctrl-O`（无间隔）被解析成
+  `Alt+Ctrl+O`，Esc 被吞、输入框没清空，后面的输入接在召回的草稿后面——脚本里独立按键之间留间隔。
+  ⑧ **颜色以样式转储为准，别看图**：PNG 渲染器的 CJK 字体没有斜体、Menlo 缺部分字形（`⇢` 干脆
+  不画、`▎` 画成 `│`），小图上「这段好像不够暗」的判断错过两次；逐段读 `[rrggbb]` 运行段，
+  **没加括号的段就是默认样式**（看着像染色漏了，其实是默认墨色接在彩色段后面）。
+  ⑨ **scrollback 里的残影先怀疑模拟器**：ratatui inline viewport 的 `insert_before` 只滚动
+  `0..viewport_top` 区域，视口内容永不进 scrollback——「视口行漏进历史」不可能是提交机制干的。
+  ⑩ **TUI 里临时的调试打印别走 stdout**：raw 模式下它直接混进画面（也会被抓进 pty 流），写文件。
 - **本机 `strip = "debuginfo"` + macOS 27 的 dyld 拒载绑定的 cdylib（2026-11，环境问题，非仓库缺陷）**：
   症状：`maturin develop` / `npm run build:debug` 都成功，`import tiny_agent` / `require(…)` 当场失败，
   报 `mis-aligned LINKEDIT string pool`。根因：用户级 `~/.cargo/config.toml` 的 `[profile.dev] debug = false`

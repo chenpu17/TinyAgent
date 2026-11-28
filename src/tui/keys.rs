@@ -228,20 +228,19 @@ impl Session {
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             if self.run.phase == RunPhase::Running {
                 self.run.begin_cancelling();
-                self.rows.push(Row::sys_warn("[cancelling…]"));
+                // The queue goes now; its notice waits for the run to end. A
+                // row pushed here would land between the answer and the
+                // chunks still arriving (see `begin_cancelling`).
                 if !self.queued.is_empty() {
-                    self.rows.push(Row::sys_warn(format!(
-                        "[dropped {} queued message(s)]",
-                        self.queued.len()
-                    )));
+                    self.cancel_dropped = Some(self.queued.len());
                     self.queued.clear();
                     // The pause is a property of held
                     // messages: nothing held, nothing paused.
                     self.queue_paused = false;
                 }
             }
-            // Already Cancelling: keep the signal latched but
-            // do not append another row on key repeat.
+            // Already Cancelling: keep the signal latched. The queue was
+            // discarded by the first press; nothing is left to drop.
         } else if code == KeyCode::Char('c') {
             // Ctrl-C in idle: first press arms (notice row),
             // second within the window quits. /quit and /exit

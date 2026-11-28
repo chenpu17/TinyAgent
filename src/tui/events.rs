@@ -20,8 +20,8 @@ use std::time::Instant;
 /// families (Anthropic: end_turn / tool_use / stop_sequence; OpenAI: stop /
 /// tool_calls). Only abnormal stops (max_tokens / length / error / unknown)
 /// get a System row — a routine end needs no noise. `cancelled` is here too:
-/// the Esc/Ctrl-C handler already printed `[cancelling…]`, so a second
-/// `[done: cancelled]` line would just duplicate the notice.
+/// a run stopped by Esc ends in the one `[cancelled]` notice of the completion
+/// path, so a `[done: cancelled]` line would just duplicate it.
 pub(super) fn is_normal_stop(reason: &str) -> bool {
     matches!(
         reason,
@@ -56,6 +56,7 @@ impl Session {
                 self.run.end_all_streams();
                 self.run.fail();
                 self.queue_paused = pause_for_held(true, self.queued.len());
+                self.push_cancel_dropped();
                 if !self.queued.is_empty() {
                     self.rows.push(Row::sys_warn(format!(
                         "[queue paused — {} message(s) held; /resume continues, /unqueue edits]",
@@ -109,17 +110,20 @@ impl Session {
                     None => self.run.phase == RunPhase::Cancelling,
                 };
                 if aborted {
-                    // Exactly one terminal notice; the initial keypress
-                    // already contributed the waiting-state row.
+                    // The one notice of a stopped run — it follows the answer,
+                    // together with the queue the keypress discarded (the
+                    // waiting state itself was chrome only).
                     self.rows.push(Row::sys_warn("[cancelled]"));
+                    self.push_cancel_dropped();
                     self.run.idle();
                 } else if compact.is_some() && self.run.phase == RunPhase::Cancelling {
                     // Only reachable for a compact: an Esc raced a fold
                     // that landed anyway (or a request that concluded on
                     // its own). The outcome's row is already up — report
-                    // what happened, not a cancel that did nothing. The
-                    // queue is empty here: the Esc that entered Cancelling
-                    // dropped it.
+                    // what happened, not a cancel that did nothing. Nothing
+                    // was cancelled, but the queue the Esc discarded is
+                    // still gone: its notice is owed.
+                    self.push_cancel_dropped();
                     self.run.idle();
                 } else if self.queue_paused {
                     // A separate prompt may have completed while an older

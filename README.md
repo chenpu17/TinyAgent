@@ -234,10 +234,14 @@ content scrolls, the selection drifts" is gone. **Input mode** is the default:
 | `Esc` | busy → cancel the current turn; idle → clear the input box (only closes the popup when it is open). Quit via `/quit`, `/exit`, or idle double `Ctrl-C` |
 
 While running, the input box stays editable: keep typing; `Enter` queues the message in FIFO order. A
-separate live preview shows the oldest pending message and queue length — pending text is **not** inserted
-into the transcript as a ghost row and never blocks completed tool output from committing. A message gets
+live preview line in the tool gutter right above the input box shows the count and the oldest pending
+message — `  ❯ 2 queued · +1 · <oldest message>`; after a failed run it turns into the warning
+`  ! 2 paused · +1 · /resume · <oldest message>` — and pending text is **not** inserted into the transcript
+as a ghost row, so it never blocks completed tool output from committing. A message gets
 its real `❯` user row only when delivery starts. `/queue` lists pending text, `/unqueue` withdraws the
-newest pending message into the editor, and `Ctrl-C`/`Esc` cancels the turn **and discards its queue**.
+newest pending message into the editor, and `Ctrl-C`/`Esc` cancels the turn **and discards its queue**:
+the `! [cancelled]` notice (followed by `! [dropped N queued message(s)]` when the queue had messages) is
+printed once the run has stopped, right after the answer's last lines.
 A failed run pauses any held queue instead of firing a cascade of requests: `/resume` explicitly releases
 the next message; sending a separate new prompt does not implicitly release the held FIFO. `/clear`,
 `/context`, `/resume`, and `/compact` are hidden from completion while running (`/context` needs the worker
@@ -258,51 +262,61 @@ by line (same look as Claude Code), and the live region keeps only the last two 
 (early-committed lines are never re-laid-out; unmatched inline-code spans wait for their closing backticks
 rather than being split into visibly corrupted Markdown). **Thinking is deliberately different**: its live
 view is a bounded tail, and the final block commits atomically so a long trace can still fold. An empty
-conversation (or after `/clear`) shows a three-row render-only masthead: a spaced `T I N Y A G E N T`
-wordmark with the version pinned to the same right edge as the composer on wide screens, a two-tone rule
-across the full work area, and a concise tagline. The composer's bottom border carries the key legend
-just below; the sheet does not repeat it. Narrow terminals shed the version first. It is render-only and
-never enters the transcript or `/export`. The one committed row above it, `· session ready · <model> · <n>
-tools`, is also where a note for an unset `limits.max_context_tokens` goes: a dim second line pointing at
-`/context`, not a separate warning.
-Conversation text is capped at 120 columns and left-aligned on wide screens; roles are distinguished by
-inline icons — your messages use a cyan `❯ ` and bold body text, the assistant's a green `◆ ` (no separate title
-line; one line saved per message). Long lines soft-wrap with a hanging indent; code blocks and expanded
-tool output keep their `▎` / `│` guides on continuation rows. Inline code uses the same theme-aware raised
-surface as the keycaps. Tool calls and results share a continuous `▎`
-execution rail under the assistant: calls show a compact argument summary (`key=value` pairs with long values
-elided; `/call` has the full input) and results show status, elapsed time,
-and an output preview. Failed results auto-expand only when they fit both limits (≤20 lines and ≤2000 chars), so one huge
+conversation opens with one committed row, `◆ TinyAgent v<version> · <model> · <n> tools` (the
+wordmark bold, the rest dim). It is also where a note for an unset `limits.max_context_tokens` goes: a
+dim second line pointing at `/context`, not a separate warning. In a fresh or cleared session, right above
+the input box, a render-only key legend — `  Ctrl-J newline · Esc cancel · /help keys` — names the keys the box itself
+does not (the placeholder keeps the `/` pointer); narrow terminals drop the `Esc` pair first. The legend
+leaves with the first message and never enters the transcript or `/export`.
+The palette is deliberately quiet. Conversation text is capped at 120 columns, left-aligned on wide
+screens, and drawn in the terminal's own default foreground — the UI paints no background anywhere — and
+five inks do all the work: an accent (prompts, role marks, the running state), a dim ink (names, previews,
+secondary text), a fainter one (separators, durations, paths), and warn / error. Roles are told apart by
+inline marks: your messages by an accent `❯ `, the assistant's by an accent `◆ ` (no separate title line;
+one line saved per message), both followed by plain text. One blank line separates blocks — never two in a
+row, including across the batches of a streaming reply. Long lines soft-wrap with a hanging indent; fenced
+code blocks carry a faint `▎ ` bar and expanded tool output a faint `│ ` guide. In Markdown, inline code is
+set in the accent ink, links in the accent with an underline, and headings in bold (h1–h3 in the default
+ink, h4 and below in the dim ink) without their `#` markers. Tool calls and results sit in a two-space
+gutter under the assistant: calls show `  → name  <argument summary>` (`key=value` pairs with long values
+elided; `/call` has the full input) and results `  ✓ name · <elapsed>  <preview>` or, in the error ink,
+`  ✗ name · <elapsed>  <preview>`. Failed results auto-expand only when they fit both limits (≤20 lines
+and ≤2000 chars), so one huge
 single-line error cannot flood the screen. Use `/out` for full output and `/call` for full input JSON;
 both append a fresh expanded copy instead of trying to mutate immutable scrollback. While tool arguments
-are streaming, a render-only `receiving arguments` activity appears; JSON fragments never enter the
-transcript. Conversation, composer, queue preview, and status share the same 120-column maximum work area
-on wide screens. The composer uses a rounded frame and a slightly raised theme-aware surface; it soft-wraps
+are streaming, a render-only `  → name · receiving arguments · 3s` activity appears; JSON fragments never
+enter the transcript. System lines share the gutter — `  · text` (info), `  ! text` (warning),
+`  ✗ text` (error) — so notices line up with tool rows instead of competing with the conversation.
+Conversation, composer, queue preview, and status share the same 120-column maximum work area
+on wide screens. The composer is a rounded frame with no background and, while idle, no title — the ` ❯ `
+prompt and the placeholder ` Describe a task… · / for commands` say what it is. It soft-wraps
 long prompts and scrolls vertically to keep the caret visible inside the fixed eight-row inline viewport —
-there is no horizontal input scrolling. While running, the input title shows a spinner, current activity
-(thinking / writing / → tool name), turn elapsed time, cancel hint, and queue length; narrow terminals
-shed detail in stages while preserving the cancel hint. Idle, running, cancelling, and failed have distinct
-titles and border/status colors; the idle title is ` ◆ MESSAGE `, and the bottom border carries matching
-`Enter` / `/` / `Ctrl-J` / `/help` keycaps when they fit (narrow frames drop `/` and Ctrl-J first).
+there is no horizontal input scrolling. While running, the frame and its title take the accent ink; the
+title shows a spinner, current activity (thinking / writing / → tool name), turn elapsed time, cancel
+hint, and queue length (e.g. ` ⠋ writing… · 3s · Ctrl-C cancel · 1 queued `); narrow terminals
+shed detail in stages while preserving the cancel hint. Cancelling turns the frame amber
+(` ⠹ cancelling… · waiting for stop `), a failed run red (` failed · /resume continues the held queue `).
 At the start of a turn with nothing visible yet, the live region shows a transient `◆ …` placeholder
 (synthesized during render, never enters conversation history); it disappears at the first text or tool
-call. A reasoning model's thinking renders as its own italic magenta `✻` block — no markdown, visually
+call. A reasoning model's thinking renders as its own dim italic `✻` block — no markdown, visually
 separate from the reply body, with a `▌` cursor while streaming and the input title showing thinking; once
 the reply starts, the ✻ block finalizes into the scrollback and the reply begins as a normal block (a
 sub-agent's thinking carries a `[name]` tag). A finalized trace longer than eight display rows folds to a
-compact header plus its last three rows; `/thinking [n]` appends the complete n-th newest trace (latest by
+compact header (`✻ Thinking · folded · N rows · /thinking`) plus its last three rows; `/thinking [n]`
+appends the complete n-th newest trace (latest by
 default), and `/export` always includes the full original as `✻ Thinking` sections.
-The status line sits on a subtle theme-aware surface with a cyan text model label rather than a heavy solid
-badge. Its left side keeps only the model, overall run state (`ready` / `running` / `cancelling` / `failed`,
-no idle timer), context occupancy, and cumulative tokens once something has been billed (e.g.
-`1.2k in / 0.8k out`; a fresh session omits the segment instead of showing zeros); the right side
-right-aligns the current directory (instantly tells apart multiple parallel windows). A path longer than its
+The status line is one plain row with no background. The run state leads it as a glyph and label in the
+state's ink — dim `● ready`, accent `◆ running`, amber `! cancelling`, red `✗ failed`, no idle timer —
+followed by the model in the default ink, then context occupancy and cumulative tokens once something has
+been billed, both in the dim ink (e.g. `● my-model · ready · ctx 21% (54.7k/256k) · 1.2k in / 0.8k out`;
+a fresh session omits the token segment instead of showing zeros); the right side right-aligns the current
+directory in the faint ink (instantly tells apart multiple parallel windows). A path longer than its
 48-column display budget keeps the longest complete trailing directory components with an `…` prefix; it is
 hidden entirely if fewer than 12 columns would remain — the first thing narrow screens lose.
 Context occupancy renders as `ctx 54.7k`; once the model's context window
-is set in `limits.max_context_tokens` it becomes `ctx 21% (54.7k/256k)`, turning yellow at ≥60% and red at
+is set in `limits.max_context_tokens` it becomes `ctx 21% (54.7k/256k)`, turning amber at ≥60% and red at
 ≥80%. After the agent has used `todo`, the status bar adds a `plan done/total` segment (e.g. `plan 2/5`,
-green when all complete, yellow in progress), reflecting task-plan progress live — the full checklist stays
+in the accent once every step is complete, dim while work remains), reflecting task-plan progress live — the full checklist stays
 in the most recent `todo` tool-result line. When the terminal narrows, the status bar drops tokens first,
 then plan; the context segment lasts longest, down to just model and run state. On exit (`/quit`,
 `/exit`, or idle double `Ctrl-C`) with messages still queued, the count dropped is reported on stderr
@@ -316,8 +330,9 @@ command name (no space yet), a completion popup floats above the input: filtered
 `Tab`/`Enter` complete the selected command into
 the input box (`/export` appends a trailing space for the path; completion only fills in — one more
 `Enter` executes an abbreviation, guarding against accidental `/clear`; a command typed out in full runs on
-the first `Enter`), `Esc` closes just the popup. The selected row has a `❯`
-gutter and a raised surface; footer keycaps make completion, execution, and dismissal discoverable. Typing a space
+the first `Enter`), `Esc` closes just the popup. The selected row carries an accent `❯` mark in the default ink (no highlight
+surface); a plain footer — `Tab complete · Enter select / again run · Esc close` — makes completion,
+execution, and dismissal discoverable. Typing a space
 enters the argument phase; deleting the `/` or emptying the matches closes the popup automatically; mouse
 clicking is not supported yet; available while running too (commands execute immediately, messages still
 queue):
@@ -362,11 +377,13 @@ multi-line input, use `Shift+Enter`, `Alt+Enter`, or `Ctrl+J`; you can also end 
 press `Enter` (line continuation) — when the terminal reports no modifier keys (e.g. macOS Terminal.app)
 this is the only manual multi-line entry.
 
-Light-terminal support: `TINYAGENT_TUI_THEME=light` starts the TUI with dim text (system lines /
-previews / status segments) switched to a darker mid-gray (readable on both light and dark backgrounds),
-and inline code recolored from white to cyan (white is near-invisible on light). Unset or any other value
-keeps the dark theme; there is no auto-detection (terminal background reporting is unreliable) — set the
-variable explicitly for a light theme.
+Theme and color depth: the TUI uses a dark palette by default; `TINYAGENT_TUI_THEME=light` switches every
+ink to its light counterpart (a darker dim text, a deeper accent blue, amber and red that stay readable on
+a light background — inline code follows the accent). Unset or any other value keeps the dark palette;
+there is no auto-detection (terminal background reporting is unreliable) — set the variable explicitly.
+`TINYAGENT_TUI_COLOR` overrides how the inks are emitted: `truecolor` (24-bit RGB), `256` (matching
+xterm-256 entries), or `16` (the standard ANSI colors). Unset, it follows `COLORTERM`: `truecolor` or
+`24bit` selects 24-bit, anything else 256.
 
 ## MCP client
 
@@ -776,7 +793,7 @@ message and replayed to the same model for the rest of the current turn — stil
 text. A GUI
 (e.g. TinyWorker)
 renders collapsible "thinking" sections from it; headless terminals write thinking to **stderr** (not
-polluting stdout's final reply / `summary`); the TUI renders it as the **separate italic magenta `✻`
+polluting stdout's final reply / `summary`); the TUI renders it as the **separate dim italic `✻`
 block** (no markdown, visually separate from the reply body; the input title shows thinking while it
 streams, then it finalizes into the scrollback with the reply). Batch fragments may override it (a soft
 field, same class as `model`/`max_tokens`; not in `forbidden_batch_override`).
@@ -1932,21 +1949,21 @@ src/  # CLI crate (package tiny-agent, bin tiny-agent): process shell + headless
 ├── harness_tests.rs      ( 1216)  # harness behavior tests (retry ladder / result.json / NDJSON; moved here with harness from the kernel's agent_tests.rs)
 ├── tui.rs                (   33)  # TUI module root (feature tui): mod declarations + public exports (run / transcript_rows)
 └── tui/  # TUI submodules (same tui gate): split from the original 8.7k-line single file by concern, then gathered around one Session state machine
-    ├── app.rs                (  312)  # session assembly + event loop: run entry / channels / worker start / ui_loop (drain → commit → repaint → one key) — holds no state of its own
-    ├── session.rs            (  535)  # the one Session: all interactive state + RunState (phase transitions / queue release / stream closing); the reducers are impl Session blocks in events / keys / commands
+    ├── app.rs                (  317)  # session assembly + event loop: run entry / channels / worker start / ui_loop (drain → commit → repaint → one key) — holds no state of its own
+    ├── session.rs            (  561)  # the one Session: all interactive state + RunState (phase transitions / queue release / stream closing); the reducers are impl Session blocks in events / keys / commands
     ├── worker.rs             (  259)  # worker side: the thread that owns the agent (run / clear / context / compact per input) + the UiMsg / Input messages crossing to and from it
-    ├── events.rs             (  530)  # reducer: worker messages → session (run-level outcomes + one arm per AgentEvent)
-    ├── keys.rs               (  271)  # reducer: keys → session (popup pick / Esc & Ctrl-C chords / line editing / history recall; returns Effect)
+    ├── events.rs             (  534)  # reducer: worker messages → session (run-level outcomes + one arm per AgentEvent)
+    ├── keys.rs               (  270)  # reducer: keys → session (popup pick / Esc & Ctrl-C chords / line editing / history recall; returns Effect)
     ├── commands.rs           (  384)  # reducer: Enter → send now / queue / slash command (busy refusals, worker-bound /clear /context /compact)
-    ├── view.rs               (  302)  # commit + paint: scrollback commit / live viewport draw / the final frame on quit
+    ├── view.rs               (  305)  # commit + paint: scrollback commit / live viewport draw / the final frame on quit
     ├── terminal.rs           (  164)  # terminal ownership: restore guard / tty-disconnect monitor / kernel diag bridge
     ├── input.rs              (  333)  # multi-line InputBuffer editor / input history recall / word & line editing
-    ├── slash.rs              (  867)  # slash commands: classify grammar / read-only replies / completion popup state machine / /context report
-    ├── theme.rs              (  191)  # theme: single source for history-row & chrome colors / light-dark switch TINYAGENT_TUI_THEME / number formatting helpers
-    ├── markdown.rs           (  769)  # markdown & ANSI rendering: render_markdown / escape parsing / fence scanning (shared with streaming splits) / MdCache single-slot cache
-    ├── transcript.rs         ( 1338)  # conversation Row model and all build/mutation logic: history rendering / streaming increments & incremental splits / /export dump / resume rebuild
-    ├── render.rs             ( 1049)  # terminal drawing: scrollback commit_rows / live-region render / input & status bar chrome / width & control-char utilities
-    ├── tests.rs              ( 5101)  # TUI regression tests (TestBackend cell-grid assertions + input / completion / streaming-split logic)
-    └── tests_loop.rs         ( 2399)  # loop-level TUI tests: keys and worker messages driven through a real Session the way ui_loop drives it (rows / queue / worker messages)
+    ├── slash.rs              (  887)  # slash commands: classify grammar / read-only replies / completion popup state machine / /context report
+    ├── theme.rs              (  261)  # five inks (accent / dim / faint / warn / error), each defined for truecolor, 256 and 16 colors: light-dark switch TINYAGENT_TUI_THEME / depth switch TINYAGENT_TUI_COLOR / number formatting helpers
+    ├── markdown.rs           (  919)  # markdown & ANSI rendering: theme-bound style sheet (Sheet) / render_markdown / escape parsing / fence scanning (shared with streaming splits) / MdCache single-slot cache
+    ├── transcript.rs         ( 1413)  # conversation Row model and all build/mutation logic: history rendering (gutter tool lines, block gaps by the row_gap pair rule) / streaming increments & incremental splits / /export dump / resume rebuild
+    ├── render.rs             ( 1032)  # terminal drawing: scrollback commit_rows / live-region chrome (opening row, key legend, queue line, composer title, status line) / width & control-char utilities
+    ├── tests.rs              ( 6766)  # TUI regression tests (TestBackend cell-grid assertions + input / completion / streaming-split logic)
+    └── tests_loop.rs         ( 3760)  # loop-level TUI tests: keys and worker messages driven through a real Session the way ui_loop drives it (rows / queue / worker messages)
 ```
 <!-- END CODE STRUCTURE -->

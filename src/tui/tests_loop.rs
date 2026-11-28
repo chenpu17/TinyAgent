@@ -7,7 +7,8 @@
 
 use super::keys::Effect;
 use super::session::{RunPhase, Session, Startup};
-use super::transcript::{Row, SysLevel};
+use super::theme::{accent_fg, dim_fg, error_fg, faint_fg, warn_fg};
+use super::transcript::{render_transcript, Row, SysLevel};
 use super::view;
 use super::worker::{CompactReport, Input, UiMsg};
 use crate::agent::{AgentEvent, CompressTrigger, TodoItem};
@@ -16,24 +17,55 @@ use crate::context_report as cr;
 use crate::provider::Usage;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::backend::TestBackend;
+use ratatui::buffer::Cell;
 use ratatui::layout::Position;
-use ratatui::Terminal;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::{Terminal, TerminalOptions, Viewport};
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use tiny_agent::diag::DiagLevel;
+use unicode_width::UnicodeWidthStr;
 
 // ── Harness ───────────────────────────────────────────────────────────
 
 /// Body width the loop hands the reducer on a 100-column terminal.
 const SPLIT_W: usize = 82;
 
-/// The one row every fresh session starts with.
-const HELLO: &str = "!session ready · test-model · 0 tools";
+/// The one row every fresh session starts with: the session's brand, the
+/// model and the tool count. It is a `Head` row — neither a notice nor part
+/// of any run.
+const HEAD_TEXT: &str = concat!(
+    "TinyAgent v",
+    env!("CARGO_PKG_VERSION"),
+    " · test-model · 0 tools"
+);
+
+/// `HEAD_TEXT` as the scrollback prints it: the agent's mark, then the meta.
+const HEAD_LINE: &str = concat!(
+    "◆ TinyAgent v",
+    env!("CARGO_PKG_VERSION"),
+    " · test-model · 0 tools"
+);
+
+/// `HEAD_TEXT` in the row tokens `shape` speaks.
+const HELLO: &str = concat!(
+    "!TinyAgent v",
+    env!("CARGO_PKG_VERSION"),
+    " · test-model · 0 tools"
+);
 
 /// The size of the cell grid every `screen` is painted into.
 const W: u16 = 80;
 const H: u16 = 8;
+
+/// The height of the screen the inline-terminal tests work on: taller than
+/// the live band, so a conversation builds up between the top of the screen
+/// and the band before any of it has to reach the scrollback.
+const SCREEN_H: u16 = 24;
+
+/// The key legend of an empty session, as the band prints it.
+const LEGEND: &str = "  Ctrl-J newline · Esc cancel · /help keys";
 
 fn cfg() -> Config {
     serde_json::from_value(json!({
@@ -256,14 +288,12 @@ fn shape(s: &Session) -> Vec<String> {
 }
 
 /// Every notice row since the session started, in order.
+///
+/// The session's opening row is not a notice. It is told apart by its level
+/// (`Head` is only ever minted by `Session::new`) — not by its text, which
+/// moves with the version, the model and the tool count.
 fn notices(s: &Session) -> Vec<String> {
-    s.rows
-        .iter()
-        .filter_map(|r| match r {
-            Row::System { text, .. } if !text.starts_with("session ready") => Some(text.clone()),
-            _ => None,
-        })
-        .collect()
+    notice_rows(s).map(|(text, _)| text.clone()).collect()
 }
 
 fn latest_notice(s: &Session) -> String {
@@ -273,13 +303,17 @@ fn latest_notice(s: &Session) -> String {
 }
 
 fn levels(s: &Session) -> Vec<SysLevel> {
-    s.rows
-        .iter()
-        .filter_map(|r| match r {
-            Row::System { text, level } if !text.starts_with("session ready") => Some(*level),
-            _ => None,
-        })
-        .collect()
+    notice_rows(s).map(|(_, level)| level).collect()
+}
+
+fn notice_rows(s: &Session) -> impl Iterator<Item = (&String, SysLevel)> {
+    s.rows.iter().filter_map(|r| match r {
+        Row::System { text, level } => match level {
+            SysLevel::Head => None,
+            SysLevel::Info | SysLevel::Warn | SysLevel::Error => Some((text, *level)),
+        },
+        _ => None,
+    })
 }
 
 fn assistant_rows(s: &Session) -> Vec<&str> {
@@ -860,17 +894,57 @@ fn a_failed_run_says_why_and_pauses_the_queue_only_when_one_is_held() {
 
 #[test]
 fn an_error_after_esc_reports_the_error_not_a_cancel() {
+    // Nothing queued: the failure is what happened; nothing was cancelled.
     let (mut s, rx, _cancel) = session();
     in_flight(&mut s, &rx);
     assert_eq!(esc(&mut s), Effect::None);
-    assert_eq!(s.run.phase, RunPhase::Cancelling);
     msg(&mut s, UiMsg::Error("socket closed".into()));
     assert_eq!(s.run.phase, RunPhase::Failed);
     assert_eq!(
         notices(&s),
-        ["[cancelling…]", "[error] socket closed"],
+        ["[error] socket closed"],
         "the failure is what happened; nothing was cancelled"
     );
+    assert_eq!(levels(&s), [SysLevel::Error]);
+    assert!(!s.queue_paused, "nothing held, nothing paused");
+
+    // A message the cancel key dropped is reported after the error, as
+    // dropped — never as sent.
+    let (mut s, rx, _cancel) = session();
+    in_flight(&mut s, &rx);
+    assert_eq!(command(&mut s, "later"), Effect::None);
+    assert_eq!(esc(&mut s), Effect::None);
+    msg(&mut s, UiMsg::Error("socket closed".into()));
+    assert_eq!(s.run.phase, RunPhase::Failed);
+    assert_eq!(
+        shape(&s),
+        [
+            HELLO,
+            "U:go",
+            "![error] socket closed",
+            "![dropped 1 queued message(s)]",
+        ]
+    );
+    assert_eq!(levels(&s), [SysLevel::Error, SysLevel::Warn]);
+    assert!(!s.queue_paused);
+    assert!(drain(&rx).is_empty());
+
+    // A message queued after the cancel key was not dropped: it is held for
+    // the next run like any message behind a failure.
+    let (mut s, rx, _cancel) = session();
+    in_flight(&mut s, &rx);
+    assert_eq!(esc(&mut s), Effect::None);
+    assert_eq!(command(&mut s, "during"), Effect::None);
+    msg(&mut s, UiMsg::Error("socket closed".into()));
+    assert_eq!(
+        notices(&s),
+        [
+            "[error] socket closed",
+            "[queue paused — 1 message(s) held; /resume continues, /unqueue edits]",
+        ]
+    );
+    assert!(s.queue_paused);
+    assert!(drain(&rx).is_empty());
 }
 
 #[test]
@@ -930,62 +1004,207 @@ fn a_held_queue_stays_held_while_a_new_prompt_runs() {
 
 // ── Cancel ────────────────────────────────────────────────────────────
 
+/// The two cancel keys share one handler (`on_cancel`): `ctrl_c` picks
+/// Ctrl-C, otherwise Esc.
+fn cancel_key(s: &mut Session, ctrl_c: bool) -> Effect {
+    if ctrl_c {
+        ctrl(s, 'c')
+    } else {
+        esc(s)
+    }
+}
+
 #[test]
 fn esc_cancels_the_run_and_the_finish_reports_it_once() {
-    let (mut s, rx, cancel) = session();
-    in_flight(&mut s, &rx);
-    ev(&mut s, AgentEvent::TextDelta("partial answer".into()));
+    for ctrl_c in [false, true] {
+        let (mut s, rx, cancel) = session();
+        in_flight(&mut s, &rx);
+        ev(&mut s, AgentEvent::TextDelta("partial answer".into()));
 
-    assert_eq!(esc(&mut s), Effect::None);
-    assert!(
-        cancel.load(Ordering::Relaxed),
-        "the worker's cancel flag is raised"
-    );
-    assert_eq!(s.run.phase, RunPhase::Cancelling);
-    assert_eq!(s.run.activity, "cancelling");
-    assert!(
-        !s.run.stream_open(),
-        "the open answer is cut where the cancel found it"
-    );
-    assert_eq!(notices(&s), ["[cancelling…]"]);
+        // At the keypress: the flag and the phase — and not one row. The
+        // answer is neither cut nor closed; it stays open until the run stops.
+        assert_eq!(cancel_key(&mut s, ctrl_c), Effect::None);
+        assert!(
+            cancel.load(Ordering::Relaxed),
+            "the worker's cancel flag is raised"
+        );
+        assert_eq!(s.run.phase, RunPhase::Cancelling);
+        assert_eq!(s.run.activity, "cancelling");
+        assert!(s.run.stream_open(), "the answer is still open");
+        assert!(notices(&s).is_empty(), "nothing is pushed at the keypress");
+        assert_eq!(shape(&s), [HELLO, "U:go", "A:partial answer"]);
 
-    // A held Esc (key repeat) must not stack notices.
-    assert_eq!(esc(&mut s), Effect::None);
-    assert_eq!(notices(&s), ["[cancelling…]"]);
+        // A held key (key repeat) neither stacks notices nor closes anything.
+        assert_eq!(cancel_key(&mut s, ctrl_c), Effect::None);
+        assert!(notices(&s).is_empty());
+        assert!(s.run.stream_open());
+        assert_eq!(s.run.phase, RunPhase::Cancelling);
 
-    ev(
-        &mut s,
-        AgentEvent::Done {
-            stop_reason: "cancelled".into(),
-        },
-    );
-    msg(&mut s, UiMsg::RunFinished);
-    assert_eq!(s.run.phase, RunPhase::Idle);
-    assert_eq!(notices(&s), ["[cancelling…]", "[cancelled]"]);
-    // The flag stays latched: only the worker clears it, when it accepts the
-    // next task (see `worker_main`).
-    assert!(cancel.load(Ordering::Relaxed));
-    assert!(drain(&rx).is_empty());
+        // What the kernel still streams before it stops joins the answer it
+        // belongs to: no second row, no stranded fragment — and the band
+        // keeps saying the run is stopping, not writing.
+        ev(&mut s, AgentEvent::TextDelta(" goes on".into()));
+        ev(&mut s, AgentEvent::TextDelta(" and ends".into()));
+        assert_eq!(
+            shape(&s),
+            [HELLO, "U:go", "A:partial answer goes on and ends"]
+        );
+        assert!(s.run.stream_open());
+        assert_eq!(s.run.phase, RunPhase::Cancelling);
+        let rows = screen(&mut s);
+        assert_eq!(
+            rows[3], "◆ partial answer goes on and ends▌",
+            "the live answer grows in place: {rows:?}"
+        );
+        assert!(
+            rows[4].contains("cancelling… · waiting for stop"),
+            "the composer still says the run is stopping: {rows:?}"
+        );
+        assert!(rows[7].starts_with("! test-model · cancelling"), "{rows:?}");
+
+        // The finish reports the cancel once, after the answer's last row.
+        ev(
+            &mut s,
+            AgentEvent::Done {
+                stop_reason: "cancelled".into(),
+            },
+        );
+        msg(&mut s, UiMsg::RunFinished);
+        assert_eq!(s.run.phase, RunPhase::Idle);
+        assert!(!s.run.stream_open());
+        assert_eq!(
+            shape(&s),
+            [
+                HELLO,
+                "U:go",
+                "A:partial answer goes on and ends",
+                "![cancelled]",
+            ]
+        );
+        assert_eq!(notices(&s), ["[cancelled]"], "reported once, by the finish");
+        assert_eq!(levels(&s), [SysLevel::Warn]);
+        // The flag stays latched: only the worker clears it, when it accepts
+        // the next task (see `worker_main`).
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(drain(&rx).is_empty());
+    }
 }
 
 #[test]
 fn cancelling_a_run_drops_the_messages_queued_behind_it() {
     let (mut s, rx, _cancel) = session();
     in_flight(&mut s, &rx);
+    ev(&mut s, AgentEvent::TextDelta("partial answer".into()));
     assert_eq!(command(&mut s, "later"), Effect::None);
+    assert_eq!(command(&mut s, "and later still"), Effect::None);
 
+    // The queue goes at the keypress…
     assert_eq!(esc(&mut s), Effect::None);
     assert!(queued(&s).is_empty());
     assert!(!s.queue_paused, "nothing held, nothing paused");
-    assert_eq!(
-        notices(&s),
-        ["[cancelling…]", "[dropped 1 queued message(s)]"]
-    );
+    // …but is only reported once the run has stopped.
+    assert!(notices(&s).is_empty(), "nothing is pushed at the keypress");
+    assert_eq!(shape(&s), [HELLO, "U:go", "A:partial answer"]);
 
     msg(&mut s, UiMsg::RunFinished);
     assert_eq!(s.run.phase, RunPhase::Idle);
-    assert_eq!(latest_notice(&s), "[cancelled]");
+    assert_eq!(
+        shape(&s),
+        [
+            HELLO,
+            "U:go",
+            "A:partial answer",
+            "![cancelled]",
+            "![dropped 2 queued message(s)]",
+        ],
+        "the dropped queue follows the [cancelled] row"
+    );
+    assert_eq!(levels(&s), [SysLevel::Warn, SysLevel::Warn]);
     assert!(drain(&rx).is_empty());
+}
+
+/// A stream that was open when the cancel key arrived keeps its row: what
+/// arrives after it is appended there (parent trace, parent answer, child
+/// bubble) — nothing is closed at the keypress, so no late chunk is left to
+/// open a stray row under it.
+#[test]
+fn a_late_chunk_after_the_cancel_key_joins_its_own_open_row() {
+    // The parent's trace, then the answer that follows it.
+    let (mut s, rx, _cancel) = session();
+    in_flight(&mut s, &rx);
+    ev(&mut s, AgentEvent::ThinkingDelta("let me ".into()));
+    assert_eq!(esc(&mut s), Effect::None);
+    ev(&mut s, AgentEvent::ThinkingDelta("think".into()));
+    assert_eq!(shape(&s), [HELLO, "U:go", "T:let me think"]);
+    assert!(s.run.stream_open(), "the trace is still open");
+    assert_eq!(screen(&mut s)[3], "✻ let me think▌");
+    ev(&mut s, AgentEvent::TextDelta("Hello".into()));
+    assert_eq!(shape(&s), [HELLO, "U:go", "T:let me think", "A:Hello"]);
+    assert!(notices(&s).is_empty());
+    assert_eq!(s.run.phase, RunPhase::Cancelling);
+
+    // A child's bubble.
+    let (mut s, rx, _cancel) = session();
+    in_flight(&mut s, &rx);
+    sub(&mut s, "scout", AgentEvent::TextDelta("looking ".into()));
+    assert_eq!(esc(&mut s), Effect::None);
+    sub(&mut s, "scout", AgentEvent::TextDelta("around".into()));
+    assert_eq!(shape(&s), [HELLO, "U:go", "A:[scout] looking around"]);
+    assert!(s.run.stream_open(), "the bubble is still open");
+    assert!(notices(&s).is_empty());
+    assert_eq!(s.run.phase, RunPhase::Cancelling);
+}
+
+/// The worker dying while a run is in flight is the one exit that cannot
+/// wait for the run to finish: it reports what it can, and folds what the
+/// cancel key had already dropped into the same count as what it still held.
+#[test]
+fn a_dead_worker_folds_the_cancel_dropped_queue_into_one_notice() {
+    let (mut s, rx, _cancel) = session();
+    in_flight(&mut s, &rx);
+    assert_eq!(command(&mut s, "first"), Effect::None);
+    assert_eq!(esc(&mut s), Effect::None);
+    assert!(queued(&s).is_empty(), "dropped by the cancel key");
+    // Queued after the cancel: still held.
+    assert_eq!(command(&mut s, "second"), Effect::None);
+    assert_eq!(command(&mut s, "third"), Effect::None);
+
+    assert!(s.reset_after_worker_exit());
+    assert!(s.dirty, "the exit changed the screen");
+    assert_eq!(s.run.phase, RunPhase::Failed);
+    assert_eq!(
+        shape(&s),
+        [
+            HELLO,
+            "U:go",
+            "![worker stopped unexpectedly — type /quit to exit]",
+            "![dropped 3 queued message(s)]",
+        ]
+    );
+    assert_eq!(levels(&s), [SysLevel::Error, SysLevel::Warn]);
+    assert!(queued(&s).is_empty());
+
+    // The exit is reported once.
+    assert!(!s.reset_after_worker_exit());
+    assert_eq!(notices(&s).len(), 2);
+
+    // Without a cancel only the held queue counts, and an idle session has
+    // nothing to report at all.
+    let (mut s, rx, _cancel) = session();
+    in_flight(&mut s, &rx);
+    assert_eq!(command(&mut s, "later"), Effect::None);
+    assert!(s.reset_after_worker_exit());
+    assert_eq!(
+        notices(&s),
+        [
+            "[worker stopped unexpectedly — type /quit to exit]",
+            "[dropped 1 queued message(s)]",
+        ]
+    );
+
+    let (mut s, _rx, _cancel) = session();
+    assert!(!s.reset_after_worker_exit());
+    assert!(notices(&s).is_empty());
 }
 
 // ── /compact ──────────────────────────────────────────────────────────
@@ -1077,39 +1296,82 @@ fn a_compact_that_folded_nothing_explains_itself_and_keeps_the_context() {
 
 #[test]
 fn an_esc_during_a_compact_is_reported_as_a_cancel_and_nothing_else() {
-    let (mut s, _rx, _cancel) = session();
-    assert_eq!(command(&mut s, "/compact "), Effect::None);
-    assert_eq!(esc(&mut s), Effect::None);
-    assert_eq!(s.run.phase, RunPhase::Cancelling);
+    // With and without a message queued behind the compact: what the cancel
+    // dropped follows the `[cancelled]` row once the request has stopped.
+    for queued_behind in [0, 1] {
+        let (mut s, rx, _cancel) = session();
+        assert_eq!(command(&mut s, "/compact "), Effect::None);
+        assert_eq!(drain(&rx), vec![Some(Input::Compact(None))]);
+        for _ in 0..queued_behind {
+            assert_eq!(command(&mut s, "later"), Effect::None);
+        }
+        assert_eq!(esc(&mut s), Effect::None);
+        assert_eq!(s.run.phase, RunPhase::Cancelling);
+        assert!(notices(&s).is_empty(), "nothing is pushed at the keypress");
 
-    msg(&mut s, compact_done(false, true, Some(bill(40, 0))));
-    assert_eq!(s.run.phase, RunPhase::Idle);
-    assert_eq!(
-        notices(&s),
-        ["[cancelling…]", "[cancelled]"],
-        "no second 'request cancelled' line after it"
-    );
-    assert_eq!(
-        totals(&s),
-        [40, 0, 0, 0],
-        "what the aborted request burned is billed"
-    );
+        msg(&mut s, compact_done(false, true, Some(bill(40, 0))));
+        assert_eq!(s.run.phase, RunPhase::Idle);
+        let mut expected = vec!["[cancelled]"];
+        if queued_behind > 0 {
+            expected.push("[dropped 1 queued message(s)]");
+        }
+        assert_eq!(
+            notices(&s),
+            expected,
+            "no second 'request cancelled' line after it"
+        );
+        assert_eq!(levels(&s), vec![SysLevel::Warn; expected.len()]);
+        assert_eq!(
+            totals(&s),
+            [40, 0, 0, 0],
+            "what the aborted request burned is billed"
+        );
+        assert!(drain(&rx).is_empty());
+    }
 }
 
 #[test]
 fn an_esc_that_lost_the_race_to_a_finished_fold_reports_the_fold() {
-    let (mut s, _rx, _cancel) = session();
+    let (mut s, rx, _cancel) = session();
     assert_eq!(command(&mut s, "/compact "), Effect::None);
+    assert_eq!(drain(&rx), vec![Some(Input::Compact(None))]);
+    assert_eq!(command(&mut s, "later"), Effect::None);
     assert_eq!(esc(&mut s), Effect::None);
     assert_eq!(s.run.phase, RunPhase::Cancelling);
+    assert!(notices(&s).is_empty(), "nothing is pushed at the keypress");
 
-    msg(&mut s, compact_done(true, false, None));
+    // The fold had already happened when the cancel landed: the kernel
+    // reports it, and the summary request is billed like any other.
+    ev(
+        &mut s,
+        AgentEvent::Compressed {
+            dropped: 12,
+            folded_ids: vec![],
+            kept: 4,
+            trigger: CompressTrigger::Manual,
+            estimated_tokens_before: 9000,
+            estimated_tokens_after: 2000,
+            measured_tokens_before: None,
+        },
+    );
+    assert_eq!(
+        notices(&s),
+        ["[context compressed (manual): dropped 12 messages, 4 kept]"]
+    );
+    msg(&mut s, compact_done(true, false, Some(bill(1200, 80))));
     assert_eq!(s.run.phase, RunPhase::Idle);
     assert_eq!(
         notices(&s),
-        ["[cancelling…]"],
-        "nothing was cancelled: no [cancelled]"
+        [
+            "[context compressed (manual): dropped 12 messages, 4 kept]",
+            "[dropped 1 queued message(s)]",
+        ],
+        "nothing was cancelled: no [cancelled]; the queue the cancel key \
+         dropped is still reported"
     );
+    assert_eq!(levels(&s), [SysLevel::Info, SysLevel::Warn]);
+    assert_eq!(totals(&s), [1200, 80, 0, 0]);
+    assert!(drain(&rx).is_empty());
 }
 
 // ── Kernel notes and /context ─────────────────────────────────────────
@@ -1591,7 +1853,11 @@ fn export_writes_a_new_file_and_never_clobbers_an_existing_one() {
     assert!(s.composer.input.is_empty());
     let text = std::fs::read_to_string(&path).expect("the export landed");
     std::fs::remove_file(&path).expect("clean up");
-    assert!(text.contains("session ready"), "{text}");
+    assert_eq!(
+        text,
+        format!("{HEAD_TEXT}\n\n\n"),
+        "the opening row goes out as a plain caption — no notice marker"
+    );
 
     // The TUI has no undo: an existing file is refused untouched, and the
     // command comes back for a different path.
@@ -2065,30 +2331,43 @@ fn idle_only_commands_are_hidden_from_the_popup_while_a_run_is_in_flight() {
 
 /// Paint the live viewport into a fresh cell grid and return its rows
 /// (trailing blanks stripped). A fresh terminal each time: the loop's
-/// scrollback commits are the terminal's business (`commit` below pins the
-/// watermark); this reads what `draw` makes of the session.
+/// scrollback commits are the terminal's business (`committed_lines` below
+/// reads them back); this reads what `draw` makes of the session.
 fn screen(s: &mut Session) -> Vec<String> {
-    rows_of(paint(s))
+    grid_rows(&paint(s))
 }
 
 /// The frame the loop leaves painted when it ends (`view::final_frame`).
 fn final_screen(s: &mut Session) -> Vec<String> {
     let mut term = Terminal::new(TestBackend::new(W, H)).unwrap();
     view::final_frame(s, &mut term, &cfg());
-    rows_of(term)
+    grid_rows(&term)
 }
 
-fn rows_of(term: Terminal<TestBackend>) -> Vec<String> {
+/// `screen` on a terminal `width` columns wide: the band is always
+/// `INLINE_HEIGHT` rows, only its width follows the terminal.
+fn sized_screen(s: &mut Session, width: u16) -> Vec<String> {
+    let mut term = Terminal::new(TestBackend::new(width, H)).unwrap();
+    term.draw(|f| view::draw(f, s, &cfg())).unwrap();
+    grid_rows(&term)
+}
+
+/// The text of a painted grid, one string per row, trailing blanks stripped.
+fn grid_rows(term: &Terminal<TestBackend>) -> Vec<String> {
     let buf = term.backend().buffer();
-    (0..H)
-        .map(|y| {
-            (0..W)
-                .map(|x| buf[(x, y)].symbol())
-                .collect::<String>()
-                .trim_end()
-                .to_string()
-        })
+    let (width, height) = (buf.area.width as usize, buf.area.height as usize);
+    (0..height)
+        .map(|y| row_text(&buf.content, width, y))
         .collect()
+}
+
+fn row_text(cells: &[Cell], width: usize, y: usize) -> String {
+    cells[y * width..(y + 1) * width]
+        .iter()
+        .map(|c| c.symbol())
+        .collect::<String>()
+        .trim_end()
+        .to_string()
 }
 
 fn paint(s: &mut Session) -> Terminal<TestBackend> {
@@ -2097,32 +2376,176 @@ fn paint(s: &mut Session) -> Terminal<TestBackend> {
     term
 }
 
-#[test]
-fn the_first_screen_shows_the_masthead_until_the_user_types() {
-    let (mut s, rx, _cancel) = session();
-    let rows = screen(&mut s);
-    assert_eq!(rows.len(), 8);
-    assert!(rows[0].contains("T I N Y A G E N T"), "{rows:?}");
-    assert!(
-        rows[2].contains("A small agent for real terminal work."),
-        "{rows:?}"
-    );
-    assert!(rows[4].contains("◆ MESSAGE"), "{rows:?}");
-    assert!(rows[5].contains("Describe a task…"), "{rows:?}");
-    assert!(
-        rows[6].contains("Enter") && rows[6].contains("send"),
-        "{rows:?}"
-    );
-    assert!(rows[7].contains("ready"), "{rows:?}");
+/// A terminal the way the loop owns one: an INLINE viewport anchored at the
+/// cursor, where `insert_before` — and with it `view::commit` — really
+/// writes. (`Terminal::new` is a fullscreen viewport, where `insert_before`
+/// is a no-op: fine for `draw`, blind to commits.)
+fn inline_terminal(width: u16) -> Terminal<TestBackend> {
+    Terminal::with_options(
+        TestBackend::new(width, SCREEN_H),
+        TerminalOptions {
+            viewport: Viewport::Inline(view::INLINE_HEIGHT),
+        },
+    )
+    .unwrap()
+}
 
-    typed(&mut s, "he");
-    let rows = screen(&mut s);
-    assert!(
-        !rows.iter().any(|r| r.contains("T I N Y")),
-        "the masthead makes room for the conversation: {rows:?}"
+/// Everything `view::commit` has written so far, top to bottom — the
+/// transcript as the terminal holds it: what has scrolled off, then what is
+/// still on screen above the live band. Trailing blanks stripped, so a
+/// spacer row reads as `""`.
+///
+/// Takes the terminal mutably: where the band starts is only told by a
+/// frame's area, so this paints one empty frame (the band goes blank; what
+/// is above it is not touched).
+fn committed_lines(term: &mut Terminal<TestBackend>) -> Vec<String> {
+    let top = band_top(term);
+    let backend = term.backend();
+    let scrolled = backend.scrollback();
+    let mut lines: Vec<String> = scrolled
+        .content
+        .chunks(scrolled.area.width as usize)
+        .map(|row| row_text(row, scrolled.area.width as usize, 0))
+        .collect();
+    let on_screen = backend.buffer();
+    let width = on_screen.area.width as usize;
+    let above = top * width;
+    lines.extend(
+        on_screen.content[..above]
+            .chunks(width)
+            .map(|row| row_text(row, width, 0)),
     );
-    assert!(rows[5].contains("❯ he"), "{rows:?}");
-    assert!(drain(&rx).is_empty());
+    lines
+}
+
+/// The cells behind `committed_lines`, for ink checks.
+fn committed_cells(term: &mut Terminal<TestBackend>) -> Vec<Cell> {
+    let top = band_top(term);
+    let scrolled = term.backend().scrollback();
+    let mut cells = scrolled.content.clone();
+    let on_screen = term.backend().buffer();
+    cells.extend_from_slice(&on_screen.content[..top * on_screen.area.width as usize]);
+    cells
+}
+
+/// Where the live band starts on screen. Only a frame knows it (`Frame::area`
+/// is the viewport; a completed frame reports the whole screen), so this
+/// paints one empty frame to ask — which also blanks the band, and leaves
+/// what is above it untouched.
+fn band_top(term: &mut Terminal<TestBackend>) -> usize {
+    let mut top = 0;
+    term.draw(|f| top = f.area().top()).unwrap();
+    top as usize
+}
+
+/// One painted row as the eye reads it: its styled runs — same-style
+/// neighbours folded, all-blank runs dropped. The text alone cannot tell the
+/// accent `◆` of an answer from the dim `✻` of a trace, or a dim notice
+/// from a red one.
+fn screen_runs(term: &Terminal<TestBackend>, y: u16) -> Vec<(String, Style)> {
+    let buf = term.backend().buffer();
+    runs_of(&buf.content, buf.area.width as usize, y as usize)
+}
+
+/// The runs of the committed transcript line `y`, counted like
+/// `committed_lines`.
+fn committed_runs(term: &mut Terminal<TestBackend>, y: usize) -> Vec<(String, Style)> {
+    let cells = committed_cells(term);
+    let width = term.backend().scrollback().area.width as usize;
+    runs_of(&cells, width, y)
+}
+
+fn runs_of(cells: &[Cell], width: usize, y: usize) -> Vec<(String, Style)> {
+    // Like `row_text`: the row is read up to its last visible cell, so a run
+    // is not padded out with the blanks that follow it.
+    let row = &cells[y * width..(y + 1) * width];
+    let last = row.iter().rposition(|c| !c.symbol().trim().is_empty());
+    let Some(last) = last else {
+        return Vec::new();
+    };
+    let mut runs: Vec<(String, Style)> = Vec::new();
+    for cell in &row[..=last] {
+        let style = ink_of(cell);
+        match runs.last_mut() {
+            Some((text, s)) if *s == style => text.push_str(cell.symbol()),
+            _ => runs.push((cell.symbol().to_string(), style)),
+        }
+    }
+    runs.retain(|(text, _)| !text.trim().is_empty());
+    runs
+}
+
+/// A cell's foreground and modifiers, as the run checks compare them. A cell
+/// stores its colors as plain values — the terminal's own foreground is
+/// `Reset` — so its own `style()` never equals a built one; the expected inks
+/// go through `Style::default().fg(..)` the same way (`terminal_ink()` for
+/// the unset one). The background is left out on purpose:
+/// `assert_no_background` reads it over the same cells.
+fn ink_of(cell: &Cell) -> Style {
+    Style::default().fg(cell.fg).add_modifier(cell.modifier)
+}
+
+/// The terminal's own foreground: no ink of the interface's own.
+fn terminal_ink() -> Style {
+    Style::default().fg(Color::Reset)
+}
+
+/// A middle row of the composer box: `inner` between the two vertical rules,
+/// padded out to the box's inner width.
+fn framed(inner: &str) -> String {
+    let pad = (W as usize - 2).saturating_sub(inner.width());
+    format!("│{inner}{}│", " ".repeat(pad))
+}
+
+/// The status row without its right-aligned path: the cwd is whatever
+/// directory the test binary was started in.
+fn status_of(rows: &[String]) -> &str {
+    rows[7].split("  ").next().unwrap_or("")
+}
+
+/// No cell may paint a background — the interface is the terminal's own
+/// surface, ink only.
+fn assert_no_background(cells: &[Cell], what: &str) {
+    let painted = cells.iter().filter(|c| c.bg != Color::Reset).count();
+    assert_eq!(painted, 0, "{what}: {painted} cell(s) paint a background");
+}
+
+/// A tool result's head as committed: `  <glyph> <name>[ · <elapsed>][
+/// <first line of the preview>]`. The elapsed time shows once the call took
+/// a tenth of a second — a test's own call takes far less, but the head must
+/// not depend on that.
+fn is_result_head(line: &str, glyph: &str, name: &str, summary: &str) -> bool {
+    let Some(rest) = line.strip_prefix(&format!("  {glyph} {name}")) else {
+        return false;
+    };
+    let (head, preview) = match rest.split_once("  ") {
+        Some((head, preview)) => (head, Some(preview)),
+        None => (rest, None),
+    };
+    let head = head.strip_prefix(" · ").unwrap_or(head);
+    (head.is_empty() || is_elapsed(head))
+        && match (summary, preview) {
+            ("", None) => true,
+            (summary, Some(preview)) if !summary.is_empty() => preview.starts_with(summary),
+            _ => false,
+        }
+}
+
+/// `0.0s`, `12.3s`, `90s` — a duration as the result heads print it.
+fn is_elapsed(s: &str) -> bool {
+    let digits = s.strip_suffix('s').unwrap_or_default();
+    !digits.is_empty()
+        && digits.chars().filter(|c| *c == '.').count() <= 1
+        && digits.chars().all(|c| c.is_ascii_digit() || c == '.')
+}
+
+/// A committed head's runs without the elapsed time: it appears from a tenth
+/// of a second on, which a test's own call never takes — but a loaded
+/// machine may be slow enough to bill one.
+fn without_elapsed(runs: Vec<(String, Style)>) -> Vec<(String, Style)> {
+    runs.into_iter()
+        .filter(|(text, _)| !text.strip_prefix(" · ").is_some_and(is_elapsed))
+        .collect()
 }
 
 #[test]
@@ -2166,26 +2589,29 @@ fn quitting_leaves_no_completion_popup_painted_on_screen() {
 }
 
 #[test]
-fn the_window_note_rides_the_welcome_row_and_leaves_the_masthead_visible() {
-    // A default config leaves the model window unset. The note used to
-    // arrive as its own warning message — four wrapped yellow lines that
-    // pushed the transcript past the empty screen and buried the masthead.
+fn the_window_note_rides_the_opening_row_as_a_dim_second_line() {
+    // A default config leaves the model window unset. The note is meta of
+    // the session, not a message: it rides the opening row as one more line
+    // of its own instead of taking a notice row (and the empty screen).
     let note = crate::config::Limits::default()
         .context_window_hint_line()
         .expect("the default config leaves the window unset");
-    let (tx, _rx) = mpsc::channel();
-    let mut s = Session::new(
-        Startup {
-            model: "test-model",
-            n_tools: 0,
-            initial_task: None,
-            auto_start: false,
-            resume_rows: Vec::new(),
-            window_note: Some(&note),
-        },
-        tx,
-        Arc::new(AtomicBool::new(false)),
-    );
+    let with_note = || {
+        let (tx, _rx) = mpsc::channel();
+        Session::new(
+            Startup {
+                model: "test-model",
+                n_tools: 0,
+                initial_task: None,
+                auto_start: false,
+                resume_rows: Vec::new(),
+                window_note: Some(&note),
+            },
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        )
+    };
+    let mut s = with_note();
     assert_eq!(
         s.rows.len(),
         1,
@@ -2195,22 +2621,52 @@ fn the_window_note_rides_the_welcome_row_and_leaves_the_masthead_visible() {
     assert!(
         matches!(
             &s.rows[0],
-            Row::System { text, level: SysLevel::Info }
-                if text.starts_with("session ready · test-model · 0 tools")
-                    && text.contains(&note)
-                    && text.contains("/context")
+            Row::System { text, level: SysLevel::Head }
+                if text == &format!("{HEAD_TEXT}\n{note} · /context for details")
         ),
         "{:?}",
         s.rows[0]
     );
+    assert!(notices(&s).is_empty(), "the note is not a notice");
 
-    let rows = screen(&mut s);
-    assert!(rows[0].contains("T I N Y A G E N T"), "{rows:?}");
+    // Committed: the opening line as always, then the note under it in the
+    // dim ink at the body column. (It is longer than a line: what wraps is
+    // the terminal's business — nothing may be cut.)
+    let mut term = inline_terminal(W);
+    view::commit(&mut s, &mut term).unwrap();
+    let lines = committed_lines(&mut term);
+    assert_eq!(lines.len(), 4, "{lines:?}");
+    assert_eq!(lines[0], HEAD_LINE);
     assert!(
-        rows[2].contains("A small agent for real terminal work."),
-        "{rows:?}"
+        lines[1].starts_with("  limits."),
+        "the note sits at the body column: {lines:?}"
     );
-    assert_eq!(rows[3].trim(), "", "the breathing row stays: {rows:?}");
+    assert_eq!(
+        lines[1..3]
+            .iter()
+            .map(|l| l.trim_start())
+            .collect::<Vec<_>>()
+            .join(" "),
+        format!("{note} · /context for details"),
+        "wrapped whole, nothing cut: {lines:?}"
+    );
+    assert_eq!(lines[3], "", "then the blank the first message follows");
+    let dim = Style::default().fg(dim_fg());
+    for y in [1, 2] {
+        assert_eq!(
+            committed_runs(&mut term, y),
+            [(lines[y].trim_start().to_string(), dim)],
+            "line {y}"
+        );
+    }
+
+    // And the screen it opens on is the empty screen as always: the note is
+    // up in the scrollback, the band is the legend and an untitled composer.
+    let mut s = with_note();
+    let rows = screen(&mut s);
+    assert_eq!(rows[3], LEGEND, "{rows:?}");
+    assert!(rows[..3].iter().all(String::is_empty), "{rows:?}");
+    assert_eq!(rows[5], framed(" ❯  Describe a task… · / for commands"));
 }
 
 #[test]
@@ -2336,16 +2792,18 @@ fn the_status_bar_reports_cost_context_and_plan_once_there_are_any() {
 #[test]
 fn the_cursor_sits_on_the_caret_in_the_composer() {
     let (mut s, _rx, _cancel) = session();
+    // The ` ❯ ` prompt is four cells wide, the box's left rule one more: an
+    // empty composer keeps the caret in the fifth column.
     assert_eq!(
         paint(&mut s).get_cursor_position().unwrap(),
-        Position::new(3, 5)
+        Position::new(4, 5)
     );
 
     typed(&mut s, "你好");
     // Two double-width glyphs: the caret moves four cells, not two.
     assert_eq!(
         paint(&mut s).get_cursor_position().unwrap(),
-        Position::new(7, 5)
+        Position::new(8, 5)
     );
 }
 
@@ -2396,4 +2854,907 @@ fn commit_advances_to_the_open_stream_and_past_every_final_row() {
     );
     view::commit(&mut s, &mut term).unwrap();
     assert_eq!(s.committed, 7, "closed: the last row commits too");
+}
+
+// ── The quiet terminal ────────────────────────────────────────────────
+//
+// Ink on the terminal's own surface, nothing filled: the roles are told
+// apart by their marks, tools and notices share one gutter, and every block
+// opens after exactly one blank line.
+
+#[test]
+fn a_fresh_session_opens_on_one_head_row_and_a_key_legend() {
+    let (mut s, _rx, _cancel) = session();
+
+    // The transcript holds exactly one row — the session's brand, not a
+    // notice: `Head` is a level of its own.
+    assert_eq!(s.rows.len(), 1, "{:?}", shape(&s));
+    assert!(
+        matches!(
+            &s.rows[0],
+            Row::System { text, level: SysLevel::Head } if text == HEAD_TEXT
+        ),
+        "{:?}",
+        s.rows[0]
+    );
+    assert!(notices(&s).is_empty());
+
+    // Committed, it is the agent's mark, a bold wordmark in the terminal's
+    // own ink, and the session meta in the dim ink — under it the blank the
+    // first message follows.
+    let mut term = inline_terminal(W);
+    view::commit(&mut s, &mut term).unwrap();
+    assert_eq!(s.committed, 1);
+    assert_eq!(committed_lines(&mut term), [HEAD_LINE, ""]);
+    assert_eq!(
+        committed_runs(&mut term, 0),
+        [
+            ("◆ ".to_owned(), Style::default().fg(accent_fg())),
+            (
+                "TinyAgent".to_owned(),
+                terminal_ink().add_modifier(Modifier::BOLD)
+            ),
+            (
+                HEAD_TEXT.strip_prefix("TinyAgent").unwrap().to_owned(),
+                Style::default().fg(dim_fg())
+            ),
+        ]
+    );
+    assert_no_background(&committed_cells(&mut term), "the opening row");
+
+    // The live band: nothing of the conversation (it is all above, in the
+    // terminal's scrollback) — the key legend right above an untitled
+    // composer, and the idle status line.
+    let rows = screen(&mut s);
+    assert_eq!(rows[3], LEGEND, "{rows:?}");
+    assert!(
+        rows[..3].iter().all(String::is_empty),
+        "the band holds nothing else: {rows:?}"
+    );
+    assert_eq!(
+        rows[4],
+        format!("╭{}╮", "─".repeat(W as usize - 2)),
+        "no title while idle: {rows:?}"
+    );
+    assert_eq!(
+        rows[5],
+        framed(" ❯  Describe a task… · / for commands"),
+        "{rows:?}"
+    );
+    assert_eq!(rows[6], format!("╰{}╯", "─".repeat(W as usize - 2)));
+    assert_eq!(
+        status_of(&rows),
+        "● test-model · ready",
+        "no clock while idle: {:?}",
+        rows[7]
+    );
+
+    // The ink: key names dim with fainter labels, the box dim with the
+    // prompt in the accent, the bar quiet with the model unstyled.
+    let term = paint(&mut s);
+    let dim = Style::default().fg(dim_fg());
+    let faint = Style::default().fg(faint_fg());
+    let accent = Style::default().fg(accent_fg());
+    let ink = terminal_ink();
+    assert_eq!(
+        screen_runs(&term, 3),
+        [
+            ("Ctrl-J".to_owned(), dim),
+            (" newline · ".to_owned(), faint),
+            ("Esc".to_owned(), dim),
+            (" cancel · ".to_owned(), faint),
+            ("/help".to_owned(), dim),
+            (" keys".to_owned(), faint),
+        ]
+    );
+    assert_eq!(
+        screen_runs(&term, 4),
+        [(format!("╭{}╮", "─".repeat(W as usize - 2)), dim)]
+    );
+    assert_eq!(
+        screen_runs(&term, 5),
+        [
+            ("│".to_owned(), dim),
+            (" ❯ ".to_owned(), accent),
+            (" Describe a task…".to_owned(), dim),
+            (" · ".to_owned(), faint),
+            ("/ for commands".to_owned(), dim),
+            ("│".to_owned(), dim),
+        ]
+    );
+    assert_eq!(
+        screen_runs(&term, 7)[..3].to_vec(),
+        [
+            ("●".to_owned(), dim),
+            (" test-model".to_owned(), ink),
+            (" · ready".to_owned(), dim),
+        ]
+    );
+    assert_no_background(&term.backend().buffer().content, "the first screen");
+
+    // The legend leaves with the first keystroke — the box holds a draft
+    // now — and is back when the draft is undone.
+    typed(&mut s, "h");
+    let rows = screen(&mut s);
+    assert_eq!(rows[3], "", "the legend left with the keystroke: {rows:?}");
+    assert_eq!(rows[5], framed(" ❯ h"));
+    key(&mut s, KeyCode::Backspace, KeyModifiers::NONE);
+    assert_eq!(
+        screen(&mut s)[3],
+        LEGEND,
+        "an emptied box is the empty state again"
+    );
+
+    // …and for good with the first message. It was never a row: nothing of
+    // it reaches the band again, the transcript or `/export`.
+    assert_eq!(command(&mut s, "go"), Effect::None);
+    msg(&mut s, UiMsg::RunFinished);
+    let rows = screen(&mut s);
+    assert_eq!(
+        rows[3], "",
+        "back to idle with an empty box, but the conversation has begun: {rows:?}"
+    );
+    assert_eq!(
+        rows[5],
+        framed(" ❯  Describe a task… · / for commands"),
+        "the placeholder returns whenever the box is empty"
+    );
+    assert!(!render_transcript(&s.rows).contains("Ctrl-J newline"));
+
+    // A cleared session is empty again…
+    assert_eq!(command(&mut s, "/clear"), Effect::None);
+    assert_eq!(screen(&mut s)[3], LEGEND);
+    // …and a narrow terminal drops the Esc pair before anything is cut.
+    assert_eq!(sized_screen(&mut s, 40)[3], "  Ctrl-J newline · /help keys");
+}
+
+#[test]
+fn a_live_turn_shows_the_trace_then_the_answer_under_their_marks() {
+    let (mut s, rx, _cancel) = session();
+    in_flight(&mut s, &rx);
+
+    // The user's row is final the moment it is sent; the trace is live.
+    ev(&mut s, AgentEvent::ThinkingDelta("let me think".into()));
+    assert_eq!(screen(&mut s)[3], "✻ let me think▌");
+    let term = paint(&mut s);
+    assert_eq!(
+        screen_runs(&term, 3),
+        [(
+            "✻ let me think▌".to_owned(),
+            Style::default().fg(dim_fg()).add_modifier(Modifier::ITALIC)
+        )]
+    );
+
+    // The answer opens under it: the mark in the accent, the words in the
+    // terminal's own ink.
+    ev(&mut s, AgentEvent::TextDelta("Hello, world".into()));
+    assert_eq!(screen(&mut s)[3], "◆ Hello, world▌");
+    let term = paint(&mut s);
+    assert_eq!(
+        screen_runs(&term, 3),
+        [
+            ("◆ ".to_owned(), Style::default().fg(accent_fg())),
+            ("Hello, world".to_owned(), terminal_ink()),
+            ("▌".to_owned(), Style::default().fg(accent_fg())),
+        ]
+    );
+}
+
+#[test]
+fn committed_roles_open_with_their_mark_and_keep_the_terminal_own_ink() {
+    let (mut s, rx, _cancel) = session();
+    in_flight(&mut s, &rx);
+    ev(&mut s, AgentEvent::ThinkingDelta("let me think".into()));
+    ev(&mut s, AgentEvent::TextDelta("Hello, world".into()));
+    msg(&mut s, UiMsg::RunFinished);
+
+    // A multi-line message: the mark rides its first line, the rest line up
+    // under the text.
+    assert_eq!(command(&mut s, "line one\nline two"), Effect::None);
+    ev(&mut s, AgentEvent::TurnStart(1));
+    // A child agent is a speaker of its own: its bubble and its trace carry
+    // its name.
+    sub(
+        &mut s,
+        "scout",
+        AgentEvent::TextDelta("looking around".into()),
+    );
+    sub(&mut s, "scout", AgentEvent::ThinkingDelta("wait".into()));
+    ev(&mut s, AgentEvent::ThinkingDelta("why".into()));
+    ev(&mut s, AgentEvent::TextDelta("Second\n\nanswer".into()));
+    msg(&mut s, UiMsg::RunFinished);
+    assert_eq!(command(&mut s, "once more"), Effect::None);
+    ev(&mut s, AgentEvent::TurnStart(1));
+    ev(&mut s, AgentEvent::TextDelta("tight".into()));
+    msg(&mut s, UiMsg::RunFinished);
+
+    // One blank before every user message; an answer follows its message
+    // and a trace its question without one; a trace and an answer are two
+    // blocks.
+    let mut term = inline_terminal(W);
+    view::commit(&mut s, &mut term).unwrap();
+    assert_eq!(
+        committed_lines(&mut term),
+        [
+            HEAD_LINE,
+            "",
+            "❯ go",
+            "✻ let me think",
+            "",
+            "◆ Hello, world",
+            "",
+            "❯ line one",
+            "  line two",
+            "◆ [scout] looking around",
+            "",
+            "✻ [scout] wait",
+            "",
+            "✻ why",
+            "",
+            "◆ Second",
+            "",
+            "  answer",
+            "",
+            "❯ once more",
+            "◆ tight",
+            "",
+        ]
+    );
+
+    let accent = Style::default().fg(accent_fg());
+    let ink = terminal_ink();
+    let trace = Style::default().fg(dim_fg()).add_modifier(Modifier::ITALIC);
+    for (y, expected) in [
+        (2, vec![("❯ ".to_owned(), accent), ("go".to_owned(), ink)]),
+        (3, vec![("✻ let me think".to_owned(), trace)]),
+        (
+            5,
+            vec![("◆ ".to_owned(), accent), ("Hello, world".to_owned(), ink)],
+        ),
+        (
+            7,
+            vec![("❯ ".to_owned(), accent), ("line one".to_owned(), ink)],
+        ),
+        (8, vec![("  line two".to_owned(), ink)]),
+        (
+            9,
+            vec![
+                ("◆ ".to_owned(), accent),
+                ("[scout] looking around".to_owned(), ink),
+            ],
+        ),
+        (11, vec![("✻ [scout] wait".to_owned(), trace)]),
+        (13, vec![("✻ why".to_owned(), trace)]),
+        (
+            15,
+            vec![("◆ ".to_owned(), accent), ("Second".to_owned(), ink)],
+        ),
+        (17, vec![("  answer".to_owned(), ink)]),
+        (
+            19,
+            vec![("❯ ".to_owned(), accent), ("once more".to_owned(), ink)],
+        ),
+        (
+            20,
+            vec![("◆ ".to_owned(), accent), ("tight".to_owned(), ink)],
+        ),
+    ] {
+        assert_eq!(committed_runs(&mut term, y), expected, "line {y}");
+    }
+    assert_no_background(&committed_cells(&mut term), "the transcript");
+}
+
+#[test]
+fn tool_rows_and_notices_share_the_two_column_gutter() {
+    let (mut s, rx, _cancel) = session();
+    in_flight(&mut s, &rx);
+    ev(
+        &mut s,
+        tool_call("read_file", json!({"path": "src/main.rs"})),
+    );
+    ev(&mut s, tool_result("read_file", "fn main() {}"));
+    // A failed call with short output opens itself: the error is the point.
+    ev(&mut s, tool_call("shell", json!({"command": "make test"})));
+    ev(
+        &mut s,
+        AgentEvent::ToolResult {
+            name: "shell".into(),
+            is_error: true,
+            content: "error: make failed".into(),
+        },
+    );
+    assert!(
+        matches!(
+            &s.rows[5],
+            Row::ToolResult {
+                is_error: true,
+                expanded: true,
+                ..
+            }
+        ),
+        "{:?}",
+        shape(&s)
+    );
+    // A long failure stays folded to its first line.
+    ev(&mut s, tool_call("shell", json!({"command": "make clean"})));
+    ev(
+        &mut s,
+        AgentEvent::ToolResult {
+            name: "shell".into(),
+            is_error: true,
+            content: (1..=40)
+                .map(|i| format!("line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        },
+    );
+    // Notices are the session's own words: the glyph states the level and the
+    // text keeps its prefix, so `/export` reads the same without the color.
+    for (level, text) in [
+        (DiagLevel::Info, "mcp: server ready"),
+        (DiagLevel::Warn, "[warn] provider retrying"),
+    ] {
+        msg(&mut s, UiMsg::Diag(level, text.into()));
+    }
+    msg(&mut s, UiMsg::Error("socket closed".into()));
+
+    // The glyph states the outcome and the text starts in one column; tool
+    // rows stay tight against the flow they belong to, and notices stack as
+    // one block.
+    let mut term = inline_terminal(W);
+    view::commit(&mut s, &mut term).unwrap();
+    let lines = committed_lines(&mut term);
+    assert_eq!(lines.len(), 15, "{lines:?}");
+    assert_eq!(
+        lines[..3].to_vec(),
+        [HEAD_LINE, "", "❯ go"].map(String::from)
+    );
+    assert_eq!(lines[3], "  → read_file  path=src/main.rs", "{lines:?}");
+    assert!(
+        is_result_head(&lines[4], "✓", "read_file", "fn main() {}"),
+        "{lines:?}"
+    );
+    assert_eq!(lines[5], "  → shell  command=\"make test\"", "{lines:?}");
+    assert!(
+        is_result_head(&lines[6], "✗", "shell", ""),
+        "a short failure opens, so the head carries no summary: {lines:?}"
+    );
+    assert_eq!(lines[7], "    │ error: make failed", "{lines:?}");
+    assert_eq!(lines[8], "  → shell  command=\"make clean\"");
+    assert!(
+        is_result_head(&lines[9], "✗", "shell", "line 1"),
+        "{lines:?}"
+    );
+    assert_eq!(lines[10], "", "the notices are a block of their own");
+    assert_eq!(lines[11], "  · mcp: server ready");
+    assert_eq!(lines[12], "  ! [warn] provider retrying");
+    assert_eq!(lines[13], "  ✗ [error] socket closed");
+    assert_eq!(lines[14], "", "the end of the history");
+
+    // Ink: only the call's glyph takes the accent, a success stays dim, and
+    // a failure and an error notice are the one red in the flow.
+    let accent = Style::default().fg(accent_fg());
+    let dim = Style::default().fg(dim_fg());
+    let faint = Style::default().fg(faint_fg());
+    let warn = Style::default().fg(warn_fg());
+    let error = Style::default().fg(error_fg());
+    assert_eq!(
+        committed_runs(&mut term, 3),
+        [
+            ("  → ".to_owned(), accent),
+            ("read_file  path=src/main.rs".to_owned(), dim)
+        ]
+    );
+    let ok = committed_runs(&mut term, 4);
+    assert_eq!(
+        without_elapsed(ok),
+        [("  ✓ read_file  fn main() {}".to_owned(), dim)],
+        "a success is dim all over: glyph, name and preview"
+    );
+    assert_eq!(
+        without_elapsed(committed_runs(&mut term, 6)),
+        [("  ✗ shell".to_owned(), error)],
+        "an opened failure carries its text below, not in the head"
+    );
+    assert_eq!(
+        committed_runs(&mut term, 7),
+        [
+            ("│ ".to_owned(), faint),
+            ("error: make failed".to_owned(), error)
+        ]
+    );
+    assert_eq!(
+        committed_runs(&mut term, 11),
+        [("  · mcp: server ready".to_owned(), dim)]
+    );
+    assert_eq!(
+        committed_runs(&mut term, 12),
+        [("  ! [warn] provider retrying".to_owned(), warn)]
+    );
+    assert_eq!(
+        committed_runs(&mut term, 13),
+        [("  ✗ [error] socket closed".to_owned(), error)]
+    );
+}
+
+#[test]
+fn the_queue_line_names_what_is_held_and_how_it_is_released() {
+    let (mut s, rx, _cancel) = session();
+    in_flight(&mut s, &rx);
+    ev(&mut s, AgentEvent::TextDelta("streaming".into()));
+    assert_eq!(command(&mut s, "after the run"), Effect::None);
+
+    // While the run is in flight the line sits between the live answer and
+    // the box; the box's title counts the queue too.
+    let rows = screen(&mut s);
+    assert_eq!(rows[2], "◆ streaming▌", "{rows:?}");
+    assert_eq!(rows[3], "  ❯ 1 queued · after the run", "{rows:?}");
+    assert!(rows[4].contains(" · 1 queued "), "{rows:?}");
+    let term = paint(&mut s);
+    assert_eq!(
+        screen_runs(&term, 3),
+        [
+            (
+                "  ❯ 1 queued · ".to_owned(),
+                Style::default().fg(accent_fg())
+            ),
+            ("after the run".to_owned(), Style::default().fg(dim_fg())),
+        ]
+    );
+
+    // More than one: the count, the rest, the oldest — a multi-line message
+    // on one line.
+    assert_eq!(command(&mut s, "second"), Effect::None);
+    assert_eq!(screen(&mut s)[3], "  ❯ 2 queued · +1 · after the run");
+
+    let (mut s, rx, _cancel) = session();
+    in_flight(&mut s, &rx);
+    assert_eq!(command(&mut s, "line one\nline two"), Effect::None);
+    assert_eq!(command(&mut s, "second"), Effect::None);
+    assert_eq!(screen(&mut s)[3], "  ❯ 2 queued · +1 · line one ↵ line two");
+
+    // A failed run leaves the queue paused: the warning mark and the key that
+    // releases it — and the box's title names the key too.
+    msg(&mut s, UiMsg::Error("boom".into()));
+    let rows = screen(&mut s);
+    assert_eq!(rows[3], "  ! 2 paused · +1 · /resume · line one ↵ line two");
+    assert!(
+        rows[4].contains(" failed · /resume continues the held queue "),
+        "{rows:?}"
+    );
+    let term = paint(&mut s);
+    assert_eq!(
+        screen_runs(&term, 3),
+        [
+            (
+                "  ! 2 paused · +1 · /resume · ".to_owned(),
+                Style::default().fg(warn_fg())
+            ),
+            (
+                "line one ↵ line two".to_owned(),
+                Style::default().fg(dim_fg())
+            ),
+        ]
+    );
+
+    // Withdrawing the newest message leaves one held: still paused, same head
+    // of the line, the count down by one. The withdrawn text is back in the
+    // box for editing.
+    assert_eq!(command(&mut s, "/unqueue"), Effect::None);
+    assert_eq!(s.composer.input.text(), "second");
+    assert_eq!(
+        screen(&mut s)[3],
+        "  ! 1 paused · /resume · line one ↵ line two"
+    );
+
+    // `/resume` releases it: the oldest becomes the run, and with nothing
+    // held the line is gone.
+    assert_eq!(command(&mut s, "/resume"), Effect::None);
+    assert_eq!(s.run.phase, RunPhase::Running);
+    let rows = screen(&mut s);
+    assert!(
+        !rows[3].contains("paused") && !rows[3].contains("queued"),
+        "{rows:?}"
+    );
+    assert!(!rows[4].contains("failed"), "{rows:?}");
+
+    // The cancel key drops the queue on the spot: the line is gone with the
+    // keypress — the answer above it is not.
+    let (mut s, rx, _cancel) = session();
+    in_flight(&mut s, &rx);
+    ev(&mut s, AgentEvent::TextDelta("streaming".into()));
+    assert_eq!(command(&mut s, "after the run"), Effect::None);
+    assert_eq!(esc(&mut s), Effect::None);
+    let rows = screen(&mut s);
+    assert_eq!(rows[3], "◆ streaming▌", "{rows:?}");
+    assert!(!rows[4].contains("queued"), "{rows:?}");
+}
+
+#[test]
+fn the_status_line_and_the_frame_follow_the_run_phase() {
+    let (mut s, rx, _cancel) = session();
+    s.cwd_path.clear(); // wherever the test binary was started
+
+    // The bar names the phase — quiet when idle, the accent while running,
+    // warn and error for the two states that need a glance — and the box's
+    // frame takes the same ink.
+    fn expect(s: &mut Session, mark: &str, label: &str, ink: Color, what: &str) {
+        let term = paint(s);
+        let rows = grid_rows(&term);
+        assert_eq!(
+            rows[7],
+            format!("{mark} test-model · {label}"),
+            "{what}: no clock in the bar, the model keeps its own ink: {:?}",
+            rows[7]
+        );
+        assert_eq!(
+            screen_runs(&term, 7),
+            [
+                (mark.to_owned(), Style::default().fg(ink)),
+                (" test-model".to_owned(), terminal_ink()),
+                (format!(" · {label}"), Style::default().fg(ink)),
+            ],
+            "{what}"
+        );
+        let frame = screen_runs(&term, 4);
+        assert!(
+            frame.iter().all(|(_, style)| style.fg == Some(ink)),
+            "{what}: the frame wears the phase's ink: {frame:?}"
+        );
+        assert!(!frame.is_empty(), "{what}: an empty frame was not checked");
+    }
+
+    expect(&mut s, "●", "ready", dim_fg(), "idle");
+    assert_eq!(
+        screen(&mut s)[4],
+        format!("╭{}╮", "─".repeat(W as usize - 2)),
+        "idle: no title"
+    );
+
+    in_flight(&mut s, &rx);
+    expect(&mut s, "◆", "running", accent_fg(), "running");
+    let rows = screen(&mut s);
+    assert!(
+        rows[4].contains("thinking… · ") && rows[4].contains(" · Ctrl-C cancel "),
+        "the title names the activity and the way out: {rows:?}"
+    );
+
+    assert_eq!(esc(&mut s), Effect::None);
+    expect(&mut s, "!", "cancelling", warn_fg(), "cancelling");
+    assert!(
+        screen(&mut s)[4].contains("cancelling… · waiting for stop"),
+        "{:?}",
+        screen(&mut s)
+    );
+
+    msg(&mut s, UiMsg::Error("boom".into()));
+    expect(&mut s, "✗", "failed", error_fg(), "failed");
+    assert!(
+        screen(&mut s)[4].contains("failed · type a message to retry"),
+        "{:?}",
+        screen(&mut s)
+    );
+
+    // A new message starts a run like any other, and its end rests the bar.
+    assert_eq!(command(&mut s, "again"), Effect::None);
+    ev(&mut s, AgentEvent::TurnStart(1));
+    expect(&mut s, "◆", "running", accent_fg(), "running again");
+    msg(&mut s, UiMsg::RunFinished);
+    expect(&mut s, "●", "ready", dim_fg(), "idle again");
+}
+
+#[test]
+fn committed_rows_get_exactly_one_blank_where_a_block_starts() {
+    let (mut s, rx, _cancel) = session();
+    in_flight(&mut s, &rx);
+    ev(&mut s, AgentEvent::ThinkingDelta("let me think".into()));
+    ev(&mut s, AgentEvent::TextDelta("Hello, world".into()));
+
+    // Mid-run: the user's row and the finished trace are final, the open
+    // answer is held back for the band. The batch does not end on a blank.
+    let mut term = inline_terminal(W);
+    view::commit(&mut s, &mut term).unwrap();
+    assert_eq!(s.committed, 3);
+    assert_eq!(
+        committed_lines(&mut term),
+        [HEAD_LINE, "", "❯ go", "✻ let me think"]
+    );
+    assert!(!s.committed_tail_blank);
+
+    // On screen the transcript sits directly above the band, the answer
+    // streams inside it — and the band is the same whatever is above it.
+    // (A frame knows where the band starts; the completed frame reports the
+    // whole screen.)
+    let (mut top, mut bottom) = (0, 0);
+    term.draw(|f| {
+        let area = f.area();
+        top = area.top() as usize;
+        bottom = area.bottom() as usize;
+        view::draw(f, &mut s, &cfg());
+    })
+    .unwrap();
+    let rows = grid_rows(&term);
+    assert_eq!(top, 4, "the four committed lines sit above the band");
+    assert_eq!(
+        rows[..top].to_vec(),
+        [HEAD_LINE, "", "❯ go", "✻ let me think"].map(String::from)
+    );
+    // (The box's title is left out: its spinner turns with the clock.)
+    let band = screen(&mut s);
+    assert_eq!(rows[top..top + 4].to_vec(), band[..4].to_vec(), "the zone");
+    assert_eq!(
+        rows[bottom - 3..bottom].to_vec(),
+        band[5..].to_vec(),
+        "the box and the bar"
+    );
+    assert_eq!(band[3], "◆ Hello, world▌");
+
+    // The answer is final: its batch opens with the blank it owes the trace
+    // — exactly one — and closes the history with one.
+    msg(&mut s, UiMsg::RunFinished);
+    view::commit(&mut s, &mut term).unwrap();
+    assert_eq!(
+        committed_lines(&mut term),
+        [
+            HEAD_LINE,
+            "",
+            "❯ go",
+            "✻ let me think",
+            "",
+            "◆ Hello, world",
+            "",
+        ]
+    );
+    assert!(s.committed_tail_blank);
+
+    // A stopped run reports itself in one block — `[cancelled]`, then what
+    // it dropped, then any notice — after the answer's last row; and the
+    // history's closing blank is not doubled by the next batch.
+    assert_eq!(command(&mut s, "again"), Effect::None);
+    ev(&mut s, AgentEvent::TurnStart(1));
+    ev(&mut s, AgentEvent::TextDelta("cut".into()));
+    assert_eq!(command(&mut s, "never sent"), Effect::None);
+    assert_eq!(esc(&mut s), Effect::None);
+    assert!(
+        committed_lines(&mut term).len() == 7,
+        "nothing is committed at the keypress"
+    );
+    msg(&mut s, UiMsg::RunFinished);
+    msg(
+        &mut s,
+        UiMsg::Diag(DiagLevel::Info, "mcp: server ready".into()),
+    );
+    view::commit(&mut s, &mut term).unwrap();
+    assert_eq!(
+        committed_lines(&mut term),
+        [
+            HEAD_LINE,
+            "",
+            "❯ go",
+            "✻ let me think",
+            "",
+            "◆ Hello, world",
+            "",
+            "❯ again",
+            "◆ cut",
+            "",
+            "  ! [cancelled]",
+            "  ! [dropped 1 queued message(s)]",
+            "  · mcp: server ready",
+            "",
+        ]
+    );
+}
+
+#[test]
+fn loose_chunks_committed_across_batches_get_one_blank_never_two() {
+    let (mut s, rx, _cancel) = session();
+    in_flight(&mut s, &rx);
+
+    // Six paragraphs in one delta: more rows than the live band holds, so
+    // the finished paragraphs are cut off as a chunk and the last one stays
+    // live — cut on the paragraph boundary, i.e. a loose chunk.
+    ev(
+        &mut s,
+        AgentEvent::TextDelta(
+            "para one\n\npara two\n\npara three\n\npara four\n\npara five\n\npara six".into(),
+        ),
+    );
+    assert_eq!(
+        shape(&s),
+        [
+            HELLO,
+            "U:go",
+            "A:para one\n\npara two\n\npara three\n\npara four\n\npara five",
+            "A:para six",
+        ]
+    );
+    assert!(matches!(
+        &s.rows[3],
+        Row::AssistantCont { tight: false, .. }
+    ));
+    let mut term = inline_terminal(W);
+    view::commit(&mut s, &mut term).unwrap();
+    assert_eq!(s.committed, 3, "the open chunk waits in the band");
+    let first = [
+        HEAD_LINE,
+        "",
+        "❯ go",
+        "◆ para one",
+        "",
+        "  para two",
+        "",
+        "  para three",
+        "",
+        "  para four",
+        "",
+        "  para five",
+    ]
+    .map(String::from);
+    assert_eq!(committed_lines(&mut term), first);
+    assert!(!s.committed_tail_blank);
+    assert_eq!(
+        screen(&mut s)[3],
+        "  para six▌",
+        "the chunk left live streams on under the same reply: no second mark"
+    );
+
+    // Five more paragraphs, all after the loose chunk: another loose cut.
+    ev(
+        &mut s,
+        AgentEvent::TextDelta(
+            "\n\npara seven\n\npara eight\n\npara nine\n\npara ten\n\npara eleven".into(),
+        ),
+    );
+    assert_eq!(
+        shape(&s)[3..],
+        [
+            "A:para six\n\npara seven\n\npara eight\n\npara nine\n\npara ten",
+            "A:para eleven"
+        ]
+    );
+    assert!(matches!(
+        &s.rows[3],
+        Row::AssistantCont { tight: false, .. }
+    ));
+    view::commit(&mut s, &mut term).unwrap();
+    assert_eq!(s.committed, 4, "the new tail waits in the band");
+    let mut second = first.to_vec();
+    second.extend(
+        [
+            "",
+            "  para six",
+            "",
+            "  para seven",
+            "",
+            "  para eight",
+            "",
+            "  para nine",
+            "",
+            "  para ten",
+        ]
+        .map(String::from),
+    );
+    assert_eq!(committed_lines(&mut term), second);
+    assert!(!s.committed_tail_blank);
+
+    // The run ends: the last chunk is final too.
+    msg(&mut s, UiMsg::RunFinished);
+    view::commit(&mut s, &mut term).unwrap();
+    assert_eq!(s.committed, 5);
+    let lines = committed_lines(&mut term);
+    assert_eq!(lines.len(), 25, "{lines:?}");
+    assert_eq!(lines[..12].to_vec(), first);
+    assert_eq!(
+        lines[12..].to_vec(),
+        [
+            "",
+            "  para six",
+            "",
+            "  para seven",
+            "",
+            "  para eight",
+            "",
+            "  para nine",
+            "",
+            "  para ten",
+            "",
+            "  para eleven",
+            "",
+        ]
+    );
+    // One blank between every pair of paragraphs — at the chunk seams no
+    // less than inside a chunk — and never two in a row.
+    assert!(
+        lines
+            .windows(2)
+            .all(|w| !(w[0].is_empty() && w[1].is_empty())),
+        "{lines:?}"
+    );
+    assert_eq!(
+        lines.iter().filter(|l| l.is_empty()).count(),
+        12,
+        "{lines:?}"
+    );
+    // Only the message head carries the mark: a chunk is the same reply.
+    assert_eq!(
+        committed_runs(&mut term, 3),
+        [
+            ("◆ ".to_owned(), Style::default().fg(accent_fg())),
+            ("para one".to_owned(), terminal_ink()),
+        ]
+    );
+    assert_eq!(
+        committed_runs(&mut term, 13),
+        [("  para six".to_owned(), terminal_ink())]
+    );
+}
+
+#[test]
+fn nothing_on_screen_paints_a_background() {
+    // The interface is the terminal's own surface: ink only, never a filled
+    // cell — on the band in every phase, in what is committed, in the final
+    // frame.
+    fn band(s: &mut Session, what: &str) {
+        let term = paint(s);
+        assert_no_background(&term.backend().buffer().content, what);
+    }
+
+    let (mut s, rx, _cancel) = session();
+    band(&mut s, "the first screen");
+    typed(&mut s, "/");
+    band(&mut s, "the slash popup");
+    key(&mut s, KeyCode::Backspace, KeyModifiers::NONE);
+
+    in_flight(&mut s, &rx);
+    band(&mut s, "the thinking placeholder");
+    ev(
+        &mut s,
+        AgentEvent::TextDelta(
+            "# Heading\n\nSome *prose* with `code`, **bold** and a [link](https://example.com).\n\n> quoted\n\n- one\n- two\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```rust\nfn main() {}\n```".into(),
+        ),
+    );
+    band(&mut s, "a markdown answer");
+    ev(
+        &mut s,
+        AgentEvent::ToolInputDelta {
+            id: "c1".into(),
+            name: "shell".into(),
+            delta: "{".into(),
+        },
+    );
+    band(&mut s, "a tool receiving its arguments");
+    ev(&mut s, tool_call("shell", json!({"command": "make test"})));
+    band(&mut s, "a running tool");
+    ev(
+        &mut s,
+        AgentEvent::ToolResult {
+            name: "shell".into(),
+            is_error: true,
+            content: "error: make failed".into(),
+        },
+    );
+    for (level, text) in [
+        (DiagLevel::Info, "mcp: server ready"),
+        (DiagLevel::Warn, "[warn] retrying"),
+    ] {
+        msg(&mut s, UiMsg::Diag(level, text.into()));
+    }
+    band(&mut s, "notices over a live answer");
+    assert_eq!(esc(&mut s), Effect::None);
+    band(&mut s, "cancelling");
+    msg(&mut s, UiMsg::RunFinished);
+    band(&mut s, "idle after a run");
+
+    let mut term = inline_terminal(W);
+    view::commit(&mut s, &mut term).unwrap();
+    assert_no_background(&committed_cells(&mut term), "the scrollback");
+
+    in_flight(&mut s, &rx);
+    assert_eq!(command(&mut s, "held"), Effect::None);
+    msg(&mut s, UiMsg::Error("boom".into()));
+    band(&mut s, "failed with a held queue");
+    let mut term = Terminal::new(TestBackend::new(W, H)).unwrap();
+    view::final_frame(&mut s, &mut term, &cfg());
+    assert_no_background(&term.backend().buffer().content, "the final frame");
 }

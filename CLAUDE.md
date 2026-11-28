@@ -155,8 +155,8 @@ cargo clippy -p tiny-agent-node
 - **run_code 路径拦截**：符号链接走查按**原始拼写**逐组件进行（先折叠 `..` 会把 `link` 抹掉、`link/../x` 逃逸）；绝对拼写**从根锚定**走查（字面前缀非 workdir 的折叠拼写不再跳过）；不存在目标经**最深已存在祖先 canonicalize** 判定（不再纯词法回退）。cancel/deadline 入口拒绝都同时 latch `interrupt`+`halted`（可捕获异常被 guest 捕获重试时，停机检查拒纳）。
 - **headless Ctrl-C**：首次翻 cancel 优雅收尾（exit 130），二次硬退；批量模式 worker gate 同款。
 - **消息稳定 id**：ingest 点分配（非构造时）；`next_msg_id` 不随 `clear_messages` 重置。
-- **TUI**：inline viewport + scrollback 提交模型；新增"在飞行"必须同步 holdback/inflight/LiveRow 三件套；Assistant 才增量切分，Thinking live 有界尾部、最终整块提交（>8 显示行折叠，全文 `/thinking` 重印）；队列唯一真值是 `VecDeque`、不得回潮 transcript ghost，失败暂停只能 `/resume` 释放；composer/折行/切点统一 grapheme 显示宽度，放弃 soft-cut 必须原子；正文与底部 chrome 共享左锚定 120 列工作区，角色/工具标识变更同步 `continuation_prefix`，空态/popup 共用 `truncate_line`；新暗色元素用 `dim_fg()`，键帽/选中行/行内代码共用 `keycap_bg()`；Unix tty 断开由独立监控线程收尾（crossterm EOF 内循环会满核），禁止回退成只靠主事件循环；源码按关注点拆在 `src/tui/`（`tui.rs` 只是模块根：装配与循环 `app`、交互状态 `session`、按键/命令/事件 `keys`/`commands`/`events`、提交与绘制 `view`/`render`、agent 线程 `worker`、终端守卫 `terminal`，加 transcript/markdown/slash/input/theme 与两个测试文件）。
-- **TUI 交互状态机（详录见 architecture 的「TUI 结构」）**：交互状态只住在一个 `Session` 里，`ui_loop` 不留局部状态；`RunPhase` 的转场只经 `RunState::start`/`idle`/`fail`/`begin_cancelling`，流式收尾只经 `end_parent_streams`/`end_child_streams`/`end_all_streams`（哪种事件收哪条流有 loop 测试逐条钉着），工具行只经 `push_tool_call`/`push_tool_result`——别在 reducer 或按键处理里直接写 `phase` / `streaming`。**交互行为先写 `tests_loop.rs`**（驱动真实 `Session`：按键 → 重绘 → 断言行；夹具的两条同构纪律见踩坑详录），pty 只留给渲染/终端层。
+- **TUI**：inline viewport + scrollback 提交模型；新增"在飞行"必须同步 holdback/inflight/LiveRow 三件套；Assistant 才增量切分，Thinking live 有界尾部、最终整块提交（>8 显示行折叠，全文 `/thinking` 重印）；队列唯一真值是 `VecDeque`、不得回潮 transcript ghost，失败暂停只能 `/resume` 释放；composer/折行/切点统一 grapheme 显示宽度，放弃 soft-cut 必须原子；正文与底部 chrome 共享左锚定 120 列工作区，角色/工具标识变更同步 `continuation_prefix`，空态/popup 共用 `truncate_line`；**视觉是「安静的终端」：全界面不铺底色，只用五种墨色（`accent_fg` / `dim_fg` / `faint_fg` / `warn_fg` / `error_fg`，明暗与色深由 `TINYAGENT_TUI_THEME` / `TINYAGENT_TUI_COLOR` 选），正文走终端默认前景色，工具行与系统提示共用两格 gutter，Markdown 样式绑 `markdown::Sheet`；块间距只认 `row_gap` 一条配对规则（批内 + 跨批，永不双空行）**；Unix tty 断开由独立监控线程收尾（crossterm EOF 内循环会满核），禁止回退成只靠主事件循环；源码按关注点拆在 `src/tui/`（`tui.rs` 只是模块根：装配与循环 `app`、交互状态 `session`、按键/命令/事件 `keys`/`commands`/`events`、提交与绘制 `view`/`render`、agent 线程 `worker`、终端守卫 `terminal`，加 transcript/markdown/slash/input/theme 与两个测试文件）。
+- **TUI 交互状态机（详录见 architecture 的「TUI 结构」）**：交互状态只住在一个 `Session` 里，`ui_loop` 不留局部状态；`RunPhase` 的转场只经 `RunState::start`/`idle`/`fail`/`begin_cancelling`，流式收尾只经 `end_parent_streams`/`end_child_streams`/`end_all_streams`（哪种事件收哪条流有 loop 测试逐条钉着），工具行只经 `push_tool_call`/`push_tool_result`——别在 reducer 或按键处理里直接写 `phase` / `streaming`；`begin_cancelling` **不关流、不落行**，`[cancelled]` 与丢弃队列的提示等 run 结束才落（`cancel_dropped`），否则答复的尾巴会以孤零零的 `◆` 片段落在提示下面。**交互行为先写 `tests_loop.rs`**（驱动真实 `Session`：按键 → 重绘 → 断言行；夹具的两条同构纪律见踩坑详录），pty 只留给渲染/终端层。
 - **文件工具 workdir 沙盒（`tools::confined_to`）**：尾段**逐组件解析走查、着陆即复检**——`缺失目录/../<外向 symlink>` 类拼写一律 Err（词法折叠会 Ok 逃逸，性质 fuzz 抓过）；**present-but-unresolvable 一律 fail-closed**（悬空 symlink/不可穿过的前缀只放行 ENOENT 真缺失——悬空外向链曾词法放行、写穿真逃逸，审计抓过），Ok 永不背 `..`/`.`、再入不动点，内向 symlink 返回真身；文件工具与 skill 沙盒共用，改它两边的语义测试都要过。
 
 ## 容易踩的坑索引（详录：`docs/claude/pitfalls.md`）
@@ -237,7 +237,7 @@ cargo clippy -p tiny-agent-node
   改了并行批次的分支（新增 Slot 赋值点、改占位/合成逻辑）先看这张表再动。
 - **TUI 视觉验证**：用 ratatui `TestBackend` 抓 cell grid 做断言（见 `tui::tests`）；端到端交互用
   pty 脚本驱动（项目里惯用 `/tmp/ta-verify/` 放临时 mock + pty 脚本，跑完即删）。**不要只靠
-  "看起来对"**——改了渲染/光标/markdown 要真抓屏或单测断言验证。pty 驱动六个坑：裸 pty 必须
+  "看起来对"**——改了渲染/光标/markdown 要真抓屏或单测断言验证。pty 驱动十一个坑：裸 pty 必须
   应答 crossterm 的 `\x1b[6n` 光标查询（回 `\x1b[<行>;<列>R`，否则启动即 "cursor position
   could not be read" 退出；固定回底行会把视口钉在屏幕底部，要贴近真实布局就按真实光标位置应答）；
   带补全弹窗的**缩写**斜杠命令要**双回车**（第一个 Enter 被弹窗吃掉当补全；完整拼出的命令第一次 Enter 即执行）；
@@ -246,7 +246,12 @@ cargo clippy -p tiny-agent-node
   重叠须用真实终端模拟器交叉核对（根因：pyte 0.8.2 根本没实现 SU/SD——`CSI S` / `CSI T` 落 no-op，
   而 scrollback 提交靠的就是它们，补 handler 的做法见 pitfalls），截图渲染器与终端事实要分开验证；
   pty 尺寸要在 fork **之前**设好（`pty.fork()` 后父进程再 `TIOCSWINSZ` 与子进程首次取尺寸竞态，
-  新 pty 初始 0×0）；
+  新 pty 初始 0×0）；模拟光标要从终端**最后一行**起步（真实启动在 shell 提示符下面，从第 0 行起步会让
+  视口沿屏下滑、底下留残影）；pty 输出要用**同一个增量 UTF-8 解码器**（逐块 decode 把跨读边界的多字节
+  字符劈成 U+FFFD，画面上是边框一个洞加下一行错位——像产品 bug，其实是抓屏链路）；文本转储要按列
+  **稠密**取（ratatui 不画默认样式的空格 cell，稀疏迭代会把后面的格子整体左移）；背靠背写入的两个键
+  会被 crossterm 合成组合键（`Esc` 紧跟 `Ctrl-O` = `Alt+Ctrl+O`，脚本里按键之间留间隔）；颜色以逐段
+  样式转储为准、别看图（没加括号的段 = 默认样式）；
   断言「空闲双击
   Ctrl-C 退出」要先等状态栏回到 `idle`——忙时第一下是取消当前轮、第二下只是空闲态的首次按下
   （只打印提示不退出），且 `idle` 这类标记要在**发键之后**收到的输出里找（起始屏幕上本来就有）。

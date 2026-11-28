@@ -10,12 +10,10 @@ use super::markdown::{
 use super::render::{
     display_row_starts, est_display_rows, strip_controls, strip_controls_json, wrap_line,
 };
-use super::theme::{
-    dim_fg, fmt_tool_elapsed, AGENT_FG, THINKING_FG, TOOL_CALL_FG, TOOL_ERR_FG, TOOL_OK_FG, USER_FG,
-};
+use super::theme::{accent_fg, dim_fg, error_fg, faint_fg, fmt_tool_elapsed, warn_fg};
 use super::view::INLINE_HEIGHT;
 use crate::provider::{Block, Message, Role};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::time::Instant;
 use unicode_segmentation::UnicodeSegmentation;
@@ -23,15 +21,33 @@ use unicode_segmentation::UnicodeSegmentation;
 /// Body indent beneath the standalone conversation role headers.
 pub(super) const ROLE_BODY_INDENT: usize = 2;
 pub(super) const AGENT_MARK: &str = "◆ ";
+/// Expanded tool bodies (and nothing else): one step deeper than the tool
+/// head's text column, behind a faint `│ ` guide.
 const TOOL_INDENT: usize = 4;
-pub(super) const TOOL_HEAD_MARK: &str = "    ▎ ";
 
-/// Severity of a `Row::System` notice — drives its color (info dim, warn
-/// yellow, error red). The text keeps its `[warn]`/`[error]`-style prefix, so
-/// the plain-text /export transcript stays self-describing without the level.
+/// Gutter of every tool and notice line: two blanks, a glyph, a space. The
+/// glyph carries the meaning (`→` call, `✓` ok, `✗` failed, `·` notice) and
+/// the text starts in one fixed column; a wrapped head repeats the gutter as
+/// BLANKS (see `continuation_cells`), so its second row lines up under the
+/// first instead of restating the glyph.
+pub(super) const TOOL_GUTTER: &str = "  ";
+
+/// The gutter with its glyph: the head of a tool / notice line.
+pub(super) fn gutter_mark(glyph: &str) -> String {
+    format!("{TOOL_GUTTER}{glyph} ")
+}
+
+/// Severity of a `Row::System` notice — drives its marker and color (info
+/// dim, warn amber, error red). The text keeps its `[warn]`/`[error]`-style
+/// prefix, so the plain-text /export transcript stays self-describing without
+/// the level. `Head` is the session's opening row (product, version, model,
+/// tool count) — not a severity, but it is the one System row that is brand
+/// rather than notice, so it renders with the agent's accent glyph and a bold
+/// wordmark.
 /// pub(crate): rides along with the pub(crate) `Row::System` variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SysLevel {
+    Head,
     Info,
     Warn,
     Error,
@@ -122,6 +138,10 @@ impl Row {
     pub(super) fn sys_error(text: impl Into<String>) -> Row {
         Row::sys(text, SysLevel::Error)
     }
+    /// The session's opening row (`welcome_text`).
+    pub(super) fn sys_head(text: impl Into<String>) -> Row {
+        Row::sys(text, SysLevel::Head)
+    }
 }
 
 /// AgentEvent::CodeLog payload → transcript row. The payload stays BARE:
@@ -184,6 +204,11 @@ pub(super) fn render_transcript(rows: &[Row]) -> String {
                     false,
                 )
             }
+            // The opening row is a plain caption in a dump — no notice marker.
+            Row::System {
+                level: SysLevel::Head,
+                text,
+            } => (format!("{text}\n"), "", false),
             Row::System { text, .. } => (format!("· {text}\n"), "", false),
         };
         let (header, body, mid_block) = block;
@@ -343,8 +368,9 @@ fn indent_lines(lines: &mut [Line<'static>], width: usize) {
 }
 
 /// Tool heads are wrapped by the shared final layout pass. Its continuation
-/// prefix keeps the four-column execution indent; pre-wrapping here used to
-/// make the final pass lose the gutter or wrap the same text twice.
+/// prefix repeats the gutter as blanks, so a wrapped head's second row lines
+/// up under the first row's text; pre-wrapping here used to make the final
+/// pass lose the gutter or wrap the same text twice.
 fn push_tool_head(lines: &mut Vec<Line<'static>>, head: Line<'static>) {
     lines.push(head);
 }
@@ -360,6 +386,8 @@ fn push_tool_head(lines: &mut Vec<Line<'static>>, head: Line<'static>) {
 /// icon (message head); a continuation chunk keeps the plain indent so its
 /// text aligns under the head's body. The live-streaming `▌` cursor lands on
 /// this row's last line when `live` selects it AND it is the last row.
+/// `last`: this is the slice's last row; `trailing_spacer`: the slice ends
+/// the history (both as in `build_history_lines`).
 // (8 params: the row context the shared body render needs; a struct just for
 // this would add noise — same allow as build_history_lines.)
 #[allow(clippy::too_many_arguments)]
@@ -369,9 +397,9 @@ fn push_assistant_body(
     inner_w: usize,
     t: &str,
     live: LiveRow,
-    idx: usize,
-    rows_len: usize,
+    last: bool,
     head: bool,
+    trailing_spacer: bool,
 ) {
     let markdown_width = inner_w.saturating_sub(ROLE_BODY_INDENT).max(1);
     let render = |txt: &str| -> Vec<Line<'static>> {
@@ -392,24 +420,34 @@ fn push_assistant_body(
     } else {
         md_cache.get_or_render(t, markdown_width, render).to_vec()
     };
-    if rendered.is_empty() {
+    // A body that renders to nothing still occupies a row when it is a
+    // message's own — an empty message shows its bare `◆`, the live stream
+    // its cursor. A chunk that more of the reply follows is not shown at
+    // all: a lone fence opener (a row cut that landed right after it)
+    // leaves nothing to print, and a blank standing in for it would double
+    // the paragraph gap the chunk after it opens with.
+    if rendered.is_empty() && last && (live != LiveRow::None || trailing_spacer) {
         rendered.push(Line::default());
+    }
+    if rendered.is_empty() {
+        return;
     }
     indent_lines(&mut rendered, ROLE_BODY_INDENT);
     if head {
         // Inline role icon: the first body line's indent becomes the `◆`
-        // marker — same column, one row saved, no header line.
-        rendered[0].spans[0] = Span::styled(
-            AGENT_MARK.to_string(),
-            Style::default().fg(AGENT_FG).add_modifier(Modifier::BOLD),
-        );
+        // marker — same column, one row saved, no header line. The marker is
+        // the accent; the answer itself keeps the terminal's default ink.
+        rendered[0].spans[0] =
+            Span::styled(AGENT_MARK.to_string(), Style::default().fg(accent_fg()));
     }
     lines.extend(rendered);
     // Streaming cursor on the live assistant row.
-    if live == LiveRow::Text && idx == rows_len - 1 {
+    if live == LiveRow::Text && last {
         if let Some(last) = lines.last_mut() {
-            last.spans
-                .push(Span::styled("▌".to_string(), Style::default().fg(AGENT_FG)));
+            last.spans.push(Span::styled(
+                "▌".to_string(),
+                Style::default().fg(accent_fg()),
+            ));
         }
     }
 }
@@ -448,14 +486,15 @@ fn push_thinking(
     if text.trim().is_empty() {
         return;
     }
-    let label_style = Style::default()
-        .fg(THINKING_FG)
-        .add_modifier(Modifier::ITALIC);
+    // Secondary ink: the trace is context for the answer, never a rival to it.
+    let label_style = Style::default().fg(dim_fg()).add_modifier(Modifier::ITALIC);
     let body_w = inner_w.saturating_sub(ROLE_BODY_INDENT).max(1);
     // Real traces end with "\n" (often "\n\n"). Trailing blank rows are not
-    // content: in a FINAL trace they count toward neither the fold decision,
-    // the header's row count, nor the three-row preview — otherwise the
-    // preview spends one of its rows on an empty line.
+    // content: a FINAL trace drops them everywhere — they count toward
+    // neither the fold decision, the header's row count nor the three-row
+    // preview (the preview would spend a row on an empty line), and they are
+    // not printed either (they used to commit as one or two blank lines
+    // under the trace, on top of the row spacer that follows).
     let trimmed = if live { text } else { text.trim_end() };
     let total_rows = (!live).then(|| est_display_rows(trimmed, body_w));
     let folded = !expanded && total_rows.is_some_and(|n| n > THINKING_FOLD_ROWS);
@@ -468,7 +507,7 @@ fn push_thinking(
             Span::styled("✻ Thinking", label_style.add_modifier(Modifier::BOLD)),
             Span::styled(
                 format!(" · {label}{detail} · /thinking"),
-                Style::default().fg(dim_fg()),
+                Style::default().fg(faint_fg()),
             ),
         ]));
     }
@@ -484,7 +523,7 @@ fn push_thinking(
             .unwrap_or(0);
         &trimmed[at..]
     } else {
-        text
+        trimmed
     };
     let mut rendered: Vec<Line<'static>> = body
         .split('\n')
@@ -516,6 +555,43 @@ pub(super) enum LiveRow {
     Think,
 }
 
+/// A line that prints as blank: no spans, or nothing but whitespace.
+pub(super) fn is_blank_line(line: &Line<'_>) -> bool {
+    line.spans.iter().all(|s| s.content.trim().is_empty())
+}
+
+/// The one spacing rule of the conversation: is a blank line laid between two
+/// adjacent rows? Both places that join rows share it — inside one commit
+/// batch (`build_history_lines`) and across two batches (`view::commit` opens
+/// the later one with the gap its first row owes its predecessor).
+///
+/// Base rule: a blank before a user message or a system row, and between two
+/// assistant-shaped blocks — an incrementally split chunk recovers the
+/// paragraph gap the split consumed, and two separate messages stop reading
+/// as one blob. A thinking trace gets a blank after it (trace vs answer) and
+/// before it unless it directly follows the user's message (mirrors the tight
+/// user→assistant look). Tight chunks are the exception: cut mid-way through
+/// a paragraph/trace, they render flush against the row they continue — a
+/// blank there would tear one block into two. Tool rows stay tight against
+/// the flow they belong to, and consecutive notices stack as one block.
+pub(super) fn row_gap(prev: &Row, next: &Row) -> bool {
+    match next {
+        Row::System { .. } if matches!(prev, Row::System { .. }) => false,
+        Row::User(_) | Row::System { .. } => true,
+        Row::Thinking { tight: true, .. } => false,
+        Row::Thinking { .. } | Row::ThinkingFull(_) => !matches!(prev, Row::User(_)),
+        Row::AssistantCont { tight: true, .. } => false,
+        Row::Assistant(_) | Row::AssistantCont { .. } => matches!(
+            prev,
+            Row::Assistant(_)
+                | Row::AssistantCont { .. }
+                | Row::Thinking { .. }
+                | Row::ThinkingFull(_)
+        ),
+        _ => false,
+    }
+}
+
 /// `inner_w` is the content width.
 /// `live` appends a `▌` cursor to the in-flight row's last line — the lines
 /// are clones out of MdCache, so the cached render stays clean.
@@ -532,16 +608,18 @@ pub(super) fn build_history_lines(
     trailing_spacer: bool,
 ) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let marker = TOOL_HEAD_MARK;
     for (idx, row) in rows.iter().enumerate() {
+        let last = idx + 1 == rows.len();
         match row {
             Row::User(t) => {
+                // Roles are told apart by their glyph, not by a color: the
+                // message keeps the default ink like the answer does.
                 push_role(
                     &mut lines,
                     "❯ ",
-                    Style::default().fg(USER_FG).add_modifier(Modifier::BOLD),
+                    Style::default().fg(accent_fg()),
                     t,
-                    Style::default().add_modifier(Modifier::BOLD),
+                    Style::default(),
                 );
             }
             Row::Assistant(t) => {
@@ -551,9 +629,9 @@ pub(super) fn build_history_lines(
                     inner_w,
                     t,
                     live,
-                    idx,
-                    rows.len(),
+                    last,
                     true,
+                    trailing_spacer,
                 );
             }
             Row::AssistantCont { text: t, .. } => {
@@ -565,9 +643,9 @@ pub(super) fn build_history_lines(
                     inner_w,
                     t,
                     live,
-                    idx,
-                    rows.len(),
+                    last,
                     false,
+                    trailing_spacer,
                 );
             }
             Row::Thinking { text: t, .. } => {
@@ -583,15 +661,13 @@ pub(super) fn build_history_lines(
                 expanded,
                 ..
             } => {
-                let name_span = format!("{marker}→ {name}");
                 let has_summary = !*expanded && !collapsed.is_empty();
+                // The whole tool block is secondary ink; only the glyph
+                // carries the accent, so a long execution flow never competes
+                // with the answer around it.
                 let head = Line::from(vec![
-                    Span::styled(
-                        name_span.clone(),
-                        Style::default()
-                            .fg(TOOL_CALL_FG)
-                            .add_modifier(Modifier::BOLD),
-                    ),
+                    Span::styled(gutter_mark("→"), Style::default().fg(accent_fg())),
+                    Span::styled(name.to_string(), Style::default().fg(dim_fg())),
                     if has_summary {
                         Span::styled(
                             format!("  {}", collapsed.lines().next().unwrap_or_default()),
@@ -621,32 +697,29 @@ pub(super) fn build_history_lines(
                 expanded,
                 elapsed,
             } => {
-                let (tag, head_fg) = if *is_error {
-                    ("✗", TOOL_ERR_FG)
-                } else {
-                    ("✓", TOOL_OK_FG)
-                };
-                // The ok head stays UNBOLD: a green bold "✓ shell" reads as a
+                // The glyph states the outcome. The ok glyph stays in the
+                // secondary ink — a colored "✓" on every call reads as a
                 // second "◆" agent icon in a long execution flow; only the
-                // failure glyph earns the emphasis.
-                let head_style = if *is_error {
-                    Style::default().fg(head_fg).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(head_fg)
-                };
+                // failure earns a color of its own.
+                let ink = if *is_error { error_fg() } else { dim_fg() };
+                let head_style = Style::default().fg(ink);
+                // "0.0s" on an instant call is noise: the duration appears
+                // once it reaches a tenth of a second.
                 let dur = elapsed
                     .as_deref()
+                    .filter(|e| *e != "0.0s")
                     .map(|e| format!(" · {e}"))
                     .unwrap_or_default();
-                let name_span = format!("{marker}{tag} {name}{dur}");
                 let has_summary = !*expanded && !collapsed.is_empty();
                 let head = Line::from(vec![
-                    Span::styled(name_span.clone(), head_style),
+                    Span::styled(gutter_mark(if *is_error { "✗" } else { "✓" }), head_style),
+                    Span::styled(name.to_string(), head_style),
+                    Span::styled(dur, Style::default().fg(faint_fg())),
                     if has_summary {
                         let preview = ansi_plain(collapsed);
                         Span::styled(
                             format!("  {}", preview.lines().next().unwrap_or_default()),
-                            Style::default().fg(if *is_error { TOOL_ERR_FG } else { dim_fg() }),
+                            head_style,
                         )
                     } else {
                         Span::raw(String::new())
@@ -657,80 +730,41 @@ pub(super) fn build_history_lines(
                 // parser strips non-SGR sequences and bare control chars, so
                 // this path no longer needs strip_controls at entry).
                 if *expanded {
-                    let body_style = if *is_error {
-                        Style::default().fg(TOOL_ERR_FG)
-                    } else {
-                        Style::default().fg(dim_fg())
-                    };
-                    let mut body = ansi_guided_lines(content, body_style);
+                    let mut body = ansi_guided_lines(content, head_style);
                     indent_lines(&mut body, TOOL_INDENT);
                     lines.extend(body);
                 }
             }
-            Row::System { text, level } => {
-                let fg = match level {
-                    SysLevel::Info => dim_fg(),
-                    SysLevel::Warn => TOOL_CALL_FG,
-                    SysLevel::Error => TOOL_ERR_FG,
-                };
-                // One-line layout: the "· " marker rides the first text line
-                // (a bare "·" dangling on its own line read as a bug);
-                // continuation lines align under it. Info notices nest in the
-                // tool gutter; warn/error rise to column 0 so they stand out
-                // from the execution detail they interrupt.
-                let (marker_pad, cont_pad) = match level {
-                    SysLevel::Info => ("    · ", "      "),
-                    SysLevel::Warn => ("! ", "  "),
-                    SysLevel::Error => ("✗ ", "  "),
-                };
-                let marker_style = Style::default().fg(fg).add_modifier(Modifier::BOLD);
-                let body_style = Style::default().fg(fg);
-                let mut it = text.lines();
-                lines.push(Line::from(vec![
-                    Span::styled(marker_pad.to_string(), marker_style),
-                    Span::styled(it.next().unwrap_or("").to_string(), body_style),
-                ]));
-                for l in it {
-                    lines.push(Line::from(Span::styled(
-                        format!("{cont_pad}{l}"),
-                        body_style,
-                    )));
-                }
-            }
+            Row::System { text, level } => match level {
+                SysLevel::Head => push_head(&mut lines, text),
+                SysLevel::Info => push_notice(&mut lines, "·", dim_fg(), text),
+                SysLevel::Warn => push_notice(&mut lines, "!", warn_fg(), text),
+                SysLevel::Error => push_notice(&mut lines, "✗", error_fg(), text),
+            },
         }
-        // Row-boundary spacers. Base rule: a blank before the next user/system
-        // row, or at the end of the history. On top:
-        // adjacent assistant-shaped rows get a gap (an incrementally-split
-        // chunk recovers the paragraph gap the split consumed; two separate
-        // messages stop reading as one blob), and a Thinking block gets a
-        // blank after it (trace vs answer separation) and before it unless it
-        // directly follows the user's message (mirrors the tight
-        // user→assistant look). Tight chunks are the exception: cut mid-way
-        // through a paragraph/trace, they render flush against the row they
-        // continue — a blank there would tear one block into two. Tool rows
-        // stay tight against the flow they belong to.
-        // `trailing_spacer`: whether the LAST row of this (possibly partial)
-        // view ends the history. Incremental commits render SLICES of `rows`
-        // — the slice's last row is usually followed by the still-streaming
-        // tail, and an unconditional end-of-history blank there would insert
-        // a spurious empty line into scrollback after every mid-stream batch
-        // (tight chunks would read as torn paragraphs).
+        // Row-boundary spacers: the pair rule (`row_gap`) between this row
+        // and the next one inside the batch, and — for the batch's last row —
+        // `trailing_spacer`: whether this (possibly partial) view ends the
+        // history. Incremental commits render SLICES of `rows` — the slice's
+        // last row is usually followed by the still-streaming tail, and an
+        // unconditional end-of-history blank there would insert a spurious
+        // empty line into scrollback after every mid-stream batch (tight
+        // chunks would read as torn paragraphs). The gap that last row owes
+        // what comes after it is opened by the NEXT batch instead
+        // (`view::commit`, same pair rule).
+        //
+        // One exception to "a blank before every system row": consecutive
+        // notices stack as one block. A stopped run pushes "[cancelled]" and
+        // "[dropped N queued message(s)]" back to back — separated by blanks
+        // they read as unrelated interjections.
         let spacer = match rows.get(idx + 1) {
             None => trailing_spacer,
-            Some(Row::User(_) | Row::System { .. }) => true,
-            Some(Row::Thinking { tight: true, .. }) => false,
-            Some(Row::Thinking { .. } | Row::ThinkingFull(_)) => !matches!(row, Row::User(_)),
-            Some(Row::AssistantCont { tight: true, .. }) => false,
-            Some(Row::Assistant(_) | Row::AssistantCont { .. }) => matches!(
-                row,
-                Row::Assistant(_)
-                    | Row::AssistantCont { .. }
-                    | Row::Thinking { .. }
-                    | Row::ThinkingFull(_)
-            ),
-            Some(_) => false,
+            Some(next) => row_gap(row, next),
         };
-        if spacer {
+        // Never two blanks in a row: a row whose own rendering ends on a
+        // blank line (an expanded tool dump ending with a newline) already
+        // carries the gap.
+        if spacer && !lines.last().is_some_and(is_blank_line) {
             lines.push(Line::default());
         }
     }
@@ -738,17 +772,62 @@ pub(super) fn build_history_lines(
     // a turn has started but nothing visible has streamed yet.
     if thinking {
         lines.push(Line::from(vec![
-            Span::styled(
-                AGENT_MARK,
-                Style::default().fg(AGENT_FG).add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(AGENT_MARK, Style::default().fg(accent_fg())),
             Span::styled("…", Style::default().fg(dim_fg())),
         ]));
     }
     lines
 }
 
-/// Wall-clock duration of a tool call, pre-formatted for the result header/// ("1.2s"). Matches the NEAREST same-name ToolCall row scanning backwards:
+/// A notice in the tool gutter: the glyph rides the first text line (a bare
+/// marker on a line of its own reads as a bug) and the continuation lines
+/// line up under the text. Every level uses the same column — the color, not
+/// the indentation, is what makes a warning stand out.
+fn push_notice(lines: &mut Vec<Line<'static>>, glyph: &str, fg: Color, text: &str) {
+    let style = Style::default().fg(fg);
+    let mut it = text.lines();
+    lines.push(Line::from(vec![
+        Span::styled(gutter_mark(glyph), style),
+        Span::styled(it.next().unwrap_or("").to_string(), style),
+    ]));
+    for l in it {
+        lines.push(Line::from(Span::styled(
+            format!("{TOOL_GUTTER}  {l}"),
+            style,
+        )));
+    }
+}
+
+/// The session's opening row: `TinyAgent v0.4.3 · <model> · <n> tools`. The
+/// first word is the wordmark — bold, in the terminal's default ink, behind
+/// the agent's accent glyph — and everything after it is session meta in the
+/// secondary ink. A second line (the context-window hint) is meta all over.
+fn push_head(lines: &mut Vec<Line<'static>>, text: &str) {
+    let dim = Style::default().fg(dim_fg());
+    let mut it = text.lines();
+    let first = it.next().unwrap_or_default();
+    let (name, rest) = first.split_once(' ').unwrap_or((first, ""));
+    let mut head = vec![
+        Span::styled(AGENT_MARK, Style::default().fg(accent_fg())),
+        Span::styled(
+            name.to_string(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if !rest.is_empty() {
+        head.push(Span::styled(format!(" {rest}"), dim));
+    }
+    lines.push(Line::from(head));
+    for l in it {
+        lines.push(Line::from(vec![
+            Span::raw(" ".repeat(ROLE_BODY_INDENT)),
+            Span::styled(l.to_string(), dim),
+        ]));
+    }
+}
+
+/// Wall-clock duration of a tool call, pre-formatted for the result header
+/// ("1.2s"). Matches the NEAREST same-name ToolCall row scanning backwards:
 /// parallel sub-agents interleave their calls, so a name can repeat and
 /// nearest-back is the best available approximation. None when no same-name
 /// call row exists (e.g. a resumed session whose calls predate the row list).
@@ -891,12 +970,8 @@ pub(super) fn tool_running_line(state: &ToolRunning, now: Instant) -> Option<Lin
         format!(" · {elapsed}…")
     };
     Some(Line::from(vec![
-        Span::styled(
-            format!("{TOOL_HEAD_MARK}→ {name}"),
-            Style::default()
-                .fg(TOOL_CALL_FG)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(gutter_mark("→"), Style::default().fg(accent_fg())),
+        Span::styled(name.to_string(), Style::default().fg(dim_fg())),
         Span::styled(tail, Style::default().fg(dim_fg())),
     ]))
 }

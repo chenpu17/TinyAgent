@@ -4,22 +4,20 @@
 //! neither changes any other state.
 
 use super::render::{
-    build_input_title, build_status_line, chrome_fg, commit_rows, composer_footer, composer_scroll,
-    content_width, empty_state_lines, failed_title, layout_composer, queue_preview_line,
-    render_zone_tail, render_zone_top, status_stats, truncate_display, wrap_history,
+    build_input_title, build_status_line, chrome_fg, commit_rows, composer_scroll, content_width,
+    empty_state_lines, failed_title, layout_composer, placeholder_line, queue_preview_line,
+    render_zone_tail, render_zone_top, status_stats, truncate_display, truncate_line, wrap_history,
 };
 use super::session::{RunPhase, Session};
 use super::slash::slash_popup_lines_for;
-use super::theme::{
-    composer_bg, dim_fg, fmt_ctx, surface_bg, AGENT_FG, TOOL_CALL_FG, TOOL_ERR_FG, USER_FG,
-};
+use super::theme::{accent_fg, dim_fg, error_fg, fmt_ctx, warn_fg};
 use super::transcript::{
-    build_history_lines, commit_pending_end, inflight_row_index, tool_running_line, LiveRow, Row,
-    AGENT_MARK, TOOL_HEAD_MARK,
+    build_history_lines, commit_pending_end, gutter_mark, inflight_row_index, row_gap,
+    tool_running_line, LiveRow, Row, AGENT_MARK,
 };
 use crate::config::Config;
 use ratatui::layout::{Constraint, Layout};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as WBlock, BorderType, Borders, Paragraph};
 use ratatui::{Frame, Terminal};
@@ -37,11 +35,11 @@ const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '�
 /// lines fit; the host terminal scrolls once committed content outgrows it.
 pub(super) const INLINE_HEIGHT: u16 = 8;
 
-/// Ghost placeholder shown in the empty input box. Keeps the /help pointer:
-/// the welcome line scrolls away, this is the standing discoverability hint.
-/// Leading space keeps the terminal's block caret off the first glyph of the
-/// placeholder — the empty composer reads as focused, not as a selected "D".
-const INPUT_PLACEHOLDER: &str = " Describe a task…  ·  / for commands";
+/// The composer's prompt: a cell of padding, the glyph, a cell of air. Typed
+/// text starts two columns inside the border — the same column as a tool
+/// line's name — and the glyph sits in the tool lines' glyph column, so the
+/// box and the transcript share one vertical rhythm.
+const PROMPT: &str = " ❯ ";
 
 /// Commit finalized rows into the terminal scrollback. A row is "finalized"
 /// once it will never mutate again: everything except the in-flight streaming
@@ -63,13 +61,28 @@ pub(super) fn commit<B: ratatui::backend::Backend>(
         // live view had rendered at 120 and the scrollback commit
         // suddenly went wider (external re-review).
         let width = content_width(term.size().map(|sz| sz.width).unwrap_or(80));
-        commit_rows(
+        // The gap this batch's first row owes its predecessor. Inside one
+        // batch the row-boundary spacer of `build_history_lines` places it;
+        // across batches it used to be lost — a mid-stream batch never ends
+        // with the end-of-history blank, so whatever followed landed flush
+        // against it: every paragraph break of a long streaming answer, the
+        // answer under a held-back thinking trace. One pair rule (`row_gap`)
+        // now serves both places; a batch that did end on a blank already
+        // carries the gap.
+        let leading_spacer = s.committed > 0
+            && !s.committed_tail_blank
+            && row_gap(&s.rows[s.committed - 1], &s.rows[s.committed]);
+        let tail_blank = commit_rows(
             term,
             &s.rows[s.committed..pending_end],
             &mut s.md_cache,
             width,
+            leading_spacer,
             pending_end == s.rows.len(),
         )?;
+        if let Some(tail_blank) = tail_blank {
+            s.committed_tail_blank = tail_blank;
+        }
         s.committed = pending_end;
         s.dirty = true;
     }
@@ -104,13 +117,10 @@ pub(super) fn draw(f: &mut Frame, s: &mut Session, cfg: &Config) {
     let area = f.area(); // the INLINE_HEIGHT-row band at the bottom
     let busy = s.run.phase.busy();
     let term_w = area.width;
-    let (prompt, prompt_style) = (
-        "❯ ".to_string(),
-        Style::default().fg(USER_FG).add_modifier(Modifier::BOLD),
-    );
+    let prompt_style = Style::default().fg(accent_fg());
     let chrome_w = content_width(term_w) as u16;
     let inner_cols = (chrome_w as usize).saturating_sub(2).max(1);
-    let composer = layout_composer(&s.composer.input, inner_cols, &prompt, prompt_style);
+    let composer = layout_composer(&s.composer.input, inner_cols, PROMPT, prompt_style);
     // Soft-wrapped rows, not logical newlines, determine height.
     // The fixed inline viewport keeps at least a small live zone.
     let max_input = ((area.height as usize) / 2).max(3);
@@ -133,24 +143,22 @@ pub(super) fn draw(f: &mut Frame, s: &mut Session, cfg: &Config) {
 
     // Transcript zone (the rows above the input box inside the
     // viewport): the slash popup while typing a command, else the
-    // thinking placeholder before any output, else the in-flight
-    // streaming row, else the running-tool placeholder (a tool
-    // execution streams nothing of its own). Each is bottom-aligned
-    // so its last line sits flush above the input box.
-    // Already-committed turns live in the host terminal's
+    // key legend of a fresh session (the box's caption — it leaves with
+    // the first keystroke), else the thinking placeholder before any
+    // output, else the in-flight streaming row, else the running-tool
+    // placeholder (a tool execution streams nothing of its own). Each
+    // is bottom-aligned so its last line sits flush above the input
+    // box; already-committed turns live in the host terminal's
     // scrollback above this viewport.
     if s.composer.popup.is_open() {
         let lines = slash_popup_lines_for(&s.composer.popup, zone_rect.height as usize, content_w);
         render_zone_top(f, zone_rect, &lines);
     } else if s.run.phase == RunPhase::Idle && s.rows.len() <= 1 && s.composer.input.is_empty() {
         let lines = empty_state_lines(content_w);
-        render_zone_top(f, zone_rect, &lines);
+        render_zone_tail(f, zone_rect, &lines);
     } else if s.run.thinking {
         let line = Line::from(vec![
-            Span::styled(
-                AGENT_MARK.to_string(),
-                Style::default().fg(AGENT_FG).add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(AGENT_MARK.to_string(), prompt_style),
             Span::styled("…", Style::default().fg(dim_fg())),
         ]);
         render_zone_tail(f, zone_rect, &[line]);
@@ -174,12 +182,8 @@ pub(super) fn draw(f: &mut Frame, s: &mut Session, cfg: &Config) {
         }
     } else if let Some((name, started)) = s.run.tool_building.as_ref().filter(|_| busy) {
         let line = Line::from(vec![
-            Span::styled(
-                format!("{TOOL_HEAD_MARK}→ {name}"),
-                Style::default()
-                    .fg(TOOL_CALL_FG)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(gutter_mark("→"), prompt_style),
+            Span::styled(name.to_string(), Style::default().fg(dim_fg())),
             Span::styled(
                 format!(" · receiving arguments · {}s", started.elapsed().as_secs()),
                 Style::default().fg(dim_fg()),
@@ -194,9 +198,10 @@ pub(super) fn draw(f: &mut Frame, s: &mut Session, cfg: &Config) {
     }
 
     // Input box. The editing prompt is stable; Enter queues while
-    // busy. The border frame tracks the run: busy flips the whole
-    // frame to AGENT_FG so the bottom chrome reads as one busy
-    // unit, idle falls back to USER_FG.
+    // busy. The border frame tracks the run: busy turns the whole frame
+    // to the accent so the bottom chrome reads as one busy unit, and
+    // idle rests in the secondary ink — the box is still the one
+    // outlined thing on screen, so it stays where the eye lands.
     let spinner_char = SPINNER[(s
         .run
         .run_start
@@ -221,31 +226,31 @@ pub(super) fn draw(f: &mut Frame, s: &mut Session, cfg: &Config) {
         _ => build_input_title(busy, spinner_char, act, secs, s.queued.len(), title_w),
     };
     let title_fg = match s.run.phase {
-        RunPhase::Cancelling => TOOL_CALL_FG,
-        RunPhase::Failed => TOOL_ERR_FG,
+        RunPhase::Cancelling => warn_fg(),
+        RunPhase::Failed => error_fg(),
         _ => chrome_fg(busy),
     };
-    let mut input_lines = composer.lines;
-    if body.is_empty() {
-        if let Some(first) = input_lines.first_mut() {
-            first.spans.push(Span::styled(
-                truncate_display(INPUT_PLACEHOLDER, inner_cols.saturating_sub(prompt.width())),
-                Style::default().fg(dim_fg()),
-            ));
-        }
-    }
     let border_fg = match s.run.phase {
         RunPhase::Idle => dim_fg(),
         _ => title_fg,
     };
+    let mut input_lines = composer.lines;
+    if body.is_empty() {
+        if let Some(first) = input_lines.first_mut() {
+            let room = inner_cols.saturating_sub(PROMPT.width());
+            first
+                .spans
+                .extend(truncate_line(placeholder_line(), room).spans);
+        }
+    }
     let mut input_block = WBlock::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .style(Style::default().bg(composer_bg()))
-        .border_style(Style::default().fg(border_fg))
-        .title(Span::styled(input_title, Style::default().fg(title_fg)));
-    if let Some(footer) = composer_footer(busy, title_w) {
-        input_block = input_block.title_bottom(footer);
+        .border_style(Style::default().fg(border_fg));
+    // An idle box carries no title: the prompt and the placeholder
+    // already say what it is.
+    if !input_title.is_empty() {
+        input_block = input_block.title(Span::styled(input_title, Style::default().fg(title_fg)));
     }
     let input_widget = Paragraph::new(input_lines)
         .block(input_block)
@@ -270,18 +275,19 @@ pub(super) fn draw(f: &mut Frame, s: &mut Session, cfg: &Config) {
         s.usage.cache_read,
     );
     let ctx = fmt_ctx(s.usage.ctx_tokens, cfg.limits.max_context_tokens);
-    // Plan segment: " · plan done/total", green when every step is
-    // completed, yellow while work remains. None when the agent
-    // hasn't used `todo` (segment absent, not a null).
+    // Plan segment: " · plan done/total". The accent once every step is
+    // done — the one plan state worth a glance — and the secondary ink
+    // while work remains. None when the agent hasn't used `todo`
+    // (segment absent, not a null).
     let plan_seg = if s.plan.is_empty() {
         None
     } else {
         let total = s.plan.len();
         let done = s.plan.iter().filter(|t| t.status == "completed").count();
         let style = if done == total {
-            Style::default().fg(AGENT_FG)
+            Style::default().fg(accent_fg())
         } else {
-            Style::default().fg(TOOL_CALL_FG)
+            Style::default().fg(dim_fg())
         };
         Some((format!(" · plan {done}/{total}"), style))
     };
@@ -295,8 +301,5 @@ pub(super) fn draw(f: &mut Frame, s: &mut Session, cfg: &Config) {
         &s.cwd_path,
         status_rect.width as usize,
     );
-    f.render_widget(
-        Paragraph::new(status).style(Style::default().bg(surface_bg())),
-        status_rect,
-    );
+    f.render_widget(Paragraph::new(status), status_rect);
 }

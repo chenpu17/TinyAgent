@@ -1,120 +1,190 @@
 //! Theme: the one place history-row / chrome colors are defined, plus the
-//! light/dark knob (`TINYAGENT_TUI_THEME`) and the small number-formatting
-//! helpers shared by the status bar, the slash replies, and the tool
-//! timing lines.
+//! light/dark knob (`TINYAGENT_TUI_THEME`), the color-depth knob
+//! (`TINYAGENT_TUI_COLOR` / `COLORTERM`) and the small number-formatting
+//! helpers shared by the status bar, the slash replies, and the tool timing
+//! lines.
+//!
+//! The palette is deliberately small. Conversation text — the user's message
+//! and the agent's answer — keeps the terminal's default foreground, so it
+//! reads exactly like the rest of the terminal. Around it sit five inks, each
+//! with one job:
+//!
+//! | ink    | used for                                                       |
+//! |--------|----------------------------------------------------------------|
+//! | accent | role and tool glyphs, the busy frame, inline code               |
+//! | dim    | secondary text: tool lines, thinking, notices, the status readout |
+//! | faint  | tertiary marks: guides, rules, key labels                       |
+//! | warn   | the few states that want a glance (cancelling, queue held)      |
+//! | error  | failures                                                       |
+//!
+//! Nothing paints a background: the terminal's own theme stays the surface,
+//! so the UI never shows a tinted panel that clashes with it.
 
 use ratatui::style::{Color, Style};
 use std::time::Duration;
 
-// Theme: the one place history-row / chrome colors are defined. `dim_fg()`
-// is a function, not a const, because it flips with TINYAGENT_TUI_THEME
-// (see `theme_light_from`): Gray (color 7) is near-invisible on light
-// terminals, where DarkGray (color 8) reads as the intended mid-gray.
-pub(super) const USER_FG: Color = Color::Cyan;
-pub(super) const AGENT_FG: Color = Color::Green;
-pub(super) const TOOL_CALL_FG: Color = Color::Yellow;
-pub(super) const TOOL_OK_FG: Color = Color::Green;
-pub(super) const TOOL_ERR_FG: Color = Color::Red;
-pub(super) const THINKING_FG: Color = Color::Magenta;
+/// How many colors the terminal is trusted to draw. Picked once at TUI start
+/// (see [`color_depth_from`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ColorDepth {
+    /// 24-bit: the exact tints below.
+    TrueColor,
+    /// xterm's 256-color palette: a hand-picked standard entry of matching
+    /// visual weight (not the computed nearest one).
+    Indexed256,
+    /// Only the 16 ANSI colors: whatever the terminal's theme maps there.
+    Ansi16,
+}
 
-/// Quiet surface behind the bottom status instrument strip. Indexed colors
-/// avoid assuming true-color support; the light/dark knob selects a tint that
-/// stays close to the host background instead of painting a heavy panel.
-pub(super) fn surface_bg() -> Color {
-    if *THEME_LIGHT.get().unwrap_or(&false) {
-        Color::Indexed(254)
-    } else {
-        Color::Indexed(233)
+/// Pure decision core of the depth knob. `override_var` (`TINYAGENT_TUI_COLOR`)
+/// wins when it names a depth (`truecolor` / `256` / `16`, case-insensitive);
+/// otherwise `COLORTERM=truecolor|24bit` — what modern terminals export —
+/// selects true color, and anything else (including unset, or a multiplexer
+/// that dropped the variable) stays on the 256-color palette.
+pub(super) fn color_depth_from(override_var: Option<&str>, colorterm: Option<&str>) -> ColorDepth {
+    match override_var
+        .map(|v| v.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("truecolor") => ColorDepth::TrueColor,
+        Some("256") => ColorDepth::Indexed256,
+        Some("16") => ColorDepth::Ansi16,
+        _ => match colorterm.map(|c| c.to_ascii_lowercase()).as_deref() {
+            Some("truecolor" | "24bit") => ColorDepth::TrueColor,
+            _ => ColorDepth::Indexed256,
+        },
     }
 }
 
-/// Slightly raised composer surface: enough separation to read as the active
-/// work area, close enough to the host background to stay quiet.
-pub(super) fn composer_bg() -> Color {
-    if *THEME_LIGHT.get().unwrap_or(&false) {
-        Color::Indexed(253)
-    } else {
-        Color::Indexed(234)
-    }
+/// One ink in the three depths. `idx` is an entry of xterm's 256-color
+/// palette (the grayscale ramp for the grays); `ansi` is the 16-color slot a
+/// forced-16 terminal falls back on.
+#[derive(Clone, Copy)]
+struct Ink {
+    rgb: (u8, u8, u8),
+    idx: u8,
+    ansi: Color,
 }
 
-/// Shared keycap / selected-command / inline-code surface. One visual vocabulary
-/// across the welcome sheet, composer footer, slash popup and Markdown.
-pub(super) fn keycap_bg() -> Color {
-    if *THEME_LIGHT.get().unwrap_or(&false) {
-        Color::Indexed(251)
-    } else {
-        Color::Indexed(237)
-    }
+const fn ink(rgb: (u8, u8, u8), idx: u8, ansi: Color) -> Ink {
+    Ink { rgb, idx, ansi }
 }
 
-pub(super) fn keycap_fg() -> Color {
-    if *THEME_LIGHT.get().unwrap_or(&false) {
-        Color::Black
-    } else {
-        Color::White
-    }
-}
+const ACCENT_DARK: Ink = ink((122, 162, 247), 110, Color::LightBlue);
+const ACCENT_LIGHT: Ink = ink((37, 99, 235), 27, Color::Blue);
+const DIM_DARK: Ink = ink((138, 146, 158), 245, Color::Gray);
+const DIM_LIGHT: Ink = ink((100, 116, 139), 246, Color::DarkGray);
+const FAINT_DARK: Ink = ink((104, 110, 124), 240, Color::DarkGray);
+const FAINT_LIGHT: Ink = ink((164, 174, 192), 248, Color::DarkGray);
+const WARN_DARK: Ink = ink((229, 180, 102), 179, Color::Yellow);
+const WARN_LIGHT: Ink = ink((178, 106, 0), 130, Color::Yellow);
+const ERROR_DARK: Ink = ink((224, 108, 117), 210, Color::LightRed);
+const ERROR_LIGHT: Ink = ink((200, 50, 50), 160, Color::Red);
 
-// Markdown header emphasis by level: h1 pops, h2/h3 steady, deeper recedes.
-pub(super) const MD_H1_FG: Color = Color::Yellow;
-pub(super) const MD_H23_FG: Color = Color::Cyan;
-pub(super) const MD_DEEP_FG: Color = Color::DarkGray;
-
-// ── Light-terminal theme knob ────────────────────────────────────────────
-// The named colors above map onto the terminal's 16-color palette, which
-// FLIPS with the terminal theme. On a light background Gray (color 7) — the
-// one dim color used across system rows, previews, status segments, code
-// bars, and the empty-state sheet — is near-white and effectively invisible,
-// and tui-markdown styles inline code fg White (white-on-white). No
-// autodetection (COLORFGBG et al. are unreliable); `TINYAGENT_TUI_THEME=`
-// light|dark (default dark) is the explicit knob, read once at TUI start.
-// Everything else (role/tool colors, the model label, the ANSI-parsing palettes
-// that carry TOOL OUTPUT colors chosen by other programs) stays put — those
-// read fine on both backgrounds.
+// ── Knobs ───────────────────────────────────────────────────────────────
+// The 16 ANSI colors flip with the terminal theme and the 256-color grays are
+// fixed, so neither can serve a light and a dark background at once. No
+// autodetection of the background (COLORFGBG et al. are unreliable):
+// `TINYAGENT_TUI_THEME=light|dark` (default dark) is the explicit knob, read
+// once at TUI start. The color depth comes from `TINYAGENT_TUI_COLOR` /
+// `COLORTERM` the same way.
 
 /// Whether the light palette is active. Set once in `run` from the env;
 /// tests read the unset (dark) default.
 static THEME_LIGHT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+/// The bound color depth. Set once in `run`; tests read the unset
+/// (256-color) default.
+static COLOR_DEPTH: std::sync::OnceLock<ColorDepth> = std::sync::OnceLock::new();
 
-/// Pure decision core of the env knob: exactly `light` selects the light
+/// Pure decision core of the theme knob: exactly `light` selects the light
 /// palette; anything else (including unset) stays dark.
 pub(super) fn theme_light_from(var: Option<&str>) -> bool {
     var.is_some_and(|v| v.eq_ignore_ascii_case("light"))
 }
 
-/// Bind the knob from the real environment. Called once at TUI start; later
-/// calls are no-ops (OnceLock keeps the first value).
+/// Bind the theme knob from the real environment. Called once at TUI start;
+/// later calls are no-ops (OnceLock keeps the first value).
 pub(super) fn set_theme_from_env(var: Option<String>) {
     let _ = THEME_LIGHT.set(theme_light_from(var.as_deref()));
 }
 
-/// The dim foreground: Gray on dark terminals (color 7, the classic dim),
-/// DarkGray on light ones (color 8 — there it IS the mid-gray).
+/// Bind the depth knob from the real environment (same once-only contract).
+pub(super) fn set_color_depth_from_env(override_var: Option<String>, colorterm: Option<String>) {
+    let _ = COLOR_DEPTH.set(color_depth_from(
+        override_var.as_deref(),
+        colorterm.as_deref(),
+    ));
+}
+
+fn resolve(light: bool, depth: ColorDepth, dark: Ink, light_ink: Ink) -> Color {
+    let ink = if light { light_ink } else { dark };
+    match depth {
+        ColorDepth::TrueColor => Color::Rgb(ink.rgb.0, ink.rgb.1, ink.rgb.2),
+        ColorDepth::Indexed256 => Color::Indexed(ink.idx),
+        ColorDepth::Ansi16 => ink.ansi,
+    }
+}
+
+/// The bound theme and depth: dark and 256-color until `run` binds them.
+fn bound() -> (bool, ColorDepth) {
+    (
+        *THEME_LIGHT.get().unwrap_or(&false),
+        *COLOR_DEPTH.get().unwrap_or(&ColorDepth::Indexed256),
+    )
+}
+
+/// The one accent: role/tool glyphs, the busy frame, inline code.
+pub(super) fn accent_fg() -> Color {
+    let (light, depth) = bound();
+    accent_fg_for(light, depth)
+}
+
+/// Secondary text: tool lines, thinking, notices, the status readout.
 pub(super) fn dim_fg() -> Color {
-    dim_fg_for(*THEME_LIGHT.get().unwrap_or(&false))
+    let (light, depth) = bound();
+    dim_fg_for(light, depth)
 }
 
-pub(super) fn dim_fg_for(light: bool) -> Color {
-    if light {
-        Color::DarkGray
-    } else {
-        Color::Gray
-    }
+/// Tertiary marks: guides, rules, key labels.
+pub(super) fn faint_fg() -> Color {
+    let (light, depth) = bound();
+    faint_fg_for(light, depth)
 }
 
-/// Inline-code foreground: tui-markdown hardcodes fg White, which vanishes on
-/// light backgrounds — the light theme re-dyes it cyan (readable on both).
-pub(super) fn code_fg() -> Color {
-    code_fg_for(*THEME_LIGHT.get().unwrap_or(&false))
+/// States that want a glance: cancelling, a held queue, a context window
+/// filling up.
+pub(super) fn warn_fg() -> Color {
+    let (light, depth) = bound();
+    warn_fg_for(light, depth)
 }
 
-pub(super) fn code_fg_for(light: bool) -> Color {
-    if light {
-        MD_H23_FG
-    } else {
-        Color::White
-    }
+/// Failures.
+pub(super) fn error_fg() -> Color {
+    let (light, depth) = bound();
+    error_fg_for(light, depth)
+}
+
+/// The five inks for an explicit theme and depth: the pure cores behind the
+/// [`accent_fg`] family, so tests assert a color without reading (or racing)
+/// process-global state.
+pub(super) fn accent_fg_for(light: bool, depth: ColorDepth) -> Color {
+    resolve(light, depth, ACCENT_DARK, ACCENT_LIGHT)
+}
+
+pub(super) fn dim_fg_for(light: bool, depth: ColorDepth) -> Color {
+    resolve(light, depth, DIM_DARK, DIM_LIGHT)
+}
+
+pub(super) fn faint_fg_for(light: bool, depth: ColorDepth) -> Color {
+    resolve(light, depth, FAINT_DARK, FAINT_LIGHT)
+}
+
+pub(super) fn warn_fg_for(light: bool, depth: ColorDepth) -> Color {
+    resolve(light, depth, WARN_DARK, WARN_LIGHT)
+}
+
+pub(super) fn error_fg_for(light: bool, depth: ColorDepth) -> Color {
+    resolve(light, depth, ERROR_DARK, ERROR_LIGHT)
 }
 
 /// Compact tool duration: one decimal under 10s ("1.2s"), whole seconds at
@@ -161,7 +231,7 @@ pub(super) fn fmt_tokens_round(n: u64) -> String {
 /// Format the status bar's context-window segment: `ctx 54.7k` when the
 /// model's window size is unknown (limits.max_context_tokens unset), or
 /// `ctx 21% (54.7k/256.0k)` when it is configured. The color grades with
-/// fill level — dim while comfortable, yellow past 60%, red past 80% — so a
+/// fill level — dim while comfortable, warn past 60%, error past 80% — so a
 /// glance tells you how much headroom is left. None before the first Usage
 /// event (nothing meaningful to show).
 pub(super) fn fmt_ctx(ctx_tokens: u64, max_context_tokens: u64) -> Option<(String, Style)> {
@@ -176,9 +246,9 @@ pub(super) fn fmt_ctx(ctx_tokens: u64, max_context_tokens: u64) -> Option<(Strin
     }
     let pct = ctx_tokens.saturating_mul(100) / max_context_tokens.max(1);
     let fg = if pct >= 80 {
-        TOOL_ERR_FG
+        error_fg()
     } else if pct >= 60 {
-        TOOL_CALL_FG
+        warn_fg()
     } else {
         dim_fg()
     };

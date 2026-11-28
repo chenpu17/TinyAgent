@@ -2,9 +2,10 @@
 //! of tui-markdown), the ANSI escape parser for tool output, the fence
 //! scanner shared with the streaming split, and the single-slot `MdCache`.
 
-use super::theme::{code_fg, dim_fg, keycap_bg, MD_DEEP_FG, MD_H1_FG, MD_H23_FG};
+use super::theme::{accent_fg, dim_fg, error_fg, faint_fg, warn_fg};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use tui_markdown::{AlertKind, Options, StyleSheet};
 
 /// The standard ANSI palette (SGR 30-37 / 40-47) and the bright variant
 /// (90-97 / 100-107), in SGR order.
@@ -244,16 +245,16 @@ pub(super) fn ansi_to_lines(text: &str) -> Vec<Line<'static>> {
     lines
 }
 
-/// Tool-output body lines with the dim `│ ` guide: ANSI-styled spans keep
+/// Tool-output body lines with the faint `│ ` guide: ANSI-styled spans keep
 /// their colors; spans the source left unstyled (or reset to default) take
-/// `base_style` (dim for ok results, red for errors).
+/// `base_style` (dim for ok results, the error ink for failures).
 pub(super) fn ansi_guided_lines(text: &str, base_style: Style) -> Vec<Line<'static>> {
     ansi_to_lines(text)
         .into_iter()
         .map(|l| {
             let mut spans = vec![Span::styled(
                 "│ ".to_string(),
-                Style::default().fg(dim_fg()),
+                Style::default().fg(faint_fg()),
             )];
             spans.extend(l.spans.into_iter().map(|s| {
                 if s.style == Style::default() {
@@ -293,34 +294,200 @@ pub(super) fn is_hrule(text: &str) -> bool {
             .all(|c| c.is_whitespace() || matches!(c, '-' | '*' | '_'))
 }
 
-/// Render a markdown string into styled lines. `tui-markdown` 0.3 styles inline
-/// elements (bold / code) correctly but leaves block elements literal: an ATX
-/// header renders as plain "## Title" (markers visible, no emphasis), a list
-/// item as "- text", a fenced code block keeps its ``` fence lines with the
-/// code unstyled, and a thematic break comes through as a literal "---" line.
-/// We keep its inline work and fix only the block lines — headers become a
-/// bold, level-colored title with the `#` markers stripped, `-`/`*`/`+`
-/// bullets become `•`, the ``` fence lines are dropped and the enclosed code
-/// gets a dim `▎ ` left border bar with the body left at the default color
-/// (tui-markdown emits no language highlighting), and an hr becomes a
-/// full-width dim `─` rule.
+/// tui-markdown's style sheet, bound to the TUI palette. The crate's default
+/// is a rainbow of its own — H1 white on a cyan band, cyan H2/H3, green
+/// blockquotes, magenta math, light-blue list markers, white-on-black code —
+/// so every element the renderer can emit is redirected here: one of the
+/// theme's inks (or plain weight), and never a background.
+#[derive(Clone, Copy, Debug, Default)]
+struct Sheet;
+
+impl StyleSheet for Sheet {
+    /// Weight, not color: see [`heading_style`].
+    fn heading(&self, level: u8) -> Style {
+        heading_style(level)
+    }
+    /// Inline code: the accent ink, no chip (a filled background assumed a
+    /// surface the terminal never promised, and white-on-black vanished on a
+    /// light theme). Fenced blocks are restyled separately in
+    /// [`render_markdown`].
+    fn code(&self) -> Style {
+        Style::new().fg(accent_fg())
+    }
+    /// Links: the accent plus an underline, so they stay tellable from code.
+    fn link(&self) -> Style {
+        Style::new()
+            .fg(accent_fg())
+            .add_modifier(Modifier::UNDERLINED)
+    }
+    /// Quoted text recedes: the secondary ink (the `>` itself goes fainter
+    /// still in [`render_markdown`]).
+    fn blockquote(&self) -> Style {
+        Style::new().fg(dim_fg())
+    }
+    fn heading_meta(&self) -> Style {
+        Style::new().fg(faint_fg())
+    }
+    fn metadata_block(&self) -> Style {
+        Style::new().fg(faint_fg())
+    }
+    fn html(&self) -> Style {
+        Style::new().fg(dim_fg())
+    }
+    /// Math keeps its delimiters and the surrounding ink; no magenta.
+    fn math_inline(&self) -> Style {
+        Style::new().add_modifier(Modifier::ITALIC)
+    }
+    fn math_display(&self) -> Style {
+        Style::new()
+    }
+    fn footnote_ref(&self) -> Style {
+        Style::new().fg(dim_fg()).add_modifier(Modifier::ITALIC)
+    }
+    fn footnote_def(&self) -> Style {
+        Style::new().fg(dim_fg())
+    }
+    /// GFM alerts (`> [!NOTE]`) by gravity: the informational kinds take the
+    /// accent, a warning the warn ink, a caution the error ink.
+    fn alert(&self, kind: AlertKind) -> Style {
+        let fg = match kind {
+            AlertKind::Note | AlertKind::Tip | AlertKind::Important => accent_fg(),
+            AlertKind::Warning => warn_fg(),
+            AlertKind::Caution => error_fg(),
+        };
+        Style::new().fg(fg)
+    }
+    /// A table's header row is weight; its frame is a tertiary mark.
+    fn table_header(&self) -> Style {
+        Style::new().add_modifier(Modifier::BOLD)
+    }
+    fn table_border(&self) -> Style {
+        Style::new().fg(faint_fg())
+    }
+    fn list_marker(&self) -> Style {
+        Style::new().fg(dim_fg())
+    }
+    fn image_alt(&self) -> Style {
+        Style::new().fg(dim_fg()).add_modifier(Modifier::ITALIC)
+    }
+}
+
+/// Heading style: bold in the default ink for h1–h3 — weight, not color, is
+/// the emphasis, so an answer's headings sit in the same ink as its body — and
+/// bold in the secondary ink from h4 down, where the levels recede.
+fn heading_style(level: u8) -> Style {
+    let style = Style::new().add_modifier(Modifier::BOLD);
+    if level > 3 {
+        style.fg(dim_fg())
+    } else {
+        style
+    }
+}
+
+/// Move a line's own style onto its spans and reset it. tui-markdown puts
+/// block styling — heading weight, the quote and code-block inks — on the
+/// LINE (`Line::patch_style`), where it also covers whatever a row renderer
+/// later puts in front of that line: a heading that opened an answer turned
+/// the `◆ ` role mark cyan and bold, and the code bar came out on the code
+/// block's background. With the style on the spans the line's own style is
+/// plain, and the rest of the pipeline (wrapping, continuation cells, the
+/// role mark) sees every style where it expects one. A span keeps its own
+/// properties; the line style fills in the rest.
+fn flatten_line_style(line: &mut Line<'_>) {
+    let base = line.style;
+    if base != Style::default() {
+        for span in &mut line.spans {
+            span.style = base.patch(span.style);
+        }
+        line.style = Style::default();
+    }
+}
+
+/// The text of a line's first span ("" for an empty line).
+fn first_text<'a>(line: &'a Line<'a>) -> &'a str {
+    line.spans.first().map(|s| s.content.as_ref()).unwrap_or("")
+}
+
+/// Number of leading spans that make up a blockquote prefix: tui-markdown
+/// writes one as a `>` span followed by a space span. Only a single level is
+/// recognized (a nested quote's prefixes come out in another shape); such
+/// lines simply get no quote handling.
+fn quote_prefix_len(line: &Line<'_>) -> usize {
+    let mut spans = line.spans.iter();
+    match (spans.next(), spans.next()) {
+        (Some(gt), Some(space)) if gt.content == ">" && space.content == " " => 2,
+        _ => 0,
+    }
+}
+
+/// A code-block content line: the faint `▎ ` bar and the body in the default
+/// ink (no highlighting — the crate is built without it, and tinted code
+/// would fight the answer around it). `spans[..skip]` is a blockquote prefix
+/// kept in front of the bar, restyled to the quote's ink.
+fn code_line(spans: Vec<Span<'_>>, skip: usize) -> Line<'_> {
+    let mut out: Vec<Span<'_>> = spans[..skip]
+        .iter()
+        .map(|s| Span::styled(s.content.clone(), Style::new().fg(dim_fg())))
+        .collect();
+    let body: String = spans[skip..].iter().map(|s| s.content.as_ref()).collect();
+    out.push(Span::styled("▎ ".to_string(), Style::new().fg(faint_fg())));
+    out.push(Span::raw(body));
+    Line::from(out)
+}
+
+/// Display form of a bullet marker span. tui-markdown writes the whole
+/// marker — nesting indent included — as the item's first span: `-` / `*` /
+/// `+` bullets become a dim `•`, and a task item keeps its box (`- [ ] ` →
+/// `• ☐ `, `- [x] ` → `• ☑ `). None for anything else: ordered markers
+/// (`1. `) are styled by the sheet and left alone.
+fn bullet_mark(content: &str) -> Option<&'static str> {
+    match content.trim_start_matches(' ') {
+        "- " | "* " | "+ " => Some("• "),
+        "- [ ] " => Some("• ☐ "),
+        "- [x] " | "- [X] " => Some("• ☑ "),
+        _ => None,
+    }
+}
+
+/// Render a markdown string into styled lines.
+///
+/// tui-markdown does the parsing and draws everything through [`Sheet`], so
+/// its elements come out in the TUI's inks with no background anywhere. The
+/// block-level presentation is fixed up here, after [`flatten_line_style`]
+/// has moved every style onto the spans:
+///
+/// * An ATX heading loses its `#` marker span. Inline emphasis and code
+///   inside the title are kept (they used to be collapsed along with the
+///   marker).
+/// * Bullets recede into a dim `•`; task items keep their checkbox.
+/// * A blockquote's `>` goes faint under the dim quote body.
+/// * The ``` fence lines are dropped and the enclosed code gets a faint `▎ `
+///   left bar with the body in the default ink ([`code_line`]).
+/// * An hr becomes a full-width faint `─` rule.
 ///
 /// Fence lines are classified from the SOURCE markdown (`fence_plan`): the
 /// renderer normalizes every fence to exactly ``` so a nested example's inner
 /// fences are invisible in the output — the source's marker lengths are the
 /// only thing that keeps them straight. RESIDUAL LIMITATION: constructs the
-/// plan's scan does not model (fences inside list items / blockquotes,
-/// indented 4-space code blocks, entity-escaped info strings) make the plan
-/// fail its verification against the rendered lines and fall back to the plain
-/// toggle, which mis-tracks nested fences in exactly those cases — the
-/// pre-existing behavior, kept as the safe degradation.
+/// plan's scan does not model (indented 4-space code blocks, entity-escaped
+/// info strings) make the plan fail its verification against the rendered
+/// lines and fall back to the plain toggle, which mis-tracks nested fences in
+/// exactly those cases — the pre-existing behavior, kept as the safe
+/// degradation.
+///
+/// A fence quoted inside a blockquote (`> ```` …) never reaches the plan —
+/// the source scan sees the `>` first — so those lines get a plain toggle of
+/// their own, after the top-level one had its say: a top-level fence's content
+/// that merely looks like a quoted fence is consumed as code before this
+/// toggle can see it, and a line without the quote prefix closes the quoted
+/// fence (CommonMark: a fence cannot outlive its blockquote).
 ///
 /// `width` is the conversation block's inner width (hr length). NOTE: the
 /// rendered lines are memoized in MdCache keyed by row text, so a terminal
 /// RESIZE keeps hr rules at the old width until the row re-renders — a minor
 /// cosmetic staleness, accepted over keying the cache on width too.
 pub(super) fn render_markdown(md: &str, width: usize) -> Vec<Line<'_>> {
-    let raw = tui_markdown::from_str(md).lines;
+    let raw = tui_markdown::from_str_with_options(md, &Options::new(Sheet)).lines;
     // Fence classification: prefer the SOURCE-derived plan (fence_plan —
     // fixes nested fences, whose inner ``` lines the normalized output can't
     // distinguish from real fences), but only after verifying it against the
@@ -332,7 +499,7 @@ pub(super) fn render_markdown(md: &str, width: usize) -> Vec<Line<'_>> {
     let plan_ok = {
         let mut plan_iter = plan.iter();
         let all_match = raw.iter().all(|line| {
-            let first = line.spans.first().map(|s| s.content.as_ref()).unwrap_or("");
+            let first = first_text(line);
             if !first.trim_start().starts_with("```") {
                 return true; // not fence-looking: doesn't consume the plan
             }
@@ -342,10 +509,13 @@ pub(super) fn render_markdown(md: &str, width: usize) -> Vec<Line<'_>> {
     };
     let mut lines: Vec<Line<'_>> = Vec::with_capacity(raw.len());
     let mut in_fence = false;
+    let mut in_quote_fence = false;
     let mut next_evt = 0usize;
     for line in raw {
-        let first: &str = line.spans.first().map(|s| s.content.as_ref()).unwrap_or("");
-        if first.trim_start().starts_with("```") {
+        let mut line = line;
+        flatten_line_style(&mut line);
+        let heading = header_level(first_text(&line)).is_some();
+        if first_text(&line).trim_start().starts_with("```") {
             // Fence-looking line: with a verified plan, classify from the
             // SOURCE (a Content line here is a code line wearing a fence's
             // clothes — it must fall through to the code rendering below,
@@ -373,76 +543,56 @@ pub(super) fn render_markdown(md: &str, width: usize) -> Vec<Line<'_>> {
             }
         }
         if in_fence {
-            // Code content: a dim `▎ ` border bar is the only signal — the
-            // body keeps the default fg so code no longer fights the yellow
-            // tool-call heads for attention (tui-markdown emits no inline
-            // styling inside a fence anyway).
-            let mut line = line;
-            line.spans.insert(
-                0,
-                Span::styled("▎ ".to_string(), Style::default().fg(dim_fg())),
-            );
-            lines.push(line);
+            lines.push(code_line(line.spans, 0));
             continue;
         }
         let line_text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         if is_hrule(&line_text) {
             lines.push(Line::from(Span::styled(
                 "─".repeat(width.max(1)),
-                Style::default().fg(dim_fg()),
+                Style::new().fg(faint_fg()),
             )));
             continue;
         }
-        let mut line = line;
-        let first: String = line
-            .spans
-            .first()
-            .map(|s| s.content.as_ref())
-            .unwrap_or("")
-            .to_string();
-        if let Some(hashes) = header_level(&first) {
-            // Collapse to one bold span; inline styling inside a header title
-            // is rare, so dropping it is fine.
-            let title: String = line
-                .spans
-                .iter()
+        let quote = quote_prefix_len(&line);
+        if quote > 0 {
+            let qfirst = line.spans[quote..]
+                .first()
                 .map(|s| s.content.as_ref())
-                .collect::<String>()[hashes..]
-                .trim_start()
-                .to_string();
-            let color = match hashes {
-                1 => MD_H1_FG,
-                2 | 3 => MD_H23_FG,
-                _ => MD_DEEP_FG,
-            };
-            line.spans = vec![Span::styled(
-                title,
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            )];
-        } else if first.starts_with("- ") || first.starts_with("* ") || first.starts_with("+ ") {
-            // tui-markdown isolates the marker in its own span, so swap just it
-            // and keep the rest (inline code/bold on the item text).
-            if let Some(s0) = line.spans.first_mut() {
-                s0.content = "• ".into();
+                .unwrap_or("");
+            if qfirst.starts_with("```") {
+                in_quote_fence = !in_quote_fence;
+                continue;
             }
+            if in_quote_fence {
+                lines.push(code_line(line.spans, quote));
+                continue;
+            }
+            // The quote mark is tertiary to the quoted text.
+            if let Some(gt) = line.spans.first_mut() {
+                gt.style = Style::new().fg(faint_fg());
+            }
+        } else {
+            in_quote_fence = false;
         }
-        redye_inline_code(&mut line, code_fg(), keycap_bg());
+        if heading {
+            // Drop just the marker span (tui-markdown writes `"### "` as one
+            // span); the title keeps its own inline styling.
+            line.spans.remove(0);
+            if let Some(title) = line.spans.first_mut() {
+                let trimmed = title.content.trim_start().to_string();
+                title.content = trimmed.into();
+            }
+        } else if let Some(mark) = line.spans.first().and_then(|s| bullet_mark(&s.content)) {
+            let marker = &mut line.spans[0];
+            let indent = marker.content.len() - marker.content.trim_start_matches(' ').len();
+            let lead = marker.content[..indent].to_string();
+            marker.content = format!("{lead}{mark}").into();
+            marker.style = marker.style.fg(dim_fg());
+        }
         lines.push(line);
     }
     lines
-}
-
-/// Restyle tui-markdown's inline-code spans (White on Black) onto the shared
-/// raised surface. The two-color predicate avoids touching ordinary white text;
-/// the explicit arguments keep the light/dark pair testable without changing the
-/// process-global theme knob.
-pub(super) fn redye_inline_code(line: &mut Line, fg: Color, bg: Color) {
-    for s in line.spans.iter_mut() {
-        if s.style.fg == Some(Color::White) && s.style.bg == Some(Color::Black) {
-            s.style.fg = Some(fg);
-            s.style.bg = Some(bg);
-        }
-    }
 }
 
 /// Snapshot a `Line` with every span's borrowed content materialized into an

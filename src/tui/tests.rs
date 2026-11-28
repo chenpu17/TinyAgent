@@ -14,6 +14,7 @@ use crate::config::Config;
 use crate::provider::{Block, Message};
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::backend::TestBackend;
+use ratatui::buffer::Buffer;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -26,10 +27,10 @@ use unicode_width::UnicodeWidthStr;
 #[test]
 fn markdown_fenced_code_block_styled_and_fences_dropped() {
     // Probe conclusion (tui-markdown 0.3): the ``` fence lines survive as
-    // literal lines and the code between them is unstyled. render_markdown
-    // must drop the fence lines and give the enclosed code a dim `▎ `
-    // border bar; the body keeps the DEFAULT fg so code doesn't fight
-    // the yellow tool-call heads for attention.
+    // literal lines and the block's style lands on the LINE. render_markdown
+    // must drop the fence lines and give the enclosed code a faint `▎ ` bar;
+    // the body keeps the DEFAULT fg so code doesn't fight the answer around
+    // it for attention.
     let lines = render_markdown(
         "before\n\n```rust\nlet x = 1;\nlet y = 2;\n```\n\nafter `code`\n",
         40,
@@ -45,22 +46,39 @@ fn markdown_fenced_code_block_styled_and_fences_dropped() {
         .collect();
     assert_eq!(code.len(), 2, "code lines: {texts:?}");
     for l in code {
-        // Span 0 is the dim border bar; the code spans stay default.
+        // Exactly two spans: the faint bar, then the body in the default ink.
+        assert_eq!(l.spans.len(), 2, "bar + body: {:?}", l.spans);
         assert_eq!(l.spans[0].content.as_ref(), "▎ ");
-        assert_eq!(l.spans[0].style.fg, Some(dim_fg()));
-        assert!(
-            l.spans[1..].iter().all(|s| s.style.fg.is_none()),
+        assert_eq!(l.spans[0].style, Style::default().fg(faint_fg()));
+        assert_eq!(
+            l.spans[1].style,
+            Style::default(),
             "code body must keep the default fg: {:?}",
             l.spans
         );
     }
-    // Inline code outside a fence keeps tui-markdown's own styling
-    // (fg White), untouched by the fence pass.
+    // Inline code outside a fence takes the accent ink — and no chip.
     let after = lines
         .iter()
         .find(|l| row_text(l).starts_with("after"))
         .expect("the line after the block");
-    assert!(after.spans.iter().any(|s| s.style.fg == Some(Color::White)));
+    let inline = after
+        .spans
+        .iter()
+        .find(|s| s.content.as_ref() == "code")
+        .expect("the inline code span");
+    assert_eq!(inline.style, Style::default().fg(accent_fg()));
+    // Nothing in the whole block paints a background or a line-level style.
+    assert!(
+        lines
+            .iter()
+            .all(|l| l.spans.iter().all(|s| s.style.bg.is_none())),
+        "a background leaked: {lines:?}"
+    );
+    assert!(
+        lines.iter().all(|l| l.style == Style::default()),
+        "a line-level style survived: {lines:?}"
+    );
 }
 
 #[test]
@@ -155,16 +173,22 @@ fn fence_plan_classifies_nested_unclosed_and_tilde_fences() {
 }
 
 #[test]
-fn markdown_hrule_becomes_a_full_width_dim_rule() {
+fn markdown_hrule_becomes_a_full_width_faint_rule() {
     // tui-markdown emits a thematic break as a literal "---" line;
-    // render_markdown swaps it for a dim ─ rule of the given width.
+    // render_markdown swaps it for a faint ─ rule of the given width — one
+    // span, no background, nothing else on the line.
     let lines = render_markdown("above\n\n---\n\nbelow\n", 12);
     let rule = lines
         .iter()
         .find(|l| row_text(l).contains('─'))
         .expect("an hr line");
     assert_eq!(row_text(rule), "─".repeat(12));
-    assert_eq!(rule.spans[0].style.fg, Some(dim_fg()));
+    assert_eq!(rule.spans.len(), 1);
+    assert_eq!(rule.spans[0].style, Style::default().fg(faint_fg()));
+    assert_eq!(rule.style, Style::default());
+    // A zero width still draws one cell of rule rather than nothing.
+    let degenerate = render_markdown("---\n", 0);
+    assert_eq!(row_text(&degenerate[0]), "─");
     // is_hrule itself: ≥3 chars of -,*,_ only; "--" and "- item" are not.
     assert!(is_hrule("---") && is_hrule("***") && is_hrule("___"));
     assert!(is_hrule(" - - - "));
@@ -219,56 +243,21 @@ fn theme_light_from_matches_light_case_insensitively() {
 }
 
 #[test]
-fn theme_fg_accessors_default_to_the_legacy_dark_constants() {
-    // Tests never set THEME_LIGHT (OnceLock is process-global and cannot
-    // be reset), so the accessors here exercise the unset → dark branch.
-    // Pins "default zero drift": dark theme is byte-identical to the
-    // pre-knob DIM_FG / White constants.
-    assert_eq!(dim_fg(), Color::Gray);
-    assert_eq!(code_fg(), Color::White);
-}
-
-#[test]
-fn redye_inline_code_rewrites_only_white_on_black_spans() {
-    let mut line = Line::from(vec![
-        Span::styled("plain", Style::default()),
-        Span::styled("code", Style::default().fg(Color::White).bg(Color::Black)),
-        Span::styled("other", Style::default().fg(Color::Cyan)),
-        Span::styled(
-            "bold-code",
-            Style::default()
-                .fg(Color::White)
-                .bg(Color::Black)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("plain-white", Style::default().fg(Color::White)),
-    ]);
-    redye_inline_code(&mut line, MD_H23_FG, Color::Indexed(251));
-    let styles: Vec<_> = line
-        .spans
-        .iter()
-        .map(|s| (s.style.fg, s.style.bg))
-        .collect();
-    assert_eq!(
-        styles,
-        vec![
-            (None, None),
-            (Some(MD_H23_FG), Some(Color::Indexed(251))),
-            (Some(Color::Cyan), None),
-            (Some(MD_H23_FG), Some(Color::Indexed(251))),
-            (Some(Color::White), None),
-        ]
-    );
-    // Modifiers survive — only the inline-code colors are touched.
-    assert!(line.spans[3].style.add_modifier.contains(Modifier::BOLD));
-    // Dark theme passes White as the foreground target with a raised surface.
-    let mut dark = Line::from(Span::styled(
-        "code",
-        Style::default().fg(Color::White).bg(Color::Black),
-    ));
-    redye_inline_code(&mut dark, Color::White, Color::Indexed(237));
-    assert_eq!(dark.spans[0].style.fg, Some(Color::White));
-    assert_eq!(dark.spans[0].style.bg, Some(Color::Indexed(237)));
+fn theme_fg_accessors_default_to_the_dark_palette_at_256_colors() {
+    // Tests never bind THEME_LIGHT / COLOR_DEPTH (OnceLocks are
+    // process-global and only `run` sets them), so the accessors here
+    // exercise the unset branch: the dark palette's 256-color entries.
+    assert_eq!(accent_fg(), Color::Indexed(110));
+    assert_eq!(dim_fg(), Color::Indexed(245));
+    assert_eq!(faint_fg(), Color::Indexed(240));
+    assert_eq!(warn_fg(), Color::Indexed(179));
+    assert_eq!(error_fg(), Color::Indexed(210));
+    // …which is exactly what the pure cores return for (dark, 256).
+    assert_eq!(accent_fg(), accent_fg_for(false, ColorDepth::Indexed256));
+    assert_eq!(dim_fg(), dim_fg_for(false, ColorDepth::Indexed256));
+    assert_eq!(faint_fg(), faint_fg_for(false, ColorDepth::Indexed256));
+    assert_eq!(warn_fg(), warn_fg_for(false, ColorDepth::Indexed256));
+    assert_eq!(error_fg(), error_fg_for(false, ColorDepth::Indexed256));
 }
 
 #[test]
@@ -276,22 +265,32 @@ fn history_user_and_agent_use_inline_icons() {
     let rows = vec![Row::User("hello".into()), Row::Assistant("world".into())];
     let lines = history(&rows);
 
-    // User: cyan-bold `❯ ` icon inline on the first body line — no
-    // standalone header row. The user's own text earns the stronger weight.
+    // User: the accent `❯ ` mark inline on the first body line — no
+    // standalone header row. The user's own text keeps the terminal's
+    // default ink at plain weight: the glyph tells the roles apart.
     assert_eq!(row_text(&lines[0]), "❯ hello");
-    let icon = lines[0].spans[0].style;
-    assert_eq!(icon.fg, Some(USER_FG));
-    assert!(icon.add_modifier.contains(Modifier::BOLD));
-    assert!(lines[0].spans[1]
-        .style
-        .add_modifier
-        .contains(Modifier::BOLD));
+    assert_eq!(lines[0].spans.len(), 2);
+    assert_eq!(lines[0].spans[0].content.as_ref(), "❯ ");
+    assert_eq!(lines[0].spans[0].style, Style::default().fg(accent_fg()));
+    assert_eq!(lines[0].spans[1].content.as_ref(), "hello");
+    assert_eq!(lines[0].spans[1].style, Style::default());
+    assert_eq!(lines[0].style, Style::default());
 
-    // Assistant: green-bold `◆ ` icon the same way.
+    // Assistant: the accent `◆ ` mark the same way, body in the default ink.
+    // (A user message and its answer are one exchange: no blank between.)
     assert_eq!(row_text(&lines[1]), "◆ world");
-    let icon = lines[1].spans[0].style;
-    assert_eq!(icon.fg, Some(AGENT_FG));
-    assert!(icon.add_modifier.contains(Modifier::BOLD));
+    assert_eq!(lines[1].spans.len(), 2);
+    assert_eq!(lines[1].spans[0].content.as_ref(), "◆ ");
+    assert_eq!(lines[1].spans[0].style, Style::default().fg(accent_fg()));
+    assert_eq!(lines[1].spans[1].content.as_ref(), "world");
+    assert_eq!(lines[1].spans[1].style, Style::default());
+    assert_eq!(lines[1].style, Style::default());
+    // A message and its answer are one exchange: no blank between them —
+    // the only blank is the end-of-history spacer.
+    assert_eq!(
+        lines.iter().map(row_text).collect::<Vec<_>>(),
+        vec!["❯ hello", "◆ world", ""]
+    );
 }
 
 #[cfg(unix)]
@@ -327,36 +326,61 @@ fn history_multiline_role_body_aligns_under_the_icon_text() {
 }
 
 #[test]
-fn history_tool_rows_have_colored_heads_and_guided_bodies() {
+fn history_tool_rows_sit_in_the_gutter_with_their_own_inks() {
     let rows = vec![
         tool_call_row("shell"),
         tool_result_row("shell", false),
         tool_result_row("shell", true),
     ];
     let lines = history(&rows);
+    let accent = Style::default().fg(accent_fg());
+    let dim = Style::default().fg(dim_fg());
+    let faint = Style::default().fg(faint_fg());
+    let error = Style::default().fg(error_fg());
 
-    // Collapsed tools share a continuous amber/green/red execution rail.
-    assert_eq!(row_text(&lines[0]), "    ▎ → shell  arg summary");
-    let st = lines[0].spans[0].style;
-    assert_eq!(st.fg, Some(TOOL_CALL_FG));
-    assert!(st.add_modifier.contains(Modifier::BOLD));
-    assert_eq!(lines[0].spans[1].style.fg, Some(dim_fg()));
+    // Call head: two-space gutter, the arrow carries the accent, and the
+    // whole rest of the line is secondary ink. No weight anywhere — a bold
+    // head reads as a second `◆` agent icon in a long execution flow.
+    let call = &lines[0];
+    assert_eq!(row_text(call), "  → shell  arg summary");
+    assert_eq!(call.spans.len(), 3);
+    assert_eq!(call.spans[0].content.as_ref(), "  → ");
+    assert_eq!(call.spans[0].style, accent);
+    assert_eq!(call.spans[1].content.as_ref(), "shell");
+    assert_eq!(call.spans[1].style, dim);
+    assert_eq!(call.spans[2].content.as_ref(), "  arg summary");
+    assert_eq!(call.spans[2].style, dim);
 
-    // Success stays compact and uses a dim preview. The ok head is NOT
-    // bold: a green bold "✓" would read as a second "◆ " agent icon.
-    assert_eq!(row_text(&lines[1]), "    ▎ ✓ shell  body line");
-    let ok = lines[1].spans[0].style;
-    assert_eq!(ok.fg, Some(TOOL_OK_FG));
-    assert!(!ok.add_modifier.contains(Modifier::BOLD));
-    assert_eq!(lines[1].spans[1].style.fg, Some(dim_fg()));
+    // A success is one quiet dim line. Its (hidden) duration span is the
+    // only faint cell run; the preview is dim like the name.
+    let ok = &lines[1];
+    assert_eq!(row_text(ok), "  ✓ shell  body line");
+    assert_eq!(
+        spans(ok),
+        vec![
+            ("  ✓ ", dim),
+            ("shell", dim),
+            ("", faint),
+            ("  body line", dim)
+        ]
+    );
 
-    // Error preview is red as well as carrying an explicit failure glyph;
-    // the failure head alone earns the bold.
-    assert_eq!(row_text(&lines[2]), "    ▎ ✗ shell  body line");
-    let err = lines[2].spans[0].style;
-    assert_eq!(err.fg, Some(TOOL_ERR_FG));
-    assert!(err.add_modifier.contains(Modifier::BOLD));
-    assert_eq!(lines[2].spans[1].style.fg, Some(TOOL_ERR_FG));
+    // A failure is the one result that earns a color of its own: the glyph,
+    // the name and the preview all in the error ink.
+    let failed = &lines[2];
+    assert_eq!(row_text(failed), "  ✗ shell  body line");
+    assert_eq!(
+        spans(failed),
+        vec![
+            ("  ✗ ", error),
+            ("shell", error),
+            ("", faint),
+            ("  body line", error)
+        ]
+    );
+    // Tool rows stay tight against the flow they belong to.
+    assert_eq!(lines.len(), 4);
+    assert_eq!(row_text(&lines[3]), "");
 }
 
 #[test]
@@ -366,7 +390,22 @@ fn history_tool_result_head_shows_elapsed_when_present() {
         *elapsed = Some("1.2s".into());
     }
     let lines = history(&[row]);
-    assert_eq!(row_text(&lines[0]), "    ▎ ✓ shell · 1.2s  body line");
+    let head = &lines[0];
+    assert_eq!(row_text(head), "  ✓ shell · 1.2s  body line");
+    // The duration is a tertiary mark (faint); it does not recolor the rest.
+    assert_eq!(head.spans[2].content.as_ref(), " · 1.2s");
+    assert_eq!(head.spans[2].style, Style::default().fg(faint_fg()));
+    assert_eq!(head.spans[1].style, Style::default().fg(dim_fg()));
+    assert_eq!(head.spans[3].style, Style::default().fg(dim_fg()));
+
+    // "0.0s" on an instant call is noise: hidden.
+    let mut instant = tool_result_row("shell", false);
+    if let Row::ToolResult { elapsed, .. } = &mut instant {
+        *elapsed = Some("0.0s".into());
+    }
+    let lines = history(&[instant]);
+    assert_eq!(row_text(&lines[0]), "  ✓ shell  body line");
+    assert_eq!(lines[0].spans[2].content.as_ref(), "");
 }
 
 #[test]
@@ -380,15 +419,19 @@ fn history_collapsed_tool_preview_strips_ansi_without_losing_text() {
         elapsed: None,
     };
     let lines = history(&[row]);
-    assert_eq!(row_text(&lines[0]), "    ▎ ✓ shell  - old");
+    assert_eq!(row_text(&lines[0]), "  ✓ shell  - old");
     assert!(!row_text(&lines[0]).contains('\x1b'));
+    // The preview takes the row's dim ink — not the ANSI red of the source.
+    assert_eq!(lines[0].spans[3].content.as_ref(), "  - old");
+    assert_eq!(lines[0].spans[3].style, Style::default().fg(dim_fg()));
 }
 
 #[test]
 fn history_tool_head_summary_wraps_with_a_hanging_indent() {
     // A wide collapsed summary on a narrow terminal wraps the head; the
-    // continuation rows retain the execution gutter instead of falling back
-    // to column 0. Wrapping is asserted through the same final pass the app uses.
+    // continuation rows retain the gutter AS BLANKS (the glyph is never
+    // repeated down the wrapped rows) and line up under the first row's
+    // text. Wrapping is asserted through the same final pass the app uses.
     let mut row = tool_call_row("shell");
     if let Row::ToolCall { collapsed, .. } = &mut row {
         *collapsed = "alpha beta gamma delta epsilon zeta eta theta iota".into();
@@ -396,64 +439,107 @@ fn history_tool_head_summary_wraps_with_a_hanging_indent() {
     let lines = wrap_history(&history(&[row]), TEST_W);
     let body: Vec<&Line> = lines.iter().filter(|l| !row_text(l).is_empty()).collect();
     assert!(body.len() > 1, "head must wrap at width {TEST_W}");
-    assert!(row_text(body[0]).starts_with("    ▎ → shell  alpha"));
+    assert_eq!(
+        row_text(body[0]),
+        "  → shell  alpha beta gamma delta",
+        "greedy wrap fills the first row"
+    );
     for cont in &body[1..] {
+        let text = row_text(cont);
+        assert_eq!(
+            text.len() - text.trim_start_matches(' ').len(),
+            4,
+            "continuation must carry exactly the four-cell blank gutter: {text:?}"
+        );
         assert!(
-            row_text(cont).starts_with(TOOL_HEAD_MARK),
-            "continuation lost the execution rail: {:?}",
-            row_text(cont)
+            !text.contains('→'),
+            "the glyph repeated down the wrap: {text:?}"
         );
         // The indent leaves room for text, not a full-width row.
-        assert!(row_width(cont) <= TEST_W);
+        assert!((row_width(cont) <= TEST_W) && (row_width(cont) > 4));
     }
     // All summary words survive the wrap.
     let all: String = body.iter().map(|l| row_text(l)).collect();
-    assert!(all.contains("theta") && all.contains("iota"));
+    for word in ["epsilon", "zeta", "eta", "theta", "iota"] {
+        assert!(all.contains(word), "{word} lost: {all:?}");
+    }
+    // The head (wrapped) and the end-of-history blank: nothing else.
+    assert_eq!(lines.len(), body.len() + 1);
+    assert_eq!(row_text(lines.last().unwrap()), "");
 }
 
 #[test]
-fn history_system_levels_are_color_graded() {
+fn history_system_levels_share_the_gutter_in_their_own_ink() {
     let rows = vec![
-        Row::sys_info("[done: end_turn]"),
-        Row::sys_warn("[cancelling…]"),
+        Row::sys_info("[history cleared]"),
+        Row::sys_warn("[done: max_tokens]"),
         Row::sys_error("[error] boom"),
     ];
     let lines = history(&rows);
-    // Single-line layout: marker + text + blank per row. Info nests in the
-    // tool gutter; warnings/errors rise to column 0 with distinct glyphs.
+    // Every level uses the same two-space gutter column — the ink, not the
+    // indentation, is what makes a warning stand out. Consecutive notices
+    // stack as one block: no blank between them, one blank closes the history.
+    let texts: Vec<String> = lines.iter().map(row_text).collect();
+    assert_eq!(
+        texts,
+        vec![
+            "  · [history cleared]".to_string(),
+            "  ! [done: max_tokens]".to_string(),
+            "  ✗ [error] boom".to_string(),
+            String::new(),
+        ]
+    );
     let cases = [
-        (0, dim_fg(), "    · "),
-        (2, TOOL_CALL_FG, "! "),
-        (4, TOOL_ERR_FG, "✗ "),
+        (0, "  · ", "[history cleared]", dim_fg()),
+        (1, "  ! ", "[done: max_tokens]", warn_fg()),
+        (2, "  ✗ ", "[error] boom", error_fg()),
     ];
-    for (base, fg, pad) in cases {
-        // The "· " marker and the first text line share one rendered line.
-        let (marker, body) = (&lines[base].spans[0], &lines[base].spans[1]);
-        assert_eq!(marker.content.as_ref(), pad, "marker at {base}");
-        assert_eq!(marker.style.fg, Some(fg), "marker at {base}");
-        assert!(marker.style.add_modifier.contains(Modifier::BOLD));
-        assert_eq!(body.style.fg, Some(fg), "body at {base}");
-        assert!(!body.style.add_modifier.contains(Modifier::ITALIC));
+    for (base, mark, body, fg) in cases {
+        // The marker and the first text line share one rendered line, both in
+        // the level's ink at plain weight (no bold, no italic).
+        let line = &lines[base];
+        let ink = Style::default().fg(fg);
+        assert_eq!(
+            line.spans.len(),
+            2,
+            "span count at {base}: {:?}",
+            line.spans
+        );
+        assert_eq!(line.spans[0].content.as_ref(), mark, "marker at {base}");
+        assert_eq!(line.spans[0].style, ink, "marker ink at {base}");
+        assert_eq!(line.spans[1].content.as_ref(), body, "body at {base}");
+        assert_eq!(line.spans[1].style, ink, "body ink at {base}");
     }
 }
 
 #[test]
 fn history_system_multiline_indents_continuation_lines() {
     // Multi-line notices (e.g. the /help reply): first line carries the
-    // "· " marker, continuation lines align under it — in the gutter for
-    // info, at column 0 for warn/error.
+    // glyph in the gutter, continuation lines line up under its text
+    // (column 4) in the same ink — on every level.
     let rows = vec![Row::sys_info("first\nsecond\nthird")];
     let lines = history(&rows);
-    assert_eq!(row_text(&lines[0]), "    · first");
-    assert_eq!(row_text(&lines[1]), "      second");
-    assert_eq!(row_text(&lines[2]), "      third");
-    assert!(!lines[1].spans[0]
-        .style
-        .add_modifier
-        .contains(Modifier::ITALIC));
+    assert_eq!(
+        lines.iter().map(row_text).collect::<Vec<_>>(),
+        vec!["  · first", "    second", "    third", ""]
+    );
+    assert_eq!(lines[1].spans.len(), 1);
+    assert_eq!(lines[1].spans[0].content.as_ref(), "    second");
+    assert_eq!(lines[1].spans[0].style, Style::default().fg(dim_fg()));
+    assert_eq!(lines[2].spans[0].style, Style::default().fg(dim_fg()));
+
     let lines = history(&[Row::sys_warn("w1\nw2")]);
-    assert_eq!(row_text(&lines[0]), "! w1");
-    assert_eq!(row_text(&lines[1]), "  w2");
+    assert_eq!(
+        lines.iter().map(row_text).collect::<Vec<_>>(),
+        vec!["  ! w1", "    w2", ""]
+    );
+    assert_eq!(lines[1].spans[0].style, Style::default().fg(warn_fg()));
+    let lines = history(&[Row::sys_error("e1\ne2")]);
+    assert_eq!(
+        lines.iter().map(row_text).collect::<Vec<_>>(),
+        vec!["  ✗ e1", "    e2", ""]
+    );
+    assert_eq!(lines[1].spans[0].style, Style::default().fg(error_fg()));
 }
 
 #[test]
@@ -464,8 +550,12 @@ fn code_log_row_renders_with_exactly_one_marker() {
     // screen, exactly one in /export.
     let row = code_log_row("console: hi".into());
     let lines = history(std::slice::from_ref(&row));
-    assert_eq!(row_text(&lines[0]), "    · console: hi");
-    assert!(!row_text(&lines[0]).contains("· ·"));
+    assert_eq!(row_text(&lines[0]), "  · console: hi");
+    assert_eq!(lines[0].spans[0].content.as_ref(), "  · ");
+    assert_eq!(
+        (lines[0].spans[1].content.as_ref(), lines[0].spans[1].style),
+        ("console: hi", Style::default().fg(dim_fg()))
+    );
     let out = render_transcript(&[row]);
     assert!(out.contains("· console: hi"), "transcript: {out:?}");
     assert!(!out.contains("· ·"), "doubled marker leaked: {out:?}");
@@ -490,24 +580,31 @@ fn history_turns_use_whitespace_instead_of_full_width_rules() {
 
 #[test]
 fn history_first_user_after_the_welcome_line_gets_no_separator() {
-    // rows[0] is the startup welcome (System), so the first User sits at
-    // idx 1. The old `idx > 0` rule drew a separator above it that floated
-    // mid-screen with nothing to separate — separators only between turns.
-    let rows = vec![
-        Row::sys_info(welcome_text("glm", 3, None)),
-        Row::User("hi".into()),
-    ];
+    // rows[0] is the startup welcome (the session's Head row), so the first
+    // User sits at idx 1. The old `idx > 0` rule drew a separator above it
+    // that floated mid-screen with nothing to separate — separators only
+    // between turns.
+    let welcome = welcome_text("glm", 3, None);
+    let rows = vec![Row::sys_head(welcome.clone()), Row::User("hi".into())];
     let lines = history(&rows);
-    assert!(
-        lines.iter().all(|l| row_text(l) != "─".repeat(TEST_W)),
-        "no separator above the first User row"
-    );
-    // Welcome notice and user row are separated by whitespace, not a rule.
+    // Head, ONE blank, the first user row, the end-of-history blank — and
+    // no rule anywhere.
+    let texts: Vec<String> = lines.iter().map(row_text).collect();
     assert_eq!(
-        row_text(&lines[0]),
-        format!("    · {}", welcome_text("glm", 3, None))
+        texts,
+        vec![
+            format!("◆ {welcome}"),
+            String::new(),
+            "❯ hi".to_string(),
+            String::new()
+        ]
     );
-    assert_eq!(row_text(&lines[2]), "❯ hi");
+    assert!(
+        lines
+            .iter()
+            .all(|l| !row_text(l).contains('─') && !row_text(l).contains('━')),
+        "a rule replaced the whitespace separator: {texts:?}"
+    );
 }
 
 #[test]
@@ -695,48 +792,41 @@ fn new_slash_commands_share_grammar_and_busy_availability() {
 
 #[test]
 fn empty_state_and_semantic_status_fit_narrow_cells() {
+    // The key legend is ONE line at every width, never wider than the
+    // terminal — whatever it has to drop or truncate.
     for width in [0, 1, 12, 40, 100] {
         let lines = empty_state_lines(width);
-        assert_eq!(lines.len(), 3);
-        assert!(lines.iter().all(|line| line.width() <= width));
+        assert_eq!(lines.len(), 1, "width {width}");
+        assert!(
+            lines.iter().all(|line| line.width() <= width),
+            "width {width}"
+        );
     }
+    // Wide: the full legend in the tool gutter — no masthead, no tagline,
+    // no rule ride with it any more.
     let opening = empty_state_lines(80);
-    let masthead = row_text(&opening[0]);
-    assert!(masthead.contains("T I N Y A G E N T"));
-    assert!(masthead.contains(env!("CARGO_PKG_VERSION")));
-    assert!(!masthead.contains("TERMINAL AGENT"));
     assert_eq!(
-        opening[0].width(),
-        80,
-        "version pins to the chrome's right edge"
+        row_text(&opening[0]),
+        "  Ctrl-J newline · Esc cancel · /help keys"
     );
-    assert!(opening[0]
-        .spans
-        .iter()
-        .any(|span| span.style.fg == Some(AGENT_FG)));
-    assert_eq!(opening[1].width(), 80, "rule spans the whole work area");
-    assert!(row_text(&opening[1]).contains("━"));
-    assert!(row_text(&opening[2]).contains("real terminal work"));
-    // One key legend only: the composer's bottom border. The welcome sheet
-    // must not repeat it two rows above.
-    let footer = composer_footer(false, 80).expect("footer fits at 80");
-    assert!(row_text(&footer).contains("Enter"));
-    assert!(row_text(&footer).contains("commands"));
-    assert!(row_text(&footer).contains("/help"));
-    assert!(composer_footer(true, 80).is_none());
-    assert!(composer_footer(false, 20).is_none());
+    assert_eq!(opening[0].width(), 42);
+    // No cell of it paints a background: every cell keeps the terminal's
+    // own surface.
+    let term = test_line_terminal(opening, 80, 1);
+    assert!(paints_no_background(&term));
 
+    // Last-resort density keeps the broad state — in its own ink.
     let failed = build_status_line("model", "failed", false, None, None, "", "", 5);
     assert_eq!(row_text(&failed), "fail…");
-    assert_eq!(failed.spans[0].style.fg, Some(TOOL_ERR_FG));
+    assert_eq!(failed.spans.len(), 1);
+    assert_eq!(failed.spans[0].style, Style::default().fg(error_fg()));
     let cancelling = build_status_line("model", "cancelling", true, None, None, "", "", 40);
-    assert!(row_text(&cancelling).contains("cancelling"));
-    assert_eq!(cancelling.spans[1].style.fg, Some(TOOL_CALL_FG));
-
-    assert_eq!(dim_fg_for(false), Color::Gray);
-    assert_eq!(dim_fg_for(true), Color::DarkGray);
-    assert_eq!(code_fg_for(false), Color::White);
-    assert_eq!(code_fg_for(true), MD_H23_FG);
+    assert_eq!(row_text(&cancelling), "! model · cancelling");
+    let state = Style::default().fg(warn_fg());
+    assert_eq!(cancelling.spans[0].content.as_ref(), "!");
+    assert_eq!(cancelling.spans[0].style, state);
+    assert_eq!(cancelling.spans[2].content.as_ref(), " · cancelling");
+    assert_eq!(cancelling.spans[2].style, state);
 }
 
 #[test]
@@ -761,30 +851,71 @@ fn queue_preview_never_exceeds_even_a_tiny_viewport() {
 
 #[test]
 fn empty_state_and_slash_popup_draw_into_a_real_cell_grid() {
-    let term = test_line_terminal(empty_state_lines(40), 40, 4);
+    // Wide enough for the full legend (42 cells). The app bottom-aligns it
+    // in the zone above the input box (`render_zone_tail`).
+    let legend = empty_state_lines(60);
+    let term = test_line_terminal(legend.clone(), 60, 4);
     let first = test_buffer_row(&term, 0);
-    let third = test_buffer_row(&term, 2);
-    let fourth = test_buffer_row(&term, 3);
-    assert!(first.contains("T I N Y A G E N T"), "{first:?}");
-    assert!(third.contains("Ask. Build. Debug."), "{third:?}");
-    assert!(
-        fourth.trim().is_empty(),
-        "one breathing row above the composer"
+    assert_eq!(
+        first.trim_end(),
+        "  Ctrl-J newline · Esc cancel · /help keys",
+        "{first:?}"
     );
-    assert!(first.width() <= 40);
-    // The empty sheet carries no keycaps; the composer border owns the only
-    // legend (and at 40 columns it still fits the short form).
-    assert!(!first.contains("Enter"), "{first:?}");
-    assert!(composer_footer(false, 38).is_some());
+    assert!(first.width() <= 60);
+    assert!(!first.contains("Enter"), "the legend names keys, not Enter");
+    let mut term = Terminal::new(TestBackend::new(60, 4)).unwrap();
+    term.draw(|frame| render_zone_tail(frame, ratatui::layout::Rect::new(0, 0, 60, 4), &legend))
+        .unwrap();
+    assert_eq!(
+        test_buffer_row(&term, 3).trim_end(),
+        "  Ctrl-J newline · Esc cancel · /help keys"
+    );
+    for y in 0..3 {
+        assert!(
+            test_buffer_row(&term, y).trim().is_empty(),
+            "the one-line legend must sit flush above the input box (row {})",
+            y
+        );
+    }
+    // Inks, cell by cell: key names dim, labels and ` · ` separators faint,
+    // the legend's own gutter and the rest of the row in the terminal's
+    // default foreground, nothing painted.
+    let cells = term.backend().buffer();
+    assert_eq!(rendered_cell(cells, 0, 3), (" ", Some(Color::Reset)));
+    assert_eq!(rendered_cell(cells, 2, 3), ("C", Some(dim_fg())));
+    assert_eq!(rendered_cell(cells, 7, 3), ("J", Some(dim_fg())));
+    assert_eq!(rendered_cell(cells, 8, 3), (" ", Some(faint_fg())));
+    assert_eq!(rendered_cell(cells, 9, 3), ("n", Some(faint_fg())));
+    assert_eq!(rendered_cell(cells, 17, 3), ("·", Some(faint_fg())));
+    assert_eq!(rendered_cell(cells, 19, 3), ("E", Some(dim_fg())));
+    assert_eq!(rendered_cell(cells, 30, 3), ("·", Some(faint_fg())));
+    assert_eq!(rendered_cell(cells, 32, 3), ("/", Some(dim_fg())));
+    assert_eq!(rendered_cell(cells, 41, 3), ("s", Some(faint_fg())));
+    assert_eq!(rendered_cell(cells, 42, 3), (" ", Some(Color::Reset)));
+    assert!(paints_no_background(&term));
 
+    // The popup: the selection is a glyph and an ink, not a surface.
     let mut popup = SlashPopup::new();
     popup.update_for("/c", false);
     let lines = slash_popup_lines_for(&popup, 4, 40);
     let term = test_line_terminal(lines, 40, 4);
     let cells = term.backend().buffer();
-    assert!(test_buffer_row(&term, 0).contains("/c"));
-    assert_eq!(cells[(0, 0)].style().bg, Some(keycap_bg()));
-    assert!(test_buffer_row(&term, 3).contains("select"));
+    assert!(test_buffer_row(&term, 0).starts_with(" ❯ /clear"));
+    assert_eq!(rendered_cell(cells, 1, 0), ("❯", Some(accent_fg())));
+    // The selected name keeps the default ink; an unselected one is dim.
+    assert_eq!(rendered_cell(cells, 3, 0), ("/", Some(Color::Reset)));
+    assert_eq!(rendered_cell(cells, 3, 1), ("/", Some(dim_fg())));
+    assert!(paints_no_background(&term));
+    // The footer is the shared key-legend line (one cell of indent),
+    // truncated to the zone width with an ellipsis.
+    assert_eq!(
+        test_buffer_row(&term, 3).trim_end(),
+        " Tab complete · Enter select / again ru…"
+    );
+    assert_eq!(rendered_cell(cells, 0, 3), (" ", Some(Color::Reset)));
+    assert_eq!(rendered_cell(cells, 1, 3), ("T", Some(dim_fg())));
+    assert_eq!(rendered_cell(cells, 4, 3), (" ", Some(faint_fg())));
+    assert_eq!(rendered_cell(cells, 5, 3), ("c", Some(faint_fg())));
 }
 
 #[test]
@@ -802,7 +933,7 @@ fn history_streaming_cursor_marks_the_live_assistant_tail() {
     assert_eq!(row_text(&lines[2]), "◆ typing▌");
     let last = lines[2].spans.last().expect("a cursor span");
     assert_eq!(last.content.as_ref(), "▌");
-    assert_eq!(last.style.fg, Some(AGENT_FG));
+    assert_eq!(last.style.fg, Some(accent_fg()));
     // Not streaming: no cursor anywhere.
     let lines = history(&rows);
     assert!(!row_text(&lines[1]).contains('▌'));
@@ -815,10 +946,14 @@ fn history_thinking_appends_a_transient_placeholder_tail() {
     let lines = build_history_lines(&rows, &mut cache, TEST_W, LiveRow::None, true, true);
     let last = lines.last().expect("a thinking tail line");
     assert_eq!(row_text(last), "◆ …");
-    let icon = last.spans[0].style;
-    assert_eq!(icon.fg, Some(AGENT_FG));
-    assert!(icon.add_modifier.contains(Modifier::BOLD));
-    assert_eq!(last.spans[1].style.fg, Some(dim_fg()));
+    assert_eq!(last.spans.len(), 2);
+    // The agent's mark in the accent, the ellipsis in the dim ink — plain
+    // weight: it is a placeholder, not a message head.
+    assert_eq!(last.spans[0].content.as_ref(), "◆ ");
+    assert_eq!(last.spans[0].style, Style::default().fg(accent_fg()));
+    assert_eq!(last.spans[1].content.as_ref(), "…");
+    assert_eq!(last.spans[1].style, Style::default().fg(dim_fg()));
+    assert_eq!(last.style, Style::default());
     // Not thinking: no tail, the trailing spacer stays last.
     let lines = history(&rows);
     assert_eq!(row_text(lines.last().unwrap()), "");
@@ -833,7 +968,7 @@ fn history_thinking_appends_a_transient_placeholder_tail() {
 #[test]
 fn thinking_row_uses_a_distinct_italic_channel_without_markdown() {
     // The trace must NOT read like the answer: no markdown parsing
-    // (asterisks stay literal), its own magenta italic channel, `✻ ` marker.
+    // (asterisks stay literal), its own dim italic channel, `✻ ` marker.
     // (A trailing blank spacer line follows every row boundary — these
     // assertions target the body lines, not lines.last().)
     let rows = vec![Row::Thinking {
@@ -843,10 +978,10 @@ fn thinking_row_uses_a_distinct_italic_channel_without_markdown() {
     let lines = history(&rows);
     assert_eq!(row_text(&lines[0]), "✻ **bold** and `code`");
     let m = lines[0].spans[0].style;
-    assert_eq!(m.fg, Some(THINKING_FG));
+    assert_eq!(m.fg, Some(dim_fg()));
     assert!(m.add_modifier.contains(Modifier::ITALIC));
     let body = lines[0].spans[1].style;
-    assert_eq!(body.fg, Some(THINKING_FG));
+    assert_eq!(body.fg, Some(dim_fg()));
     assert!(body.add_modifier.contains(Modifier::ITALIC));
 
     // Multi-line traces: continuation lines indent under the marker.
@@ -1041,19 +1176,22 @@ fn is_normal_stop_covers_both_provider_families() {
 }
 
 #[test]
-fn welcome_text_names_the_ready_session() {
+fn welcome_text_names_the_session_head_row() {
+    let version = env!("CARGO_PKG_VERSION");
     assert_eq!(
         welcome_text("glm-4.6", 7, None),
-        "session ready · glm-4.6 · 7 tools"
+        format!("TinyAgent v{version} · glm-4.6 · 7 tools")
     );
     // The unset-window note is a second line of the SAME row: the empty
-    // screen shows the masthead while the transcript holds no row beyond
-    // the welcome one, and a note that counted as its own row hid it.
+    // screen shows the wordmark row while the transcript holds no row
+    // beyond it, and a note that counted as its own row hid it.
     let text = welcome_text("glm-4.6", 7, Some("limits.max_context_tokens is not set"));
     assert_eq!(
         text,
-        "session ready · glm-4.6 · 7 tools\n\
-         limits.max_context_tokens is not set · /context for details"
+        format!(
+            "TinyAgent v{version} · glm-4.6 · 7 tools\n\
+             limits.max_context_tokens is not set · /context for details"
+        )
     );
 }
 
@@ -1063,7 +1201,10 @@ fn input_title_merges_activity_elapsed_cancel_and_queue() {
         build_input_title(true, '⠋', "running shell", 65, 2, 200),
         " ⠋ running shell… · 1m05s · Ctrl-C cancel · 2 queued "
     );
-    assert_eq!(build_input_title(false, '⠋', "", 0, 0, 200), " ◆ MESSAGE ");
+    // Idle: no title at all — the prompt and the placeholder say what the
+    // box is. (Never a lone spinner either, whatever the width.)
+    assert_eq!(build_input_title(false, '⠋', "", 0, 0, 200), "");
+    assert_eq!(build_input_title(false, '⠋', "running shell", 65, 2, 0), "");
 }
 
 #[test]
@@ -1187,16 +1328,30 @@ fn tool_running_line_shows_name_elapsed_and_parallel_count() {
     assert!(tool_running_line(&t, now).is_none(), "nothing in flight");
     t.calls = vec![("shell".into(), now - Duration::from_millis(3200))];
     let l = tool_running_line(&t, now).expect("a placeholder line");
-    assert_eq!(l.spans[0].content.as_ref(), "    ▎ → shell");
-    assert_eq!(l.spans[0].style.fg, Some(TOOL_CALL_FG));
-    assert!(l.spans[0].style.add_modifier.contains(Modifier::BOLD));
-    assert_eq!(l.spans[1].content.as_ref(), " · 3.2s…");
-    assert_eq!(l.spans[1].style.fg, Some(dim_fg()));
-    // Parallel calls aggregate: the OLDEST call's elapsed + (+N) count.
+    // The call's own head, still in the gutter: accent arrow, dim name and
+    // elapsed — the same grammar as the committed `  → name` call row.
+    let dim = Style::default().fg(dim_fg());
+    assert_eq!(
+        spans(&l),
+        vec![
+            ("  → ", Style::default().fg(accent_fg())),
+            ("shell", dim),
+            (" · 3.2s…", dim)
+        ]
+    );
+    // Parallel calls aggregate: the OLDEST call's elapsed + (+N) count, the
+    // head's grammar and inks unchanged.
     t.calls.push(("read".into(), now));
     let l = tool_running_line(&t, now).expect("a placeholder line");
-    assert_eq!(l.spans[0].content.as_ref(), "    ▎ → shell");
-    assert_eq!(l.spans[1].content.as_ref(), " · 3.2s… (+1)");
+    assert_eq!(row_text(&l), "  → shell · 3.2s… (+1)");
+    assert_eq!(
+        spans(&l),
+        vec![
+            ("  → ", Style::default().fg(accent_fg())),
+            ("shell", dim),
+            (" · 3.2s… (+1)", dim)
+        ]
+    );
 }
 
 #[test]
@@ -1224,50 +1379,112 @@ fn tool_elapsed_for_matches_nearest_same_name_call_backwards() {
 #[test]
 fn build_status_line_reduces_detail_on_narrow_terminals() {
     let stats = " · 5 in · 6 out";
-    // Wide: full token detail appears as a dim third span.
+    let dim = Style::default().fg(dim_fg());
+    let accent = Style::default().fg(accent_fg());
+    let plain = Style::default();
+    // Wide: `● glm · ready · 5 in · 6 out` — the state glyph + label in the
+    // idle (dim) ink, the model in the terminal's default ink, the stats dim.
     let wide = build_status_line("glm", "idle", false, None, None, stats, "", 200);
-    assert_eq!(wide.spans.len(), 3);
-    assert_eq!(wide.spans[2].content.as_ref(), stats);
-    assert_eq!(wide.spans[2].style.fg, Some(dim_fg()));
-    // Medium: stats no longer fit, so the bar drops to badge+state only.
-    let medium_width = " ◆ glm".width() + "  ● ready".width();
+    assert_eq!(row_text(&wide), "● glm · ready · 5 in · 6 out");
+    assert_eq!(
+        spans(&wide),
+        vec![("●", dim), (" glm", plain), (" · ready", dim), (stats, dim)]
+    );
+    // Medium: exactly the room the three left spans need, so the stats no
+    // longer fit and the bar drops to glyph + model + state.
+    let medium_width = "● glm · ready".width();
     let medium = build_status_line("glm", "idle", false, None, None, stats, "", medium_width);
-    assert_eq!(medium.spans.len(), 2);
-    // Narrow: model and live state remain, everything else disappears.
-    let narrow = build_status_line("glm", "idle", false, None, None, stats, "", medium_width);
-    assert_eq!(narrow.spans.len(), 2);
-    // Busy and ready share the agent accent; the run phase remains explicit
-    // in text (running vs ready), never color-only. Idle carries no clock.
-    let busy = build_status_line("glm", "running", true, None, None, stats, "", 200);
-    let st = busy.spans[1].style;
-    assert_eq!(st.fg, Some(AGENT_FG));
-    assert!(st.add_modifier.contains(Modifier::BOLD));
-    let idle = build_status_line("glm", "idle", false, None, None, stats, "", 200);
-    assert!(row_text(&idle).contains("● ready"));
-    assert_eq!(idle.spans[1].style.fg, Some(AGENT_FG));
-    // The model is a compact text label on the shared status surface, not a
-    // terminal-width-competing solid cyan block.
-    assert_eq!(wide.spans[0].style.fg, Some(USER_FG));
-    assert_eq!(wide.spans[0].style.bg, None);
-    assert!(wide.spans[0].style.add_modifier.contains(Modifier::BOLD));
+    assert_eq!(span_texts(&medium), vec!["●", " glm", " · ready"]);
+    // Narrow: only the state label survives, truncated to the width.
+    let narrow = build_status_line("glm", "idle", false, None, None, stats, "", 3);
+    assert_eq!(row_text(&narrow), "re…");
+    assert_eq!(narrow.spans.len(), 1);
+    assert_eq!(narrow.spans[0].style, dim);
+    // Running: the same shape in the accent ink. The phase stays explicit in
+    // text (running vs ready), never color-only; idle carries no clock.
+    let running = build_status_line("glm", "running", true, None, None, stats, "", 200);
+    assert_eq!(row_text(&running), "◆ glm · running · 5 in · 6 out");
+    assert_eq!(
+        spans(&running),
+        vec![
+            ("◆", accent),
+            (" glm", plain),
+            (" · running", accent),
+            (stats, dim)
+        ]
+    );
+    // Cancelling and failed are their own inks whenever the phase is shown.
+    let cancelling = build_status_line("glm", "cancelling", true, None, None, stats, "", 200);
+    assert_eq!(row_text(&cancelling), "! glm · cancelling · 5 in · 6 out");
+    let warn = Style::default().fg(warn_fg());
+    assert_eq!(spans(&cancelling)[0], ("!", warn));
+    assert_eq!(spans(&cancelling)[2], (" · cancelling", warn));
+    let error = Style::default().fg(error_fg());
+    for busy in [false, true] {
+        let failed = build_status_line("glm", "failed", busy, None, None, stats, "", 200);
+        assert_eq!(row_text(&failed), "✗ glm · failed · 5 in · 6 out");
+        assert_eq!(spans(&failed)[0], ("✗", error));
+        assert_eq!(spans(&failed)[1], (" glm", plain));
+        assert_eq!(spans(&failed)[2], (" · failed", error));
+    }
+    // The model is plain text in the default ink on every state — no color,
+    // no weight, no surface.
+    for line in [&wide, &running, &cancelling] {
+        assert_eq!(line.spans[1].style, plain);
+        assert!(line.spans.iter().all(|s| s.style.bg.is_none()));
+        assert_eq!(line.style, plain);
+    }
+    // Any other state label (e.g. a future phase) still reads `· label`.
+    let other = build_status_line("glm", "paused", false, None, None, "", "", 200);
+    assert_eq!(spans(&other)[0], ("·", dim));
+    assert_eq!(spans(&other)[2], (" · paused", dim));
 }
 
 #[test]
 fn build_status_line_ctx_outlives_the_stats() {
     let stats = " · 5 in · 6 out";
-    let ctx = Some(("ctx 21% (54.7k/256k)", Style::default().fg(dim_fg())));
+    let dim = Style::default().fg(dim_fg());
+    let plain = Style::default();
+    let accent = Style::default().fg(accent_fg());
+    let ctx = Some(("ctx 21% (54.7k/256k)", dim));
     // Wide: ctx sits between the state and the stats, keeping its style.
     let wide = build_status_line("glm", "idle", false, ctx, None, stats, "", 200);
-    assert_eq!(wide.spans.len(), 4);
-    assert_eq!(wide.spans[2].content.as_ref(), " · ctx 21% (54.7k/256k)");
-    assert_eq!(wide.spans[2].style.fg, Some(dim_fg()));
-    assert_eq!(wide.spans[3].content.as_ref(), stats);
+    assert_eq!(
+        row_text(&wide),
+        "● glm · ready · ctx 21% (54.7k/256k) · 5 in · 6 out"
+    );
+    assert_eq!(
+        spans(&wide),
+        vec![
+            ("●", dim),
+            (" glm", plain),
+            (" · ready", dim),
+            (" · ctx 21% (54.7k/256k)", dim),
+            (stats, dim)
+        ]
+    );
     // Narrower: stats drop out but ctx stays — it's the most decision-relevant
     // number, so it outlives the stats and is the last segment standing.
-    let ctx_only_width = " ◆ glm".width() + "  ● ready".width() + " · ctx 21% (54.7k/256k)".width();
+    let ctx_only_width = "● glm · ready · ctx 21% (54.7k/256k)".width();
     let minimal = build_status_line("glm", "idle", false, ctx, None, stats, "", ctx_only_width);
-    assert_eq!(minimal.spans.len(), 3);
-    assert_eq!(minimal.spans[2].content.as_ref(), " · ctx 21% (54.7k/256k)");
+    assert_eq!(
+        span_texts(&minimal),
+        vec!["●", " glm", " · ready", " · ctx 21% (54.7k/256k)"]
+    );
+    // A nearly full window recolors only its own segment (error ≥ 80%) — the
+    // state and the stats keep their own inks.
+    let hot = Some(("ctx 82% (210.0k/256k)", Style::default().fg(error_fg())));
+    let line = build_status_line("glm", "running", true, hot, None, stats, "", 200);
+    assert_eq!(
+        spans(&line),
+        vec![
+            ("◆", accent),
+            (" glm", plain),
+            (" · running", accent),
+            (" · ctx 82% (210.0k/256k)", Style::default().fg(error_fg())),
+            (stats, dim)
+        ]
+    );
 }
 
 #[test]
@@ -1276,34 +1493,53 @@ fn build_status_line_plan_segment_drops_after_stats_before_ctx() {
     // first, then plan, then ctx (ctx survives longest). plan=None ⇒ the
     // segment is absent and behavior matches pre-plan exactly.
     let stats = " · 5 in · 6 out";
-    let ctx = Some(("ctx 21%", Style::default().fg(dim_fg())));
-    let plan = Some((" · plan 2/5", Style::default().fg(TOOL_CALL_FG)));
-    // Wide: all four optional segments present, plan between ctx and stats.
+    let dim = Style::default().fg(dim_fg());
+    let plain = Style::default();
+    let accent = Style::default().fg(accent_fg());
+    let ctx = Some(("ctx 21%", dim));
+    let plan = Some((" · plan 2/5", accent));
+    // Wide: every segment present, plan between ctx and stats.
     let wide = build_status_line("glm", "idle", false, ctx, plan, stats, "", 200);
-    assert_eq!(wide.spans.len(), 5);
-    assert_eq!(wide.spans[2].content.as_ref(), " · ctx 21%");
-    assert_eq!(wide.spans[3].content.as_ref(), " · plan 2/5");
-    assert_eq!(wide.spans[3].style.fg, Some(TOOL_CALL_FG));
-    assert_eq!(wide.spans[4].content.as_ref(), stats);
+    assert_eq!(
+        row_text(&wide),
+        "● glm · ready · ctx 21% · plan 2/5 · 5 in · 6 out"
+    );
+    assert_eq!(
+        spans(&wide),
+        vec![
+            ("●", dim),
+            (" glm", plain),
+            (" · ready", dim),
+            (" · ctx 21%", dim),
+            (" · plan 2/5", accent),
+            (stats, dim)
+        ]
+    );
     // Tight: stats drop, ctx+plan remain (plan outlives stats).
-    let no_stats_w =
-        " ◆ glm".width() + "  ● ready".width() + " · ctx 21%".width() + " · plan 2/5".width();
+    let no_stats_w = "● glm · ready · ctx 21% · plan 2/5".width();
     let mid = build_status_line("glm", "idle", false, ctx, plan, stats, "", no_stats_w);
-    assert_eq!(mid.spans.len(), 4);
-    assert_eq!(mid.spans[3].content.as_ref(), " · plan 2/5");
+    assert_eq!(
+        span_texts(&mid),
+        vec!["●", " glm", " · ready", " · ctx 21%", " · plan 2/5"]
+    );
+    assert_eq!(spans(&mid)[4], (" · plan 2/5", accent));
     // Tighter: plan drops too, ctx alone survives (ctx outlives plan).
-    let ctx_only_w = " ◆ glm".width() + "  ● ready".width() + " · ctx 21%".width();
+    let ctx_only_w = "● glm · ready · ctx 21%".width();
     let tight = build_status_line("glm", "idle", false, ctx, plan, stats, "", ctx_only_w);
-    assert_eq!(tight.spans.len(), 3);
-    assert_eq!(tight.spans[2].content.as_ref(), " · ctx 21%");
+    assert_eq!(
+        span_texts(&tight),
+        vec!["●", " glm", " · ready", " · ctx 21%"]
+    );
 }
 
 #[test]
 fn right_path_seg_right_aligns_truncates_and_vanishes() {
-    // Fits: right-aligned with padding, dim.
+    // Fits: right-aligned with padding, faint.
+    let faint = Style::default().fg(faint_fg());
     let seg = right_path_seg("/tmp/proj", 20).expect("fits");
     assert_eq!(seg.content.as_ref(), "           /tmp/proj");
-    assert_eq!(seg.style.fg, Some(dim_fg()));
+    assert_eq!(seg.style, faint);
+    assert_eq!(seg.style.bg, None);
     // Under 12 columns left: no segment at all.
     assert!(right_path_seg("/tmp/proj", 11).is_none());
     assert_eq!(
@@ -1358,15 +1594,27 @@ fn right_path_seg_right_aligns_truncates_and_vanishes() {
 #[test]
 fn build_status_line_path_takes_what_the_left_side_leaves() {
     let stats = " · 5 in · 6 out";
-    // The model label + ready state + stats use 30 columns; at 48 the path
-    // right-aligns into the remaining 18.
+    let faint = Style::default().fg(faint_fg());
+    // The state glyph + model + ready + stats use 28 columns; at 48 the path
+    // right-aligns into the remaining 20.
     let line = build_status_line("glm", "idle", false, None, None, stats, "/tmp/proj", 48);
-    let last = line.spans.last().expect("a path span");
-    assert!(last.content.ends_with("/tmp/proj"));
+    assert_eq!(
+        row_text(&line),
+        "● glm · ready · 5 in · 6 out           /tmp/proj"
+    );
     assert_eq!(line.width(), 48, "left + padded path fills the bar");
-    // Narrow terminal: stats still fit but leave no useful room for the path.
+    let path = line.spans.last().expect("a path span");
+    assert_eq!(path.content.as_ref(), "           /tmp/proj");
+    assert_eq!(path.style, faint);
+    // Narrow terminal: stats still fit but leave fewer than 12 columns, so
+    // the path is the first thing to go.
     let line = build_status_line("glm", "idle", false, None, None, stats, "/tmp/proj", 34);
-    assert_eq!(line.spans.len(), 3, "no path span: {:?}", line.spans);
+    assert_eq!(
+        span_texts(&line),
+        vec!["●", " glm", " · ready", " · 5 in · 6 out"],
+        "no path span: {:?}",
+        line.spans
+    );
 }
 
 #[test]
@@ -1378,23 +1626,24 @@ fn fmt_ctx_formats_grades_and_hides_until_first_usage() {
     assert_eq!(t, "ctx 54.7k");
     assert_eq!(s.fg, Some(dim_fg()));
     // Known window → percentage + both numbers; round denominator drops
-    // its ".0". Fill-level color grading: dim < 60%, yellow ≥ 60%, red ≥ 80%.
+    // its ".0". Fill-level color grading: dim < 60%, warn ≥ 60%, error ≥ 80%.
     let (t, s) = fmt_ctx(54_700, 256_000).unwrap();
     assert_eq!(t, "ctx 21% (54.7k/256k)");
     assert_eq!(s.fg, Some(dim_fg()));
     let (_, s) = fmt_ctx(160_000, 256_000).unwrap(); // 62%
-    assert_eq!(s.fg, Some(TOOL_CALL_FG));
+    assert_eq!(s.fg, Some(warn_fg()));
     let (t, s) = fmt_ctx(210_000, 256_000).unwrap(); // 82%
     assert_eq!(t, "ctx 82% (210.0k/256k)");
-    assert_eq!(s.fg, Some(TOOL_ERR_FG));
+    assert_eq!(s.fg, Some(error_fg()));
 }
 
 #[test]
 fn chrome_fg_is_one_busy_color_for_chrome_and_status() {
     // Busy: the whole bottom chrome (input border + status state) reads as
-    // one AGENT_FG unit. Idle: the USER_FG idle color.
-    assert_eq!(chrome_fg(true), AGENT_FG);
-    assert_eq!(chrome_fg(false), USER_FG);
+    // one accent unit. Idle: it rests in the secondary ink.
+    assert_eq!(chrome_fg(true), accent_fg());
+    assert_eq!(chrome_fg(false), dim_fg());
+    assert_ne!(chrome_fg(true), chrome_fg(false));
 }
 
 #[test]
@@ -1862,32 +2111,86 @@ fn visible_window_keeps_the_selection_inside() {
 
 #[test]
 fn slash_popup_lines_format_highlight_and_pad_the_selection() {
+    let dim = Style::default().fg(dim_fg());
+    let faint = Style::default().fg(faint_fg());
+    let accent = Style::default().fg(accent_fg());
+    let plain = Style::default();
     let mut p = SlashPopup::new();
     p.update("/");
     let lines = slash_popup_lines(&p, POPUP_MAX_ROWS);
-    // With 9 commands over the 8-row cap, the bare "/" list is windowed
+    // More commands than the 8-row cap: the bare "/" list is windowed
     // (selection 0 → the window starts at the top).
     assert_eq!(lines.len(), POPUP_MAX_ROWS.min(SLASH_COMMANDS.len()));
-    // Row format: gutter + "/name" + optional " [arg]" + description.
+    assert!(
+        SLASH_COMMANDS.len() > POPUP_MAX_ROWS,
+        "the bare \"/\" list must overflow the cap for this windowing to mean anything"
+    );
+    // Row format: three-cell mark + "/name" + optional " [arg]" + two cells
+    // of air + description. The widest name on the visible window
+    // (`/export [path]`, 14 cells) sets the description column.
+    let rows: Vec<String> = lines.iter().map(row_text).collect();
     assert_eq!(
-        row_text(&lines[1]),
+        rows[0],
+        format!(" ❯ /clear{}clear the conversation history", " ".repeat(10))
+    );
+    assert_eq!(
+        rows[1],
         "   /export [path]  dump the transcript to a file (or clipboard)"
     );
     assert_eq!(
-        row_text(&lines[0]).trim(),
-        "❯ /clear  clear the conversation history"
+        rows[7],
+        format!(
+            "   /resume{}continue a queue paused after a failed run",
+            " ".repeat(9)
+        )
     );
-    // The selected row uses the shared raised surface and is padded to the
-    // content width; the others stay on the terminal background.
-    let content_w = lines.iter().map(|l| l.width()).max().unwrap();
-    assert_eq!(lines[0].style.bg, Some(keycap_bg()));
-    assert_eq!(lines[0].width(), content_w);
-    assert_eq!(lines[1].style.bg, None);
-    // Moving the selection moves the highlight.
+    for line in &lines {
+        assert_eq!(line.spans.len(), 4, "{:?}", line.spans);
+        assert_eq!(
+            line.spans[0].width() + line.spans[1].width() + line.spans[2].width(),
+            3 + 14 + 2,
+            "descriptions must share one column: {:?}",
+            line.spans
+        );
+        assert_eq!(line.style.bg, None);
+    }
+    // The selected row: accent glyph, the name in the terminal's default
+    // ink, its description dim. No highlight band anywhere.
+    assert_eq!(
+        spans(&lines[0]),
+        vec![
+            (" ❯ ", accent),
+            ("/clear", plain),
+            ("          ", plain),
+            ("clear the conversation history", dim)
+        ]
+    );
+    // The other rows recede: dim names, fainter descriptions.
+    assert_eq!(
+        spans(&lines[1]),
+        vec![
+            ("   ", plain),
+            ("/export [path]", dim),
+            ("  ", plain),
+            ("dump the transcript to a file (or clipboard)", faint)
+        ]
+    );
+    // Moving the selection moves the mark and swaps the inks with it.
     p.next();
     let lines = slash_popup_lines(&p, POPUP_MAX_ROWS);
-    assert_eq!(lines[0].style.bg, None);
-    assert_eq!(lines[1].style.bg, Some(keycap_bg()));
+    let row = |i: usize| spans(&lines[i]);
+    assert_eq!(row(0)[0], ("   ", plain));
+    assert_eq!(row(0)[1], ("/clear", dim));
+    assert_eq!(row(0)[3], ("clear the conversation history", faint));
+    assert_eq!(row(1)[0], (" ❯ ", accent));
+    assert_eq!(row(1)[1], ("/export [path]", plain));
+    assert_eq!(
+        row(1)[3],
+        ("dump the transcript to a file (or clipboard)", dim)
+    );
+    // The rows themselves did not move.
+    assert_eq!(row_text(&lines[0]), rows[0].replace(" ❯ ", "   "));
+    assert_eq!(row_text(&lines[1]), rows[1].replace("   ", " ❯ "));
 }
 
 #[test]
@@ -2610,12 +2913,13 @@ fn ansi_to_lines_strips_osc_and_truncated_sequences() {
 
 #[test]
 fn ansi_guided_lines_guides_and_falls_back_to_base_style() {
-    let err_style = Style::default().fg(TOOL_ERR_FG);
+    let err_style = Style::default().fg(error_fg());
     let lines = ansi_guided_lines("\x1b[31m- old\x1b[0m\nplain", err_style);
-    // Every line gets the dim "│ " guide.
+    // Every line gets the faint `│ ` guide — a tertiary mark whatever the
+    // body's ink.
     for l in &lines {
         assert_eq!(l.spans[0].content.as_ref(), "│ ");
-        assert_eq!(l.spans[0].style.fg, Some(dim_fg()));
+        assert_eq!(l.spans[0].style, Style::default().fg(faint_fg()));
     }
     // ANSI-colored spans keep their own color…
     let red = lines[0]
@@ -2627,6 +2931,10 @@ fn ansi_guided_lines_guides_and_falls_back_to_base_style() {
     // …unstyled spans fall back to the base style (error red here).
     assert_eq!(lines[1].spans[1].content.as_ref(), "plain");
     assert_eq!(lines[1].spans[1].style, err_style);
+    // The guide is faint in the ok case too (dim body).
+    let ok = ansi_guided_lines("body", Style::default().fg(dim_fg()));
+    assert_eq!(ok[0].spans[0].style, Style::default().fg(faint_fg()));
+    assert_eq!(ok[0].spans[1].style, Style::default().fg(dim_fg()));
 }
 
 #[test]
@@ -2860,46 +3168,75 @@ fn history_expanded_tool_rows_render_full_bodies() {
     // Every body line carries the role gutter followed by the guide span.
     let guided = lines
         .iter()
-        .filter(|l| l.spans.get(1).is_some_and(|s| s.content.as_ref() == "│ "));
+        .filter(|l| l.spans.get(1).is_some_and(|s| s.content.as_ref() == "│ "))
+        .collect::<Vec<_>>();
     assert!(
-        guided.count() >= 4,
+        guided.len() >= 4,
         "expanded bodies must be guided: {texts:?}"
     );
+    // The guide is the tertiary ink, the indent plain, on every body line —
+    // both the pretty JSON of the call and the output of the result.
+    for l in &guided {
+        assert_eq!(l.spans[0].content.as_ref(), "    ");
+        assert_eq!(l.spans[0].style, Style::default());
+        assert_eq!(l.spans[1].style, Style::default().fg(faint_fg()));
+    }
 }
 
 #[test]
 fn markdown_unclosed_fence_colors_tail_without_leaking() {
     // 8b: a fence left open at EOF (streamed partial block) must not
-    // panic, leak the ``` line, or leave the tail without its border bar.
+    // panic, leak the ``` line, or leave the tail without its bar.
     let lines = render_markdown("intro\n\n```rust\nlet a = 1;\nlet b = 2;", 40);
     let texts: Vec<String> = lines.iter().map(row_text).collect();
     assert!(
         !texts.iter().any(|t| t.contains("```")),
         "fence leaked: {texts:?}"
     );
-    for l in lines.iter().filter(|l| row_text(l).starts_with("▎ let ")) {
-        assert_eq!(l.spans[0].style.fg, Some(dim_fg()));
-        assert!(
-            l.spans[1..].iter().all(|s| s.style.fg.is_none()),
+    let tail: Vec<&Line> = lines
+        .iter()
+        .filter(|l| row_text(l).starts_with("▎ let "))
+        .collect();
+    assert_eq!(tail.len(), 2, "both tail lines keep their bar: {texts:?}");
+    for l in tail {
+        assert_eq!(l.spans.len(), 2, "bar + body: {:?}", l.spans);
+        assert_eq!(l.spans[0].content.as_ref(), "▎ ");
+        assert_eq!(l.spans[0].style, Style::default().fg(faint_fg()));
+        assert_eq!(
+            l.spans[1].style,
+            Style::default(),
             "unclosed fence tail must stay default fg: {:?}",
             l.spans
         );
     }
+    // The prose before it is untouched.
+    assert_eq!(row_text(&lines[0]), "intro");
 }
 
 #[test]
 fn build_status_line_width_boundary_keeps_then_drops_stats() {
     let state = "idle · 3s";
     let stats = " · 5 in · 6 out";
-    let used = " ◆ glm".width() + format!("  · {state}").width() + stats.width();
+    let dim = Style::default().fg(dim_fg());
+    let plain = Style::default();
+    // A state the bar has no glyph for still reads `· <model> · <state>`.
+    let used = "· glm · idle · 3s".width() + stats.width();
     let exact = used;
-    // At the exact fit, the full stats are the third span.
+    // At the exact fit, the full stats are the last span.
     let full = build_status_line("glm", state, false, None, None, stats, "", exact);
-    assert_eq!(full.spans[2].content.as_ref(), stats);
+    assert_eq!(
+        spans(&full),
+        vec![
+            ("·", dim),
+            (" glm", plain),
+            (" · idle · 3s", dim),
+            (stats, dim)
+        ]
+    );
     // One column short: stats no longer fit and there's no ctx to fall back
-    // to, so the bar is just badge+state.
+    // to, so the bar is just glyph+model+state.
     let dropped = build_status_line("glm", state, false, None, None, stats, "", exact - 1);
-    assert_eq!(dropped.spans.len(), 2);
+    assert_eq!(span_texts(&dropped), vec!["·", " glm", " · idle · 3s"]);
 }
 
 #[test]
@@ -2911,11 +3248,14 @@ fn idle_prompt_glyph_is_two_columns() {
 
 #[test]
 fn markdown_headers_and_lists_restyled() {
-    // tui-markdown 0.3 leaves ATX headers literal ("## T", unstyled) and
-    // bullets literal ("- x"). render_markdown must fix them while keeping
-    // inline styling (code → fg White) on list items.
+    // tui-markdown 0.3 leaves ATX headers literal ("## T") and bullets
+    // literal ("- x"), and hangs the heading weight on the LINE.
+    // render_markdown must fix the markers and move the style onto the
+    // spans, keeping inline styling (code → the accent ink) on list items.
     let lines = render_markdown("## 标题\n\n- 项目 `code` more\n", 40);
-    // Header: a single bold span, markers stripped, just the title.
+    // Header: a single bold span, markers stripped, just the title — bold
+    // in the terminal's default ink (weight, not color), on a line whose
+    // own style is plain so a role mark in front of it stays uncolored.
     let hdr = lines
         .iter()
         .find(|l| {
@@ -2928,18 +3268,35 @@ fn markdown_headers_and_lists_restyled() {
     let ht = hdr.spans[0].content.as_ref();
     assert!(!ht.contains('#'), "header still has '#': {ht}");
     assert_eq!(ht, "标题");
+    assert_eq!(
+        hdr.spans[0].style,
+        Style::default().add_modifier(Modifier::BOLD)
+    );
+    assert_eq!(hdr.style, Style::default());
 
-    // List: first span is "• ", and a later span still carries inline code
-    // styling from `code` (kept, not dropped by the marker swap).
+    // List: the first span is a dim `• ` and a later span still carries the
+    // inline code styling from `code` (kept, not dropped by the marker swap);
+    // the item's own text is plain.
     let list = lines
         .iter()
         .find(|l| l.spans.first().is_some_and(|s| s.content.as_ref() == "• "))
         .expect("a bulleted list line");
-    assert_eq!(list.spans[0].content.as_ref(), "• ");
+    assert_eq!(
+        spans(list),
+        vec![
+            ("• ", Style::default().fg(dim_fg())),
+            ("项目 ", Style::default()),
+            ("code", Style::default().fg(accent_fg())),
+            (" more", Style::default())
+        ]
+    );
+    assert_eq!(list.style, Style::default());
+    // Every line the sheet draws stays background-free.
     assert!(
-        list.spans.iter().any(|s| s.style.fg == Some(Color::White)),
-        "inline code styling lost: {:?}",
-        list.spans
+        lines
+            .iter()
+            .all(|l| l.spans.iter().all(|s| s.style.bg.is_none())),
+        "{lines:?}"
     );
 }
 
@@ -3518,13 +3875,33 @@ fn out_reprint_renders_the_full_guided_body() {
     let reprint = nth_last_tool_result(&[original], 1).expect("the clone");
     let lines = history(&[reprint]);
     let texts: Vec<String> = lines.iter().map(row_text).collect();
-    assert!(
-        texts.iter().any(|t| t.starts_with("    ▎ ✓ shell · 1.2s")),
-        "head: {texts:?}"
+    // The head is the normal guttered result head; an EXPANDED result
+    // carries no collapsed preview any more (its body follows instead), so
+    // the fourth span is an empty unstyled placeholder — it paints nothing.
+    assert_eq!(row_text(&lines[0]), "  ✓ shell · 1.2s");
+    assert_eq!(
+        spans(&lines[0]),
+        vec![
+            ("  ✓ ", Style::default().fg(dim_fg())),
+            ("shell", Style::default().fg(dim_fg())),
+            (" · 1.2s", Style::default().fg(faint_fg())),
+            ("", Style::default())
+        ]
     );
     for body in ["    │ line1", "    │ line2", "    │ line3"] {
         assert!(texts.iter().any(|t| t == body), "missing {body}: {texts:?}");
     }
+    // Each expanded body line: the four-cell indent, a faint guide, the
+    // text in the result's dim ink.
+    let body = &lines[1];
+    assert_eq!(
+        spans(body),
+        vec![
+            ("    ", Style::default()),
+            ("│ ", Style::default().fg(faint_fg())),
+            ("line1", Style::default().fg(dim_fg()))
+        ]
+    );
 }
 
 #[test]
@@ -3724,9 +4101,46 @@ fn test_buffer_row(terminal: &Terminal<TestBackend>, y: u16) -> String {
         .collect()
 }
 
+/// A rendered cell's glyph and foreground ink. A cell the renderer left
+/// alone reads `Some(Color::Reset)` — the terminal's own foreground — so
+/// "default ink" is an exact, checkable value.
+fn rendered_cell(cells: &Buffer, x: u16, y: u16) -> (&str, Option<Color>) {
+    let cell = &cells[(x, y)];
+    (cell.symbol(), cell.style().fg)
+}
+
+/// True when no cell of a rendered buffer carries a background: every cell
+/// is still the terminal's own surface (`Reset`).
+fn paints_no_background(term: &Terminal<TestBackend>) -> bool {
+    term.backend()
+        .buffer()
+        .content()
+        .iter()
+        .all(|cell| cell.style().bg == Some(Color::Reset))
+}
+
 /// Joined text of a wrapped row (to assert content / dropped spaces).
 fn row_text(l: &Line) -> String {
     l.spans.iter().map(|s| s.content.as_ref()).collect()
+}
+
+/// Every span of a line as an exact `(text, style)` list — empty spans
+/// included (a hidden duration or stats segment is still a span).
+fn spans<'a>(l: &'a Line<'a>) -> Vec<(&'a str, Style)> {
+    l.spans
+        .iter()
+        .map(|s| (s.content.as_ref(), s.style))
+        .collect()
+}
+
+/// The texts of the NON-EMPTY spans — for lines that legitimately end in an
+/// empty segment (the status bar's stats on a fresh session).
+fn span_texts<'a>(l: &'a Line<'a>) -> Vec<&'a str> {
+    l.spans
+        .iter()
+        .filter(|s| !s.content.is_empty())
+        .map(|s| s.content.as_ref())
+        .collect()
 }
 
 #[test]
@@ -3738,7 +4152,7 @@ fn wrap_line_short_fits_one_row() {
 
 #[test]
 fn wrap_line_keeps_the_new_assistant_marks_hanging_indent() {
-    let rows = wrap_line(&span_line("◆ alpha beta gamma delta", AGENT_FG), 14);
+    let rows = wrap_line(&span_line("◆ alpha beta gamma delta", accent_fg()), 14);
     assert!(rows.len() > 1);
     assert!(row_text(&rows[0]).starts_with(AGENT_MARK));
     for row in &rows[1..] {
@@ -4314,21 +4728,57 @@ fn slash_popup_lines_windows_to_zone_height_keeping_selection_visible() {
     p.sel = 0;
     let top = slash_popup_lines(&p, 3);
     assert_eq!(top.len(), 3, "popup must cap to the zone height");
-    assert_eq!(top[0].style.bg, Some(keycap_bg()));
     // Bottom of the list: the window follows so the last selection shows.
     p.sel = SLASH_COMMANDS.len() - 1;
     let bot = slash_popup_lines(&p, 3);
     assert_eq!(bot.len(), 3);
-    assert_eq!(
-        bot[2].style.bg,
-        Some(keycap_bg()),
-        "last selection must be the bottom visible row"
-    );
-    let want = format!(" ❯ /{}", p.matches[p.sel].name);
-    assert!(
-        bot.iter().any(|l| row_text(l).starts_with(&want)),
-        "selected command {want:?} not among visible rows"
-    );
+
+    // Both windows, row by row. The selected row is marked by a glyph and an
+    // ink, never a highlight band: the accent `❯`, its name in the terminal's
+    // default ink, its description dim. Every other row recedes — a blank
+    // mark, the name dim, the description faint. No line and no span of
+    // either window paints a background.
+    let plain = Style::default();
+    let dim = plain.fg(dim_fg());
+    let faint = plain.fg(faint_fg());
+    let accent = plain.fg(accent_fg());
+    // Per window: its lines, the row the selection sits on inside it, and the
+    // selected command's index in the list.
+    for (lines, at, sel) in [
+        (&top, 0usize, 0usize),
+        (&bot, bot.len() - 1, SLASH_COMMANDS.len() - 1),
+    ] {
+        for (row, line) in lines.iter().enumerate() {
+            let chosen = row == at;
+            assert_eq!(line.style, plain, "row {row}");
+            assert!(line.spans.iter().all(|s| s.style.bg.is_none()), "row {row}");
+            let s = spans(line);
+            let (mark, name_ink, desc_ink) = if chosen {
+                ((" ❯ ", accent), plain, dim)
+            } else {
+                (("   ", plain), dim, faint)
+            };
+            assert_eq!(s[0], mark, "row {row}");
+            assert_eq!(s[1].1, name_ink, "row {row}");
+            assert_eq!(s[3].1, desc_ink, "row {row}");
+            assert!(s[1].0.starts_with('/'), "row {row}");
+            // The window follows the selection: the row that carries the mark
+            // IS the selected command — the first one at the top of the list,
+            // the last one at its bottom.
+            if chosen {
+                assert!(
+                    s[1].0.starts_with(&format!("/{}", p.matches[sel].name)),
+                    "row {row}: {:?} is not {:?}",
+                    s[1].0,
+                    p.matches[sel].name
+                );
+            }
+        }
+    }
+    // Spelled out: the top window's first row and the bottom window's last
+    // row are the ones that carry the mark.
+    assert!(row_text(&top[0]).starts_with(" ❯ /"));
+    assert!(row_text(&bot[2]).starts_with(" ❯ /"));
 }
 
 // ── Word motion / line editing (Alt+←→, Ctrl-W/U/K/A/E) ──────────
@@ -5098,4 +5548,1219 @@ fn compact_step_reports_a_dead_ui_as_undelivered() {
     assert!(!compact_step(&mut agent, None, &tx));
     // The fold itself still completed on the agent.
     assert_eq!(agent.messages().len(), 3);
+}
+
+// ── The quiet-terminal rework ──────────────────────────────────────────────
+// Five inks on the terminal's own surface, one spacing rule, and block
+// styling carried by the spans. Every test below names concrete text, inks
+// and backgrounds.
+
+/// The pure core behind one of the five inks.
+type InkCore = fn(bool, ColorDepth) -> Color;
+/// One ink per theme: its truecolor tint, 256-palette entry and ANSI slot.
+type InkSlot = (Color, u8, Color);
+
+#[test]
+fn color_depth_from_prefers_the_override_then_colorterm() {
+    // TINYAGENT_TUI_COLOR names a depth outright — case- and padding-insensitive
+    // — and wins over whatever COLORTERM says.
+    for (var, colorterm, want) in [
+        ("truecolor", None, ColorDepth::TrueColor),
+        ("  TrueColor  ", Some(""), ColorDepth::TrueColor),
+        ("TRUECOLOR", Some("xterm-256color"), ColorDepth::TrueColor),
+        ("256", Some("truecolor"), ColorDepth::Indexed256),
+        (" 256 ", Some("24bit"), ColorDepth::Indexed256),
+        ("16", Some("truecolor"), ColorDepth::Ansi16),
+        (" 16 ", None, ColorDepth::Ansi16),
+    ] {
+        assert_eq!(
+            color_depth_from(Some(var), colorterm),
+            want,
+            "override {var:?} with COLORTERM {colorterm:?}"
+        );
+    }
+    // Unset — or naming no depth — it follows COLORTERM: `truecolor` or
+    // `24bit` selects 24-bit, anything else stays on the 256-color palette.
+    for (colorterm, want) in [
+        (Some("truecolor"), ColorDepth::TrueColor),
+        (Some("Truecolor"), ColorDepth::TrueColor),
+        (Some("24bit"), ColorDepth::TrueColor),
+        (Some("24BIT"), ColorDepth::TrueColor),
+        (Some(""), ColorDepth::Indexed256),
+        (Some("16"), ColorDepth::Indexed256),
+        (Some("256"), ColorDepth::Indexed256),
+        (Some("yes"), ColorDepth::Indexed256),
+        (Some("xterm-256color"), ColorDepth::Indexed256),
+        (Some(" truecolor"), ColorDepth::Indexed256),
+        (None, ColorDepth::Indexed256),
+    ] {
+        assert_eq!(
+            color_depth_from(None, colorterm),
+            want,
+            "COLORTERM {colorterm:?}"
+        );
+    }
+    // An override that names no depth is no override.
+    assert_eq!(
+        color_depth_from(Some(""), Some("truecolor")),
+        ColorDepth::TrueColor
+    );
+    assert_eq!(color_depth_from(Some("auto"), None), ColorDepth::Indexed256);
+    // `24bit` is a COLORTERM spelling, not an override one.
+    assert_eq!(
+        color_depth_from(Some("24bit"), Some("24bit")),
+        ColorDepth::TrueColor
+    );
+    assert_eq!(
+        color_depth_from(Some("24bit"), None),
+        ColorDepth::Indexed256
+    );
+}
+
+#[test]
+fn five_inks_resolve_at_every_theme_and_depth() {
+    // One row per ink: the dark palette's tint, 256 entry and ANSI slot,
+    // then the light palette's.
+    let table: [(&str, InkCore, [InkSlot; 2]); 5] = [
+        (
+            "accent",
+            accent_fg_for,
+            [
+                (Color::Rgb(122, 162, 247), 110, Color::LightBlue),
+                (Color::Rgb(37, 99, 235), 27, Color::Blue),
+            ],
+        ),
+        (
+            "dim",
+            dim_fg_for,
+            [
+                (Color::Rgb(138, 146, 158), 245, Color::Gray),
+                (Color::Rgb(100, 116, 139), 246, Color::DarkGray),
+            ],
+        ),
+        (
+            "faint",
+            faint_fg_for,
+            [
+                (Color::Rgb(104, 110, 124), 240, Color::DarkGray),
+                (Color::Rgb(164, 174, 192), 248, Color::DarkGray),
+            ],
+        ),
+        (
+            "warn",
+            warn_fg_for,
+            [
+                (Color::Rgb(229, 180, 102), 179, Color::Yellow),
+                (Color::Rgb(178, 106, 0), 130, Color::Yellow),
+            ],
+        ),
+        (
+            "error",
+            error_fg_for,
+            [
+                (Color::Rgb(224, 108, 117), 210, Color::LightRed),
+                (Color::Rgb(200, 50, 50), 160, Color::Red),
+            ],
+        ),
+    ];
+    for (name, ink, slots) in table {
+        for (light, (rgb, idx, ansi)) in [(false, slots[0]), (true, slots[1])] {
+            assert_eq!(
+                ink(light, ColorDepth::TrueColor),
+                rgb,
+                "{name} light={light} truecolor"
+            );
+            assert_eq!(
+                ink(light, ColorDepth::Indexed256),
+                Color::Indexed(idx),
+                "{name} light={light} 256"
+            );
+            assert_eq!(
+                ink(light, ColorDepth::Ansi16),
+                ansi,
+                "{name} light={light} 16"
+            );
+        }
+    }
+    // Five inks do all the work: they stay tellable apart in every palette
+    // that has the room for it (16 colors fold the two grays of the light
+    // theme onto one slot)…
+    for depth in [ColorDepth::TrueColor, ColorDepth::Indexed256] {
+        for light in [false, true] {
+            let all = [
+                accent_fg_for(light, depth),
+                dim_fg_for(light, depth),
+                faint_fg_for(light, depth),
+                warn_fg_for(light, depth),
+                error_fg_for(light, depth),
+            ];
+            for (i, c) in all.iter().enumerate() {
+                assert!(
+                    !all[..i].contains(c),
+                    "light={light} depth={depth:?}: {all:?}"
+                );
+            }
+        }
+    }
+    // …the three colored states stay apart even on 16 colors…
+    for light in [false, true] {
+        let states = [
+            accent_fg_for(light, ColorDepth::Ansi16),
+            warn_fg_for(light, ColorDepth::Ansi16),
+            error_fg_for(light, ColorDepth::Ansi16),
+        ];
+        assert_ne!(states[0], states[1]);
+        assert_ne!(states[0], states[2]);
+        assert_ne!(states[1], states[2]);
+    }
+    // …and faint really is one step further from the background than dim: on
+    // the 256 palette both grays sit on the same ramp (232 dark → 255 light),
+    // faint below dim on the dark theme and above it on the light one.
+    let ramp = |c: Color| match c {
+        Color::Indexed(i) => i,
+        other => panic!("not a grayscale-ramp entry: {other:?}"),
+    };
+    for light in [false, true] {
+        let (dim, faint) = (
+            ramp(dim_fg_for(light, ColorDepth::Indexed256)),
+            ramp(faint_fg_for(light, ColorDepth::Indexed256)),
+        );
+        if light {
+            assert!(faint > dim, "light: dim {dim}, faint {faint}");
+        } else {
+            assert!(faint < dim, "dark: dim {dim}, faint {faint}");
+        }
+    }
+}
+
+#[test]
+fn hint_line_puts_keys_in_dim_and_labels_in_faint() {
+    let plain = Style::default();
+    let dim = plain.fg(dim_fg());
+    let faint = plain.fg(faint_fg());
+
+    // Key names in the secondary ink; their labels and the ` · ` separators
+    // one step fainter — plain text, no keycap surface.
+    let line = hint_line(
+        2,
+        &[("Ctrl-J", "newline"), ("Esc", "cancel"), ("/help", "keys")],
+    );
+    assert_eq!(
+        row_text(&line),
+        "  Ctrl-J newline · Esc cancel · /help keys"
+    );
+    assert_eq!(
+        spans(&line),
+        vec![
+            ("  ", plain),
+            ("Ctrl-J", dim),
+            (" newline", faint),
+            (" · ", faint),
+            ("Esc", dim),
+            (" cancel", faint),
+            (" · ", faint),
+            ("/help", dim),
+            (" keys", faint),
+        ]
+    );
+    assert_eq!(line.style, plain);
+    assert!(paints_no_background(&test_line_terminal(vec![line], 60, 1)));
+    // One pair: no separator, and a zero indent is an empty unstyled span.
+    // No pairs: just the indent.
+    assert_eq!(
+        spans(&hint_line(0, &[("Tab", "complete")])),
+        vec![("", plain), ("Tab", dim), (" complete", faint)]
+    );
+    assert_eq!(spans(&hint_line(1, &[])), vec![(" ", plain)]);
+
+    // The composer's ghost placeholder is the same grammar: what to type in
+    // the dim ink, the separator faint, where the commands are in dim again.
+    let line = placeholder_line();
+    assert_eq!(row_text(&line), " Describe a task… · / for commands");
+    assert_eq!(
+        spans(&line),
+        vec![
+            (" Describe a task…", dim),
+            (" · ", faint),
+            ("/ for commands", dim),
+        ]
+    );
+    assert_eq!(line.style, plain);
+    assert!(paints_no_background(&test_line_terminal(vec![line], 60, 1)));
+}
+
+#[test]
+fn empty_state_legend_drops_the_esc_pair_before_truncating() {
+    const FULL: &str = "  Ctrl-J newline · Esc cancel · /help keys";
+    const SHORT: &str = "  Ctrl-J newline · /help keys";
+    let plain = Style::default();
+    let dim = plain.fg(dim_fg());
+    let faint = plain.fg(faint_fg());
+
+    // Wide enough: the whole legend, in exactly 42 cells.
+    for width in [42, 60, 120] {
+        let lines = empty_state_lines(width);
+        assert_eq!(lines.len(), 1, "width {width}");
+        assert_eq!(row_text(&lines[0]), FULL, "width {width}");
+        assert_eq!(lines[0].width(), 42);
+    }
+    // One cell short, the Esc pair goes as a whole — the rest is not chopped…
+    for width in [29, 30, 41] {
+        let lines = empty_state_lines(width);
+        assert_eq!(row_text(&lines[0]), SHORT, "width {width}");
+        assert!(!row_text(&lines[0]).contains("Esc"), "width {width}");
+    }
+    // …and the shortened legend keeps the key-legend grammar.
+    assert_eq!(
+        spans(&empty_state_lines(41)[0]),
+        vec![
+            ("  ", plain),
+            ("Ctrl-J", dim),
+            (" newline", faint),
+            (" · ", faint),
+            ("/help", dim),
+            (" keys", faint),
+        ]
+    );
+    // Narrower still: truncated with an ellipsis in the ink of what it cut.
+    let lines = empty_state_lines(20);
+    assert_eq!(row_text(&lines[0]), "  Ctrl-J newline · …");
+    assert_eq!(
+        spans(&lines[0]),
+        vec![
+            ("  ", plain),
+            ("Ctrl-J", dim),
+            (" newline", faint),
+            (" · ", faint),
+            ("…", faint),
+        ]
+    );
+    // Whatever the width: ONE line, never wider than the width given.
+    for width in 0..=60 {
+        let lines = empty_state_lines(width);
+        assert_eq!(lines.len(), 1, "width {width}");
+        assert!(
+            lines[0].width() <= width,
+            "width {width}: {:?}",
+            row_text(&lines[0])
+        );
+    }
+    assert_eq!(row_text(&empty_state_lines(1)[0]), "…");
+    assert_eq!(row_text(&empty_state_lines(0)[0]), "");
+}
+
+#[test]
+fn queue_preview_line_shows_count_state_and_the_head_message() {
+    let plain = Style::default();
+    let accent = plain.fg(accent_fg());
+    let warn = plain.fg(warn_fg());
+    let dim = plain.fg(dim_fg());
+    let queue = |items: &[&str]| -> std::collections::VecDeque<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    };
+
+    // Nothing queued, paused or not: no line at all.
+    assert!(queue_preview_line(&queue(&[]), false, 40).is_none());
+    assert!(queue_preview_line(&queue(&[]), true, 40).is_none());
+
+    // Waiting its turn: the user's own mark in the accent; the count, the
+    // state and the `+N` behind the head ride it in the same ink; only the
+    // FIFO head is previewed, in the dim ink.
+    let two = queue(&["next question", "last question"]);
+    let line = queue_preview_line(&two, false, 40).expect("a queued preview");
+    assert_eq!(row_text(&line), "  ❯ 2 queued · +1 · next question");
+    assert_eq!(
+        spans(&line),
+        vec![("  ❯ 2 queued · +1 · ", accent), ("next question", dim)]
+    );
+    let line = queue_preview_line(&queue(&["only"]), false, 40).expect("a queued preview");
+    assert_eq!(
+        spans(&line),
+        vec![("  ❯ 1 queued · ", accent), ("only", dim)]
+    );
+
+    // Held after a failed run: the warning mark and ink, plus the command
+    // that releases it. That head is 30 cells; on a 40-cell row the preview
+    // takes the ten that remain and is cut with an ellipsis, in the dim ink.
+    let line = queue_preview_line(&two, true, 40).expect("a paused preview");
+    assert_eq!(row_text(&line), "  ! 2 paused · +1 · /resume · next ques…");
+    assert_eq!(line.width(), 40);
+    assert_eq!(
+        spans(&line),
+        vec![
+            ("  ! 2 paused · +1 · /resume · ", warn),
+            ("next ques…", dim)
+        ]
+    );
+    // Given the room, the preview is whole.
+    let line = queue_preview_line(&two, true, 43).expect("a paused preview");
+    assert_eq!(
+        spans(&line),
+        vec![
+            ("  ! 2 paused · +1 · /resume · ", warn),
+            ("next question", dim)
+        ]
+    );
+    let line = queue_preview_line(&queue(&["only"]), true, 40).expect("a paused preview");
+    assert_eq!(
+        spans(&line),
+        vec![("  ! 1 paused · /resume · ", warn), ("only", dim)]
+    );
+
+    // A multi-line draft previews on one row.
+    assert_eq!(
+        row_text(
+            &queue_preview_line(&queue(&["first\nsecond"]), false, 40).expect("a queued preview")
+        ),
+        "  ❯ 1 queued · first ↵ second"
+    );
+
+    // Narrow: the head keeps its grammar, the preview takes what is left.
+    for (width, head, preview) in [
+        (21, "  ❯ 2 queued · +1 · ", "…"),
+        (20, "  ❯ 2 queued · +1 · ", ""),
+        (19, "  ❯ 2 queued · +1 …", ""),
+        (12, "  ❯ 2 queue…", ""),
+        (1, "…", ""),
+        (0, "", ""),
+    ] {
+        let line = queue_preview_line(&two, false, width).expect("a queued queue previews");
+        assert_eq!(
+            spans(&line),
+            vec![(head, accent), (preview, dim)],
+            "width {width}"
+        );
+        assert!(line.width() <= width, "width {width}");
+    }
+
+    // Drawn: the notice sits in the tool gutter's column, each glyph in its
+    // ink, and paints no surface.
+    let line = queue_preview_line(&two, true, 40).expect("a paused preview");
+    let term = test_line_terminal(vec![line], 40, 1);
+    let cells = term.backend().buffer();
+    assert!(paints_no_background(&term));
+    assert_eq!(rendered_cell(cells, 2, 0), ("!", Some(warn_fg())));
+    assert_eq!(rendered_cell(cells, 4, 0), ("2", Some(warn_fg())));
+    assert_eq!(rendered_cell(cells, 30, 0), ("n", Some(dim_fg())));
+}
+
+#[test]
+fn status_line_states_lead_in_their_own_ink() {
+    let plain = Style::default();
+    let dim = plain.fg(dim_fg());
+
+    // The run state leads as a glyph and label in its own ink; the model
+    // after it keeps the terminal's default ink. (The token segment is still
+    // empty on a fresh session — it is a span that paints nothing.)
+    for (state, mark, label, ink) in [
+        ("idle", "●", " · ready", dim),
+        ("running", "◆", " · running", plain.fg(accent_fg())),
+        ("cancelling", "!", " · cancelling", plain.fg(warn_fg())),
+        ("failed", "✗", " · failed", plain.fg(error_fg())),
+    ] {
+        let line = build_status_line("glm", state, false, None, None, "", "", 40);
+        assert_eq!(
+            spans(&line),
+            vec![(mark, ink), (" glm", plain), (label, ink), ("", dim)],
+            "{state}"
+        );
+        assert_eq!(row_text(&line), format!("{mark} glm{label}"));
+        assert_eq!(line.style, plain);
+    }
+
+    // The working directory: the faint ink, right-aligned to the last cell.
+    // Its span is the padding and the path together — as wide as the room the
+    // left side left over (a nine-cell path under a 13-cell idle left side
+    // leaves eighteen cells of air).
+    let faint = plain.fg(faint_fg());
+    let path = "/tmp/proj";
+    for (state, left, pad) in [
+        ("idle", "● glm · ready", 18),
+        ("running", "◆ glm · running", 16),
+        ("cancelling", "! glm · cancelling", 13),
+        ("failed", "✗ glm · failed", 17),
+    ] {
+        let line = build_status_line("glm", state, false, None, None, "", path, 40);
+        assert_eq!(
+            row_text(&line),
+            format!("{left}{}{path}", " ".repeat(pad)),
+            "{state}"
+        );
+        assert_eq!(line.width(), 40, "{state}");
+        let last = line.spans.last().expect("the path span");
+        assert_eq!(
+            last.content.as_ref(),
+            format!("{}{path}", " ".repeat(pad)),
+            "{state}"
+        );
+        assert_eq!(last.style, faint, "{state}");
+    }
+
+    // Drawn on a wide bar with the tokens billed: each glyph in its ink —
+    // the accent state, the default-ink model, the dim tokens, the faint
+    // path — and no cell with a background.
+    let stats = " · 5 in / 6 out";
+    let line = build_status_line("glm", "running", true, None, None, stats, path, 60);
+    let term = test_line_terminal(vec![line], 60, 1);
+    let cells = term.backend().buffer();
+    assert!(paints_no_background(&term));
+    assert_eq!(
+        test_buffer_row(&term, 0),
+        format!("◆ glm · running{stats}{}{path}", " ".repeat(21))
+    );
+    let reset = Some(Color::Reset);
+    assert_eq!(rendered_cell(cells, 0, 0), ("◆", Some(accent_fg())));
+    assert_eq!(rendered_cell(cells, 1, 0), (" ", reset));
+    assert_eq!(rendered_cell(cells, 2, 0), ("g", reset));
+    assert_eq!(rendered_cell(cells, 4, 0), ("m", reset));
+    assert_eq!(rendered_cell(cells, 5, 0), (" ", Some(accent_fg())));
+    assert_eq!(rendered_cell(cells, 6, 0), ("·", Some(accent_fg())));
+    assert_eq!(rendered_cell(cells, 16, 0), ("·", Some(dim_fg())));
+    assert_eq!(rendered_cell(cells, 18, 0), ("5", Some(dim_fg())));
+    assert_eq!(rendered_cell(cells, 50, 0), (" ", Some(faint_fg())));
+    assert_eq!(rendered_cell(cells, 51, 0), ("/", Some(faint_fg())));
+    assert_eq!(rendered_cell(cells, 59, 0), ("j", Some(faint_fg())));
+}
+
+#[test]
+fn session_head_is_a_bold_wordmark_followed_by_dim_meta() {
+    let plain = Style::default();
+    let accent = plain.fg(accent_fg());
+    let dim = plain.fg(dim_fg());
+    let bold = plain.add_modifier(Modifier::BOLD);
+    let meta = format!(" v{} · glm · 7 tools", env!("CARGO_PKG_VERSION"));
+    let head = welcome_text("glm", 7, None);
+
+    // `TinyAgent v<version> · <model> · <n> tools`: the agent's accent glyph,
+    // the wordmark bold in the terminal's default ink, the session meta
+    // behind it dim. Plain weight for everything but the wordmark.
+    let lines = history(&[Row::sys_head(head.clone())]);
+    assert_eq!(
+        spans(&lines[0]),
+        vec![("◆ ", accent), ("TinyAgent", bold), (meta.as_str(), dim)]
+    );
+    assert_eq!(lines[0].style, plain);
+    assert_eq!(
+        lines.len(),
+        2,
+        "the end-of-history blank is its only companion"
+    );
+
+    // The unset-window note is meta all over: a second line, indented two
+    // cells under the wordmark — not a warning of its own.
+    let note = "limits.max_context_tokens is not set";
+    let lines = history(&[Row::sys_head(welcome_text("glm", 7, Some(note)))]);
+    assert_eq!(
+        lines.iter().map(row_text).collect::<Vec<_>>(),
+        [
+            format!("◆ {head}"),
+            format!("  {note} · /context for details"),
+            String::new()
+        ]
+    );
+    assert_eq!(
+        spans(&lines[1]),
+        vec![
+            ("  ", plain),
+            (
+                "limits.max_context_tokens is not set · /context for details",
+                dim
+            ),
+        ]
+    );
+    // Drawn: the glyph in the accent, the wordmark's weight, dim meta, no surface.
+    let term = test_line_terminal(lines, 60, 3);
+    let cells = term.backend().buffer();
+    assert!(paints_no_background(&term));
+    assert_eq!(rendered_cell(cells, 0, 0), ("◆", Some(accent_fg())));
+    assert_eq!(rendered_cell(cells, 2, 0), ("T", Some(Color::Reset)));
+    assert_eq!(cells[(2, 0)].style().add_modifier, Modifier::BOLD);
+    assert_eq!(rendered_cell(cells, 11, 0), (" ", Some(dim_fg())));
+    assert_eq!(rendered_cell(cells, 12, 0), ("v", Some(dim_fg())));
+    assert_eq!(rendered_cell(cells, 2, 1), ("l", Some(dim_fg())));
+
+    // A wordmark without meta: two spans, nothing empty appended.
+    assert_eq!(
+        spans(&history(&[Row::sys_head("TinyAgent")])[0]),
+        vec![("◆ ", accent), ("TinyAgent", bold)]
+    );
+}
+
+#[test]
+fn conversation_gutter_column_inks_in_a_real_cell_grid() {
+    // System lines share the two-space gutter with tool rows: the glyph in
+    // column 2 states the level or outcome and carries the ink, the text
+    // follows it in the same ink — except a tool call, whose name is dim.
+    let rows = vec![
+        Row::sys_info("[history cleared]"),
+        Row::sys_warn("[done: max_tokens]"),
+        Row::sys_error("[error] boom"),
+        tool_call_row("shell"),
+        tool_result_row("shell", false),
+        tool_result_row("shell", true),
+    ];
+    let lines = history(&rows);
+    assert_eq!(
+        lines.iter().map(row_text).collect::<Vec<_>>(),
+        [
+            "  · [history cleared]",
+            "  ! [done: max_tokens]",
+            "  ✗ [error] boom",
+            "  → shell  arg summary",
+            "  ✓ shell  body line",
+            "  ✗ shell  body line",
+            "",
+        ]
+    );
+    let term = test_line_terminal(lines, 40, 7);
+    let cells = term.backend().buffer();
+    assert!(paints_no_background(&term));
+    for (y, glyph, ink, text, text_ink) in [
+        (0, "·", dim_fg(), "[", dim_fg()),
+        (1, "!", warn_fg(), "[", warn_fg()),
+        (2, "✗", error_fg(), "[", error_fg()),
+        (3, "→", accent_fg(), "s", dim_fg()),
+        (4, "✓", dim_fg(), "s", dim_fg()),
+        (5, "✗", error_fg(), "s", error_fg()),
+    ] {
+        assert_eq!(rendered_cell(cells, 2, y), (glyph, Some(ink)), "row {y}");
+        assert_eq!(
+            rendered_cell(cells, 4, y),
+            (text, Some(text_ink)),
+            "row {y}"
+        );
+        // The whole four-cell gutter mark wears that ink — the two blank
+        // cells in front and the space after the glyph included.
+        for x in [0, 1, 3] {
+            assert_eq!(
+                rendered_cell(cells, x, y),
+                (" ", Some(ink)),
+                "row {y} col {x}"
+            );
+        }
+    }
+}
+
+#[test]
+fn row_gap_is_the_one_spacing_rule() {
+    let user = Row::User("u".into());
+    let answer = Row::Assistant("a".into());
+    let cont = |tight| Row::AssistantCont {
+        text: "c".into(),
+        tight,
+    };
+    let trace = |tight| Row::Thinking {
+        text: "t".into(),
+        tight,
+    };
+    let full = Row::ThinkingFull("t".into());
+    let call = tool_call_row("shell");
+    let ok = tool_result_row("shell", false);
+    let info = Row::sys_info("i");
+    let warn = Row::sys_warn("w");
+
+    // A blank opens a user message or a notice, whatever stands before it…
+    for next in [&user, &info, &warn] {
+        for prev in [&user, &answer, &cont(false), &call, &ok, &trace(false)] {
+            assert!(row_gap(prev, next), "{prev:?} → {next:?}");
+        }
+    }
+    // …except that consecutive notices stack as one block.
+    for (prev, next) in [
+        (&info, &info),
+        (&info, &warn),
+        (&warn, &info),
+        (&warn, &warn),
+    ] {
+        assert!(!row_gap(prev, next), "{prev:?} → {next:?}");
+    }
+
+    // Between two assistant-shaped blocks — two messages, or a chunk cut on
+    // a paragraph boundary — so they do not read as one blob…
+    let loose = [&answer, &cont(false), &cont(true)];
+    for next in [&answer, &cont(false)] {
+        for prev in loose {
+            assert!(row_gap(prev, next), "{prev:?} → {next:?}");
+        }
+    }
+    // …but never before a mid-paragraph (tight) chunk: the cut consumed no
+    // paragraph gap, and a blank would tear one paragraph in two.
+    for prev in loose {
+        assert!(!row_gap(prev, &cont(true)), "{prev:?}");
+    }
+
+    // The user's message and the flow it opened are one exchange: no blank
+    // under the question, none around the tool rows, none before the answer
+    // resumes after them.
+    for next in [
+        &answer,
+        &cont(false),
+        &cont(true),
+        &call,
+        &ok,
+        &trace(false),
+        &full,
+    ] {
+        assert!(!row_gap(&user, next), "user → {next:?}");
+    }
+    for next in [&call, &ok] {
+        for prev in loose {
+            assert!(!row_gap(prev, next), "{prev:?} → {next:?}");
+        }
+        assert!(!row_gap(&call, next), "call → {next:?}");
+        assert!(!row_gap(&ok, next), "ok → {next:?}");
+        assert!(!row_gap(&trace(false), next), "trace → {next:?}");
+    }
+    for next in loose {
+        assert!(!row_gap(&call, next), "call → {next:?}");
+        assert!(!row_gap(&ok, next), "ok → {next:?}");
+    }
+
+    // A trace is context for the answer: a blank after it (trace vs answer)…
+    for prev in [&trace(false), &trace(true), &full] {
+        for next in [&answer, &cont(false), &trace(false), &full] {
+            assert!(row_gap(prev, next), "{prev:?} → {next:?}");
+        }
+        assert!(!row_gap(prev, &cont(true)), "{prev:?}");
+    }
+    // …and before it, unless it directly follows the user's message (the
+    // tight user → assistant look).
+    for next in [&trace(false), &full] {
+        assert!(!row_gap(&user, next), "user → {next:?}");
+        for prev in [
+            &answer,
+            &cont(false),
+            &cont(true),
+            &call,
+            &ok,
+            &trace(false),
+            &full,
+        ] {
+            assert!(row_gap(prev, next), "{prev:?} → {next:?}");
+        }
+    }
+    // A tight trace flushes against the row it continues, as any tight chunk.
+    assert!(!row_gap(&answer, &trace(true)));
+    assert!(!row_gap(&trace(false), &trace(true)));
+    assert!(!row_gap(&full, &trace(true)));
+    assert!(!row_gap(&call, &trace(true)));
+}
+
+#[test]
+fn history_spacing_one_blank_between_blocks_never_two() {
+    let texts = |rows: &[Row]| -> Vec<String> { history(rows).iter().map(row_text).collect() };
+    // No batch opens on a blank, and no two blanks are ever adjacent: one
+    // blank separates blocks, that is the whole rule.
+    let well_spaced = |lines: &[String]| {
+        assert!(!lines.is_empty());
+        assert!(!lines[0].trim().is_empty(), "opens on a blank: {lines:?}");
+        assert!(
+            !lines
+                .windows(2)
+                .any(|w| w[0].trim().is_empty() && w[1].trim().is_empty()),
+            "two blanks in a row: {lines:?}"
+        );
+    };
+
+    // Two exchanges: one blank between the blocks, none inside one — a
+    // question and its answer read as one exchange.
+    let lines = texts(&[
+        Row::User("q1".into()),
+        Row::Assistant("a1".into()),
+        Row::User("q2".into()),
+        Row::Assistant("a2".into()),
+    ]);
+    assert_eq!(lines, ["❯ q1", "◆ a1", "", "❯ q2", "◆ a2", ""]);
+    well_spaced(&lines);
+
+    // Consecutive notices stack as one block: none between them, one before
+    // the next block (a stopped run reports "[cancelled]" and the dropped
+    // queue back to back — they are one event, not two interjections).
+    let lines = texts(&[
+        Row::sys_info("[cancelled]"),
+        Row::sys_warn("[dropped 2 queued message(s)]"),
+        Row::sys_error("[error] boom"),
+        Row::User("again".into()),
+    ]);
+    assert_eq!(
+        lines,
+        [
+            "  · [cancelled]",
+            "  ! [dropped 2 queued message(s)]",
+            "  ✗ [error] boom",
+            "",
+            "❯ again",
+            "",
+        ]
+    );
+    well_spaced(&lines);
+
+    // A mixed batch: tool rows stay tight against the flow they belong to,
+    // the answer resumes flush after them, the notice after it opens with a
+    // blank, a second notice stacks, the next question opens with one again.
+    let lines = texts(&[
+        Row::User("q".into()),
+        tool_call_row("shell"),
+        tool_result_row("shell", false),
+        Row::Assistant("done".into()),
+        Row::sys_info("note"),
+        Row::sys_warn("warn"),
+        Row::User("next".into()),
+    ]);
+    assert_eq!(
+        lines,
+        [
+            "❯ q",
+            "  → shell  arg summary",
+            "  ✓ shell  body line",
+            "◆ done",
+            "",
+            "  · note",
+            "  ! warn",
+            "",
+            "❯ next",
+            "",
+        ]
+    );
+    well_spaced(&lines);
+
+    // Thinking and its answer, tool rows between them: every block opened
+    // once, nothing doubled.
+    let lines = texts(&[
+        Row::User("q".into()),
+        Row::Thinking {
+            text: "reason".into(),
+            tight: false,
+        },
+        Row::Assistant("a".into()),
+        tool_call_row("shell"),
+        tool_result_row("shell", false),
+        Row::Assistant("b".into()),
+        Row::User("next".into()),
+    ]);
+    assert_eq!(
+        lines,
+        [
+            "❯ q",
+            "✻ reason",
+            "",
+            "◆ a",
+            "  → shell  arg summary",
+            "  ✓ shell  body line",
+            "◆ b",
+            "",
+            "❯ next",
+            "",
+        ]
+    );
+    well_spaced(&lines);
+
+    // Never two in a row: a message that itself ends on a blank line (pasted
+    // text with a trailing empty line) already carries the gap its successor
+    // is owed — the spacer is not laid on top of it, even though the pair
+    // rule asks for one.
+    let pasted = Row::User("a\n\n".into());
+    assert!(row_gap(&pasted, &Row::User("next".into())));
+    let lines = texts(&[pasted, Row::User("next".into())]);
+    assert_eq!(lines, ["❯ a", "  ", "❯ next", ""]);
+    well_spaced(&lines);
+}
+
+#[test]
+fn final_thinking_is_trimmed_and_its_header_is_dim_italic_over_faint_meta() {
+    let plain = Style::default();
+    let trace_ink = plain.fg(dim_fg()).add_modifier(Modifier::ITALIC);
+    let faint = plain.fg(faint_fg());
+
+    // A short final trace drops its trailing blank lines (real traces end
+    // with "\n", often "\n\n") and keeps the interior ones. Body and `✻ `
+    // mark: the dim ink, italic, no markdown.
+    let lines = history(&[Row::Thinking {
+        text: "plan\n\ncheck\n\n".into(),
+        tight: false,
+    }]);
+    assert_eq!(
+        lines.iter().map(row_text).collect::<Vec<_>>(),
+        ["✻ plan", "  ", "  check", ""]
+    );
+    assert_eq!(spans(&lines[0]), [("✻ ", trace_ink), ("plan", trace_ink)]);
+    assert_eq!(spans(&lines[1]), [("  ", plain)]);
+    assert_eq!(spans(&lines[2]), [("  ", plain), ("check", trace_ink)]);
+
+    // A trace over eight display rows folds: `✻ Thinking` in the trace ink
+    // made bold, its meta one step fainter, then the last three rows.
+    let trace = (1..=10).map(|i| format!("line {i}\n")).collect::<String>();
+    let lines = history(&[Row::Thinking {
+        text: trace,
+        tight: false,
+    }]);
+    assert_eq!(
+        lines.iter().map(row_text).collect::<Vec<_>>(),
+        [
+            "✻ Thinking · folded · 10 rows · /thinking",
+            "  line 8",
+            "  line 9",
+            "  line 10",
+            "",
+        ]
+    );
+    assert_eq!(
+        spans(&lines[0]),
+        [
+            ("✻ Thinking", trace_ink.add_modifier(Modifier::BOLD)),
+            (" · folded · 10 rows · /thinking", faint),
+        ]
+    );
+    assert_eq!(spans(&lines[1]), [("  ", plain), ("line 8", trace_ink)]);
+    assert_eq!(spans(&lines[3]), [("  ", plain), ("line 10", trace_ink)]);
+    // Drawn: the trace is a quiet block — the dim ink on the terminal's
+    // own surface, no background anywhere.
+    let term = test_line_terminal(lines, 40, 5);
+    let cells = term.backend().buffer();
+    assert!(paints_no_background(&term));
+    // The folded header: the label's weight shows in the cells' modifiers.
+    assert_eq!(rendered_cell(cells, 0, 0), ("✻", Some(dim_fg())));
+    assert_eq!(rendered_cell(cells, 2, 0), ("T", Some(dim_fg())));
+    assert_eq!(
+        cells[(2, 0)].style().add_modifier,
+        Modifier::BOLD | Modifier::ITALIC
+    );
+    assert_eq!(rendered_cell(cells, 9, 0), ("g", Some(dim_fg())));
+    assert_eq!(rendered_cell(cells, 10, 0), (" ", Some(faint_fg())));
+    assert_eq!(rendered_cell(cells, 13, 0), ("f", Some(faint_fg())));
+    assert_eq!(rendered_cell(cells, 2, 1), ("l", Some(dim_fg())));
+    assert_eq!(cells[(2, 1)].style().add_modifier, Modifier::ITALIC);
+}
+
+#[test]
+fn empty_non_final_chunk_renders_no_lines() {
+    let texts = |rows: &[Row]| -> Vec<String> { history(rows).iter().map(row_text).collect() };
+
+    // A chunk that more of the reply follows is not shown when it renders
+    // nothing — whitespace, or a lone fence opener a row cut landed right
+    // after. No blank stands in for it: that would tear the paragraph it sits
+    // in into two blocks.
+    for empty in ["", "   ", "\n", "```"] {
+        let lines = texts(&[
+            Row::Assistant("a".into()),
+            Row::AssistantCont {
+                text: empty.into(),
+                tight: true,
+            },
+            Row::AssistantCont {
+                text: "b".into(),
+                tight: true,
+            },
+        ]);
+        assert_eq!(lines, ["◆ a", "  b", ""], "empty chunk {empty:?}");
+    }
+    // The same for a whole message that renders nothing.
+    assert_eq!(
+        texts(&[
+            Row::Assistant("a".into()),
+            Row::Assistant(String::new()),
+            Row::Assistant("b".into()),
+        ]),
+        ["◆ a", "", "◆ b", ""]
+    );
+    // A mid-stream batch (not the end of history) prints nothing for an
+    // empty last chunk either.
+    let tail = [
+        Row::Assistant("a".into()),
+        Row::AssistantCont {
+            text: "```".into(),
+            tight: true,
+        },
+    ];
+    let mut cache = MdCache::new();
+    let lines = build_history_lines(&tail, &mut cache, TEST_W, LiveRow::None, false, false);
+    assert_eq!(lines.iter().map(row_text).collect::<Vec<_>>(), ["◆ a"]);
+
+    // End of history: an empty final body is a message's own and still holds
+    // its row; while it streams, that row carries the cursor.
+    assert_eq!(texts(&tail), ["◆ a", "  "]);
+    let mut cache = MdCache::new();
+    let lines = build_history_lines(&tail, &mut cache, TEST_W, LiveRow::Text, false, false);
+    assert_eq!(
+        lines.iter().map(row_text).collect::<Vec<_>>(),
+        ["◆ a", "  ▌"]
+    );
+    assert_eq!(
+        spans(&lines[1]),
+        [
+            ("  ", Style::default()),
+            ("▌", Style::default().fg(accent_fg()))
+        ]
+    );
+    // An empty message shows its bare `◆`.
+    assert_eq!(texts(&[Row::Assistant(String::new())]), ["◆ ", ""]);
+}
+
+#[test]
+fn markdown_headings_are_bold_without_their_markers() {
+    let plain = Style::default();
+    let bold = plain.add_modifier(Modifier::BOLD);
+    let lines: Vec<Line<'static>> = render_markdown(
+        "# One\n\n## Two `code`\n\n### Three\n\n#### Four\n\n##### Five\n\n###### Six\n",
+        40,
+    )
+    .iter()
+    .map(line_to_owned)
+    .collect();
+    // h1–h3: weight, not color — the title sits in the terminal's default ink.
+    assert_eq!(row_text(&lines[0]), "One");
+    assert_eq!(spans(&lines[0]), [("One", bold)]);
+    // Inline code inside a title keeps its accent on top of the weight.
+    assert_eq!(
+        spans(&lines[2]),
+        [("Two ", bold), ("code", bold.fg(accent_fg()))]
+    );
+    assert_eq!(spans(&lines[4]), [("Three", bold)]);
+    // h4 and below recede: bold in the dim ink.
+    assert_eq!(spans(&lines[6]), [("Four", bold.fg(dim_fg()))]);
+    assert_eq!(spans(&lines[8]), [("Five", bold.fg(dim_fg()))]);
+    assert_eq!(spans(&lines[10]), [("Six", bold.fg(dim_fg()))]);
+    // No `#` anywhere; the odd rows are the paragraphs' blank lines.
+    assert_eq!(lines.len(), 11);
+    assert!(lines
+        .iter()
+        .all(|l| !row_text(l).contains('#') && l.style == plain));
+    assert!(lines
+        .iter()
+        .all(|l| l.spans.iter().all(|s| s.style.bg.is_none())));
+    assert!(paints_no_background(&test_line_terminal(lines, 40, 11)));
+}
+
+#[test]
+fn markdown_code_wears_the_accent_and_a_faint_bar_with_no_background() {
+    let plain = Style::default();
+    let accent = plain.fg(accent_fg());
+    let faint = plain.fg(faint_fg());
+    let lines: Vec<Line<'static>> =
+        render_markdown("run `make` now\n\n```sh\nmake test\n```\n", 40)
+            .iter()
+            .map(line_to_owned)
+            .collect();
+    // Inline code: the accent ink at plain weight — no chip behind it.
+    assert_eq!(row_text(&lines[0]), "run make now");
+    assert_eq!(
+        spans(&lines[0]),
+        [("run ", plain), ("make", accent), (" now", plain)]
+    );
+    // A fenced block: the fence lines are gone, the body in the default ink
+    // behind a faint `▎ ` bar.
+    assert_eq!(row_text(&lines[1]), "");
+    assert_eq!(row_text(&lines[2]), "▎ make test");
+    assert_eq!(spans(&lines[2]), [("▎ ", faint), ("make test", plain)]);
+    assert_eq!(lines.len(), 3);
+    // Drawn: every glyph in its ink, and not one cell with a background —
+    // neither behind the inline code nor behind the block.
+    let term = test_line_terminal(lines, 40, 3);
+    let cells = term.backend().buffer();
+    assert!(paints_no_background(&term));
+    assert_eq!(test_buffer_row(&term, 0).trim_end(), "run make now");
+    assert_eq!(test_buffer_row(&term, 2).trim_end(), "▎ make test");
+    let reset = Some(Color::Reset);
+    assert_eq!(rendered_cell(cells, 0, 0), ("r", reset));
+    assert_eq!(rendered_cell(cells, 4, 0), ("m", Some(accent_fg())));
+    assert_eq!(rendered_cell(cells, 7, 0), ("e", Some(accent_fg())));
+    assert_eq!(rendered_cell(cells, 9, 0), ("n", reset));
+    assert_eq!(rendered_cell(cells, 0, 2), ("▎", Some(faint_fg())));
+    assert_eq!(rendered_cell(cells, 1, 2), (" ", Some(faint_fg())));
+    assert_eq!(rendered_cell(cells, 2, 2), ("m", reset));
+}
+
+#[test]
+fn markdown_lone_fence_opener_renders_zero_lines() {
+    // A row cut that lands right after a fence opener leaves the committed
+    // chunk with nothing to print: no bar, no blank row standing in for it.
+    for md in ["```", "```rust", "```\n"] {
+        assert!(render_markdown(md, 40).is_empty(), "{md:?}");
+    }
+    // An opener with a content line behind it — an empty one counts — is a
+    // block: one row, its bar and nothing else.
+    let lines: Vec<Line<'static>> = render_markdown("```\n\n", 40)
+        .iter()
+        .map(line_to_owned)
+        .collect();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(
+        spans(&lines[0]),
+        [
+            ("▎ ", Style::default().fg(faint_fg())),
+            ("", Style::default())
+        ]
+    );
+}
+
+#[test]
+fn markdown_task_items_and_nested_bullets_keep_their_marks() {
+    let plain = Style::default();
+    let dim = plain.fg(dim_fg());
+    let own = |md: &str| -> Vec<Line<'static>> {
+        render_markdown(md, 40).iter().map(line_to_owned).collect()
+    };
+
+    // Task items keep their box; the marker is dim, the item's text plain.
+    let lines = own("- [ ] buy milk\n- [x] done thing\n  - nested\n    - deeper\n");
+    assert_eq!(
+        lines.iter().map(row_text).collect::<Vec<_>>(),
+        [
+            "• ☐ buy milk",
+            "• ☑ done thing",
+            "    • nested",
+            "        • deeper",
+        ]
+    );
+    assert_eq!(spans(&lines[0]), [("• ☐ ", dim), ("buy milk", plain)]);
+    assert_eq!(spans(&lines[1]), [("• ☑ ", dim), ("done thing", plain)]);
+    // Nested bullets recede the same way, one dim `•` per level under the
+    // nesting indent tui-markdown gives it.
+    assert_eq!(spans(&lines[2]), [("    • ", dim), ("nested", plain)]);
+    assert_eq!(spans(&lines[3]), [("        • ", dim), ("deeper", plain)]);
+    // An upper-case box is done too.
+    assert_eq!(row_text(&own("- [X] done too")[0]), "• ☑ done too");
+    // Every bullet marker becomes the same dim `•`; an ordered marker keeps
+    // its number, in the dim ink as well.
+    for marker in ["-", "*", "+"] {
+        assert_eq!(
+            spans(&own(&format!("{marker} item"))[0]),
+            [("• ", dim), ("item", plain)],
+            "marker {marker}"
+        );
+    }
+    assert_eq!(
+        spans(&own("1. ordered")[0]),
+        [("1. ", dim), ("ordered", plain)]
+    );
+}
+
+#[test]
+fn markdown_fence_inside_a_blockquote_keeps_its_quote() {
+    let plain = Style::default();
+    let dim = plain.fg(dim_fg());
+    let faint = plain.fg(faint_fg());
+    let lines: Vec<Line<'static>> = render_markdown(
+        "> quoted\n>\n> ```rust\n> fn main() {}\n> ```\n> after\n",
+        40,
+    )
+    .iter()
+    .map(line_to_owned)
+    .collect();
+    // The quote mark is tertiary to the dim quote body.
+    assert_eq!(row_text(&lines[0]), "> quoted");
+    assert_eq!(
+        spans(&lines[0]),
+        [(">", faint), (" ", dim), ("quoted", dim)]
+    );
+    // The fenced block inside the quote: the quote stays in front of a faint
+    // `▎ ` bar, the body in the default ink.
+    assert_eq!(row_text(&lines[2]), "> ▎ fn main() {}");
+    assert_eq!(
+        spans(&lines[2]),
+        [
+            (">", dim),
+            (" ", dim),
+            ("▎ ", faint),
+            ("fn main() {}", plain)
+        ]
+    );
+    // The quote resumes after the block.
+    assert_eq!(row_text(&lines[4]), "> after");
+    assert_eq!(spans(&lines[4]), [(">", faint), (" ", dim), ("after", dim)]);
+    assert_eq!(lines.len(), 5);
+    // The rows between are bare quote marks: the quote's own blank line, and
+    // the gap the block's closing fence leaves.
+    assert_eq!(spans(&lines[1]), [(">", faint), (" ", dim)]);
+    assert_eq!(spans(&lines[3]), [(">", faint), (" ", dim)]);
+    // Drawn: no background behind the quoted block either.
+    let term = test_line_terminal(lines, 40, 5);
+    let cells = term.backend().buffer();
+    assert!(paints_no_background(&term));
+    assert_eq!(rendered_cell(cells, 0, 2), (">", Some(dim_fg())));
+    assert_eq!(rendered_cell(cells, 2, 2), ("▎", Some(faint_fg())));
+    assert_eq!(rendered_cell(cells, 4, 2), ("f", Some(Color::Reset)));
+}
+
+#[test]
+fn markdown_block_styles_live_on_spans_so_role_marks_keep_their_ink() {
+    let plain = Style::default();
+    let bold = plain.add_modifier(Modifier::BOLD);
+    let dim = plain.fg(dim_fg());
+    let faint = plain.fg(faint_fg());
+
+    // Every block tui-markdown styles on the LINE — heading weight, the
+    // quote and code-block inks, list markers, the table frame — comes out
+    // on its spans instead: each line's own style is plain, and no span
+    // carries a background.
+    let lines = render_markdown(
+        "# Title\n\n> quote\n\n```rust\nlet x = 1;\n```\n\n- item\n\n---\n\n| a | b |\n|---|---|\n| 1 | 2 |\n",
+        40,
+    );
+    assert_eq!(lines.len(), 15);
+    for line in &lines {
+        assert_eq!(line.style, plain, "{line:?}");
+        assert!(line.spans.iter().all(|s| s.style.bg.is_none()), "{line:?}");
+    }
+    // The inks the move carried over: a bold title in the default ink…
+    assert_eq!(spans(&lines[0]), [("Title", bold)]);
+    // …a faint `>` over a dim quote, a faint bar over a plain body…
+    assert_eq!(spans(&lines[2]), [(">", faint), (" ", dim), ("quote", dim)]);
+    assert_eq!(spans(&lines[4]), [("▎ ", faint), ("let x = 1;", plain)]);
+    // …a dim bullet, a faint full-width rule…
+    assert_eq!(spans(&lines[6]), [("• ", dim), ("item", plain)]);
+    assert_eq!(spans(&lines[8]), [("─".repeat(40).as_str(), faint)]);
+    // …a bold header row over a faint table frame, plain-weight cells.
+    for border in [&lines[10], &lines[12], &lines[14]] {
+        assert!(border.spans.iter().all(|s| s.style == faint), "{border:?}");
+    }
+    assert_eq!(
+        spans(&lines[11]),
+        [
+            ("│", faint),
+            (" ", bold),
+            ("a", bold),
+            (" ", bold),
+            ("│", faint),
+            (" ", bold),
+            ("b", bold),
+            (" ", bold),
+            ("│", faint),
+        ]
+    );
+    assert_eq!(
+        spans(&lines[13]),
+        [
+            ("│", faint),
+            (" ", plain),
+            ("1", plain),
+            (" ", plain),
+            ("│", faint),
+            (" ", plain),
+            ("2", plain),
+            (" ", plain),
+            ("│", faint),
+        ]
+    );
+
+    // What that buys: the `◆ ` role mark of an answer that opens with a
+    // heading stays the accent at plain weight — the heading's bold used to
+    // ride the line and take the mark with it.
+    let lines = history(&[Row::Assistant("# Title\n\nbody".into())]);
+    assert_eq!(
+        spans(&lines[0]),
+        [("◆ ", plain.fg(accent_fg())), ("Title", bold)]
+    );
+    assert_eq!(lines[0].style, plain);
+    // …and a fenced block right behind the mark shows its faint bar on the
+    // terminal's own surface.
+    let lines = history(&[Row::Assistant("intro\n\n```js\nlet a = 1;\n```".into())]);
+    assert_eq!(
+        lines.iter().map(row_text).collect::<Vec<_>>(),
+        ["◆ intro", "  ", "  ▎ let a = 1;", ""]
+    );
+    assert_eq!(
+        spans(&lines[2]),
+        [("  ", plain), ("▎ ", faint), ("let a = 1;", plain)]
+    );
 }
