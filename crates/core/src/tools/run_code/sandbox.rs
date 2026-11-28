@@ -731,6 +731,8 @@ mod tests {
     #[test]
     fn cancel_flag_terminates_busy_loop() {
         use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+        let flip_after = Duration::from_millis(300);
         let flag = Arc::new(AtomicBool::new(false));
         let dir = scratch();
         let mut c = ctx(&dir);
@@ -739,19 +741,45 @@ mod tests {
         // time the flipper below would have already fired and the ENTRY gate
         // (not the in-flight delivery this test pins) would do the work.
         assert!(!run_code("return 1", CodeConfig::default()).is_error);
+        // Stamp the clock BEFORE the flipper exists: the flag can then never
+        // flip earlier than `started + flip_after`, however the two threads
+        // get scheduled.
+        let started = Instant::now();
+        let watch = flag.clone();
         let flipper = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(300));
+            std::thread::sleep(flip_after);
             flag.store(true, std::sync::atomic::Ordering::Relaxed);
         });
-        let started = Instant::now();
+        let flipped_before_entry = watch.load(std::sync::atomic::Ordering::Relaxed);
         let out = tool_with(CodeConfig::default())
             .run_with_emit(&json!({"code": "while (true) {}"}), &c, &mut |_| {})
             .unwrap();
+        // The guest's own lifetime, read BEFORE the join: after it the elapsed
+        // time is always ≥ flip_after (the flipper is slept out even when the
+        // guest died early), which hides an early death.
+        let guest_took = started.elapsed();
         flipper.join().unwrap();
         assert!(out.is_error, "{}", out.content);
+        // Nothing can stop this guest before the flag flips: the busy loop
+        // needs seconds for the default fuel and there is no wall clock. An
+        // earlier end is a termination that is not the cancel — whatever the
+        // message says. (A flag that was already up when the call began means
+        // the test thread was stalled for the whole flip window: then the
+        // entry gate legitimately ends the guest at once.)
+        assert!(
+            flipped_before_entry || guest_took >= flip_after,
+            "the guest ended before the cancel flag could have fired \
+             (ran {guest_took:?}, flips at {flip_after:?}): {}",
+            out.content
+        );
         assert!(
             out.content.contains("cancelled"),
-            "cancel-specific message: {}",
+            // On a failure read `ran` first: well under the flip = the guest
+            // was stopped before any cancel existed (CI 2026-11-27: one
+            // "fuel exhausted" in a 303ms run); at or after the flip = stopped
+            // by the cancel but attributed to something else.
+            "cancel-specific message (guest ran {guest_took:?}, the flag flips at \
+             {flip_after:?}): {}",
             out.content
         );
         assert!(
@@ -760,7 +788,7 @@ mod tests {
             out.content
         );
         assert!(
-            started.elapsed().as_secs() < 5,
+            started.elapsed() < Duration::from_secs(5),
             "epoch delivery must be prompt, took {:?}",
             started.elapsed()
         );

@@ -1912,7 +1912,7 @@ crates/core/src/  # kernel crate (package tiny-agent-core, lib name tiny_agent):
 │   ├── llm.rs                (  743)  # llm judgment primitive (feature code + code.llm gate): single-shot stateless inner model call — LD-17 reserve/settle, LD-18 label normalization, shared Provider cell
 │   └── run_code/  # run_code submodules (same code gate): split from the original 11.9k single file by concern
 │       ├── contract.rs           (  936)  # guest-facing contract text: reserved names/CODE marker/byte caps, PRELUDE three sources, skill md loading, strip_once
-│       ├── sandbox.rs            (  806)  # wasmtime sandbox: QuickJS module load & cache, epoch/fuel/MemLimiter, CallTrace, HostCtx, wall clock, guest memory read caps
+│       ├── sandbox.rs            (  834)  # wasmtime sandbox: QuickJS module load & cache, epoch/fuel/MemLimiter, CallTrace, HostCtx, wall clock, guest memory read caps
 │       ├── guest_api.rs          ( 3603)  # host function surface: unpack/read/write, host_call_tool dispatch, inner-result envelope, llm marker parse folding, audit meta
 │       ├── fs_policy.rs          ( 2444)  # fs/glob policy: path interception & lexical normalization, write-dir constraints, symlink checks, glob matching (** folding + segment caps)
 │       ├── lib_index.rs          ( 2051)  # lib family: session library index/read-write caps, sha256, reserved names, include delivery

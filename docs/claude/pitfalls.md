@@ -690,3 +690,27 @@
     job（clippy）红着的时候下游测试**根本没跑**，修好上游之后要有下游再红一轮的准备——推修 CI 的提交前，把
     「此后才第一次跑到的测试面」过一遍（本次是 `git diff <上次绿的提交>..HEAD -- '*.rs'` 里的 cfg 分支）。
     两个探针同病，一次修两处：`grep -rn 'cfg(windows)' crates src bindings` 定位块再逐块读。
+- **run_code 的取消用例偶发报「fuel exhausted」（2026-11-27，根因没查出来，测试改成自带诊断）**：TUI 重构的四个
+  提交推上去后，`code` 格的 `cargo test --locked -p tiny-agent-core -p tiny-agent --features code,mock` 红在
+  `tools::run_code::sandbox::tests::cancel_flag_terminates_busy_loop`（A-5：300ms 后翻共享 cancel 标志，空转死循环
+  应在下一个 epoch tick 被取消），断言文案是 `cancel-specific message: [run_code] terminated: fuel exhausted
+  (5000000000 — deterministic budget; …)`，该用例耗时 303ms（绿的两次是 317 / 306ms）。**这条文案按代码路径到不了**：
+  `RunCodeTool::terminated()` 只在 `interrupt` 为空、内存没超、`store.get_fuel() == Some(0)` 时才报「fuel exhausted」，
+  而每个观察 cancel 的点（epoch 回调、host_call 入口、batch 的波间复查）都是先给同一个 store 记上 `interrupt` 再返回
+  `Err`，没有任何路径清它——取消造成的终止一律是「cancelled … in-flight」；真烧完 50 亿 fuel，空转死循环在本机要
+  约 1.8s，塞不进 300ms。逐条排除过的：wasmtime 36 的 fuel 记账（`get_fuel` = 储备 + 注入量的相反数；写这个槽的只有
+  生成的机器码、内核唯一一处 `set_fuel`、`out_of_gas` 里的 `refuel`）；wasmtime 36 里没有别的线程会写某个 store 的
+  上下文（epoch 是引擎级的共享计数器）；codegen 是确定性的（真有 bug 每次都会红）。本机复现不了（arm64 macOS，CI 是
+  x86_64 Linux）：随机翻转时刻 8–60ms、4 线程、外加两线程反复建 store 与 fsync，13,646 次零异常；与 CI 相同的命令在
+  两套工具链上全绿；翻 CI 历史，这条测试此前从没红过。当时的同场现象（因果没证实）：红的那一次里，所有做成功
+  `saveLib` 的 `lib_index` 用例在 49.3–51.3s 之间慢了 10–60 倍（库落盘走 `atomic_write` 的 `sync_all`，是 fsync 在
+  等盘；完成时刻成簇 = runner 的一次磁盘停顿），失败用例当时与其中三个并行。**处置**：不猜修、不给测试加重试或
+  余量；产品代码没动，测试改成自带诊断——在 `join` 之前读 guest 自己的存活时长 `guest_took`（`join` 之后恒 ≥ 300ms，
+  分不出「提前死」和「到点才停」），并断言「标志没翻之前没有东西能停掉这个 guest」。**再红时先读断言里的
+  `guest ran`**：远小于 300ms = guest 在任何 cancel 存在之前就被停了（与本次同形；下一步是临时在 `terminated()` 里
+  打出 trap 的真实类型、并设法在 x86_64 上复现——怀疑运行时或 runner，而不是内核的归因逻辑）；≈300ms 或更久 =
+  取消生效了但归因成别的（内核 `terminated()` 的裁决有 bug）。**从 CI 日志重建时间线的办法**：libtest 保持 N（vCPU
+  数）个用例在飞，每有一个跑完就打印它的结果行、然后才启动字母序里的下一个，所以一个用例的启动时刻 = 它排到队首
+  时那条「跑完」打印的时间戳；把红绿两次同一 job 的逐用例耗时并排比，能看出 runner 的停顿（fsync 敏感的 `lib_index`
+  用例是现成的温度计）。日志过期的失败 job（`--log` 返回 404）还能从
+  `/repos/<owner>/<repo>/check-runs/<job-id>/annotations` 拿到报错行。
