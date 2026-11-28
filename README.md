@@ -1707,10 +1707,10 @@ tooling installed and is not in the default set — `./scripts/check.sh bindings
 also opt-in: `./scripts/check.sh bench`.
 
 ```sh
-cargo test --features tui,mock   # unit tests (incl. TUI input/render logic + lib_api integration tests)
+cargo test -p tiny-agent-core -p tiny-agent --features tui,mock   # unit tests: kernel + CLI (TUI input/render logic), lib_api integration tests
 cargo clippy --features tui --all-targets   # lint (TUI config)
 cargo clippy --all-targets                 # lint (headless config)
-cargo test --features code,mock            # run_code sandbox suite (mandatory after touching run_code.rs)
+cargo test -p tiny-agent-core -p tiny-agent --features code,mock  # run_code sandbox suite (mandatory after touching run_code.rs)
 cargo clippy --features code --all-targets # lint (code config — run_code.rs sits behind the feature; invisible above)
 
 # keyless end-to-end smoke test:

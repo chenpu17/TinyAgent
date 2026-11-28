@@ -1248,10 +1248,10 @@ tool whitelist`。真正的"按轮临时预批准"需要每轮权限/激活层�
 性能基准也不在默认集里，显式 `./scripts/check.sh bench`。
 
 ```sh
-cargo test --features tui,mock   # 单元测试（含 TUI 输入/渲染逻辑 + lib_api 集成测试）
+cargo test -p tiny-agent-core -p tiny-agent --features tui,mock   # 单元测试：内核 + CLI（含 TUI 输入/渲染逻辑）与 lib_api 集成测试
 cargo clippy --features tui --all-targets   # lint（TUI 版）
 cargo clippy --all-targets                 # lint（headless 版）
-cargo test --features code,mock            # run_code 沙箱套件（改 run_code.rs 必跑）
+cargo test -p tiny-agent-core -p tiny-agent --features code,mock  # run_code 沙箱套件（改 run_code.rs 必跑）
 cargo clippy --features code --all-targets # lint（code 版——run_code.rs 在 feature 后，上面两个看不到）
 
 # 无 API key 的端到端冒烟测试：

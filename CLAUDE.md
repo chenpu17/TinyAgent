@@ -16,12 +16,12 @@
 
 ```sh
 cargo build --features tui                 # 默认只编 headless；TUI 要带 feature
-cargo test --features tui,mock             # 单测（含 TUI 输入/渲染逻辑 + lib_api 集成测试）
+cargo test -p tiny-agent-core -p tiny-agent --features tui,mock  # 单测（内核 + CLI，含 TUI 输入/渲染逻辑 + lib_api 集成测试）
 cargo clippy --features tui --all-targets  # lint TUI 版
 cargo clippy --all-targets                # lint headless 版
 cargo clippy --features code --all-targets # lint code 版（run_code.rs 在 feature 后）
 cargo clippy --features tui,code --all-targets # lint 交叉组合（CI 第四配置：TUI 的 code 渲染 / set_code_* 交互面）
-cargo test --features code,mock            # run_code 沙箱套件（改 run_code.rs 必跑）
+cargo test -p tiny-agent-core -p tiny-agent --features code,mock  # run_code 沙箱套件（改 run_code.rs 必跑）
 cargo fmt --all                            # 格式化（CI 有 --check 门禁，改完代码必跑）
 ```
 
@@ -38,13 +38,15 @@ zig 包装配方做一次 Windows 目标交叉 clippy。CI 里四个 clippy 都�
 文档同步门禁：`scripts/sync_run_code_contract.py --check`（含 README code 配置表与
 `CodeConfig::default` 的交叉核对）和 `scripts/gen_structure.py --check`（README.md 与 README.zh-CN.md 两份代码结构树行数从源文件
 实时生成，ENTRIES 描述单一事实源、双写两份）——动了对应内容记得 `--write` 再提交。
-**测试命令必带 `--features mock` 才真正跑到 `tests/lib_api.rs`**：该文件整体门在
-`#![cfg(feature = "mock")]` 后（`provider::mock` 是 `cfg(any(test, feature = "mock"))`，
-而集成测试编译时 lib 不带 `cfg(test)`），不带 mock 的 `cargo test` 把它编成 **0 个测试
-照样全绿**——绿灯不等于 lib_api 集成测试跑过。CI 另有两道本地复现不了的 job：musl
-静态构建冒烟（每次 push 必过，"嵌入式低配 Linux"是核心交付定位）与 cargo-audit
-（RustSec 扫依赖树；本地可用同版 cargo-audit 复现，配方见 pitfalls「本地 clippy 绿 ≠ CI clippy 绿」条）
-——升级/新增依赖或动平台相关代码时留意这两道门。
+**测试命令要选到内核 crate、并带 `--features mock`，才真正跑到 `tests/lib_api.rs`**：在仓库根
+目录不带 `-p` 的 `cargo test` 只选根 package（CLI 自己的单测），lib_api 根本不编，run_code
+沙箱套件同理（上面两条都带 `-p tiny-agent-core`）；选到内核 crate 之后还有第二道门——该文件
+整体在 `#![cfg(feature = "mock")]` 之后（`provider::mock` 是 `cfg(any(test, feature = "mock"))`，
+而集成测试编译时 lib 不带 `cfg(test)`），不带 mock 把它编成 **0 个测试照样全绿**——绿灯
+不等于 lib_api 集成测试跑过。与 CI 逐字一致的四条测试命令在 `./scripts/check.sh`。
+CI 另有两道本地复现不了的 job：musl 静态构建冒烟（每次 push 必过，"嵌入式低配 Linux"是
+核心交付定位）与 cargo-audit（RustSec 扫依赖树；本地可用同版 cargo-audit 复现，配方见
+pitfalls「本地 clippy 绿 ≠ CI clippy 绿」条）——升级/新增依赖或动平台相关代码时留意这两道门。
 
 ### 语言绑定（workspace 成员 `bindings/python`、`bindings/node`）
 
@@ -91,7 +93,8 @@ cargo clippy -p tiny-agent-node
 ## 高频纪律（几乎每次改动都适用）
 
 - **四个 clippy 配置 + `cargo fmt --all` 全跑**（见上「常用命令」），黄字即红灯。
-- **测试必带 `--features mock`**，否则 `tests/lib_api.rs` 编成 0 个测试照样全绿。
+- **测试要选到内核 crate 并带 `--features mock`**（`-p tiny-agent-core`）：不带 `-p` 只跑 CLI 单测、
+  lib_api 不编；选了内核但不带 mock，lib_api 编成 0 个测试——两种都照样全绿。
 - **改 `agent.rs` 核心路径必须配套 loop 测试**（`agent_tests.rs` + `provider/mock.rs` 脚本化 Provider，
   不连网）——别只靠 mock server 跑一遍就提交。
 - **数值写端一律 `saturating_add`**（usage / RunCost / merge_usage / batch 汇总所有 `+=`）。
